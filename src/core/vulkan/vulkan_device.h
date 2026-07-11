@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "core/vulkan/vulkan_loader.h"
 
@@ -29,6 +31,33 @@ struct OpenVulkanDiagnostics {
 
   std::string error;
   std::string fallback_reason;
+  std::string blocked_reason;
+  std::string degraded_reason;
+
+  struct ModelInfo {
+    std::string id;
+    std::string display_name;
+    std::string task;
+    int width = 0;
+    int height = 0;
+  };
+  std::vector<std::string> installed_models;
+  std::vector<ModelInfo> models;
+  std::string default_model_id;
+  std::map<std::string, std::string> missing_models;
+
+  std::vector<std::string> available_effects;
+  std::map<std::string, std::string> blocked_effects;
+  std::vector<std::string> install_hints;
+
+  std::string matting_runtime;
+  bool matting_runtime_created = false;
+  bool matting_graph_loaded = false;
+  bool input_device_resident = false;
+  bool alpha_device_resident = false;
+  bool output_device_resident = false;
+  std::string device_residency_mode;
+  std::vector<std::string> warnings;
 
   std::string ToJson() const;
 };

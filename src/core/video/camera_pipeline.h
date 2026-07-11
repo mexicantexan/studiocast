@@ -209,9 +209,21 @@ struct CameraPipelineStatus {
     std::uint64_t upload_calls = 0;
     std::uint64_t download_calls = 0;
     std::uint64_t final_download_calls = 0;
+    std::uint64_t cpu_continuation_download_calls = 0;
+    std::uint64_t alpha_download_calls = 0;
+    std::uint64_t matte_frame_upload_calls = 0;
+    std::uint64_t preprocess_dispatch_calls = 0;
+    std::uint64_t matting_inference_calls = 0;
+    std::uint64_t alpha_resize_dispatch_calls = 0;
+    std::uint64_t blur_dispatch_calls = 0;
+    std::uint64_t background_upload_calls = 0;
+    std::uint64_t composite_dispatch_calls = 0;
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
     std::uint64_t forced_sync_calls = 0;
+    std::uint64_t cpu_tail_stage_calls = 0;
+    std::uint64_t fallback_frames = 0;
+    std::uint64_t runtime_failure_frames = 0;
   } open_vulkan_transfers{};
 
   // Optional Maxine transfer counters (emitted in status JSON only when

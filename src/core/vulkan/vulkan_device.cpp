@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -15,6 +16,50 @@ std::string BoolJson(bool v) { return v ? "true" : "false"; }
 
 std::string JsonEscape(const std::string &s) {
   return studiocast::util::json::EscapeString(s);
+}
+
+void AppendJsonStringArray(std::ostringstream *oss,
+                           const std::vector<std::string> &a) {
+  *oss << "[";
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (i)
+      *oss << ",";
+    *oss << "\"" << JsonEscape(a[i]) << "\"";
+  }
+  *oss << "]";
+}
+
+void AppendJsonStringMap(std::ostringstream *oss,
+                         const std::map<std::string, std::string> &m) {
+  *oss << "{";
+  bool first = true;
+  for (const auto &[k, v] : m) {
+    if (!first)
+      *oss << ",";
+    first = false;
+    *oss << "\"" << JsonEscape(k) << "\":";
+    *oss << "\"" << JsonEscape(v) << "\"";
+  }
+  *oss << "}";
+}
+
+void AppendJsonModels(
+    std::ostringstream *oss,
+    const std::vector<OpenVulkanDiagnostics::ModelInfo> &models) {
+  *oss << "[";
+  for (std::size_t i = 0; i < models.size(); ++i) {
+    if (i)
+      *oss << ",";
+    const auto &m = models[i];
+    *oss << "{";
+    *oss << "\"id\":\"" << JsonEscape(m.id) << "\",";
+    *oss << "\"display_name\":\"" << JsonEscape(m.display_name) << "\",";
+    *oss << "\"task\":\"" << JsonEscape(m.task) << "\",";
+    *oss << "\"width\":" << m.width << ",";
+    *oss << "\"height\":" << m.height;
+    *oss << "}";
+  }
+  *oss << "]";
 }
 
 std::string VendorName(std::uint32_t vendor_id) {
@@ -132,11 +177,49 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << ",";
   oss << "\"error\":\"" << JsonEscape(error) << "\",";
   oss << "\"fallback_reason\":\"" << JsonEscape(fallback_reason) << "\",";
-  oss << "\"install_hints\":[";
-  oss << "\"Install a Vulkan loader/runtime such as libvulkan1.\",";
-  oss << "\"Rebuild with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON to enable this "
-         "backend.\"";
-  oss << "]";
+  oss << "\"blocked_reason\":\"" << JsonEscape(blocked_reason) << "\",";
+  oss << "\"degraded_reason\":\"" << JsonEscape(degraded_reason) << "\",";
+  oss << "\"installed_models\":";
+  AppendJsonStringArray(&oss, installed_models);
+  oss << ",";
+  oss << "\"default_model_id\":\"" << JsonEscape(default_model_id) << "\",";
+  oss << "\"models\":";
+  AppendJsonModels(&oss, models);
+  oss << ",";
+  oss << "\"missing_models\":";
+  AppendJsonStringMap(&oss, missing_models);
+  oss << ",";
+  oss << "\"available_effects\":";
+  AppendJsonStringArray(&oss, available_effects);
+  oss << ",";
+  oss << "\"blocked_effects\":";
+  AppendJsonStringMap(&oss, blocked_effects);
+  oss << ",";
+  oss << "\"matting_runtime\":\"" << JsonEscape(matting_runtime) << "\",";
+  oss << "\"matting_runtime_created\":"
+      << BoolJson(matting_runtime_created) << ",";
+  oss << "\"matting_graph_loaded\":" << BoolJson(matting_graph_loaded)
+      << ",";
+  oss << "\"input_device_resident\":" << BoolJson(input_device_resident)
+      << ",";
+  oss << "\"alpha_device_resident\":" << BoolJson(alpha_device_resident)
+      << ",";
+  oss << "\"output_device_resident\":" << BoolJson(output_device_resident)
+      << ",";
+  oss << "\"device_residency_mode\":\""
+      << JsonEscape(device_residency_mode) << "\",";
+  oss << "\"warnings\":";
+  AppendJsonStringArray(&oss, warnings);
+  oss << ",";
+  oss << "\"install_hints\":";
+  if (install_hints.empty()) {
+    AppendJsonStringArray(
+        &oss, {"Install a Vulkan loader/runtime such as libvulkan1.",
+               "Rebuild with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON to enable "
+               "this backend."});
+  } else {
+    AppendJsonStringArray(&oss, install_hints);
+  }
   oss << "}";
   return oss.str();
 }

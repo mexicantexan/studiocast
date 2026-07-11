@@ -111,8 +111,10 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
                         " -DSTUDIOCAST_ENABLE_DLIB=OFF"
                         " -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON"
                         " -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON"
+                        " -DSTUDIOCAST_ENABLE_NCNN_SPIKE=ON"
                         " -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON"
                         " -DCMAKE_DISABLE_FIND_PACKAGE_onnxruntime=ON"
+                        " -DCMAKE_DISABLE_FIND_PACKAGE_ncnn=ON"
                         " -DCMAKE_DISABLE_FIND_PACKAGE_Python3=ON"
                         " 2>&1";
 
@@ -131,6 +133,8 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
                            "STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=ON") &&
             ExpectContains("nested CMake cache", cache,
                            "STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=ON") &&
+            ExpectContains("nested CMake cache", cache,
+                           "STUDIOCAST_ENABLE_NCNN_SPIKE:BOOL=ON") &&
             ExpectContains("nested CMake cache", cache,
                            "STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON") &&
             Expect(cache.find("STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=OFF") ==

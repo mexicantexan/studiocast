@@ -30,6 +30,7 @@ struct FaceLandmarks {
 enum class FrameMatteStorage {
   cpu_f32_alpha,
   cuda_f32_alpha,
+  vulkan_f32_alpha,
   maxine_gpu_alpha,
 };
 
@@ -81,7 +82,8 @@ struct FrameMatteArtifact {
   std::vector<float> cpu_alpha;
 
   // Opaque provider handles for GPU/device-local artifacts. For Open CUDA this
-  // can identify a CudaImage/CudaTensor allocation; for Maxine it can identify
+  // can identify a CudaImage/CudaTensor allocation; for Open Vulkan this can
+  // identify a VulkanImage/VulkanTensor allocation; for Maxine it can identify
   // an NvCVImage. Ownership stays with the provider that published the artifact.
   std::uintptr_t handle = 0;
   std::uintptr_t aux_handle = 0;

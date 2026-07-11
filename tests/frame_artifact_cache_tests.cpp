@@ -194,6 +194,11 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   auto cpu_key = cuda_key;
   cpu_key.storage =
       studiocast::open_video::FrameMatteStorage::cpu_f32_alpha;
+  auto vulkan_key = cuda_key;
+  vulkan_key.provider_id = "open_vulkan";
+  vulkan_key.storage =
+      studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha;
+  vulkan_key.stream = 0;
 
   studiocast::open_video::FrameMatteArtifact artifact;
   artifact.key = cuda_key;
@@ -214,6 +219,17 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
                 "precomputed CUDA matte key should find stored artifact");
   ok &= Require(cache.FindMatte(31, cpu_key) == nullptr,
                 "precomputed CPU/CUDA storage variants must stay distinct");
+  ok &= Require(cache.FindMatte(31, vulkan_key) == nullptr,
+                "precomputed CUDA/Vulkan storage variants must stay distinct");
+
+  studiocast::open_video::FrameMatteArtifact vk_artifact;
+  vk_artifact.key = vulkan_key;
+  vk_artifact.handle = 0xF00Du;
+  (void)cache.StoreMatte(31, std::move(vk_artifact));
+  ok &= Require(cache.FindMatte(31, vulkan_key) != nullptr,
+                "precomputed Vulkan matte key should find stored artifact");
+  ok &= Require(cache.FindMatte(31, cuda_key) != nullptr,
+                "storing a Vulkan matte should not replace CUDA storage");
   ok &= Require(cache.FindMatte(31, other_provider) == nullptr,
                 "provider changes must not reuse matte artifacts");
   ok &= Require(cache.FindMatte(31, other_model) == nullptr,

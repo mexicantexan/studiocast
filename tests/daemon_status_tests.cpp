@@ -142,6 +142,28 @@ std::string StatusForVideoConfig(
                       /*openAudioJson=*/"", /*loopbackJson=*/"");
 }
 
+std::string StatusForVideoConfigWithDiagnostics(
+    const studiocast::video::VirtualCameraServiceConfig &videoConfig,
+    const std::string &maxineJson, const std::string &openCudaJson,
+    const std::string &openVulkanJson) {
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  videoStatus.service_running = true;
+  videoStatus.virtual_device_present = true;
+  videoStatus.virtual_device_available = true;
+
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  audioStatus.service_running = true;
+  audioStatus.mic_present = true;
+  audioStatus.speakers_present = true;
+
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  return StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                      std::filesystem::path("/tmp/studiocastd-test.sock"),
+                      maxineJson, openCudaJson, openVulkanJson,
+                      /*openAudioJson=*/"", /*loopbackJson=*/"");
+}
+
 bool TestVideoStatusReportsAllowCpuResize() {
   studiocast::video::VirtualCameraServiceConfig videoConfig;
   videoConfig.pipeline.allow_cpu_resize = false;
@@ -451,6 +473,39 @@ bool TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() {
                 "unknown readiness should explain missing diagnostics");
 }
 
+bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.enabled = true;
+  videoConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  videoConfig.pipeline.effects.virtual_background.mode =
+      studiocast::video::effects::VirtualBackgroundMode::blur;
+
+  const std::string openVulkanJson =
+      "{\"compiled_enabled\":true,\"ok\":true,"
+      "\"available_effects\":[],"
+      "\"blocked_effects\":{\"virtual_background.blur\":"
+      "\"open_vulkan_matting_unavailable\"},"
+      "\"installed_models\":[\"modnet-webnn-256-fp32\"],"
+      "\"default_model_id\":\"modnet-webnn-256-fp32\","
+      "\"blocked_reason\":\"open_vulkan_matting_unavailable\"}";
+
+  const ReadinessFields entry = ReadinessEntryFor(
+      StatusForVideoConfigWithDiagnostics(videoConfig, /*maxineJson=*/"",
+                                          /*openCudaJson=*/"",
+                                          openVulkanJson),
+      "virtual_background.blur");
+  if (!entry.present)
+    return false;
+
+  return Expect(entry.backend == "open_vulkan",
+                "explicit Vulkan VB should keep open_vulkan attribution") &&
+         Expect(entry.state == "backend_unavailable",
+                "blocked Vulkan VB should report backend_unavailable") &&
+         Expect(entry.reason == "open_vulkan_matting_unavailable",
+                "blocked Vulkan VB should report Vulkan matting reason");
+}
+
 bool TestBuiltinEffectReadyWithoutDiagnostics() {
   studiocast::video::effects::BroadcastCameraEffects effects;
   effects.engine =
@@ -588,6 +643,7 @@ int main() {
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;
   ok = TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() && ok;
+  ok = TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() && ok;
   ok = TestBuiltinEffectReadyWithoutDiagnostics() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;

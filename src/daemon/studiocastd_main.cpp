@@ -326,6 +326,17 @@ DiagnosticsJsonSnapshot ComputeDiagnosticsJsonSnapshot() {
       "\"device_type\":0,\"vendor_name\":\"\",\"device_name\":\"\","
       "\"compute_queue_family_index\":0,\"error\":\"Open Vulkan backend is "
       "disabled in this build.\",\"fallback_reason\":\"disabled_in_build\","
+      "\"blocked_reason\":\"disabled_in_build\","
+      "\"degraded_reason\":\"Open Vulkan backend is disabled in this build.\","
+      "\"installed_models\":[],\"default_model_id\":\"\",\"models\":[],"
+      "\"missing_models\":{},\"available_effects\":[],"
+      "\"blocked_effects\":{\"virtual_background.blur\":\"disabled_in_build\","
+      "\"virtual_background.remove\":\"disabled_in_build\","
+      "\"virtual_background.replace\":\"disabled_in_build\"},"
+      "\"matting_runtime\":\"none\",\"matting_runtime_created\":false,"
+      "\"matting_graph_loaded\":false,\"input_device_resident\":false,"
+      "\"alpha_device_resident\":false,\"output_device_resident\":false,"
+      "\"device_residency_mode\":\"disabled\",\"warnings\":[],"
       "\"install_hints\":[\"Rebuild with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON "
       "to enable this backend.\"]}";
 #endif
@@ -493,6 +504,14 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
     out.summary = *s;
   if (const std::string *s = JsonStringField(*obj, "blocked_reason"))
     out.blocked_reason = *s;
+  if (out.blocked_reason.empty()) {
+    if (const std::string *s = JsonStringField(*obj, "fallback_reason"))
+      out.blocked_reason = *s;
+  }
+  if (out.blocked_reason.empty()) {
+    if (const std::string *s = JsonStringField(*obj, "degraded_reason"))
+      out.blocked_reason = *s;
+  }
   if (const std::string *s = JsonStringField(*obj, "default_model_id"))
     out.default_model_id = *s;
   out.installed_models = JsonStringArraySet(*obj, "installed_models");
@@ -799,13 +818,18 @@ std::string ChooseVideoEffectBackend(
     const studiocast::video::effects::BroadcastCameraEffects &fx,
     const std::map<std::string, std::string> &activeBackends,
     const EngineDiagnosticsSummary &maxineDiag,
-    const EngineDiagnosticsSummary &openCudaDiag) {
+    const EngineDiagnosticsSummary &openCudaDiag,
+    const EngineDiagnosticsSummary &openVulkanDiag,
+    studiocast::video::ComputeBackendPreference computePreference) {
   const auto activeIt = activeBackends.find(id);
   if (activeIt != activeBackends.end())
     return activeIt->second;
 
   if (IsBuiltinVideoEffect(id))
     return "builtin";
+
+  if (computePreference == studiocast::video::ComputeBackendPreference::vulkan)
+    return "open_vulkan";
 
   using studiocast::video::effects::EffectsEnginePreference;
   if (fx.engine == EffectsEnginePreference::maxine)
@@ -821,6 +845,10 @@ std::string ChooseVideoEffectBackend(
                                   openCudaDiag.available_effects.end()) {
     return "open_cuda";
   }
+  if (openVulkanDiag.present && openVulkanDiag.available_effects.find(id) !=
+                                    openVulkanDiag.available_effects.end()) {
+    return "open_vulkan";
+  }
   if (maxineDiag.present && (maxineDiag.ok || maxineDiag.supported))
     return "maxine";
   if (openCudaDiag.present && openCudaDiag.ok)
@@ -835,15 +863,20 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     const std::map<std::string, std::string> &activeBackends,
     const std::map<std::string, std::string> &ruleDisabled,
     const EngineDiagnosticsSummary &maxineDiag,
-    const EngineDiagnosticsSummary &openCudaDiag) {
+    const EngineDiagnosticsSummary &openCudaDiag,
+    const EngineDiagnosticsSummary &openVulkanDiag,
+    studiocast::video::ComputeBackendPreference computePreference) {
   VideoEffectReadinessEntry out;
   out.id = id;
-  out.backend = ChooseVideoEffectBackend(id, fx, activeBackends, maxineDiag,
-                                         openCudaDiag);
+  out.backend =
+      ChooseVideoEffectBackend(id, fx, activeBackends, maxineDiag,
+                               openCudaDiag, openVulkanDiag, computePreference);
   out.requested_model_id = RequestedVideoModelId(fx, id);
-  if (out.backend == "open_cuda")
+  if (out.backend == "open_cuda" || out.backend == "open_vulkan")
     out.resolved_model_id = out.requested_model_id.empty()
-                                ? openCudaDiag.default_model_id
+                                ? (out.backend == "open_vulkan"
+                                       ? openVulkanDiag.default_model_id
+                                       : openCudaDiag.default_model_id)
                                 : out.requested_model_id;
 
   const std::string label = VideoEffectLabel(id);
@@ -871,6 +904,8 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     diag = &maxineDiag;
   else if (out.backend == "open_cuda" || out.backend == "open_video")
     diag = &openCudaDiag;
+  else if (out.backend == "open_vulkan")
+    diag = &openVulkanDiag;
 
   if (out.backend == "builtin") {
     out.state = "ready";
@@ -910,7 +945,8 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     return out;
   }
 
-  if (out.backend == "open_cuda" && IsOpenCudaModelReadinessEffect(id)) {
+  if ((out.backend == "open_cuda" || out.backend == "open_vulkan") &&
+      IsOpenCudaModelReadinessEffect(id)) {
     if (!out.requested_model_id.empty()) {
       const auto missingModelIt =
           diag->missing_models.find(out.requested_model_id);
@@ -940,6 +976,18 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     }
   }
 
+  if (out.backend == "open_vulkan" &&
+      diag->available_effects.find(id) == diag->available_effects.end()) {
+    out.state = "backend_unavailable";
+    out.summary = label + " is blocked by the selected backend.";
+    out.detail = !diag->blocked_reason.empty()
+                     ? diag->blocked_reason
+                     : "Open Vulkan does not provide this effect.";
+    out.reason = !diag->blocked_reason.empty() ? diag->blocked_reason
+                                               : "missing_effect";
+    return out;
+  }
+
   if ((diag->ok || diag->supported) ||
       diag->available_effects.find(id) != diag->available_effects.end()) {
     out.state = "ready";
@@ -958,7 +1006,8 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
 std::string VideoEffectReadinessToJson(
     const studiocast::video::VirtualCameraServiceStatus &st,
     const studiocast::video::VirtualCameraServiceConfig &cfg,
-    const std::string &maxineJson, const std::string &openCudaJson) {
+    const std::string &maxineJson, const std::string &openCudaJson,
+    const std::string &openVulkanJson) {
   const auto &fx = cfg.pipeline.effects;
   const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(fx);
 
@@ -1005,6 +1054,8 @@ std::string VideoEffectReadinessToJson(
       ParseEngineDiagnosticsSummary(maxineJson);
   const EngineDiagnosticsSummary openCudaDiag =
       ParseEngineDiagnosticsSummary(openCudaJson);
+  const EngineDiagnosticsSummary openVulkanDiag =
+      ParseEngineDiagnosticsSummary(openVulkanJson);
 
   std::ostringstream oss;
   oss << "{";
@@ -1012,7 +1063,7 @@ std::string VideoEffectReadinessToJson(
   for (const auto &id : ids) {
     const VideoEffectReadinessEntry entry = BuildVideoEffectReadinessEntry(
         id, fx, st.pipeline.degraded_effect, activeBackends, ruleDisabled,
-        maxineDiag, openCudaDiag);
+        maxineDiag, openCudaDiag, openVulkanDiag, cfg.pipeline.compute_backend);
     if (!first)
       oss << ",";
     first = false;
@@ -1336,7 +1387,9 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
              cfg.pipeline.effects)
       << ",";
   oss << "\"effect_readiness\":"
-      << VideoEffectReadinessToJson(st, cfg, maxineJson, openCudaJson) << ",";
+      << VideoEffectReadinessToJson(st, cfg, maxineJson, openCudaJson,
+                                    openVulkanJson)
+      << ",";
 
   const int vkl_intensity = std::max(
       0, std::min(100, cfg.pipeline.effects.virtual_key_light.intensity));
@@ -1460,6 +1513,26 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers.download_calls << ",";
     oss << "\"final_download_calls\":"
         << st.pipeline.open_vulkan_transfers.final_download_calls << ",";
+    oss << "\"cpu_continuation_download_calls\":"
+        << st.pipeline.open_vulkan_transfers.cpu_continuation_download_calls
+        << ",";
+    oss << "\"alpha_download_calls\":"
+        << st.pipeline.open_vulkan_transfers.alpha_download_calls << ",";
+    oss << "\"matte_frame_upload_calls\":"
+        << st.pipeline.open_vulkan_transfers.matte_frame_upload_calls << ",";
+    oss << "\"preprocess_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.preprocess_dispatch_calls << ",";
+    oss << "\"matting_inference_calls\":"
+        << st.pipeline.open_vulkan_transfers.matting_inference_calls << ",";
+    oss << "\"alpha_resize_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.alpha_resize_dispatch_calls
+        << ",";
+    oss << "\"blur_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.blur_dispatch_calls << ",";
+    oss << "\"background_upload_calls\":"
+        << st.pipeline.open_vulkan_transfers.background_upload_calls << ",";
+    oss << "\"composite_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.composite_dispatch_calls << ",";
     oss << "\"standalone_scaler_upload_calls\":"
         << st.pipeline.open_vulkan_transfers.standalone_scaler_upload_calls
         << ",";
@@ -1467,7 +1540,13 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers.standalone_scaler_download_calls
         << ",";
     oss << "\"forced_sync_calls\":"
-        << st.pipeline.open_vulkan_transfers.forced_sync_calls;
+        << st.pipeline.open_vulkan_transfers.forced_sync_calls << ",";
+    oss << "\"cpu_tail_stage_calls\":"
+        << st.pipeline.open_vulkan_transfers.cpu_tail_stage_calls << ",";
+    oss << "\"fallback_frames\":"
+        << st.pipeline.open_vulkan_transfers.fallback_frames << ",";
+    oss << "\"runtime_failure_frames\":"
+        << st.pipeline.open_vulkan_transfers.runtime_failure_frames;
     oss << "}";
   }
 

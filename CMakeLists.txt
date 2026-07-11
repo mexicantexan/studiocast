@@ -36,6 +36,7 @@ include(CompilerWarnings)
 include(Sanitizers)
 include(GenerateVersionHeader)
 include(OnnxRuntime)
+include(Ncnn)
 
 studiocast_setup_options()
 studiocast_global_options()
@@ -137,6 +138,23 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     message(STATUS "Open Vulkan backend enabled (runtime-loaded Vulkan; no SDK link dependency).")
 else()
     message(STATUS "Open Vulkan backend disabled.")
+endif()
+
+set(_studiocast_ncnn_found FALSE)
+set(_studiocast_ncnn_target "")
+set(_studiocast_ncnn_has_vulkan FALSE)
+if (STUDIOCAST_ENABLE_NCNN_SPIKE)
+    studiocast_configure_ncnn(_studiocast_ncnn_found _studiocast_ncnn_target _studiocast_ncnn_has_vulkan)
+    if (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan)
+        message(STATUS "ncnn found (${_studiocast_ncnn_target}); experimental Vulkan matting spike can run ncnn Vulkan.")
+    elseif (_studiocast_ncnn_found)
+        message(STATUS "ncnn found (${_studiocast_ncnn_target}) but Vulkan support was not detected; spike tool will report ncnn_vulkan_unavailable.")
+    else()
+        message(STATUS "ncnn not found; spike tool will build a diagnostics-only stub unless STUDIOCAST_REQUIRE_NCNN=ON.")
+    endif()
+    if (STUDIOCAST_REQUIRE_NCNN AND NOT (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan))
+        message(FATAL_ERROR "STUDIOCAST_REQUIRE_NCNN=ON requires ncnn with Vulkan support. Set ncnn_DIR or NCNN_ROOT, or disable STUDIOCAST_REQUIRE_NCNN.")
+    endif()
 endif()
 
 set(CMAKE_AUTOMOC ON)
@@ -402,6 +420,8 @@ endif()
 
 if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     target_sources(studiocast_core PRIVATE
+            src/core/open_video/vulkan_matting_session.h
+            src/core/open_video/vulkan_matting_session.cpp
             src/core/vulkan/vulkan_loader.h
             src/core/vulkan/vulkan_loader.cpp
             src/core/vulkan/vulkan_device.h
@@ -648,6 +668,36 @@ target_include_directories(studiocast-open PRIVATE
 
 studiocast_set_project_warnings(studiocast-open)
 studiocast_enable_sanitizers(studiocast-open)
+
+if (STUDIOCAST_ENABLE_NCNN_SPIKE)
+    add_executable(studiocast-vulkan-matting-spike
+            src/tools/studiocast_vulkan_matting_spike_main.cpp
+    )
+
+    set_target_properties(studiocast-vulkan-matting-spike PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    target_link_libraries(studiocast-vulkan-matting-spike PRIVATE studiocast_core)
+    if (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan)
+        target_link_libraries(studiocast-vulkan-matting-spike PRIVATE "${_studiocast_ncnn_target}")
+    endif()
+
+    target_include_directories(studiocast-vulkan-matting-spike PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    target_compile_definitions(studiocast-vulkan-matting-spike PRIVATE
+            STUDIOCAST_HAVE_NCNN=$<BOOL:${_studiocast_ncnn_found}>
+            STUDIOCAST_NCNN_HAS_VULKAN=$<BOOL:${_studiocast_ncnn_has_vulkan}>
+    )
+
+    studiocast_set_project_warnings(studiocast-vulkan-matting-spike)
+    studiocast_enable_sanitizers(studiocast-vulkan-matting-spike)
+endif()
 
 # -----------------------------
 # Audio tool 

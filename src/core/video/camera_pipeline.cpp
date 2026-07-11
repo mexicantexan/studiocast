@@ -14,6 +14,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string_view>
@@ -56,7 +57,9 @@
 #include "core/video/v4l2loopback.h"
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
+#include "core/open_video/vulkan_matting_session.h"
 #include "core/vulkan/kernels/resize_bilinear.h"
+#include "core/vulkan/kernels/utility_kernels.h"
 #endif
 
 namespace studiocast::video {
@@ -2641,6 +2644,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return &cpu_matte_artifact_key;
       case studiocast::open_video::FrameMatteStorage::cuda_f32_alpha:
         return &cuda_matte_artifact_key;
+      case studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha:
+        return nullptr;
       case studiocast::open_video::FrameMatteStorage::maxine_gpu_alpha:
         return nullptr;
       }
@@ -3430,6 +3435,169 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       return true;
     }
   } open_cuda_vb;
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  struct OpenVulkanVirtualBackgroundContext {
+    bool initialized = false;
+    bool enabled = false;
+
+    std::string last_error;
+    std::string active_model_id;
+    std::string active_requested_model_id;
+
+    studiocast::vulkan::kernels::UtilityKernels kernels;
+    std::optional<studiocast::open_video::ModelPack> model_pack;
+    std::unique_ptr<studiocast::open_vulkan::OpenVulkanMattingSession>
+        matting_session;
+
+    studiocast::open_video::FrameArtifactCache matte_artifacts;
+    studiocast::open_video::FrameMatteArtifactKey vulkan_matte_artifact_key;
+    bool vulkan_matte_artifact_key_valid = false;
+
+    ~OpenVulkanVirtualBackgroundContext() { Destroy(); }
+
+    void Destroy() {
+      matting_session.reset();
+      model_pack.reset();
+      kernels.Shutdown();
+      initialized = false;
+      enabled = false;
+      last_error.clear();
+      active_model_id.clear();
+      active_requested_model_id.clear();
+      ClearMatteArtifactKey();
+    }
+
+    void ClearMatteArtifactKey() {
+      vulkan_matte_artifact_key =
+          studiocast::open_video::FrameMatteArtifactKey{};
+      vulkan_matte_artifact_key_valid = false;
+      matte_artifacts.ClearArtifacts();
+    }
+
+    std::string ResolveMattingModelId(
+        const studiocast::open_video::ModelPackRegistry &registry,
+        const std::string &requested_model_id) const {
+      if (!requested_model_id.empty())
+        return requested_model_id;
+      if (registry.Find("matting", "modnet-webnn-256-fp32"))
+        return "modnet-webnn-256-fp32";
+      if (registry.Find("matting", "birefnet_lite"))
+        return "birefnet_lite";
+      for (const auto &m : registry.ListModels()) {
+        if (m.task == "matting")
+          return m.id;
+      }
+      return {};
+    }
+
+    void RefreshMatteArtifactKey(int frame_w, int frame_h) {
+      if (!model_pack || !model_pack->matting) {
+        ClearMatteArtifactKey();
+        return;
+      }
+      studiocast::open_video::FrameMatteArtifactKey key;
+      key.provider_id = "open_vulkan";
+      key.model_id = active_model_id;
+      key.storage =
+          studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha;
+      key.frame_width = frame_w;
+      key.frame_height = frame_h;
+      key.matte_width = model_pack->matting->input.width;
+      key.matte_height = model_pack->matting->input.height;
+      key.config_fingerprint = 0;
+      key.device_context =
+          reinterpret_cast<std::uintptr_t>(kernels.device());
+      key.stream = 0;
+      vulkan_matte_artifact_key = key;
+      vulkan_matte_artifact_key_valid = true;
+    }
+
+    bool EnsureInitialized(
+        int frame_w, int frame_h,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+      if (frame_w <= 0 || frame_h <= 0) {
+        last_error = "Open Vulkan: invalid frame size.";
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
+      std::string e;
+      if (!kernels.Initialized() && !kernels.Initialize(&e)) {
+        last_error = "Open Vulkan: utility kernels unavailable: " + e;
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
+      const auto registry =
+          studiocast::open_video::ModelPackRegistry::ScanDefault();
+      const std::string requested_model_id = fx.virtual_background.model_id;
+      const std::string model_id =
+          ResolveMattingModelId(registry, requested_model_id);
+      if (model_id.empty()) {
+        last_error = "Open Vulkan: no matting model pack is installed.";
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
+      if (!model_pack || active_model_id != model_id ||
+          active_requested_model_id != requested_model_id) {
+        auto resolved = registry.Find("matting", model_id);
+        if (!resolved) {
+          last_error = "Open Vulkan: matting model pack '" + model_id +
+                       "' is not installed.";
+          if (error_out)
+            *error_out = last_error;
+          return false;
+        }
+
+        matting_session.reset();
+        model_pack = std::move(resolved);
+        active_model_id = model_id;
+        active_requested_model_id = requested_model_id;
+        ClearMatteArtifactKey();
+
+        studiocast::open_vulkan::OpenVulkanMattingSession::Options opts;
+        opts.require_device_residency = true;
+        matting_session =
+            std::make_unique<studiocast::open_vulkan::OpenVulkanMattingSession>(
+                kernels.device(), &kernels, *model_pack, opts);
+      }
+
+      if (!matting_session) {
+        last_error = "Open Vulkan: matting session is not available.";
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
+      if (!matting_session->EnsureInitialized(frame_w, frame_h, &e)) {
+        last_error = "Open Vulkan: " + e;
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+      if (!matting_session->Warmup(&e)) {
+        last_error = "Open Vulkan: " + e;
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
+      RefreshMatteArtifactKey(frame_w, frame_h);
+      initialized = true;
+      enabled = true;
+      last_error.clear();
+      return true;
+    }
+  } open_vulkan_vb;
+#endif
 
   struct OpenCudaAutoFrameContext {
     bool initialized = false;
@@ -6305,6 +6473,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   bool want_open_cuda_vb = false;
   bool have_open_cuda_vb = false;
 
+  bool want_open_vulkan_vb = false;
+  bool have_open_vulkan_vb = false;
+
   bool want_open_cuda_auto_frame = false;
   bool have_open_cuda_auto_frame = false;
 
@@ -6440,6 +6611,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     want_open_cuda_vb = false;
     have_open_cuda_vb = false;
 
+    want_open_vulkan_vb = false;
+    have_open_vulkan_vb = false;
+
     want_open_cuda_auto_frame = false;
     have_open_cuda_auto_frame = false;
 
@@ -6534,12 +6708,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     const bool compute_work_requested = plan_requests_compute();
     ComputeBackendAvailability compute_available;
-    compute_available.vulkan_available = vulkan_scaler.initialized;
+    compute_available.vulkan_available = false;
     compute_available.vulkan_unavailable_reason =
-        vulkan_scaler.init_error.empty()
-            ? "Vulkan compute backend requested, but Open Vulkan resize is "
-              "not available in this build/runtime."
-            : vulkan_scaler.init_error;
+        "Vulkan compute backend requested, but Open Vulkan virtual background "
+        "is not available.";
 
     const auto remove_compute_stages_from_plan = [&] {
       remove_stage_from_plan(
@@ -6560,21 +6732,27 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::contract::kEffectIdVignette);
     };
 
+    const auto remove_non_vulkan_vb_compute_stages_from_plan = [&] {
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdEyeContact);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdAutoFrame);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVignette);
+    };
+
     auto compute_selection = ResolveComputeBackendSelection(
         cfg.compute_backend, compute_available, compute_work_requested);
 
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
-      remove_compute_stages_from_plan();
-      if (vulkan_scaler.initialized) {
-        append_note("Open Vulkan: resize runtime is available; Vulkan "
-                    "video effects and inference are not implemented yet, so "
-                    "GPU-backed video effects are disabled.");
-      } else {
-        append_note(compute_selection.degraded_reason.empty()
-                        ? compute_available.vulkan_unavailable_reason
-                        : compute_selection.degraded_reason);
-      }
+      remove_non_vulkan_vb_compute_stages_from_plan();
+      append_note("Open Vulkan: only virtual background blur/remove/replace "
+                  "is eligible for the Vulkan backend in this milestone.");
     } else if (compute_work_requested &&
                compute_selection.resolved == ComputeBackendKind::cpu &&
                cfg.compute_backend == ComputeBackendPreference::cpu) {
@@ -6813,7 +6991,31 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
-      if (fx.engine ==
+      if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+        want_open_vulkan_vb = true;
+        std::string vk_err;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+        if (open_vulkan_vb.EnsureInitialized(capA.width, capA.height, fx,
+                                             &vk_err)) {
+          have_open_vulkan_vb = true;
+          compute_available.vulkan_available = true;
+          if (vb_effect_id.has_value())
+            set_backend(*vb_effect_id, "open_vulkan");
+          append_backend_note("Open Vulkan");
+        } else
+#else
+        vk_err = "Open Vulkan: backend is disabled in this build. Rebuild "
+                 "with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
+#endif
+        {
+          if (!vk_err.empty()) {
+            compute_available.vulkan_unavailable_reason = vk_err;
+            append_note(vk_err);
+          }
+          if (vb_effect_id.has_value())
+            remove_stage_from_plan(*vb_effect_id);
+        }
+      } else if (fx.engine ==
           studiocast::video::effects::EffectsEnginePreference::open_cuda) {
         want_open_cuda_vb = true;
         std::string oc_err;
@@ -7183,11 +7385,19 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           have_maxine_bg_blur || have_maxine_auto_frame ||
           have_maxine_eye_contact || have_maxine_relight ||
           have_maxine_denoise;
+      const bool have_any_vulkan_compute = have_open_vulkan_vb;
       const bool have_any_cuda_compute =
           have_any_maxine_compute || have_open_cuda_vb ||
           have_open_cuda_auto_frame || have_open_cuda_key_light ||
           have_open_cuda_video_denoise || have_maxine_vignette_only;
 
+      compute_available.vulkan_available = have_any_vulkan_compute;
+      if (!compute_available.vulkan_available &&
+          compute_available.vulkan_unavailable_reason.empty()) {
+        compute_available.vulkan_unavailable_reason =
+            "Vulkan compute backend requested, but no Vulkan-backed video "
+            "effect was available.";
+      }
       compute_available.cuda_available = have_any_cuda_compute;
       if (!compute_available.cuda_available) {
         compute_available.cuda_unavailable_reason =
@@ -7197,7 +7407,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       compute_selection = ResolveComputeBackendSelection(
           cfg.compute_backend, compute_available, compute_work_requested);
 
-      if (compute_work_requested && have_any_cuda_compute) {
+      if (compute_work_requested && have_any_vulkan_compute) {
+        compute_selection.resolved = ComputeBackendKind::vulkan;
+        compute_selection.degraded = false;
+        compute_selection.fallback_reason.clear();
+        compute_selection.degraded_reason.clear();
+      } else if (compute_work_requested && have_any_cuda_compute) {
         compute_selection.resolved = ComputeBackendKind::cuda;
         compute_selection.degraded = false;
         compute_selection.fallback_reason.clear();

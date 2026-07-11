@@ -1,9 +1,16 @@
 #include "core/vulkan/kernels/resize_bilinear.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <limits>
+#include <set>
+#include <string>
+#include <utility>
 
+#include "core/open_video/model_pack_registry.h"
+#include "core/util/xdg.h"
+#include "core/video/effects/broadcast_effect_contract.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 
@@ -410,29 +417,146 @@ bool IsResizeBilinearAvailable(std::string *error_out) {
 
 namespace studiocast::vulkan {
 
+namespace {
+
+constexpr const char *kOpenVulkanMattingUnavailable =
+    "open_vulkan_matting_unavailable";
+
+void PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
+  if (!d)
+    return;
+
+  const auto reg = studiocast::open_video::ModelPackRegistry::ScanDefault();
+  std::set<std::string> installed_model_ids;
+  d->default_model_id = [&reg]() -> std::string {
+    if (reg.Find("matting", "modnet-webnn-256-fp32"))
+      return "modnet-webnn-256-fp32";
+    if (reg.Find("matting", "birefnet_lite"))
+      return "birefnet_lite";
+    for (const auto &m : reg.ListModels()) {
+      if (m.task == "matting")
+        return m.id;
+    }
+    return {};
+  }();
+
+  for (const auto &m : reg.ListModels()) {
+    if (m.task != "matting")
+      continue;
+    installed_model_ids.insert(m.id);
+    d->installed_models.push_back(m.id);
+    OpenVulkanDiagnostics::ModelInfo mi;
+    mi.id = m.id;
+    mi.display_name = m.display_name;
+    mi.task = m.task;
+    if (m.matting) {
+      mi.width = m.matting->input.width;
+      mi.height = m.matting->input.height;
+    }
+    d->models.push_back(std::move(mi));
+  }
+
+  for (const auto &[id, reason] : reg.Problems()) {
+    const std::string lower_reason = [&] {
+      std::string out = reason;
+      std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      return out;
+    }();
+    if (installed_model_ids.find(id) != installed_model_ids.end() &&
+        lower_reason.find("duplicate model id") != std::string::npos) {
+      continue;
+    }
+    d->missing_models[id] = reason;
+  }
+
+  const auto modelsRoot = studiocast::util::StudioCastModelsDir();
+  const auto openVideoRoot =
+      modelsRoot.empty()
+          ? std::string("~/.local/share/studiocast/models/open_video")
+          : (modelsRoot / "open_video").string();
+  d->install_hints.push_back(std::string("Model packs: ") + openVideoRoot +
+                             "/<subject>/<pack_dir>/");
+  d->install_hints.push_back("Example: " + openVideoRoot +
+                             "/matting/Good Quality/model.json");
+  d->install_hints.push_back(
+      "Source builds: run ./scripts/install.sh open-video-models to install "
+      "curated Open Video packs.");
+  d->install_hints.push_back(
+      "Device-resident Vulkan virtual background requires a production Vulkan "
+      "matting runtime; the ncnn spike CPU Mat path is not used here.");
+}
+
+void BlockOpenVulkanVirtualBackground(OpenVulkanDiagnostics *d,
+                                      const char *reason_code) {
+  if (!d)
+    return;
+  d->blocked_effects[std::string(studiocast::video::effects::contract::
+                                     kEffectIdVirtualBackgroundBlur)] =
+      reason_code;
+  d->blocked_effects[std::string(studiocast::video::effects::contract::
+                                     kEffectIdVirtualBackgroundRemove)] =
+      reason_code;
+  d->blocked_effects[std::string(studiocast::video::effects::contract::
+                                     kEffectIdVirtualBackgroundReplace)] =
+      reason_code;
+}
+
+} // namespace
+
 OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   kernels::ResizeBilinear resize;
   std::string e;
   if (!resize.EnsureInitialized(4, 4, 4, 4, &e)) {
     OpenVulkanDiagnostics d = resize.Diagnostics();
+    PopulateOpenVulkanModelDiagnostics(&d);
+    d.matting_runtime = "none";
+    d.device_residency_mode = "unavailable";
+    BlockOpenVulkanVirtualBackground(&d, "open_vulkan_runtime_unavailable");
     if (d.error.empty())
       d.error = e;
     if (d.fallback_reason.empty())
       d.fallback_reason = "open_vulkan_resize_unavailable";
+    if (d.blocked_reason.empty())
+      d.blocked_reason = d.fallback_reason;
     return d;
   }
   kernels::UtilityKernels utility;
   if (!utility.Initialize(&e)) {
     OpenVulkanDiagnostics d = utility.Diagnostics();
+    PopulateOpenVulkanModelDiagnostics(&d);
+    d.matting_runtime = "none";
+    d.device_residency_mode = "unavailable";
+    BlockOpenVulkanVirtualBackground(&d,
+                                     "open_vulkan_utility_kernels_unavailable");
     if (d.error.empty())
       d.error = e;
     if (d.fallback_reason.empty())
       d.fallback_reason = "open_vulkan_utility_kernels_unavailable";
+    if (d.blocked_reason.empty())
+      d.blocked_reason = d.fallback_reason;
     return d;
   }
   OpenVulkanDiagnostics d = resize.Diagnostics();
   d.ok = true;
   d.shader_pipeline_created = true;
+  PopulateOpenVulkanModelDiagnostics(&d);
+  d.matting_runtime = "none";
+  d.device_residency_mode = "unavailable";
+  d.matting_runtime_created = false;
+  d.matting_graph_loaded = false;
+  d.input_device_resident = true;
+  d.alpha_device_resident = false;
+  d.output_device_resident = true;
+  d.blocked_reason = kOpenVulkanMattingUnavailable;
+  d.degraded_reason =
+      "Open Vulkan runtime is available, but no production device-resident "
+      "matting inference runtime is available.";
+  d.warnings.push_back(
+      "The milestone-4 ncnn Vulkan spike used CPU Mat input/output; it is not "
+      "used for production Open Vulkan virtual background.");
+  BlockOpenVulkanVirtualBackground(&d, kOpenVulkanMattingUnavailable);
   return d;
 }
 
