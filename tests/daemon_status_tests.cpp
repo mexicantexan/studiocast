@@ -45,6 +45,17 @@ const JsonArray *ArrayAt(const JsonObject &obj, const std::string &key,
   return value;
 }
 
+bool ArrayContainsString(const JsonArray *array, const std::string &needle) {
+  if (!array)
+    return false;
+  for (const auto &value : *array) {
+    const std::string *s = value.AsString();
+    if (s && *s == needle)
+      return true;
+  }
+  return false;
+}
+
 struct ReadinessFields {
   std::string state;
   std::string reason;
@@ -289,6 +300,39 @@ bool TestVideoStatusReportsComputeBackend() {
       StringAt(*compute, "degraded_reason", "compute degraded should exist");
   if (!preference || !resolved || !active || !fallback || !degraded)
     return false;
+  const JsonArray *activeEngines =
+      ArrayAt(*compute, "active_engines",
+              "compute active_engines should exist");
+  const JsonObject *unavailable = ObjectAt(
+      *compute, "unavailable_reasons",
+      "compute unavailable_reasons should exist");
+  const JsonObject *fallbackObject =
+      ObjectAt(*compute, "fallback", "compute fallback object should exist");
+  const JsonObject *provider =
+      ObjectAt(*compute, "provider", "compute provider should exist");
+  const JsonObject *cpuTails =
+      ObjectAt(*compute, "cpu_tails", "compute cpu_tails should exist");
+  const JsonObject *transfers =
+      ObjectAt(*compute, "transfers", "compute transfers should exist");
+  if (!activeEngines || !unavailable || !fallbackObject || !provider ||
+      !cpuTails || !transfers)
+    return false;
+  const std::string *vulkanUnavailable = StringAt(
+      *unavailable, "vulkan", "compute vulkan unavailable reason should exist");
+  const std::string *fallbackCode =
+      StringAt(*fallbackObject, "code", "compute fallback code should exist");
+  const std::string *providerMode =
+      StringAt(*provider, "mode", "compute provider mode should exist");
+  const JsonObject *cudaTransfers =
+      ObjectAt(*transfers, "open_cuda", "open_cuda transfers should exist");
+  const JsonObject *vulkanTransfers =
+      ObjectAt(*transfers, "open_vulkan",
+               "open_vulkan transfers should exist");
+  const JsonObject *maxineTransfers =
+      ObjectAt(*transfers, "maxine", "maxine transfers should exist");
+  if (!vulkanUnavailable || !fallbackCode || !providerMode ||
+      !cudaTransfers || !vulkanTransfers || !maxineTransfers)
+    return false;
 
   studiocast::util::json::Value configValue;
   if (!studiocast::util::json::Parse(ConfigToJson(videoConfig), &configValue,
@@ -318,8 +362,132 @@ bool TestVideoStatusReportsComputeBackend() {
                 "vulkan unavailable status should include fallback reason") &&
          Expect(*degraded == *fallback,
                 "vulkan unavailable degraded reason should match fallback") &&
+         Expect(ArrayContainsString(activeEngines, "cpu"),
+                "vulkan unavailable status should report active cpu engine") &&
+         Expect(vulkanUnavailable->find("Vulkan compute backend requested") !=
+                    std::string::npos,
+                "vulkan unavailable reason should be normalized") &&
+         Expect(JsonBoolField(*fallbackObject, "active", false),
+                "fallback object should mark fallback active") &&
+         Expect(*fallbackCode == "vulkan_unavailable",
+                "fallback object should report vulkan_unavailable code") &&
+         Expect(*providerMode == "cpu",
+                "provider should report CPU mode for CPU fallback") &&
+         Expect(!JsonBoolField(*cpuTails, "active", true),
+                "cpu tail summary should report inactive with zero counters") &&
          Expect(*configBackend == "vulkan",
                 "config JSON should report vulkan compute_backend");
+}
+
+bool TestVideoComputeStatusReportsCachedCountersAndProvider() {
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  videoStatus.service_running = true;
+  videoStatus.virtual_device_present = true;
+  videoStatus.virtual_device_available = true;
+  videoStatus.pipeline.running = true;
+  videoStatus.pipeline.compute_backend_resolved = "cuda";
+  videoStatus.pipeline.compute_backend_active = "cuda";
+  videoStatus.pipeline.effects_backends =
+      "video_noise_removal:open_cuda,virtual_key_light:open_cuda";
+  videoStatus.pipeline.open_cuda_transfers.active_frames = 12;
+  videoStatus.pipeline.open_cuda_transfers.upload_calls = 3;
+  videoStatus.pipeline.open_cuda_transfers.download_calls = 4;
+  videoStatus.pipeline.open_cuda_transfers.final_download_calls = 5;
+  videoStatus.pipeline.open_cuda_transfers.forced_sync_calls = 2;
+  videoStatus.pipeline.open_cuda_transfers.cpu_tail_stage_calls = 2;
+  videoStatus.pipeline.open_cuda_transfers.cpu_tail_key_light_calls = 1;
+  videoStatus.pipeline.open_cuda_transfers.cpu_tail_denoise_calls = 1;
+
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.enabled = true;
+  videoConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::cuda;
+  videoConfig.pipeline.effects.video_noise_removal.enabled = true;
+  videoConfig.pipeline.effects.virtual_key_light.enabled = true;
+
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  audioStatus.service_running = true;
+  audioStatus.mic_present = true;
+  audioStatus.speakers_present = true;
+
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  const std::string openCudaJson =
+      "{\"ok\":true,\"onnxruntime_cuda_provider_present\":true,"
+      "\"onnxruntime_tensorrt_provider_present\":true,"
+      "\"tensorrt_requested\":true,\"tensorrt_available\":true,"
+      "\"cuda_context_available\":true,\"cuda_device_count\":1,"
+      "\"available_effects\":[\"video_noise_removal\","
+      "\"virtual_key_light\"]}";
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(
+          StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                       std::filesystem::path("/tmp/studiocastd-test.sock"),
+                       /*maxineJson=*/"", openCudaJson,
+                       /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                       /*loopbackJson=*/""),
+          &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *compute =
+      ObjectAt(*video, "compute", "video.compute should exist");
+  if (!compute)
+    return false;
+
+  const JsonArray *activeEngines =
+      ArrayAt(*compute, "active_engines",
+              "compute active_engines should exist");
+  const JsonObject *provider =
+      ObjectAt(*compute, "provider", "compute provider should exist");
+  const JsonObject *cpuTails =
+      ObjectAt(*compute, "cpu_tails", "compute cpu_tails should exist");
+  const JsonObject *transfers =
+      ObjectAt(*compute, "transfers", "compute transfers should exist");
+  if (!activeEngines || !provider || !cpuTails || !transfers)
+    return false;
+
+  const JsonArray *tailStages =
+      ArrayAt(*cpuTails, "stages", "cpu tail stages should exist");
+  const JsonObject *openCudaTransfers =
+      ObjectAt(*transfers, "open_cuda", "open_cuda transfers should exist");
+  if (!tailStages || !openCudaTransfers)
+    return false;
+  const std::string *providerMode =
+      StringAt(*provider, "mode", "provider mode should exist");
+  const std::string *activeProvider = StringAt(
+      *provider, "active_provider", "active provider should exist");
+  const std::string *tensorIo =
+      StringAt(*provider, "tensor_io_mode", "tensor I/O mode should exist");
+  if (!providerMode || !activeProvider || !tensorIo)
+    return false;
+
+  return Expect(ArrayContainsString(activeEngines, "open_cuda"),
+                "active engines should include open_cuda") &&
+         Expect(*providerMode == "open_cuda",
+                "provider mode should report open_cuda") &&
+         Expect(*activeProvider == "TensorrtExecutionProvider",
+                "provider should prefer requested available TensorRT") &&
+         Expect(*tensorIo == "cuda_device_iobinding",
+                "provider should report CUDA device tensor I/O") &&
+         Expect(JsonBoolField(*cpuTails, "active", false),
+                "cpu tails should report active when counters are cached") &&
+         Expect(ArrayContainsString(tailStages, "key_light"),
+                "cpu tail stages should include key_light") &&
+         Expect(ArrayContainsString(tailStages, "denoise"),
+                "cpu tail stages should include denoise") &&
+         Expect(JsonNumberField(*openCudaTransfers, "forced_syncs", 0.0) ==
+                    2.0,
+                "transfer summary should include forced sync count");
 }
 
 bool TestVideoConfigMapsComputeBackendPreference() {
@@ -639,6 +807,7 @@ int main() {
   ok = TestVideoStatusReportsAllowCpuResize() && ok;
   ok = TestVideoStatusReportsRequestedOutputFormat() && ok;
   ok = TestVideoStatusReportsComputeBackend() && ok;
+  ok = TestVideoComputeStatusReportsCachedCountersAndProvider() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;

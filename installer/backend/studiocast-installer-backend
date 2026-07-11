@@ -55,6 +55,10 @@ PERSIST_LOOPBACK=1
 WITH_SERVICE=1
 WITH_MODELS=0
 OPEN_BACKENDS=1
+OPEN_VULKAN=0
+WITH_VULKAN_RUNTIME=0
+WITH_MESA_VULKAN=0
+WITH_SHADER_TOOLS=0
 FRESH_BUILD=0
 REMOVE_USER_DATA=0
 SOURCE_EXPLICIT=0
@@ -146,6 +150,12 @@ Install/update options:
   --models | --no-models    Download default Open Audio/Open Video model packs; default is off.
   --open-backends | --no-open-backends
                             Explicitly configure Open Video/Open CUDA and Open Audio support; default is on.
+  --open-vulkan | --no-open-vulkan
+                            Configure the optional Open Vulkan backend; default is off.
+  --vulkan-runtime | --no-vulkan-runtime
+                            Install optional Vulkan loader/diagnostic packages; default is off.
+  --mesa-vulkan             With --vulkan-runtime, install Mesa Intel/AMD Vulkan ICDs.
+  --shader-tools            Install optional developer Vulkan shader tools.
   --fresh-build | --no-fresh-build
 
 Uninstall/clean-install options:
@@ -437,6 +447,30 @@ detect_onnxruntime_cuda_provider_path() {
   return 1
 }
 
+detect_vulkan_loader_path() {
+  if have_cmd ldconfig; then
+    local from_ldconfig
+    from_ldconfig="$(ldconfig -p 2>/dev/null | awk '/libvulkan[.]so[.]1/ {print $NF; exit}')"
+    if [[ -n "${from_ldconfig}" ]]; then
+      printf '%s\n' "${from_ldconfig}"
+      return 0
+    fi
+  fi
+
+  local candidate
+  for candidate in \
+    /usr/lib/libvulkan.so.1 \
+    /usr/lib64/libvulkan.so.1 \
+    /usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
+    /lib/x86_64-linux-gnu/libvulkan.so.1; do
+    if [[ -e "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 detect_maxine_base_dir() {
   printf '%s\n' "${XDG_DATA_HOME_DIR}/${APP_ID}/maxine"
 }
@@ -480,6 +514,15 @@ print_optional_components_json() {
   [[ -d "${afx_root}" ]] && maxine_afx=1
   [[ "${maxine_vfx}" -eq 1 && "${maxine_ar}" -eq 1 && "${maxine_afx}" -eq 1 ]] && maxine_complete=1
 
+  local vulkan_loader=0 vulkan_loader_path="" vulkaninfo_present=0
+  if vulkan_loader_path="$(detect_vulkan_loader_path 2>/dev/null || true)" &&
+     [[ -n "${vulkan_loader_path}" ]]; then
+    vulkan_loader=1
+  fi
+  if have_cmd vulkaninfo; then
+    vulkaninfo_present=1
+  fi
+
   printf '{'
   printf '"cuda":{'
   printf '"available":'; json_bool "${cuda_available}"; printf ','
@@ -501,6 +544,16 @@ print_optional_components_json() {
   printf '"ar_present":'; json_bool "${maxine_ar}"; printf ','
   printf '"afx_present":'; json_bool "${maxine_afx}"; printf ','
   printf '"install_docs":'; json_string "docs/maxine_install.md"
+  printf '},'
+  printf '"vulkan":{'
+  printf '"loader_present":'; json_bool "${vulkan_loader}"; printf ','
+  printf '"loader_path":'; json_string "${vulkan_loader_path}"; printf ','
+  printf '"vulkaninfo_present":'; json_bool "${vulkaninfo_present}"; printf ','
+  printf '"runtime_packages":'; json_string_array "libvulkan1" "vulkan-tools"; printf ','
+  printf '"mesa_icd_package":'; json_string "mesa-vulkan-drivers"; printf ','
+  printf '"shader_tools_package":'; json_string "glslang-tools"; printf ','
+  printf '"summary":'; json_string "Optional Vulkan packages provide the loader and diagnostics only; Open Vulkan also requires -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON plus a GPU driver/ICD exposing a compute-capable device."; printf ','
+  printf '"install_docs":'; json_string "docs/SETUP.md"
   printf '}'
   printf '}'
 }
@@ -718,6 +771,16 @@ plan_workflow() {
     if [[ "${WITH_DEPS}" -eq 1 ]]; then
       PLAN_CHANGES+=("Install/refresh build and runtime dependencies through scripts/setup.sh.")
       PLAN_PRIVILEGED+=("apt package operations and /opt/ldconfig writes delegated to scripts/setup.sh via sudo.")
+      if [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]]; then
+        PLAN_CHANGES+=("Install optional Vulkan loader/diagnostic packages; this does not guarantee Vulkan device support.")
+        PLAN_PRIVILEGED+=("Vulkan package operations are delegated to scripts/setup.sh via sudo.")
+      fi
+      if [[ "${WITH_MESA_VULKAN}" -eq 1 ]]; then
+        PLAN_CHANGES+=("Install Mesa Intel/AMD Vulkan ICD packages when available from the distro.")
+      fi
+      if [[ "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
+        PLAN_CHANGES+=("Install optional developer shader tools for validating/regenerating embedded Vulkan SPIR-V.")
+      fi
     fi
     if [[ "${WITH_V4L2}" -eq 1 ]]; then
       PLAN_CHANGES+=("Ensure v4l2loopback is installed for the StudioCast virtual camera.")
@@ -742,6 +805,9 @@ plan_workflow() {
     if [[ "${OPEN_BACKENDS}" -eq 1 ]]; then
       PLAN_CHANGES+=("Force Linux CMake configuration to keep Open Video/Open CUDA and Open Audio enabled.")
     fi
+    if [[ "${OPEN_VULKAN}" -eq 1 ]]; then
+      PLAN_CHANGES+=("Enable the optional Open Vulkan CMake backend; missing loader/device support is reported as degraded or unavailable at runtime.")
+    fi
     PLAN_CHANGES+=("Enable CPU resize fallback in the daemon config by default.")
     PLAN_CHANGES+=("Write install manifest: ${MANIFEST_PATH}.")
   fi
@@ -757,12 +823,18 @@ plan_workflow() {
           [[ "${LOAD_LOOPBACK}" -eq 1 ]] && setup_args+=("--load-loopback")
           [[ "${PERSIST_LOOPBACK}" -eq 1 ]] && setup_args+=("--persist-loopback")
         fi
+        [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && setup_args+=("--vulkan-runtime")
+        [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && setup_args+=("--mesa-vulkan")
+        [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && setup_args+=("--shader-tools")
         [[ "${YES}" -eq 1 ]] && setup_args+=("--yes")
         add_plan_command "${plan_source_dir}/scripts/setup.sh" "${setup_args[@]}"
       fi
       local -a cmake_configure_args=(-S "${plan_source_dir}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE}")
       if [[ "${OPEN_BACKENDS}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
         cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON)
+      fi
+      if [[ "${OPEN_VULKAN}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON)
       fi
       add_plan_command cmake "${cmake_configure_args[@]}"
       add_plan_command cmake --build "${BUILD_DIR}" --target "${BUILD_TARGETS[@]}"
@@ -919,6 +991,9 @@ run_setup_deps() {
     [[ "${LOAD_LOOPBACK}" -eq 1 ]] && args+=("--load-loopback")
     [[ "${PERSIST_LOOPBACK}" -eq 1 ]] && args+=("--persist-loopback")
   fi
+  [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && args+=("--vulkan-runtime")
+  [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && args+=("--mesa-vulkan")
+  [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && args+=("--shader-tools")
   [[ "${YES}" -eq 1 ]] && args+=("--yes")
   log "Installing/checking dependencies through scripts/setup.sh"
   run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/setup.sh" "${args[@]}"
@@ -943,6 +1018,9 @@ configure_build() {
   local -a cmake_configure_args=(-S "${EFFECTIVE_SOURCE_DIR}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE}")
   if [[ "${OPEN_BACKENDS}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
     cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON)
+  fi
+  if [[ "${OPEN_VULKAN}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+    cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON)
   fi
   run_cmd cmake "${cmake_configure_args[@]}"
 }
@@ -1026,6 +1104,7 @@ write_manifest() {
   local dependency_method="skipped"
   [[ "${WITH_DEPS}" -eq 1 ]] && dependency_method="scripts/setup.sh --deps"
   [[ "${WITH_V4L2}" -eq 1 ]] && dependency_method="${dependency_method} + v4l2loopback"
+  [[ "${WITH_DEPS}" -eq 1 && "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && dependency_method="${dependency_method} + optional Vulkan runtime"
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "Would write manifest: ${MANIFEST_PATH}"
@@ -1207,6 +1286,12 @@ parse_options() {
       --no-models) WITH_MODELS=0; shift ;;
       --open-backends) OPEN_BACKENDS=1; shift ;;
       --no-open-backends) OPEN_BACKENDS=0; shift ;;
+      --open-vulkan) OPEN_VULKAN=1; shift ;;
+      --no-open-vulkan) OPEN_VULKAN=0; shift ;;
+      --vulkan-runtime) WITH_VULKAN_RUNTIME=1; shift ;;
+      --no-vulkan-runtime) WITH_VULKAN_RUNTIME=0; WITH_MESA_VULKAN=0; shift ;;
+      --mesa-vulkan) WITH_VULKAN_RUNTIME=1; WITH_MESA_VULKAN=1; shift ;;
+      --shader-tools) WITH_SHADER_TOOLS=1; shift ;;
       --fresh-build) FRESH_BUILD=1; shift ;;
       --no-fresh-build) FRESH_BUILD=0; shift ;;
       --preserve-user-data) REMOVE_USER_DATA=0; shift ;;

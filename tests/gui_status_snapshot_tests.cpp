@@ -145,7 +145,30 @@ bool TestStatusJsonCompatibilityShapes() {
             "resolved_backend":"cpu",
             "active_backend":"cpu",
             "fallback_reason":"Vulkan unavailable.",
-            "degraded_reason":"Vulkan unavailable."
+            "degraded_reason":"Vulkan unavailable.",
+            "active_engines":["cpu"],
+            "fallback":{
+              "active":true,
+              "from":"vulkan",
+              "to":"cpu",
+              "code":"vulkan_unavailable",
+              "detail":"Vulkan unavailable."
+            },
+            "provider":{
+              "mode":"cpu",
+              "active_provider":"CPU",
+              "device":"host",
+              "tensor_io_mode":"host"
+            },
+            "cpu_tails":{
+              "active":true,
+              "stages":["key_light","denoise"]
+            },
+            "transfers":{
+              "open_cuda":{"active_frames":0,"uploads":0,"downloads":0,"forced_syncs":0},
+              "open_vulkan":{"active_frames":0,"uploads":0,"downloads":0,"dispatches":0,"forced_syncs":0},
+              "maxine":{"active_frames":0,"uploads":0,"downloads":0,"forced_syncs":0}
+            }
           },
           "virtual_device_present":true,
           "virtual_device_available":true,
@@ -207,6 +230,24 @@ bool TestStatusJsonCompatibilityShapes() {
          Expect(s.videoComputeDegradedReason ==
                     QStringLiteral("Vulkan unavailable."),
                 "video compute degraded reason should parse") &&
+         Expect(s.videoComputeActiveEngines.contains(QStringLiteral("cpu")),
+                "video compute active engines should parse") &&
+         Expect(s.videoComputeFallbackActive,
+                "video compute fallback active should parse") &&
+         Expect(s.videoComputeFallbackCode ==
+                    QStringLiteral("vulkan_unavailable"),
+                "video compute fallback code should parse") &&
+         Expect(s.videoComputeProviderMode == QStringLiteral("cpu"),
+                "video compute provider mode should parse") &&
+         Expect(s.videoComputeActiveProvider == QStringLiteral("CPU"),
+                "video compute active provider should parse") &&
+         Expect(s.videoComputeTensorIoMode == QStringLiteral("host"),
+                "video compute tensor I/O mode should parse") &&
+         Expect(s.videoComputeCpuTailsActive,
+                "video compute CPU tail state should parse") &&
+         Expect(s.videoComputeCpuTailStages.contains(
+                    QStringLiteral("key_light")),
+                "video compute CPU tail stages should parse") &&
          Expect(s.audioEffectsEnginePreference == QStringLiteral("open_source"),
                 "audio engine preference should parse") &&
          Expect(s.maxine.present && !s.maxine.supported,

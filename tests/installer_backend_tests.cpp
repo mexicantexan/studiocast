@@ -145,12 +145,50 @@ bool TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() {
                         "-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON") &&
          ExpectContains("installer backend plan", result.stdout_str,
                         "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
+                    std::string::npos,
+                "default installer plan should not enable Open Vulkan") &&
+         Expect(result.stdout_str.find("--vulkan-runtime") ==
+                    std::string::npos,
+                "default installer plan should not install Vulkan runtime "
+                "packages") &&
          ExpectContains("installer backend plan", result.stdout_str,
                         "Enable CPU resize fallback in the daemon config by "
                         "default") &&
          ExpectContains("installer backend plan", result.stdout_str,
                         "Force Linux CMake configuration to keep Open Video/"
                         "Open CUDA and Open Audio enabled");
+}
+
+bool TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json",
+                     "--with-deps --vulkan-runtime --mesa-vulkan "
+                     "--shader-tools --open-vulkan"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan plan should exit successfully") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "--vulkan-runtime") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "--mesa-vulkan") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "--shader-tools") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "optional Vulkan loader/diagnostic packages") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "Mesa Intel/AMD Vulkan ICD") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "developer shader tools");
 }
 
 bool TestRepairPlanCanDisableOpenBackendConfigureFlags() {
@@ -213,6 +251,14 @@ bool TestStatusReportsOptionalComponents() {
                         "\"optional_components\"") &&
          ExpectContains("installer backend status", result.stdout_str,
                         "\"onnxruntime_cuda\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"vulkan\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"libvulkan1\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"vulkan-tools\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"mesa-vulkan-drivers\"") &&
          ExpectContains("installer backend status", result.stdout_str,
                         "docs/open_source_video_models_install.md") &&
          ExpectContains("installer backend status", result.stdout_str,
@@ -389,6 +435,7 @@ bool TestUserServiceDryRunRestartsServiceAfterInstall() {
 int main() {
   bool ok = true;
   ok = TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() && ok;
+  ok = TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() && ok;
   ok = TestRepairPlanCanDisableOpenBackendConfigureFlags() && ok;
   ok = TestRepairDryRunIncludesOpenBackendConfigureFlags() && ok;
   ok = TestStatusReportsOptionalComponents() && ok;

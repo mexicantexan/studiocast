@@ -460,6 +460,8 @@ void HomePage::UpdateCard(ReadinessCard *card,
   card->summary->setText(PrimaryDeviceSummary(card->title->text(), readiness));
 
   QString detail = PrimaryDeviceDetail(card->title->text(), readiness).trimmed();
+  if (detail.isEmpty() && !readiness.notes.isEmpty())
+    detail = readiness.notes.front().trimmed();
   card->detail->setVisible(!detail.isEmpty());
   card->detail->setText(detail);
 }

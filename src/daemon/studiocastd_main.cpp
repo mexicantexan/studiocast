@@ -420,6 +420,15 @@ bool JsonBoolField(const JsonObject &obj, const std::string &key,
   return value ? *value : fallback;
 }
 
+double JsonNumberField(const JsonObject &obj, const std::string &key,
+                       double fallback = 0.0) {
+  const auto it = obj.find(key);
+  if (it == obj.end())
+    return fallback;
+  const double *value = it->second.AsNumber();
+  return value ? *value : fallback;
+}
+
 std::set<std::string> JsonStringArraySet(const JsonObject &obj,
                                          const std::string &key) {
   std::set<std::string> out;
@@ -433,6 +442,23 @@ std::set<std::string> JsonStringArraySet(const JsonObject &obj,
     const std::string *s = value.AsString();
     if (s && !s->empty())
       out.insert(*s);
+  }
+  return out;
+}
+
+std::vector<std::string> JsonStringArrayVector(const JsonObject &obj,
+                                               const std::string &key) {
+  std::vector<std::string> out;
+  const auto it = obj.find(key);
+  if (it == obj.end())
+    return out;
+  const JsonArray *array = it->second.AsArray();
+  if (!array)
+    return out;
+  for (const auto &value : *array) {
+    const std::string *s = value.AsString();
+    if (s && !s->empty())
+      out.push_back(*s);
   }
   return out;
 }
@@ -474,8 +500,31 @@ struct EngineDiagnosticsSummary {
   bool ok = false;
   bool supported = false;
   std::string summary;
+  std::string error;
   std::string blocked_reason;
+  std::string fallback_reason;
+  std::string degraded_reason;
   std::string default_model_id;
+  std::vector<std::string> onnxruntime_providers;
+  bool onnxruntime_cuda_provider_present = false;
+  bool onnxruntime_tensorrt_provider_present = false;
+  bool tensorrt_requested = false;
+  bool tensorrt_available = false;
+  std::string tensorrt_status;
+  bool cuda_context_available = false;
+  int cuda_device_count = -1;
+  bool runtime_library_found = false;
+  bool logical_device_created = false;
+  bool shader_pipeline_created = false;
+  std::uint32_t vendor_id = 0;
+  std::uint32_t device_id = 0;
+  std::string vendor_name;
+  std::string device_name;
+  std::string matting_runtime;
+  std::string device_residency_mode;
+  bool input_device_resident = false;
+  bool alpha_device_resident = false;
+  bool output_device_resident = false;
   std::set<std::string> installed_models;
   std::set<std::string> available_effects;
   std::map<std::string, std::string> blocked_effects;
@@ -502,18 +551,56 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
   out.supported = JsonBoolField(*obj, "supported", out.ok);
   if (const std::string *s = JsonStringField(*obj, "summary"))
     out.summary = *s;
+  if (const std::string *s = JsonStringField(*obj, "error"))
+    out.error = *s;
   if (const std::string *s = JsonStringField(*obj, "blocked_reason"))
     out.blocked_reason = *s;
-  if (out.blocked_reason.empty()) {
-    if (const std::string *s = JsonStringField(*obj, "fallback_reason"))
-      out.blocked_reason = *s;
-  }
-  if (out.blocked_reason.empty()) {
-    if (const std::string *s = JsonStringField(*obj, "degraded_reason"))
-      out.blocked_reason = *s;
-  }
+  if (const std::string *s = JsonStringField(*obj, "fallback_reason"))
+    out.fallback_reason = *s;
+  if (const std::string *s = JsonStringField(*obj, "degraded_reason"))
+    out.degraded_reason = *s;
+  if (out.blocked_reason.empty())
+    out.blocked_reason = !out.fallback_reason.empty() ? out.fallback_reason
+                                                      : out.degraded_reason;
   if (const std::string *s = JsonStringField(*obj, "default_model_id"))
     out.default_model_id = *s;
+  out.onnxruntime_providers = JsonStringArrayVector(*obj, "onnxruntime_providers");
+  out.onnxruntime_cuda_provider_present =
+      JsonBoolField(*obj, "onnxruntime_cuda_provider_present", false);
+  out.onnxruntime_tensorrt_provider_present =
+      JsonBoolField(*obj, "onnxruntime_tensorrt_provider_present", false);
+  out.tensorrt_requested = JsonBoolField(*obj, "tensorrt_requested", false);
+  out.tensorrt_available = JsonBoolField(*obj, "tensorrt_available", false);
+  if (const std::string *s = JsonStringField(*obj, "tensorrt_status"))
+    out.tensorrt_status = *s;
+  out.cuda_context_available =
+      JsonBoolField(*obj, "cuda_context_available", false);
+  out.cuda_device_count =
+      static_cast<int>(JsonNumberField(*obj, "cuda_device_count", -1.0));
+  out.runtime_library_found =
+      JsonBoolField(*obj, "runtime_library_found", false);
+  out.logical_device_created =
+      JsonBoolField(*obj, "logical_device_created", false);
+  out.shader_pipeline_created =
+      JsonBoolField(*obj, "shader_pipeline_created", false);
+  out.vendor_id =
+      static_cast<std::uint32_t>(JsonNumberField(*obj, "vendor_id", 0.0));
+  out.device_id =
+      static_cast<std::uint32_t>(JsonNumberField(*obj, "device_id", 0.0));
+  if (const std::string *s = JsonStringField(*obj, "vendor_name"))
+    out.vendor_name = *s;
+  if (const std::string *s = JsonStringField(*obj, "device_name"))
+    out.device_name = *s;
+  if (const std::string *s = JsonStringField(*obj, "matting_runtime"))
+    out.matting_runtime = *s;
+  if (const std::string *s = JsonStringField(*obj, "device_residency_mode"))
+    out.device_residency_mode = *s;
+  out.input_device_resident =
+      JsonBoolField(*obj, "input_device_resident", false);
+  out.alpha_device_resident =
+      JsonBoolField(*obj, "alpha_device_resident", false);
+  out.output_device_resident =
+      JsonBoolField(*obj, "output_device_resident", false);
   out.installed_models = JsonStringArraySet(*obj, "installed_models");
   out.available_effects = JsonStringArraySet(*obj, "available_effects");
   out.blocked_effects = JsonStringishMap(*obj, "blocked_effects");
@@ -1175,6 +1262,294 @@ ActualFormatToJson(const studiocast::video::ActualFormat &f) {
   return oss.str();
 }
 
+void AppendJsonStringVector(std::ostringstream &oss,
+                            const std::vector<std::string> &values) {
+  oss << "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i)
+      oss << ",";
+    oss << "\"" << JsonEscape(values[i]) << "\"";
+  }
+  oss << "]";
+}
+
+std::string DiagnosticUnavailableReason(const EngineDiagnosticsSummary &diag) {
+  if (!diag.present || diag.ok || diag.supported)
+    return {};
+  if (!diag.blocked_reason.empty())
+    return diag.blocked_reason;
+  if (!diag.fallback_reason.empty())
+    return diag.fallback_reason;
+  if (!diag.degraded_reason.empty())
+    return diag.degraded_reason;
+  if (!diag.error.empty())
+    return diag.error;
+  if (!diag.blocked_effects.empty())
+    return diag.blocked_effects.begin()->second;
+  if (!diag.summary.empty())
+    return diag.summary;
+  return "diagnostics_unavailable";
+}
+
+std::string NormalizeComputeEngineName(const std::string &backend) {
+  if (backend == "cuda" || backend == "open_cuda" ||
+      backend == "open_video")
+    return "open_cuda";
+  if (backend == "vulkan" || backend == "open_vulkan")
+    return "open_vulkan";
+  if (backend == "maxine")
+    return "maxine";
+  if (backend == "cpu")
+    return "cpu";
+  return {};
+}
+
+std::vector<std::string> ActiveComputeEngines(
+    const studiocast::video::CameraPipelineStatus &pipeline,
+    const std::string &computeActive) {
+  std::set<std::string> engines;
+  const auto activeBackends = ParseEffectBackendMap(pipeline.effects_backends);
+  for (const auto &[_, backend] : activeBackends) {
+    const std::string normalized = NormalizeComputeEngineName(backend);
+    if (!normalized.empty())
+      engines.insert(normalized);
+  }
+  if (engines.empty()) {
+    const std::string normalized = NormalizeComputeEngineName(computeActive);
+    engines.insert(normalized.empty() ? std::string("cpu") : normalized);
+  }
+  return std::vector<std::string>(engines.begin(), engines.end());
+}
+
+std::string ComputeFallbackCode(const std::string &preference,
+                                const std::string &resolved,
+                                const std::string &active) {
+  if (preference == "vulkan" && active != "vulkan")
+    return "vulkan_unavailable";
+  if (preference == "cuda" && active != "cuda")
+    return "cuda_unavailable";
+  if (active == "cpu" && preference != "cpu")
+    return "gpu_unavailable";
+  if (active == resolved)
+    return {};
+  return "backend_changed";
+}
+
+struct ComputeProviderStatus {
+  std::string mode = "cpu";
+  std::string active_provider = "CPU";
+  std::string device = "host";
+  std::string tensor_io_mode = "host";
+};
+
+ComputeProviderStatus BuildComputeProviderStatus(
+    const std::string &active,
+    const std::vector<std::string> &activeEngines,
+    const EngineDiagnosticsSummary &maxineDiag,
+    const EngineDiagnosticsSummary &openCudaDiag,
+    const EngineDiagnosticsSummary &openVulkanDiag) {
+  const auto hasEngine = [&](const char *name) {
+    return std::find(activeEngines.begin(), activeEngines.end(), name) !=
+           activeEngines.end();
+  };
+
+  ComputeProviderStatus out;
+  if (active == "vulkan" || hasEngine("open_vulkan")) {
+    out.mode = "open_vulkan";
+    out.active_provider = "Vulkan";
+    out.device = openVulkanDiag.device_name.empty()
+                     ? std::string("vulkan")
+                     : openVulkanDiag.device_name;
+    out.tensor_io_mode = openVulkanDiag.device_residency_mode.empty()
+                             ? std::string("vulkan_device_kernels")
+                             : openVulkanDiag.device_residency_mode;
+    return out;
+  }
+
+  if (active == "maxine" || hasEngine("maxine")) {
+    out.mode = "maxine";
+    out.active_provider = "NVIDIA Maxine";
+    out.device = maxineDiag.device_name.empty() ? std::string("cuda")
+                                                : maxineDiag.device_name;
+    out.tensor_io_mode = "cuda_device";
+    return out;
+  }
+
+  if (active == "cuda" || hasEngine("open_cuda")) {
+    out.mode = "open_cuda";
+    if (openCudaDiag.tensorrt_requested && openCudaDiag.tensorrt_available) {
+      out.active_provider = "TensorrtExecutionProvider";
+      out.tensor_io_mode = "cuda_device_iobinding";
+    } else if (openCudaDiag.onnxruntime_cuda_provider_present) {
+      out.active_provider = "CUDAExecutionProvider";
+      out.tensor_io_mode = "cuda_device_iobinding";
+    } else {
+      out.active_provider = "CUDA driver kernels";
+      out.tensor_io_mode = "cuda_device_kernels";
+    }
+    out.device =
+        openCudaDiag.cuda_device_count > 0 || openCudaDiag.cuda_context_available
+            ? std::string("cuda:0")
+            : std::string("cuda");
+    return out;
+  }
+
+  return out;
+}
+
+void AppendCpuTailStages(std::ostringstream &oss,
+                         const studiocast::video::CameraPipelineStatus &p) {
+  std::vector<std::string> stages;
+  const auto addIf = [&](const char *name, std::uint64_t count) {
+    if (count > 0)
+      stages.push_back(name);
+  };
+  addIf("key_light", p.open_cuda_transfers.cpu_tail_key_light_calls +
+                         p.open_vulkan_transfers.cpu_tail_key_light_calls);
+  addIf("auto_frame", p.open_cuda_transfers.cpu_tail_auto_frame_calls +
+                          p.open_vulkan_transfers.cpu_tail_auto_frame_calls);
+  addIf("auto_frame_face_tracking",
+        p.open_cuda_transfers.cpu_tail_auto_frame_face_tracking_calls +
+            p.open_vulkan_transfers.cpu_tail_auto_frame_face_tracking_calls);
+  addIf("auto_frame_matte_tracking",
+        p.open_cuda_transfers.cpu_tail_auto_frame_matte_tracking_calls +
+            p.open_vulkan_transfers.cpu_tail_auto_frame_matte_tracking_calls);
+  addIf("auto_frame_cpu_crop",
+        p.open_cuda_transfers.cpu_tail_auto_frame_cpu_crop_calls +
+            p.open_vulkan_transfers.cpu_tail_auto_frame_cpu_crop_calls);
+  addIf("denoise", p.open_cuda_transfers.cpu_tail_denoise_calls);
+  AppendJsonStringVector(oss, stages);
+}
+
+void AppendVideoComputeStatusJson(
+    std::ostringstream &oss,
+    const studiocast::video::CameraPipelineStatus &pipeline,
+    const std::string &preference, const std::string &resolved,
+    const std::string &active, const std::string &fallbackReason,
+    const std::string &degradedReason,
+    const EngineDiagnosticsSummary &maxineDiag,
+    const EngineDiagnosticsSummary &openCudaDiag,
+    const EngineDiagnosticsSummary &openVulkanDiag) {
+  const std::vector<std::string> activeEngines =
+      ActiveComputeEngines(pipeline, active);
+  std::string cudaUnavailable = DiagnosticUnavailableReason(openCudaDiag);
+  std::string vulkanUnavailable = DiagnosticUnavailableReason(openVulkanDiag);
+  std::string maxineUnavailable = DiagnosticUnavailableReason(maxineDiag);
+  if (vulkanUnavailable.empty() && preference == "vulkan" &&
+      active != "vulkan")
+    vulkanUnavailable =
+        !fallbackReason.empty() ? fallbackReason : degradedReason;
+  if (cudaUnavailable.empty() && preference == "cuda" && active != "cuda")
+    cudaUnavailable =
+        !fallbackReason.empty() ? fallbackReason : degradedReason;
+
+  const bool fallbackActive =
+      !fallbackReason.empty() || (!resolved.empty() && resolved != active);
+  const std::string fallbackCode =
+      fallbackActive ? ComputeFallbackCode(preference, resolved, active)
+                     : std::string();
+  const ComputeProviderStatus provider = BuildComputeProviderStatus(
+      active, activeEngines, maxineDiag, openCudaDiag, openVulkanDiag);
+
+  const auto &cu = pipeline.open_cuda_transfers;
+  const auto &vk = pipeline.open_vulkan_transfers;
+  const auto &mx = pipeline.maxine_transfers;
+  const std::uint64_t cpuTailStages =
+      cu.cpu_tail_stage_calls + vk.cpu_tail_stage_calls;
+
+  oss << "{";
+  oss << "\"preference\":\"" << JsonEscape(preference) << "\",";
+  oss << "\"resolved_backend\":\"" << JsonEscape(resolved) << "\",";
+  oss << "\"active_backend\":\"" << JsonEscape(active) << "\",";
+  oss << "\"fallback_reason\":\"" << JsonEscape(fallbackReason) << "\",";
+  oss << "\"degraded_reason\":\"" << JsonEscape(degradedReason) << "\",";
+  oss << "\"active_engines\":";
+  AppendJsonStringVector(oss, activeEngines);
+  oss << ",\"unavailable_reasons\":{";
+  oss << "\"cuda\":\"" << JsonEscape(cudaUnavailable) << "\",";
+  oss << "\"vulkan\":\"" << JsonEscape(vulkanUnavailable) << "\",";
+  oss << "\"maxine\":\"" << JsonEscape(maxineUnavailable) << "\"";
+  oss << "},";
+  oss << "\"fallback\":{";
+  oss << "\"active\":" << BoolJson(fallbackActive) << ",";
+  oss << "\"from\":\"" << JsonEscape(preference) << "\",";
+  oss << "\"to\":\"" << JsonEscape(active) << "\",";
+  oss << "\"code\":\"" << JsonEscape(fallbackCode) << "\",";
+  oss << "\"detail\":\""
+      << JsonEscape(!fallbackReason.empty() ? fallbackReason : degradedReason)
+      << "\"";
+  oss << "},";
+  oss << "\"provider\":{";
+  oss << "\"mode\":\"" << JsonEscape(provider.mode) << "\",";
+  oss << "\"active_provider\":\"" << JsonEscape(provider.active_provider)
+      << "\",";
+  oss << "\"device\":\"" << JsonEscape(provider.device) << "\",";
+  oss << "\"tensor_io_mode\":\"" << JsonEscape(provider.tensor_io_mode)
+      << "\"";
+  oss << "},";
+  oss << "\"cpu_tails\":{";
+  oss << "\"active\":" << BoolJson(cpuTailStages > 0) << ",";
+  oss << "\"stage_calls\":" << cpuTailStages << ",";
+  oss << "\"stages\":";
+  AppendCpuTailStages(oss, pipeline);
+  oss << ",\"cuda_tensor_tail\":"
+      << BoolJson(cu.cpu_tail_denoise_calls > 0) << ",";
+  oss << "\"counts\":{";
+  oss << "\"open_cuda\":" << cu.cpu_tail_stage_calls << ",";
+  oss << "\"open_vulkan\":" << vk.cpu_tail_stage_calls << ",";
+  oss << "\"denoise\":" << cu.cpu_tail_denoise_calls;
+  oss << "}";
+  oss << "},";
+  oss << "\"transfers\":{";
+  oss << "\"open_cuda\":{";
+  oss << "\"active_frames\":" << cu.active_frames << ",";
+  oss << "\"uploads\":"
+      << (cu.upload_calls + cu.matte_frame_upload_calls +
+          cu.denoise_tensor_upload_calls + cu.standalone_scaler_upload_calls)
+      << ",";
+  oss << "\"downloads\":"
+      << (cu.download_calls + cu.final_download_calls +
+          cu.cpu_continuation_download_calls + cu.alpha_download_calls +
+          cu.denoise_tensor_download_calls +
+          cu.standalone_scaler_download_calls)
+      << ",";
+  oss << "\"forced_syncs\":" << cu.forced_sync_calls;
+  oss << "},";
+  oss << "\"open_vulkan\":{";
+  oss << "\"active_frames\":" << vk.active_frames << ",";
+  oss << "\"uploads\":"
+      << (vk.upload_calls + vk.matte_frame_upload_calls +
+          vk.background_upload_calls + vk.standalone_scaler_upload_calls)
+      << ",";
+  oss << "\"downloads\":"
+      << (vk.download_calls + vk.final_download_calls +
+          vk.cpu_continuation_download_calls + vk.alpha_download_calls +
+          vk.standalone_scaler_download_calls)
+      << ",";
+  oss << "\"dispatches\":"
+      << (vk.preprocess_dispatch_calls + vk.alpha_resize_dispatch_calls +
+          vk.blur_dispatch_calls + vk.composite_dispatch_calls +
+          vk.key_light_dispatch_calls + vk.crop_resize_dispatch_calls)
+      << ",";
+  oss << "\"forced_syncs\":" << vk.forced_sync_calls << ",";
+  oss << "\"fallback_frames\":" << vk.fallback_frames << ",";
+  oss << "\"runtime_failure_frames\":" << vk.runtime_failure_frames;
+  oss << "},";
+  oss << "\"maxine\":{";
+  oss << "\"active_frames\":" << mx.active_frames << ",";
+  oss << "\"uploads\":" << mx.upload_calls << ",";
+  oss << "\"downloads\":"
+      << (mx.download_calls + mx.final_download_calls +
+          mx.cpu_continuation_download_calls +
+          mx.standalone_scaler_download_calls)
+      << ",";
+  oss << "\"forced_syncs\":" << mx.forced_sync_calls << ",";
+  oss << "\"deferred_readbacks\":" << mx.deferred_readbacks;
+  oss << "}";
+  oss << "}";
+  oss << "}";
+}
+
 std::string
 StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
              const studiocast::video::VirtualCameraServiceConfig &cfg,
@@ -1236,6 +1611,12 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   const std::string computePreference =
       studiocast::video::ComputeBackendPreferenceToString(
           cfg.pipeline.compute_backend);
+  const EngineDiagnosticsSummary computeMaxineDiag =
+      ParseEngineDiagnosticsSummary(maxineJson);
+  const EngineDiagnosticsSummary computeOpenCudaDiag =
+      ParseEngineDiagnosticsSummary(openCudaJson);
+  const EngineDiagnosticsSummary computeOpenVulkanDiag =
+      ParseEngineDiagnosticsSummary(openVulkanJson);
   std::string computeResolved = st.pipeline.compute_backend_resolved.empty()
                                     ? std::string("cpu")
                                     : st.pipeline.compute_backend_resolved;
@@ -1283,13 +1664,13 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   oss << "\"always_on\":" << BoolJson(cfg.always_on) << ",";
   oss << "\"allow_cpu_resize\":" << BoolJson(cfg.pipeline.allow_cpu_resize)
       << ",";
-  oss << "\"compute\":{";
-  oss << "\"preference\":\"" << JsonEscape(computePreference) << "\",";
-  oss << "\"resolved_backend\":\"" << JsonEscape(computeResolved) << "\",";
-  oss << "\"active_backend\":\"" << JsonEscape(computeActive) << "\",";
-  oss << "\"fallback_reason\":\"" << JsonEscape(computeFallback) << "\",";
-  oss << "\"degraded_reason\":\"" << JsonEscape(computeDegraded) << "\"";
-  oss << "},";
+  oss << "\"compute\":";
+  AppendVideoComputeStatusJson(oss, st.pipeline, computePreference,
+                               computeResolved, computeActive,
+                               computeFallback, computeDegraded,
+                               computeMaxineDiag, computeOpenCudaDiag,
+                               computeOpenVulkanDiag);
+  oss << ",";
   oss << "\"output_format_requested\":\""
       << JsonEscape(
              studiocast::video::PixelFormatName(cfg.pipeline.output_format))

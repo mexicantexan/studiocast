@@ -177,9 +177,10 @@ struct CameraPipelineStatus {
     std::uint64_t pace_resyncs = 0;
   } debug{};
 
-  // Optional Open CUDA transfer counters (emitted in status JSON only when
+  // Optional Open CUDA transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
   // STUDIOCAST_DEBUG_OPEN_CUDA_TRANSFERS=1 (or legacy
-  // STUDIOCAST_DEBUG_CUDA_UPLOADS=1) is set for the daemon).
+  // STUDIOCAST_DEBUG_CUDA_UPLOADS=1).
   struct OpenCudaTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t upload_calls = 0;
@@ -203,8 +204,9 @@ struct CameraPipelineStatus {
     std::uint64_t cpu_tail_denoise_calls = 0;
   } open_cuda_transfers{};
 
-  // Optional Open Vulkan transfer counters (emitted in status JSON only when
-  // STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS=1 is set for the daemon).
+  // Optional Open Vulkan transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
+  // STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS=1.
   struct OpenVulkanTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t upload_calls = 0;
@@ -234,8 +236,9 @@ struct CameraPipelineStatus {
     std::uint64_t runtime_failure_frames = 0;
   } open_vulkan_transfers{};
 
-  // Optional Maxine transfer counters (emitted in status JSON only when
-  // STUDIOCAST_DEBUG_MAXINE_TRANSFERS=1 is set for the daemon).
+  // Optional Maxine transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
+  // STUDIOCAST_DEBUG_MAXINE_TRANSFERS=1.
   struct MaxineTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t rgb_to_bgr_calls = 0;

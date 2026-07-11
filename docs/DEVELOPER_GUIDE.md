@@ -365,21 +365,50 @@ Key concepts:
 - `effects/broadcast_effect_contract.h` defines stable effect IDs, parameter
   IDs, and ranges for IPC and JSON.
 
-Engine preference values:
+Effect engine preference values:
 
 - `auto` / `auto_select`: prefer Maxine when available, otherwise use Open CUDA
   for supported effects.
 - `maxine`: force the Maxine backend where supported.
 - `open_cuda`: force the Open Video/Open CUDA backend where supported.
 
+Video compute preference values:
+
+- `auto`: prefer usable CUDA on NVIDIA systems, otherwise resolve to the next
+  supported backend or CPU/pass-through.
+- `cpu`: force CPU/pass-through behavior for GPU-backed effects.
+- `cuda`: request Open CUDA; missing CUDA/ORT/model support must be reported as
+  unavailable or degraded.
+- `vulkan`: request Open Vulkan. This must not silently run CUDA; if Vulkan is
+  unavailable, status reports a Vulkan fallback/degraded reason and the active
+  backend reflects CPU/pass-through where applicable.
+
 Availability is daemon-owned. The GUI should use `GET_STATUS` instead of trying
 to infer local engine or model state. Daemon status reports nested engine
 diagnostics such as `engines.maxine`, `engines.open_cuda`, and
-`engines.open_audio`, plus compatibility aliases where present.
+`engines.open_vulkan` and `engines.open_audio`, plus compatibility aliases
+where present.
+
+The normalized video backend status lives under `video.compute` and includes:
+
+- `preference`, `resolved_backend`, `active_backend`
+- `fallback_reason`, `degraded_reason`, and `fallback`
+- `active_engines`, `unavailable_reasons`, and `provider`
+- compact `cpu_tails` and `transfers` rollups
+
+Keep this status built from cached setup-time diagnostics and pipeline counters.
+Do not add provider/package/runtime checks, JSON construction, or probe logic to
+the frame loop.
 
 Open CUDA video effects are GPU-only. If CUDA, ONNX Runtime, or model packs are
 missing, the effects should be marked unavailable rather than silently falling
 back to CPU.
+
+Open Vulkan is optional and runtime-loaded. Build with
+`-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it. Ubuntu-family setup can
+install loader/diagnostic packages with `./scripts/setup.sh --vulkan-runtime`
+and Mesa Intel/AMD ICD packages with `--mesa-vulkan`; these packages do not
+promise hardware support.
 
 Canonical video effects are persisted under `video.effects.json` in the daemon
 config.
@@ -466,6 +495,35 @@ Useful checks:
   the video pipeline.
 - Close all consumers and confirm heavy processing returns to idle.
 - Generate a debug report after failures.
+
+## Benchmarks and hardware CI
+
+Benchmark tools are opt-in:
+
+```bash
+cmake -S . -B build-bench -G Ninja \
+  -DSTUDIOCAST_BUILD_BENCHMARKS=ON \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON
+cmake --build build-bench --target \
+  studiocast-rgb-yuyv-bench \
+  studiocast-cuda-transfer-bench \
+  studiocast-resize-backend-bench
+```
+
+Coverage:
+
+- `studiocast-rgb-yuyv-bench`: CPU color conversion, CPU resize, CPU
+  background-remove primitives.
+- `studiocast-cuda-transfer-bench`: CUDA upload, download, and roundtrip
+  transfer rows.
+- `studiocast-resize-backend-bench`: CPU/CUDA/Vulkan resize comparisons when
+  each backend is compiled and available.
+
+CSV output includes warmup/iteration counts, avg/p95/p99/min/max timing, status
+(`ok` or `skipped`), and skip reasons for unavailable GPU backends. Hardware
+benchmarks must stay out of default push CI. The CI workflow keeps ordinary jobs
+no-GPU-safe and exposes workflow-dispatch smoke jobs for CUDA/NVIDIA and
+Vulkan/NVIDIA, Vulkan/AMD, and Vulkan/Intel runners.
 
 ## Packaging and systemd notes
 

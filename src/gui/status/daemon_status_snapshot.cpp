@@ -1164,6 +1164,40 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
       compute.value(QStringLiteral("fallback_reason")).toString();
   out.videoComputeDegradedReason =
       compute.value(QStringLiteral("degraded_reason")).toString();
+  out.videoComputeActiveEngines =
+      StringListValue(compute, QStringLiteral("active_engines"));
+  const QJsonObject computeFallback =
+      ObjectValue(compute, QStringLiteral("fallback"));
+  out.videoComputeFallbackActive =
+      computeFallback.value(QStringLiteral("active")).toBool(false);
+  out.videoComputeFallbackFrom =
+      computeFallback.value(QStringLiteral("from")).toString().trimmed();
+  out.videoComputeFallbackTo =
+      computeFallback.value(QStringLiteral("to")).toString().trimmed();
+  out.videoComputeFallbackCode =
+      computeFallback.value(QStringLiteral("code")).toString().trimmed();
+  out.videoComputeFallbackDetail =
+      computeFallback.value(QStringLiteral("detail")).toString().trimmed();
+  const QJsonObject computeProvider =
+      ObjectValue(compute, QStringLiteral("provider"));
+  out.videoComputeProviderMode =
+      computeProvider.value(QStringLiteral("mode")).toString().trimmed();
+  out.videoComputeActiveProvider =
+      computeProvider.value(QStringLiteral("active_provider"))
+          .toString()
+          .trimmed();
+  out.videoComputeProviderDevice =
+      computeProvider.value(QStringLiteral("device")).toString().trimmed();
+  out.videoComputeTensorIoMode =
+      computeProvider.value(QStringLiteral("tensor_io_mode"))
+          .toString()
+          .trimmed();
+  const QJsonObject cpuTails =
+      ObjectValue(compute, QStringLiteral("cpu_tails"));
+  out.videoComputeCpuTailsActive =
+      cpuTails.value(QStringLiteral("active")).toBool(false);
+  out.videoComputeCpuTailStages =
+      StringListValue(cpuTails, QStringLiteral("stages"));
   out.videoEffectsEnginePreference =
       ObjectValue(video, QStringLiteral("video_effects"))
           .value(QStringLiteral("engine"))

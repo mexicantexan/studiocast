@@ -1627,15 +1627,20 @@ void EnginesModelsPage::UpdateStatus(const DaemonStatusSnapshot &snapshot) {
     audioPreferenceLabel_->setText(
         FriendlyBackendLabel(snapshot.audioEffectsEnginePreference));
   if (microphoneActiveLabel_) {
+    const QString microphoneActive =
+        !snapshot.reachable || !snapshot.parsed
+            ? QStringLiteral("Unknown")
+            : FriendlyBackendLabel(snapshot.microphoneActiveBackend);
     microphoneActiveLabel_->setText(
-        QStringLiteral("Microphone: %1")
-            .arg(FriendlyBackendLabel(snapshot.microphoneActiveBackend)));
+        QStringLiteral("Microphone: %1").arg(microphoneActive));
     microphoneActiveLabel_->setToolTip(snapshot.microphoneActiveBackend);
   }
   if (speakersActiveLabel_) {
     QString speakerActive;
     const QString routeMode = snapshot.speakersRouteMode.trimmed().toLower();
-    if (routeMode == QStringLiteral("loopback")) {
+    if (!snapshot.reachable || !snapshot.parsed) {
+      speakerActive = QStringLiteral("Unknown");
+    } else if (routeMode == QStringLiteral("loopback")) {
       speakerActive = QStringLiteral("Loopback / pass-through");
     } else if (routeMode == QStringLiteral("off") &&
                snapshot.speakersActiveBackend.trimmed().isEmpty()) {

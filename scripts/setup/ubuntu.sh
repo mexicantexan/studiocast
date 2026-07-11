@@ -24,6 +24,9 @@ Options:
   --onnxruntime-version V ONNX Runtime version to install (default: 1.17.3).
   --onnxruntime-flavor    cpu|gpu (default: auto; gpu if nvidia-smi works, else cpu).
   --onnxruntime-arch A    x64|aarch64 (default: auto from uname -m).
+  --vulkan-runtime        Install optional Vulkan loader/diagnostic packages.
+  --mesa-vulkan           With --vulkan-runtime, install Mesa Intel/AMD ICDs.
+  --shader-tools          Install optional developer shader tools.
 
   --build                 Configure + build StudioCast (dev convenience).
   --build-dir DIR         Build directory (default: ./cmake-build-debug).
@@ -51,6 +54,9 @@ DO_BUILD=0
 BUILD_DIR="./cmake-build-debug"
 BUILD_TYPE="Debug"
 DO_MAXINE=0
+DO_VULKAN_RUNTIME=0
+DO_MESA_VULKAN=0
+DO_SHADER_TOOLS=0
 MAXINE_ARGS=()
 PARSE_MAXINE_ARGS=0
 
@@ -283,6 +289,25 @@ ensure_v4l2loopback_available() {
   fi
 }
 
+install_optional_vulkan_runtime() {
+  log "Installing optional Vulkan runtime/diagnostic packages..."
+  local pkgs=(libvulkan1 vulkan-tools)
+  if [[ "${DO_MESA_VULKAN}" -eq 1 ]]; then
+    pkgs+=(mesa-vulkan-drivers)
+  fi
+  apt_install "${pkgs[@]}"
+  log "Vulkan packages only provide a loader/diagnostic path. Open Vulkan also requires a build with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON and a GPU driver/ICD exposing a compute-capable Vulkan device."
+  if [[ "${DO_MESA_VULKAN}" -ne 1 ]]; then
+    log "For Intel/AMD Mesa drivers, rerun with --vulkan-runtime --mesa-vulkan or install mesa-vulkan-drivers manually. NVIDIA Vulkan support normally comes from the NVIDIA driver packages."
+  fi
+}
+
+install_optional_shader_tools() {
+  log "Installing optional developer shader tools..."
+  apt_install glslang-tools
+  log "Shader tools are only needed to regenerate/validate embedded Vulkan SPIR-V headers; normal builds use committed generated headers."
+}
+
 load_v4l2loopback_now() {
   require_cmd modprobe
   log "Loading v4l2loopback now (video_nr=${VIDEO_NR}, label=${LABEL}, exclusive_caps=${EXCLUSIVE_CAPS})..."
@@ -328,6 +353,9 @@ while [[ $# -gt 0 ]]; do
     --onnxruntime-version) ORT_VERSION="${2:-}"; shift 2 ;;
     --onnxruntime-flavor) ORT_FLAVOR="${2:-}"; shift 2 ;;
     --onnxruntime-arch) ORT_ARCH="${2:-}"; shift 2 ;;
+    --vulkan-runtime) DO_VULKAN_RUNTIME=1; shift ;;
+    --mesa-vulkan) DO_MESA_VULKAN=1; DO_VULKAN_RUNTIME=1; shift ;;
+    --shader-tools) DO_SHADER_TOOLS=1; shift ;;
     --build) DO_BUILD=1; shift ;;
     --build-dir) BUILD_DIR="${2:-}"; shift 2 ;;
     --build-type) BUILD_TYPE="${2:-}"; shift 2 ;;
@@ -380,6 +408,14 @@ if [[ "$DO_DEPS" -eq 1 ]]; then
     libpng-dev
 
   ensure_onnxruntime_available
+fi
+
+if [[ "$DO_VULKAN_RUNTIME" -eq 1 ]]; then
+  install_optional_vulkan_runtime
+fi
+
+if [[ "$DO_SHADER_TOOLS" -eq 1 ]]; then
+  install_optional_shader_tools
 fi
 
 if [[ "$DO_V4L2" -eq 1 ]]; then

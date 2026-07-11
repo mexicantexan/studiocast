@@ -139,6 +139,18 @@ struct DaemonStatusSnapshot {
   QString videoComputeActiveBackend;
   QString videoComputeFallbackReason;
   QString videoComputeDegradedReason;
+  QStringList videoComputeActiveEngines;
+  bool videoComputeFallbackActive = false;
+  QString videoComputeFallbackFrom;
+  QString videoComputeFallbackTo;
+  QString videoComputeFallbackCode;
+  QString videoComputeFallbackDetail;
+  QString videoComputeProviderMode;
+  QString videoComputeActiveProvider;
+  QString videoComputeProviderDevice;
+  QString videoComputeTensorIoMode;
+  bool videoComputeCpuTailsActive = false;
+  QStringList videoComputeCpuTailStages;
   QString videoEffectsEnginePreference;
   QString audioEffectsEnginePreference;
   QString rawVideoEffectsJson;

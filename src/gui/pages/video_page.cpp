@@ -831,7 +831,7 @@ QString FriendlyBackendLabel(const QString &id) {
     return QStringLiteral("Maxine");
   if (v == QStringLiteral("open_cuda") || v == QStringLiteral("open_source") ||
       v == QStringLiteral("open_video") || v == QStringLiteral("open"))
-    return QStringLiteral("Open Source");
+    return QStringLiteral("Open Video");
 
   if (v == QStringLiteral("passthrough"))
     return QStringLiteral("Pass-through");
@@ -851,10 +851,26 @@ QString FriendlyBackendLabel(const QString &id) {
   return id;
 }
 
+QString FriendlyComputeBackendLabel(const QString &id) {
+  const QString v = id.trimmed().toLower();
+  if (v.isEmpty())
+    return QStringLiteral("CPU");
+  if (v == QStringLiteral("cuda") || v == QStringLiteral("open_cuda") ||
+      v == QStringLiteral("open_video"))
+    return QStringLiteral("CUDA");
+  if (v == QStringLiteral("vulkan") || v == QStringLiteral("open_vulkan"))
+    return QStringLiteral("Vulkan");
+  if (v == QStringLiteral("maxine"))
+    return QStringLiteral("Maxine");
+  if (v == QStringLiteral("cpu"))
+    return QStringLiteral("CPU");
+  return id;
+}
+
 QString SanitizeBackendNote(QString note) {
-  note.replace(QStringLiteral("Open CUDA"), QStringLiteral("Open Source"),
+  note.replace(QStringLiteral("Open CUDA"), QStringLiteral("Open Video"),
                Qt::CaseInsensitive);
-  note.replace(QStringLiteral("open_cuda"), QStringLiteral("open_source"),
+  note.replace(QStringLiteral("open_cuda"), QStringLiteral("open_video"),
                Qt::CaseInsensitive);
   return note;
 }
@@ -1050,11 +1066,11 @@ VideoPage::VideoPage(QWidget *parent) : QWidget(parent) {
   runLayout->addLayout(ctlRow);
 
   auto *engineRow = new QHBoxLayout();
-  engineRow->addWidget(new QLabel("Backend:", runBox));
+  engineRow->addWidget(new QLabel("Effect preference:", runBox));
   engineCombo_ = new QComboBox(runBox);
   engineCombo_->addItem("Auto", "auto");
   engineCombo_->addItem("Maxine", "maxine");
-  engineCombo_->addItem("Open Source", "open_cuda");
+  engineCombo_->addItem("Open Video", "open_cuda");
   engineRow->addWidget(engineCombo_, 1);
   runLayout->addLayout(engineRow);
 
@@ -1071,7 +1087,7 @@ VideoPage::VideoPage(QWidget *parent) : QWidget(parent) {
   runLayout->addLayout(computeRow);
 
   auto *activeRow = new QHBoxLayout();
-  activeRow->addWidget(new QLabel("Active:", runBox));
+  activeRow->addWidget(new QLabel("Active effects:", runBox));
   effectEngineValue_ = ValueLabel("—", runBox);
   activeRow->addWidget(effectEngineValue_, 1);
   runLayout->addLayout(activeRow);
@@ -2411,7 +2427,7 @@ void VideoPage::OnOpenInstallHints() {
   QString title;
   QVector<QPair<QString, QString>> commands;
   if (pref == studiocast::video::effects::EffectsEnginePreference::open_cuda) {
-    title = "Open Source install hints";
+    title = "Open Video install hints";
     commands.push_back(
         {resolveProgram("studiocast-open"), QStringLiteral("studiocast-open")});
   } else if (pref ==
@@ -2882,8 +2898,14 @@ void VideoPage::UpdateUiEnabled() {
     } else if (!enabled) {
       effectEngineValue_->setText(QStringLiteral("Off"));
       effectEngineValue_->setToolTip(QString());
+    } else if (!st.pipeline_running && st.pipeline_starting) {
+      effectEngineValue_->setText(QStringLiteral("Starting..."));
+      effectEngineValue_->setToolTip(QString());
+    } else if (!st.pipeline_running && st.pipeline_active_needed) {
+      effectEngineValue_->setText(QStringLiteral("Waiting for app"));
+      effectEngineValue_->setToolTip(st.pipeline_idle_reason);
     } else if (!st.pipeline_running) {
-      effectEngineValue_->setText(QStringLiteral("Starting…"));
+      effectEngineValue_->setText(QStringLiteral("Idle"));
       effectEngineValue_->setToolTip(QString());
     } else if (st.effects_backends.trimmed().isEmpty()) {
       effectEngineValue_->setText(QStringLiteral("Pass-through"));
@@ -2912,9 +2934,9 @@ void VideoPage::UpdateUiEnabled() {
       const QString resolved =
           st.compute_resolved_backend.isEmpty() ? active
                                                 : st.compute_resolved_backend;
-      QString text = active;
+      QString text = FriendlyComputeBackendLabel(active);
       if (active != resolved)
-        text += QStringLiteral(" (%1)").arg(resolved);
+        text += QStringLiteral(" (%1)").arg(FriendlyComputeBackendLabel(resolved));
       computeBackendValue_->setText(text);
 
       QStringList detail;
@@ -2938,7 +2960,17 @@ void VideoPage::UpdateUiEnabled() {
       engineInfoBanner_->setVisible(false);
       engineInfoBanner_->setToolTip(QString());
     } else {
-      const QString full = SanitizeBackendNote(st.effects_note).trimmed();
+      QStringList notes;
+      QString computeNote = st.compute_degraded_reason.trimmed();
+      if (computeNote.isEmpty())
+        computeNote = st.compute_fallback_reason.trimmed();
+      if (!computeNote.trimmed().isEmpty())
+        notes << QStringLiteral("Compute degraded: %1")
+                     .arg(SanitizeBackendNote(computeNote));
+      const QString effectsNote = SanitizeBackendNote(st.effects_note).trimmed();
+      if (!effectsNote.isEmpty())
+        notes << effectsNote;
+      const QString full = notes.join(QStringLiteral("\n")).trimmed();
       const QString first = FirstLine(full);
       engineInfoBanner_->setVisible(!first.isEmpty());
       engineInfoBanner_->setText(first);
@@ -3026,7 +3058,7 @@ void VideoPage::UpdateUiEnabled() {
   if (openInstallHintsBtn_) {
     if (enginePref ==
         studiocast::video::effects::EffectsEnginePreference::open_cuda) {
-      openInstallHintsBtn_->setText("Open Source install hints");
+      openInstallHintsBtn_->setText("Open Video install hints");
     } else if (enginePref ==
                studiocast::video::effects::EffectsEnginePreference::maxine) {
       openInstallHintsBtn_->setText("Maxine install hints");

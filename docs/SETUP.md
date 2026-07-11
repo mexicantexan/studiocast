@@ -102,9 +102,10 @@ those XDG directories.
 ./scripts/setup.sh --deps --v4l2loopback --load-loopback --persist-loopback
 ```
 
-This installs build dependencies (Qt6/CMake/Ninja/etc), ONNX Runtime (required; GPU build by default), and runtime dependencies (v4l2loopback tools, v4l-utils),
+This installs build dependencies (Qt6/CMake/Ninja/etc), ONNX Runtime, and runtime dependencies (v4l2loopback tools, v4l-utils),
 then creates a virtual camera device (by default at `/dev/video10` with label **StudioCast Camera**).
 The setup helper prefers a kernel-provided/prebuilt v4l2loopback module and only falls back to `v4l2loopback-dkms` when the running kernel does not already provide one.
+The ONNX Runtime flavor is `gpu` only when `nvidia-smi` works or when you pass `--onnxruntime-flavor gpu`; otherwise the helper installs the CPU flavor.
 
 MJPEG decode uses **libjpeg-turbo** (via CMake `FindJPEG`). If you are installing dependencies manually:
 
@@ -165,7 +166,7 @@ Install/usage docs:
 
 - `docs/open_cuda_install.md`
 
-On Ubuntu 22.04+, the helper script that installs an ONNX Runtime GPU build is:
+On Ubuntu 22.04+, the helper script that installs ONNX Runtime is:
 
 ```bash
 ./scripts/setup.sh --deps
@@ -173,6 +174,40 @@ On Ubuntu 22.04+, the helper script that installs an ONNX Runtime GPU build is:
 
 `--deps` ensures ONNX Runtime is available via `pkg-config onnxruntime` by installing the upstream tarball under
 `/opt/studiocast/onnxruntime/<version>/...` and configuring runtime linking via `ldconfig`.
+For Open CUDA, use a working NVIDIA driver and install the GPU ONNX Runtime flavor explicitly when auto-detection cannot see `nvidia-smi`:
+
+```bash
+./scripts/setup.sh --deps --onnxruntime-flavor gpu
+```
+
+## 3a) Optional: Open Vulkan backend
+
+The Open Vulkan backend is optional and disabled at build time unless requested:
+
+```bash
+cmake -S . -B <build-dir> -G Ninja \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON
+```
+
+Vulkan runtime packages are also optional. On Ubuntu-family systems:
+
+```bash
+./scripts/setup.sh --vulkan-runtime
+```
+
+For Intel/AMD Mesa ICDs, add:
+
+```bash
+./scripts/setup.sh --vulkan-runtime --mesa-vulkan
+```
+
+These packages provide the Vulkan loader and diagnostics (`libvulkan1`, `vulkan-tools`, and optionally `mesa-vulkan-drivers`). They do not guarantee hardware support. You still need a GPU driver/ICD that exposes a compute-capable Vulkan device. Developer shader tools are separate:
+
+```bash
+./scripts/setup.sh --shader-tools
+```
+
+Explicit Vulkan selection does not silently run CUDA. If Vulkan is requested but the build/runtime/device path is unavailable, daemon status reports the Vulkan fallback/degraded reason and the active backend is CPU/pass-through where applicable.
 
 ## 3b) Optional: Open Audio backend (no Maxine required)
 

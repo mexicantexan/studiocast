@@ -166,11 +166,22 @@ std::vector<std::uint8_t> MakeRgb(int width, int height) {
   return rgb;
 }
 
-void PrintResult(bool csv, const char *backend, const Case &c,
-                 const Stats &stats, std::uint64_t checksum) {
+std::string CsvSafe(std::string s) {
+  for (char &ch : s) {
+    if (ch == ',')
+      ch = ';';
+    if (ch == '\n' || ch == '\r')
+      ch = ' ';
+  }
+  return s;
+}
+
+void PrintResult(const Options &opts, bool csv, const char *backend,
+                 const Case &c, const Stats &stats, std::uint64_t checksum) {
   if (csv) {
     std::cout << backend << "," << c.label << "," << c.src_w << "x"
               << c.src_h << "," << c.dst_w << "x" << c.dst_h << ","
+              << opts.warmup << "," << opts.iterations << ",ok,,"
               << stats.avg_ms << "," << stats.p95_ms << "," << stats.p99_ms
               << "," << stats.min_ms << "," << stats.max_ms << ","
               << checksum << "\n";
@@ -184,6 +195,18 @@ void PrintResult(bool csv, const char *backend, const Case &c,
   std::cout << "  min/max     : " << stats.min_ms << " / " << stats.max_ms
             << " ms\n";
   std::cout << "  checksum    : " << checksum << "\n";
+}
+
+void PrintSkip(const Options &opts, bool csv, const char *backend,
+               const Case &c, const std::string &reason) {
+  if (csv) {
+    std::cout << backend << "," << c.label << "," << c.src_w << "x" << c.src_h
+              << "," << c.dst_w << "x" << c.dst_h << "," << opts.warmup
+              << "," << opts.iterations << ",skipped," << CsvSafe(reason)
+              << ",0,0,0,0,0,0\n";
+  } else {
+    std::cout << backend << " " << c.label << " skipped: " << reason << "\n";
+  }
 }
 
 template <typename Fn>
@@ -231,17 +254,15 @@ bool BenchCpu(const Options &opts, const Case &c, bool csv) {
     std::cerr << "ERROR: CPU resize failed: " << err << "\n";
     return false;
   }
-  PrintResult(csv, "cpu", c, stats, Checksum(dst));
+  PrintResult(opts, csv, "cpu", c, stats, Checksum(dst));
   return true;
 }
 
 bool BenchCuda(const Options &opts, const Case &c, bool csv,
                CudaBenchRuntime *runtime) {
   if (!runtime || !runtime->Ensure()) {
-    if (!csv)
-      std::cout << "cuda " << c.label << " skipped: "
-                << (runtime ? runtime->error : std::string("unavailable"))
-                << "\n";
+    PrintSkip(opts, csv, "cuda", c,
+              runtime ? runtime->error : std::string("unavailable"));
     return true;
   }
   std::string err;
@@ -278,7 +299,7 @@ bool BenchCuda(const Options &opts, const Case &c, bool csv,
   if (!ok) {
     std::cerr << "ERROR: CUDA resize failed: " << err << "\n";
   } else {
-    PrintResult(csv, "cuda", c, stats, Checksum(dst));
+    PrintResult(opts, csv, "cuda", c, stats, Checksum(dst));
   }
   (void)src_img.Free(&runtime->cuda, nullptr);
   (void)dst_img.Free(&runtime->cuda, nullptr);
@@ -290,8 +311,7 @@ bool BenchVulkan(const Options &opts, const Case &c, bool csv) {
   studiocast::vulkan::kernels::ResizeBilinear resize;
   std::string err;
   if (!resize.EnsureInitialized(c.src_w, c.src_h, c.dst_w, c.dst_h, &err)) {
-    if (!csv)
-      std::cout << "vulkan " << c.label << " skipped: " << err << "\n";
+    PrintSkip(opts, csv, "vulkan", c, err);
     return true;
   }
   const std::size_t src_stride = static_cast<std::size_t>(c.src_w) * 3u;
@@ -310,11 +330,9 @@ bool BenchVulkan(const Options &opts, const Case &c, bool csv) {
     std::cerr << "ERROR: Vulkan resize failed: " << err << "\n";
     return false;
   }
-  PrintResult(csv, "vulkan", c, stats, Checksum(dst));
+  PrintResult(opts, csv, "vulkan", c, stats, Checksum(dst));
 #else
-  if (!csv)
-    std::cout << "vulkan " << c.label
-              << " skipped: backend disabled in build\n";
+  PrintSkip(opts, csv, "vulkan", c, "backend disabled in build");
 #endif
   return true;
 }
@@ -335,8 +353,8 @@ int main(int argc, char **argv) {
   CudaBenchRuntime cuda;
 
   if (opts.csv) {
-    std::cout << "backend,case,src,dst,avg_ms,p95_ms,p99_ms,min_ms,max_ms,"
-                 "checksum\n";
+    std::cout << "backend,case,src,dst,warmup_iterations,iterations,status,"
+                 "skip_reason,avg_ms,p95_ms,p99_ms,min_ms,max_ms,checksum\n";
   }
 
   bool ok = true;
