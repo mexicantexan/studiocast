@@ -134,6 +134,11 @@ struct DaemonStatusSnapshot {
   DeviceReadiness camera;
   DeviceReadiness microphone;
   DeviceReadiness speakers;
+  QString videoComputePreference;
+  QString videoComputeResolvedBackend;
+  QString videoComputeActiveBackend;
+  QString videoComputeFallbackReason;
+  QString videoComputeDegradedReason;
   QString videoEffectsEnginePreference;
   QString audioEffectsEnginePreference;
   QString rawVideoEffectsJson;
@@ -151,6 +156,7 @@ struct DaemonStatusSnapshot {
 
   EngineStatus maxine;
   EngineStatus openCuda;
+  EngineStatus openVulkan;
   EngineStatus openAudio;
 
   static DaemonStatusSnapshot Unreachable(const QString &error);

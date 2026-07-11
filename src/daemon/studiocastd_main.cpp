@@ -15,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -36,6 +37,10 @@
 #include "core/video/v4l2loopback.h"
 #include "core/video/virtual_camera_service.h"
 #include "studiocast/version.h"
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+#include "core/vulkan/vulkan_device.h"
+#endif
 
 namespace {
 
@@ -280,6 +285,7 @@ std::string TrimAscii(std::string s) {
 struct DiagnosticsJsonSnapshot {
   std::string maxine;
   std::string open_cuda;
+  std::string open_vulkan;
   std::string open_audio;
   std::string loopback;
 };
@@ -306,6 +312,23 @@ DiagnosticsJsonSnapshot ComputeDiagnosticsJsonSnapshot() {
   snapshot.maxine = mm.Diagnose(/*verbose_probe=*/false).ToJson();
   snapshot.open_cuda =
       studiocast::open_cuda::DiagnoseOpenCudaDefault().ToJson();
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  snapshot.open_vulkan =
+      studiocast::vulkan::DiagnoseOpenVulkanDefault().ToJson();
+#else
+  snapshot.open_vulkan =
+      "{\"compiled_enabled\":false,\"ok\":false,"
+      "\"runtime_library_found\":false,\"runtime_library_path\":\"\","
+      "\"instance_created\":false,\"physical_device_found\":false,"
+      "\"compute_queue_available\":false,\"logical_device_created\":false,"
+      "\"shader_pipeline_created\":false,\"api_version\":0,"
+      "\"driver_version\":0,\"vendor_id\":0,\"device_id\":0,"
+      "\"device_type\":0,\"vendor_name\":\"\",\"device_name\":\"\","
+      "\"compute_queue_family_index\":0,\"error\":\"Open Vulkan backend is "
+      "disabled in this build.\",\"fallback_reason\":\"disabled_in_build\","
+      "\"install_hints\":[\"Rebuild with -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON "
+      "to enable this backend.\"]}";
+#endif
   snapshot.open_audio =
       studiocast::open_audio::DiagnoseOpenAudioDefault().ToJson();
   snapshot.loopback = studiocast::video::ProbeLoopbackDiagnostics().ToJson();
@@ -332,6 +355,10 @@ DiagnosticsJsonSnapshotToJson(const DiagnosticsJsonSnapshot &snapshot) {
   oss << "\"open_cuda\":"
       << (snapshot.open_cuda.empty() ? std::string("{}") : snapshot.open_cuda)
       << ",";
+  oss << "\"open_vulkan\":"
+      << (snapshot.open_vulkan.empty() ? std::string("{}")
+                                       : snapshot.open_vulkan)
+      << ",";
   oss << "\"open_audio\":"
       << (snapshot.open_audio.empty() ? std::string("{}")
                                       : snapshot.open_audio);
@@ -340,6 +367,10 @@ DiagnosticsJsonSnapshotToJson(const DiagnosticsJsonSnapshot &snapshot) {
       << (snapshot.maxine.empty() ? std::string("{}") : snapshot.maxine) << ",";
   oss << "\"open_cuda\":"
       << (snapshot.open_cuda.empty() ? std::string("{}") : snapshot.open_cuda)
+      << ",";
+  oss << "\"open_vulkan\":"
+      << (snapshot.open_vulkan.empty() ? std::string("{}")
+                                       : snapshot.open_vulkan)
       << ",";
   oss << "\"open_audio\":"
       << (snapshot.open_audio.empty() ? std::string("{}") : snapshot.open_audio)
@@ -1001,6 +1032,29 @@ std::string VideoEffectReadinessToJson(
   return oss.str();
 }
 
+bool VideoConfigRequestsCompute(
+    const studiocast::video::effects::BroadcastCameraEffects &fx) {
+  const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(fx);
+  const std::set<std::string> planned(plan.ordered_effect_ids.begin(),
+                                      plan.ordered_effect_ids.end());
+  const auto has = [&](std::string_view id) {
+    return planned.count(std::string(id)) != 0;
+  };
+  return has(studiocast::video::effects::contract::
+                 kEffectIdVideoNoiseRemoval) ||
+         has(studiocast::video::effects::contract::kEffectIdEyeContact) ||
+         has(studiocast::video::effects::contract::
+                 kEffectIdVirtualBackgroundBlur) ||
+         has(studiocast::video::effects::contract::
+                 kEffectIdVirtualBackgroundRemove) ||
+         has(studiocast::video::effects::contract::
+                 kEffectIdVirtualBackgroundReplace) ||
+         has(studiocast::video::effects::contract::kEffectIdAutoFrame) ||
+         has(studiocast::video::effects::contract::
+                 kEffectIdVirtualKeyLight) ||
+         has(studiocast::video::effects::contract::kEffectIdVignette);
+}
+
 int ParseKeyLightTemperaturePreset(const std::string &raw, int fallback) {
   const auto v = ToLowerAscii(raw);
   if (v == "0" || v == "neutral")
@@ -1077,6 +1131,7 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
              const studiocast::audio::VirtualAudioServiceConfig &acfg,
              const std::filesystem::path &socketPath,
              const std::string &maxineJson, const std::string &openCudaJson,
+             const std::string &openVulkanJson,
              const std::string &openAudioJson,
              const std::string &loopbackJson) {
   std::ostringstream oss;
@@ -1100,6 +1155,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   }
   oss << "\"open_cuda\":"
       << (openCudaJson.empty() ? std::string("{}") : openCudaJson);
+  oss << ",\"open_vulkan\":"
+      << (openVulkanJson.empty() ? std::string("{}") : openVulkanJson);
   oss << ",\"open_audio\":"
       << (openAudioJson.empty() ? std::string("{}") : openAudioJson);
   oss << "},";
@@ -1107,6 +1164,10 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   // Convenience top-level alias.
   if (!openCudaJson.empty()) {
     oss << "\"open_cuda\":" << openCudaJson << ",";
+  }
+
+  if (!openVulkanJson.empty()) {
+    oss << "\"open_vulkan\":" << openVulkanJson << ",";
   }
 
   if (!openAudioJson.empty()) {
@@ -1119,12 +1180,65 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   const std::string effectiveOutputDevice =
       st.pipeline.output_device.empty() ? cfg.pipeline.output_device
                                         : st.pipeline.output_device;
+  const bool computeRequested =
+      VideoConfigRequestsCompute(cfg.pipeline.effects);
+  const std::string computePreference =
+      studiocast::video::ComputeBackendPreferenceToString(
+          cfg.pipeline.compute_backend);
+  std::string computeResolved = st.pipeline.compute_backend_resolved.empty()
+                                    ? std::string("cpu")
+                                    : st.pipeline.compute_backend_resolved;
+  std::string computeActive = st.pipeline.compute_backend_active.empty()
+                                  ? std::string("cpu")
+                                  : st.pipeline.compute_backend_active;
+  std::string computeFallback = st.pipeline.compute_backend_fallback_reason;
+  std::string computeDegraded = st.pipeline.compute_backend_degraded_reason;
+  if (computeRequested && computeActive == "cpu") {
+    if (cfg.pipeline.compute_backend ==
+        studiocast::video::ComputeBackendPreference::cpu) {
+      computeResolved = "cpu";
+      computeActive = "cpu";
+      if (computeDegraded.empty()) {
+        computeDegraded = "CPU compute backend selected; GPU-backed video "
+                          "effects are disabled.";
+      }
+    } else if (cfg.pipeline.compute_backend ==
+               studiocast::video::ComputeBackendPreference::vulkan) {
+      computeResolved = "cpu";
+      computeActive = "cpu";
+      if (computeFallback.empty()) {
+        computeFallback =
+            "Vulkan compute backend requested, but Vulkan compute is not "
+            "available in this build.";
+      }
+      if (computeDegraded.empty())
+        computeDegraded = computeFallback;
+    } else if (cfg.pipeline.compute_backend ==
+                   studiocast::video::ComputeBackendPreference::auto_select &&
+               (st.pipeline.running || st.pipeline.starting ||
+                st.pipeline_active_needed)) {
+      if (computeFallback.empty()) {
+        computeFallback =
+            "No GPU compute backend is active; using CPU/pass-through "
+            "fallback.";
+      }
+      if (computeDegraded.empty())
+        computeDegraded = computeFallback;
+    }
+  }
 
   oss << "\"video\":{";
   oss << "\"enabled\":" << BoolJson(cfg.enabled) << ",";
   oss << "\"always_on\":" << BoolJson(cfg.always_on) << ",";
   oss << "\"allow_cpu_resize\":" << BoolJson(cfg.pipeline.allow_cpu_resize)
       << ",";
+  oss << "\"compute\":{";
+  oss << "\"preference\":\"" << JsonEscape(computePreference) << "\",";
+  oss << "\"resolved_backend\":\"" << JsonEscape(computeResolved) << "\",";
+  oss << "\"active_backend\":\"" << JsonEscape(computeActive) << "\",";
+  oss << "\"fallback_reason\":\"" << JsonEscape(computeFallback) << "\",";
+  oss << "\"degraded_reason\":\"" << JsonEscape(computeDegraded) << "\"";
+  oss << "},";
   oss << "\"output_format_requested\":\""
       << JsonEscape(
              studiocast::video::PixelFormatName(cfg.pipeline.output_format))
@@ -1280,6 +1394,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   const bool debug_open_cuda_transfers =
       (std::getenv("STUDIOCAST_DEBUG_OPEN_CUDA_TRANSFERS") != nullptr) ||
       (std::getenv("STUDIOCAST_DEBUG_CUDA_UPLOADS") != nullptr);
+  const bool debug_open_vulkan_transfers =
+      std::getenv("STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS") != nullptr;
 
   // Open CUDA transfer counters are a focused debug surface that can be enabled
   // without turning on the broader STUDIOCAST_DEBUG_VIDEO_STATS payload.
@@ -1331,6 +1447,27 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << ",";
     oss << "\"cpu_tail_denoise_calls\":"
         << st.pipeline.open_cuda_transfers.cpu_tail_denoise_calls;
+    oss << "}";
+  }
+
+  if (debug_open_vulkan_transfers) {
+    oss << ",\"open_vulkan_transfers\":{";
+    oss << "\"active_frames\":"
+        << st.pipeline.open_vulkan_transfers.active_frames << ",";
+    oss << "\"upload_calls\":"
+        << st.pipeline.open_vulkan_transfers.upload_calls << ",";
+    oss << "\"download_calls\":"
+        << st.pipeline.open_vulkan_transfers.download_calls << ",";
+    oss << "\"final_download_calls\":"
+        << st.pipeline.open_vulkan_transfers.final_download_calls << ",";
+    oss << "\"standalone_scaler_upload_calls\":"
+        << st.pipeline.open_vulkan_transfers.standalone_scaler_upload_calls
+        << ",";
+    oss << "\"standalone_scaler_download_calls\":"
+        << st.pipeline.open_vulkan_transfers.standalone_scaler_download_calls
+        << ",";
+    oss << "\"forced_sync_calls\":"
+        << st.pipeline.open_vulkan_transfers.forced_sync_calls;
     oss << "}";
   }
 
@@ -1688,6 +1825,10 @@ ConfigToJson(const studiocast::video::VirtualCameraServiceConfig &cfg) {
   oss << "\"output_format_requested\":\""
       << JsonEscape(
              studiocast::video::PixelFormatName(cfg.pipeline.output_format))
+      << "\",";
+  oss << "\"compute_backend\":\""
+      << JsonEscape(studiocast::video::ComputeBackendPreferenceToString(
+             cfg.pipeline.compute_backend))
       << "\",";
   oss << "\"allow_cpu_resize\":" << BoolJson(cfg.pipeline.allow_cpu_resize)
       << ",";
@@ -2240,6 +2381,7 @@ int main(int argc, char **argv) {
               return std::string("OK ") +
                      StatusToJson(st, current, ast, acurrent, socketPath,
                                   diagnostics.maxine, diagnostics.open_cuda,
+                                  diagnostics.open_vulkan,
                                   diagnostics.open_audio, diagnostics.loopback);
             }
 
@@ -2400,6 +2542,17 @@ int main(int argc, char **argv) {
                          ErrorJson("output_format must be rgb24|yuyv");
                 }
                 newCfg.pipeline.output_format = *parsed;
+              }
+              if (auto it = pc.kv.find("compute_backend");
+                  it != pc.kv.end()) {
+                studiocast::video::ComputeBackendPreference pref;
+                if (!studiocast::video::ParseComputeBackendPreference(
+                        it->second, &pref)) {
+                  return std::string("ERR ") +
+                         ErrorJson("compute_backend must be "
+                                   "auto|cpu|cuda|vulkan");
+                }
+                newCfg.pipeline.compute_backend = pref;
               }
               if (auto it = pc.kv.find("always_on"); it != pc.kv.end()) {
                 bool v = false;

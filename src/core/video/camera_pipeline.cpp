@@ -55,7 +55,144 @@
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+#include "core/vulkan/kernels/resize_bilinear.h"
+#endif
+
 namespace studiocast::video {
+
+std::string ComputeBackendPreferenceToString(ComputeBackendPreference pref) {
+  switch (pref) {
+  case ComputeBackendPreference::cpu:
+    return "cpu";
+  case ComputeBackendPreference::cuda:
+    return "cuda";
+  case ComputeBackendPreference::vulkan:
+    return "vulkan";
+  default:
+    return "auto";
+  }
+}
+
+std::string ComputeBackendKindToString(ComputeBackendKind kind) {
+  switch (kind) {
+  case ComputeBackendKind::cuda:
+    return "cuda";
+  case ComputeBackendKind::vulkan:
+    return "vulkan";
+  default:
+    return "cpu";
+  }
+}
+
+bool ParseComputeBackendPreference(std::string_view value,
+                                   ComputeBackendPreference *out) {
+  std::string v(value);
+  const auto begin = v.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos)
+    return false;
+  const auto end = v.find_last_not_of(" \t\r\n");
+  v = v.substr(begin, end - begin + 1);
+  for (char &c : v) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    c = static_cast<char>(std::tolower(uc));
+  }
+
+  if (v == "auto" || v == "auto_select" || v == "autoselect") {
+    if (out)
+      *out = ComputeBackendPreference::auto_select;
+    return true;
+  }
+  if (v == "cpu") {
+    if (out)
+      *out = ComputeBackendPreference::cpu;
+    return true;
+  }
+  if (v == "cuda") {
+    if (out)
+      *out = ComputeBackendPreference::cuda;
+    return true;
+  }
+  if (v == "vulkan") {
+    if (out)
+      *out = ComputeBackendPreference::vulkan;
+    return true;
+  }
+  return false;
+}
+
+ComputeBackendPreference
+ParseComputeBackendPreferenceOr(std::string_view value,
+                                ComputeBackendPreference fallback) {
+  ComputeBackendPreference parsed = fallback;
+  if (!ParseComputeBackendPreference(value, &parsed))
+    return fallback;
+  return parsed;
+}
+
+ComputeBackendSelection ResolveComputeBackendSelection(
+    ComputeBackendPreference pref, const ComputeBackendAvailability &available,
+    bool compute_work_requested) {
+  ComputeBackendSelection out;
+  out.preference = pref;
+
+  if (!compute_work_requested) {
+    out.resolved = ComputeBackendKind::cpu;
+    return out;
+  }
+
+  const auto mark_degraded = [&](std::string reason) {
+    out.degraded = true;
+    out.fallback_reason = reason;
+    out.degraded_reason = reason;
+  };
+
+  switch (pref) {
+  case ComputeBackendPreference::cpu:
+    out.resolved = ComputeBackendKind::cpu;
+    out.degraded = true;
+    out.degraded_reason =
+        "CPU compute backend selected; GPU-backed video effects are disabled.";
+    return out;
+  case ComputeBackendPreference::cuda:
+    if (available.cuda_available) {
+      out.resolved = ComputeBackendKind::cuda;
+      return out;
+    }
+    out.resolved = ComputeBackendKind::cpu;
+    mark_degraded(available.cuda_unavailable_reason.empty()
+                      ? std::string("CUDA compute backend requested, but CUDA "
+                                    "is not available.")
+                      : available.cuda_unavailable_reason);
+    return out;
+  case ComputeBackendPreference::vulkan:
+    if (available.vulkan_available) {
+      out.resolved = ComputeBackendKind::vulkan;
+      return out;
+    }
+    out.resolved = ComputeBackendKind::cpu;
+    mark_degraded(available.vulkan_unavailable_reason.empty()
+                      ? std::string("Vulkan compute backend requested, but "
+                                    "Vulkan compute is not available in this "
+                                    "build.")
+                      : available.vulkan_unavailable_reason);
+    return out;
+  default:
+    if (available.cuda_available) {
+      out.resolved = ComputeBackendKind::cuda;
+      return out;
+    }
+    if (available.vulkan_available) {
+      out.resolved = ComputeBackendKind::vulkan;
+      return out;
+    }
+    out.resolved = ComputeBackendKind::cpu;
+    mark_degraded("No GPU compute backend is available; using CPU/pass-through "
+                  "fallback.");
+    return out;
+  }
+}
+
 namespace {
 
 std::string ChooseDefaultOutputLoopback(std::string *error) {
@@ -459,11 +596,17 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.scaling_backend_active = scaling_backend_active_;
     s.scaling_from = scaling_from_;
     s.scaling_to = scaling_to_;
+    s.compute_backend_preference = compute_backend_preference_;
+    s.compute_backend_resolved = compute_backend_resolved_;
+    s.compute_backend_active = compute_backend_active_;
+    s.compute_backend_fallback_reason = compute_backend_fallback_reason_;
+    s.compute_backend_degraded_reason = compute_backend_degraded_reason_;
     s.ms_per_frame = ms_per_frame_;
     s.fps_actual = fps_actual_;
     s.perf_sample_frames = perf_sample_frames_;
     s.debug = debug_;
     s.open_cuda_transfers = open_cuda_transfers_;
+    s.open_vulkan_transfers = open_vulkan_transfers_;
     s.maxine_transfers = maxine_transfers_;
   } else {
     // Avoid exposing stale negotiated formats when the pipeline is idle.
@@ -479,11 +622,17 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.scaling_backend_active.clear();
     s.scaling_from = CaptureFormat{};
     s.scaling_to = ActualFormat{};
+    s.compute_backend_preference = compute_backend_preference_;
+    s.compute_backend_resolved = compute_backend_resolved_;
+    s.compute_backend_active = "cpu";
+    s.compute_backend_fallback_reason = compute_backend_fallback_reason_;
+    s.compute_backend_degraded_reason = compute_backend_degraded_reason_;
     s.ms_per_frame = CameraPipelineStatus::MsPerFrame{};
     s.fps_actual = 0.0;
     s.perf_sample_frames = 0;
     s.debug = CameraPipelineStatus::Debug{};
     s.open_cuda_transfers = CameraPipelineStatus::OpenCudaTransfers{};
+    s.open_vulkan_transfers = CameraPipelineStatus::OpenVulkanTransfers{};
     s.maxine_transfers = CameraPipelineStatus::MaxineTransfers{};
   }
   s.frame_index = frame_index_;
@@ -550,12 +699,19 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   scaling_backend_active_.clear();
   scaling_from_ = CaptureFormat{};
   scaling_to_ = ActualFormat{};
+  compute_backend_preference_ =
+      ComputeBackendPreferenceToString(cfg.compute_backend);
+  compute_backend_resolved_ = "cpu";
+  compute_backend_active_ = "cpu";
+  compute_backend_fallback_reason_.clear();
+  compute_backend_degraded_reason_.clear();
   frame_index_ = 0;
   ms_per_frame_ = CameraPipelineStatus::MsPerFrame{};
   fps_actual_ = 0.0;
   perf_sample_frames_ = 0;
   debug_ = CameraPipelineStatus::Debug{};
   open_cuda_transfers_ = CameraPipelineStatus::OpenCudaTransfers{};
+  open_vulkan_transfers_ = CameraPipelineStatus::OpenVulkanTransfers{};
   maxine_transfers_ = CameraPipelineStatus::MaxineTransfers{};
 
   effects_backends_.clear();
@@ -1096,6 +1252,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     none,
     maxine_nvcv,
     open_cuda,
+    vulkan,
   };
 
   auto GpuResizeBackendToActiveString = [](GpuResizeBackend b) -> std::string {
@@ -1104,6 +1261,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       return "gpu:maxine";
     case GpuResizeBackend::open_cuda:
       return "gpu:open_cuda";
+    case GpuResizeBackend::vulkan:
+      return "gpu:vulkan";
     default:
       return "cpu";
     }
@@ -1203,16 +1362,104 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
   };
 
+  struct VulkanGpuScaler {
+    bool initialized = false;
+    std::string init_error;
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    studiocast::vulkan::kernels::ResizeBilinear resize;
+#endif
+
+    bool EnsureInitialized(int src_w, int src_h, int dst_w, int dst_h,
+                           std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+      if (initialized)
+        return true;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      std::string e;
+      if (!resize.EnsureInitialized(src_w, src_h, dst_w, dst_h, &e)) {
+        init_error = e;
+        if (error_out)
+          *error_out = e;
+        return false;
+      }
+      initialized = true;
+      init_error.clear();
+      return true;
+#else
+      (void)src_w;
+      (void)src_h;
+      (void)dst_w;
+      (void)dst_h;
+      init_error =
+          "Open Vulkan resize backend is disabled in this build. Rebuild with "
+          "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
+      if (error_out)
+        *error_out = init_error;
+      return false;
+#endif
+    }
+  };
+
   MaxineGpuScaler maxine_scaler;
   OpenCudaGpuScaler open_cuda_scaler;
+  VulkanGpuScaler vulkan_scaler;
 
+  const bool resize_needed =
+      (capA.width != outA.width) || (capA.height != outA.height);
+  const bool compute_effects_configured = [&] {
+    const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(
+        cfg.effects);
+    const std::set<std::string> planned(plan.ordered_effect_ids.begin(),
+                                        plan.ordered_effect_ids.end());
+    const auto has = [&](std::string_view id) {
+      return planned.count(std::string(id)) != 0;
+    };
+    return has(studiocast::video::effects::contract::
+                   kEffectIdVideoNoiseRemoval) ||
+           has(studiocast::video::effects::contract::kEffectIdEyeContact) ||
+           has(studiocast::video::effects::contract::
+                   kEffectIdVirtualBackgroundBlur) ||
+           has(studiocast::video::effects::contract::
+                   kEffectIdVirtualBackgroundRemove) ||
+           has(studiocast::video::effects::contract::
+                   kEffectIdVirtualBackgroundReplace) ||
+           has(studiocast::video::effects::contract::kEffectIdAutoFrame) ||
+           has(studiocast::video::effects::contract::
+                   kEffectIdVirtualKeyLight) ||
+           has(studiocast::video::effects::contract::kEffectIdVignette);
+  }();
+  const bool compute_backend_allows_cuda =
+      cfg.compute_backend != ComputeBackendPreference::cpu &&
+      cfg.compute_backend != ComputeBackendPreference::vulkan;
+  const bool want_vulkan_runtime =
+      compute_effects_configured &&
+      cfg.compute_backend == ComputeBackendPreference::vulkan;
+  const bool want_vulkan_scaling =
+      want_vulkan_runtime && resize_needed &&
+      (cfg.scaling_backend != ScalingBackendPreference::cpu);
   const bool want_gpu_scaling =
+      resize_needed && compute_effects_configured &&
+      compute_backend_allows_cuda &&
       (cfg.scaling_backend != ScalingBackendPreference::cpu);
   GpuResizeBackend gpu_backend = GpuResizeBackend::none;
   std::string scaling_backend_active = "cpu";
   std::string gpu_backend_init_note;
 
-  if (want_gpu_scaling) {
+  if (want_vulkan_runtime) {
+    std::string vk_err;
+    const int vk_dst_w = want_vulkan_scaling ? outA.width : capA.width;
+    const int vk_dst_h = want_vulkan_scaling ? outA.height : capA.height;
+    if (vulkan_scaler.EnsureInitialized(capA.width, capA.height, vk_dst_w,
+                                        vk_dst_h, &vk_err)) {
+      if (want_vulkan_scaling)
+        gpu_backend = GpuResizeBackend::vulkan;
+    } else {
+      gpu_backend_init_note = "Open Vulkan resize init failed: " + vk_err;
+    }
+    scaling_backend_active = GpuResizeBackendToActiveString(gpu_backend);
+  } else if (want_gpu_scaling) {
     std::string maxine_err;
     bool maxine_ok = true;
     if (!maxine_scaler.cuda.Initialize(&maxine_err))
@@ -1275,6 +1522,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::size_t rgbStride = rgb.stride_bytes;
 
   std::vector<std::uint8_t> rgbScaled;
+  if (outA.width > 0 && outA.height > 0) {
+    rgbScaled.reserve(static_cast<std::size_t>(outA.width) *
+                      static_cast<std::size_t>(outA.height) * 3u);
+  }
   Rgb24BilinearResizePlan cpuResizePlan;
 
   std::vector<std::uint8_t> outBuf(outA.size_image);
@@ -6230,13 +6481,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       return planned.count(std::string(id)) != 0;
     };
 
-    const bool vb_requested = has(studiocast::video::effects::contract::
-                                      kEffectIdVirtualBackgroundBlur) ||
-                              has(studiocast::video::effects::contract::
-                                      kEffectIdVirtualBackgroundRemove) ||
-                              has(studiocast::video::effects::contract::
-                                      kEffectIdVirtualBackgroundReplace);
-
     const bool engine_maxine =
         (fx.engine ==
          studiocast::video::effects::EffectsEnginePreference::maxine);
@@ -6261,7 +6505,89 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (plan.vignette_attach_to_effect_id == id) {
         plan.vignette_attach_to_effect_id.clear();
       }
+      planned.erase(id);
     };
+
+    const auto append_note = [&](std::string_view s) {
+      if (s.empty())
+        return;
+      if (!note.empty())
+        note += "\n";
+      note += std::string(s);
+    };
+
+    const auto plan_requests_compute = [&] {
+      return has(studiocast::video::effects::contract::
+                     kEffectIdVideoNoiseRemoval) ||
+             has(studiocast::video::effects::contract::kEffectIdEyeContact) ||
+             has(studiocast::video::effects::contract::
+                     kEffectIdVirtualBackgroundBlur) ||
+             has(studiocast::video::effects::contract::
+                     kEffectIdVirtualBackgroundRemove) ||
+             has(studiocast::video::effects::contract::
+                     kEffectIdVirtualBackgroundReplace) ||
+             has(studiocast::video::effects::contract::kEffectIdAutoFrame) ||
+             has(studiocast::video::effects::contract::
+                     kEffectIdVirtualKeyLight) ||
+             has(studiocast::video::effects::contract::kEffectIdVignette);
+    };
+
+    const bool compute_work_requested = plan_requests_compute();
+    ComputeBackendAvailability compute_available;
+    compute_available.vulkan_available = vulkan_scaler.initialized;
+    compute_available.vulkan_unavailable_reason =
+        vulkan_scaler.init_error.empty()
+            ? "Vulkan compute backend requested, but Open Vulkan resize is "
+              "not available in this build/runtime."
+            : vulkan_scaler.init_error;
+
+    const auto remove_compute_stages_from_plan = [&] {
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdEyeContact);
+      remove_stage_from_plan(studiocast::video::effects::contract::
+                                 kEffectIdVirtualBackgroundBlur);
+      remove_stage_from_plan(studiocast::video::effects::contract::
+                                 kEffectIdVirtualBackgroundRemove);
+      remove_stage_from_plan(studiocast::video::effects::contract::
+                                 kEffectIdVirtualBackgroundReplace);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdAutoFrame);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVignette);
+    };
+
+    auto compute_selection = ResolveComputeBackendSelection(
+        cfg.compute_backend, compute_available, compute_work_requested);
+
+    if (compute_work_requested &&
+        cfg.compute_backend == ComputeBackendPreference::vulkan) {
+      remove_compute_stages_from_plan();
+      if (vulkan_scaler.initialized) {
+        append_note("Open Vulkan: resize runtime is available; Vulkan "
+                    "video effects and inference are not implemented yet, so "
+                    "GPU-backed video effects are disabled.");
+      } else {
+        append_note(compute_selection.degraded_reason.empty()
+                        ? compute_available.vulkan_unavailable_reason
+                        : compute_selection.degraded_reason);
+      }
+    } else if (compute_work_requested &&
+               compute_selection.resolved == ComputeBackendKind::cpu &&
+               cfg.compute_backend == ComputeBackendPreference::cpu) {
+      remove_compute_stages_from_plan();
+      append_note(compute_selection.degraded_reason);
+    }
+
+    const bool vb_requested = has(studiocast::video::effects::contract::
+                                      kEffectIdVirtualBackgroundBlur) ||
+                              has(studiocast::video::effects::contract::
+                                      kEffectIdVirtualBackgroundRemove) ||
+                              has(studiocast::video::effects::contract::
+                                      kEffectIdVirtualBackgroundReplace);
 
     // Video Noise Removal (Maxine VFX).
     if (has(studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval)) {
@@ -6853,6 +7179,45 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     {
       append_rule_notes();
 
+      const bool have_any_maxine_compute =
+          have_maxine_bg_blur || have_maxine_auto_frame ||
+          have_maxine_eye_contact || have_maxine_relight ||
+          have_maxine_denoise;
+      const bool have_any_cuda_compute =
+          have_any_maxine_compute || have_open_cuda_vb ||
+          have_open_cuda_auto_frame || have_open_cuda_key_light ||
+          have_open_cuda_video_denoise || have_maxine_vignette_only;
+
+      compute_available.cuda_available = have_any_cuda_compute;
+      if (!compute_available.cuda_available) {
+        compute_available.cuda_unavailable_reason =
+            "CUDA compute backend requested, but no CUDA-backed video effect "
+            "was available.";
+      }
+      compute_selection = ResolveComputeBackendSelection(
+          cfg.compute_backend, compute_available, compute_work_requested);
+
+      if (compute_work_requested && have_any_cuda_compute) {
+        compute_selection.resolved = ComputeBackendKind::cuda;
+        compute_selection.degraded = false;
+        compute_selection.fallback_reason.clear();
+        compute_selection.degraded_reason.clear();
+      }
+
+      std::string compute_active_backend = "cpu";
+      if (compute_work_requested &&
+          compute_selection.resolved == ComputeBackendKind::vulkan &&
+          compute_available.vulkan_available) {
+        compute_active_backend = "vulkan";
+      } else if (have_any_maxine_compute) {
+        compute_active_backend = "maxine";
+      } else if (have_any_cuda_compute) {
+        compute_active_backend = "cuda";
+      }
+      if (!compute_work_requested) {
+        compute_active_backend = "cpu";
+      }
+
       for (auto &breaker : optional_effect_breakers)
         breaker.Reset();
       appliedEffectsBaseNote = note;
@@ -6872,6 +7237,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       effects_backends_ = backends;
       effects_note_ = note;
+      compute_backend_preference_ =
+          ComputeBackendPreferenceToString(cfg.compute_backend);
+      compute_backend_resolved_ =
+          ComputeBackendKindToString(compute_selection.resolved);
+      compute_backend_active_ = compute_active_backend;
+      compute_backend_fallback_reason_ = compute_selection.fallback_reason;
+      compute_backend_degraded_reason_ = compute_selection.degraded_reason;
       degraded_effect_ = CameraPipelineStatus::DegradedEffect{};
       if (!note.empty()) {
         last_error_ = note;
@@ -6995,6 +7367,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::uint64_t open_cuda_cpu_tail_auto_frame_face_tracking_calls = 0;
   std::uint64_t open_cuda_cpu_tail_auto_frame_matte_tracking_calls = 0;
   std::uint64_t open_cuda_cpu_tail_auto_frame_cpu_crop_calls = 0;
+
+  std::uint64_t open_vulkan_active_frames = 0;
+  std::uint64_t open_vulkan_upload_calls = 0;
+  std::uint64_t open_vulkan_download_calls = 0;
+  std::uint64_t open_vulkan_final_download_calls = 0;
+  std::uint64_t open_vulkan_standalone_scaler_upload_calls = 0;
+  std::uint64_t open_vulkan_standalone_scaler_download_calls = 0;
+  std::uint64_t open_vulkan_forced_sync_calls = 0;
 
   const bool debug_maxine_transfers =
       (std::getenv("STUDIOCAST_DEBUG_MAXINE_TRANSFERS") != nullptr);
@@ -9167,6 +9547,63 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    // Standalone GPU scaling backend (Open Vulkan): CPU RGB -> Vulkan RGBA
+    // storage buffer, bilinear resize on compute queue, final RGB readback.
+    //
+    // The Vulkan runtime is initialized during setup/reconfiguration. This
+    // frame-path block only uses the selected backend and pre-created command
+    // infrastructure.
+    if (ShouldRunStandaloneGpuScaler(
+            /*scaling_needed=*/(frameW != outW || frameH != outH),
+            /*gpu_backend_active=*/(gpu_backend == GpuResizeBackend::vulkan),
+            /*have_deferred_gpu_out=*/have_deferred_gpu_out,
+            /*allow_cpu_resize=*/cfg.allow_cpu_resize,
+            /*same_backend_effects_ran=*/
+            compute_effects_configured &&
+                cfg.compute_backend == ComputeBackendPreference::vulkan &&
+                vulkan_scaler.initialized)) {
+      std::string gerr;
+      bool ok = vulkan_scaler.initialized;
+      if (!ok) {
+        gerr = vulkan_scaler.init_error.empty()
+                   ? "Open Vulkan GPU scaler not initialized."
+                   : vulkan_scaler.init_error;
+      }
+
+      const std::size_t tightStride = static_cast<std::size_t>(outW) * 3u;
+      if (ok) {
+        rgbScaled.resize(tightStride * static_cast<std::size_t>(outH));
+        if (!vulkan_scaler.resize.Resize(rgbOut, rgbOutStride,
+                                         rgbScaled.data(), tightStride,
+                                         &gerr)) {
+          ok = false;
+        }
+      }
+
+      if (ok) {
+        ++open_vulkan_active_frames;
+        ++open_vulkan_upload_calls;
+        ++open_vulkan_download_calls;
+        ++open_vulkan_final_download_calls;
+        ++open_vulkan_standalone_scaler_upload_calls;
+        ++open_vulkan_standalone_scaler_download_calls;
+        ++open_vulkan_forced_sync_calls;
+        frameW = outW;
+        frameH = outH;
+        rgbOut = rgbScaled.data();
+        rgbOutStride = tightStride;
+        rgbOutBytes = rgbScaled.size();
+      } else {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_error_ = "Open Vulkan GPU scaling failed";
+        if (!gerr.empty())
+          last_error_ += ": " + gerr;
+        last_error_ += ".";
+      }
+    }
+#endif
+
     if (frameW != outW || frameH != outH) {
       if (!cfg.allow_cpu_resize) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -9452,6 +9889,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_cuda_cpu_tail_auto_frame_cpu_crop_calls;
       open_cuda_transfers_.cpu_tail_denoise_calls =
           open_cuda_denoise_cpu_tail_calls;
+
+      open_vulkan_transfers_.active_frames = open_vulkan_active_frames;
+      open_vulkan_transfers_.upload_calls = open_vulkan_upload_calls;
+      open_vulkan_transfers_.download_calls = open_vulkan_download_calls;
+      open_vulkan_transfers_.final_download_calls =
+          open_vulkan_final_download_calls;
+      open_vulkan_transfers_.standalone_scaler_upload_calls =
+          open_vulkan_standalone_scaler_upload_calls;
+      open_vulkan_transfers_.standalone_scaler_download_calls =
+          open_vulkan_standalone_scaler_download_calls;
+      open_vulkan_transfers_.forced_sync_calls =
+          open_vulkan_forced_sync_calls;
 
       maxine_transfers_.active_frames = maxine_active_frames;
       maxine_transfers_.rgb_to_bgr_calls = maxine_rgb_to_bgr_calls;

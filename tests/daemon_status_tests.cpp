@@ -117,6 +117,7 @@ std::string StatusForEffects(
   return StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                       std::filesystem::path("/tmp/studiocastd-test.sock"),
                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                      /*openVulkanJson=*/"",
                       /*openAudioJson=*/"", /*loopbackJson=*/"");
 }
 
@@ -137,6 +138,7 @@ std::string StatusForVideoConfig(
   return StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                       std::filesystem::path("/tmp/studiocastd-test.sock"),
                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                      /*openVulkanJson=*/"",
                       /*openAudioJson=*/"", /*loopbackJson=*/"");
 }
 
@@ -224,6 +226,99 @@ bool TestVideoStatusReportsRequestedOutputFormat() {
                 "actual output_format should remain negotiated object");
 }
 
+bool TestVideoStatusReportsComputeBackend() {
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  videoConfig.pipeline.effects.virtual_background.mode =
+      studiocast::video::effects::VirtualBackgroundMode::blur;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(StatusForVideoConfig(videoConfig),
+                                     &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root) {
+    std::cerr << "status root should be an object\n";
+    return false;
+  }
+
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *compute =
+      ObjectAt(*video, "compute", "video.compute should exist");
+  if (!compute)
+    return false;
+
+  const std::string *preference =
+      StringAt(*compute, "preference", "compute preference should exist");
+  const std::string *resolved = StringAt(
+      *compute, "resolved_backend", "compute resolved backend should exist");
+  const std::string *active =
+      StringAt(*compute, "active_backend", "compute active backend should exist");
+  const std::string *fallback =
+      StringAt(*compute, "fallback_reason", "compute fallback should exist");
+  const std::string *degraded =
+      StringAt(*compute, "degraded_reason", "compute degraded should exist");
+  if (!preference || !resolved || !active || !fallback || !degraded)
+    return false;
+
+  studiocast::util::json::Value configValue;
+  if (!studiocast::util::json::Parse(ConfigToJson(videoConfig), &configValue,
+                                     &error)) {
+    std::cerr << "config JSON should parse: " << error << "\n";
+    return false;
+  }
+  const JsonObject *config = configValue.AsObject();
+  if (!config) {
+    std::cerr << "config root should be an object\n";
+    return false;
+  }
+  const std::string *configBackend =
+      StringAt(*config, "compute_backend",
+               "config should include compute_backend");
+  if (!configBackend)
+    return false;
+
+  return Expect(*preference == "vulkan",
+                "compute preference should report vulkan") &&
+         Expect(*resolved == "cpu",
+                "vulkan unavailable status should resolve to cpu") &&
+         Expect(*active == "cpu",
+                "vulkan unavailable status should be active cpu") &&
+         Expect(fallback->find("Vulkan compute backend requested") !=
+                    std::string::npos,
+                "vulkan unavailable status should include fallback reason") &&
+         Expect(*degraded == *fallback,
+                "vulkan unavailable degraded reason should match fallback") &&
+         Expect(*configBackend == "vulkan",
+                "config JSON should report vulkan compute_backend");
+}
+
+bool TestVideoConfigMapsComputeBackendPreference() {
+  studiocast::config::DaemonConfig daemonConfig;
+  daemonConfig.video_compute_backend = "cuda";
+  auto runtime = studiocast::config::ToVideoServiceConfig(daemonConfig);
+  if (runtime.pipeline.compute_backend !=
+      studiocast::video::ComputeBackendPreference::cuda) {
+    std::cerr << "daemon config should map video.compute.backend=cuda into "
+                 "runtime config\n";
+    return false;
+  }
+
+  runtime.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  studiocast::config::ApplyVideoServiceConfigToDaemonConfig(runtime,
+                                                            &daemonConfig);
+  return Expect(daemonConfig.video_compute_backend == "vulkan",
+                "runtime config should persist compute backend preference");
+}
+
 bool TestVideoStatusReportsCaptureFallbackState() {
   studiocast::video::VirtualCameraServiceStatus videoStatus;
   videoStatus.service_running = true;
@@ -250,6 +345,7 @@ bool TestVideoStatusReportsCaptureFallbackState() {
           StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                        std::filesystem::path("/tmp/studiocastd-test.sock"),
                        /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"",
                        /*openAudioJson=*/"", /*loopbackJson=*/""),
           &rootValue, &error)) {
     std::cerr << "status JSON should parse: " << error << "\n";
@@ -305,6 +401,7 @@ bool TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() {
           StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                        std::filesystem::path("/tmp/studiocastd-test.sock"),
                        /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"",
                        /*openAudioJson=*/"", /*loopbackJson=*/""),
           &rootValue, &error)) {
     std::cerr << "status JSON should parse: " << error << "\n";
@@ -392,6 +489,7 @@ bool TestAudioStatusReportsResolvedSourceAndWarnings() {
           StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                        std::filesystem::path("/tmp/studiocastd-test.sock"),
                        /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"",
                        /*openAudioJson=*/"", /*loopbackJson=*/""),
           &rootValue, &error)) {
     std::cerr << "status JSON should parse: " << error << "\n";
@@ -445,6 +543,7 @@ bool TestAudioStatusPropagatesSourceErrorFromService() {
           StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
                        std::filesystem::path("/tmp/studiocastd-test.sock"),
                        /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"",
                        /*openAudioJson=*/"", /*loopbackJson=*/""),
           &rootValue, &error)) {
     std::cerr << "status JSON should parse: " << error << "\n";
@@ -484,6 +583,8 @@ int main() {
   bool ok = true;
   ok = TestVideoStatusReportsAllowCpuResize() && ok;
   ok = TestVideoStatusReportsRequestedOutputFormat() && ok;
+  ok = TestVideoStatusReportsComputeBackend() && ok;
+  ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;
   ok = TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() && ok;

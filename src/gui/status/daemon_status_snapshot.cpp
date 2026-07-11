@@ -1099,6 +1099,8 @@ DaemonStatusSnapshot DaemonStatusSnapshot::Unreachable(const QString &error) {
                            QStringLiteral("Maxine"));
   out.openCuda = ParseEngine({}, QStringLiteral("open_cuda"),
                              QStringLiteral("Open Video"));
+  out.openVulkan = ParseEngine({}, QStringLiteral("open_vulkan"),
+                               QStringLiteral("Open Vulkan"));
   out.openAudio = ParseEngine({}, QStringLiteral("open_audio"),
                               QStringLiteral("Open Audio"));
   return out;
@@ -1151,6 +1153,17 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
   out.speakers = ParseSpeakers(audio);
   out.microphoneEndpoint = ParseMicrophoneEndpoint(audio, out.microphone);
   out.speakersEndpoint = ParseSpeakersEndpoint(audio, out.speakers);
+  const QJsonObject compute = ObjectValue(video, QStringLiteral("compute"));
+  out.videoComputePreference =
+      compute.value(QStringLiteral("preference")).toString();
+  out.videoComputeResolvedBackend =
+      compute.value(QStringLiteral("resolved_backend")).toString();
+  out.videoComputeActiveBackend =
+      compute.value(QStringLiteral("active_backend")).toString();
+  out.videoComputeFallbackReason =
+      compute.value(QStringLiteral("fallback_reason")).toString();
+  out.videoComputeDegradedReason =
+      compute.value(QStringLiteral("degraded_reason")).toString();
   out.videoEffectsEnginePreference =
       ObjectValue(video, QStringLiteral("video_effects"))
           .value(QStringLiteral("engine"))
@@ -1183,6 +1196,10 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
   out.openCuda =
       ParseEngine(EngineObject(root, QStringLiteral("open_cuda")),
                   QStringLiteral("open_cuda"), QStringLiteral("Open Video"));
+  out.openVulkan =
+      ParseEngine(EngineObject(root, QStringLiteral("open_vulkan")),
+                  QStringLiteral("open_vulkan"),
+                  QStringLiteral("Open Vulkan"));
   out.openAudio =
       ParseEngine(EngineObject(root, QStringLiteral("open_audio")),
                   QStringLiteral("open_audio"), QStringLiteral("Open Audio"));

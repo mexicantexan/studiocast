@@ -143,6 +143,8 @@ std::string DiffPipelineCfg(const CameraPipelineConfig &a,
   add_b("prefer_mjpeg", a.prefer_mjpeg, b.prefer_mjpeg);
   add_i("scaling_backend", static_cast<int>(a.scaling_backend),
         static_cast<int>(b.scaling_backend));
+  add_i("compute_backend", static_cast<int>(a.compute_backend),
+        static_cast<int>(b.compute_backend));
   add_b("allow_cpu_resize", a.allow_cpu_resize, b.allow_cpu_resize);
 
   return first ? std::string("(no changes)") : oss.str();
@@ -230,6 +232,7 @@ bool VirtualCameraService::NeedsPipelineRestart(const CameraPipelineConfig &a,
          a.output_format != b.output_format ||
          a.prefer_mjpeg != b.prefer_mjpeg ||
          a.scaling_backend != b.scaling_backend ||
+         a.compute_backend != b.compute_backend ||
          a.allow_cpu_resize != b.allow_cpu_resize;
 }
 
@@ -737,8 +740,28 @@ void VirtualCameraService::ThreadMain() {
       const bool wants_auto_frame = has(effects::contract::kEffectIdAutoFrame);
       const bool wants_key_light =
           has(effects::contract::kEffectIdVirtualKeyLight);
+      const bool wants_eye_contact = has(effects::contract::kEffectIdEyeContact);
+      const bool wants_vignette = has(effects::contract::kEffectIdVignette);
       const bool wants_open_cuda_fx =
           wants_vb || wants_denoise || wants_auto_frame || wants_key_light;
+      const bool wants_compute_fx = wants_open_cuda_fx || wants_eye_contact ||
+                                    wants_vignette;
+      const bool compute_backend_forces_vulkan =
+          cfg.pipeline.compute_backend == ComputeBackendPreference::vulkan;
+
+      if (wants_compute_fx &&
+          cfg.pipeline.compute_backend == ComputeBackendPreference::cpu) {
+        effectsSuppressed = true;
+        suppressMsg = "CPU compute backend selected; GPU-backed video "
+                      "effects are disabled.";
+        effects_for_pipeline.video_noise_removal.enabled = false;
+        effects_for_pipeline.auto_frame.enabled = false;
+        effects_for_pipeline.eye_contact.enabled = false;
+        effects_for_pipeline.virtual_key_light.enabled = false;
+        effects_for_pipeline.virtual_background.mode =
+            effects::VirtualBackgroundMode::none;
+        effects_for_pipeline.vignette.enabled = false;
+      }
 
       // Effects that currently require Maxine (no Open CUDA/Open Video
       // fallback). NOTE: Eye Contact has an Open Video fallback in AUTO engine
@@ -750,8 +773,11 @@ void VirtualCameraService::ThreadMain() {
       // --- Maxine gate ---
       bool needMaxineGate = false;
       bool needMaxineDiag = false;
-      if (cfg.pipeline.effects.engine ==
-          effects::EffectsEnginePreference::maxine) {
+      if (compute_backend_forces_vulkan) {
+        needMaxineGate = false;
+        needMaxineDiag = false;
+      } else if (cfg.pipeline.effects.engine ==
+                 effects::EffectsEnginePreference::maxine) {
         // Forced Maxine: any Maxine-backed effect blocks the pipeline when
         // unavailable.
         needMaxineGate =
@@ -767,7 +793,7 @@ void VirtualCameraService::ThreadMain() {
         needMaxineDiag = needMaxineGate || wants_open_cuda_fx;
       }
 
-      if (needMaxineDiag) {
+      if (!effectsSuppressed && needMaxineDiag) {
         if (!maxineDiag.has_value() ||
             lastMaxineDiagAt == std::chrono::steady_clock::time_point{} ||
             (now - lastMaxineDiagAt) >= ttl) {
@@ -777,7 +803,7 @@ void VirtualCameraService::ThreadMain() {
         }
       }
 
-      if (needMaxineGate && maxineDiag.has_value()) {
+      if (!effectsSuppressed && needMaxineGate && maxineDiag.has_value()) {
         const auto gate =
             effects::EvaluateMaxineGate(cfg.pipeline.effects, *maxineDiag);
         if (!gate.ok) {
@@ -788,7 +814,8 @@ void VirtualCameraService::ThreadMain() {
       }
 
       // --- Open CUDA gate ---
-      if (!blocked && wants_open_cuda_fx) {
+      if (!effectsSuppressed && !blocked && !compute_backend_forces_vulkan &&
+          wants_open_cuda_fx) {
         bool needOpenCudaGate = false;
         if (cfg.pipeline.effects.engine ==
             effects::EffectsEnginePreference::open_cuda) {

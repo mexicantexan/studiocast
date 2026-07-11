@@ -31,6 +31,45 @@ enum class ScalingBackendPreference {
   gpu,
 };
 
+enum class ComputeBackendPreference {
+  auto_select,
+  cpu,
+  cuda,
+  vulkan,
+};
+
+enum class ComputeBackendKind {
+  cpu,
+  cuda,
+  vulkan,
+};
+
+struct ComputeBackendAvailability {
+  bool cuda_available = false;
+  bool vulkan_available = false;
+  std::string cuda_unavailable_reason;
+  std::string vulkan_unavailable_reason;
+};
+
+struct ComputeBackendSelection {
+  ComputeBackendPreference preference = ComputeBackendPreference::auto_select;
+  ComputeBackendKind resolved = ComputeBackendKind::cpu;
+  bool degraded = false;
+  std::string fallback_reason;
+  std::string degraded_reason;
+};
+
+std::string ComputeBackendPreferenceToString(ComputeBackendPreference pref);
+std::string ComputeBackendKindToString(ComputeBackendKind kind);
+bool ParseComputeBackendPreference(std::string_view value,
+                                   ComputeBackendPreference *out);
+ComputeBackendPreference
+ParseComputeBackendPreferenceOr(std::string_view value,
+                                ComputeBackendPreference fallback);
+ComputeBackendSelection ResolveComputeBackendSelection(
+    ComputeBackendPreference pref, const ComputeBackendAvailability &available,
+    bool compute_work_requested);
+
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0
   std::string output_device; // e.g. /dev/video10 (v4l2loopback)
@@ -54,6 +93,15 @@ struct CameraPipelineConfig {
   // silent high-latency scaling paths.
   ScalingBackendPreference scaling_backend =
       ScalingBackendPreference::auto_select;
+
+  // Video compute backend preference.
+  // - auto_select: prefer CUDA when a usable CUDA path is present; Vulkan can
+  //   be selected here once implemented and available; otherwise CPU.
+  // - cpu: keep compute effects CPU/pass-through only.
+  // - cuda/vulkan: strict explicit choices; they do not silently run the other
+  //   GPU backend.
+  ComputeBackendPreference compute_backend =
+      ComputeBackendPreference::auto_select;
 
   // When false, the pipeline will NOT perform CPU resizing when output
   // dimensions differ from the source frame.
@@ -86,6 +134,14 @@ struct CameraPipelineStatus {
   std::string scaling_backend_active;
   CaptureFormat scaling_from{};
   ActualFormat scaling_to{};
+
+  // Video compute backend selected during setup/reconfiguration. These fields
+  // are status only; they are not computed in the per-frame path.
+  std::string compute_backend_preference = "auto";
+  std::string compute_backend_resolved = "cpu";
+  std::string compute_backend_active = "cpu";
+  std::string compute_backend_fallback_reason;
+  std::string compute_backend_degraded_reason;
 
   int frame_index = 0;
 
@@ -145,6 +201,18 @@ struct CameraPipelineStatus {
     std::uint64_t cpu_tail_auto_frame_cpu_crop_calls = 0;
     std::uint64_t cpu_tail_denoise_calls = 0;
   } open_cuda_transfers{};
+
+  // Optional Open Vulkan transfer counters (emitted in status JSON only when
+  // STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS=1 is set for the daemon).
+  struct OpenVulkanTransfers {
+    std::uint64_t active_frames = 0;
+    std::uint64_t upload_calls = 0;
+    std::uint64_t download_calls = 0;
+    std::uint64_t final_download_calls = 0;
+    std::uint64_t standalone_scaler_upload_calls = 0;
+    std::uint64_t standalone_scaler_download_calls = 0;
+    std::uint64_t forced_sync_calls = 0;
+  } open_vulkan_transfers{};
 
   // Optional Maxine transfer counters (emitted in status JSON only when
   // STUDIOCAST_DEBUG_MAXINE_TRANSFERS=1 is set for the daemon).
@@ -301,6 +369,11 @@ private:
   std::string scaling_backend_active_;
   CaptureFormat scaling_from_{};
   ActualFormat scaling_to_{};
+  std::string compute_backend_preference_ = "auto";
+  std::string compute_backend_resolved_ = "cpu";
+  std::string compute_backend_active_ = "cpu";
+  std::string compute_backend_fallback_reason_;
+  std::string compute_backend_degraded_reason_;
   int frame_index_ = 0;
 
   CameraPipelineStatus::MsPerFrame ms_per_frame_{};
@@ -310,6 +383,7 @@ private:
   CameraPipelineStatus::Debug debug_{};
 
   CameraPipelineStatus::OpenCudaTransfers open_cuda_transfers_{};
+  CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
 
   // Effects: updated live by SetEffects.

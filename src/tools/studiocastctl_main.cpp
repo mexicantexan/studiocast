@@ -746,7 +746,8 @@ void Usage(const char *argv0) {
       << "  " << argv0
       << " video set [input=/dev/videoX|auto] [output=/dev/videoY|auto] "
          "[width=N] [height=N] [fps=N] [always_on=0|1] "
-         "[allow_cpu_resize=0|1] [output_format=rgb24|yuyv]\n"
+         "[allow_cpu_resize=0|1] [compute_backend=auto|cpu|cuda|vulkan] "
+         "[output_format=rgb24|yuyv]\n"
       << "  " << argv0
       << " video vb --model <id> [--mode blur|remove|replace] [--engine "
          "auto|maxine|open_cuda]\n"

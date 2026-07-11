@@ -69,6 +69,11 @@
 #include "core/video/v4l2_capture.h"
 #include "studiocast/version.h"
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+#include "core/vulkan/kernels/resize_bilinear.h"
+#include "core/vulkan/vulkan_device.h"
+#endif
+
 namespace {
 bool hasArg(int argc, char **argv, std::string_view flag) {
   for (int i = 1; i < argc; ++i) {
@@ -506,6 +511,14 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
     std::printf("\n");
   };
 
+  auto reportOptionalSkip = [&](const char *name, const char *reason,
+                                const std::string &detail) {
+    std::printf("[SKIP] %s (%s)", name, reason);
+    if (!detail.empty())
+      std::printf(": %s", detail.c_str());
+    std::printf("\n");
+  };
+
   expectEq("TrimCopy", TrimCopy("  hi \n"), "hi");
   expectVecEq("Split", Split("a,b,,c", ','), {"a", "b", "", "c"});
   expectVecEq("SplitLines", SplitLines("a\r\nb\n\nc"), {"a", "b", "", "c"});
@@ -922,6 +935,37 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
                     sess.options().device_id, 2);
       }
     }
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    {
+      studiocast::vulkan::OpenVulkanDiagnostics vd;
+      vd.compiled_enabled = true;
+      vd.ok = true;
+      vd.runtime_library_found = true;
+      vd.runtime_library_path = "libvulkan.so.1";
+      vd.instance_created = true;
+      vd.physical_device_found = true;
+      vd.compute_queue_available = true;
+      vd.logical_device_created = true;
+      vd.shader_pipeline_created = true;
+      vd.vendor_id = 0x10de;
+      vd.device_id = 123;
+      vd.vendor_name = "NVIDIA";
+      vd.device_name = "Test Vulkan Device";
+      vd.compute_queue_family_index = 2;
+      const std::string j = vd.ToJson();
+      expectContains("OpenVulkanDiagnosticsJson.compiled_enabled", j,
+                     "\"compiled_enabled\":true");
+      expectContains("OpenVulkanDiagnosticsJson.runtime_library_found", j,
+                     "\"runtime_library_found\":true");
+      expectContains("OpenVulkanDiagnosticsJson.compute_queue_available", j,
+                     "\"compute_queue_available\":true");
+      expectContains("OpenVulkanDiagnosticsJson.shader_pipeline_created", j,
+                     "\"shader_pipeline_created\":true");
+      expectContains("OpenVulkanDiagnosticsJson.device_name", j,
+                     "\"device_name\":\"Test Vulkan Device\"");
+    }
+#endif
 
     // Open Audio diagnostics JSON keeps legacy ORT fields and includes
     // provider/runtime details used by daemon/GUI/CLI diagnostics.
@@ -1562,6 +1606,79 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
                         "built without ONNX Runtime", std::string());
 #endif
   }
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  // Open Vulkan resize runtime (optional): skips when no loader/device is
+  // available, but validates upload/compute/download against the CPU resize
+  // contract when the runtime exists.
+  {
+    auto runVulkanResizeCheck = [&](int src_w, int src_h, int dst_w,
+                                    int dst_h) -> bool {
+      const std::size_t src_stride = static_cast<std::size_t>(src_w) * 3u;
+      const std::size_t dst_stride = static_cast<std::size_t>(dst_w) * 3u;
+      std::vector<std::uint8_t> src_rgb(src_stride *
+                                        static_cast<std::size_t>(src_h));
+      for (int y = 0; y < src_h; ++y) {
+        for (int x = 0; x < src_w; ++x) {
+          const std::size_t i = static_cast<std::size_t>(y) * src_stride +
+                                static_cast<std::size_t>(x) * 3u;
+          src_rgb[i + 0] = static_cast<std::uint8_t>((x * 17 + y * 29) & 0xff);
+          src_rgb[i + 1] = static_cast<std::uint8_t>((x * 31 + y * 7) & 0xff);
+          src_rgb[i + 2] = static_cast<std::uint8_t>((x * 5 + y * 43) & 0xff);
+        }
+      }
+
+      std::vector<std::uint8_t> cpu_resized;
+      std::string err;
+      if (!studiocast::video::ResizeRgb24Bilinear(
+              src_rgb.data(), src_w, src_h, src_stride, dst_w, dst_h,
+              &cpu_resized, dst_stride, &err)) {
+        ++failures;
+        std::printf("[FAIL] OpenVulkanResize\n  CPU reference failed: %s\n",
+                    err.c_str());
+        return false;
+      }
+
+      studiocast::vulkan::kernels::ResizeBilinear vk_resize;
+      if (!vk_resize.EnsureInitialized(src_w, src_h, dst_w, dst_h, &err)) {
+        reportOptionalSkip("OpenVulkanResize", "Vulkan unavailable", err);
+        return false;
+      }
+
+      std::vector<std::uint8_t> vk_resized(
+          dst_stride * static_cast<std::size_t>(dst_h), 0xcd);
+      if (!vk_resize.Resize(src_rgb.data(), src_stride, vk_resized.data(),
+                            dst_stride, &err)) {
+        ++failures;
+        std::printf("[FAIL] OpenVulkanResize\n  Resize failed: %s\n",
+                    err.c_str());
+        return false;
+      }
+
+      int max_abs_diff = 0;
+      for (std::size_t i = 0; i < cpu_resized.size() && i < vk_resized.size();
+           ++i) {
+        const int d = static_cast<int>(cpu_resized[i]) -
+                      static_cast<int>(vk_resized[i]);
+        max_abs_diff = std::max(max_abs_diff, d < 0 ? -d : d);
+      }
+      if (max_abs_diff > 1) {
+        ++failures;
+        std::printf("[FAIL] OpenVulkanResize\n  max_abs_diff=%d "
+                    "(want <= 1)\n",
+                    max_abs_diff);
+        return false;
+      }
+      return true;
+    };
+
+    if (runVulkanResizeCheck(4, 4, 8, 8))
+      (void)runVulkanResizeCheck(8, 8, 4, 4);
+  }
+#else
+  reportOptionalSkip("OpenVulkanResize", "backend disabled in build",
+                     std::string());
+#endif
 
   // CUDA kernels (optional build): bilinear resize + preprocess-to-NCHW.
   {

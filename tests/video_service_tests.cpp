@@ -987,6 +987,74 @@ bool TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers() {
   return true;
 }
 
+bool TestComputeBackendSelectionPolicyIsNoGpuSafe() {
+  using studiocast::video::ComputeBackendAvailability;
+  using studiocast::video::ComputeBackendKind;
+  using studiocast::video::ComputeBackendPreference;
+  using studiocast::video::ResolveComputeBackendSelection;
+
+  ComputeBackendAvailability available;
+  available.cuda_available = true;
+  available.vulkan_available = true;
+  auto selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::auto_select, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cuda || selected.degraded) {
+    std::cerr << "auto compute backend should prefer CUDA when CUDA and Vulkan "
+                 "are available\n";
+    return false;
+  }
+
+  available.cuda_available = false;
+  available.vulkan_available = true;
+  selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::auto_select, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::vulkan || selected.degraded) {
+    std::cerr << "auto compute backend should choose Vulkan when CUDA is "
+                 "unavailable and Vulkan is available\n";
+    return false;
+  }
+
+  available.cuda_available = false;
+  available.vulkan_available = true;
+  available.cuda_unavailable_reason = "cuda unavailable";
+  selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::cuda, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cpu || !selected.degraded ||
+      selected.fallback_reason.empty()) {
+    std::cerr << "explicit CUDA should degrade visibly to CPU instead of "
+                 "running Vulkan\n";
+    return false;
+  }
+
+  available.cuda_available = true;
+  available.vulkan_available = false;
+  available.vulkan_unavailable_reason = "vulkan unavailable";
+  selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::vulkan, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cpu || !selected.degraded ||
+      selected.fallback_reason.empty()) {
+    std::cerr << "explicit Vulkan should degrade visibly to CPU instead of "
+                 "running CUDA\n";
+    return false;
+  }
+
+  available.cuda_available = true;
+  available.vulkan_available = true;
+  selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::auto_select, available,
+      /*compute_work_requested=*/false);
+  if (selected.resolved != ComputeBackendKind::cpu || selected.degraded) {
+    std::cerr << "no-effects path should resolve compute backend to CPU\n";
+    return false;
+  }
+
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1023,6 +1091,8 @@ int main() {
        &TestVideoOutputRecoveryClearsUnavailableError},
       {"standalone GPU scaler skips inactive backend transfers",
        &TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers},
+      {"compute backend selection policy is no-GPU safe",
+       &TestComputeBackendSelectionPolicyIsNoGpuSafe},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},

@@ -133,6 +133,12 @@ if (STUDIOCAST_ENABLE_OPEN_AUDIO)
     endif()
 endif()
 
+if (STUDIOCAST_ENABLE_OPEN_VULKAN)
+    message(STATUS "Open Vulkan backend enabled (runtime-loaded Vulkan; no SDK link dependency).")
+else()
+    message(STATUS "Open Vulkan backend disabled.")
+endif()
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
@@ -394,6 +400,25 @@ else()
     target_compile_definitions(studiocast_core PRIVATE STUDIOCAST_HAVE_X86_SIMD=0)
 endif()
 
+if (STUDIOCAST_ENABLE_OPEN_VULKAN)
+    target_sources(studiocast_core PRIVATE
+            src/core/vulkan/vulkan_loader.h
+            src/core/vulkan/vulkan_loader.cpp
+            src/core/vulkan/vulkan_device.h
+            src/core/vulkan/vulkan_device.cpp
+            src/core/vulkan/vulkan_image.h
+            src/core/vulkan/vulkan_image.cpp
+            src/core/vulkan/vulkan_tensor.h
+            src/core/vulkan/vulkan_tensor.cpp
+            src/core/vulkan/kernels/resize_bilinear.h
+            src/core/vulkan/kernels/resize_bilinear.cpp
+            src/core/vulkan/kernels/utility_kernels.h
+            src/core/vulkan/kernels/utility_kernels.cpp
+            src/core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h
+            src/core/vulkan/kernels/shaders/utility_kernels_spv.h
+    )
+endif()
+
 # Video color conversion is extremely hot (runs every frame). In Debug builds the lack of
 # optimization can make the virtual camera feel laggy. Force optimization for this TU.
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -450,6 +475,7 @@ endif()
 
 target_compile_definitions(studiocast_core PUBLIC
     STUDIOCAST_ENABLE_OPEN_CUDA=$<BOOL:${STUDIOCAST_ENABLE_OPEN_CUDA}>
+    STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
     STUDIOCAST_ENABLE_OPEN_AUDIO=$<BOOL:${STUDIOCAST_ENABLE_OPEN_AUDIO}>
     STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>
 )
@@ -709,6 +735,26 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
             AUTOUIC OFF
             AUTORCC OFF
     )
+
+    add_executable(studiocast-resize-backend-bench
+            src/tools/studiocast_resize_backend_bench_main.cpp
+    )
+
+    target_link_libraries(studiocast-resize-backend-bench PRIVATE studiocast_core)
+
+    target_include_directories(studiocast-resize-backend-bench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-resize-backend-bench)
+    studiocast_enable_sanitizers(studiocast-resize-backend-bench)
+
+    set_target_properties(studiocast-resize-backend-bench PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
 endif()
 
 
@@ -822,8 +868,15 @@ if (BUILD_TESTING)
         set_tests_properties(studiocast-embedded-ptx-freshness PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+        add_test(NAME studiocast-embedded-vulkan-spv-freshness
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dev/validate_embedded_vulkan_spv.py"
+                        --source-root "${CMAKE_CURRENT_SOURCE_DIR}")
+        set_tests_properties(studiocast-embedded-vulkan-spv-freshness PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
     else()
-        message(STATUS "Skipping studiocast-embedded-ptx-freshness because Python3 was not found.")
+        message(STATUS "Skipping embedded shader freshness tests because Python3 was not found.")
     endif()
 
     add_executable(studiocast-maxine-paths-tests
@@ -1172,6 +1225,33 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-video-tests COMMAND studiocast-video-tests)
+
+    if (STUDIOCAST_ENABLE_OPEN_VULKAN)
+        add_executable(studiocast-vulkan-kernel-tests
+                tests/vulkan_kernel_tests.cpp
+        )
+
+        target_link_libraries(studiocast-vulkan-kernel-tests PRIVATE
+                studiocast_core
+        )
+
+        target_include_directories(studiocast-vulkan-kernel-tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${STUDIOCAST_GENERATED_DIR}"
+        )
+
+        studiocast_set_project_warnings(studiocast-vulkan-kernel-tests)
+        studiocast_enable_sanitizers(studiocast-vulkan-kernel-tests)
+
+        set_target_properties(studiocast-vulkan-kernel-tests PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF
+        )
+
+        add_test(NAME studiocast-vulkan-kernel-tests
+                COMMAND studiocast-vulkan-kernel-tests)
+    endif()
 
     add_executable(studiocast-v4l2loopback-diagnostics-tests
             tests/v4l2loopback_diagnostics_tests.cpp

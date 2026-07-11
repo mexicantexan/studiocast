@@ -110,6 +110,7 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
                         " -DBUILD_TESTING=OFF"
                         " -DSTUDIOCAST_ENABLE_DLIB=OFF"
                         " -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON"
+                        " -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON"
                         " -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON"
                         " -DCMAKE_DISABLE_FIND_PACKAGE_onnxruntime=ON"
                         " -DCMAKE_DISABLE_FIND_PACKAGE_Python3=ON"
@@ -126,14 +127,45 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
   }
 
   const std::string cache = ReadFile(buildDir / "CMakeCache.txt");
-  return ExpectContains("nested CMake cache", cache,
-                        "STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=ON") &&
-         ExpectContains("nested CMake cache", cache,
-                        "STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON") &&
-         Expect(cache.find("STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=OFF") ==
-                    std::string::npos,
-                "Open CUDA must not be force-cached OFF when ONNX Runtime is "
-                "missing");
+  bool ok = ExpectContains("nested CMake cache", cache,
+                           "STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=ON") &&
+            ExpectContains("nested CMake cache", cache,
+                           "STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=ON") &&
+            ExpectContains("nested CMake cache", cache,
+                           "STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON") &&
+            Expect(cache.find("STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=OFF") ==
+                       std::string::npos,
+                   "Open CUDA must not be force-cached OFF when ONNX Runtime is "
+                   "missing");
+  if (!ok)
+    return false;
+
+  const fs::path defaultBuildDir = temp.path() / "build-defaults";
+  command = "env -u ONNXRUNTIME_ROOT PKG_CONFIG_LIBDIR=" +
+            ShellQuote(noPkgConfig.string()) + " " +
+            ShellQuote(STUDIOCAST_CMAKE_COMMAND) + " -S " +
+            ShellQuote(repo.string()) + " -B " +
+            ShellQuote(defaultBuildDir.string()) +
+            " -DBUILD_TESTING=OFF"
+            " -DSTUDIOCAST_ENABLE_DLIB=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF"
+            " -DCMAKE_DISABLE_FIND_PACKAGE_onnxruntime=ON"
+            " -DCMAKE_DISABLE_FIND_PACKAGE_Python3=ON"
+            " 2>&1";
+  const auto defaultResult =
+      studiocast::util::ExecCapture(command, options);
+  if (!Expect(defaultResult.exit_code == 0,
+              "nested CMake configure with Open Vulkan default should "
+              "succeed")) {
+    std::cerr << defaultResult.stdout_str << "\n";
+    return false;
+  }
+
+  const std::string defaultCache =
+      ReadFile(defaultBuildDir / "CMakeCache.txt");
+  return ExpectContains("nested default CMake cache", defaultCache,
+                        "STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=OFF");
 }
 
 } // namespace

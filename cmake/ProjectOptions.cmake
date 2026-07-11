@@ -12,6 +12,8 @@ if(UNIX AND NOT APPLE)
 endif()
 option(STUDIOCAST_ENABLE_OPEN_CUDA "Enable Open CUDA backend (requires ONNX Runtime + CUDA EP)" ${_studiocast_default_open_cuda})
 
+option(STUDIOCAST_ENABLE_OPEN_VULKAN "Enable Open Vulkan backend (runtime-loaded Vulkan compute)" OFF)
+
 set(_studiocast_default_open_audio OFF)
 if(UNIX AND NOT APPLE)
   set(_studiocast_default_open_audio ON)

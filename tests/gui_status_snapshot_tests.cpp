@@ -121,6 +121,15 @@ bool TestStatusJsonCompatibilityShapes() {
             "models":[{"id":"matting","display_name":"Matting"}],
             "missing_models":{"denoise":"Missing denoise model."},
             "install_hints":["studiocast-open install-hints"]
+          },
+          "open_vulkan":{
+            "compiled_enabled":false,
+            "ok":false,
+            "runtime_library_found":false,
+            "compute_queue_available":false,
+            "shader_pipeline_created":false,
+            "fallback_reason":"disabled_in_build",
+            "install_hints":["rebuild with vulkan"]
           }
         },
         "open_audio":{
@@ -131,6 +140,13 @@ bool TestStatusJsonCompatibilityShapes() {
         },
         "video":{
           "enabled":false,
+          "compute":{
+            "preference":"vulkan",
+            "resolved_backend":"cpu",
+            "active_backend":"cpu",
+            "fallback_reason":"Vulkan unavailable.",
+            "degraded_reason":"Vulkan unavailable."
+          },
           "virtual_device_present":true,
           "virtual_device_available":true,
           "consumer_count":0,
@@ -179,6 +195,18 @@ bool TestStatusJsonCompatibilityShapes() {
                 "speakers should be ready") &&
          Expect(s.videoEffectsEnginePreference == QStringLiteral("open_cuda"),
                 "video engine preference should parse") &&
+         Expect(s.videoComputePreference == QStringLiteral("vulkan"),
+                "video compute preference should parse") &&
+         Expect(s.videoComputeResolvedBackend == QStringLiteral("cpu"),
+                "video compute resolved backend should parse") &&
+         Expect(s.videoComputeActiveBackend == QStringLiteral("cpu"),
+                "video compute active backend should parse") &&
+         Expect(s.videoComputeFallbackReason ==
+                    QStringLiteral("Vulkan unavailable."),
+                "video compute fallback reason should parse") &&
+         Expect(s.videoComputeDegradedReason ==
+                    QStringLiteral("Vulkan unavailable."),
+                "video compute degraded reason should parse") &&
          Expect(s.audioEffectsEnginePreference == QStringLiteral("open_source"),
                 "audio engine preference should parse") &&
          Expect(s.maxine.present && !s.maxine.supported,
@@ -192,6 +220,11 @@ bool TestStatusJsonCompatibilityShapes() {
          Expect(s.openCuda.installHints.contains(
                     QStringLiteral("studiocast-open install-hints")),
                 "open_cuda install hints should parse") &&
+         Expect(s.openVulkan.present && !s.openVulkan.ok,
+                "nested open_vulkan diagnostics should parse") &&
+         Expect(s.openVulkan.installHints.contains(
+                    QStringLiteral("rebuild with vulkan")),
+                "open_vulkan install hints should parse") &&
          Expect(s.openAudio.present && s.openAudio.ok &&
                     s.openAudio.installedModelCount == 1,
                 "top-level open_audio diagnostics should parse");

@@ -36,6 +36,9 @@ struct DaemonConfig {
   // "auto" = use GPU scaling when available; otherwise CPU.
   std::string video_scaling_backend = "auto";
 
+  // Video compute backend preference: "auto" | "cpu" | "cuda" | "vulkan".
+  std::string video_compute_backend = "auto";
+
   // Allow CPU resize/scale fallback when output size mismatches cannot be
   // resolved on GPU. Users can opt out from Advanced settings.
   bool video_allow_cpu_resize = true;

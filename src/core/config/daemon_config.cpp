@@ -207,6 +207,25 @@ DaemonConfig LoadDaemonConfig() {
         s.video_scaling_backend = ScalingBackendPreferenceToString(pref);
       }
 
+      if (auto it = kv.find("video.compute.backend"); it != kv.end()) {
+        const auto pref = studiocast::video::ParseComputeBackendPreferenceOr(
+            it->second,
+            studiocast::video::ParseComputeBackendPreferenceOr(
+                s.video_compute_backend,
+                studiocast::video::ComputeBackendPreference::auto_select));
+        s.video_compute_backend =
+            studiocast::video::ComputeBackendPreferenceToString(pref);
+      }
+      if (auto it = kv.find("video.compute_backend"); it != kv.end()) {
+        const auto pref = studiocast::video::ParseComputeBackendPreferenceOr(
+            it->second,
+            studiocast::video::ParseComputeBackendPreferenceOr(
+                s.video_compute_backend,
+                studiocast::video::ComputeBackendPreference::auto_select));
+        s.video_compute_backend =
+            studiocast::video::ComputeBackendPreferenceToString(pref);
+      }
+
       if (auto it = kv.find("video.scaling.allow_cpu_resize"); it != kv.end()) {
         s.video_allow_cpu_resize =
             ParseBool(it->second, s.video_allow_cpu_resize);
@@ -676,6 +695,7 @@ bool SaveDaemonConfig(const DaemonConfig &s, std::string *error) {
   out << "video.prefer_mjpeg = " << (s.video_prefer_mjpeg ? "true" : "false")
       << "\n";
   out << "video.scaling.backend = " << s.video_scaling_backend << "\n";
+  out << "video.compute.backend = " << s.video_compute_backend << "\n";
   out << "video.scaling.allow_cpu_resize = "
       << (s.video_allow_cpu_resize ? "true" : "false") << "\n";
   out << "\n";
@@ -737,6 +757,10 @@ ToVideoServiceConfig(const DaemonConfig &s) {
   cfg.pipeline.scaling_backend = ParseScalingBackendPreference(
       s.video_scaling_backend,
       studiocast::video::ScalingBackendPreference::auto_select);
+  cfg.pipeline.compute_backend =
+      studiocast::video::ParseComputeBackendPreferenceOr(
+          s.video_compute_backend,
+          studiocast::video::ComputeBackendPreference::auto_select);
   cfg.pipeline.allow_cpu_resize = s.video_allow_cpu_resize;
   cfg.pipeline.effects = s.video_effects;
 
@@ -764,6 +788,9 @@ void ApplyVideoServiceConfigToDaemonConfig(
   out->video_prefer_mjpeg = cfg.pipeline.prefer_mjpeg;
   out->video_scaling_backend =
       ScalingBackendPreferenceToString(cfg.pipeline.scaling_backend);
+  out->video_compute_backend =
+      studiocast::video::ComputeBackendPreferenceToString(
+          cfg.pipeline.compute_backend);
   out->video_allow_cpu_resize = cfg.pipeline.allow_cpu_resize;
   out->video_effects = cfg.pipeline.effects;
 

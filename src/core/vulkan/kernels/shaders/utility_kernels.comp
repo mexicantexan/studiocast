@@ -1,0 +1,372 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer U8Src0 {
+  uint u8_src0[];
+};
+
+layout(std430, binding = 1) readonly buffer U8Src1 {
+  uint u8_src1[];
+};
+
+layout(std430, binding = 2) readonly buffer F32Src0 {
+  float f32_src0[];
+};
+
+layout(std430, binding = 3) writeonly buffer U8Out {
+  uint u8_out[];
+};
+
+layout(std430, binding = 4) buffer F32Out {
+  float f32_out[];
+};
+
+layout(std430, binding = 5) buffer Scratch {
+  uint scratch[];
+};
+
+struct Params {
+  uint src_w;
+  uint src_h;
+  uint src_pitch;
+  uint src1_pitch;
+  uint alpha_pitch;
+  uint dst_w;
+  uint dst_h;
+  uint dst_pitch;
+  uint scratch_pitch;
+  uint src_is_bgr;
+  uint dst_is_bgr;
+  int radius;
+  float crop_x;
+  float crop_y;
+  float crop_w;
+  float crop_h;
+  float mean0;
+  float mean1;
+  float mean2;
+  float inv_std0;
+  float inv_std1;
+  float inv_std2;
+  uint bg0;
+  uint bg1;
+  uint bg2;
+  uint reserved0;
+  float target_r;
+  float target_g;
+  float target_b;
+  float intensity;
+  float direction;
+};
+
+layout(std430, binding = 6) readonly buffer ParamsBlock {
+  Params pc;
+};
+
+layout(push_constant) uniform Push {
+  uint op;
+} push;
+
+const uint OP_CROP_RESIZE_U8X3 = 1u;
+const uint OP_PREPROCESS_TO_NCHW = 2u;
+const uint OP_RESIZE_F32_1 = 3u;
+const uint OP_BLUR_H_U8X3 = 4u;
+const uint OP_BLUR_V_U8X3 = 5u;
+const uint OP_BLUR_H_F32_1 = 6u;
+const uint OP_BLUR_V_F32_1 = 7u;
+const uint OP_COMPOSITE_BG = 8u;
+const uint OP_COMPOSITE_SOLID = 9u;
+const uint OP_KEY_LIGHT = 10u;
+const uint OP_COPY_U8X3 = 11u;
+const uint OP_COPY_F32_1 = 12u;
+
+uint byte_channel(uint px, uint channel) {
+  return (px >> (channel * 8u)) & 255u;
+}
+
+uint pack_rgb(uint c0, uint c1, uint c2) {
+  return (255u << 24u) | ((c2 & 255u) << 16u) | ((c1 & 255u) << 8u) |
+         (c0 & 255u);
+}
+
+uint round_clamp_byte(float v) {
+  if (v <= 0.0)
+    return 0u;
+  if (v >= 255.0)
+    return 255u;
+  return uint(v + 0.5);
+}
+
+int clamp_int(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+float clamp01(float v) {
+  return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+
+float clamp_alpha01(float v) {
+  if (isnan(v) || isinf(v))
+    return 0.0;
+  return clamp01(v);
+}
+
+uint sample_u8_src0(uint x, uint y, uint pitch) {
+  return u8_src0[y * pitch + x];
+}
+
+float sample_f32_src0(uint x, uint y, uint pitch) {
+  return f32_src0[y * pitch + x];
+}
+
+uint resize_u8_pixel(uint x, uint y) {
+  float scale_x = pc.crop_w / float(pc.dst_w);
+  float scale_y = pc.crop_h / float(pc.dst_h);
+  float src_x = pc.crop_x + (float(x) + 0.5) * scale_x - 0.5;
+  float src_y = pc.crop_y + (float(y) + 0.5) * scale_y - 0.5;
+
+  int x0 = clamp_int(int(src_x), 0, int(pc.src_w) - 1);
+  int y0 = clamp_int(int(src_y), 0, int(pc.src_h) - 1);
+  int x1 = clamp_int(x0 + 1, 0, int(pc.src_w) - 1);
+  int y1 = clamp_int(y0 + 1, 0, int(pc.src_h) - 1);
+  float fx = src_x - float(x0);
+  float fy = src_y - float(y0);
+
+  uint p00 = sample_u8_src0(uint(x0), uint(y0), pc.src_pitch);
+  uint p10 = sample_u8_src0(uint(x1), uint(y0), pc.src_pitch);
+  uint p01 = sample_u8_src0(uint(x0), uint(y1), pc.src_pitch);
+  uint p11 = sample_u8_src0(uint(x1), uint(y1), pc.src_pitch);
+
+  uint out0 = 0u;
+  uint out1 = 0u;
+  uint out2 = 0u;
+  for (uint c = 0u; c < 3u; ++c) {
+    float v00 = float(byte_channel(p00, c));
+    float v10 = float(byte_channel(p10, c));
+    float v01 = float(byte_channel(p01, c));
+    float v11 = float(byte_channel(p11, c));
+    float top = v00 + fx * (v10 - v00);
+    float bottom = v01 + fx * (v11 - v01);
+    uint byte_value = round_clamp_byte(top + fy * (bottom - top));
+    if (c == 0u)
+      out0 = byte_value;
+    else if (c == 1u)
+      out1 = byte_value;
+    else
+      out2 = byte_value;
+  }
+  return pack_rgb(out0, out1, out2);
+}
+
+void preprocess_pixel(uint x, uint y) {
+  float scale_x = float(pc.src_w) / float(pc.dst_w);
+  float scale_y = float(pc.src_h) / float(pc.dst_h);
+  float src_x = (float(x) + 0.5) * scale_x - 0.5;
+  float src_y = (float(y) + 0.5) * scale_y - 0.5;
+
+  int x0 = clamp_int(int(src_x), 0, int(pc.src_w) - 1);
+  int y0 = clamp_int(int(src_y), 0, int(pc.src_h) - 1);
+  int x1 = clamp_int(x0 + 1, 0, int(pc.src_w) - 1);
+  int y1 = clamp_int(y0 + 1, 0, int(pc.src_h) - 1);
+  float fx = src_x - float(x0);
+  float fy = src_y - float(y0);
+
+  uint p00 = sample_u8_src0(uint(x0), uint(y0), pc.src_pitch);
+  uint p10 = sample_u8_src0(uint(x1), uint(y0), pc.src_pitch);
+  uint p01 = sample_u8_src0(uint(x0), uint(y1), pc.src_pitch);
+  uint p11 = sample_u8_src0(uint(x1), uint(y1), pc.src_pitch);
+
+  uint r_i = pc.src_is_bgr != 0u ? 2u : 0u;
+  uint b_i = pc.src_is_bgr != 0u ? 0u : 2u;
+  float r00 = float(byte_channel(p00, r_i));
+  float g00 = float(byte_channel(p00, 1u));
+  float b00 = float(byte_channel(p00, b_i));
+  float r10 = float(byte_channel(p10, r_i));
+  float g10 = float(byte_channel(p10, 1u));
+  float b10 = float(byte_channel(p10, b_i));
+  float r01 = float(byte_channel(p01, r_i));
+  float g01 = float(byte_channel(p01, 1u));
+  float b01 = float(byte_channel(p01, b_i));
+  float r11 = float(byte_channel(p11, r_i));
+  float g11 = float(byte_channel(p11, 1u));
+  float b11 = float(byte_channel(p11, b_i));
+
+  float r0 = r00 + fx * (r10 - r00);
+  float g0 = g00 + fx * (g10 - g00);
+  float b0 = b00 + fx * (b10 - b00);
+  float r1 = r01 + fx * (r11 - r01);
+  float g1 = g01 + fx * (g11 - g01);
+  float b1 = b01 + fx * (b11 - b01);
+
+  float inv255 = 1.0 / 255.0;
+  float r = (r0 + fy * (r1 - r0)) * inv255;
+  float g = (g0 + fy * (g1 - g0)) * inv255;
+  float b = (b0 + fy * (b1 - b0)) * inv255;
+
+  float out0 = pc.dst_is_bgr != 0u ? b : r;
+  float out1 = g;
+  float out2 = pc.dst_is_bgr != 0u ? r : b;
+  uint hw = pc.dst_w * pc.dst_h;
+  uint base = y * pc.dst_w + x;
+  f32_out[base] = (out0 - pc.mean0) * pc.inv_std0;
+  f32_out[hw + base] = (out1 - pc.mean1) * pc.inv_std1;
+  f32_out[hw + hw + base] = (out2 - pc.mean2) * pc.inv_std2;
+}
+
+float resize_f32_value(uint x, uint y) {
+  float scale_x = float(pc.src_w) / float(pc.dst_w);
+  float scale_y = float(pc.src_h) / float(pc.dst_h);
+  float src_x = clamp((float(x) + 0.5) * scale_x - 0.5, 0.0,
+                      float(pc.src_w) - 1.0);
+  float src_y = clamp((float(y) + 0.5) * scale_y - 0.5, 0.0,
+                      float(pc.src_h) - 1.0);
+
+  int x0 = int(floor(src_x));
+  int y0 = int(floor(src_y));
+  int x1 = clamp_int(x0 + 1, 0, int(pc.src_w) - 1);
+  int y1 = clamp_int(y0 + 1, 0, int(pc.src_h) - 1);
+  float fx = src_x - float(x0);
+  float fy = src_y - float(y0);
+
+  float v00 = sample_f32_src0(uint(x0), uint(y0), pc.src_pitch);
+  float v10 = sample_f32_src0(uint(x1), uint(y0), pc.src_pitch);
+  float v01 = sample_f32_src0(uint(x0), uint(y1), pc.src_pitch);
+  float v11 = sample_f32_src0(uint(x1), uint(y1), pc.src_pitch);
+  float v0 = v00 + (v10 - v00) * fx;
+  float v1 = v01 + (v11 - v01) * fx;
+  return v0 + (v1 - v0) * fy;
+}
+
+void blur_h_u8(uint x, uint y) {
+  int radius = max(pc.radius, 0);
+  int count = radius * 2 + 1;
+  int sum0 = 0;
+  int sum1 = 0;
+  int sum2 = 0;
+  for (int dx = -radius; dx <= radius; ++dx) {
+    int xx = clamp_int(int(x) + dx, 0, int(pc.src_w) - 1);
+    uint px = sample_u8_src0(uint(xx), y, pc.src_pitch);
+    sum0 += int(byte_channel(px, 0u));
+    sum1 += int(byte_channel(px, 1u));
+    sum2 += int(byte_channel(px, 2u));
+  }
+  uint c0 = uint((sum0 + count / 2) / count);
+  uint c1 = uint((sum1 + count / 2) / count);
+  uint c2 = uint((sum2 + count / 2) / count);
+  scratch[y * pc.scratch_pitch + x] = pack_rgb(c0, c1, c2);
+}
+
+void blur_v_u8(uint x, uint y) {
+  int radius = max(pc.radius, 0);
+  int count = radius * 2 + 1;
+  int sum0 = 0;
+  int sum1 = 0;
+  int sum2 = 0;
+  for (int dy = -radius; dy <= radius; ++dy) {
+    int yy = clamp_int(int(y) + dy, 0, int(pc.src_h) - 1);
+    uint px = scratch[uint(yy) * pc.scratch_pitch + x];
+    sum0 += int(byte_channel(px, 0u));
+    sum1 += int(byte_channel(px, 1u));
+    sum2 += int(byte_channel(px, 2u));
+  }
+  uint c0 = uint((sum0 + count / 2) / count);
+  uint c1 = uint((sum1 + count / 2) / count);
+  uint c2 = uint((sum2 + count / 2) / count);
+  u8_out[y * pc.dst_pitch + x] = pack_rgb(c0, c1, c2);
+}
+
+void blur_h_f32(uint x, uint y) {
+  int radius = max(pc.radius, 0);
+  int count = radius * 2 + 1;
+  float sum = 0.0;
+  for (int dx = -radius; dx <= radius; ++dx) {
+    int xx = clamp_int(int(x) + dx, 0, int(pc.src_w) - 1);
+    sum += sample_f32_src0(uint(xx), y, pc.src_pitch);
+  }
+  scratch[y * pc.scratch_pitch + x] = floatBitsToUint(sum / float(count));
+}
+
+void blur_v_f32(uint x, uint y) {
+  int radius = max(pc.radius, 0);
+  int count = radius * 2 + 1;
+  float sum = 0.0;
+  for (int dy = -radius; dy <= radius; ++dy) {
+    int yy = clamp_int(int(y) + dy, 0, int(pc.src_h) - 1);
+    sum += uintBitsToFloat(scratch[uint(yy) * pc.scratch_pitch + x]);
+  }
+  f32_out[y * pc.dst_pitch + x] = sum / float(count);
+}
+
+uint blend_pixel(uint fg, uint bg, float alpha) {
+  float a = clamp_alpha01(alpha);
+  float ia = 1.0 - a;
+  uint c0 = round_clamp_byte(float(byte_channel(fg, 0u)) * a +
+                             float(byte_channel(bg, 0u)) * ia);
+  uint c1 = round_clamp_byte(float(byte_channel(fg, 1u)) * a +
+                             float(byte_channel(bg, 1u)) * ia);
+  uint c2 = round_clamp_byte(float(byte_channel(fg, 2u)) * a +
+                             float(byte_channel(bg, 2u)) * ia);
+  return pack_rgb(c0, c1, c2);
+}
+
+uint key_light_pixel(uint src, float alpha, uint x) {
+  float a = clamp_alpha01(alpha);
+  if (a <= 0.02 || pc.intensity <= 0.0001)
+    return src;
+
+  float cx = float(pc.src_w) * 0.5;
+  float inv_cx = cx > 1.0 ? (1.0 / cx) : 0.0;
+  float x_norm = (float(x) - cx) * inv_cx;
+  float field = clamp(1.0 + pc.direction * x_norm * 0.35, 0.65, 1.35);
+  float t = clamp01(pc.intensity * a * field);
+
+  uint c0 = round_clamp_byte(float(byte_channel(src, 0u)) +
+                             (pc.target_r - float(byte_channel(src, 0u))) * t);
+  uint c1 = round_clamp_byte(float(byte_channel(src, 1u)) +
+                             (pc.target_g - float(byte_channel(src, 1u))) * t);
+  uint c2 = round_clamp_byte(float(byte_channel(src, 2u)) +
+                             (pc.target_b - float(byte_channel(src, 2u))) * t);
+  return pack_rgb(c0, c1, c2);
+}
+
+void main() {
+  uint x = gl_GlobalInvocationID.x;
+  uint y = gl_GlobalInvocationID.y;
+  if (x >= pc.dst_w || y >= pc.dst_h)
+    return;
+
+  if (push.op == OP_CROP_RESIZE_U8X3) {
+    u8_out[y * pc.dst_pitch + x] = resize_u8_pixel(x, y);
+  } else if (push.op == OP_PREPROCESS_TO_NCHW) {
+    preprocess_pixel(x, y);
+  } else if (push.op == OP_RESIZE_F32_1) {
+    f32_out[y * pc.dst_pitch + x] = resize_f32_value(x, y);
+  } else if (push.op == OP_BLUR_H_U8X3) {
+    blur_h_u8(x, y);
+  } else if (push.op == OP_BLUR_V_U8X3) {
+    blur_v_u8(x, y);
+  } else if (push.op == OP_BLUR_H_F32_1) {
+    blur_h_f32(x, y);
+  } else if (push.op == OP_BLUR_V_F32_1) {
+    blur_v_f32(x, y);
+  } else if (push.op == OP_COMPOSITE_BG) {
+    uint fg = u8_src0[y * pc.src_pitch + x];
+    uint bg = u8_src1[y * pc.src1_pitch + x];
+    float a = f32_src0[y * pc.alpha_pitch + x];
+    u8_out[y * pc.dst_pitch + x] = blend_pixel(fg, bg, a);
+  } else if (push.op == OP_COMPOSITE_SOLID) {
+    uint fg = u8_src0[y * pc.src_pitch + x];
+    uint bg = pack_rgb(pc.bg0, pc.bg1, pc.bg2);
+    float a = f32_src0[y * pc.alpha_pitch + x];
+    u8_out[y * pc.dst_pitch + x] = blend_pixel(fg, bg, a);
+  } else if (push.op == OP_KEY_LIGHT) {
+    uint src = u8_src0[y * pc.src_pitch + x];
+    float a = f32_src0[y * pc.alpha_pitch + x];
+    u8_out[y * pc.dst_pitch + x] = key_light_pixel(src, a, x);
+  } else if (push.op == OP_COPY_U8X3) {
+    u8_out[y * pc.dst_pitch + x] = u8_src0[y * pc.src_pitch + x];
+  } else if (push.op == OP_COPY_F32_1) {
+    f32_out[y * pc.dst_pitch + x] = f32_src0[y * pc.src_pitch + x];
+  }
+}
