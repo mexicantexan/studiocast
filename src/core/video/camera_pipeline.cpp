@@ -7752,6 +7752,22 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         note += "\n";
       note += status.summary;
     };
+    auto append_open_video_face_detection_note = [&] {
+      const auto status = open_video_yunet.runtime_status();
+      if (status.summary.empty())
+        return;
+      if (!note.empty())
+        note += "\n";
+      note += status.summary;
+    };
+    auto append_open_video_eye_contact_note = [&] {
+      const auto status = open_video_eye_contact.runtime_status();
+      if (status.summary.empty())
+        return;
+      if (!note.empty())
+        note += "\n";
+      note += status.summary;
+    };
 
     want_maxine_bg_blur = false;
     have_maxine_bg_blur = false;
@@ -8053,6 +8069,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (!note.empty())
             note += "\n";
           note += "Open Video: Eye Contact (gaze correction).";
+          append_open_video_eye_contact_note();
         } else {
           if (!note.empty())
             note += "\n";
@@ -8083,6 +8100,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               note += "\n";
             note += "Open Video: Eye Contact (gaze correction) — Maxine AR "
                     "unavailable.";
+            append_open_video_eye_contact_note();
             if (!mx_err.empty()) {
               note += "\n";
               note += mx_err;
@@ -8302,6 +8320,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (have_open_video_face_detection) {
             note += "Open Vulkan: Auto Frame (CPU face tracking; Vulkan "
                     "crop/scale while the frame is Vulkan-resident).";
+            append_open_video_face_detection_note();
           } else {
             note += "Open Vulkan: Auto Frame (foreground matte tracking; "
                     "shared Vulkan matte with CPU tracking tail and Vulkan "
@@ -8358,6 +8377,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             note += "Open Video: Auto Frame (CPU face tracking; GPU "
                     "crop/scale when reusing an active Open CUDA frame, CPU "
                     "crop/scale fallback).";
+            append_open_video_face_detection_note();
           } else {
             note += "Open CUDA: Auto Frame (foreground matte tracking; GPU "
                     "crop/scale when reusing an active Open CUDA frame, CPU "
@@ -8424,6 +8444,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               note += "Open Video: Auto Frame (CPU face tracking; GPU "
                       "crop/scale when reusing an active Open CUDA frame, CPU "
                       "crop/scale fallback).";
+              append_open_video_face_detection_note();
             } else {
               note += "Open CUDA: Auto Frame (foreground matte tracking; GPU "
                       "crop/scale when reusing an active Open CUDA frame, CPU "

@@ -183,6 +183,37 @@ bool TestFrameArtifactCacheInvalidatesMatteOnNewFrame() {
   return ok;
 }
 
+bool TestFrameAnalysisCacheRetainsFaceAnalysisWithinFrame() {
+  studiocast::open_video::FrameAnalysisCache cache;
+
+  cache.BeginFrame(61);
+  cache.face_detections = std::vector<studiocast::open_video::FaceDetection>{
+      studiocast::open_video::FaceDetection{
+          .x = 10.0f, .y = 20.0f, .w = 30.0f, .h = 40.0f, .score = 0.95f}};
+  studiocast::open_video::FaceLandmarks landmarks;
+  landmarks.points.emplace_back(11.0f, 22.0f);
+  cache.face_landmarks = std::move(landmarks);
+
+  cache.BeginFrame(61);
+  bool ok = true;
+  ok &= Require(cache.face_detections.has_value(),
+                "same-frame face detections should remain cached");
+  ok &= Require(cache.face_detections && cache.face_detections->size() == 1,
+                "same-frame face detection payload should be retained");
+  ok &= Require(cache.face_landmarks.has_value(),
+                "same-frame landmarks should remain cached");
+  ok &= Require(cache.face_landmarks &&
+                    cache.face_landmarks->points.size() == 1,
+                "same-frame landmark payload should be retained");
+
+  cache.BeginFrame(62);
+  ok &= Require(!cache.face_detections.has_value(),
+                "new frame should clear face detections");
+  ok &= Require(!cache.face_landmarks.has_value(),
+                "new frame should clear face landmarks");
+  return ok;
+}
+
 bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   studiocast::open_video::FrameArtifactCache cache;
   auto cuda_key = MatteKey("rvm-test",

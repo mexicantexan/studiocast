@@ -20,10 +20,13 @@ bool TestLatestFrameWinsStopWakesAndJoins();
 bool TestLatestFrameWinsGenerationRejectsStaleResults();
 bool TestLatestFrameWinsStatsCountersAndLastError();
 bool TestFastDvdnetDenoiseTensorContractIsDeclared();
+bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared();
+bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared();
 bool TestFrameArtifactCacheReusesCompatibleMatteWithinFrame();
 bool TestFrameArtifactCacheReusesCompatibleMaxineMatteWithinFrame();
 bool TestFrameArtifactCacheSeparatesIncompatibleMatteKeys();
 bool TestFrameArtifactCacheInvalidatesMatteOnNewFrame();
+bool TestFrameAnalysisCacheRetainsFaceAnalysisWithinFrame();
 bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility();
 bool TestFrameArtifactCacheDeviceStorageAliasesPreserveCompatibility();
 bool TestFrameArtifactCacheReusesDeviceMatteAcrossCombinedEffects();
@@ -1106,6 +1109,12 @@ int main() {
        &studiocast::tests::TestLatestFrameWinsStatsCountersAndLastError},
       {"FastDVDnet denoise tensor contract is declared",
        &studiocast::tests::TestFastDvdnetDenoiseTensorContractIsDeclared},
+      {"YuNet face detection CPU tensor tail contract is declared",
+       &studiocast::tests::
+           TestYunetFaceDetectionCpuTensorTailContractIsDeclared},
+      {"Open Video eye contact CPU tensor tail contract is declared",
+       &studiocast::tests::
+           TestOpenVideoEyeContactCpuTensorTailContractIsDeclared},
       {"frame artifact cache reuses compatible matte within frame",
        &studiocast::tests::
            TestFrameArtifactCacheReusesCompatibleMatteWithinFrame},
@@ -1117,6 +1126,9 @@ int main() {
            TestFrameArtifactCacheSeparatesIncompatibleMatteKeys},
       {"frame artifact cache invalidates matte on new frame",
        &studiocast::tests::TestFrameArtifactCacheInvalidatesMatteOnNewFrame},
+      {"frame analysis cache retains face analysis within frame",
+       &studiocast::tests::
+           TestFrameAnalysisCacheRetainsFaceAnalysisWithinFrame},
       {"frame artifact cache precomputed matte keys preserve compatibility",
        &studiocast::tests::
            TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility},

@@ -82,6 +82,33 @@ void YunetFaceDetector::Reset() {
   kps_idx_ = {{-1, -1, -1}};
 }
 
+FaceDetectionRuntimeStatus YunetFaceDetector::runtime_status() const {
+  FaceDetectionRuntimeStatus s;
+  s.cuda_ep_active = session_ != nullptr && session_info_.using_cuda;
+  s.cuda_ep_cpu_tensor_io_active = s.cuda_ep_active;
+  s.cpu_only_session_active = session_ != nullptr && !session_info_.using_cuda;
+
+  if (s.cuda_ep_cpu_tensor_io_active) {
+    s.summary =
+        "Open Video face detection: CUDA EP active through CPU ORT tensors; "
+        "letterbox/BGR preprocess, detection decode/NMS, and CPU-visible face "
+        "boxes remain explicit CPU tails. This is not a device-resident GPU "
+        "path.";
+  } else if (s.cpu_only_session_active) {
+    s.summary =
+        "Open Video face detection: CPU ORT session active; letterbox/BGR "
+        "preprocess and detection decode/NMS remain CPU-only. This is not a "
+        "device-resident GPU path.";
+  } else {
+    s.summary =
+        "Open Video face detection: not initialized; YuNet uses CPU tensor "
+        "preprocess/postprocess when enabled. This is not a "
+        "device-resident GPU path.";
+  }
+
+  return s;
+}
+
 bool YunetFaceDetector::LoadSettingsFromManifest(
     const std::filesystem::path &manifest_path, std::string *error) {
   if (error)

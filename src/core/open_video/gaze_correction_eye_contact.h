@@ -14,6 +14,22 @@
 
 namespace studiocast::open_video {
 
+struct EyeContactRuntimeStatus {
+  bool uses_cpu_face_detection = true;
+  bool uses_cpu_landmarks = true;
+  bool uses_cpu_preprocess = true;
+  bool uses_cpu_tensor_io = true;
+  bool uses_cpu_postprocess = true;
+  bool device_resident_gpu_path = false;
+
+  bool left_cuda_ep_active = false;
+  bool right_cuda_ep_active = false;
+  bool cuda_ep_cpu_tensor_io_active = false;
+  bool cpu_only_session_active = false;
+
+  std::string summary;
+};
+
 // Open Video Eye Contact effect using gaze-correction-cam style models.
 //
 // Expected pipeline (mirrors the upstream project):
@@ -58,6 +74,7 @@ public:
   bool using_cpu_fallback() const { return using_cpu_fallback_; }
   const std::string &active_model_id() const { return active_model_id_; }
   const std::string &sticky_warning() const { return sticky_warning_; }
+  EyeContactRuntimeStatus runtime_status() const;
 
 private:
   struct EyeRuntime {

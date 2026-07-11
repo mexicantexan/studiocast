@@ -105,6 +105,43 @@ void GazeCorrectionEyeContact::DisableAfterFailure(const std::string &why) {
   sticky_warning_ = why;
 }
 
+EyeContactRuntimeStatus GazeCorrectionEyeContact::runtime_status() const {
+  EyeContactRuntimeStatus s;
+  const bool left_active = left_.session_active != nullptr;
+  const bool right_active = right_.session_active != nullptr;
+
+  s.left_cuda_ep_active = left_active &&
+                          left_.session_active == left_.session_cuda.get() &&
+                          left_.session_info.using_cuda;
+  s.right_cuda_ep_active = right_active &&
+                           right_.session_active == right_.session_cuda.get() &&
+                           right_.session_info.using_cuda;
+  s.cuda_ep_cpu_tensor_io_active =
+      s.left_cuda_ep_active || s.right_cuda_ep_active;
+  s.cpu_only_session_active =
+      (left_active || right_active) && !s.cuda_ep_cpu_tensor_io_active;
+
+  if (s.cuda_ep_cpu_tensor_io_active) {
+    s.summary =
+        "Open Video eye contact: CUDA EP active through CPU ORT tensors; "
+        "YuNet face detection, dlib landmarks, eye crops, anchor maps, "
+        "warp/decode, resize, and composite remain explicit CPU tails. This "
+        "is not a device-resident GPU path.";
+  } else if (s.cpu_only_session_active) {
+    s.summary =
+        "Open Video eye contact: CPU ORT session active; YuNet face detection, "
+        "dlib landmarks, eye crops, anchor maps, warp/decode, resize, and "
+        "composite remain CPU-only. This is not a device-resident GPU path.";
+  } else {
+    s.summary =
+        "Open Video eye contact: not initialized; the gaze-correction path "
+        "uses CPU face detection, dlib landmarks, CPU tensor I/O, and CPU "
+        "warp/composite when enabled. This is not a device-resident GPU path.";
+  }
+
+  return s;
+}
+
 float GazeCorrectionEyeContact::Clamp01(float x) {
   if (x < 0.f)
     return 0.f;

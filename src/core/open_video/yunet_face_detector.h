@@ -13,6 +13,19 @@
 
 namespace studiocast::open_video {
 
+struct FaceDetectionRuntimeStatus {
+  bool uses_cpu_preprocess = true;
+  bool uses_cpu_tensor_io = true;
+  bool uses_cpu_postprocess = true;
+  bool device_resident_gpu_path = false;
+
+  bool cuda_ep_active = false;
+  bool cuda_ep_cpu_tensor_io_active = false;
+  bool cpu_only_session_active = false;
+
+  std::string summary;
+};
+
 // YuNet face detector wrapper.
 //
 // This is used by the open-source video pipeline for Auto Frame tracking.
@@ -53,6 +66,7 @@ public:
 
   bool available() const { return initialized_; }
   const std::string &active_model_id() const { return active_model_id_; }
+  FaceDetectionRuntimeStatus runtime_status() const;
 
 private:
   struct Settings {

@@ -4,6 +4,8 @@
 #include <vector>
 
 #include "core/open_video/fastdvdnet_denoiser.h"
+#include "core/open_video/gaze_correction_eye_contact.h"
+#include "core/open_video/yunet_face_detector.h"
 
 namespace {
 
@@ -77,6 +79,48 @@ bool TestFastDvdnetDenoiseTensorContractIsDeclared() {
                 "contract should declare CPU postprocess");
   ok &= Require(contract.requires_output_device_to_cpu_for_postprocess,
                 "contract should declare denoised tensor readback");
+  return ok;
+}
+
+bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared() {
+  studiocast::open_video::YunetFaceDetector detector;
+  const auto status = detector.runtime_status();
+
+  bool ok = true;
+  ok &= Require(status.uses_cpu_preprocess,
+                "YuNet should declare CPU preprocess");
+  ok &=
+      Require(status.uses_cpu_tensor_io, "YuNet should declare CPU tensor I/O");
+  ok &= Require(status.uses_cpu_postprocess,
+                "YuNet should declare CPU postprocess");
+  ok &= Require(!status.device_resident_gpu_path,
+                "YuNet must not claim a device-resident GPU path");
+  ok &= Require(status.summary.find("not a device-resident GPU path") !=
+                    std::string::npos,
+                "YuNet summary should reject hidden GPU-resident claims");
+  return ok;
+}
+
+bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared() {
+  studiocast::open_video::GazeCorrectionEyeContact eye_contact;
+  const auto status = eye_contact.runtime_status();
+
+  bool ok = true;
+  ok &= Require(status.uses_cpu_face_detection,
+                "eye contact should declare CPU face detection");
+  ok &= Require(status.uses_cpu_landmarks,
+                "eye contact should declare CPU landmarks");
+  ok &= Require(status.uses_cpu_preprocess,
+                "eye contact should declare CPU preprocess");
+  ok &= Require(status.uses_cpu_tensor_io,
+                "eye contact should declare CPU tensor I/O");
+  ok &= Require(status.uses_cpu_postprocess,
+                "eye contact should declare CPU postprocess");
+  ok &= Require(!status.device_resident_gpu_path,
+                "eye contact must not claim a device-resident GPU path");
+  ok &= Require(status.summary.find("not a device-resident GPU path") !=
+                    std::string::npos,
+                "eye contact summary should reject hidden GPU-resident claims");
   return ok;
 }
 
