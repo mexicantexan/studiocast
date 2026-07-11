@@ -1597,6 +1597,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     none,
     nvcv_bgr,
     cuda_rgb,
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    vulkan_rgb,
+#endif
   };
 
   struct DeferredGpuOut {
@@ -1608,6 +1611,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     // Open CUDA (RGB)
     const studiocast::cuda::CudaImage *cuda_img = nullptr; // non-owning
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    // Open Vulkan (RGB)
+    const studiocast::vulkan::VulkanImage *vulkan_img = nullptr; // non-owning
+    studiocast::vulkan::kernels::UtilityKernels *vulkan_kernels =
+        nullptr; // non-owning
+#endif
 
     // Common
     studiocast::maxine::CUstream stream = nullptr;
@@ -1794,6 +1804,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   // Open CUDA deferred GPU output (RGB) + resize cache.
   studiocast::cuda::CudaImage gpu_rgb_scaled;
   bool gpu_rgb_scaled_allocated = false;
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  // Open Vulkan deferred GPU output (RGB) + resize cache.
+  studiocast::vulkan::VulkanImage vulkan_rgb_scaled;
+  bool vulkan_rgb_scaled_allocated = false;
+#endif
 
   // Open CUDA per-frame GPU buffers (ping-pong) for GPU-only Open CUDA stages.
   // These persist across frames and are reallocated only when the capture size
@@ -2525,6 +2541,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::vector<std::uint8_t> tmp_replace_rgb_src;
 
     std::uint64_t matte_frame_upload_calls = 0;
+    std::uint64_t matting_inference_calls = 0;
     std::uint64_t alpha_download_calls = 0;
     std::uint64_t forced_sync_calls = 0;
 
@@ -2629,7 +2646,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::open_video::FrameMatteStorage::cpu_f32_alpha;
       cuda_matte_artifact_key = std::move(base_key);
       cuda_matte_artifact_key.storage =
-          studiocast::open_video::FrameMatteStorage::cuda_f32_alpha;
+          studiocast::open_video::FrameMatteStorage::device_f32_alpha;
       matte_artifact_keys_valid = true;
     }
 
@@ -2639,15 +2656,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (!matte_artifact_keys_valid) {
         return nullptr;
       }
-      switch (storage) {
-      case studiocast::open_video::FrameMatteStorage::cpu_f32_alpha:
+      if (storage ==
+          studiocast::open_video::FrameMatteStorage::cpu_f32_alpha) {
         return &cpu_matte_artifact_key;
-      case studiocast::open_video::FrameMatteStorage::cuda_f32_alpha:
+      }
+      if (storage ==
+          studiocast::open_video::FrameMatteStorage::device_f32_alpha) {
         return &cuda_matte_artifact_key;
-      case studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha:
-        return nullptr;
-      case studiocast::open_video::FrameMatteStorage::maxine_gpu_alpha:
-        return nullptr;
       }
       return nullptr;
     }
@@ -3011,7 +3026,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
 
       const auto *matte_key = MatteArtifactKeyForStorage(
-          studiocast::open_video::FrameMatteStorage::cuda_f32_alpha);
+          studiocast::open_video::FrameMatteStorage::device_f32_alpha);
       if (!matte_key) {
         if (error)
           *error = "Open CUDA: matte artifact key not initialized.";
@@ -3028,6 +3043,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = matte_err;
         return false;
       }
+      ++matting_inference_calls;
 
       cached_matte_valid = true;
       cached_matte_sequence = capture_sequence;
@@ -3063,7 +3079,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
 
       const auto *matte_key = MatteArtifactKeyForStorage(
-          studiocast::open_video::FrameMatteStorage::cuda_f32_alpha);
+          studiocast::open_video::FrameMatteStorage::device_f32_alpha);
       if (!matte_key) {
         if (error)
           *error = "Open CUDA: matte artifact key not initialized.";
@@ -3089,6 +3105,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = matte_err;
         return false;
       }
+      ++matting_inference_calls;
 
       cached_matte_valid = true;
       cached_matte_sequence = capture_sequence;
@@ -3454,9 +3471,53 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::open_video::FrameMatteArtifactKey vulkan_matte_artifact_key;
     bool vulkan_matte_artifact_key_valid = false;
 
+    studiocast::vulkan::VulkanImage frame_rgb;     // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage out_rgb;       // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage alpha_model;   // f32_1, model WxH
+    studiocast::vulkan::VulkanImage alpha_resized; // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage alpha_tmp;     // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage alpha_feather; // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage blur_tmp;      // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage blurred;       // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage bg_rgb;        // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage bg_src_rgb;    // rgb_u8, source WxH
+    studiocast::vulkan::VulkanImage auto_frame_rgb; // rgb_u8, WxH
+
+    std::filesystem::path cached_bg_src_path;
+    std::filesystem::file_time_type cached_bg_src_mtime{};
+    int cached_bg_src_w = 0;
+    int cached_bg_src_h = 0;
+    bool cached_bg_src_valid = false;
+    std::uint64_t cached_bg_src_gen = 0;
+    int cached_bg_dst_w = 0;
+    int cached_bg_dst_h = 0;
+    bool cached_bg_dst_valid = false;
+    std::uint64_t cached_bg_dst_src_gen = 0;
+    std::vector<std::uint8_t> tmp_replace_rgb_src;
+
+    std::uint64_t cached_matte_sequence = 0;
+    bool cached_matte_valid = false;
+    std::uint64_t cached_frame_alpha_sequence = 0;
+    bool cached_frame_alpha_valid = false;
+    std::uint64_t cached_alpha_cpu_sequence = 0;
+    bool cached_alpha_cpu_valid = false;
+    std::vector<float> alpha_cpu;
+
+    std::uint64_t alpha_download_calls = 0;
+    std::uint64_t preprocess_dispatch_calls = 0;
+    std::uint64_t matting_inference_calls = 0;
+    std::uint64_t alpha_resize_dispatch_calls = 0;
+    std::uint64_t blur_dispatch_calls = 0;
+    std::uint64_t background_upload_calls = 0;
+    std::uint64_t composite_dispatch_calls = 0;
+    std::uint64_t key_light_dispatch_calls = 0;
+    std::uint64_t crop_resize_dispatch_calls = 0;
+    std::uint64_t forced_sync_calls = 0;
+
     ~OpenVulkanVirtualBackgroundContext() { Destroy(); }
 
     void Destroy() {
+      FreeImages();
       matting_session.reset();
       model_pack.reset();
       kernels.Shutdown();
@@ -3466,6 +3527,33 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       active_model_id.clear();
       active_requested_model_id.clear();
       ClearMatteArtifactKey();
+      InvalidateMatteCache();
+
+      cached_bg_src_path.clear();
+      cached_bg_src_mtime = {};
+      cached_bg_src_w = 0;
+      cached_bg_src_h = 0;
+      cached_bg_src_valid = false;
+      cached_bg_src_gen = 0;
+      cached_bg_dst_w = 0;
+      cached_bg_dst_h = 0;
+      cached_bg_dst_valid = false;
+      cached_bg_dst_src_gen = 0;
+      tmp_replace_rgb_src.clear();
+    }
+
+    void FreeImages() {
+      frame_rgb.Free();
+      out_rgb.Free();
+      alpha_model.Free();
+      alpha_resized.Free();
+      alpha_tmp.Free();
+      alpha_feather.Free();
+      blur_tmp.Free();
+      blurred.Free();
+      bg_rgb.Free();
+      bg_src_rgb.Free();
+      auto_frame_rgb.Free();
     }
 
     void ClearMatteArtifactKey() {
@@ -3473,6 +3561,119 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::open_video::FrameMatteArtifactKey{};
       vulkan_matte_artifact_key_valid = false;
       matte_artifacts.ClearArtifacts();
+    }
+
+    void InvalidateMatteCache() {
+      cached_matte_sequence = 0;
+      cached_matte_valid = false;
+      cached_frame_alpha_sequence = 0;
+      cached_frame_alpha_valid = false;
+      cached_alpha_cpu_sequence = 0;
+      cached_alpha_cpu_valid = false;
+      alpha_cpu.clear();
+      matte_artifacts.ClearArtifacts();
+    }
+
+    bool EnsureImage(studiocast::vulkan::VulkanImage *image, int width,
+                     int height, studiocast::vulkan::VulkanPixelFormat format,
+                     bool map_memory, const char *label,
+                     std::string *error_out) {
+      if (!image) {
+        if (error_out)
+          *error_out = std::string("Open Vulkan: null image for ") + label +
+                       ".";
+        return false;
+      }
+      if (image->Valid() && image->width() == width &&
+          image->height() == height && image->format() == format &&
+          (!map_memory || image->mapped() != nullptr)) {
+        return true;
+      }
+      std::string err;
+      if (!image->Allocate(kernels.device(), width, height, format,
+                           map_memory, &err)) {
+        if (error_out)
+          *error_out = std::string("Open Vulkan: failed to allocate ") +
+                       label + ": " + err;
+        return false;
+      }
+      return true;
+    }
+
+    bool UploadRgbToImage(const std::uint8_t *rgb, std::size_t stride,
+                          int width, int height,
+                          studiocast::vulkan::VulkanImage *image,
+                          std::string *error_out) {
+      if (!rgb || stride == 0 || width <= 0 || height <= 0) {
+        if (error_out)
+          *error_out = "Open Vulkan: invalid RGB upload input.";
+        return false;
+      }
+      if (!EnsureImage(image, width, height,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "RGB upload image", error_out)) {
+        return false;
+      }
+      if (!image->mapped()) {
+        if (error_out)
+          *error_out = "Open Vulkan: RGB upload image is not mapped.";
+        return false;
+      }
+      studiocast::vulkan::PackRgb24ToRgba32(
+          rgb, stride, width, height,
+          static_cast<std::uint32_t *>(image->mapped()),
+          image->pitch_pixels());
+      std::string ferr;
+      if (!image->Flush(&ferr)) {
+        if (error_out)
+          *error_out = "Open Vulkan: failed to flush RGB upload image: " +
+                       ferr;
+        return false;
+      }
+      return true;
+    }
+
+    bool DownloadImageToRgb(const studiocast::vulkan::VulkanImage &image,
+                            std::uint8_t *rgb, std::size_t stride,
+                            std::string *error_out) {
+      if (!image.Valid() ||
+          image.format() != studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
+        if (error_out)
+          *error_out = "Open Vulkan: invalid RGB image for download.";
+        return false;
+      }
+      if (!rgb || stride == 0) {
+        if (error_out)
+          *error_out = "Open Vulkan: invalid RGB download output.";
+        return false;
+      }
+      if (!image.mapped()) {
+        if (error_out)
+          *error_out = "Open Vulkan: RGB download image is not mapped.";
+        return false;
+      }
+      std::string ierr;
+      if (!image.Invalidate(&ierr)) {
+        if (error_out)
+          *error_out = "Open Vulkan: failed to invalidate RGB download image: " +
+                       ierr;
+        return false;
+      }
+      studiocast::vulkan::UnpackRgba32ToRgb24(
+          static_cast<const std::uint32_t *>(image.mapped()),
+          image.pitch_pixels(), image.width(), image.height(), rgb, stride);
+      return true;
+    }
+
+    void PublishMatteArtifact(
+        std::uint64_t capture_sequence,
+        const studiocast::open_video::FrameMatteArtifactKey &key,
+        std::uintptr_t handle, std::uintptr_t aux_handle = 0) {
+      studiocast::open_video::FrameMatteArtifact artifact;
+      artifact.key = key;
+      artifact.handle = handle;
+      artifact.aux_handle = aux_handle;
+      (void)matte_artifacts.StoreMatte(capture_sequence, std::move(artifact));
     }
 
     std::string ResolveMattingModelId(
@@ -3496,19 +3697,35 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         ClearMatteArtifactKey();
         return;
       }
+      const int matte_w = model_pack->matting->input.width;
+      const int matte_h = model_pack->matting->input.height;
+      const auto device_handle = reinterpret_cast<std::uintptr_t>(kernels.device());
+      const auto queue_handle =
+          reinterpret_cast<std::uintptr_t>(kernels.device()->queue());
+      if (vulkan_matte_artifact_key_valid &&
+          vulkan_matte_artifact_key.frame_width == frame_w &&
+          vulkan_matte_artifact_key.frame_height == frame_h &&
+          vulkan_matte_artifact_key.matte_width == matte_w &&
+          vulkan_matte_artifact_key.matte_height == matte_h &&
+          vulkan_matte_artifact_key.device_context == device_handle &&
+          vulkan_matte_artifact_key.stream == queue_handle) {
+        return;
+      }
+      if (vulkan_matte_artifact_key_valid) {
+        InvalidateMatteCache();
+      }
       studiocast::open_video::FrameMatteArtifactKey key;
       key.provider_id = "open_vulkan";
       key.model_id = active_model_id;
       key.storage =
-          studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha;
+          studiocast::open_video::FrameMatteStorage::device_f32_alpha;
       key.frame_width = frame_w;
       key.frame_height = frame_h;
-      key.matte_width = model_pack->matting->input.width;
-      key.matte_height = model_pack->matting->input.height;
+      key.matte_width = matte_w;
+      key.matte_height = matte_h;
       key.config_fingerprint = 0;
-      key.device_context =
-          reinterpret_cast<std::uintptr_t>(kernels.device());
-      key.stream = 0;
+      key.device_context = device_handle;
+      key.stream = queue_handle;
       vulkan_matte_artifact_key = key;
       vulkan_matte_artifact_key_valid = true;
     }
@@ -3516,7 +3733,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool EnsureInitialized(
         int frame_w, int frame_h,
         const studiocast::video::effects::BroadcastCameraEffects &fx,
-        std::string *error_out) {
+        std::string *error_out, bool require_vb_buffers = true) {
       if (error_out)
         error_out->clear();
       if (frame_w <= 0 || frame_h <= 0) {
@@ -3562,6 +3779,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         active_model_id = model_id;
         active_requested_model_id = requested_model_id;
         ClearMatteArtifactKey();
+        InvalidateMatteCache();
 
         studiocast::open_vulkan::OpenVulkanMattingSession::Options opts;
         opts.require_device_residency = true;
@@ -3591,9 +3809,434 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
 
       RefreshMatteArtifactKey(frame_w, frame_h);
+
+      const int matte_w = model_pack->matting->input.width;
+      const int matte_h = model_pack->matting->input.height;
+      if (!EnsureImage(&frame_rgb, frame_w, frame_h,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "frame_rgb", error_out) ||
+          !EnsureImage(&out_rgb, frame_w, frame_h,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "out_rgb", error_out) ||
+          !EnsureImage(&alpha_model, matte_w, matte_h,
+                       studiocast::vulkan::VulkanPixelFormat::f32_1,
+                       /*map_memory=*/true, "alpha_model", error_out) ||
+          !EnsureImage(&alpha_resized, frame_w, frame_h,
+                       studiocast::vulkan::VulkanPixelFormat::f32_1,
+                       /*map_memory=*/true, "alpha_resized", error_out)) {
+        last_error = error_out ? *error_out : "Open Vulkan allocation failed.";
+        return false;
+      }
+
+      if (require_vb_buffers) {
+        if (!EnsureImage(&alpha_tmp, frame_w, frame_h,
+                         studiocast::vulkan::VulkanPixelFormat::f32_1,
+                         /*map_memory=*/true, "alpha_tmp", error_out) ||
+            !EnsureImage(&alpha_feather, frame_w, frame_h,
+                         studiocast::vulkan::VulkanPixelFormat::f32_1,
+                         /*map_memory=*/true, "alpha_feather", error_out) ||
+            !EnsureImage(&blur_tmp, frame_w, frame_h,
+                         studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                         /*map_memory=*/true, "blur_tmp", error_out) ||
+            !EnsureImage(&blurred, frame_w, frame_h,
+                         studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                         /*map_memory=*/true, "blurred", error_out)) {
+          last_error =
+              error_out ? *error_out : "Open Vulkan allocation failed.";
+          return false;
+        }
+      }
+
+      if (cached_bg_dst_w != frame_w || cached_bg_dst_h != frame_h) {
+        cached_bg_dst_valid = false;
+        cached_bg_dst_w = frame_w;
+        cached_bg_dst_h = frame_h;
+      }
+
       initialized = true;
       enabled = true;
       last_error.clear();
+      return true;
+    }
+
+    bool EnsureReplaceBackgroundGpu(int width, int height,
+                                    const std::filesystem::path &path,
+                                    std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+      if (!initialized) {
+        if (error_out)
+          *error_out = "Open Vulkan: not initialized.";
+        return false;
+      }
+      if (path.empty()) {
+        if (error_out)
+          *error_out = "Open Vulkan: virtual_background.replace_path not set.";
+        return false;
+      }
+
+      std::error_code ec;
+      const auto mtime = std::filesystem::last_write_time(path, ec);
+      if (ec) {
+        if (error_out)
+          *error_out = "Open Vulkan: failed to stat replace image: " +
+                       ec.message();
+        return false;
+      }
+
+      const bool src_cache_hit =
+          cached_bg_src_valid && cached_bg_src_path == path &&
+          cached_bg_src_mtime == mtime && bg_src_rgb.Valid();
+      if (!src_cache_hit) {
+        int iw = 0;
+        int ih = 0;
+        std::string img_err;
+        if (!studiocast::video::LoadImageRgb24(
+                path, &iw, &ih, &tmp_replace_rgb_src, &img_err)) {
+          if (error_out)
+            *error_out =
+                "Open Vulkan: failed to load replace image: " + img_err;
+          return false;
+        }
+        if (!UploadRgbToImage(tmp_replace_rgb_src.data(),
+                              static_cast<std::size_t>(iw) * 3u, iw, ih,
+                              &bg_src_rgb, error_out)) {
+          if (error_out && !error_out->empty()) {
+            *error_out =
+                "Open Vulkan: failed to upload replace image: " + *error_out;
+          }
+          return false;
+        }
+        ++background_upload_calls;
+
+        cached_bg_src_path = path;
+        cached_bg_src_mtime = mtime;
+        cached_bg_src_w = iw;
+        cached_bg_src_h = ih;
+        cached_bg_src_valid = true;
+        ++cached_bg_src_gen;
+        cached_bg_dst_valid = false;
+      }
+
+      const bool dst_cache_hit =
+          cached_bg_dst_valid && cached_bg_dst_w == width &&
+          cached_bg_dst_h == height &&
+          cached_bg_dst_src_gen == cached_bg_src_gen && bg_rgb.Valid();
+      if (dst_cache_hit) {
+        return true;
+      }
+
+      if (!EnsureImage(&bg_rgb, width, height,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "bg_rgb", error_out)) {
+        return false;
+      }
+      std::string kerr;
+      if (!kernels.ResizeBilinear(bg_src_rgb, bg_rgb, &kerr)) {
+        if (error_out)
+          *error_out =
+              "Open Vulkan: failed to resize replace image on GPU: " + kerr;
+        return false;
+      }
+      ++forced_sync_calls;
+
+      cached_bg_dst_w = width;
+      cached_bg_dst_h = height;
+      cached_bg_dst_src_gen = cached_bg_src_gen;
+      cached_bg_dst_valid = true;
+      return true;
+    }
+
+    bool EnsureMatteForFrameGpu(
+        const studiocast::vulkan::VulkanImage &in_rgb,
+        std::uint64_t capture_sequence, int width, int height,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+
+      std::string init_err;
+      if (!EnsureInitialized(width, height, fx, &init_err,
+                             /*require_vb_buffers=*/false)) {
+        if (error_out)
+          *error_out = init_err;
+        return false;
+      }
+      if (!vulkan_matte_artifact_key_valid) {
+        if (error_out)
+          *error_out = "Open Vulkan: matte artifact key not initialized.";
+        return false;
+      }
+      if (cached_matte_valid && cached_matte_sequence == capture_sequence &&
+          matte_artifacts.FindMatte(capture_sequence,
+                                    vulkan_matte_artifact_key)) {
+        return true;
+      }
+
+      std::string matte_err;
+      if (!matting_session->Run(in_rgb, &alpha_model, &matte_err)) {
+        if (error_out)
+          *error_out = matte_err;
+        return false;
+      }
+      ++preprocess_dispatch_calls;
+      ++matting_inference_calls;
+      ++forced_sync_calls;
+
+      cached_matte_valid = true;
+      cached_matte_sequence = capture_sequence;
+      cached_frame_alpha_valid = false;
+      cached_alpha_cpu_valid = false;
+      PublishMatteArtifact(
+          capture_sequence, vulkan_matte_artifact_key,
+          reinterpret_cast<std::uintptr_t>(&alpha_model),
+          reinterpret_cast<std::uintptr_t>(alpha_model.buffer()));
+      return true;
+    }
+
+    bool EnsureFrameAlphaForFrameGpu(
+        const studiocast::vulkan::VulkanImage &in_rgb,
+        std::uint64_t capture_sequence, int width, int height,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        std::string *error_out) {
+      if (!EnsureMatteForFrameGpu(in_rgb, capture_sequence, width, height, fx,
+                                  error_out)) {
+        return false;
+      }
+      if (cached_frame_alpha_valid &&
+          cached_frame_alpha_sequence == capture_sequence &&
+          alpha_resized.Valid() && alpha_resized.width() == width &&
+          alpha_resized.height() == height) {
+        return true;
+      }
+      std::string kerr;
+      if (!kernels.ResizeBilinearF32_1(alpha_model, alpha_resized, &kerr)) {
+        if (error_out)
+          *error_out = "Open Vulkan: alpha resize failed: " + kerr;
+        return false;
+      }
+      ++alpha_resize_dispatch_calls;
+      ++forced_sync_calls;
+      cached_frame_alpha_valid = true;
+      cached_frame_alpha_sequence = capture_sequence;
+      return true;
+    }
+
+    bool GetAlphaCpuForFrame(
+        const studiocast::vulkan::VulkanImage &in_rgb,
+        std::uint64_t capture_sequence, int width, int height,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        const std::vector<float> **out_alpha, int *out_alpha_w,
+        int *out_alpha_h, std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+      if (out_alpha)
+        *out_alpha = nullptr;
+      if (out_alpha_w)
+        *out_alpha_w = 0;
+      if (out_alpha_h)
+        *out_alpha_h = 0;
+
+      if (!model_pack || !model_pack->matting) {
+        if (error_out)
+          *error_out = "Open Vulkan: matting model pack not initialized.";
+        return false;
+      }
+      const int matte_w = model_pack->matting->input.width;
+      const int matte_h = model_pack->matting->input.height;
+      if (cached_alpha_cpu_valid &&
+          cached_alpha_cpu_sequence == capture_sequence) {
+        if (out_alpha)
+          *out_alpha = &alpha_cpu;
+        if (out_alpha_w)
+          *out_alpha_w = matte_w;
+        if (out_alpha_h)
+          *out_alpha_h = matte_h;
+        return true;
+      }
+
+      if (!EnsureMatteForFrameGpu(in_rgb, capture_sequence, width, height, fx,
+                                  error_out)) {
+        return false;
+      }
+      if (!alpha_model.mapped()) {
+        if (error_out)
+          *error_out = "Open Vulkan: alpha model image is not mapped.";
+        return false;
+      }
+      std::string ierr;
+      if (!alpha_model.Invalidate(&ierr)) {
+        if (error_out)
+          *error_out =
+              "Open Vulkan: failed to invalidate alpha image: " + ierr;
+        return false;
+      }
+      const auto count = static_cast<std::size_t>(matte_w) *
+                         static_cast<std::size_t>(matte_h);
+      const auto *src = static_cast<const float *>(alpha_model.mapped());
+      alpha_cpu.assign(src, src + count);
+      ++alpha_download_calls;
+      cached_alpha_cpu_valid = true;
+      cached_alpha_cpu_sequence = capture_sequence;
+      if (out_alpha)
+        *out_alpha = &alpha_cpu;
+      if (out_alpha_w)
+        *out_alpha_w = matte_w;
+      if (out_alpha_h)
+        *out_alpha_h = matte_h;
+      return true;
+    }
+
+    bool
+    ApplyGpuStage(const studiocast::vulkan::VulkanImage &in_rgb,
+                  studiocast::vulkan::VulkanImage *out_rgb_img, int width,
+                  int height, std::uint64_t capture_sequence,
+                  const studiocast::video::effects::BroadcastCameraEffects &fx,
+                  std::string *error_out) {
+      if (error_out)
+        error_out->clear();
+
+      using studiocast::video::effects::VirtualBackgroundMode;
+      if (fx.virtual_background.mode == VirtualBackgroundMode::none)
+        return true;
+      if (!out_rgb_img) {
+        if (error_out)
+          *error_out = "Open Vulkan: out_rgb is null.";
+        return false;
+      }
+      if (!in_rgb.Valid()) {
+        if (error_out)
+          *error_out = "Open Vulkan: invalid input GPU RGB image.";
+        return false;
+      }
+      if (in_rgb.width() != width || in_rgb.height() != height ||
+          in_rgb.format() != studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
+        if (error_out)
+          *error_out = "Open Vulkan: invalid input GPU RGB image.";
+        return false;
+      }
+      if (!EnsureFrameAlphaForFrameGpu(in_rgb, capture_sequence, width, height,
+                                       fx, error_out)) {
+        return false;
+      }
+      if (!EnsureImage(out_rgb_img, width, height,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "out_rgb", error_out)) {
+        return false;
+      }
+
+      const int strength = std::max(
+          studiocast::video::effects::contract::kVbStrengthMin,
+          std::min(studiocast::video::effects::contract::kVbStrengthMax,
+                   fx.virtual_background.strength));
+      const int feather_radius = std::min(4, strength / 16);
+      const studiocast::vulkan::VulkanImage *alpha_use = &alpha_resized;
+      if (feather_radius > 0) {
+        std::string kerr;
+        if (!kernels.BoxBlurSeparableF32_1(alpha_resized, alpha_tmp,
+                                           alpha_feather, feather_radius,
+                                           &kerr)) {
+          if (error_out)
+            *error_out = "Open Vulkan: alpha feather blur failed: " + kerr;
+          return false;
+        }
+        ++blur_dispatch_calls;
+        ++forced_sync_calls;
+        alpha_use = &alpha_feather;
+      }
+
+      if (fx.virtual_background.mode == VirtualBackgroundMode::blur) {
+        std::string kerr;
+        if (!kernels.BoxBlurSeparableU8x3(in_rgb, blur_tmp, blurred, strength,
+                                          &kerr)) {
+          if (error_out)
+            *error_out = "Open Vulkan: background blur failed: " + kerr;
+          return false;
+        }
+        ++blur_dispatch_calls;
+        ++forced_sync_calls;
+        if (!kernels.CompositeAlphaU8x3(in_rgb, blurred, *alpha_use,
+                                        *out_rgb_img, &kerr)) {
+          if (error_out)
+            *error_out = "Open Vulkan: composite failed: " + kerr;
+          return false;
+        }
+        ++composite_dispatch_calls;
+        ++forced_sync_calls;
+      } else if (fx.virtual_background.mode ==
+                 VirtualBackgroundMode::remove) {
+        std::uint32_t rgb_hex = 0x000000u;
+        if (!ParseRgbHex(fx.virtual_background.remove_color, &rgb_hex)) {
+          rgb_hex = 0x000000u;
+        }
+        const auto r = static_cast<std::uint8_t>((rgb_hex >> 16) & 0xFFu);
+        const auto g = static_cast<std::uint8_t>((rgb_hex >> 8) & 0xFFu);
+        const auto b = static_cast<std::uint8_t>(rgb_hex & 0xFFu);
+        std::string kerr;
+        if (!kernels.CompositeAlphaSolidU8x3(in_rgb, *alpha_use, r, g, b,
+                                             *out_rgb_img, &kerr)) {
+          if (error_out)
+            *error_out =
+                "Open Vulkan: composite(solid) failed: " + kerr;
+          return false;
+        }
+        ++composite_dispatch_calls;
+        ++forced_sync_calls;
+      } else if (fx.virtual_background.mode ==
+                 VirtualBackgroundMode::replace) {
+        if (!EnsureReplaceBackgroundGpu(
+                width, height, fx.virtual_background.replace_path,
+                error_out)) {
+          return false;
+        }
+        std::string kerr;
+        if (!kernels.CompositeAlphaU8x3(in_rgb, bg_rgb, *alpha_use,
+                                        *out_rgb_img, &kerr)) {
+          if (error_out)
+            *error_out =
+                "Open Vulkan: composite(replace) failed: " + kerr;
+          return false;
+        }
+        ++composite_dispatch_calls;
+        ++forced_sync_calls;
+      }
+      return true;
+    }
+
+    bool
+    ApplyVulkanRgb(const studiocast::vulkan::VulkanImage &in_rgb,
+                   studiocast::vulkan::VulkanImage *out_rgb_img,
+                   const studiocast::video::effects::BroadcastCameraEffects &fx,
+                   std::uint64_t capture_sequence, std::string *error_out,
+                   DeferredGpuOut *deferred_out) {
+      if (error_out)
+        error_out->clear();
+      using studiocast::video::effects::VirtualBackgroundMode;
+      if (fx.virtual_background.mode == VirtualBackgroundMode::none) {
+        if (deferred_out)
+          *deferred_out = DeferredGpuOut{};
+        return true;
+      }
+      if (!deferred_out) {
+        if (error_out)
+          *error_out = "Open Vulkan: ApplyVulkanRgb requires deferred_out.";
+        return false;
+      }
+      std::string stage_err;
+      if (!ApplyGpuStage(in_rgb, out_rgb_img, in_rgb.width(), in_rgb.height(),
+                         capture_sequence, fx, &stage_err)) {
+        if (error_out)
+          *error_out = stage_err;
+        return false;
+      }
+      deferred_out->kind = DeferredGpuKind::vulkan_rgb;
+      deferred_out->nvcv_img = nullptr;
+      deferred_out->nvcv = nullptr;
+      deferred_out->cuda_img = nullptr;
+      deferred_out->cuda = nullptr;
+      deferred_out->stream = nullptr;
+      deferred_out->vulkan_img = out_rgb_img;
+      deferred_out->vulkan_kernels = &kernels;
       return true;
     }
   } open_vulkan_vb;
@@ -4559,6 +5202,501 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
   } open_cuda_key_light;
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  struct OpenVulkanKeyLightContext {
+    bool initialized = false;
+    bool enabled = false;
+    std::string last_error;
+    std::string active_model_id;
+    OpenVulkanVirtualBackgroundContext *matte = nullptr;
+    int last_frame_w = 0;
+    int last_frame_h = 0;
+
+    void Destroy() {
+      initialized = false;
+      enabled = false;
+      last_error.clear();
+      active_model_id.clear();
+      last_frame_w = 0;
+      last_frame_h = 0;
+    }
+
+    bool EnsureInitialized(
+        int frame_w, int frame_h,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        std::string *error) {
+      if (error)
+        error->clear();
+      if (frame_w <= 0 || frame_h <= 0) {
+        last_error = "Open Vulkan Virtual Key Light: invalid frame size.";
+        if (error)
+          *error = last_error;
+        return false;
+      }
+      if (!matte) {
+        last_error = "Open Vulkan Virtual Key Light: matte provider not set.";
+        if (error)
+          *error = last_error;
+        return false;
+      }
+      std::string matte_err;
+      if (!matte->EnsureInitialized(frame_w, frame_h, fx, &matte_err,
+                                    /*require_vb_buffers=*/false)) {
+        last_error = "Open Vulkan Virtual Key Light: " + matte_err;
+        if (error)
+          *error = last_error;
+        return false;
+      }
+      const std::string current_model_id = matte->active_model_id;
+      if (initialized && enabled && current_model_id == active_model_id &&
+          last_frame_w == frame_w && last_frame_h == frame_h) {
+        return true;
+      }
+      active_model_id = current_model_id;
+      last_frame_w = frame_w;
+      last_frame_h = frame_h;
+      initialized = true;
+      enabled = true;
+      last_error.clear();
+      return true;
+    }
+
+    bool
+    ApplyVulkanRgb(const studiocast::vulkan::VulkanImage &in_rgb,
+                   studiocast::vulkan::VulkanImage *out_rgb_img,
+                   const studiocast::video::effects::BroadcastCameraEffects &fx,
+                   std::uint64_t capture_sequence, std::string *error,
+                   DeferredGpuOut *deferred_out) {
+      if (error)
+        error->clear();
+      if (!deferred_out) {
+        if (error)
+          *error = "Open Vulkan Virtual Key Light: invalid GPU output.";
+        return false;
+      }
+      const auto publish_passthrough = [&]() {
+        deferred_out->kind = DeferredGpuKind::vulkan_rgb;
+        deferred_out->nvcv_img = nullptr;
+        deferred_out->nvcv = nullptr;
+        deferred_out->cuda_img = nullptr;
+        deferred_out->cuda = nullptr;
+        deferred_out->stream = nullptr;
+        deferred_out->vulkan_img = &in_rgb;
+        deferred_out->vulkan_kernels = matte ? &matte->kernels : nullptr;
+      };
+      if (!fx.virtual_key_light.enabled) {
+        publish_passthrough();
+        return true;
+      }
+      const float intensity01 =
+          Clamp01FromPercent(fx.virtual_key_light.intensity);
+      if (intensity01 <= 0.0001f) {
+        publish_passthrough();
+        return true;
+      }
+      if (!matte || !out_rgb_img) {
+        if (error)
+          *error = "Open Vulkan Virtual Key Light: invalid GPU stage state.";
+        return false;
+      }
+      if (!in_rgb.Valid() ||
+          in_rgb.format() != studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
+        if (error)
+          *error =
+              "Open Vulkan Virtual Key Light: invalid input GPU RGB image.";
+        return false;
+      }
+      std::string init_err;
+      if (!EnsureInitialized(in_rgb.width(), in_rgb.height(), fx, &init_err)) {
+        if (error)
+          *error = init_err;
+        return false;
+      }
+      if (!matte->EnsureFrameAlphaForFrameGpu(
+              in_rgb, capture_sequence, in_rgb.width(), in_rgb.height(), fx,
+              error)) {
+        if (error && !error->empty()) {
+          *error = "Open Vulkan Virtual Key Light: " + *error;
+        }
+        return false;
+      }
+      if (!matte->EnsureImage(
+              out_rgb_img, in_rgb.width(), in_rgb.height(),
+              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+              /*map_memory=*/true, "key_light_out", error)) {
+        return false;
+      }
+
+      const float pan = std::clamp(
+          static_cast<float>(fx.virtual_key_light.direction_pan_degrees),
+          -90.0f, 90.0f);
+      const float dir = std::clamp(pan / 90.0f, -1.0f, 1.0f);
+
+      float target_r = 255.0f, target_g = 255.0f, target_b = 255.0f;
+      OpenCudaKeyLightContext::ResolveTargetColorFromTemperaturePreset(
+          fx.virtual_key_light.temperature_preset, &target_r, &target_g,
+          &target_b);
+
+      std::string kerr;
+      if (!matte->kernels.ApplyKeyLightU8x3(
+              in_rgb, matte->alpha_resized, target_r, target_g, target_b,
+              intensity01, dir, *out_rgb_img, &kerr)) {
+        if (error)
+          *error = "Open Vulkan Virtual Key Light: GPU blend failed: " + kerr;
+        return false;
+      }
+      ++matte->key_light_dispatch_calls;
+      ++matte->forced_sync_calls;
+
+      deferred_out->kind = DeferredGpuKind::vulkan_rgb;
+      deferred_out->nvcv_img = nullptr;
+      deferred_out->nvcv = nullptr;
+      deferred_out->cuda_img = nullptr;
+      deferred_out->cuda = nullptr;
+      deferred_out->stream = nullptr;
+      deferred_out->vulkan_img = out_rgb_img;
+      deferred_out->vulkan_kernels = &matte->kernels;
+      return true;
+    }
+  } open_vulkan_key_light;
+
+  struct OpenVulkanAutoFrameContext {
+    using TrackingSource = OpenCudaAutoFrameContext::TrackingSource;
+    using TrackingBox = OpenCudaAutoFrameContext::TrackingBox;
+    using CropPlan = OpenCudaAutoFrameContext::CropPlan;
+
+    bool initialized = false;
+    bool enabled = false;
+    std::string last_error;
+    std::string active_model_id;
+    OpenVulkanVirtualBackgroundContext *matte = nullptr;
+    int last_frame_w = 0;
+    int last_frame_h = 0;
+
+    std::uint64_t last_matte_query_sequence = 0;
+    bool have_last_matte_box = false;
+    studiocast::maxine::effects::RectF last_matte_box_px{};
+
+    bool have_smoothed_crop = false;
+    studiocast::maxine::effects::RectF crop_smoothed_px;
+    bool last_had_detection = false;
+    TrackingSource last_tracking_source = TrackingSource::kNone;
+
+    void Destroy() {
+      initialized = false;
+      enabled = false;
+      last_error.clear();
+      active_model_id.clear();
+      last_frame_w = 0;
+      last_frame_h = 0;
+      last_matte_query_sequence = 0;
+      have_last_matte_box = false;
+      last_matte_box_px = {};
+      have_smoothed_crop = false;
+      last_had_detection = false;
+      last_tracking_source = TrackingSource::kNone;
+    }
+
+    bool EnsureInitialized(
+        int frame_w, int frame_h,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        bool require_matte_tracking, std::string *error) {
+      if (error)
+        error->clear();
+      if (frame_w <= 0 || frame_h <= 0) {
+        last_error = "Open Vulkan Auto Frame: invalid frame size.";
+        if (error)
+          *error = last_error;
+        return false;
+      }
+
+      std::string current_model_id;
+      if (!matte) {
+        last_error = "Open Vulkan Auto Frame: matte provider not set.";
+        if (error)
+          *error = last_error;
+        return false;
+      }
+      if (require_matte_tracking) {
+        std::string matte_err;
+        if (!matte->EnsureInitialized(frame_w, frame_h, fx, &matte_err,
+                                      /*require_vb_buffers=*/false)) {
+          last_error = "Open Vulkan Auto Frame: " + matte_err;
+          if (error)
+            *error = last_error;
+          return false;
+        }
+        current_model_id = matte->active_model_id;
+      } else if (!matte->kernels.Initialized()) {
+        std::string vk_err;
+        if (!matte->kernels.Initialize(&vk_err)) {
+          last_error =
+              "Open Vulkan Auto Frame: utility kernels unavailable: " +
+              vk_err;
+          if (error)
+            *error = last_error;
+          return false;
+        }
+      }
+
+      if (initialized && enabled && current_model_id == active_model_id &&
+          last_frame_w == frame_w && last_frame_h == frame_h) {
+        return true;
+      }
+      have_smoothed_crop = false;
+      last_had_detection = false;
+      last_tracking_source = TrackingSource::kNone;
+      last_matte_query_sequence = 0;
+      have_last_matte_box = false;
+      last_matte_box_px = {};
+      active_model_id = current_model_id;
+      last_frame_w = frame_w;
+      last_frame_h = frame_h;
+      initialized = true;
+      enabled = true;
+      last_error.clear();
+      return true;
+    }
+
+    bool ResolveMatteTrackingBox(
+        std::uint64_t capture_sequence,
+        const studiocast::vulkan::VulkanImage &in_rgb, int width, int height,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        TrackingBox *out_box, std::string *error) {
+      if (out_box)
+        *out_box = TrackingBox{};
+      if (!out_box || !matte)
+        return true;
+
+      const bool matte_cached_this_frame =
+          matte->cached_matte_valid &&
+          matte->cached_matte_sequence == capture_sequence;
+      constexpr std::uint64_t kMatteFallbackIntervalFrames = 10;
+      const bool should_query_matte =
+          matte_cached_this_frame || (last_matte_query_sequence == 0) ||
+          (capture_sequence >=
+           (last_matte_query_sequence + kMatteFallbackIntervalFrames));
+      if (!should_query_matte) {
+        if (have_last_matte_box) {
+          out_box->source = TrackingSource::kMatte;
+          out_box->box_px = last_matte_box_px;
+          out_box->confidence = 1.0f;
+        }
+        return true;
+      }
+
+      std::string matte_err;
+      if (!matte->EnsureInitialized(width, height, fx, &matte_err,
+                                    /*require_vb_buffers=*/false)) {
+        if (error && !matte_err.empty())
+          *error = "Open Vulkan Auto Frame: " + matte_err;
+        return true;
+      }
+
+      const std::vector<float> *alpha_cpu = nullptr;
+      int alpha_w = 0;
+      int alpha_h = 0;
+      std::string alpha_err;
+      studiocast::maxine::effects::RectF box_px;
+      if (matte->GetAlphaCpuForFrame(in_rgb, capture_sequence, width, height,
+                                     fx, &alpha_cpu, &alpha_w, &alpha_h,
+                                     &alpha_err) &&
+          alpha_cpu) {
+        const bool found = OpenCudaAutoFrameContext::ComputeMatteBoxPxFromAlpha(
+            *alpha_cpu, alpha_w, alpha_h, width, height, &box_px);
+
+        last_matte_query_sequence = capture_sequence;
+        if (found) {
+          have_last_matte_box = true;
+          last_matte_box_px = box_px;
+          out_box->source = TrackingSource::kMatte;
+          out_box->box_px = box_px;
+          out_box->confidence = 1.0f;
+        } else {
+          have_last_matte_box = false;
+          last_matte_box_px = {};
+        }
+      } else if (error && !alpha_err.empty()) {
+        *error = "Open Vulkan Auto Frame: " + alpha_err;
+      }
+      return true;
+    }
+
+    bool ResolveCropPlan(
+        std::uint64_t capture_sequence,
+        const studiocast::vulkan::VulkanImage &in_rgb, int width, int height,
+        const studiocast::video::effects::BroadcastCameraEffects &fx,
+        const TrackingBox *tracking_box, bool tracking_provider_ran,
+        CropPlan *plan, std::string *error) {
+      if (plan)
+        *plan = CropPlan{};
+      if (!fx.auto_frame.enabled)
+        return true;
+      if (!plan) {
+        if (error)
+          *error = "Open Vulkan Auto Frame: null crop plan.";
+        return true;
+      }
+
+      std::string init_err;
+      if (!EnsureInitialized(width, height, fx,
+                             /*require_matte_tracking=*/!tracking_provider_ran,
+                             &init_err)) {
+        if (error && !init_err.empty())
+          *error = init_err;
+        return true;
+      }
+
+      TrackingBox resolved_box;
+      bool found = false;
+      if (tracking_box &&
+          OpenCudaAutoFrameContext::IsUsableTrackingBox(*tracking_box, width,
+                                                        height)) {
+        resolved_box = *tracking_box;
+        found = true;
+      } else if (!tracking_provider_ran) {
+        if (!ResolveMatteTrackingBox(capture_sequence, in_rgb, width, height,
+                                     fx, &resolved_box, error)) {
+          return false;
+        }
+        found = OpenCudaAutoFrameContext::IsUsableTrackingBox(resolved_box,
+                                                              width, height);
+      }
+
+      const TrackingSource source =
+          found ? resolved_box.source : TrackingSource::kNone;
+      if (source != last_tracking_source) {
+        have_smoothed_crop = false;
+        last_tracking_source = source;
+      }
+
+      studiocast::maxine::effects::AutoFrameKnobs knobs;
+      knobs.strength = fx.auto_frame.strength;
+      knobs.smoothing = fx.auto_frame.smoothing;
+      knobs.headroom = fx.auto_frame.headroom;
+
+      const float out_aspect =
+          static_cast<float>(width) / static_cast<float>(height);
+      studiocast::maxine::effects::RectF target_crop = {};
+      if (found) {
+        target_crop = studiocast::maxine::effects::ArAutoFrameTracker::
+            ComputeTargetCropFromBoxPx(resolved_box.box_px, width, height,
+                                       out_aspect, knobs);
+      } else {
+        const float strength01 =
+            std::clamp(static_cast<float>(knobs.strength) / 100.0f, 0.0f,
+                       1.0f);
+        const float zoom = 1.0f + strength01 * 0.5f;
+        target_crop =
+            studiocast::maxine::effects::ArAutoFrameTracker::CenterCrop(
+                width, height, out_aspect, zoom);
+      }
+
+      auto clamp_crop = [&](studiocast::maxine::effects::RectF *r) {
+        if (!r)
+          return;
+        r->w = std::clamp(r->w, 1.0f, static_cast<float>(width));
+        r->h = std::clamp(r->h, 1.0f, static_cast<float>(height));
+        r->x = std::clamp(r->x, 0.0f, static_cast<float>(width) - r->w);
+        r->y = std::clamp(r->y, 0.0f, static_cast<float>(height) - r->h);
+      };
+
+      if (!have_smoothed_crop) {
+        crop_smoothed_px = target_crop;
+        have_smoothed_crop = true;
+      } else {
+        const float a =
+            studiocast::maxine::effects::ArAutoFrameTracker::SmoothingAlpha(
+                knobs.smoothing);
+        crop_smoothed_px =
+            studiocast::maxine::effects::ArAutoFrameTracker::Lerp(
+                crop_smoothed_px, target_crop, a);
+      }
+      clamp_crop(&crop_smoothed_px);
+      last_had_detection = found;
+
+      constexpr float kEpsPx = 0.5f;
+      if (std::abs(crop_smoothed_px.x) <= kEpsPx &&
+          std::abs(crop_smoothed_px.y) <= kEpsPx &&
+          std::abs(crop_smoothed_px.w - static_cast<float>(width)) <= kEpsPx &&
+          std::abs(crop_smoothed_px.h - static_cast<float>(height)) <=
+              kEpsPx) {
+        return true;
+      }
+
+      plan->should_crop = true;
+      plan->found_tracking_box = found;
+      plan->tracking_source = source;
+      plan->crop_px = crop_smoothed_px;
+      return true;
+    }
+
+    bool
+    ApplyVulkanRgb(std::uint64_t capture_sequence,
+                   const studiocast::vulkan::VulkanImage &in_rgb,
+                   studiocast::vulkan::VulkanImage *out_rgb,
+                   const studiocast::video::effects::BroadcastCameraEffects &fx,
+                   const TrackingBox *tracking_box,
+                   bool tracking_provider_ran, DeferredGpuOut *deferred_out,
+                   std::string *error) {
+      if (!fx.auto_frame.enabled)
+        return true;
+      if (!matte || !out_rgb || !deferred_out) {
+        if (error)
+          *error = "Open Vulkan Auto Frame: invalid GPU stage state.";
+        return false;
+      }
+      if (!in_rgb.Valid() ||
+          in_rgb.format() != studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
+        if (error)
+          *error = "Open Vulkan Auto Frame: invalid input GPU RGB image.";
+        return false;
+      }
+
+      CropPlan plan;
+      std::string plan_err;
+      if (!ResolveCropPlan(capture_sequence, in_rgb, in_rgb.width(),
+                           in_rgb.height(), fx, tracking_box,
+                           tracking_provider_ran, &plan, &plan_err)) {
+        if (error)
+          *error = plan_err;
+        return false;
+      }
+
+      deferred_out->kind = DeferredGpuKind::vulkan_rgb;
+      deferred_out->nvcv_img = nullptr;
+      deferred_out->nvcv = nullptr;
+      deferred_out->cuda_img = nullptr;
+      deferred_out->cuda = nullptr;
+      deferred_out->stream = nullptr;
+      deferred_out->vulkan_kernels = &matte->kernels;
+
+      if (!plan.should_crop) {
+        deferred_out->vulkan_img = &in_rgb;
+        return true;
+      }
+
+      if (!matte->EnsureImage(out_rgb, in_rgb.width(), in_rgb.height(),
+                              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                              /*map_memory=*/true, "auto_frame_out", error)) {
+        return false;
+      }
+      std::string kerr;
+      if (!matte->kernels.CropResizeBilinear(
+              in_rgb, *out_rgb, plan.crop_px.x, plan.crop_px.y,
+              plan.crop_px.w, plan.crop_px.h, &kerr)) {
+        if (error)
+          *error = "Open Vulkan Auto Frame: GPU crop/resize failed: " + kerr;
+        return false;
+      }
+      ++matte->crop_resize_dispatch_calls;
+      ++matte->forced_sync_calls;
+      deferred_out->vulkan_img = out_rgb;
+      return true;
+    }
+  } open_vulkan_auto_frame;
+#endif
+
   // Share the same Open CUDA matting model/session (and per-frame matte cache)
   // across all open-source video effects that need a foreground matte. This
   // avoids re-running the matting network multiple times per frame.
@@ -4567,6 +5705,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   // stage is not scheduled; other effects request matte-only initialization.
   open_cuda_auto_frame.matte = &open_cuda_vb;
   open_cuda_key_light.matte = &open_cuda_vb;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  open_vulkan_auto_frame.matte = &open_vulkan_vb;
+  open_vulkan_key_light.matte = &open_vulkan_vb;
+#endif
 
   // Open Video analysis cache (per-frame) and face detection.
   //
@@ -6476,6 +7618,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   bool want_open_vulkan_vb = false;
   bool have_open_vulkan_vb = false;
 
+  bool want_open_vulkan_auto_frame = false;
+  bool have_open_vulkan_auto_frame = false;
+
+  bool want_open_vulkan_key_light = false;
+  bool have_open_vulkan_key_light = false;
+
   bool want_open_cuda_auto_frame = false;
   bool have_open_cuda_auto_frame = false;
 
@@ -6614,6 +7762,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     want_open_vulkan_vb = false;
     have_open_vulkan_vb = false;
 
+    want_open_vulkan_auto_frame = false;
+    have_open_vulkan_auto_frame = false;
+
+    want_open_vulkan_key_light = false;
+    have_open_vulkan_key_light = false;
+
     want_open_cuda_auto_frame = false;
     have_open_cuda_auto_frame = false;
 
@@ -6710,8 +7864,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     ComputeBackendAvailability compute_available;
     compute_available.vulkan_available = false;
     compute_available.vulkan_unavailable_reason =
-        "Vulkan compute backend requested, but Open Vulkan virtual background "
-        "is not available.";
+        "Vulkan compute backend requested, but no Open Vulkan video effect is "
+        "available.";
 
     const auto remove_compute_stages_from_plan = [&] {
       remove_stage_from_plan(
@@ -6738,10 +7892,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       remove_stage_from_plan(
           studiocast::video::effects::contract::kEffectIdEyeContact);
       remove_stage_from_plan(
-          studiocast::video::effects::contract::kEffectIdAutoFrame);
-      remove_stage_from_plan(
-          studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
-      remove_stage_from_plan(
           studiocast::video::effects::contract::kEffectIdVignette);
     };
 
@@ -6751,8 +7901,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
       remove_non_vulkan_vb_compute_stages_from_plan();
-      append_note("Open Vulkan: only virtual background blur/remove/replace "
-                  "is eligible for the Vulkan backend in this milestone.");
+      append_note("Open Vulkan: virtual background, virtual key light, and "
+                  "auto frame are eligible for the Vulkan backend in this "
+                  "milestone.");
     } else if (compute_work_requested &&
                compute_selection.resolved == ComputeBackendKind::cpu &&
                cfg.compute_backend == ComputeBackendPreference::cpu) {
@@ -7124,7 +8275,64 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
-      if (engine_open_cuda) {
+      bool auto_frame_handled_by_vulkan_request = false;
+      if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+        auto_frame_handled_by_vulkan_request = true;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+        want_open_vulkan_auto_frame = true;
+
+        bool have_open_video_face_detection = false;
+        std::string fd_err;
+        if (open_video_yunet.EnsureInitialized(fx.auto_frame.model_id,
+                                               &fd_err)) {
+          have_open_video_face_detection = true;
+        }
+
+        std::string vk_err;
+        const bool require_matte_tracking = !have_open_video_face_detection;
+        if (open_vulkan_auto_frame.EnsureInitialized(
+                capA.width, capA.height, fx,
+                /*require_matte_tracking=*/require_matte_tracking, &vk_err)) {
+          have_open_vulkan_auto_frame = true;
+          compute_available.vulkan_available = true;
+          set_backend(stage_id, "open_vulkan");
+          if (!note.empty()) {
+            note += "\n";
+          }
+          if (have_open_video_face_detection) {
+            note += "Open Vulkan: Auto Frame (CPU face tracking; Vulkan "
+                    "crop/scale while the frame is Vulkan-resident).";
+          } else {
+            note += "Open Vulkan: Auto Frame (foreground matte tracking; "
+                    "shared Vulkan matte with CPU tracking tail and Vulkan "
+                    "crop/scale).";
+          }
+          detach_vignette_from_auto_frame();
+        } else {
+          if (!note.empty()) {
+            note += "\n";
+          }
+          if (!fd_err.empty() && !have_open_video_face_detection) {
+            note += fd_err;
+            note += "\n";
+          }
+          note += vk_err;
+          compute_available.vulkan_unavailable_reason = vk_err;
+          remove_stage_from_plan(stage_id);
+          detach_vignette_from_auto_frame();
+        }
+#else
+        const std::string vk_err =
+            "Open Vulkan: backend is disabled in this build. Rebuild with "
+            "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
+        append_note(vk_err);
+        compute_available.vulkan_unavailable_reason = vk_err;
+        remove_stage_from_plan(stage_id);
+        detach_vignette_from_auto_frame();
+#endif
+      }
+
+      if (!auto_frame_handled_by_vulkan_request && engine_open_cuda) {
         // Open source: prefer Open Video face tracking when available,
         // otherwise fall back to the foreground matte path.
         want_open_cuda_auto_frame = true;
@@ -7169,7 +8377,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           remove_stage_from_plan(stage_id);
           detach_vignette_from_auto_frame();
         }
-      } else if (!maxine_strict_blocked) {
+      } else if (!auto_frame_handled_by_vulkan_request &&
+                 !maxine_strict_blocked) {
         // Maxine AR preferred; Open CUDA fallback when engine_preference=AUTO.
         want_maxine_auto_frame = true;
         std::string mx_err;
@@ -7244,7 +8453,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       // If Auto Frame couldn't be initialized on any backend, make sure
       // vignette isn't left attached.
-      if (!have_maxine_auto_frame && !have_open_cuda_auto_frame) {
+      if (!have_maxine_auto_frame && !have_open_cuda_auto_frame &&
+          !have_open_vulkan_auto_frame) {
         detach_vignette_from_auto_frame();
       }
     }
@@ -7265,7 +8475,44 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
-      if (engine_open_cuda) {
+      bool key_light_handled_by_vulkan_request = false;
+      if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+        key_light_handled_by_vulkan_request = true;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+        want_open_vulkan_key_light = true;
+        std::string vk_err;
+        if (open_vulkan_key_light.EnsureInitialized(capA.width, capA.height,
+                                                    fx, &vk_err)) {
+          have_open_vulkan_key_light = true;
+          compute_available.vulkan_available = true;
+          set_backend(stage_id, "open_vulkan");
+          if (!note.empty()) {
+            note += "\n";
+          }
+          note += "Open Vulkan: Virtual Key Light (shared Vulkan matte; GPU "
+                  "foreground relight while the frame is Vulkan-resident).";
+          detach_vignette_from_key_light();
+        } else {
+          if (!note.empty()) {
+            note += "\n";
+          }
+          note += vk_err;
+          compute_available.vulkan_unavailable_reason = vk_err;
+          remove_stage_from_plan(stage_id);
+          detach_vignette_from_key_light();
+        }
+#else
+        const std::string vk_err =
+            "Open Vulkan: backend is disabled in this build. Rebuild with "
+            "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
+        append_note(vk_err);
+        compute_available.vulkan_unavailable_reason = vk_err;
+        remove_stage_from_plan(stage_id);
+        detach_vignette_from_key_light();
+#endif
+      }
+
+      if (!key_light_handled_by_vulkan_request && engine_open_cuda) {
         // Open CUDA: key light via shared matting + masked lift.
         want_open_cuda_key_light = true;
         std::string oc_err;
@@ -7288,7 +8535,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           remove_stage_from_plan(stage_id);
           detach_vignette_from_key_light();
         }
-      } else if (!maxine_strict_blocked) {
+      } else if (!key_light_handled_by_vulkan_request &&
+                 !maxine_strict_blocked) {
         // Maxine VFX preferred; Open CUDA fallback when engine_preference=AUTO.
         want_maxine_relight = true;
         std::string mx_err;
@@ -7346,7 +8594,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       // If key light couldn't be initialized on any backend, make sure vignette
       // isn't left attached.
-      if (!have_maxine_relight && !have_open_cuda_key_light) {
+      if (!have_maxine_relight && !have_open_cuda_key_light &&
+          !have_open_vulkan_key_light) {
         detach_vignette_from_key_light();
       }
     }
@@ -7385,7 +8634,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           have_maxine_bg_blur || have_maxine_auto_frame ||
           have_maxine_eye_contact || have_maxine_relight ||
           have_maxine_denoise;
-      const bool have_any_vulkan_compute = have_open_vulkan_vb;
+      const bool have_any_vulkan_compute =
+          have_open_vulkan_vb || have_open_vulkan_auto_frame ||
+          have_open_vulkan_key_light;
       const bool have_any_cuda_compute =
           have_any_maxine_compute || have_open_cuda_vb ||
           have_open_cuda_auto_frame || have_open_cuda_key_light ||
@@ -7587,9 +8838,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::uint64_t open_vulkan_upload_calls = 0;
   std::uint64_t open_vulkan_download_calls = 0;
   std::uint64_t open_vulkan_final_download_calls = 0;
+  std::uint64_t open_vulkan_cpu_continuation_download_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_stage_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_key_light_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_auto_frame_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_auto_frame_face_tracking_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_auto_frame_matte_tracking_calls = 0;
+  std::uint64_t open_vulkan_cpu_tail_auto_frame_cpu_crop_calls = 0;
   std::uint64_t open_vulkan_standalone_scaler_upload_calls = 0;
   std::uint64_t open_vulkan_standalone_scaler_download_calls = 0;
   std::uint64_t open_vulkan_forced_sync_calls = 0;
+  std::uint64_t open_vulkan_runtime_failure_frames = 0;
 
   const bool debug_maxine_transfers =
       (std::getenv("STUDIOCAST_DEBUG_MAXINE_TRANSFERS") != nullptr);
@@ -7895,7 +9154,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     DeferredGpuOut deferred_gpu_out{};
     bool have_deferred_gpu_out = false;
     bool open_cuda_gpu_frame_pending_cpu_readback = false;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    bool open_vulkan_gpu_frame_pending_cpu_readback = false;
+#endif
     bool open_cuda_active_this_frame = false;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    bool open_vulkan_active_this_frame = false;
+#endif
     bool maxine_active_this_frame = false;
     int maxine_green_screen_calls_this_frame = 0;
     MaxineFrameLocalSharedHandles maxine_shared_handles;
@@ -7905,12 +9170,116 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     open_cuda_next = nullptr;
     open_cuda_uploaded_this_frame = false;
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    studiocast::vulkan::VulkanImage *open_vulkan_curr = nullptr;
+    studiocast::vulkan::VulkanImage *open_vulkan_next = nullptr;
+    bool open_vulkan_uploaded_this_frame = false;
+#endif
+
     auto mark_open_cuda_active_frame = [&]() {
       if (!open_cuda_active_this_frame) {
         open_cuda_active_this_frame = true;
         ++open_cuda_active_frames;
       }
     };
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    auto mark_open_vulkan_active_frame = [&]() {
+      if (!open_vulkan_active_this_frame) {
+        open_vulkan_active_this_frame = true;
+        ++open_vulkan_active_frames;
+      }
+    };
+
+    auto mark_open_vulkan_cpu_tail = [&](std::string_view stage_id) {
+      mark_open_vulkan_active_frame();
+      ++open_vulkan_cpu_tail_stage_calls;
+      if (stage_id ==
+          studiocast::video::effects::contract::kEffectIdVirtualKeyLight) {
+        ++open_vulkan_cpu_tail_key_light_calls;
+      } else if (stage_id ==
+                 studiocast::video::effects::contract::kEffectIdAutoFrame) {
+        ++open_vulkan_cpu_tail_auto_frame_calls;
+      }
+    };
+
+    auto mark_open_vulkan_auto_frame_cpu_tail =
+        [&](OpenCudaAutoFrameContext::TrackingSource tracking_source,
+            bool cpu_crop_resize) {
+          mark_open_vulkan_cpu_tail(
+              studiocast::video::effects::contract::kEffectIdAutoFrame);
+          switch (tracking_source) {
+          case OpenCudaAutoFrameContext::TrackingSource::kFace:
+            ++open_vulkan_cpu_tail_auto_frame_face_tracking_calls;
+            break;
+          case OpenCudaAutoFrameContext::TrackingSource::kMatte:
+            ++open_vulkan_cpu_tail_auto_frame_matte_tracking_calls;
+            break;
+          default:
+            break;
+          }
+          if (cpu_crop_resize)
+            ++open_vulkan_cpu_tail_auto_frame_cpu_crop_calls;
+        };
+
+    auto ensure_open_vulkan_current_from_cpu = [&](std::string *error) {
+      if (error)
+        error->clear();
+      if (open_vulkan_uploaded_this_frame && open_vulkan_curr &&
+          open_vulkan_curr->Valid()) {
+        return true;
+      }
+      mark_open_vulkan_active_frame();
+      std::string vk_err;
+      if (!open_vulkan_vb.kernels.Initialized() &&
+          !open_vulkan_vb.kernels.Initialize(&vk_err)) {
+        if (error)
+          *error = "Open Vulkan: utility kernels unavailable: " + vk_err;
+        return false;
+      }
+      if (!open_vulkan_vb.EnsureImage(
+              &open_vulkan_vb.frame_rgb, capA.width, capA.height,
+              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+              /*map_memory=*/true, "frame_rgb", error) ||
+          !open_vulkan_vb.EnsureImage(
+              &open_vulkan_vb.out_rgb, capA.width, capA.height,
+              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+              /*map_memory=*/true, "out_rgb", error)) {
+        return false;
+      }
+      if (!open_vulkan_vb.UploadRgbToImage(rgb.data(), rgbStride, capA.width,
+                                           capA.height,
+                                           &open_vulkan_vb.frame_rgb, error)) {
+        return false;
+      }
+      open_vulkan_curr = &open_vulkan_vb.frame_rgb;
+      open_vulkan_next = &open_vulkan_vb.out_rgb;
+      open_vulkan_uploaded_this_frame = true;
+      ++open_vulkan_upload_calls;
+      return true;
+    };
+
+    auto download_open_vulkan_current_to_cpu = [&](std::string *error) {
+      if (error)
+        error->clear();
+      if (!open_vulkan_gpu_frame_pending_cpu_readback) {
+        return true;
+      }
+      if (!open_vulkan_curr || !open_vulkan_curr->Valid()) {
+        if (error)
+          *error = "Open Vulkan: no current GPU frame to download.";
+        return false;
+      }
+      if (!open_vulkan_vb.DownloadImageToRgb(*open_vulkan_curr, rgb.data(),
+                                             rgbStride, error)) {
+        return false;
+      }
+      ++open_vulkan_download_calls;
+      ++open_vulkan_cpu_continuation_download_calls;
+      open_vulkan_gpu_frame_pending_cpu_readback = false;
+      return true;
+    };
+#endif
 
     auto mark_open_cuda_cpu_tail = [&](std::string_view stage_id) {
       mark_open_cuda_active_frame();
@@ -8105,6 +9474,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const bool open_cuda_auto_frame_stage_enabled =
           have_open_cuda_auto_frame &&
           has_stage(studiocast::video::effects::contract::kEffectIdAutoFrame);
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      const bool open_vulkan_key_light_stage_enabled =
+          have_open_vulkan_key_light &&
+          has_stage(studiocast::video::effects::contract::
+                        kEffectIdVirtualKeyLight);
+      const bool open_vulkan_auto_frame_stage_enabled =
+          have_open_vulkan_auto_frame &&
+          has_stage(studiocast::video::effects::contract::kEffectIdAutoFrame);
+#endif
 
       const auto is_open_cuda_stage_id = [&](const std::string &stage_id) {
         if (!open_cuda_any_stage_enabled)
@@ -8402,6 +9781,66 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             return;
           }
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+          if (have_open_vulkan_key_light) {
+            std::string vk_err;
+            if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
+              ++open_vulkan_runtime_failure_frames;
+              std::lock_guard<std::mutex> lock(mu_);
+              last_error_ =
+                  "Open Vulkan virtual key light failed: " + vk_err;
+              return;
+            }
+
+            if (!open_vulkan_next) {
+              open_vulkan_next =
+                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                      ? &open_vulkan_vb.out_rgb
+                      : &open_vulkan_vb.frame_rgb;
+            }
+
+            if (open_vulkan_key_light.ApplyVulkanRgb(
+                    *open_vulkan_curr, open_vulkan_next, fx,
+                    capture_sequence, &vk_err, &deferred_gpu_out)) {
+              if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
+                const bool curr_was_frame =
+                    (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
+                open_vulkan_curr = open_vulkan_next;
+                open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
+                                                  : &open_vulkan_vb.out_rgb;
+              }
+              open_vulkan_gpu_frame_pending_cpu_readback = true;
+
+              const bool keep_gpu_for_auto_frame =
+                  open_vulkan_auto_frame_stage_enabled &&
+                  stage_appears_after(
+                      stage_id,
+                      studiocast::video::effects::contract::
+                          kEffectIdAutoFrame);
+              if (defer_readback) {
+                have_deferred_gpu_out = true;
+                return;
+              }
+              if (keep_gpu_for_auto_frame) {
+                return;
+              }
+              std::string down_err;
+              if (!download_open_vulkan_current_to_cpu(&down_err)) {
+                ++open_vulkan_runtime_failure_frames;
+                std::lock_guard<std::mutex> lock(mu_);
+                last_error_ =
+                    "Open Vulkan virtual key light failed: " + down_err;
+              }
+              return;
+            }
+
+            ++open_vulkan_runtime_failure_frames;
+            std::lock_guard<std::mutex> lock(mu_);
+            last_error_ = "Open Vulkan virtual key light failed: " + vk_err;
+            return;
+          }
+#endif
+
           if (have_open_cuda_key_light) {
             // If an earlier Open CUDA stage has kept the RGB frame and matte
             // on GPU, run key light inside that GPU section. This avoids the
@@ -8517,6 +9956,68 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                             kEffectIdVirtualBackgroundRemove ||
             stage_id == studiocast::video::effects::contract::
                             kEffectIdVirtualBackgroundReplace) {
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+          if (have_open_vulkan_vb) {
+            std::string vk_err;
+            if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
+              ++open_vulkan_runtime_failure_frames;
+              std::lock_guard<std::mutex> lock(mu_);
+              last_error_ =
+                  "Open Vulkan virtual background failed: " + vk_err;
+              return;
+            }
+
+            if (!open_vulkan_next) {
+              open_vulkan_next =
+                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                      ? &open_vulkan_vb.out_rgb
+                      : &open_vulkan_vb.frame_rgb;
+            }
+
+            if (!open_vulkan_vb.ApplyVulkanRgb(
+                    *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
+                    &vk_err, &deferred_gpu_out)) {
+              ++open_vulkan_runtime_failure_frames;
+              std::lock_guard<std::mutex> lock(mu_);
+              last_error_ =
+                  "Open Vulkan virtual background failed: " + vk_err;
+              return;
+            }
+
+            const bool curr_was_frame =
+                (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
+            open_vulkan_curr = open_vulkan_next;
+            open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
+                                              : &open_vulkan_vb.out_rgb;
+            open_vulkan_gpu_frame_pending_cpu_readback = true;
+
+            const bool keep_gpu_frame_for_key_light =
+                open_vulkan_key_light_stage_enabled &&
+                stage_appears_after(stage_id,
+                                    studiocast::video::effects::contract::
+                                        kEffectIdVirtualKeyLight);
+            const bool keep_gpu_frame_for_auto_frame =
+                open_vulkan_auto_frame_stage_enabled &&
+                stage_appears_after(
+                    stage_id,
+                    studiocast::video::effects::contract::kEffectIdAutoFrame);
+            if (defer_readback || keep_gpu_frame_for_key_light ||
+                keep_gpu_frame_for_auto_frame) {
+              have_deferred_gpu_out = defer_readback;
+              return;
+            }
+
+            std::string down_err;
+            if (!download_open_vulkan_current_to_cpu(&down_err)) {
+              ++open_vulkan_runtime_failure_frames;
+              std::lock_guard<std::mutex> lock(mu_);
+              last_error_ =
+                  "Open Vulkan virtual background failed: " + down_err;
+            }
+            return;
+          }
+#endif
+
           if (have_maxine_bg_blur) {
             auto &breaker =
                 optional_breaker(OptionalEffectSlot::virtual_background);
@@ -8860,6 +10361,101 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
         if (stage_id ==
             studiocast::video::effects::contract::kEffectIdAutoFrame) {
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+          if (have_open_vulkan_auto_frame) {
+            OpenCudaAutoFrameContext::TrackingBox tracking_box;
+            const OpenCudaAutoFrameContext::TrackingBox *tracking_box_ptr =
+                nullptr;
+            bool tracking_provider_ran = false;
+            auto tracking_tail_source =
+                OpenCudaAutoFrameContext::TrackingSource::kMatte;
+
+            const auto adopt_face_detections =
+                [&](const std::vector<studiocast::open_video::FaceDetection>
+                        &detections) {
+                  tracking_provider_ran = true;
+                  tracking_tail_source =
+                      OpenCudaAutoFrameContext::TrackingSource::kFace;
+                  if (OpenCudaAutoFrameContext::BuildBestFaceTrackingBox(
+                          detections, &tracking_box)) {
+                    tracking_box_ptr = &tracking_box;
+                  }
+                };
+
+            if (open_video_cache.face_detections) {
+              adopt_face_detections(*open_video_cache.face_detections);
+            } else if (open_video_yunet.available()) {
+              std::string fd_err;
+              if (open_video_yunet.EnsureDetectionsForFrame(
+                      rgb.data(), capA.width, capA.height, rgbStride,
+                      fx.auto_frame.model_id, capture_sequence,
+                      &open_video_cache, &fd_err)) {
+                if (open_video_cache.face_detections) {
+                  adopt_face_detections(*open_video_cache.face_detections);
+                }
+              } else if (!fd_err.empty()) {
+                std::lock_guard<std::mutex> lock(mu_);
+                last_error_ = "Open Video face detection failed: " + fd_err;
+              }
+            }
+
+            std::string vk_err;
+            if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
+              ++open_vulkan_runtime_failure_frames;
+              std::lock_guard<std::mutex> lock(mu_);
+              last_error_ = "Open Vulkan auto frame failed: " + vk_err;
+              return;
+            }
+            if (!open_vulkan_next) {
+              open_vulkan_next =
+                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                      ? &open_vulkan_vb.out_rgb
+                      : &open_vulkan_vb.frame_rgb;
+            }
+
+            DeferredGpuOut auto_frame_gpu_out{};
+            if (open_vulkan_auto_frame.ApplyVulkanRgb(
+                    capture_sequence, *open_vulkan_curr, open_vulkan_next, fx,
+                    tracking_box_ptr, tracking_provider_ran,
+                    &auto_frame_gpu_out, &vk_err)) {
+              deferred_gpu_out = auto_frame_gpu_out;
+              if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
+                const bool curr_was_frame =
+                    (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
+                open_vulkan_curr = open_vulkan_next;
+                open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
+                                                  : &open_vulkan_vb.out_rgb;
+              }
+              open_vulkan_gpu_frame_pending_cpu_readback = true;
+
+              const bool keep_deferred_after_auto_frame =
+                  allow_defer_readback && (stage_id == last_stage_for_defer);
+              if (keep_deferred_after_auto_frame) {
+                have_deferred_gpu_out = true;
+              } else {
+                std::string down_err;
+                if (!download_open_vulkan_current_to_cpu(&down_err)) {
+                  ++open_vulkan_runtime_failure_frames;
+                  std::lock_guard<std::mutex> lock(mu_);
+                  last_error_ =
+                      "Open Vulkan auto frame failed after GPU crop/resize: " +
+                      down_err;
+                  return;
+                }
+                have_deferred_gpu_out = false;
+              }
+              mark_open_vulkan_auto_frame_cpu_tail(
+                  tracking_tail_source, /*cpu_crop_resize=*/false);
+              return;
+            }
+
+            ++open_vulkan_runtime_failure_frames;
+            std::lock_guard<std::mutex> lock(mu_);
+            last_error_ = "Open Vulkan auto frame failed: " + vk_err;
+            return;
+          }
+#endif
+
           if (have_maxine_auto_frame) {
             auto &breaker = optional_breaker(OptionalEffectSlot::auto_frame);
             if (!breaker.AllowsAttempt(capture_sequence))
@@ -9105,6 +10701,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             }
           }
         }
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+        if (open_vulkan_gpu_frame_pending_cpu_readback &&
+            !have_deferred_gpu_out) {
+          std::string down_err;
+          if (!download_open_vulkan_current_to_cpu(&down_err)) {
+            std::lock_guard<std::mutex> lock(mu_);
+            last_error_ = down_err;
+            fx_failed = true;
+          }
+        }
+#endif
       }
 
       if (!fx_failed) {
@@ -9252,6 +10859,94 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           last_error_ += " (and readback failed: " + derr + ")";
         last_error_ += ".";
       }
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    } else if (have_deferred_gpu_out &&
+               deferred_gpu_out.kind == DeferredGpuKind::vulkan_rgb) {
+      std::string gerr;
+      bool ok = true;
+
+      if (!deferred_gpu_out.vulkan_img ||
+          !deferred_gpu_out.vulkan_kernels) {
+        ok = false;
+        gerr = "Deferred Open Vulkan output reference is incomplete.";
+      }
+      if (ok && !deferred_gpu_out.vulkan_img->Valid()) {
+        ok = false;
+        gerr = "Deferred Open Vulkan output image is invalid.";
+      }
+      if (ok && deferred_gpu_out.vulkan_img->format() !=
+                    studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
+        ok = false;
+        gerr = "Deferred Open Vulkan output image format must be rgb_u8.";
+      }
+
+      const studiocast::vulkan::VulkanImage *download_img =
+          deferred_gpu_out.vulkan_img;
+      const std::size_t tightStride = static_cast<std::size_t>(outW) * 3u;
+      const std::size_t tightBytes =
+          tightStride * static_cast<std::size_t>(outH);
+
+      if (ok && (frameW != outW || frameH != outH)) {
+        if (!open_vulkan_vb.EnsureImage(
+                &vulkan_rgb_scaled, outW, outH,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/true, "vulkan_rgb_scaled", &gerr)) {
+          ok = false;
+        } else {
+          vulkan_rgb_scaled_allocated = true;
+        }
+        if (ok && !deferred_gpu_out.vulkan_kernels->ResizeBilinear(
+                      *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled,
+                      &gerr)) {
+          ok = false;
+        } else if (ok) {
+          ++open_vulkan_forced_sync_calls;
+        }
+        download_img = &vulkan_rgb_scaled;
+      }
+
+      if (ok) {
+        rgbScaled.resize(tightBytes);
+        if (!open_vulkan_vb.DownloadImageToRgb(*download_img, rgbScaled.data(),
+                                               tightStride, &gerr)) {
+          ok = false;
+        }
+      }
+
+      if (ok) {
+        ++open_vulkan_download_calls;
+        ++open_vulkan_final_download_calls;
+        frameW = outW;
+        frameH = outH;
+        rgbOut = rgbScaled.data();
+        rgbOutStride = tightStride;
+        rgbOutBytes = rgbScaled.size();
+        have_deferred_gpu_out = false;
+        open_vulkan_gpu_frame_pending_cpu_readback = false;
+      } else {
+        std::string derr;
+        bool readback_ok = false;
+        if (deferred_gpu_out.vulkan_img) {
+          if (open_vulkan_vb.DownloadImageToRgb(*deferred_gpu_out.vulkan_img,
+                                                rgb.data(), rgbStride,
+                                                &derr)) {
+            ++open_vulkan_download_calls;
+            ++open_vulkan_cpu_continuation_download_calls;
+            readback_ok = true;
+            have_deferred_gpu_out = false;
+            open_vulkan_gpu_frame_pending_cpu_readback = false;
+          }
+        }
+
+        std::lock_guard<std::mutex> lock(mu_);
+        last_error_ = "Open Vulkan deferred GPU resize path failed";
+        if (!gerr.empty())
+          last_error_ += ": " + gerr;
+        if (!readback_ok && !derr.empty())
+          last_error_ += " (and readback failed: " + derr + ")";
+        last_error_ += ".";
+      }
+#endif
     } else if (have_deferred_gpu_out &&
                deferred_gpu_out.kind == DeferredGpuKind::nvcv_bgr) {
       std::string gerr;
@@ -10080,6 +11775,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_cuda_vb.alpha_download_calls;
       open_cuda_transfers_.matte_frame_upload_calls =
           open_cuda_vb.matte_frame_upload_calls;
+      open_cuda_transfers_.matting_inference_calls =
+          open_cuda_vb.matting_inference_calls;
       open_cuda_transfers_.standalone_scaler_upload_calls =
           open_cuda_standalone_scaler_upload_calls;
       open_cuda_transfers_.standalone_scaler_download_calls =
@@ -10110,12 +11807,52 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       open_vulkan_transfers_.download_calls = open_vulkan_download_calls;
       open_vulkan_transfers_.final_download_calls =
           open_vulkan_final_download_calls;
+      open_vulkan_transfers_.cpu_continuation_download_calls =
+          open_vulkan_cpu_continuation_download_calls;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      open_vulkan_transfers_.alpha_download_calls =
+          open_vulkan_vb.alpha_download_calls;
+      open_vulkan_transfers_.preprocess_dispatch_calls =
+          open_vulkan_vb.preprocess_dispatch_calls;
+      open_vulkan_transfers_.matting_inference_calls =
+          open_vulkan_vb.matting_inference_calls;
+      open_vulkan_transfers_.alpha_resize_dispatch_calls =
+          open_vulkan_vb.alpha_resize_dispatch_calls;
+      open_vulkan_transfers_.blur_dispatch_calls =
+          open_vulkan_vb.blur_dispatch_calls;
+      open_vulkan_transfers_.background_upload_calls =
+          open_vulkan_vb.background_upload_calls;
+      open_vulkan_transfers_.composite_dispatch_calls =
+          open_vulkan_vb.composite_dispatch_calls;
+      open_vulkan_transfers_.key_light_dispatch_calls =
+          open_vulkan_vb.key_light_dispatch_calls;
+      open_vulkan_transfers_.crop_resize_dispatch_calls =
+          open_vulkan_vb.crop_resize_dispatch_calls;
+#endif
       open_vulkan_transfers_.standalone_scaler_upload_calls =
           open_vulkan_standalone_scaler_upload_calls;
       open_vulkan_transfers_.standalone_scaler_download_calls =
           open_vulkan_standalone_scaler_download_calls;
       open_vulkan_transfers_.forced_sync_calls =
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+          open_vulkan_forced_sync_calls + open_vulkan_vb.forced_sync_calls;
+#else
           open_vulkan_forced_sync_calls;
+#endif
+      open_vulkan_transfers_.cpu_tail_stage_calls =
+          open_vulkan_cpu_tail_stage_calls;
+      open_vulkan_transfers_.cpu_tail_key_light_calls =
+          open_vulkan_cpu_tail_key_light_calls;
+      open_vulkan_transfers_.cpu_tail_auto_frame_calls =
+          open_vulkan_cpu_tail_auto_frame_calls;
+      open_vulkan_transfers_.cpu_tail_auto_frame_face_tracking_calls =
+          open_vulkan_cpu_tail_auto_frame_face_tracking_calls;
+      open_vulkan_transfers_.cpu_tail_auto_frame_matte_tracking_calls =
+          open_vulkan_cpu_tail_auto_frame_matte_tracking_calls;
+      open_vulkan_transfers_.cpu_tail_auto_frame_cpu_crop_calls =
+          open_vulkan_cpu_tail_auto_frame_cpu_crop_calls;
+      open_vulkan_transfers_.runtime_failure_frames =
+          open_vulkan_runtime_failure_frames;
 
       maxine_transfers_.active_frames = maxine_active_frames;
       maxine_transfers_.rgb_to_bgr_calls = maxine_rgb_to_bgr_calls;
@@ -10160,6 +11897,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   }
   gpu_rgb_scaled.ClearMetadata();
   gpu_rgb_scaled_allocated = false;
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  if (vulkan_rgb_scaled_allocated && vulkan_rgb_scaled.Valid()) {
+    vulkan_rgb_scaled.Free();
+  }
+  vulkan_rgb_scaled_allocated = false;
+#endif
 
   // Cleanup Open CUDA ping-pong frame buffers.
   if (open_cuda_vb.cuda.IsInitialized()) {

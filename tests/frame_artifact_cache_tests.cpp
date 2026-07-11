@@ -187,8 +187,9 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   studiocast::open_video::FrameArtifactCache cache;
   auto cuda_key = MatteKey("rvm-test",
                            studiocast::open_video::FrameMatteStorage::
-                               cuda_f32_alpha,
+                               device_f32_alpha,
                            "open_cuda");
+  cuda_key.device_context = 0x1111u;
   cuda_key.stream = 0x1234u;
 
   auto cpu_key = cuda_key;
@@ -197,8 +198,9 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   auto vulkan_key = cuda_key;
   vulkan_key.provider_id = "open_vulkan";
   vulkan_key.storage =
-      studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha;
-  vulkan_key.stream = 0;
+      studiocast::open_video::FrameMatteStorage::device_f32_alpha;
+  vulkan_key.device_context = 0x2222u;
+  vulkan_key.stream = 0x3333u;
 
   studiocast::open_video::FrameMatteArtifact artifact;
   artifact.key = cuda_key;
@@ -211,6 +213,12 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   other_model.model_id = "rvm-next";
   auto other_frame_size = cuda_key;
   other_frame_size.frame_width = 1920;
+  auto other_matte_size = cuda_key;
+  other_matte_size.matte_width = 512;
+  auto other_config = cuda_key;
+  other_config.config_fingerprint = 43;
+  auto other_device = cuda_key;
+  other_device.device_context = 0x4444u;
   auto other_stream = cuda_key;
   other_stream.stream = 0x5678u;
 
@@ -218,9 +226,10 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
   ok &= Require(cache.FindMatte(31, cuda_key) != nullptr,
                 "precomputed CUDA matte key should find stored artifact");
   ok &= Require(cache.FindMatte(31, cpu_key) == nullptr,
-                "precomputed CPU/CUDA storage variants must stay distinct");
+                "precomputed CPU/device storage variants must stay distinct");
   ok &= Require(cache.FindMatte(31, vulkan_key) == nullptr,
-                "precomputed CUDA/Vulkan storage variants must stay distinct");
+                "Open CUDA/Open Vulkan providers must stay distinct with "
+                "neutral device storage");
 
   studiocast::open_video::FrameMatteArtifact vk_artifact;
   vk_artifact.key = vulkan_key;
@@ -236,8 +245,90 @@ bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility() {
                 "model changes must not reuse matte artifacts");
   ok &= Require(cache.FindMatte(31, other_frame_size) == nullptr,
                 "frame size changes must not reuse matte artifacts");
+  ok &= Require(cache.FindMatte(31, other_matte_size) == nullptr,
+                "matte size changes must not reuse matte artifacts");
+  ok &= Require(cache.FindMatte(31, other_config) == nullptr,
+                "config changes must not reuse matte artifacts");
+  ok &= Require(cache.FindMatte(31, other_device) == nullptr,
+                "device changes must not reuse device-local matte artifacts");
   ok &= Require(cache.FindMatte(31, other_stream) == nullptr,
-                "stream changes must not reuse device-local matte artifacts");
+                "stream/queue changes must not reuse device-local matte "
+                "artifacts");
+  return ok;
+}
+
+bool TestFrameArtifactCacheDeviceStorageAliasesPreserveCompatibility() {
+  auto cuda_alias_key = MatteKey(
+      "rvm-test", studiocast::open_video::FrameMatteStorage::cuda_f32_alpha,
+      "open_cuda");
+  cuda_alias_key.device_context = 0x1111u;
+  cuda_alias_key.stream = 0x1234u;
+
+  auto neutral_key = cuda_alias_key;
+  neutral_key.storage =
+      studiocast::open_video::FrameMatteStorage::device_f32_alpha;
+
+  auto vulkan_alias_key = neutral_key;
+  vulkan_alias_key.storage =
+      studiocast::open_video::FrameMatteStorage::vulkan_f32_alpha;
+
+  studiocast::open_video::FrameArtifactCache cache;
+  studiocast::open_video::FrameMatteArtifact artifact;
+  artifact.key = neutral_key;
+  artifact.handle = 0xCAFEu;
+  (void)cache.StoreMatte(41, std::move(artifact));
+
+  bool ok = true;
+  ok &= Require(cache.FindMatte(41, cuda_alias_key) != nullptr,
+                "legacy CUDA storage alias should match neutral device "
+                "storage");
+  ok &= Require(cache.FindMatte(41, vulkan_alias_key) != nullptr,
+                "legacy Vulkan storage alias should match neutral device "
+                "storage when provider/device/queue identity matches");
+  return ok;
+}
+
+bool TestFrameArtifactCacheReusesDeviceMatteAcrossCombinedEffects() {
+  studiocast::open_video::FrameArtifactCache cache;
+  auto key = MatteKey("rvm-test",
+                      studiocast::open_video::FrameMatteStorage::
+                          device_f32_alpha,
+                      "open_vulkan");
+  key.device_context = 0x2222u;
+  key.stream = 0x3333u;
+
+  int matte_runs = 0;
+  std::string error;
+  const studiocast::open_video::FrameMatteArtifact *vb_matte = nullptr;
+  const studiocast::open_video::FrameMatteArtifact *key_light_matte = nullptr;
+  const studiocast::open_video::FrameMatteArtifact *auto_frame_matte = nullptr;
+
+  const auto producer =
+      [&](studiocast::open_video::FrameMatteArtifact *artifact,
+          std::string *producer_error) {
+        if (producer_error)
+          producer_error->clear();
+        ++matte_runs;
+        artifact->key = key;
+        artifact->handle = 0xF00Du;
+        return true;
+      };
+
+  bool ok = true;
+  ok &= Require(cache.GetOrComputeMatte(51, key, producer, &vb_matte, &error),
+                "VB device matte request should succeed");
+  ok &= Require(cache.GetOrComputeMatte(51, key, producer, &key_light_matte,
+                                        &error),
+                "key-light device matte request should reuse VB matte");
+  ok &= Require(cache.GetOrComputeMatte(51, key, producer, &auto_frame_matte,
+                                        &error),
+                "auto-frame matte fallback request should reuse VB matte");
+  ok &= Require(matte_runs == 1,
+                "combined effects should share one device matte producer run");
+  ok &= Require(vb_matte && key_light_matte && auto_frame_matte &&
+                    vb_matte == key_light_matte &&
+                    vb_matte == auto_frame_matte,
+                "combined effects should receive the same matte artifact");
   return ok;
 }
 

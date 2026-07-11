@@ -25,6 +25,8 @@ bool TestFrameArtifactCacheReusesCompatibleMaxineMatteWithinFrame();
 bool TestFrameArtifactCacheSeparatesIncompatibleMatteKeys();
 bool TestFrameArtifactCacheInvalidatesMatteOnNewFrame();
 bool TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility();
+bool TestFrameArtifactCacheDeviceStorageAliasesPreserveCompatibility();
+bool TestFrameArtifactCacheReusesDeviceMatteAcrossCombinedEffects();
 bool TestCudaContextClassifierPrefersCurrentContext();
 bool TestSignedInt32PtxPitchContractIsNoGpuSafe();
 bool TestOpenCudaBoxBlurRadiusBoundsAreNoGpuSafe();
@@ -1118,6 +1120,12 @@ int main() {
       {"frame artifact cache precomputed matte keys preserve compatibility",
        &studiocast::tests::
            TestFrameArtifactCachePrecomputedMatteKeysPreserveCompatibility},
+      {"frame artifact cache device storage aliases preserve compatibility",
+       &studiocast::tests::
+           TestFrameArtifactCacheDeviceStorageAliasesPreserveCompatibility},
+      {"frame artifact cache reuses device matte across combined effects",
+       &studiocast::tests::
+           TestFrameArtifactCacheReusesDeviceMatteAcrossCombinedEffects},
       {"CUDA context classifier prefers current context",
        &studiocast::tests::TestCudaContextClassifierPrefersCurrentContext},
       {"signed int32 PTX pitch contract is no-GPU safe",

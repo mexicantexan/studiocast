@@ -29,8 +29,9 @@ struct FaceLandmarks {
 
 enum class FrameMatteStorage {
   cpu_f32_alpha,
-  cuda_f32_alpha,
-  vulkan_f32_alpha,
+  device_f32_alpha,
+  cuda_f32_alpha = device_f32_alpha,
+  vulkan_f32_alpha = device_f32_alpha,
   maxine_gpu_alpha,
 };
 
@@ -49,8 +50,9 @@ struct FrameMatteArtifactKey {
   std::uint64_t config_fingerprint = 0;
 
   // Optional opaque compatibility handles for device-local artifacts. They are
-  // intentionally integers to keep this header independent of CUDA/Maxine
-  // headers and to make the cache testable without GPU hardware.
+  // intentionally integers to keep this header independent of CUDA/Vulkan/
+  // Maxine headers and to make the cache testable without GPU hardware. For
+  // Vulkan, stream is the selected queue identity.
   std::uintptr_t device_context = 0;
   std::uintptr_t stream = 0;
 

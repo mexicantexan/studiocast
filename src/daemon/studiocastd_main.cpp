@@ -1469,6 +1469,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_cuda_transfers.alpha_download_calls << ",";
     oss << "\"matte_frame_upload_calls\":"
         << st.pipeline.open_cuda_transfers.matte_frame_upload_calls << ",";
+    oss << "\"matting_inference_calls\":"
+        << st.pipeline.open_cuda_transfers.matting_inference_calls << ",";
     oss << "\"standalone_scaler_upload_calls\":"
         << st.pipeline.open_cuda_transfers.standalone_scaler_upload_calls
         << ",";
@@ -1533,6 +1535,10 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers.background_upload_calls << ",";
     oss << "\"composite_dispatch_calls\":"
         << st.pipeline.open_vulkan_transfers.composite_dispatch_calls << ",";
+    oss << "\"key_light_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.key_light_dispatch_calls << ",";
+    oss << "\"crop_resize_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers.crop_resize_dispatch_calls << ",";
     oss << "\"standalone_scaler_upload_calls\":"
         << st.pipeline.open_vulkan_transfers.standalone_scaler_upload_calls
         << ",";
@@ -1543,6 +1549,22 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers.forced_sync_calls << ",";
     oss << "\"cpu_tail_stage_calls\":"
         << st.pipeline.open_vulkan_transfers.cpu_tail_stage_calls << ",";
+    oss << "\"cpu_tail_key_light_calls\":"
+        << st.pipeline.open_vulkan_transfers.cpu_tail_key_light_calls << ",";
+    oss << "\"cpu_tail_auto_frame_calls\":"
+        << st.pipeline.open_vulkan_transfers.cpu_tail_auto_frame_calls << ",";
+    oss << "\"cpu_tail_auto_frame_face_tracking_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .cpu_tail_auto_frame_face_tracking_calls
+        << ",";
+    oss << "\"cpu_tail_auto_frame_matte_tracking_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .cpu_tail_auto_frame_matte_tracking_calls
+        << ",";
+    oss << "\"cpu_tail_auto_frame_cpu_crop_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .cpu_tail_auto_frame_cpu_crop_calls
+        << ",";
     oss << "\"fallback_frames\":"
         << st.pipeline.open_vulkan_transfers.fallback_frames << ",";
     oss << "\"runtime_failure_frames\":"
