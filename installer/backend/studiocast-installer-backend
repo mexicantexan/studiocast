@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import datetime as dt
 import hashlib
 import importlib.util
@@ -98,6 +99,21 @@ FORBIDDEN_HELPER_FIELDS = {
     "environment", "url", "download", "file_content", "module_name",
     "package_manager_flags",
 }
+PRIVILEGED_INPUT_FIELDS = {
+    "packages.ensure.v1": frozenset(("operation_type", "packages")),
+    "v4l.module.load.v1": frozenset(("operation_type", "device_number", "label", "exclusive_caps")),
+    "v4l.persistence.write.v1": frozenset(("operation_type", "device_number", "label", "exclusive_caps")),
+    "v4l.persistence.remove.v1": frozenset(("operation_type", "expected_hashes")),
+}
+V4L_OWNED_PATHS = {
+    "v4l_modules_load": Path("/etc/modules-load.d/studiocast-v4l2loopback.conf"),
+    "v4l_modprobe": Path("/etc/modprobe.d/studiocast-v4l2loopback.conf"),
+}
+CANONICAL_EFFECTS = (
+    "mirror", "virtual_background.blur", "virtual_background.remove",
+    "virtual_background.replace", "auto_frame", "eye_contact",
+    "video_noise_removal", "virtual_key_light", "vignette",
+)
 
 
 def release_module() -> Any:
@@ -465,6 +481,218 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def readonly_command(argv: list[str], timeout: float = 3.0) -> tuple[int | None, str]:
+    """Run a bounded, read-only capability probe without a shell."""
+    try:
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=timeout,
+                                check=False, errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return result.returncode, result.stdout[:4 * 1024 * 1024]
+
+
+def writable_path_fact(path: Path) -> dict[str, Any]:
+    current = path
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    writable = current.is_dir() and not current.is_symlink() and os.access(current, os.W_OK | os.X_OK)
+    return {"path": str(path), "writable": writable,
+            "reason_codes": ["path.writable" if writable else "path.not_writable"]}
+
+
+def nvidia_facts() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    reason_codes: list[str] = []
+    devices: list[dict[str, Any]] = []
+    if not command_exists("nvidia-smi"):
+        return devices, {"driver_usable": False, "cuda_usable": False,
+                         "reason_codes": ["gpu.nvidia.tool_unavailable"]}
+    code, text = readonly_command([
+        "nvidia-smi", "--query-gpu=index,uuid,name,driver_version,compute_cap",
+        "--format=csv,noheader,nounits",
+    ])
+    if code != 0:
+        return devices, {"driver_usable": False, "cuda_usable": False,
+                         "reason_codes": ["gpu.nvidia.driver_unusable"]}
+    for row in csv.reader(text.splitlines()):
+        if len(row) != 5:
+            continue
+        try:
+            index = int(row[0].strip())
+        except ValueError:
+            continue
+        devices.append({"id": f"nvidia:{index}", "index": index,
+                        "uuid": row[1].strip(), "name": row[2].strip(),
+                        "vendor": "nvidia", "driver_version": row[3].strip(),
+                        "compute_capability": row[4].strip()})
+    driver_usable = bool(devices)
+    summary_code, summary = readonly_command(["nvidia-smi"], timeout=3)
+    cuda_match = re.search(r"CUDA Version:\s*([0-9]+(?:\.[0-9]+)?)", summary)
+    cuda_usable = driver_usable and summary_code == 0 and cuda_match is not None
+    reason_codes.append("gpu.nvidia.driver_usable" if driver_usable else "gpu.nvidia.no_devices")
+    reason_codes.append("gpu.cuda.driver_api_reported" if cuda_usable else "gpu.cuda.runtime_unavailable")
+    return devices, {"driver_usable": driver_usable, "cuda_usable": cuda_usable,
+                     "reported_cuda_version": cuda_match.group(1) if cuda_match else None,
+                     "reason_codes": reason_codes}
+
+
+def vulkan_facts() -> dict[str, Any]:
+    loader = command_exists("vulkaninfo") or any(Path(path).exists() for path in (
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/lib/x86_64-linux-gnu/libvulkan.so.1"))
+    result = {"loader_present": loader, "physical_devices": [],
+              "compute_device_usable": False, "reason_codes": []}
+    if not loader:
+        result["reason_codes"] = ["vulkan_loader_unavailable"]
+        return result
+    if not command_exists("vulkaninfo"):
+        result["reason_codes"] = ["vulkan_no_physical_device", "vulkan_probe_tool_unavailable"]
+        return result
+    summary_code, summary = readonly_command(["vulkaninfo", "--summary"], timeout=5)
+    full_code, full = readonly_command(["vulkaninfo"], timeout=8)
+    if summary_code != 0:
+        result["reason_codes"] = ["vulkan_no_physical_device", "vulkan_probe_failed"]
+        return result
+    devices: list[dict[str, Any]] = []
+    blocks = re.split(r"(?m)^GPU(?=\d+:)", summary)
+    for block in blocks[1:]:
+        index_match = re.match(r"(\d+):", block)
+        name_match = re.search(r"(?m)^\s*deviceName\s*=\s*(.+?)\s*$", block)
+        type_match = re.search(r"(?m)^\s*deviceType\s*=\s*(\S+)\s*$", block)
+        if not index_match:
+            continue
+        index = int(index_match.group(1))
+        device_type = type_match.group(1) if type_match else "unknown"
+        full_block_match = re.search(
+            rf"(?ms)^GPU id = {index}(?: \([^\n]*\))?.*?(?=^GPU id = \d+|\Z)", full)
+        full_block = full_block_match.group(0) if full_block_match else ""
+        compute = full_code == 0 and ("VK_QUEUE_COMPUTE_BIT" in full_block or
+                                      re.search(r"queueFlags\s*=.*\bCOMPUTE\b", full_block) is not None)
+        software = "CPU" in device_type.upper()
+        devices.append({"index": index, "name": name_match.group(1).strip() if name_match else "",
+                        "device_type": device_type, "compute_queue": compute,
+                        "software_device": software, "production_compute_usable": compute and not software})
+    result["physical_devices"] = devices
+    result["compute_device_usable"] = any(item["production_compute_usable"] for item in devices)
+    if not devices:
+        result["reason_codes"] = ["vulkan_no_physical_device"]
+    elif result["compute_device_usable"]:
+        result["reason_codes"] = ["vulkan_compute_device_usable"]
+    elif all(item["software_device"] for item in devices):
+        result["reason_codes"] = ["vulkan_only_cpu_devices_available"]
+    else:
+        result["reason_codes"] = ["vulkan_no_compute_queue"]
+    return result
+
+
+def runtime_diagnostics(data_root: Path) -> dict[str, Any] | None:
+    ctl = data_root / "current/bin/studiocastctl"
+    if not ctl.is_file() or ctl.is_symlink() or not os.access(ctl, os.X_OK):
+        return None
+    code, text = readonly_command([str(ctl), "status"], timeout=4)
+    if code != 0:
+        return None
+    try:
+        value = json.loads(text, object_pairs_hook=reject_duplicates)
+    except (json.JSONDecodeError, BackendError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def ort_facts(diagnostics: dict[str, Any] | None) -> dict[str, Any]:
+    engines = diagnostics.get("engines", {}) if diagnostics else {}
+    candidates = [engines.get("open_cuda", {}), engines.get("open_audio", {})]
+    candidates = [value for value in candidates if isinstance(value, dict)]
+    version = next((str(value.get("onnxruntime_version")) for value in candidates
+                    if value.get("onnxruntime_version")), None)
+    provider_names = sorted({str(provider) for value in candidates
+                             for provider in value.get("onnxruntime_providers", [])
+                             if isinstance(provider, str)})
+    if candidates and (version or provider_names):
+        cpu = any(bool(value.get("onnxruntime_cpu_provider_present")) for value in candidates)
+        cuda = any(bool(value.get("onnxruntime_cuda_provider_present")) and
+                   bool(value.get("cuda_context_available", True)) for value in candidates)
+        return {"present": True, "compatible": True, "version": version,
+                "provider_names": provider_names, "providers": {"cpu": cpu, "cuda": cuda},
+                "probe": "daemon_runtime_diagnostics",
+                "reason_codes": ["runtime.ort.providers_usable"]}
+    code, version_text = readonly_command(["pkg-config", "--modversion", "onnxruntime"])
+    present = code == 0 and bool(version_text.strip())
+    return {"present": present, "compatible": present,
+            "version": version_text.strip() if present else None,
+            "provider_names": [], "providers": {"cpu": False, "cuda": False},
+            "probe": "metadata_only" if present else "unavailable",
+            "reason_codes": ["runtime.ort.present_providers_unvalidated" if present
+                             else "runtime.ort.unavailable"]}
+
+
+def maxine_facts(diagnostics: dict[str, Any] | None, data_root: Path) -> dict[str, Any]:
+    value = diagnostics.get("engines", {}).get("maxine", {}) if diagnostics else {}
+    if isinstance(value, dict) and value:
+        components: dict[str, Any] = {}
+        for source, target in (("vfx", "video_fx"), ("ar", "ar"), ("afx", "audio_fx")):
+            component = value.get(source, {})
+            components[target] = {"present": bool(component.get("root_found")),
+                                  "library_loadable": bool(component.get("library_loadable")),
+                                  "usable": bool(component.get("ok"))}
+        effects = {effect: {"usable": effect in value.get("available_effects", []),
+                            "reason_code": "maxine.effect.usable" if effect in value.get("available_effects", [])
+                            else "maxine.effect.unavailable"} for effect in CANONICAL_EFFECTS}
+        return {"components": components, "effects": effects,
+                "usable": bool(value.get("ok")), "probe": "daemon_runtime_diagnostics",
+                "reason_codes": ["maxine.sdk.usable" if value.get("ok") else
+                                 str(value.get("blocked_reason") or "maxine.sdk.unusable")]}
+    roots_by_component = {"video_fx": data_root / "maxine/VideoFX",
+                          "ar": data_root / "maxine/ARSDK",
+                          "audio_fx": data_root / "maxine/Audio_Effects_SDK"}
+    components = {name: {"present": path.is_dir() and not path.is_symlink(),
+                         "library_loadable": False, "usable": False}
+                  for name, path in roots_by_component.items()}
+    present = any(item["present"] for item in components.values())
+    return {"components": components, "effects": {}, "usable": False,
+            "probe": "layout_only", "reason_codes": ["maxine.sdk.present_unvalidated" if present
+                                                       else "maxine.sdk.absent"]}
+
+
+def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, Any]) -> dict[str, Any]:
+    engines = diagnostics.get("engines", {}) if diagnostics else {}
+    cuda_available = set(engines.get("open_cuda", {}).get("available_effects", []))
+    vulkan_available = set(engines.get("open_vulkan", {}).get("available_effects", []))
+    out: dict[str, Any] = {}
+    for effect in CANONICAL_EFFECTS:
+        vulkan = "unavailable"
+        if effect == "auto_frame" and effect in vulkan_available:
+            vulkan = "usable_with_degraded_behavior"
+        elif effect in {"virtual_background.blur", "virtual_background.remove",
+                        "virtual_background.replace", "virtual_key_light"} and effect in vulkan_available:
+            vulkan = "experimental"
+        out[effect] = {"maxine": "production_usable" if maxine.get("effects", {}).get(effect, {}).get("usable") else "unavailable",
+                       "cuda": "production_usable" if effect in cuda_available else "unavailable",
+                       "vulkan": vulkan, "cpu": "unavailable"}
+    return out
+
+
+def validated_v4l_ownership(manifest: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not manifest or manifest.get("schema_version") != 2:
+        return []
+    recorded = manifest.get("v4l", {}).get("owned_configuration", [])
+    if not isinstance(recorded, list):
+        return []
+    validated: list[dict[str, Any]] = []
+    for item in recorded:
+        if not isinstance(item, dict) or item.get("id") not in V4L_OWNED_PATHS:
+            continue
+        expected_path = V4L_OWNED_PATHS[item["id"]]
+        expected_hash = item.get("sha256")
+        try:
+            info = expected_path.lstat()
+            actual_hash = file_sha256(expected_path) if stat.S_ISREG(info.st_mode) else None
+        except OSError:
+            continue
+        if str(expected_path) == item.get("path") and expected_hash == actual_hash:
+            validated.append({"id": item["id"], "path": str(expected_path), "sha256": actual_hash})
+    return validated
+
+
 def host_analyze(target_version: str | None) -> dict[str, Any]:
     r = roots()
     classification, manifest, install_reasons = manifest_state(r["data"] / "install-manifest.json")
@@ -490,15 +718,18 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
             vendor = (card / "device/vendor").read_text().strip()
             device = (card / "device/device").read_text().strip()
-            gpu_devices.append({"id": card.name, "vendor_id": vendor, "device_id": device})
+            vendor_name = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}.get(vendor.lower(), "unknown")
+            gpu_devices.append({"id": card.name, "vendor_id": vendor, "device_id": device,
+                                "vendor": vendor_name})
     except OSError:
         pass
-    nvidia_driver = command_exists("nvidia-smi")
-    # Loader presence is intentionally not promoted to device usability.  A full
-    # compute/device probe is supplied by daemon facts or fixtures.
-    vulkan_loader = command_exists("vulkaninfo") or any(Path(p).exists() for p in (
-        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/lib/x86_64-linux-gnu/libvulkan.so.1"))
-    module_available = Path("/sys/module/v4l2loopback").exists()
+    nvidia_devices, nvidia = nvidia_facts()
+    known_ids = {item["id"] for item in gpu_devices}
+    gpu_devices.extend(item for item in nvidia_devices if item["id"] not in known_ids)
+    vulkan = vulkan_facts()
+    module_loaded = Path("/sys/module/v4l2loopback").exists()
+    modinfo_code, modinfo_path = readonly_command(["modinfo", "-n", "v4l2loopback"], timeout=2)
+    module_available = module_loaded or (modinfo_code == 0 and bool(modinfo_path.strip()))
     device_present = Path("/dev/video10").exists()
     device_label = ""
     try:
@@ -519,6 +750,7 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         except (OSError, subprocess.TimeoutExpired):
             pass
     headers = Path(f"/lib/modules/{platform.release()}/build").exists()
+    dkms_present = command_exists("dkms")
     secure_boot = "unknown"
     try:
         values = list(Path("/sys/firmware/efi/efivars").glob("SecureBoot-*"))
@@ -538,6 +770,11 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
             systemd_reason = "service.user_manager.usable" if systemd_usable else "service.user_manager.unreachable"
         except (OSError, subprocess.TimeoutExpired):
             systemd_reason = "service.user_manager.unreachable"
+    diagnostics = runtime_diagnostics(r["data"])
+    ort = ort_facts(diagnostics)
+    maxine = maxine_facts(diagnostics, r["data"])
+    effects = effect_capabilities(diagnostics, maxine)
+    owned_v4l = validated_v4l_ownership(manifest)
     model_packs: dict[str, Any] = {}
     for pack, artifacts in MODEL_ARTIFACTS.items():
         matches = list((r["data"] / "models").rglob(pack)) if (r["data"] / "models").is_dir() else []
@@ -557,35 +794,43 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
             "active_version": active, "previous_version": previous, "target_version": target_version,
             "version_relation": version_relation(active, target_version),
             "desired_configuration": desired, "payloads": []},
-        "paths": {"data_root": {"path": str(r["data"]), "writable": os.access(r["data"].parent, os.W_OK)},
-            "cache_root": {"path": str(r["cache"]), "writable": os.access(r["cache"].parent, os.W_OK)},
-            "config_root": {"path": str(r["config"]), "writable": os.access(r["config"].parent, os.W_OK)},
+        "paths": {"data_root": writable_path_fact(r["data"]),
+            "cache_root": writable_path_fact(r["cache"]),
+            "config_root": writable_path_fact(r["config"]),
             "free_bytes": disk, "required_bytes": {"download": 0, "build": 4_000_000_000, "staging": 1_000_000_000}},
         "toolchain": {"tools": {name: command_exists(name) for name in ("cmake", "ninja", "c++", "pkg-config")},
             "build_dependencies": ["cmake", "ninja", "c++", "pkg-config"],
             "missing_build_dependencies": [name for name in ("cmake", "ninja", "c++", "pkg-config") if not command_exists(name)],
             "reason_codes": []},
-        "runtime": {"dependencies": {}, "onnxruntime": {"present": False, "compatible": False,
-            "providers": {"cpu": False, "cuda": False}, "probe": "not_run", "reason_codes": ["runtime.ort.unknown"]}},
+        "runtime": {"dependencies": {}, "onnxruntime": ort},
         "systemd_user": {"systemctl_present": systemd_present, "manager_usable": systemd_usable,
             "reason_codes": [systemd_reason]},
         "v4l2": {"package_state": package_state, "module_available": module_available,
-            "module_loaded": module_available, "device_present": device_present, "device_number": 10,
+            "module_loaded": module_loaded, "device_present": device_present, "device_number": 10,
             "device_label": device_label, "device_number_conflict": device_conflict, "persistence_state": persistence_state,
-            "kernel_headers_usable": headers, "dkms_viable": headers, "secure_boot": secure_boot,
-            "reason_codes": ["v4l.device.present" if device_present else "v4l.device.absent"]},
+            "kernel_headers_usable": headers, "dkms_viable": module_available or (headers and dkms_present),
+            "secure_boot": secure_boot, "owned_configuration": owned_v4l,
+            "owned_configuration_validated": len(owned_v4l) == len(V4L_OWNED_PATHS),
+            "reason_codes": ["v4l.module.available" if module_available else "v4l.module.unavailable",
+                             "v4l.module.loaded" if module_loaded else "v4l.module.not_loaded",
+                             "v4l.device.present" if device_present else "v4l.device.absent",
+                             "v4l.dkms.viable" if module_available or (headers and dkms_present) else "v4l.dkms.not_viable",
+                             f"secure_boot.{secure_boot}"]},
         "privileged_helper": helper_facts(),
-        "gpus": {"devices": gpu_devices, "nvidia": {"driver_usable": nvidia_driver,
-            "cuda_usable": False, "reason_codes": ["gpu.cuda.not_probed"]},
-            "vulkan": {"loader_present": vulkan_loader, "physical_devices": [],
-                "compute_device_usable": False, "reason_codes": ["gpu.vulkan.device_not_probed"]}},
-        "maxine": {"components": {name: {"present": False, "usable": False} for name in ("video_fx", "ar", "audio_fx")},
-            "effects": {}, "reason_codes": ["maxine.sdk.not_probed"]},
-        "effects": {"capabilities": {}},
+        "gpus": {"devices": gpu_devices, "nvidia": nvidia, "vulkan": vulkan},
+        "maxine": maxine,
+        "effects": {"capabilities": effects},
         "models": {"packs": model_packs, "default_pack_ids": list(DEFAULT_MODEL_PACKS)},
-        "cache": {"release_artifacts": {}, "model_artifacts": {}},
-        "connectivity": {"release_source": {"state": "not_probed", "reason_codes": ["network.release.not_probed"]},
-            "model_source": {"state": "not_probed", "reason_codes": ["network.models.not_probed"]}},
+        "cache": {"release_artifacts": {}, "model_artifacts": {
+            pack: {"verified": all((r["cache"] / "models" / pack / artifact).is_file() and
+                                   not (r["cache"] / "models" / pack / artifact).is_symlink() and
+                                   file_sha256(r["cache"] / "models" / pack / artifact) == "sha256:" + _MODEL_HASHES[pack][index]
+                                   for index, artifact in enumerate(artifacts))}
+            for pack, artifacts in MODEL_ARTIFACTS.items()}},
+        "connectivity": {"release_source": {"state": "offline" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "unknown",
+                "reason_codes": ["network.release.offline_requested" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "network.release.not_probed"]},
+            "model_source": {"state": "offline" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "unknown",
+                "reason_codes": ["network.models.offline_requested" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "network.models.not_probed"]}},
         "reason_codes": [],
     }
     stable = copy.deepcopy(result)
@@ -674,7 +919,7 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
     required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
     if free < required:
         blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths"})
-    if detected_route == "offline":
+    if detected_route == "offline" and route == "recommended":
         blockers.append({"code": "network.release.offline_no_verified_cache", "applies_to": "source"})
     camera = selections["virtual_camera"]
     if camera.get("desired"):
@@ -776,6 +1021,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     current = r["data"] / "current"
     ops: list[dict[str, Any]] = [operation("preflight.validate", "preflight", [], {}, "validation", "none")]
     last = "preflight.validate"
+    plan_specific_warnings: list[dict[str, Any]] = []
     preservation = {"preserve_settings": bool(desired.get("preserve_settings", True)), "snapshot_path": None}
     if intent in {"clean-install", "reinstall"}:
         if preservation["preserve_settings"]:
@@ -790,9 +1036,10 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                 ("cleanup.models", "models")):
             ops.append(operation(op_id, "cleanup", [last], {"target": target_name}, "removed_items"))
             last = op_id
-        if not preservation["preserve_settings"]:
-            ops.append(operation("cleanup.settings", "cleanup", [last], {"target": "settings"}, "removed_items"))
-            last = "cleanup.settings"
+        # Clean means reset configuration too.  A selected preservation snapshot
+        # is restored transactionally; otherwise this is a literal wipe.
+        ops.append(operation("cleanup.settings", "cleanup", [last], {"target": "settings"}, "removed_items"))
+        last = "cleanup.settings"
         desired["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
     minimal_repair = intent == "repair" and facts.get("installation", {}).get("classification") == "healthy"
     if intent == "uninstall":
@@ -801,6 +1048,18 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             kind = "service_state_reconcile" if target_name == "service_state" else "service_unit_reconcile" if target_name == "service_unit" else "links_reconcile" if target_name == "links" else "cleanup"
             ops.append(operation(op_id, kind, [last], {"desired": "absent", "target": target_name}, "application_files"))
             last = op_id
+        owned = facts.get("v4l2", {}).get("owned_configuration", [])
+        expected_hashes = {item.get("id"): item.get("sha256") for item in owned
+                           if isinstance(item, dict) and item.get("id") in V4L_OWNED_PATHS}
+        if set(expected_hashes) == set(V4L_OWNED_PATHS):
+            ops.append(operation("v4l.persistence.remove", "trusted_helper", [last],
+                                 {"operation_type": "v4l.persistence.remove.v1",
+                                  "expected_hashes": expected_hashes},
+                                 "system_changes", "trusted_helper", failure="degrade"))
+            last = "v4l.persistence.remove"
+        elif facts.get("v4l2", {}).get("persistence_state") != "absent":
+            plan_specific_warnings.append({"code": "v4l.persistence.ownership_unverified_manual_cleanup",
+                                           "applies_to": "system_changes"})
         if not preservation["preserve_settings"]:
             for op_id, target_name in (("cleanup.models", "models"), ("cleanup.settings", "settings"), ("cleanup.data", "data")):
                 ops.append(operation(op_id, "cleanup", [last], {"target": target_name}, "removed_items")); last = op_id
@@ -810,9 +1069,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         vf = facts.get("v4l2", {})
         if v4l.get("desired"):
             helper_args = {"device_number": int(v4l.get("device_number", 10)),
-                           "card_label": str(v4l.get("label", "StudioCast Camera")),
-                           "exclusive_caps": bool(v4l.get("exclusive_caps", True)),
-                           "persist": bool(v4l.get("persist", True))}
+                           "label": str(v4l.get("label", "StudioCast Camera")),
+                           "exclusive_caps": bool(v4l.get("exclusive_caps", True))}
             if not vf.get("module_available"):
                 ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
             if not vf.get("module_loaded") or not vf.get("device_present"):
@@ -863,8 +1121,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         v4l = desired["virtual_camera"]
         if v4l.get("desired"):
             vf = facts.get("v4l2", {})
-            helper_args = {"device_number": int(v4l.get("device_number", 10)), "card_label": str(v4l.get("label", "StudioCast Camera")),
-                           "exclusive_caps": bool(v4l.get("exclusive_caps", True)), "persist": bool(v4l.get("persist", True))}
+            helper_args = {"device_number": int(v4l.get("device_number", 10)), "label": str(v4l.get("label", "StudioCast Camera")),
+                           "exclusive_caps": bool(v4l.get("exclusive_caps", True))}
             if not vf.get("module_available"):
                 ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
             if not vf.get("module_loaded") or not vf.get("device_present"):
@@ -883,7 +1141,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             ops.append(operation("settings.restore", "settings_restore", [last], {"snapshot_path": preservation["snapshot_path"]}, "preserved_items")); last = "settings.restore"
         ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
     blockers = copy.deepcopy(rec["blockers"])
-    warnings = copy.deepcopy(rec["warnings"])
+    warnings = copy.deepcopy(rec["warnings"]) + plan_specific_warnings
     if intent == "uninstall":
         # User-local removal remains available on unsupported/offline/low-disk
         # hosts and never needs a release source or build cache.
@@ -891,7 +1149,15 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     if not desired["virtual_camera"].get("desired"):
         blockers = [item for item in blockers if item.get("applies_to") != "virtual_camera"]
     if any(op["privilege"] == "trusted_helper" for op in ops) and not facts.get("privileged_helper", {}).get("trusted", False):
-        if not any(item.get("code") == "privileged_helper_missing" for item in blockers):
+        if intent == "uninstall":
+            ops = [op for op in ops if op["privilege"] != "trusted_helper"]
+            previous: str | None = None
+            for op in ops:
+                op["depends_on"] = [] if previous is None else [previous]
+                previous = op["id"]
+            warnings.append({"code": "v4l.persistence.helper_unavailable_manual_cleanup",
+                             "applies_to": "system_changes"})
+        elif not any(item.get("code") == "privileged_helper_missing" for item in blockers):
             blockers.append({"code": "privileged_helper_missing", "applies_to": "system_changes"})
     if verified_release:
         active_version = facts.get("installation", {}).get("active_version")
@@ -920,11 +1186,19 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         # evidence when the two components are integrated.
         blockers.append({"code": "source.signed_verification_receipt_required", "applies_to": "source"})
     if getattr(args, "allow_unsupported", False):
+        if rec["route"] != "advanced":
+            blockers.append({"code": "os.unsupported.override_requires_advanced",
+                             "applies_to": "installation"})
         # Developer override permits only unprivileged work; automatic package or
         # module operations remain removed/fail-closed on unsupported systems.
-        blockers = [b for b in blockers if not b["code"].startswith("os.unsupported")]
-        if not facts.get("os", {}).get("supported", False):
+        elif not facts.get("os", {}).get("supported", False):
+            blockers = [b for b in blockers if not b["code"].startswith("os.unsupported")]
             ops = [op for op in ops if op["privilege"] != "trusted_helper"]
+            previous = None
+            for op in ops:
+                op["depends_on"] = [] if previous is None else [previous]
+                previous = op["id"]
+            blockers = [b for b in blockers if b.get("code") != "privileged_helper_missing"]
             warnings.append({"code": "os.unsupported.developer_override_unprivileged_only", "applies_to": "installation"})
     created = utc_now()
     expires = (parse_time(created) + dt.timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
@@ -935,6 +1209,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         "privilege_preconditions": {"base_os": facts.get("os", {}).get("base_id"),
             "base_release": facts.get("os", {}).get("base_version_id"),
             "kernel_release": facts.get("os", {}).get("kernel_release")},
+        "observed_state": {"service": copy.deepcopy(facts.get("service", {})),
+                           "v4l2": copy.deepcopy(facts.get("v4l2", {}))},
         "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
         "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
             "target_payload": str(target_payload), "current_link": str(current)},
@@ -1006,6 +1282,12 @@ class Executor:
         self.retryable: list[str] = []
         self.cancelled = False
         self.child: subprocess.Popen[bytes] | None = None
+        self.settings_snapshot: Path | None = None
+        observed = plan.get("observed_state", {})
+        self.service_actual = observed.get("service", {}).get("actual", "unknown")
+        self.v4l_actual = copy.deepcopy(observed.get("v4l2", {}))
+        self.v4l_owned_configuration = copy.deepcopy(
+            (self.manifest_before or {}).get("v4l", {}).get("owned_configuration", []))
         self._load_manifest()
 
     def _load_manifest(self) -> None:
@@ -1017,6 +1299,9 @@ class Executor:
             raise BackendError("manifest.unknown_schema", "Cannot execute with unknown manifest schema")
         self.manifest_before = value
         self.active_before = copy.deepcopy(value.get("payloads", {}).get("active"))
+        self.service_actual = value.get("service", {}).get("actual", self.service_actual)
+        self.v4l_owned_configuration = copy.deepcopy(
+            value.get("v4l", {}).get("owned_configuration", self.v4l_owned_configuration))
 
     def run_process(self, argv: list[str]) -> None:
         if self.dry_run:
@@ -1073,7 +1358,7 @@ class Executor:
             except BackendError as exc:
                 self.append(op["id"], "cancelled" if self.cancelled else "failed", exc)
                 self.failed_operation = op["id"]
-                if op["failure_policy"] == "degrade" and self.core_committed:
+                if op["failure_policy"] == "degrade" and (self.core_committed or self.plan["intent"] == "uninstall"):
                     self.retryable.append(op["id"])
                     # Preserve exact-plan accounting: remaining optional model
                     # operations are recorded skipped, then manifest commits.
@@ -1084,6 +1369,8 @@ class Executor:
         state = "cancelled" if self.cancelled else "failed" if failure else "degraded" if self.retryable else "committed"
         if state in {"failed", "cancelled"} and not self.core_committed:
             self.restore_previous_pointer()
+        if state in {"failed", "cancelled"}:
+            self.compensate_settings()
         if not self.dry_run:
             self.write_manifest(state, failure)
         result = {"schema_version": 1, "result_version": RESULT_VERSION,
@@ -1113,7 +1400,10 @@ class Executor:
         if kind == "settings_snapshot":
             src, dst = self.r["config"], Path(inputs["snapshot_path"])
             validate_mutation_path(dst, [self.r["config"].parent])
-            if not self.dry_run and src.exists(): shutil.copytree(src, dst, symlinks=False)
+            self.settings_snapshot = dst
+            if not self.dry_run and src.exists():
+                if dst.exists(): safe_remove(dst, [self.r["config"].parent])
+                shutil.copytree(src, dst, symlinks=True)
         elif kind == "source_extract": self.extract_source(Path(inputs["archive"]), Path(inputs["destination"]))
         elif kind == "build_cache_prepare":
             path = Path(self.plan["paths"]["build_cache"]); validate_mutation_path(path, [self.r["cache"]])
@@ -1229,9 +1519,40 @@ class Executor:
             raise BackendError("authorization_cancelled", "Authorization was cancelled or unavailable")
         if completed.returncode:
             raise BackendError("privilege.operation_failed", "Trusted helper operation failed", {"exit_code": completed.returncode})
-        try: response = json.loads(completed.stdout)
+        try: response = json.loads(completed.stdout, object_pairs_hook=reject_duplicates)
         except json.JSONDecodeError as exc: raise BackendError("privilege.malformed_result", "Trusted helper returned invalid JSON") from exc
-        if response.get("state") != "succeeded": raise BackendError(response.get("reason_code", "privilege.operation_failed"), "Trusted helper did not succeed")
+        except BackendError as exc: raise BackendError("privilege.malformed_result", "Trusted helper returned duplicate JSON fields") from exc
+        if not isinstance(response, dict):
+            raise BackendError("privilege.malformed_result", "Trusted helper result must be an object")
+        if (response.get("schema_version") != 1 or response.get("request_id") != request["request_id"] or
+                response.get("transaction_id") != request["transaction_id"] or
+                response.get("plan_digest") != request["plan_digest"]):
+            raise BackendError("privilege.result_binding_mismatch", "Trusted helper result is not bound to this request")
+        results = response.get("results")
+        if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict) or
+                results[0].get("id") != self.executed[-1] or results[0].get("type") != inputs["operation_type"]):
+            raise BackendError("privilege.result_binding_mismatch", "Trusted helper operation result does not match the reviewed operation")
+        if response.get("state") != "succeeded" or results[0].get("status") != "succeeded":
+            raise BackendError(response.get("reason_code", "privilege.operation_failed"), "Trusted helper did not succeed")
+        if inputs["operation_type"] == "v4l.persistence.write.v1":
+            files = results[0].get("files", [])
+            validated: list[dict[str, Any]] = []
+            for item in files:
+                if (isinstance(item, dict) and item.get("id") in V4L_OWNED_PATHS and
+                        item.get("path") == str(V4L_OWNED_PATHS[item["id"]]) and
+                        re.fullmatch(r"sha256:[0-9a-f]{64}", str(item.get("sha256", "")))):
+                    validated.append({"id": item["id"], "path": item["path"], "sha256": item["sha256"]})
+            if len(validated) != len(V4L_OWNED_PATHS):
+                raise BackendError("privilege.malformed_result", "Persistence result omitted owned-file hashes")
+            self.v4l_owned_configuration = validated
+            self.v4l_actual["persistence_state"] = "configured"
+        elif inputs["operation_type"] == "v4l.persistence.remove.v1":
+            self.v4l_owned_configuration = []
+            self.v4l_actual["persistence_state"] = "absent"
+        elif inputs["operation_type"] == "v4l.module.load.v1":
+            self.v4l_actual.update({"module_available": True, "module_loaded": True,
+                                    "device_present": True, "device_number": inputs["device_number"],
+                                    "device_label": inputs["label"]})
 
     def activate_payload(self, version: str) -> None:
         staging, target, current = map(Path, (self.plan["paths"]["staging_payload"], self.plan["paths"]["target_payload"], self.plan["paths"]["current_link"]))
@@ -1276,10 +1597,13 @@ class Executor:
 
     def reconcile_service_state(self, desired: str) -> None:
         if self.dry_run or not shutil.which("systemctl"): return
-        if desired == "enabled_started": self.run_process(["systemctl", "--user", "daemon-reload"]); self.run_process(["systemctl", "--user", "enable", "--now", SERVICE_NAME])
+        if desired == "enabled_started":
+            self.run_process(["systemctl", "--user", "daemon-reload"]); self.run_process(["systemctl", "--user", "enable", "--now", SERVICE_NAME])
+            self.service_actual = "active"
         else:
             completed = subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if completed.returncode not in {0, 1, 5}: raise BackendError("service.state_failed", "Could not disable StudioCast service")
+            self.service_actual = "inactive"
 
     def obtain_model(self, pack: str) -> None:
         cache = self.r["cache"] / "models" / pack
@@ -1309,11 +1633,35 @@ class Executor:
     def restore_settings(self, snapshot: Path) -> None:
         if self.dry_run or not snapshot.exists(): return
         if self.r["config"].exists(): safe_remove(self.r["config"], [self.r["config"].parent])
-        shutil.copytree(snapshot, self.r["config"], symlinks=False)
-        safe_remove(snapshot, [self.r["config"].parent])
+        os.replace(snapshot, self.r["config"])
+        self.settings_snapshot = None
+
+    def compensate_settings(self) -> None:
+        snapshot = self.settings_snapshot
+        if self.dry_run or snapshot is None or not snapshot.exists():
+            return
+        error: BackendError | None = None
+        try:
+            validate_mutation_path(snapshot, [self.r["config"].parent])
+            if self.r["config"].exists():
+                # Failure before the reset left the authoritative settings in
+                # place; do not overwrite a possibly newer user edit.
+                safe_remove(snapshot, [self.r["config"].parent])
+            else:
+                os.replace(snapshot, self.r["config"])
+        except (OSError, BackendError) as exc:
+            error = exc if isinstance(exc, BackendError) else BackendError("settings.compensation_failed", str(exc))
+        self.journal.append({"sequence": len(self.journal) + 1,
+            "operation_id": "settings.restore.compensation",
+            "state": "failed" if error else "completed", "finished_at": utc_now(),
+            "exit": {"kind": "backend_result", "code": 1 if error else 0, "signal": None},
+            "error": None if error is None else {"code": error.code, "message": error.message,
+                                                   "details": error.details},
+            "compensation_operation_ids": ["settings.snapshot"]})
+        self.settings_snapshot = None
 
     def cleanup(self, target: str) -> None:
-        mapping = {"payloads": self.r["data"] / "payloads", "build_cache": self.r["cache"],
+        mapping = {"payloads": self.r["data"] / "payloads",
             "runtime_state": self.r["state"], "models": self.r["data"] / "models", "settings": self.r["config"]}
         if target == "service":
             self.reconcile_service_state("disabled"); self.reconcile_service_unit("absent"); return
@@ -1322,6 +1670,10 @@ class Executor:
             # paths read from a stale manifest.
             for path in (self.r["data"] / "current", self.r["data"] / "install-manifest.json"):
                 if not self.dry_run: safe_remove(path, [self.r["data"]])
+            return
+        if target == "build_cache":
+            for path in (self.r["cache"] / "builds", self.r["cache"] / "sources"):
+                if path.exists() and not self.dry_run: safe_remove(path, [self.r["cache"]])
             return
         path = mapping.get(target)
         if path and path.exists() and not self.dry_run: safe_remove(path, [path.parent])
@@ -1334,6 +1686,8 @@ class Executor:
                    "validation": self.plan["expected_validation"]}) if self.core_committed else self.active_before
         previous = self.active_before if self.core_committed else (self.manifest_before or {}).get("payloads", {}).get("previous")
         if self.plan["intent"] == "uninstall": active = None
+        unit_path = self.r["systemd"] / SERVICE_NAME
+        unit_hash = file_sha256(unit_path) if unit_path.is_file() and not unit_path.is_symlink() else None
         manifest = {"schema_version": 2, "policy_version": POLICY_VERSION,
             "transaction": {"id": self.transaction_id, "state": "uninstalled" if self.plan["intent"] == "uninstall" and state == "committed" else state,
                 "intent": self.plan["intent"], "started_at": self.plan["created_at"], "updated_at": utc_now(), "completed_at": utc_now(),
@@ -1348,45 +1702,155 @@ class Executor:
                 "service": self.plan["desired_state"]["service"], "v4l": self.plan["desired_state"]["virtual_camera"],
                 "model_pack_ids": self.plan["desired_state"].get("model_pack_ids", []), "preserve_settings": self.plan["preservation"]["preserve_settings"]},
             "effective_build_configuration": {"cmake": next((op["inputs"]["cmake"] for op in self.plan["operations"] if op["id"] == "build.configure"), {})},
-            "service": {"desired": self.plan["desired_state"]["service"]["desired"], "actual": "unknown", "unit_path": str(self.r["systemd"] / SERVICE_NAME), "unit_sha256": None},
-            "v4l": {"desired": self.plan["desired_state"]["virtual_camera"].get("desired"), "actual": {}, "owned_configuration": []},
+            "service": {"desired": self.plan["desired_state"]["service"]["desired"],
+                "actual": self.service_actual, "unit_path": str(unit_path), "unit_sha256": unit_hash},
+            "v4l": {"desired": self.plan["desired_state"]["virtual_camera"].get("desired"),
+                "actual": self.v4l_actual, "owned_configuration": self.v4l_owned_configuration},
             "models": {"packs": {pack: {**MODEL_METADATA.get(pack, {}), "state": "installed" if (self.r["data"] / "models/curated" / pack).is_dir() else "missing"} for pack in self.plan["desired_state"].get("model_pack_ids", [])}},
             "ownership": {"application_files": [{"path": str(target / "bin" / name), "type": "file", "creating_operation": "payload.stage", "namespace": "studiocast"} for name in BINARIES] if active else [],
                 "links": [{"path": str(self.r["bin"] / name), "type": "symlink", "target": str(self.r["data"] / "current/bin" / name), "creating_operation": "links.reconcile", "namespace": "studiocast"} for name in BINARIES] if active else [],
-                "system_configuration": [], "shared_dependencies_observed": []},
-            "preservation": {"preserve_settings": self.plan["preservation"]["preserve_settings"], "restored": "settings.restore" in self.executed},
+                "system_configuration": [{**item, "type": "file", "namespace": "studiocast",
+                    "creating_operation": "v4l.persistence.write"} for item in self.v4l_owned_configuration],
+                "shared_dependencies_observed": []},
+            "preservation": {"preserve_settings": self.plan["preservation"]["preserve_settings"],
+                "restored": any(item["operation_id"] in {"settings.restore", "settings.restore.compensation"} and
+                                item["state"] == "completed" for item in self.journal)},
             "health": {"core": "healthy" if active else "absent", "overall": state,
                 "validation": self.plan["expected_validation"], "failure": None if failure is None else {"code": failure.code, "message": failure.message}},
             "journal": self.journal}
         atomic_write(self.manifest_path, manifest)
 
 
+def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> None:
+    inputs = op.get("inputs")
+    if not isinstance(inputs, dict):
+        raise BackendError("plan.operation_schema", f"Operation inputs must be an object: {op.get('id')}")
+    kind = op["kind"]
+    if kind == "trusted_helper":
+        operation_type = inputs.get("operation_type")
+        expected = PRIVILEGED_INPUT_FIELDS.get(operation_type)
+        if expected is None or set(inputs) != set(expected):
+            raise BackendError("plan.unsafe_privilege", f"Privileged operation schema mismatch: {op.get('id')}")
+        if operation_type == "packages.ensure.v1":
+            packages = inputs.get("packages")
+            if not isinstance(packages, list) or not packages or any(not isinstance(item, str) for item in packages):
+                raise BackendError("plan.unsafe_privilege", "Privileged packages must be a non-empty string array")
+        elif operation_type == "v4l.persistence.remove.v1":
+            hashes = inputs.get("expected_hashes")
+            if (not isinstance(hashes, dict) or set(hashes) != set(V4L_OWNED_PATHS) or
+                    any(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)) is None for value in hashes.values())):
+                raise BackendError("plan.unsafe_privilege", "Persistence removal requires both reviewed hashes")
+        else:
+            if (type(inputs.get("device_number")) is not int or not 0 <= inputs["device_number"] <= 63 or
+                    type(inputs.get("exclusive_caps")) is not bool or
+                    re.fullmatch(r"[ A-Za-z0-9_.()+-]{1,64}", str(inputs.get("label", ""))) is None):
+                raise BackendError("plan.unsafe_privilege", "Invalid reviewed v4l arguments")
+    elif kind == "cleanup" and inputs.get("target") not in {
+            "payloads", "build_cache", "runtime_state", "models", "settings", "data", "service"}:
+        raise BackendError("plan.operation_schema", f"Unknown cleanup target: {inputs.get('target')}")
+    elif kind in {"model_obtain", "model_verify", "model_activate"} and inputs.get("pack_id") not in MODEL_ARTIFACTS:
+        raise BackendError("plan.operation_schema", f"Unknown curated model pack: {inputs.get('pack_id')}")
+    elif kind == "build_configure":
+        expected_cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA", "STUDIOCAST_ENABLE_OPEN_AUDIO",
+                          "STUDIOCAST_ENABLE_OPEN_VULKAN"}
+        if set(inputs.get("cmake", {})) != expected_cmake or any(type(value) is not bool for value in inputs["cmake"].values()):
+            raise BackendError("plan.operation_schema", "CMake feature flags must be explicit booleans")
+        if inputs.get("build_path") != plan.get("paths", {}).get("build_cache"):
+            raise BackendError("plan.path_binding", "Configure build path differs from reviewed path")
+    elif kind == "build_compile":
+        if inputs.get("build_path") != plan.get("paths", {}).get("build_cache") or tuple(inputs.get("targets", ())) != BINARIES:
+            raise BackendError("plan.operation_schema", "Build operation targets or path differ from the reviewed contract")
+    elif kind == "payload_stage" and inputs.get("build_path") != plan.get("paths", {}).get("build_cache"):
+        raise BackendError("plan.path_binding", "Payload stage build path differs from reviewed path")
+    elif kind == "payload_validate" and tuple(inputs.get("required_binaries", ())) != BINARIES:
+        raise BackendError("plan.operation_schema", "Payload validation binary set is incomplete")
+    elif kind == "links_reconcile":
+        names = inputs.get("binaries", list(BINARIES))
+        if tuple(names) != BINARIES:
+            raise BackendError("plan.operation_schema", "Link reconciliation binary set differs from the owned set")
+
+
+def validate_current_preconditions(plan: dict[str, Any]) -> None:
+    r = roots()
+    paths = plan.get("paths", {})
+    expected_roots = {
+        "build_cache": r["cache"], "staging_payload": r["data"],
+        "target_payload": r["data"] / "payloads", "current_link": r["data"],
+    }
+    for name, root in expected_roots.items():
+        value = paths.get(name)
+        if not isinstance(value, str):
+            raise BackendError("plan.path_binding", f"Reviewed path is missing: {name}")
+        validate_mutation_path(Path(value), [root])
+    classification, manifest, _ = manifest_state(r["data"] / "install-manifest.json")
+    reviewed = plan.get("current_state", {})
+    if classification != reviewed.get("classification", "absent"):
+        raise BackendError("plan.precondition_changed", "Installation classification changed after review")
+    actual_active = None
+    if manifest:
+        actual_active = (manifest.get("versions", {}).get("active") if manifest.get("schema_version") == 2
+                         else manifest.get("installed_version"))
+    if actual_active != reviewed.get("active_version"):
+        raise BackendError("plan.precondition_changed", "Active installation version changed after review")
+    if any(op.get("privilege") == "trusted_helper" for op in plan.get("operations", [])):
+        if os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") != "1":
+            os_now = os_facts()
+            expected = plan.get("privilege_preconditions", {})
+            if (os_now["base_id"] != expected.get("base_os") or
+                    os_now["base_version_id"] != expected.get("base_release") or
+                    os_now["kernel_release"] != expected.get("kernel_release")):
+                raise BackendError("plan.precondition_changed", "Privileged host preconditions changed after review")
+            if not helper_facts().get("trusted"):
+                raise BackendError("privileged_helper_missing", "Trusted helper changed after review")
+
+
 def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts: dict[str, Any] | None) -> None:
     if plan.get("schema_version") != 1 or plan.get("plan_version") != PLAN_VERSION or plan.get("policy_version") != POLICY_VERSION:
         raise BackendError("plan.unsupported_schema", "Unsupported plan schema or policy")
+    try:
+        parsed_plan_id = uuid.UUID(str(plan.get("plan_id")))
+    except ValueError as exc:
+        raise BackendError("plan.invalid_id", "Reviewed plan ID is invalid") from exc
+    if str(parsed_plan_id) != plan.get("plan_id"):
+        raise BackendError("plan.invalid_id", "Reviewed plan ID must use canonical UUID syntax")
+    if re.fullmatch(r"[0-9a-f]{64}", token or "") is None:
+        raise BackendError("plan.token_invalid", "Plan approval token has invalid syntax")
+    if not isinstance(plan.get("operations"), list) or not plan["operations"]:
+        raise BackendError("plan.operation_schema", "Reviewed plan operations must be a non-empty array")
+    if not isinstance(plan.get("blockers"), list):
+        raise BackendError("plan.operation_schema", "Reviewed plan blockers must be an array")
     calculated = plan_digest(plan)
     if supplied_digest != calculated or plan.get("plan_digest") != calculated:
         raise BackendError("plan.digest_mismatch", "Reviewed plan digest does not match")
-    if parse_time(plan["expires_at"]) < dt.datetime.now(dt.timezone.utc):
+    try:
+        expires = parse_time(plan["expires_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackendError("plan.invalid_expiry", "Reviewed plan expiry is invalid") from exc
+    if expires < dt.datetime.now(dt.timezone.utc):
         raise BackendError("plan.expired", "Reviewed plan has expired")
     pending = load_json(pending_path(plan["plan_id"]))
     if pending.get("used") or pending.get("uid") != os.getuid() or pending.get("digest") != calculated or pending.get("token") != token:
         raise BackendError("plan.token_invalid", "Plan approval token is missing, used, or invalid")
     if facts is not None and facts.get("host_fingerprint") != plan.get("facts_fingerprint"):
         raise BackendError("plan.precondition_changed", "Machine facts changed after review")
+    validate_current_preconditions(plan)
     if plan.get("blockers"):
         raise BackendError("plan.blocked", "Plan contains unresolved blockers", {"blockers": plan["blockers"]})
     known: set[str] = set()
     for op in plan.get("operations", []):
         if op.get("kind") not in ALLOWED_OPERATION_KINDS or op.get("privilege") not in {"none", "user", "trusted_helper"}:
             raise BackendError("plan.unknown_operation", f"Unsupported plan operation: {op.get('id')}")
+        op_id = op.get("id")
+        if not isinstance(op_id, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", op_id) is None or op_id in known:
+            raise BackendError("plan.operation_id", f"Invalid or duplicate operation ID: {op_id}")
         if not isinstance(op.get("depends_on"), list) or any(dep not in known for dep in op["depends_on"]):
             raise BackendError("plan.dependency_order", f"Invalid dependency order for {op.get('id')}")
         if op.get("privilege") == "trusted_helper":
             inputs = op.get("inputs", {})
             if inputs.get("operation_type") not in PRIVILEGED_TYPES or any(key in FORBIDDEN_HELPER_FIELDS for key in inputs):
                 raise BackendError("plan.unsafe_privilege", f"Unsafe privileged operation: {op.get('id')}")
-        known.add(op["id"])
+        validate_operation_contract(plan, op)
+        known.add(op_id)
     pending["used"] = True
     atomic_write(pending_path(plan["plan_id"]), pending)
 
