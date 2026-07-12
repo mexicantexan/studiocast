@@ -482,6 +482,11 @@ class PackagingContractTests(unittest.TestCase):
         self.assertIn("/usr/libexec/studiocast/studiocast-system-helper", policy)
         self.assertIn("auth_admin_keep", policy)
         self.assertNotIn("sudo", policy)
+        self.assertEqual(
+            HELPER_SOURCE.read_text().splitlines()[0],
+            "#!/usr/bin/python3 -I",
+            "privileged Python must ignore caller-controlled Python paths",
+        )
 
     def test_selected_source_sentinel_is_never_executed(self):
         with tempfile.TemporaryDirectory(prefix="studiocast-selected-source-") as directory:

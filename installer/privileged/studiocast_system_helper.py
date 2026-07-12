@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Root-side StudioCast host integration helper.
 
 This file is installed by the separately signed studiocast-system-helper OS

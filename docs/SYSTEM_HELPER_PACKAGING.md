@@ -62,6 +62,10 @@ other argument vector. This executable-plus-argument contract is recorded in
 `package-layout.json` because polkit's executable annotation does not constrain
 arguments.
 
+The packaged Python entrypoint uses interpreter isolated mode (`-I`) so caller
+`PYTHONPATH`, user-site packages, and other Python environment settings cannot
+affect imports before the helper validates and sanitizes the request.
+
 The helper reads one bounded UTF-8 JSON request on standard input and returns
 one structured JSON result. It validates the complete request before the first
 operation. The frozen v1 allowlist consists of:
