@@ -574,6 +574,12 @@ void InstallerWizard::setCustomRoute(bool enabled) {
   }
   customRoute_ = enabled;
 }
+void InstallerWizard::setAdvancedSourceSelected(bool enabled) {
+  if (advancedSourceSelected_ != enabled) {
+    invalidatePlan();
+  }
+  advancedSourceSelected_ = enabled;
+}
 void InstallerWizard::setSourceDir(const QString &path) {
   if (sourceDir_ != path)
     invalidatePlan();
@@ -605,24 +611,28 @@ void InstallerWizard::setInstallDeps(bool enabled) {
   installDeps_ = enabled;
 }
 void InstallerWizard::setConfigureV4l2Loopback(bool enabled) {
-  if (configureV4l2Loopback_ != enabled)
+  if (configureV4l2Loopback_ != enabled || !v4lChoiceResolved_)
     invalidatePlan();
   configureV4l2Loopback_ = enabled;
+  v4lChoiceResolved_ = true;
 }
 void InstallerWizard::setLoadLoopback(bool enabled) {
-  if (loadLoopback_ != enabled)
+  if (loadLoopback_ != enabled || !loadLoopbackChoiceResolved_)
     invalidatePlan();
   loadLoopback_ = enabled;
+  loadLoopbackChoiceResolved_ = true;
 }
 void InstallerWizard::setPersistLoopback(bool enabled) {
-  if (persistLoopback_ != enabled)
+  if (persistLoopback_ != enabled || !persistLoopbackChoiceResolved_)
     invalidatePlan();
   persistLoopback_ = enabled;
+  persistLoopbackChoiceResolved_ = true;
 }
 void InstallerWizard::setInstallService(bool enabled) {
-  if (installService_ != enabled)
+  if (installService_ != enabled || !serviceChoiceResolved_)
     invalidatePlan();
   installService_ = enabled;
+  serviceChoiceResolved_ = true;
 }
 void InstallerWizard::setOpenBackendsSetup(bool enabled) {
   if (openCuda_ != enabled || openAudio_ != enabled)
@@ -824,18 +834,25 @@ bool InstallerWizard::refreshReleaseStatus(QString *error) {
   receipt.close();
   QFile::remove(receiptPath);
 
+  const bool explicitlyOffline =
+      QProcessEnvironment::systemEnvironment().value(QStringLiteral(
+          "STUDIOCAST_INSTALLER_OFFLINE")) == QStringLiteral("1");
   QString onlineError;
   QJsonObject releaseStatus;
   QStringList args{QStringLiteral("release-status"), QStringLiteral("--json"),
                    QStringLiteral("--release-receipt-out"), receiptPath};
-  args += releaseChannelOptions(false);
-  bool verified = runBackendJson(args, &releaseStatus, &onlineError);
+  args += releaseChannelOptions(explicitlyOffline);
+  bool verified = runBackendJson(args, &releaseStatus,
+                                 explicitlyOffline ? nullptr : &onlineError);
   QString offlineError;
-  if (!verified) {
+  if (!verified && !explicitlyOffline) {
     args = {QStringLiteral("release-status"), QStringLiteral("--json"),
             QStringLiteral("--release-receipt-out"), receiptPath};
     args += releaseChannelOptions(true);
     verified = runBackendJson(args, &releaseStatus, &offlineError);
+  } else if (!verified) {
+    offlineError = QStringLiteral(
+        "No verified signed release was available in the offline cache.");
   }
 
   if (!verified ||
@@ -845,10 +862,17 @@ bool InstallerWizard::refreshReleaseStatus(QString *error) {
       releaseStatus.value(QStringLiteral("available_version"))
           .toString()
           .isEmpty() ||
+      (explicitlyOffline &&
+       !jsonBool(releaseStatus, QStringLiteral("offline"))) ||
       !QFileInfo(receiptPath).isFile()) {
     QFile::remove(receiptPath);
     if (error) {
-      if (!offlineError.trimmed().isEmpty()) {
+      if (explicitlyOffline) {
+        *error = offlineError.trimmed().isEmpty()
+                     ? QStringLiteral("Verified signed offline release status "
+                                      "was incomplete.")
+                     : offlineError.trimmed();
+      } else if (!offlineError.trimmed().isEmpty()) {
         *error =
             QStringLiteral("Stable release verification failed online (%1) "
                            "and no verified offline cache was usable (%2).")
@@ -1033,15 +1057,24 @@ void InstallerWizard::seedFromPriorDesiredConfiguration() {
     openAudio_ = jsonBool(features, QStringLiteral("open_audio"), openAudio_);
     openVulkan_ = jsonBool(features, QStringLiteral("open_vulkan"), false);
     const QJsonObject service = prior.value(QStringLiteral("service")).toObject();
-    installService_ =
-        jsonString(service, QStringLiteral("desired")) ==
-        QStringLiteral("enabled_started");
+    const QString serviceDesired =
+        jsonString(service, QStringLiteral("desired"));
+    serviceChoiceResolved_ =
+        serviceDesired == QStringLiteral("enabled_started") ||
+        serviceDesired == QStringLiteral("disabled");
+    installService_ = serviceDesired == QStringLiteral("enabled_started");
     const QJsonObject camera = prior.value(QStringLiteral("v4l")).toObject();
+    v4lChoiceResolved_ = camera.value(QStringLiteral("desired")).isBool();
     configureV4l2Loopback_ =
-        jsonBool(camera, QStringLiteral("desired"), configureV4l2Loopback_);
+        v4lChoiceResolved_ ? camera.value(QStringLiteral("desired")).toBool()
+                           : false;
+    loadLoopbackChoiceResolved_ = v4lChoiceResolved_;
     loadLoopback_ = configureV4l2Loopback_;
-    persistLoopback_ = jsonBool(camera, QStringLiteral("persist"),
-                                persistLoopback_);
+    persistLoopbackChoiceResolved_ =
+        camera.value(QStringLiteral("persist")).isBool();
+    persistLoopback_ = persistLoopbackChoiceResolved_
+                           ? camera.value(QStringLiteral("persist")).toBool()
+                           : false;
     v4lDeviceNumber_ =
         camera.value(QStringLiteral("device_number")).toInt(v4lDeviceNumber_);
     v4lLabel_ = jsonString(camera, QStringLiteral("label"), v4lLabel_);
@@ -1086,12 +1119,24 @@ bool InstallerWizard::refreshPlan(QString *error) {
       *error = planError_;
     return false;
   }
-  if (!customRoute_ && workflow_ != QStringLiteral("repair") &&
-      workflow_ != QStringLiteral("uninstall") &&
+  if (workflow_ != QStringLiteral("uninstall") &&
+      (!serviceChoiceResolved_ || !v4lChoiceResolved_ ||
+       (configureV4l2Loopback_ &&
+        (!loadLoopbackChoiceResolved_ || !persistLoopbackChoiceResolved_)))) {
+    planError_ = QStringLiteral(
+        "Migrated service or virtual-camera choices are unknown. Choose "
+        "Customize and explicitly review each unknown choice before Apply.");
+    if (error)
+      *error = planError_;
+    return false;
+  }
+  if (workflow_ != QStringLiteral("repair") &&
+      workflow_ != QStringLiteral("uninstall") && !advancedSourceSelected_ &&
       (verifiedReleaseReceiptPath_.isEmpty() ||
        !QFileInfo(verifiedReleaseReceiptPath_).isFile())) {
     planError_ = QStringLiteral(
-        "Recommended installation requires a current signed-release receipt.");
+        "Official Recommended or Custom installation requires a current "
+        "signed-release receipt.");
     if (error)
       *error = planError_;
     return false;
@@ -1185,10 +1230,16 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
                            workflow_ != QStringLiteral("advanced");
   const bool recommendedSelection =
       !customRoute_ && detectedRoute() == QStringLiteral("recommended") &&
-      (workflow_ == QStringLiteral("install") ||
-       workflow_ == QStringLiteral("update"));
+      workflow_ == QStringLiteral("install");
+  args << QStringLiteral("--route")
+       << (advancedSourceSelected_ ? QStringLiteral("advanced")
+           : customRoute_          ? QStringLiteral("custom")
+                                   : QStringLiteral("recommended"));
+  if (jsonBool(releaseStatusObject_, QStringLiteral("offline"))) {
+    args << QStringLiteral("--offline");
+  }
   if (needsSource) {
-    if (!customRoute_ && !verifiedReleaseReceiptPath_.isEmpty()) {
+    if (!advancedSourceSelected_ && !verifiedReleaseReceiptPath_.isEmpty()) {
       args << QStringLiteral("--release-receipt")
            << verifiedReleaseReceiptPath_;
     } else if (useReleaseArchive_ && !releaseArchive_.isEmpty()) {
@@ -1219,6 +1270,13 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
   }
 
   const bool effectiveV4l = recommendedSelection || configureV4l2Loopback_;
+  if (!v4lChoiceResolved_ ||
+      (configureV4l2Loopback_ &&
+       (!loadLoopbackChoiceResolved_ || !persistLoopbackChoiceResolved_))) {
+    if (!forPlan)
+      args << QStringLiteral("--yes");
+    return args;
+  }
   if (effectiveV4l) {
     args << QStringLiteral("--v4l2loopback");
   } else {
@@ -1238,8 +1296,10 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
   args << ((recommendedSelection || v4lExclusiveCaps_)
                ? QStringLiteral("--v4l-exclusive-caps")
                : QStringLiteral("--no-v4l-exclusive-caps"));
-  args << (installService_ ? QStringLiteral("--service")
-                           : QStringLiteral("--no-service"));
+  if (serviceChoiceResolved_) {
+    args << (installService_ ? QStringLiteral("--service")
+                             : QStringLiteral("--no-service"));
+  }
   args << ((recommendedSelection || openCuda_)
                ? QStringLiteral("--open-cuda")
                : QStringLiteral("--no-open-cuda"));
@@ -1380,7 +1440,12 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
         if (auto *w = installerWizard(this)) {
           w->setWorkflow(radio->property("workflow").toString());
           w->setCustomRoute(radio->property("customRoute").toBool());
-          if (radio->property("recommended").toBool()) {
+          if (!radio->property("customRoute").toBool()) {
+            w->setAdvancedSourceSelected(false);
+          }
+          if (radio->property("recommended").toBool() &&
+              radio->property("workflow").toString() ==
+                  QStringLiteral("install")) {
             w->setBuildType(QStringLiteral("Release"));
             w->setConfigureV4l2Loopback(true);
             w->setLoadLoopback(true);
@@ -1736,8 +1801,8 @@ UninstallPage::UninstallPage(QWidget *parent) : QWizardPage(parent) {
   layout->addWidget(statusLabel_);
 
   removeUserData_ = new QCheckBox(
-      QStringLiteral("Also remove user config, downloaded models, logs, and "
-                     "cache"),
+      QStringLiteral("Also remove settings, downloaded models, other user "
+                     "data, logs, and caches"),
       this);
   removeUserData_->setObjectName(
       QStringLiteral("scInstallerUninstallRemoveUserData"));
@@ -1745,7 +1810,8 @@ UninstallPage::UninstallPage(QWidget *parent) : QWizardPage(parent) {
 
   dataWarning_ = mutedLabel(
       QStringLiteral("The additional user-data removal is permanent. Leave "
-                     "this unchecked to preserve your settings and downloads."),
+                     "this unchecked to preserve settings, downloaded "
+                     "models, other user data, logs, and caches."),
       this);
   dataWarning_->setObjectName(
       QStringLiteral("scInstallerUninstallDataWarning"));
@@ -1809,7 +1875,15 @@ void UninstallPage::refreshPlanText() {
   auto *w = installerWizard(this);
   QString error;
   if (w->refreshPlan(&error)) {
-    planText_->setPlainText(planTextFromObject(w->planObject()));
+    const QString dataPolicy =
+        removeUserData_->isChecked()
+            ? QStringLiteral(
+                  "User data policy: REMOVE settings, downloaded models, "
+                  "other user data, logs, and caches.\n\n")
+            : QStringLiteral(
+                  "User data policy: PRESERVE settings, downloaded models, "
+                  "other user data, logs, and caches.\n\n");
+    planText_->setPlainText(dataPolicy + planTextFromObject(w->planObject()));
   } else {
     planText_->setPlainText(error);
   }
@@ -1826,10 +1900,21 @@ BuildOptionsPage::BuildOptionsPage(QWidget *parent) : QWizardPage(parent) {
   auto *sourceLayout = new QVBoxLayout(sourceBox);
 
   sourceDirRadio_ = new QRadioButton(
-      QStringLiteral("Build from source directory"), sourceBox);
+      QStringLiteral("Advanced: build from a selected source directory"),
+      sourceBox);
+  sourceDirRadio_->setObjectName(
+      QStringLiteral("scInstallerAdvancedSourceDirectory"));
   archiveRadio_ = new QRadioButton(
-      QStringLiteral("Build from selected release archive"), sourceBox);
-  sourceDirRadio_->setChecked(true);
+      QStringLiteral("Advanced: build from a selected source archive"),
+      sourceBox);
+  archiveRadio_->setObjectName(
+      QStringLiteral("scInstallerAdvancedSourceArchive"));
+  officialReleaseRadio_ = new QRadioButton(
+      QStringLiteral("Use the verified official stable release"), sourceBox);
+  officialReleaseRadio_->setObjectName(
+      QStringLiteral("scInstallerVerifiedOfficialSource"));
+  officialReleaseRadio_->setChecked(true);
+  sourceLayout->addWidget(officialReleaseRadio_);
   sourceLayout->addWidget(sourceDirRadio_);
 
   auto *sourceRow = new QHBoxLayout;
@@ -1850,6 +1935,22 @@ BuildOptionsPage::BuildOptionsPage(QWidget *parent) : QWizardPage(parent) {
   archiveRow->addWidget(archiveEdit_, 1);
   archiveRow->addWidget(browseArchive);
   sourceLayout->addLayout(archiveRow);
+  sourceLayout->addWidget(mutedLabel(
+      QStringLiteral("The official option keeps the signed release identity. "
+                     "Selecting either Advanced option changes the plan to "
+                     "an arbitrary developer source."),
+      sourceBox));
+  const auto updateSourceInputs = [this, browseSource, browseArchive] {
+    const bool sourceAllowed = sourceDirRadio_->isEnabled();
+    sourceDirEdit_->setEnabled(sourceAllowed && sourceDirRadio_->isChecked());
+    browseSource->setEnabled(sourceAllowed && sourceDirRadio_->isChecked());
+    archiveEdit_->setEnabled(sourceAllowed && archiveRadio_->isChecked());
+    browseArchive->setEnabled(sourceAllowed && archiveRadio_->isChecked());
+  };
+  connect(officialReleaseRadio_, &QRadioButton::toggled, this,
+          updateSourceInputs);
+  connect(sourceDirRadio_, &QRadioButton::toggled, this, updateSourceInputs);
+  connect(archiveRadio_, &QRadioButton::toggled, this, updateSourceInputs);
   layout->addWidget(sourceBox);
 
   connect(browseSource, &QPushButton::clicked, this, [this] {
@@ -1891,8 +1992,10 @@ BuildOptionsPage::BuildOptionsPage(QWidget *parent) : QWizardPage(parent) {
   form->addRow(QStringLiteral("Build type"), buildTypeCombo_);
 
   installDeps_ = new QCheckBox(
-      QStringLiteral("Install or refresh build/runtime dependencies"),
-      buildBox);
+      QStringLiteral("Install exact missing build/runtime packages"), buildBox);
+  installDeps_->setToolTip(QStringLiteral(
+      "This controls normal build/runtime package reconciliation only. "
+      "Virtual-camera package/module work is reviewed separately."));
   freshBuild_ = new QCheckBox(
       QStringLiteral("Remove the selected build directory first"), buildBox);
   form->addRow(QString(), installDeps_);
@@ -1913,17 +2016,21 @@ void BuildOptionsPage::initializePage() {
   auto *w = installerWizard(this);
   const bool sourceRelevant = w->workflow() != QStringLiteral("uninstall") &&
                               w->workflow() != QStringLiteral("advanced");
+  officialReleaseRadio_->setEnabled(sourceRelevant);
   sourceDirRadio_->setEnabled(sourceRelevant);
   archiveRadio_->setEnabled(sourceRelevant);
-  sourceDirEdit_->setEnabled(sourceRelevant);
-  archiveEdit_->setEnabled(sourceRelevant);
   buildDirEdit_->setEnabled(sourceRelevant);
   buildTypeCombo_->setEnabled(sourceRelevant);
   installDeps_->setEnabled(sourceRelevant);
   freshBuild_->setEnabled(sourceRelevant);
 
-  sourceDirRadio_->setChecked(!w->useReleaseArchive());
-  archiveRadio_->setChecked(w->useReleaseArchive());
+  officialReleaseRadio_->setChecked(!w->advancedSourceSelected());
+  sourceDirRadio_->setChecked(w->advancedSourceSelected() &&
+                              !w->useReleaseArchive());
+  archiveRadio_->setChecked(w->advancedSourceSelected() &&
+                            w->useReleaseArchive());
+  sourceDirEdit_->setEnabled(sourceRelevant && sourceDirRadio_->isChecked());
+  archiveEdit_->setEnabled(sourceRelevant && archiveRadio_->isChecked());
   sourceDirEdit_->setText(w->sourceDir());
   archiveEdit_->setText(w->releaseArchive());
   buildDirEdit_->setText(w->buildDir());
@@ -1937,7 +2044,16 @@ bool BuildOptionsPage::validatePage() {
   const bool sourceRelevant = w->workflow() != QStringLiteral("uninstall") &&
                               w->workflow() != QStringLiteral("advanced");
   if (sourceRelevant) {
-    if (archiveRadio_->isChecked()) {
+    if (officialReleaseRadio_->isChecked()) {
+      if (w->verifiedReleaseReceiptPath().isEmpty() ||
+          !QFileInfo(w->verifiedReleaseReceiptPath()).isFile()) {
+        QMessageBox::warning(
+            this, QStringLiteral("StudioCast Installer"),
+            QStringLiteral("The verified official release receipt is no "
+                           "longer available. Return to Analyze and retry."));
+        return false;
+      }
+    } else if (archiveRadio_->isChecked()) {
       if (archiveEdit_->text().trimmed().isEmpty() ||
           !QFileInfo(archiveEdit_->text().trimmed()).isFile()) {
         QMessageBox::warning(this, QStringLiteral("StudioCast Installer"),
@@ -1956,6 +2072,7 @@ bool BuildOptionsPage::validatePage() {
       return false;
     }
   }
+  w->setAdvancedSourceSelected(!officialReleaseRadio_->isChecked());
   w->setUseReleaseArchive(archiveRadio_->isChecked());
   w->setSourceDir(sourceDirEdit_->text().trimmed());
   w->setReleaseArchive(archiveEdit_->text().trimmed());
@@ -2029,15 +2146,20 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
 
   installService_ = new QCheckBox(
       QStringLiteral("Install and start the systemd user service"), this);
+  installService_->setObjectName(QStringLiteral("scInstallerService"));
   configureV4l2_ = new QCheckBox(
-      QStringLiteral("Install/configure v4l2loopback virtual camera support"),
+      QStringLiteral(
+          "Reconcile required v4l2loopback package and module support"),
       this);
   configureV4l2_->setObjectName(QStringLiteral("scInstallerConfigureV4l"));
   loadLoopback_ = new QCheckBox(
-      QStringLiteral("Load the StudioCast virtual camera now"), this);
+      QStringLiteral("Load the StudioCast virtual-camera module/device now"),
+      this);
   loadLoopback_->setObjectName(QStringLiteral("scInstallerLoadV4l"));
   persistLoopback_ = new QCheckBox(
-      QStringLiteral("Persist the virtual camera across reboot"), this);
+      QStringLiteral(
+          "Write namespaced automatic-load configuration for reboot"),
+      this);
   persistLoopback_->setObjectName(QStringLiteral("scInstallerPersistV4l"));
   v4lDeviceNumber_ = new QSpinBox(this);
   v4lDeviceNumber_->setRange(0, 63);
@@ -2074,6 +2196,15 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   removeUserData_->setObjectName(QStringLiteral("scInstallerPreserveSettings"));
 
   layout->addWidget(installService_);
+  auto *unknownChoices = mutedLabel(
+      QStringLiteral("A migrated installer manifest did not record one or "
+                     "more service or virtual-camera choices. Partially "
+                     "checked controls are unresolved and must be explicitly "
+                     "selected or cleared before review."),
+      this);
+  unknownChoices->setObjectName(
+      QStringLiteral("scInstallerUnknownMigratedChoices"));
+  layout->addWidget(unknownChoices);
   layout->addWidget(line(this));
   auto *cameraBox = new QGroupBox(QStringLiteral("Virtual camera"), this);
   auto *cameraLayout = new QFormLayout(cameraBox);
@@ -2177,21 +2308,23 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
       this));
   layout->addStretch(1);
 
-  connect(configureV4l2_, &QCheckBox::toggled, this, [this](bool checked) {
+  connect(configureV4l2_, &QCheckBox::stateChanged, this, [this](int state) {
+    const bool checked = state == Qt::Checked;
+    const bool unresolved = state == Qt::PartiallyChecked;
     loadLoopback_->setEnabled(checked);
     persistLoopback_->setEnabled(checked);
     v4lDeviceNumber_->setEnabled(checked);
     v4lLabel_->setEnabled(checked);
     v4lExclusiveCaps_->setEnabled(checked);
-    if (!checked) {
+    if (!checked && !unresolved) {
       loadLoopback_->setChecked(false);
       persistLoopback_->setChecked(false);
     }
     if (auto *limitation = findChild<QLabel *>(
             QStringLiteral("scInstallerCameraLimitation"))) {
-      limitation->setVisible(!checked);
+      limitation->setVisible(!checked && !unresolved);
     }
-    cameraLimitationAck_->setVisible(!checked);
+    cameraLimitationAck_->setVisible(!checked && !unresolved);
     if (checked)
       cameraLimitationAck_->setChecked(false);
   });
@@ -2237,16 +2370,47 @@ void ServiceOptionsPage::initializePage() {
   removeUserData_->setEnabled(reinstall);
   removeUserData_->setVisible(reinstall);
 
-  installService_->setChecked(w->installService());
-  configureV4l2_->setChecked(w->configureV4l2Loopback());
-  loadLoopback_->setChecked(w->configureV4l2Loopback() && w->loadLoopback());
-  persistLoopback_->setChecked(w->configureV4l2Loopback() &&
-                               w->persistLoopback());
+  {
+    const QSignalBlocker serviceBlocker(installService_);
+    installService_->setTristate(!w->serviceChoiceResolved());
+    installService_->setCheckState(
+        w->serviceChoiceResolved()
+            ? (w->installService() ? Qt::Checked : Qt::Unchecked)
+            : Qt::PartiallyChecked);
+  }
+  {
+    const QSignalBlocker cameraBlocker(configureV4l2_);
+    const QSignalBlocker loadBlocker(loadLoopback_);
+    const QSignalBlocker persistBlocker(persistLoopback_);
+    configureV4l2_->setTristate(!w->v4lChoiceResolved());
+    configureV4l2_->setCheckState(
+        w->v4lChoiceResolved()
+            ? (w->configureV4l2Loopback() ? Qt::Checked : Qt::Unchecked)
+            : Qt::PartiallyChecked);
+    loadLoopback_->setTristate(!w->loadLoopbackChoiceResolved());
+    loadLoopback_->setCheckState(
+        w->loadLoopbackChoiceResolved()
+            ? (w->configureV4l2Loopback() && w->loadLoopback() ? Qt::Checked
+                                                               : Qt::Unchecked)
+            : Qt::PartiallyChecked);
+    persistLoopback_->setTristate(!w->persistLoopbackChoiceResolved());
+    persistLoopback_->setCheckState(
+        w->persistLoopbackChoiceResolved()
+            ? (w->configureV4l2Loopback() && w->persistLoopback()
+                   ? Qt::Checked
+                   : Qt::Unchecked)
+            : Qt::PartiallyChecked);
+  }
+  const bool cameraExplicitlyEnabled =
+      configureV4l2_->checkState() == Qt::Checked;
+  loadLoopback_->setEnabled(installLike && cameraExplicitlyEnabled);
+  persistLoopback_->setEnabled(installLike && cameraExplicitlyEnabled);
   v4lDeviceNumber_->setValue(w->v4lDeviceNumber());
   v4lLabel_->setText(w->v4lLabel());
   v4lExclusiveCaps_->setChecked(w->v4lExclusiveCaps());
   cameraLimitationAck_->setChecked(false);
-  cameraLimitationAck_->setVisible(!configureV4l2_->isChecked());
+  cameraLimitationAck_->setVisible(configureV4l2_->checkState() ==
+                                   Qt::Unchecked);
   openCuda_->setChecked(w->openCuda());
   openAudio_->setChecked(w->openAudio());
   openVulkan_->setChecked(w->openVulkan());
@@ -2266,7 +2430,14 @@ void ServiceOptionsPage::initializePage() {
   removeUserData_->setChecked(!w->removeUserData());
   if (auto *limitation = findChild<QLabel *>(
           QStringLiteral("scInstallerCameraLimitation"))) {
-    limitation->setVisible(!configureV4l2_->isChecked());
+    limitation->setVisible(configureV4l2_->checkState() == Qt::Unchecked);
+  }
+  if (auto *unknown = findChild<QLabel *>(
+          QStringLiteral("scInstallerUnknownMigratedChoices"))) {
+    unknown->setVisible(!w->serviceChoiceResolved() ||
+                        !w->v4lChoiceResolved() ||
+                        !w->loadLoopbackChoiceResolved() ||
+                        !w->persistLoopbackChoiceResolved());
   }
 
   const QString optionalNotice =
@@ -2281,6 +2452,17 @@ bool ServiceOptionsPage::validatePage() {
   for (QCheckBox *pack : modelPackChecks_) {
     if (pack->isChecked())
       selectedModels.append(pack->property("modelPackId").toString());
+  }
+  if (installService_->checkState() == Qt::PartiallyChecked ||
+      configureV4l2_->checkState() == Qt::PartiallyChecked ||
+      (configureV4l2_->checkState() == Qt::Checked &&
+       (loadLoopback_->checkState() == Qt::PartiallyChecked ||
+        persistLoopback_->checkState() == Qt::PartiallyChecked))) {
+    QMessageBox::warning(
+        this, QStringLiteral("Review migrated choices"),
+        QStringLiteral("Explicitly select or clear every partially checked "
+                       "service and virtual-camera option before review."));
+    return false;
   }
   if (!configureV4l2_->isChecked() &&
       !cameraLimitationAck_->isChecked()) {

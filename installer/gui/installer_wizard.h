@@ -79,6 +79,15 @@ public:
   QString detectedRoute() const;
   QString primaryAction() const;
   bool customRoute() const { return customRoute_; }
+  bool advancedSourceSelected() const { return advancedSourceSelected_; }
+  bool serviceChoiceResolved() const { return serviceChoiceResolved_; }
+  bool v4lChoiceResolved() const { return v4lChoiceResolved_; }
+  bool loadLoopbackChoiceResolved() const {
+    return loadLoopbackChoiceResolved_;
+  }
+  bool persistLoopbackChoiceResolved() const {
+    return persistLoopbackChoiceResolved_;
+  }
   bool planReady() const { return planReady_; }
   QString planError() const { return planError_; }
   QString reviewedPlanPath() const { return reviewedPlanPath_; }
@@ -97,6 +106,7 @@ public:
 
   void setWorkflow(const QString &workflow);
   void setCustomRoute(bool enabled);
+  void setAdvancedSourceSelected(bool enabled);
   void setSourceDir(const QString &path);
   void setReleaseArchive(const QString &path);
   void setUseReleaseArchive(bool enabled);
@@ -163,6 +173,11 @@ private:
   bool allowUnsupported_ = false;
   bool removeUserData_ = false;
   bool customRoute_ = false;
+  bool advancedSourceSelected_ = false;
+  bool serviceChoiceResolved_ = true;
+  bool v4lChoiceResolved_ = true;
+  bool loadLoopbackChoiceResolved_ = true;
+  bool persistLoopbackChoiceResolved_ = true;
   bool priorConfigurationSeeded_ = false;
   bool analysisAvailable_ = false;
   bool planReady_ = false;
@@ -245,6 +260,7 @@ public:
   bool validatePage() override;
 
 private:
+  QRadioButton *officialReleaseRadio_ = nullptr;
   QRadioButton *sourceDirRadio_ = nullptr;
   QRadioButton *archiveRadio_ = nullptr;
   QLineEdit *sourceDirEdit_ = nullptr;

@@ -90,7 +90,10 @@ QJsonObject ReleaseStatus(const QString &archive = {}, bool offline = false) {
       {QStringLiteral("reason_code"), QStringLiteral("release.install")},
       {QStringLiteral("minimum_installer_version"), QStringLiteral("0.2.9")},
       {QStringLiteral("installer_meets_minimum"), true},
-      {QStringLiteral("offline"), offline}};
+      {QStringLiteral("offline"), offline},
+      {QStringLiteral("source_archive_state"),
+       offline ? QStringLiteral("candidate_verified")
+               : QStringLiteral("acquisition_pending")}};
   if (!archive.isEmpty())
     status[QStringLiteral("verified_source_archive")] = archive;
   return status;
@@ -283,6 +286,7 @@ public:
     qunsetenv("STUDIOCAST_STABLE_CHANNEL_URL");
     qunsetenv("STUDIOCAST_STABLE_CHANNEL_SIGNATURE_URL");
     qunsetenv("STUDIOCAST_RELEASE_CACHE_DIR");
+    qunsetenv("STUDIOCAST_INSTALLER_OFFLINE");
     qunsetenv("APPIMAGE");
     qunsetenv("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE");
     qunsetenv("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG");
@@ -320,6 +324,7 @@ public:
   QString archive() const { return archive_; }
   QString planArguments() const { return read(planArgs_); }
   QString releaseCalls() const { return read(releaseCalls_); }
+  void clearReleaseCalls() { QFile::remove(releaseCalls_); }
   qint64 childPid() const { return read(childPid_).trimmed().toLongLong(); }
 
 private:
@@ -401,6 +406,108 @@ bool TestSignedReleaseAndOfflineReceipt(FakeBackend &backend) {
               "Signed-release failure must block Apply before mutation") &&
        ok;
   backend.setReleaseFailures(false, false);
+  return ok;
+}
+
+bool TestExplicitOfflineUsesOnlyVerifiedCache(FakeBackend &backend) {
+  QJsonObject facts = BaseFacts();
+  facts[QStringLiteral("connectivity")] = QJsonObject{
+      {QStringLiteral("release_source"),
+       QJsonObject{{QStringLiteral("state"), QStringLiteral("offline")}}}};
+  facts[QStringLiteral("cache")] = QJsonObject{
+      {QStringLiteral("release_artifacts"),
+       QJsonObject{{QStringLiteral("0.2.9"),
+                    QJsonObject{{QStringLiteral("verified"), true}}}}}};
+  backend.setScenario(facts,
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("install")),
+                      Plan(), Result(QStringLiteral("committed"), true), 0);
+  backend.setReleaseStatus(ReleaseStatus(backend.archive(), true));
+  backend.setReleaseFailures(false, false);
+  backend.clearReleaseCalls();
+  qputenv("STUDIOCAST_INSTALLER_OFFLINE", "1");
+
+  studiocast::installer::InstallerWizard offline;
+  offline.page(studiocast::installer::PageReview)->initializePage();
+  const QString releaseCalls = backend.releaseCalls();
+  const QString planArgs = backend.planArguments();
+  bool ok =
+      Expect(releaseCalls.count(QStringLiteral("release-status\n")) == 1 &&
+                 releaseCalls.contains(QStringLiteral("--offline")),
+             "explicit offline mode must issue one offline release-status "
+             "request and never probe online") &&
+      Expect(offline.planReady() &&
+                 planArgs.contains(QStringLiteral("--offline")) &&
+                 planArgs.contains(QStringLiteral("--release-receipt")),
+             "verified offline status should permit planning and bind offline "
+             "plus the signed receipt into the reviewed arguments");
+
+  backend.setScenario(facts,
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("offline"), QStringLiteral("stop")),
+                      Plan(), Result(QStringLiteral("failed"), false), 2);
+  backend.setReleaseFailures(false, true);
+  backend.clearReleaseCalls();
+  studiocast::installer::InstallerWizard missingCache;
+  missingCache.page(studiocast::installer::PageReview)->initializePage();
+  const QString missingCalls = backend.releaseCalls();
+  ok = Expect(missingCalls.count(QStringLiteral("release-status\n")) == 1 &&
+                  missingCalls.contains(QStringLiteral("--offline")) &&
+                  !missingCache.planReady(),
+              "an explicit offline cache miss must stop before planning "
+              "without an online fallback") &&
+       ok;
+
+  qunsetenv("STUDIOCAST_INSTALLER_OFFLINE");
+  backend.setReleaseFailures(false, false);
+  backend.setReleaseStatus(ReleaseStatus());
+  return ok;
+}
+
+bool TestCustomRetainsVerifiedOfficialSource(FakeBackend &backend) {
+  backend.setScenario(BaseFacts(),
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("install")),
+                      Plan(), Result(QStringLiteral("committed"), true), 0);
+  studiocast::installer::InstallerWizard custom;
+  custom.setCustomRoute(true);
+  custom.setReleaseArchive(backend.archive());
+  auto *build = custom.page(studiocast::installer::PageBuildOptions);
+  build->initializePage();
+  auto *official = build->findChild<QRadioButton *>(
+      QStringLiteral("scInstallerVerifiedOfficialSource"));
+  auto *advancedArchive = build->findChild<QRadioButton *>(
+      QStringLiteral("scInstallerAdvancedSourceArchive"));
+  bool ok =
+      Expect(official && official->isChecked() && build->validatePage(),
+             "Customize should begin with the verified official source") &&
+      Expect(custom.backendOptions(true).contains(
+                 QStringLiteral("--release-receipt")) &&
+                 custom.backendOptions(true).value(
+                     custom.backendOptions(true).indexOf(
+                         QStringLiteral("--route")) +
+                     1) == QStringLiteral("custom") &&
+                 !custom.backendOptions(true).contains(
+                     QStringLiteral("--release-archive")),
+             "Custom planning must retain signed identity and use the custom "
+             "route");
+
+  advancedArchive->setChecked(true);
+  ok = Expect(build->validatePage() && custom.advancedSourceSelected(),
+              "an explicit Advanced archive selection should validate") &&
+       ok;
+  const QStringList advancedArgs = custom.backendOptions(true);
+  const qsizetype routeIndex = advancedArgs.indexOf(QStringLiteral("--route"));
+  ok = Expect(routeIndex >= 0 &&
+                  advancedArgs.value(routeIndex + 1) ==
+                      QStringLiteral("advanced") &&
+                  advancedArgs.contains(QStringLiteral("--release-archive")) &&
+                  !advancedArgs.contains(QStringLiteral("--release-receipt")),
+              "only an explicitly selected arbitrary source should switch "
+              "Custom to Advanced trust semantics") &&
+       ok;
   return ok;
 }
 
@@ -990,6 +1097,122 @@ bool TestCustomAdvancedSelectionsAndRecommendedDefaults(FakeBackend &backend) {
   return ok;
 }
 
+bool TestMigratedUnknownChoicesRequireExplicitReview(FakeBackend &backend) {
+  QJsonObject facts = BaseFacts(QStringLiteral("healthy"));
+  QJsonObject installation =
+      facts.value(QStringLiteral("installation")).toObject();
+  installation[QStringLiteral("desired_configuration")] = QJsonObject{
+      {QStringLiteral("features"), QJsonObject{}},
+      {QStringLiteral("service"),
+       QJsonObject{{QStringLiteral("desired"), QStringLiteral("unknown")}}},
+      {QStringLiteral("v4l"),
+       QJsonObject{{QStringLiteral("desired"), QStringLiteral("unknown")}}}};
+  facts[QStringLiteral("installation")] = installation;
+  backend.setScenario(facts,
+                      Status(QStringLiteral("healthy"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("update"), true),
+                      Plan(QStringLiteral("update")),
+                      Result(QStringLiteral("committed"), true), 0);
+
+  studiocast::installer::InstallerWizard migrated;
+  migrated.setWorkflow(QStringLiteral("update"));
+  QString error;
+  bool ok = Expect(
+      !migrated.refreshPlan(&error) &&
+          error.contains(QStringLiteral("unknown"), Qt::CaseInsensitive) &&
+          !migrated.backendOptions(true).contains(
+              QStringLiteral("--v4l2loopback")) &&
+          !migrated.backendOptions(true).contains(
+              QStringLiteral("--no-v4l2loopback")),
+      "unknown migrated choices must block review without becoming "
+      "automatic boolean work");
+
+  migrated.setCustomRoute(true);
+  auto *page = migrated.page(studiocast::installer::PageServiceOptions);
+  page->initializePage();
+  auto *service =
+      page->findChild<QCheckBox *>(QStringLiteral("scInstallerService"));
+  auto *camera =
+      page->findChild<QCheckBox *>(QStringLiteral("scInstallerConfigureV4l"));
+  auto *load =
+      page->findChild<QCheckBox *>(QStringLiteral("scInstallerLoadV4l"));
+  auto *persist =
+      page->findChild<QCheckBox *>(QStringLiteral("scInstallerPersistV4l"));
+  auto *notice = page->findChild<QLabel *>(
+      QStringLiteral("scInstallerUnknownMigratedChoices"));
+  ok = Expect(service && camera && load && persist && notice &&
+                  service->checkState() == Qt::PartiallyChecked &&
+                  camera->checkState() == Qt::PartiallyChecked &&
+                  load->checkState() == Qt::PartiallyChecked &&
+                  persist->checkState() == Qt::PartiallyChecked &&
+                  !notice->isHidden(),
+              "unknown migrated choices should be visibly tri-state") &&
+       ok;
+
+  service->setCheckState(Qt::Checked);
+  camera->setCheckState(Qt::Checked);
+  load->setCheckState(Qt::Checked);
+  persist->setCheckState(Qt::Unchecked);
+  ok = Expect(page->validatePage() && migrated.refreshPlan(&error),
+              "explicitly reviewed service/load/persistence choices should "
+              "unblock a fresh exact plan") &&
+       ok;
+  const QString planArgs = backend.planArguments();
+  ok =
+      Expect(planArgs.contains(QStringLiteral("--service")) &&
+                 planArgs.contains(QStringLiteral("--v4l2loopback")) &&
+                 planArgs.contains(QStringLiteral("--load-loopback")) &&
+                 planArgs.contains(QStringLiteral("--no-persist-loopback")) &&
+                 planArgs.contains(QStringLiteral("--route\ncustom")),
+             "reviewed controls should map to exact typed backend semantics") &&
+      ok;
+  ok = Expect(camera->text().contains(QStringLiteral("package")) &&
+                  load->text().contains(QStringLiteral("module/device")) &&
+                  persist->text().contains(QStringLiteral("namespaced")),
+              "dependency, load, and persistence labels should describe the "
+              "operations they control") &&
+       ok;
+  return ok;
+}
+
+bool TestUninstallPreservationReviewMatchesFlags(FakeBackend &backend) {
+  backend.setScenario(BaseFacts(QStringLiteral("healthy")),
+                      Status(QStringLiteral("healthy"),
+                             QStringLiteral("modify"), QStringLiteral("modify"),
+                             true),
+                      Plan(QStringLiteral("uninstall")),
+                      Result(QStringLiteral("committed"), false), 0);
+  studiocast::installer::InstallerWizard uninstall;
+  uninstall.setWorkflow(QStringLiteral("uninstall"));
+  auto *page = uninstall.page(studiocast::installer::PageUninstall);
+  page->initializePage();
+  auto *remove = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerUninstallRemoveUserData"));
+  auto *review = page->findChild<QPlainTextEdit *>(
+      QStringLiteral("scInstallerUninstallPlan"));
+  bool ok =
+      Expect(remove && !remove->isChecked() && review &&
+                 review->toPlainText().contains(QStringLiteral("PRESERVE")) &&
+                 review->toPlainText().contains(QStringLiteral("logs")) &&
+                 review->toPlainText().contains(QStringLiteral("caches")) &&
+                 backend.planArguments().contains(
+                     QStringLiteral("--preserve-user-data")),
+             "ordinary uninstall should review and pass preservation for all "
+             "user-owned data categories");
+  remove->setChecked(true);
+  QApplication::processEvents();
+  ok = Expect(review->toPlainText().contains(QStringLiteral("REMOVE")) &&
+                  review->toPlainText().contains(
+                      QStringLiteral("other user data")) &&
+                  backend.planArguments().contains(
+                      QStringLiteral("--remove-user-data")),
+              "explicit full user-data removal should update both review "
+              "copy and exact plan flag") &&
+       ok;
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -998,6 +1221,8 @@ int main(int argc, char **argv) {
   FakeBackend backend;
   bool ok = true;
   ok = TestSignedReleaseAndOfflineReceipt(backend) && ok;
+  ok = TestExplicitOfflineUsesOnlyVerifiedCache(backend) && ok;
+  ok = TestCustomRetainsVerifiedOfficialSource(backend) && ok;
   ok = TestExplicitSelfUpdateOffer(backend) && ok;
   ok = TestStateDrivenRoutes(backend) && ok;
   ok = TestRecommendedCustomAndContextualRoutes(backend) && ok;
@@ -1007,5 +1232,7 @@ int main(int argc, char **argv) {
   ok = TestStructuredProgressAndDegradedRetry(backend) && ok;
   ok = TestCancellationCleansChild(backend) && ok;
   ok = TestCustomAdvancedSelectionsAndRecommendedDefaults(backend) && ok;
+  ok = TestMigratedUnknownChoicesRequireExplicitReview(backend) && ok;
+  ok = TestUninstallPreservationReviewMatchesFlags(backend) && ok;
   return ok ? 0 : 1;
 }
