@@ -1334,6 +1334,30 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-vulkan-frame-plan-tests
             COMMAND studiocast-vulkan-frame-plan-tests)
 
+    add_executable(studiocast-vulkan-capability-audit-tests
+            tests/vulkan_capability_audit_tests.cpp
+    )
+
+    target_include_directories(studiocast-vulkan-capability-audit-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_compile_definitions(studiocast-vulkan-capability-audit-tests PRIVATE
+            STUDIOCAST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-vulkan-capability-audit-tests)
+    studiocast_enable_sanitizers(studiocast-vulkan-capability-audit-tests)
+
+    set_target_properties(studiocast-vulkan-capability-audit-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-vulkan-capability-audit-tests
+            COMMAND studiocast-vulkan-capability-audit-tests)
+
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
         add_executable(studiocast-vulkan-kernel-tests
                 tests/vulkan_kernel_tests.cpp
