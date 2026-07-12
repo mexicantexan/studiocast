@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,45 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first["host_fingerprint"].startswith("sha256:"))
 
+    def test_helper_analysis_uses_full_fake_trust_and_transport_preflight(self):
+        root = self.s.root / "preflight"
+        root.mkdir()
+        helper, pkexec = root / "helper", root / "pkexec"
+        for path in (helper, pkexec):
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+        policy = root / "policy.xml"
+        policy.write_text(f"""<policyconfig><action id="com.studiocast.Installer1.manage-host-integration">
+<annotate key="org.freedesktop.policykit.exec.path">{helper}</annotate>
+<annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+</action></policyconfig>""", encoding="utf-8")
+        policy.chmod(0o644)
+        service = root / "polkit.service"
+        service.write_text("[D-BUS Service]\nName=org.freedesktop.PolicyKit1\n", encoding="utf-8")
+        service.chmod(0o644)
+        bus_path = root / "system_bus_socket"
+        bus = socket.socket(socket.AF_UNIX)
+        bus.bind(str(bus_path))
+        env = self.s.env | {
+            "STUDIOCAST_INSTALLER_TEST_HELPER": str(helper),
+            "STUDIOCAST_INSTALLER_TEST_PKEXEC": str(pkexec),
+            "STUDIOCAST_INSTALLER_TEST_POLKIT_POLICY": str(policy),
+            "STUDIOCAST_INSTALLER_TEST_SYSTEM_BUS": str(bus_path),
+            "STUDIOCAST_INSTALLER_TEST_POLKIT_SERVICE": str(service),
+        }
+        try:
+            facts = self.s.json("analyze", "--target-version", "0.2.9", env=env)
+        finally:
+            bus.close()
+            bus_path.unlink()
+        self.assertEqual(facts["privileged_helper"]["reason_codes"],
+                         ["privileged_helper_usable"])
+        self.assertTrue(facts["privileged_helper"]["trusted"])
+        self.assertTrue(facts["privileged_helper"]["authorization_transport_available"])
+        unavailable = self.s.json("analyze", "--target-version", "0.2.9", env=env)
+        self.assertEqual(unavailable["privileged_helper"]["reason_codes"],
+                         ["authorization_transport_unavailable"])
+
     def test_routes_cover_install_update_modify_newer_repair_tombstone_unsupported_offline(self):
         cases = [
             (base_facts(), ("recommended", "install")),
@@ -154,6 +194,9 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(self.recommendation(facts)["route"], "unsupported")
         facts = base_facts(); facts["connectivity"]["release_source"]["state"] = "offline"
         self.assertEqual(self.recommendation(facts)["route"], "offline")
+        facts["cache"]["release_artifacts"] = {
+            "studiocast-source": {"verified": True, "state": "cached_verified"}}
+        self.assertEqual(self.recommendation(facts)["route"], "recommended")
 
     def test_recommendation_is_deterministic_models_exact_and_vulkan_not_promoted(self):
         one = self.recommendation(); two = self.recommendation()
@@ -186,6 +229,36 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertTrue(all(x["privilege"] == "trusted_helper" for x in plan["operations"] if x["id"].startswith("v4l.")))
         for op in (item for item in plan["operations"] if item["id"] in {"v4l.module.load", "v4l.persistence.write"}):
             self.assertEqual(set(op["inputs"]), {"operation_type", "device_number", "label", "exclusive_caps"})
+
+    def test_dependency_load_and_persistence_switches_change_exact_operations(self):
+        facts = base_facts()
+        facts["toolchain"]["missing_build_dependencies"] = ["cmake", "c++", "pkg-config"]
+        facts["v4l2"].update(module_available=True, module_loaded=False, device_present=False,
+                              persistence_state="absent")
+        facts["privileged_helper"].update(present=True, trusted=True, compatible=True,
+                                           authorization_transport_available=True)
+        self.s.write_facts(facts)
+        managed = self.s.json("plan", "advanced", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--with-deps", "--v4l2loopback", "--load-loopback",
+            "--no-persist-loopback", "--no-service", "--no-models", "--allow-unsupported")
+        packages = next(op for op in managed["operations"]
+                        if op["id"] == "dependencies.packages.ensure")
+        self.assertEqual(packages["inputs"]["packages"],
+                         ["cmake", "build-essential", "pkg-config"])
+        ids = [op["id"] for op in managed["operations"]]
+        self.assertLess(ids.index("dependencies.packages.ensure"), ids.index("build.configure"))
+        self.assertIn("v4l.module.load", ids)
+        self.assertNotIn("v4l.persistence.write", ids)
+
+        skipped = self.s.json("plan", "advanced", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--skip-deps", "--v4l2loopback", "--no-load-loopback",
+            "--persist-loopback", "--no-service", "--no-models", "--allow-unsupported")
+        ids = [op["id"] for op in skipped["operations"]]
+        self.assertNotIn("dependencies.packages.ensure", ids)
+        self.assertNotIn("v4l.module.load", ids)
+        self.assertIn("v4l.persistence.write", ids)
+        self.assertIn("toolchain.build_dependencies_missing",
+                      [item["code"] for item in skipped["blockers"]])
 
     def test_apply_rejects_tamper_and_exact_dry_run_executes(self):
         plan = self.plan()
@@ -224,6 +297,28 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(value["source"]["legacy_hints"]["source_path"], "/")
         self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
 
+    def test_migrated_unknown_service_and_v4l_require_explicit_selection(self):
+        facts = base_facts(classification="partial", active_version="0.2.8",
+            desired_configuration={"build_type": "unknown", "features": {},
+                "service": {"desired": "unknown"}, "v4l": {"desired": "unknown"},
+                "model_pack_ids": [], "preserve_settings": True})
+        self.s.write_facts(facts)
+        blocked = self.s.json("plan", "repair", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-models", "--allow-unsupported")
+        codes = [item["code"] for item in blocked["blockers"]]
+        self.assertIn("configuration.service.selection_required", codes)
+        self.assertIn("configuration.virtual_camera.selection_required", codes)
+        ids = [op["id"] for op in blocked["operations"]]
+        self.assertFalse(any(op_id.startswith("v4l.") for op_id in ids))
+        self.assertFalse(any(op_id.startswith("service.") for op_id in ids))
+
+        selected = self.s.json("plan", "repair", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-models", "--no-v4l2loopback",
+            "--no-service", "--allow-unsupported")
+        selected_codes = [item["code"] for item in selected["blockers"]]
+        self.assertNotIn("configuration.service.selection_required", selected_codes)
+        self.assertNotIn("configuration.virtual_camera.selection_required", selected_codes)
+
     def test_pack_catalog_is_exact_seven_ids_eight_hashed_artifacts(self):
         plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                            "--no-v4l2loopback", "--no-service", "--models", "--allow-unsupported")
@@ -236,6 +331,38 @@ class InstallerBackendCoreTests(unittest.TestCase):
         gaze = next(x for x in transactions if x["inputs"]["pack_id"] == "gaze_correction_cam_flx_v0_1_1")
         self.assertEqual([a["name"] for a in gaze["inputs"]["pack"]["artifacts"]],
                          ["gaze_flx_left.onnx", "gaze_flx_right.onnx"])
+
+    def test_recommended_models_require_trusted_sizes_before_any_mutation(self):
+        plan = self.s.json("plan", "install", "--facts", str(self.s.facts),
+                           "--no-v4l2loopback", "--no-service", "--models")
+        self.assertIn("artifact_sizes_untrusted", [item["code"] for item in plan["blockers"]])
+        transactions = [op for op in plan["operations"] if op["kind"] == "model_transaction"]
+        self.assertTrue(transactions)
+        self.assertTrue(all(op["inputs"]["recommended"] for op in transactions))
+        path = self.s.root / "blocked-model-plan.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], "--facts", str(self.s.facts),
+                            check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast/builds").exists())
+        advanced = self.plan("--models")
+        self.assertTrue(all(not op["inputs"]["recommended"] for op in advanced["operations"]
+                            if op["kind"] == "model_transaction"))
+
+        repair_facts = base_facts(classification="partial", active_version="0.2.8",
+            desired_configuration={"build_type": "Release", "features": {},
+                "service": {"desired": "disabled"},
+                "v4l": {"desired": False, "required_for_success": False},
+                "model_pack_ids": list(DEFAULT_PACKS), "preserve_settings": True})
+        self.s.write_facts(repair_facts)
+        repair = self.s.json("plan", "repair", "--facts", str(self.s.facts),
+                             "--no-v4l2loopback", "--no-service", "--models")
+        self.assertEqual((repair["route"], repair["detected_route"]),
+                         ("recommended", "repair"))
+        self.assertIn("artifact_sizes_untrusted", [item["code"] for item in repair["blockers"]])
+        self.assertTrue(all(op["inputs"]["recommended"] for op in repair["operations"]
+                            if op["kind"] == "model_transaction"))
 
     def test_backend_executes_packaged_atomic_model_transaction_and_degrades_on_missing_source(self):
         component = self.s.root / "component"
@@ -322,12 +449,38 @@ class InstallerBackendCoreTests(unittest.TestCase):
         current = data / "current"; current.symlink_to(data / "payloads/0.2.9")
         models = data / "models/custom"; models.mkdir(parents=True); (models / "mine").write_text("keep")
         config = Path(self.s.env["XDG_CONFIG_HOME"]) / "studiocast"; config.mkdir(parents=True); (config / "daemon.conf").write_text("keep")
+        state = Path(self.s.env["XDG_STATE_HOME"]) / "studiocast"; state.mkdir(parents=True); (state / "installer.log").write_text("keep")
+        cache = Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast"; cache.mkdir(parents=True); (cache / "verified.cache").write_text("keep")
         plan = self.s.json("plan", "uninstall", "--facts", str(self.s.facts), "--preserve-user-data")
         path = self.s.root / "uninstall.json"; path.write_text(json.dumps(plan), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"], "--token", plan["approval_token"])
         self.assertEqual(terminal_result(result.stdout)["state"], "committed")
         self.assertFalse((data / "payloads").exists()); self.assertTrue((models / "mine").exists()); self.assertTrue((config / "daemon.conf").exists())
+        self.assertTrue((state / "installer.log").is_file()); self.assertTrue((cache / "verified.cache").is_file())
         self.assertEqual(json.loads((data / "install-manifest.json").read_text())["transaction"]["state"], "uninstalled")
+
+    def test_uninstall_remove_user_data_wipes_only_fixed_xdg_roots(self):
+        data = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast"
+        config = Path(self.s.env["XDG_CONFIG_HOME"]) / "studiocast"
+        state = Path(self.s.env["XDG_STATE_HOME"]) / "studiocast"
+        cache = Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast"
+        for root in (data / "models/custom", config, state, cache):
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "owned").write_text("remove", encoding="utf-8")
+        outside = self.s.root / "outside"
+        outside.write_text("keep", encoding="utf-8")
+        plan = self.s.json("plan", "uninstall", "--facts", str(self.s.facts),
+                           "--remove-user-data")
+        cleanup = {op["inputs"].get("target") for op in plan["operations"]
+                   if op["kind"] == "cleanup"}
+        self.assertTrue({"models", "settings", "runtime_state", "cache", "data"} <= cleanup)
+        path = self.s.root / "full-uninstall.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], "--facts", str(self.s.facts))
+        self.assertEqual(terminal_result(result.stdout)["state"], "committed")
+        self.assertFalse(config.exists()); self.assertFalse(state.exists()); self.assertFalse(cache.exists())
+        self.assertFalse((data / "models").exists()); self.assertTrue(outside.is_file())
 
     def test_uninstall_remains_available_with_unsupported_override_flag(self):
         facts = base_facts()
@@ -567,10 +720,10 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         self.assertEqual(plan["desired_state"]["build_type"], "Debug")
         self.assertNotIn("build.configure", ids)
 
-    def _fake_cmake(self, fail=False):
+    def _fake_cmake(self, fail=False, version="0.2.9"):
         bindir = self.s.root / "fake-bin"; bindir.mkdir(exist_ok=True)
         cmake = bindir / "cmake"
-        cmake.write_text("#!/bin/sh\n" + ("exit 41\n" if fail else "if [ \"$1\" = --build ]; then\n d=$2\n mkdir -p \"$d\"\n for n in studiocast studiocastd studiocastctl studiocast-probe studiocast-open studiocast-maxine studiocast-video studiocast-audio; do printf '#!/bin/sh\\n[ \"$1\" = --version ] && echo StudioCast-0.2.9\\nexit 0\\n' >\"$d/$n\"; chmod 755 \"$d/$n\"; done\nfi\nexit 0\n"), encoding="utf-8")
+        cmake.write_text("#!/bin/sh\n" + ("exit 41\n" if fail else f"if [ \"$1\" = --build ]; then\n d=$2\n mkdir -p \"$d\"\n for n in studiocast studiocastd studiocastctl studiocast-probe studiocast-open studiocast-maxine studiocast-video studiocast-audio; do printf '#!/bin/sh\\n[ \"$1\" = --version ] && echo StudioCast-{version}\\nexit 0\\n' >\"$d/$n\"; chmod 755 \"$d/$n\"; done\nfi\nexit 0\n"), encoding="utf-8")
         cmake.chmod(0o755)
         return self.s.env | {"PATH": str(bindir) + ":/usr/bin:/bin"}
 
@@ -647,6 +800,50 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
         self.assertEqual(manifest["payloads"]["active"]["path"], str(active_before))
         self.assertEqual(manifest["transaction"]["state"], "failed")
+
+    def test_post_activation_failure_atomically_rolls_back_and_retains_target(self):
+        initial_facts = base_facts(target_version="0.2.8")
+        self.s.write_facts(initial_facts)
+        initial = self.s.json("plan", "install", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+            "--no-models", "--allow-unsupported", "--target-version", "0.2.8")
+        path = self.s.root / "rollback-plan.json"
+        path.write_text(json.dumps(initial), encoding="utf-8")
+        installed = self.s.run("apply-plan", "--plan", str(path),
+            "--digest", initial["plan_digest"], "--token", initial["approval_token"],
+            "--facts", str(self.s.facts), env=self._fake_cmake(version="0.2.8"))
+        self.assertEqual(terminal_result(installed.stdout)["state"], "committed")
+        data = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast"
+        prior = data / "payloads/0.2.8"
+        current = data / "current"
+        self.assertEqual(current.resolve(), prior)
+
+        facts = self.s.json("analyze", "--target-version", "0.2.9")
+        self.s.write_facts(facts)
+        unit = Path(self.s.env["XDG_CONFIG_HOME"]) / "systemd/user/studiocastd.service"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("user-owned conflict\n", encoding="utf-8")
+        update = self.s.json("plan", "update", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--service",
+            "--no-models", "--allow-unsupported", "--target-version", "0.2.9")
+        path.write_text(json.dumps(update), encoding="utf-8")
+        failed = self.s.run("apply-plan", "--plan", str(path),
+            "--digest", update["plan_digest"], "--token", update["approval_token"],
+            "--facts", str(self.s.facts), check=False,
+            env=self._fake_cmake(version="0.2.9"))
+        value = terminal_result(failed.stdout)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual((value["state"], value["rollback_state"], value["active_version"]),
+                         ("rolled_back", "rolled_back", "0.2.8"))
+        self.assertEqual(value["error"]["code"], "ownership.mismatch")
+        self.assertEqual(current.resolve(), prior)
+        self.assertTrue((data / "payloads/0.2.9/bin/studiocast").is_file())
+        manifest = json.loads((data / "install-manifest.json").read_text())
+        self.assertEqual(manifest["transaction"]["state"], "rolled_back")
+        self.assertEqual(manifest["versions"]["active"], "0.2.8")
+        rollback_states = [item["state"] for item in manifest["journal"]
+                           if item["operation_id"] == "payload.rollback"]
+        self.assertEqual(rollback_states, ["rolling_back", "rolled_back"])
 
     def test_payload_validation_runs_version_probe_before_activation(self):
         plan = self.plan()
@@ -741,7 +938,9 @@ python3 -c 'import json; p={json.dumps(str(captured))}; r=json.load(open(p)); o=
         self.assertEqual(success.returncode, 0); self.assertEqual(value["state"], "committed")
         request = json.loads(captured.read_text())
         self.assertEqual(request["policy_version"], 1)
-        self.assertEqual(request["preconditions"], {"base_os": "ubuntu", "base_release": "24.04", "kernel_release": "fixture"})
+        self.assertEqual(request["preconditions"],
+                         {"base_os": "ubuntu", "base_release": "24.04",
+                          "kernel_release": "fixture"})
         self.assertEqual(request["operations"][0]["type"], "v4l.module.load.v1")
         self.assertIn("device_number", request["operations"][0]); self.assertNotIn("arguments", request["operations"][0])
 
