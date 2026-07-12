@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QList>
 #include <QProcess>
 #include <QStringList>
 #include <QWizard>
@@ -15,6 +16,7 @@ class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
 class QRadioButton;
+class QSpinBox;
 
 namespace studiocast::installer {
 
@@ -50,11 +52,18 @@ public:
   bool persistLoopback() const;
   bool installService() const;
   bool openBackendsSetup() const;
+  bool openCuda() const;
+  bool openAudio() const;
   bool openVulkan() const;
   bool installVulkanRuntime() const;
   bool installMesaVulkan() const;
   bool installShaderTools() const;
   bool installModels() const;
+  QStringList modelPackIds() const;
+  QString modelDestination() const;
+  int v4lDeviceNumber() const;
+  QString v4lLabel() const;
+  bool v4lExclusiveCaps() const;
   bool freshBuild() const;
   bool allowUnsupported() const;
   bool removeUserData() const;
@@ -99,11 +108,18 @@ public:
   void setPersistLoopback(bool enabled);
   void setInstallService(bool enabled);
   void setOpenBackendsSetup(bool enabled);
+  void setOpenCuda(bool enabled);
+  void setOpenAudio(bool enabled);
   void setOpenVulkan(bool enabled);
   void setInstallVulkanRuntime(bool enabled);
   void setInstallMesaVulkan(bool enabled);
   void setInstallShaderTools(bool enabled);
   void setInstallModels(bool enabled);
+  void setModelPackIds(const QStringList &ids);
+  void setModelDestination(const QString &path);
+  void setV4lDeviceNumber(int number);
+  void setV4lLabel(const QString &label);
+  void setV4lExclusiveCaps(bool enabled);
   void setFreshBuild(bool enabled);
   void setAllowUnsupported(bool enabled);
   void setRemoveUserData(bool enabled);
@@ -131,12 +147,18 @@ private:
   bool loadLoopback_ = true;
   bool persistLoopback_ = true;
   bool installService_ = true;
-  bool openBackendsSetup_ = true;
+  bool openCuda_ = true;
+  bool openAudio_ = true;
   bool openVulkan_ = false;
   bool installVulkanRuntime_ = false;
   bool installMesaVulkan_ = false;
   bool installShaderTools_ = false;
   bool installModels_ = false;
+  QStringList modelPackIds_;
+  QString modelDestination_;
+  int v4lDeviceNumber_ = 10;
+  QString v4lLabel_ = QStringLiteral("StudioCast Camera");
+  bool v4lExclusiveCaps_ = true;
   bool freshBuild_ = false;
   bool allowUnsupported_ = false;
   bool removeUserData_ = false;
@@ -256,12 +278,19 @@ private:
   QCheckBox *configureV4l2_ = nullptr;
   QCheckBox *loadLoopback_ = nullptr;
   QCheckBox *persistLoopback_ = nullptr;
-  QCheckBox *openBackendsSetup_ = nullptr;
+  QSpinBox *v4lDeviceNumber_ = nullptr;
+  QLineEdit *v4lLabel_ = nullptr;
+  QCheckBox *v4lExclusiveCaps_ = nullptr;
+  QCheckBox *cameraLimitationAck_ = nullptr;
+  QCheckBox *openCuda_ = nullptr;
+  QCheckBox *openAudio_ = nullptr;
   QCheckBox *openVulkan_ = nullptr;
   QCheckBox *installVulkanRuntime_ = nullptr;
   QCheckBox *installMesaVulkan_ = nullptr;
   QCheckBox *installShaderTools_ = nullptr;
   QCheckBox *installModels_ = nullptr;
+  QList<QCheckBox *> modelPackChecks_;
+  QLineEdit *modelDestination_ = nullptr;
   QCheckBox *removeUserData_ = nullptr;
   QLabel *optionalComponentsNotice_ = nullptr;
 };
