@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 import uuid
 import zipfile
 from pathlib import Path
@@ -37,6 +38,7 @@ FACTS_VERSION = "installer-facts/v1"
 RECOMMENDATION_VERSION = "installer-recommendation/v1"
 PLAN_VERSION = "installer-plan/v1"
 RESULT_VERSION = "installer-result/v1"
+PROGRESS_VERSION = "installer-progress/v1"
 HELPER_PATH = Path("/usr/libexec/studiocast/studiocast-system-helper")
 SERVICE_NAME = "studiocastd.service"
 BINARIES = (
@@ -49,44 +51,11 @@ DEFAULT_MODEL_PACKS = (
     "dlib_68_ibug_300w", "gaze_correction_cam_flx_v0_1_1",
     "fastdvdnet_sigma15",
 )
-MODEL_ARTIFACTS = {
-    "fastenhancer_s_vd_v1": ("model.onnx",),
-    "fastenhancer_m_vd_v1": ("model.onnx",),
-    "modnet-webnn-256-fp32": ("model.onnx",),
-    "yunet_opencv_zoo_2023mar_fp32": ("model.onnx",),
-    "dlib_68_ibug_300w": ("shape_predictor_68_face_landmarks.dat",),
-    "gaze_correction_cam_flx_v0_1_1": ("gaze_flx_left.onnx", "gaze_flx_right.onnx"),
-    "fastdvdnet_sigma15": ("model.onnx",),
-}
-_MODEL_HASHES = {
-    "fastenhancer_s_vd_v1": ("e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8",),
-    "fastenhancer_m_vd_v1": ("367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa",),
-    "modnet-webnn-256-fp32": ("07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",),
-    "yunet_opencv_zoo_2023mar_fp32": ("8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",),
-    "dlib_68_ibug_300w": ("fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f",),
-    "gaze_correction_cam_flx_v0_1_1": ("1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00", "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"),
-    "fastdvdnet_sigma15": ("500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc",),
-}
-_MODEL_LICENSES = {
-    "fastenhancer_s_vd_v1": ("MIT", "FastEnhancer release"),
-    "fastenhancer_m_vd_v1": ("MIT", "FastEnhancer release"),
-    "modnet-webnn-256-fp32": ("Apache-2.0", "onnx-community/modnet-webnn"),
-    "yunet_opencv_zoo_2023mar_fp32": ("MIT", "OpenCV Zoo YuNet 2023mar"),
-    "dlib_68_ibug_300w": ("LicenseRef-iBUG-300W-non-commercial", "dlib iBUG 300-W predictor"),
-    "gaze_correction_cam_flx_v0_1_1": ("BSD-3-Clause", "gaze-correction-cam v0.1.1 StudioCast ONNX export"),
-    "fastdvdnet_sigma15": ("MIT", "FastDVDnet StudioCast ONNX export"),
-}
-MODEL_METADATA = {pack: {
-    "license": {"identifier": _MODEL_LICENSES[pack][0], "name": _MODEL_LICENSES[pack][0], "url": None},
-    "provenance": _MODEL_LICENSES[pack][1],
-    "artifacts": [{"path": name, "size": None, "sha256": "sha256:" + checksum}
-                  for name, checksum in zip(files, _MODEL_HASHES[pack])],
-} for pack, files in MODEL_ARTIFACTS.items()}
 ALLOWED_OPERATION_KINDS = {
-    "preflight", "settings_snapshot", "source_extract", "build_cache_prepare",
+    "preflight", "settings_snapshot", "release_acquire", "source_extract", "build_cache_prepare",
     "build_configure", "build_compile", "payload_stage", "payload_validate",
     "trusted_helper", "payload_activate", "links_reconcile", "service_unit_reconcile",
-    "service_state_reconcile", "model_obtain", "model_verify", "model_activate",
+    "service_state_reconcile", "model_transaction",
     "settings_restore", "cleanup", "manifest_commit", "uninstall_tombstone",
 }
 PRIVILEGED_TYPES = {
@@ -155,24 +124,67 @@ def release_cache_dir(args: argparse.Namespace) -> Path:
     return Path(value).absolute() if value else roots()["cache"] / "release"
 
 
+def model_module() -> Any:
+    candidates = [
+        Path(__file__).resolve().parent / "models/model_transactions.py",
+        Path(__file__).resolve().parent.parent / "models/model_transactions.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise BackendError("model.transaction_unavailable", "Packaged model transaction module is unavailable")
+    spec = importlib.util.spec_from_file_location("studiocast_packaged_model_transactions", path)
+    if spec is None or spec.loader is None:
+        raise BackendError("model.transaction_unavailable", "Could not load packaged model transaction module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def model_component_root() -> Path:
+    candidates = [Path(__file__).resolve().parent.parent, Path(__file__).resolve().parents[2]]
+    return next((candidate for candidate in candidates
+                 if (candidate / "packaging/models/curated-model-catalog-v1.json").is_file()), candidates[-1])
+
+
+def load_model_catalog() -> tuple[Any, dict[str, Any], Path, str]:
+    module = model_module()
+    root = model_component_root()
+    path = root / "packaging/models/curated-model-catalog-v1.json"
+    try:
+        catalog = module.load_catalog(path)
+    except (OSError, module.CatalogError) as exc:
+        code = getattr(exc, "reason_code", "model.catalog_unavailable")
+        raise BackendError(code, str(exc)) from exc
+    return module, catalog, root, file_sha256(path)
+
+
 def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
     receipt_path = getattr(args, "release_receipt", None)
     manifest_path = getattr(args, "release_manifest", None)
     signature_path = getattr(args, "release_signature", None)
     stable_url = getattr(args, "stable_url", None)
     offline = bool(getattr(args, "offline", False))
+    if (offline and (getattr(args, "source_dir", None) or
+                     (getattr(args, "release_archive", None) and not
+                      any((receipt_path, manifest_path, stable_url))))):
+        return None
     if not any((receipt_path, manifest_path, stable_url, offline)):
         return None
     rc = release_module()
     keys = release_keys(args, rc)
     allow_file = os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1"
+    receipt_input: dict[str, Any] | None = None
     if receipt_path:
-        receipt = load_json(Path(receipt_path))
-        if receipt.get("schema_version") != 1 or receipt.get("receipt_version") != "studiocast-verified-release/v1":
+        receipt_input = load_json(Path(receipt_path))
+        if (receipt_input.get("schema_version") != 1 or
+                receipt_input.get("receipt_version") != "studiocast-verified-release/v1"):
             raise BackendError("release.receipt.schema", "Unsupported verified-release receipt")
-        manifest_path = receipt.get("manifest_path")
-        signature_path = receipt.get("signature_path")
-        args.release_archive = receipt.get("archive_path")
+        manifest_path = receipt_input.get("manifest_path")
+        signature_path = receipt_input.get("signature_path")
+        if not getattr(args, "release_archive", None):
+            args.release_archive = (receipt_input.get("archive_candidate_path")
+                if "archive_candidate_path" in receipt_input else receipt_input.get("archive_path"))
     if manifest_path or signature_path:
         if not manifest_path or not signature_path:
             raise BackendError("release.manifest.arguments", "Manifest and signature paths must be supplied together")
@@ -198,23 +210,27 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
         signature_file = cache / generation / "manifest.json.sig"
     source = manifest["artifacts"]["source_archive"]
     archive_arg = getattr(args, "release_archive", None)
-    try:
-        if archive_arg:
-            archive = Path(archive_arg).absolute()
+    archive: Path | None = None
+    if archive_arg:
+        archive = Path(archive_arg).absolute()
+        try:
             rc.verify_artifact(archive, source, keys)
-        else:
-            archive = rc.acquire_artifact(source, release_cache_dir(args) / "artifacts", keys, offline=offline)
-    except rc.ReleaseChannelError as exc:
-        raise BackendError(exc.code, str(exc)) from exc
+        except rc.ReleaseChannelError as exc:
+            raise BackendError(exc.code, str(exc)) from exc
     signature_envelope = rc.strict_json_loads(signature_file.read_bytes())
+    cache_path = release_cache_dir(args) / "artifacts" / source["filename"]
     receipt = {
         "schema_version": 1, "receipt_version": "studiocast-verified-release/v1",
         "channel": manifest["channel"], "version": manifest["release"]["version"],
         "minimum_installer_version": manifest["minimum_installer_version"],
         "manifest_path": str(manifest_file), "signature_path": str(signature_file),
         "manifest_sha256": hashlib.sha256(manifest_file.read_bytes()).hexdigest(),
-        "manifest_key_id": signature_envelope["key_id"], "archive_path": str(archive),
+        "manifest_key_id": signature_envelope["key_id"],
+        "archive_path": str(cache_path),
+        "archive_candidate_path": str(archive) if archive is not None else None,
+        "archive_state": "candidate_verified" if archive is not None else "acquisition_pending",
         "archive_sha256": source["sha256"], "archive_size": source["size_bytes"],
+        "archive_filename": source["filename"],
         "archive_signature": copy.deepcopy(source["signature"]),
         "archive_url": source["url"], "provenance": copy.deepcopy(source["provenance"]),
         "license": copy.deepcopy(source["license"]),
@@ -227,7 +243,7 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
     out = getattr(args, "release_receipt_out", None)
     if out:
         atomic_write(Path(out).absolute(), receipt)
-    args.release_archive = str(archive)
+    args.release_archive = str(archive) if archive is not None else None
     args.target_version = receipt["version"]
     args.verified_release = receipt
     return receipt
@@ -776,15 +792,19 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
     effects = effect_capabilities(diagnostics, maxine)
     owned_v4l = validated_v4l_ownership(manifest)
     model_packs: dict[str, Any] = {}
-    for pack, artifacts in MODEL_ARTIFACTS.items():
-        matches = list((r["data"] / "models").rglob(pack)) if (r["data"] / "models").is_dir() else []
-        present = any(all((root / artifact).is_file() for artifact in artifacts) for root in matches)
-        verified = any(all((root / artifact).is_file() and not (root / artifact).is_symlink() and
-                               file_sha256(root / artifact) == "sha256:" + _MODEL_HASHES[pack][index]
-                               for index, artifact in enumerate(artifacts)) for root in matches)
+    _, catalog, _, _ = load_model_catalog()
+    for pack in catalog["packs"]:
+        pack_id = pack["id"]
+        root = r["data"] / "models" / pack["family"] / pack["pack_path"]
+        artifacts = pack["artifacts"]
+        present = all((root / artifact["name"]).is_file() for artifact in artifacts)
+        verified = all((root / artifact["name"]).is_file() and
+                       not (root / artifact["name"]).is_symlink() and
+                       file_sha256(root / artifact["name"]) == "sha256:" + artifact["sha256"]
+                       for artifact in artifacts)
         integrity = "verified" if verified else "corrupt" if present else "absent"
-        model_packs[pack] = {"integrity": integrity,
-                             "reason_codes": [f"model.{pack}.{integrity}"]}
+        model_packs[pack_id] = {"integrity": integrity,
+                                "reason_codes": [f"model.{pack_id}.{integrity}"]}
     result = {
         "schema_version": 1, "facts_version": FACTS_VERSION, "captured_at": utc_now(),
         "os": os_facts(),
@@ -822,11 +842,12 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         "effects": {"capabilities": effects},
         "models": {"packs": model_packs, "default_pack_ids": list(DEFAULT_MODEL_PACKS)},
         "cache": {"release_artifacts": {}, "model_artifacts": {
-            pack: {"verified": all((r["cache"] / "models" / pack / artifact).is_file() and
-                                   not (r["cache"] / "models" / pack / artifact).is_symlink() and
-                                   file_sha256(r["cache"] / "models" / pack / artifact) == "sha256:" + _MODEL_HASHES[pack][index]
-                                   for index, artifact in enumerate(artifacts))}
-            for pack, artifacts in MODEL_ARTIFACTS.items()}},
+            pack["id"]: {"verified": all(
+                (r["cache"] / "models/sha256" / artifact["sha256"]).is_file() and
+                not (r["cache"] / "models/sha256" / artifact["sha256"]).is_symlink() and
+                file_sha256(r["cache"] / "models/sha256" / artifact["sha256"]) ==
+                "sha256:" + artifact["sha256"] for artifact in pack["artifacts"])}
+            for pack in catalog["packs"]}},
         "connectivity": {"release_source": {"state": "offline" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "unknown",
                 "reason_codes": ["network.release.offline_requested" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "network.release.not_probed"]},
             "model_source": {"state": "offline" if os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" else "unknown",
@@ -895,6 +916,9 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         "virtual_camera": copy.deepcopy(prior.get("v4l", {"desired": True, "required_for_success": route == "recommended", "device_number": 10,
             "label": "StudioCast Camera", "exclusive_caps": True, "persist": True})),
         "model_pack_ids": list(prior.get("model_pack_ids", DEFAULT_MODEL_PACKS)),
+        "model_destination": prior.get("model_destination"),
+        "model_source": prior.get("model_source"),
+        "model_offline": bool(prior.get("model_offline", False)),
         "effects": {}, "features": copy.deepcopy(prior.get("features", {})),
         "shader_tools": False, "mesa_packages": False, "preserve_settings": prior.get("preserve_settings", True),
     }
@@ -966,8 +990,17 @@ def desired_from_args(args: argparse.Namespace, recommendation: dict[str, Any]) 
     if getattr(args, "open_backends", None) is not None:
         desired.setdefault("features", {})["open_cuda"] = args.open_backends
         desired["features"]["open_audio"] = args.open_backends
+    if getattr(args, "open_cuda", None) is not None:
+        desired.setdefault("features", {})["open_cuda"] = args.open_cuda
+    if getattr(args, "open_audio", None) is not None:
+        desired.setdefault("features", {})["open_audio"] = args.open_audio
     if getattr(args, "open_vulkan", None) is not None: desired.setdefault("features", {})["open_vulkan"] = args.open_vulkan
     if getattr(args, "models", None) is not None: desired["model_pack_ids"] = list(DEFAULT_MODEL_PACKS) if args.models else []
+    if getattr(args, "model_ids", None): desired["model_pack_ids"] = list(dict.fromkeys(args.model_ids))
+    if getattr(args, "model_destination", None): desired["model_destination"] = str(Path(args.model_destination).absolute())
+    if getattr(args, "v4l_device_number", None) is not None: desired["virtual_camera"]["device_number"] = args.v4l_device_number
+    if getattr(args, "v4l_label", None) is not None: desired["virtual_camera"]["label"] = args.v4l_label
+    if getattr(args, "v4l_exclusive_caps", None) is not None: desired["virtual_camera"]["exclusive_caps"] = args.v4l_exclusive_caps
     if getattr(args, "vulkan_runtime", False): desired["vulkan_runtime"] = True
     if getattr(args, "mesa_vulkan", False): desired["mesa_packages"] = True
     if getattr(args, "shader_tools", False): desired["shader_tools"] = True
@@ -1008,11 +1041,45 @@ def source_for_plan(args: argparse.Namespace, target: str) -> tuple[str, str]:
 def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, Any]) -> dict[str, Any]:
     r = roots()
     desired = desired_from_args(args, rec)
+    camera_contract = desired.get("virtual_camera", {})
+    if (type(camera_contract.get("device_number", 10)) is not int or
+            not 0 <= camera_contract.get("device_number", 10) <= 63 or
+            type(camera_contract.get("exclusive_caps", True)) is not bool or
+            re.fullmatch(r"[ A-Za-z0-9_.()+-]{1,64}",
+                         str(camera_contract.get("label", "StudioCast Camera"))) is None):
+        raise BackendError("v4l.invalid_configuration", "Advanced virtual-camera arguments are invalid")
     intent = args.workflow
+    if intent in {"clean-install", "reinstall"}:
+        desired["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
     target = getattr(args, "target_version", None) or facts.get("installation", {}).get("target_version") or read_version(Path(getattr(args, "source_dir", None) or ""))
     if target == "unknown": target = facts.get("installation", {}).get("active_version") or "unknown"
     source_kind, source_path = source_for_plan(args, target)
     verified_release = copy.deepcopy(getattr(args, "verified_release", None))
+    if verified_release:
+        source_kind, source_path = "archive", verified_release["archive_path"]
+    model_packs: dict[str, dict[str, Any]] = {}
+    model_catalog: dict[str, Any] | None = None
+    model_catalog_sha256: str | None = None
+    model_source: str | None = None
+    model_destination = Path(desired.get("model_destination") or r["data"] / "models").absolute()
+    validate_mutation_path(model_destination, [r["data"] / "models"], allow_root=True)
+    desired["model_destination"] = str(model_destination)
+    if desired.get("model_pack_ids"):
+        _, model_catalog, _, model_catalog_sha256 = load_model_catalog()
+        model_packs = {pack["id"]: pack for pack in model_catalog["packs"]}
+        if any(pack not in model_packs for pack in desired["model_pack_ids"]):
+            raise BackendError("model.catalog_missing_default", "The packaged catalog omits a selected model pack")
+        requested_source = getattr(args, "model_source", None)
+        if requested_source and rec["route"] != "advanced" and os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") != "1":
+            raise BackendError("model.source.advanced_only", "Custom model sources are available only in Advanced mode")
+        model_source = requested_source or desired.get("model_source") or model_catalog["default_source"]
+    model_offline = bool(getattr(args, "offline", False) or
+                         os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1" or
+                         desired.get("model_offline", False))
+    release_offline = bool(getattr(args, "offline", False) or
+                           os.environ.get("STUDIOCAST_INSTALLER_OFFLINE") == "1")
+    desired["model_source"] = model_source
+    desired["model_offline"] = model_offline
     build_cache = Path(getattr(args, "build_dir", "") or r["cache"] / "builds" / target).absolute()
     payload_root = r["data"] / "payloads"
     plan_id = str(uuid.uuid4())
@@ -1023,6 +1090,20 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     last = "preflight.validate"
     plan_specific_warnings: list[dict[str, Any]] = []
     preservation = {"preserve_settings": bool(desired.get("preserve_settings", True)), "snapshot_path": None}
+
+    def append_model_transaction(pack_id: str) -> None:
+        nonlocal last
+        pack = model_packs[pack_id]
+        op_id = f"model.pack.{pack_id}.transaction"
+        inputs = {"pack_id": pack_id, "family": pack["family"],
+                  "catalog_version": model_catalog["catalog_version"],
+                  "catalog_sha256": model_catalog_sha256,
+                  "source": model_source, "offline": model_offline, "retries": 2,
+                  "destination_root": str(model_destination),
+                  "pack": copy.deepcopy(pack)}
+        ops.append(operation(op_id, "model_transaction", [last], inputs,
+                             "downloads", failure="degrade"))
+        last = op_id
     if intent in {"clean-install", "reinstall"}:
         if preservation["preserve_settings"]:
             # The clean-install state wipe must not erase its own backup.  Keep
@@ -1089,11 +1170,33 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         for pack in desired["model_pack_ids"]:
             if pack_facts.get(pack, {}).get("integrity") == "verified":
                 continue
-            ops.append(operation(f"model.pack.{pack}.obtain", "model_obtain", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.obtain"
-            ops.append(operation(f"model.pack.{pack}.verify", "model_verify", [last], {"pack_id": pack, "artifacts": MODEL_METADATA.get(pack, {}).get("artifacts", [])}, "downloads", "none", "degrade")); last = f"model.pack.{pack}.verify"
-            ops.append(operation(f"model.pack.{pack}.activate", "model_activate", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.activate"
+            append_model_transaction(pack)
         ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
     else:
+        if verified_release:
+            source_metadata = {"artifact_id": "studiocast-source",
+                "filename": verified_release["archive_filename"],
+                "url": verified_release["archive_url"],
+                "size_bytes": verified_release["archive_size"],
+                "sha256": verified_release["archive_sha256"],
+                "signature": copy.deepcopy(verified_release["archive_signature"]),
+                "provenance": copy.deepcopy(verified_release["provenance"]),
+                "license": copy.deepcopy(verified_release["license"])}
+            ops.append(operation("source.release.acquire", "release_acquire", [last], {
+                "manifest_path": verified_release["manifest_path"],
+                "signature_path": verified_release["signature_path"],
+                "manifest_sha256": verified_release["manifest_sha256"],
+                "manifest_key_id": verified_release["manifest_key_id"],
+                "version": verified_release["version"],
+                "artifact": source_metadata,
+                "candidate_path": verified_release.get("archive_candidate_path"),
+                "cache_dir": str(release_cache_dir(args) / "artifacts"),
+                "offline": release_offline,
+            }, "downloads", source_paths=[verified_release["manifest_path"],
+                verified_release["signature_path"]] + ([verified_release["archive_candidate_path"]]
+                if verified_release.get("archive_candidate_path") else []),
+                target_paths=[source_path]))
+            last = "source.release.acquire"
         if source_kind == "archive":
             extract_to = r["cache"] / "sources" / plan_id
             ops.append(operation("source.archive.extract", "source_extract", [last], {"archive": source_path, "destination": str(extract_to)}, "downloads", source_paths=[source_path], target_paths=[str(extract_to)]))
@@ -1134,9 +1237,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes")); last = "service.unit.reconcile"
         ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes", failure="degrade")); last = "service.state.reconcile"
         for pack in desired["model_pack_ids"]:
-            ops.append(operation(f"model.pack.{pack}.obtain", "model_obtain", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.obtain"
-            ops.append(operation(f"model.pack.{pack}.verify", "model_verify", [last], {"pack_id": pack, "artifacts": MODEL_METADATA.get(pack, {}).get("artifacts", [])}, "downloads", "none", "degrade")); last = f"model.pack.{pack}.verify"
-            ops.append(operation(f"model.pack.{pack}.activate", "model_activate", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.activate"
+            append_model_transaction(pack)
         if intent in {"clean-install", "reinstall"} and preservation["preserve_settings"]:
             ops.append(operation("settings.restore", "settings_restore", [last], {"snapshot_path": preservation["snapshot_path"]}, "preserved_items")); last = "settings.restore"
         ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
@@ -1200,8 +1301,21 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                 previous = op["id"]
             blockers = [b for b in blockers if b.get("code") != "privileged_helper_missing"]
             warnings.append({"code": "os.unsupported.developer_override_unprivileged_only", "applies_to": "installation"})
+    if (desired.get("service", {}).get("desired") == "enabled_started" and
+            not facts.get("systemd_user", {}).get("manager_usable", False)):
+        warnings.append({"code": "service.user_manager.unavailable_degraded",
+                         "applies_to": "service_changes"})
     created = utc_now()
     expires = (parse_time(created) + dt.timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    def reviewed_model_url(base: str | None, relative: str) -> str | None:
+        if not base:
+            return None
+        parsed = urllib.parse.urlparse(base)
+        if parsed.scheme not in {"https", "http", "file"}:
+            return None
+        encoded = "/".join(urllib.parse.quote(part, safe="") for part in relative.split("/"))
+        return base.rstrip("/") + "/" + encoded
+
     plan = {"schema_version": 1, "plan_version": PLAN_VERSION, "policy_version": POLICY_VERSION,
         "plan_id": plan_id, "created_at": created, "expires_at": expires, "intent": intent,
         "route": rec["route"], "facts_fingerprint": facts["host_fingerprint"],
@@ -1210,6 +1324,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             "base_release": facts.get("os", {}).get("base_version_id"),
             "kernel_release": facts.get("os", {}).get("kernel_release")},
         "observed_state": {"service": copy.deepcopy(facts.get("service", {})),
+                           "systemd_user": copy.deepcopy(facts.get("systemd_user", {})),
                            "v4l2": copy.deepcopy(facts.get("v4l2", {}))},
         "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
         "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
@@ -1234,10 +1349,21 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             "signature": verified_release["archive_signature"], "provenance": verified_release["provenance"],
             "license": verified_release["license"], "cache_path": verified_release["archive_path"],
             "destination": str(build_cache), "required_for_core": True}] if verified_release else []) +
-            [{"artifact_id": pack, "url": None, "size": sum(a["size"] or 0 for a in MODEL_METADATA.get(pack, {}).get("artifacts", [])),
-            "sha256": None, "signature": None, "provenance": MODEL_METADATA.get(pack, {}).get("provenance"),
-            "license": MODEL_METADATA.get(pack, {}).get("license"), "cache_path": str(r["cache"] / "models" / pack),
-            "destination": str(r["data"] / "models"), "required_for_core": False} for pack in desired.get("model_pack_ids", [])],
+            [{"artifact_id": f"{pack_id}:{artifact['name']}", "pack_id": pack_id,
+              "filename": artifact["name"],
+              "url": reviewed_model_url(model_source, artifact["source_paths"][0]),
+              "source_base": model_source,
+              "source_paths": copy.deepcopy(artifact["source_paths"]),
+              "size": artifact["size_bytes"], "size_status": artifact["size_status"],
+              "sha256": "sha256:" + artifact["sha256"], "signature": None,
+              "provenance": copy.deepcopy(model_packs[pack_id]["provenance"]),
+              "license": copy.deepcopy(model_packs[pack_id]["license"]),
+              "cache_path": str(r["cache"] / "models/sha256" / artifact["sha256"]),
+              "destination": str(model_destination / model_packs[pack_id]["family"] /
+                                 model_packs[pack_id]["pack_path"]),
+              "required_for_core": False}
+             for pack_id in desired.get("model_pack_ids", [])
+             for artifact in model_packs[pack_id]["artifacts"]],
         "operations": ops, "preservation": preservation, "blockers": blockers, "warnings": warnings,
         "expected_validation": [{"code": "payload.binaries.executable"}, {"code": "manifest.atomic"}],
         "approval_token": uuid.uuid4().hex + uuid.uuid4().hex}
@@ -1280,6 +1406,8 @@ class Executor:
         self.core_committed = self.reused_core
         self.failed_operation: str | None = None
         self.retryable: list[str] = []
+        self.model_results: dict[str, dict[str, Any]] = {}
+        self.progress_sequence = 0
         self.cancelled = False
         self.child: subprocess.Popen[bytes] | None = None
         self.settings_snapshot: Path | None = None
@@ -1305,7 +1433,7 @@ class Executor:
 
     def run_process(self, argv: list[str]) -> None:
         if self.dry_run:
-            print("+ " + " ".join(argv))
+            print("+ " + " ".join(argv), file=sys.stderr)
             return
         self.child = subprocess.Popen(argv, start_new_session=True)
         previous_handlers: dict[int, Any] = {}
@@ -1343,6 +1471,19 @@ class Executor:
             checkpoint = "cancelled" if self.cancelled else "core_committed" if self.core_committed else "executing"
             self.write_manifest(checkpoint, error)
 
+    def progress(self, op: dict[str, Any], boundary: str, state: str,
+                 error: BackendError | None = None) -> None:
+        self.progress_sequence += 1
+        event = {"schema_version": 1, "event_version": PROGRESS_VERSION,
+            "progress_version": PROGRESS_VERSION,
+            "plan_id": self.plan["plan_id"], "plan_digest": self.plan["plan_digest"],
+            "transaction_id": self.transaction_id, "sequence": self.progress_sequence,
+            "operation_id": op["id"], "phase": op.get("review", {}).get("category", "operation"),
+            "boundary": boundary, "state": state, "timestamp": utc_now(),
+            "error": None if error is None else {"code": error.code, "message": error.message,
+                                                   "details": error.details}}
+        print(json.dumps(event, sort_keys=True, ensure_ascii=False), flush=True)
+
     def execute(self) -> tuple[dict[str, Any], int]:
         completed: set[str] = set()
         failure: BackendError | None = None
@@ -1351,12 +1492,19 @@ class Executor:
                 failure = BackendError("plan.dependency_order", f"Dependencies not completed for {op['id']}")
                 self.failed_operation = op["id"]; break
             self.executed.append(op["id"])
+            self.progress(op, "before", "started")
             try:
                 self.execute_one(op)
                 completed.add(op["id"])
                 self.append(op["id"], "completed")
-            except BackendError as exc:
+                self.progress(op, "after", "completed")
+            except Exception as unexpected:
+                exc = (unexpected if isinstance(unexpected, BackendError) else
+                       BackendError("operation.unexpected_failure",
+                                    f"Unexpected failure while executing {op['id']}",
+                                    {"exception_type": type(unexpected).__name__}))
                 self.append(op["id"], "cancelled" if self.cancelled else "failed", exc)
+                self.progress(op, "after", "cancelled" if self.cancelled else "failed", exc)
                 self.failed_operation = op["id"]
                 if op["failure_policy"] == "degrade" and (self.core_committed or self.plan["intent"] == "uninstall"):
                     self.retryable.append(op["id"])
@@ -1394,7 +1542,8 @@ class Executor:
                     link = self.r["bin"] / name
                     if link.exists() and not link.is_symlink():
                         raise BackendError("ownership.mismatch", f"Refusing to replace non-link: {link}")
-                    if link.is_symlink() and not str(link.readlink()).startswith(str(self.r["data"] / "current")):
+                    expected = self.r["data"] / "current/bin" / name
+                    if link.is_symlink() and link.readlink() != expected:
                         raise BackendError("ownership.mismatch", f"Refusing to replace unowned link: {link}")
             return
         if kind == "settings_snapshot":
@@ -1404,6 +1553,7 @@ class Executor:
             if not self.dry_run and src.exists():
                 if dst.exists(): safe_remove(dst, [self.r["config"].parent])
                 shutil.copytree(src, dst, symlinks=True)
+        elif kind == "release_acquire": self.acquire_release(inputs)
         elif kind == "source_extract": self.extract_source(Path(inputs["archive"]), Path(inputs["destination"]))
         elif kind == "build_cache_prepare":
             path = Path(self.plan["paths"]["build_cache"]); validate_mutation_path(path, [self.r["cache"]])
@@ -1424,12 +1574,70 @@ class Executor:
         elif kind == "links_reconcile": self.reconcile_links(inputs.get("desired", "present"), inputs.get("binaries", BINARIES))
         elif kind == "service_unit_reconcile": self.reconcile_service_unit(inputs.get("desired", "disabled"))
         elif kind == "service_state_reconcile": self.reconcile_service_state(inputs.get("desired", "disabled"))
-        elif kind == "model_obtain": self.obtain_model(inputs["pack_id"])
-        elif kind == "model_verify": self.verify_model(inputs["pack_id"])
-        elif kind == "model_activate": self.activate_model(inputs["pack_id"])
+        elif kind == "model_transaction": self.install_model_pack(inputs)
         elif kind == "settings_restore": self.restore_settings(Path(inputs["snapshot_path"]))
         elif kind == "cleanup": self.cleanup(inputs["target"])
         elif kind in {"manifest_commit", "uninstall_tombstone"}: return
+
+    def acquire_release(self, inputs: dict[str, Any]) -> None:
+        rc = release_module()
+        keys = release_keys(argparse.Namespace(trusted_key=[]), rc)
+        manifest_path = Path(inputs["manifest_path"])
+        signature_path = Path(inputs["signature_path"])
+        try:
+            raw_manifest = manifest_path.read_bytes()
+            raw_signature = signature_path.read_bytes()
+            if hashlib.sha256(raw_manifest).hexdigest() != inputs["manifest_sha256"]:
+                raise BackendError("release.manifest.changed", "Signed release manifest changed after review")
+            manifest = rc.verify_manifest(raw_manifest, raw_signature, keys,
+                allow_file_urls=os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1")
+            envelope = rc.strict_json_loads(raw_signature)
+        except BackendError:
+            raise
+        except (OSError, rc.ReleaseChannelError) as exc:
+            raise BackendError(getattr(exc, "code", "release.manifest.unavailable"), str(exc)) from exc
+        if (manifest["release"]["version"] != inputs["version"] or
+                envelope.get("key_id") != inputs["manifest_key_id"] or
+                canonical_bytes(manifest["artifacts"]["source_archive"]) !=
+                canonical_bytes(inputs["artifact"])):
+            raise BackendError("release.evidence_changed", "Release evidence differs from the reviewed plan")
+        metadata = inputs["artifact"]
+        cache_dir = Path(inputs["cache_dir"])
+        target = cache_dir / metadata["filename"]
+        if self.dry_run:
+            self.source_root = target
+            return
+        candidate_value = inputs.get("candidate_path")
+        try:
+            target_good = False
+            if target.exists() and not target.is_symlink():
+                try:
+                    rc.verify_artifact(target, metadata, keys)
+                    target_good = True
+                except rc.ReleaseChannelError:
+                    target_good = False
+            if not target_good and candidate_value:
+                candidate = Path(candidate_value)
+                rc.verify_artifact(candidate, metadata, keys)
+                cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if cache_dir.is_symlink():
+                    raise BackendError("release.cache.unsafe_path", "Release cache may not be a symlink")
+                temporary = cache_dir / f".{metadata['filename']}.{uuid.uuid4().hex}.tmp"
+                try:
+                    shutil.copy2(candidate, temporary, follow_symlinks=False)
+                    rc.verify_artifact(temporary, metadata, keys)
+                    os.replace(temporary, target)
+                finally:
+                    if temporary.exists(): temporary.unlink()
+            elif not target_good:
+                target = rc.acquire_artifact(metadata, cache_dir, keys,
+                    offline=bool(inputs["offline"]))
+            rc.verify_artifact(target, metadata, keys)
+        except BackendError:
+            raise
+        except (OSError, rc.ReleaseChannelError) as exc:
+            raise BackendError(getattr(exc, "code", "release.artifact.acquire_failed"), str(exc)) from exc
+        self.source_root = target
 
     def extract_source(self, archive: Path, destination: Path) -> None:
         validate_mutation_path(destination, [self.r["cache"]])
@@ -1578,8 +1786,9 @@ class Executor:
         self.r["bin"].mkdir(parents=True, exist_ok=True)
         for name in names:
             link = self.r["bin"] / name; validate_mutation_path(link, [self.r["bin"]])
+            expected = self.r["data"] / "current/bin" / name
             if desired == "absent":
-                if link.is_symlink() and str(link.readlink()).startswith(str(self.r["data"] / "current")): link.unlink()
+                if link.is_symlink() and link.readlink() == expected: link.unlink()
                 continue
             if self.dry_run: continue
             target = self.r["data"] / "current/bin" / name
@@ -1596,39 +1805,62 @@ class Executor:
         unit.write_text("[Unit]\nDescription=StudioCast daemon\n[Service]\nExecStart=%h/.local/share/studiocast/current/bin/studiocastd\nRestart=on-failure\n[Install]\nWantedBy=default.target\n", encoding="utf-8")
 
     def reconcile_service_state(self, desired: str) -> None:
-        if self.dry_run or not shutil.which("systemctl"): return
+        manager = self.plan.get("observed_state", {}).get("systemd_user", {})
+        if desired == "enabled_started" and not manager.get("manager_usable", False):
+            raise BackendError("service.user_manager.unavailable",
+                               "The reviewed host has no usable user systemd manager")
+        if self.dry_run: return
+        if os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1":
+            adapter = os.environ.get("STUDIOCAST_INSTALLER_TEST_SYSTEMCTL")
+            if not adapter:
+                if desired == "enabled_started":
+                    raise BackendError("service.test_adapter_missing",
+                                       "Hermetic service adapter is unavailable")
+                self.service_actual = "inactive"
+                return
+        systemctl = (os.environ.get("STUDIOCAST_INSTALLER_TEST_SYSTEMCTL")
+                     if os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1" else
+                     shutil.which("systemctl"))
+        if not systemctl:
+            if desired == "enabled_started":
+                raise BackendError("service.systemctl.unavailable", "systemctl is unavailable")
+            self.service_actual = "inactive"
+            return
         if desired == "enabled_started":
-            self.run_process(["systemctl", "--user", "daemon-reload"]); self.run_process(["systemctl", "--user", "enable", "--now", SERVICE_NAME])
+            self.run_process([systemctl, "--user", "daemon-reload"])
+            self.run_process([systemctl, "--user", "enable", "--now", SERVICE_NAME])
             self.service_actual = "active"
         else:
-            completed = subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            completed = subprocess.run([systemctl, "--user", "disable", "--now", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if completed.returncode not in {0, 1, 5}: raise BackendError("service.state_failed", "Could not disable StudioCast service")
             self.service_actual = "inactive"
 
-    def obtain_model(self, pack: str) -> None:
-        cache = self.r["cache"] / "models" / pack
-        if not cache.is_dir(): raise BackendError("network.models.offline", f"Verified cache unavailable for model pack {pack}")
-
-    def verify_model(self, pack: str) -> None:
-        cache = self.r["cache"] / "models" / pack
-        for index, name in enumerate(MODEL_ARTIFACTS.get(pack, ())):
-            path = cache / name
-            if not path.is_file() or path.is_symlink(): raise BackendError("model.artifact.missing", f"Model artifact missing: {name}")
-            expected = _MODEL_HASHES.get(pack, ())[index]
-            if file_sha256(path) != "sha256:" + expected:
-                raise BackendError("model.download.checksum_mismatch", f"Model artifact checksum mismatch: {name}")
-
-    def activate_model(self, pack: str) -> None:
-        source, dest = self.r["cache"] / "models" / pack, self.r["data"] / "models/curated" / pack
-        validate_mutation_path(dest, [self.r["data"]])
-        if not source.is_dir():
-            raise BackendError("model.cache.missing", f"Verified cache unavailable for model pack {pack}")
-        if not self.dry_run:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            temp = dest.with_name(f".{pack}.{uuid.uuid4().hex}.tmp")
-            shutil.copytree(source, temp, symlinks=False)
-            if dest.exists(): safe_remove(dest, [self.r["data"]])
-            os.replace(temp, dest)
+    def install_model_pack(self, inputs: dict[str, Any]) -> None:
+        module, catalog, component_root, catalog_hash = load_model_catalog()
+        current = next((pack for pack in catalog["packs"] if pack["id"] == inputs["pack_id"]), None)
+        if (catalog_hash != inputs["catalog_sha256"] or
+                catalog["catalog_version"] != inputs["catalog_version"] or
+                current is None or canonical_bytes(current) != canonical_bytes(inputs["pack"]) or
+                current["family"] != inputs["family"]):
+            raise BackendError("model.catalog.changed", "Packaged model catalog differs from the reviewed plan")
+        if self.dry_run:
+            return
+        try:
+            transport = None if inputs["offline"] else module.transport_for(inputs["source"])
+            installer = module.ModelTransactionInstaller(catalog, component_root,
+                Path(inputs["destination_root"]) / inputs["family"], self.r["cache"] / "models",
+                transport, offline=bool(inputs["offline"]), retries=int(inputs["retries"]))
+            result = installer.install(inputs["family"], [inputs["pack_id"]], force=False,
+                                       recommended=False)
+        except (OSError, module.CatalogError, module.TransactionError) as exc:
+            raise BackendError(getattr(exc, "reason_code", "model.transaction_failed"), str(exc)) from exc
+        self.model_results[inputs["pack_id"]] = copy.deepcopy(result)
+        if result.get("state") != "succeeded":
+            pack_result = (result.get("packs") or [{}])[0]
+            raise BackendError(str(pack_result.get("reason_code") or result.get("reason_code") or
+                                   "model.transaction_failed"),
+                               str(pack_result.get("message") or "Curated model transaction failed"),
+                               {"pack_id": inputs["pack_id"]})
 
     def restore_settings(self, snapshot: Path) -> None:
         if self.dry_run or not snapshot.exists(): return
@@ -1688,6 +1920,28 @@ class Executor:
         if self.plan["intent"] == "uninstall": active = None
         unit_path = self.r["systemd"] / SERVICE_NAME
         unit_hash = file_sha256(unit_path) if unit_path.is_file() and not unit_path.is_symlink() else None
+        reviewed_model_ops = [op for op in self.plan["operations"] if op["kind"] == "model_transaction"]
+        previous_models = (self.manifest_before or {}).get("models", {}).get("packs", {})
+        desired_model_ids = set(self.plan["desired_state"].get("model_pack_ids", []))
+        model_manifest: dict[str, Any] = {
+            pack_id: copy.deepcopy(value) for pack_id, value in previous_models.items()
+            if pack_id in desired_model_ids and isinstance(value, dict)
+        }
+        for op in reviewed_model_ops:
+            inputs = op["inputs"]
+            pack = inputs["pack"]
+            destination = Path(inputs["destination_root"]) / pack["family"] / pack["pack_path"]
+            result = self.model_results.get(inputs["pack_id"])
+            model_manifest[inputs["pack_id"]] = {
+                "family": pack["family"], "task": pack["task"],
+                "destination": str(destination),
+                "catalog_version": inputs["catalog_version"],
+                "catalog_sha256": inputs["catalog_sha256"],
+                "license": copy.deepcopy(pack["license"]),
+                "provenance": copy.deepcopy(pack["provenance"]),
+                "artifacts": copy.deepcopy(pack["artifacts"]),
+                "state": "installed" if destination.is_dir() and not destination.is_symlink() else "missing",
+                "transaction_result": copy.deepcopy(result)}
         manifest = {"schema_version": 2, "policy_version": POLICY_VERSION,
             "transaction": {"id": self.transaction_id, "state": "uninstalled" if self.plan["intent"] == "uninstall" and state == "committed" else state,
                 "intent": self.plan["intent"], "started_at": self.plan["created_at"], "updated_at": utc_now(), "completed_at": utc_now(),
@@ -1700,13 +1954,17 @@ class Executor:
                 "archive_sha256": file_sha256(Path(self.plan["source"]["path"])) if self.plan["source"]["kind"] in {"archive", "official_release"} and Path(self.plan["source"]["path"]).is_file() else None},
             "desired_configuration": {"build_type": self.plan["desired_state"]["build_type"], "features": self.plan["desired_state"]["features"],
                 "service": self.plan["desired_state"]["service"], "v4l": self.plan["desired_state"]["virtual_camera"],
-                "model_pack_ids": self.plan["desired_state"].get("model_pack_ids", []), "preserve_settings": self.plan["preservation"]["preserve_settings"]},
+                "model_pack_ids": self.plan["desired_state"].get("model_pack_ids", []),
+                "model_destination": self.plan["desired_state"].get("model_destination"),
+                "model_source": self.plan["desired_state"].get("model_source"),
+                "model_offline": self.plan["desired_state"].get("model_offline", False),
+                "preserve_settings": self.plan["preservation"]["preserve_settings"]},
             "effective_build_configuration": {"cmake": next((op["inputs"]["cmake"] for op in self.plan["operations"] if op["id"] == "build.configure"), {})},
             "service": {"desired": self.plan["desired_state"]["service"]["desired"],
                 "actual": self.service_actual, "unit_path": str(unit_path), "unit_sha256": unit_hash},
             "v4l": {"desired": self.plan["desired_state"]["virtual_camera"].get("desired"),
                 "actual": self.v4l_actual, "owned_configuration": self.v4l_owned_configuration},
-            "models": {"packs": {pack: {**MODEL_METADATA.get(pack, {}), "state": "installed" if (self.r["data"] / "models/curated" / pack).is_dir() else "missing"} for pack in self.plan["desired_state"].get("model_pack_ids", [])}},
+            "models": {"packs": model_manifest},
             "ownership": {"application_files": [{"path": str(target / "bin" / name), "type": "file", "creating_operation": "payload.stage", "namespace": "studiocast"} for name in BINARIES] if active else [],
                 "links": [{"path": str(self.r["bin"] / name), "type": "symlink", "target": str(self.r["data"] / "current/bin" / name), "creating_operation": "links.reconcile", "namespace": "studiocast"} for name in BINARIES] if active else [],
                 "system_configuration": [{**item, "type": "file", "namespace": "studiocast",
@@ -1748,8 +2006,36 @@ def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> Non
     elif kind == "cleanup" and inputs.get("target") not in {
             "payloads", "build_cache", "runtime_state", "models", "settings", "data", "service"}:
         raise BackendError("plan.operation_schema", f"Unknown cleanup target: {inputs.get('target')}")
-    elif kind in {"model_obtain", "model_verify", "model_activate"} and inputs.get("pack_id") not in MODEL_ARTIFACTS:
-        raise BackendError("plan.operation_schema", f"Unknown curated model pack: {inputs.get('pack_id')}")
+    elif kind == "release_acquire":
+        expected_fields = {"manifest_path", "signature_path", "manifest_sha256", "manifest_key_id",
+                           "version", "artifact", "candidate_path", "cache_dir", "offline"}
+        artifact = inputs.get("artifact")
+        if set(inputs) != expected_fields or not isinstance(artifact, dict):
+            raise BackendError("plan.operation_schema", "Release acquisition contract is incomplete")
+        if (re.fullmatch(r"[0-9a-f]{64}", str(inputs.get("manifest_sha256", ""))) is None or
+                type(inputs.get("offline")) is not bool or
+                re.fullmatch(r"[A-Za-z0-9._-]{1,128}", str(artifact.get("filename", ""))) is None or
+                re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", ""))) is None or
+                type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] < 0):
+            raise BackendError("plan.operation_schema", "Release acquisition metadata is invalid")
+        validate_mutation_path(Path(inputs["cache_dir"]), [roots()["cache"]])
+        expected_source = Path(inputs["cache_dir"]) / artifact["filename"]
+        if expected_source != Path(plan.get("source", {}).get("path", "")):
+            raise BackendError("plan.path_binding", "Release cache target differs from the reviewed source")
+    elif kind == "model_transaction":
+        expected_fields = {"pack_id", "family", "catalog_version", "catalog_sha256",
+                           "source", "offline", "retries", "destination_root", "pack"}
+        if (set(inputs) != expected_fields or inputs.get("pack_id") not in DEFAULT_MODEL_PACKS or
+                inputs.get("family") not in {"open_audio", "open_video"} or
+                re.fullmatch(r"sha256:[0-9a-f]{64}", str(inputs.get("catalog_sha256", ""))) is None or
+                not isinstance(inputs.get("source"), str) or not inputs["source"] or
+                type(inputs.get("offline")) is not bool or type(inputs.get("retries")) is not int or
+                not 0 <= inputs["retries"] <= 10 or not isinstance(inputs.get("pack"), dict) or
+                inputs["pack"].get("id") != inputs["pack_id"] or
+                inputs["pack"].get("family") != inputs["family"]):
+            raise BackendError("plan.operation_schema", "Curated model transaction contract is invalid")
+        validate_mutation_path(Path(inputs["destination_root"]),
+                               [roots()["data"] / "models"], allow_root=True)
     elif kind == "build_configure":
         expected_cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA", "STUDIOCAST_ENABLE_OPEN_AUDIO",
                           "STUDIOCAST_ENABLE_OPEN_VULKAN"}
@@ -1907,6 +2193,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-deps", dest="deps", action="store_false")
     parser.add_argument("--v4l2loopback", dest="v4l2", action="store_true")
     parser.add_argument("--no-v4l2loopback", dest="v4l2", action="store_false")
+    parser.add_argument("--v4l-device-number", type=int)
+    parser.add_argument("--v4l-label")
+    parser.add_argument("--v4l-exclusive-caps", dest="v4l_exclusive_caps", action="store_true")
+    parser.add_argument("--no-v4l-exclusive-caps", dest="v4l_exclusive_caps", action="store_false")
     parser.add_argument("--load-loopback", action="store_true")
     parser.add_argument("--no-load-loopback", action="store_true")
     parser.add_argument("--persist-loopback", action="store_true")
@@ -1915,8 +2205,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-service", dest="service", action="store_false")
     parser.add_argument("--models", dest="models", action="store_true")
     parser.add_argument("--no-models", dest="models", action="store_false")
+    parser.add_argument("--model-id", dest="model_ids", action="append", default=[])
+    parser.add_argument("--model-destination")
+    parser.add_argument("--model-source")
     parser.add_argument("--open-backends", dest="open_backends", action="store_true")
     parser.add_argument("--no-open-backends", dest="open_backends", action="store_false")
+    parser.add_argument("--open-cuda", dest="open_cuda", action="store_true")
+    parser.add_argument("--no-open-cuda", dest="open_cuda", action="store_false")
+    parser.add_argument("--open-audio", dest="open_audio", action="store_true")
+    parser.add_argument("--no-open-audio", dest="open_audio", action="store_false")
     parser.add_argument("--open-vulkan", dest="open_vulkan", action="store_true")
     parser.add_argument("--no-open-vulkan", dest="open_vulkan", action="store_false")
     parser.add_argument("--vulkan-runtime", dest="vulkan_runtime", action="store_true")
@@ -1927,7 +2224,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-fresh-build", dest="fresh_build", action="store_false")
     parser.add_argument("--preserve-user-data", dest="preserve_settings", action="store_true")
     parser.add_argument("--remove-user-data", dest="preserve_settings", action="store_false")
-    parser.set_defaults(v4l2=None, service=None, models=None, open_backends=None, open_vulkan=None,
+    parser.set_defaults(v4l2=None, service=None, models=None, open_backends=None, open_cuda=None,
+                        open_audio=None, open_vulkan=None, v4l_exclusive_caps=None,
                         preserve_settings=None, fresh_build=False, deps=None)
 
 
@@ -1995,6 +2293,8 @@ def main(argv: list[str]) -> int:
             "reason_code": decision.reason_code, "minimum_installer_version": evidence["minimum_installer_version"],
             "installer_meets_minimum": rc.installer_meets_minimum(installer_version(), evidence["minimum_installer_version"]),
             "offline": bool(args.offline), "verified_source_archive": evidence["archive_path"],
+            "source_archive_state": evidence["archive_state"],
+            "source_acquisition_required": evidence["archive_state"] == "acquisition_pending",
             "rollback": rc.rollback_metadata(evidence["version"], installed, roots()["data"] / "payloads")}
         if args.prepare_self_update:
             manifest_view = {"release": {"version": evidence["version"]},
@@ -2032,7 +2332,13 @@ def main(argv: list[str]) -> int:
     if args.command in {"plan", "run", "install", "update", "repair", "reinstall", "clean-install", "uninstall"}:
         verify_release_evidence(args)
         facts = load_facts(args); prior = facts.get("installation", {}).get("desired_configuration") if args.workflow in {"update", "repair", "reinstall", "clean-install", "modify"} else None
-        route = "advanced" if args.workflow == "advanced" or args.source_dir else "recommended"
+        advanced_requested = bool(args.workflow == "advanced" or args.source_dir or
+            (args.release_archive and not getattr(args, "verified_release", None)) or
+            args.model_ids or args.model_destination or args.model_source or args.build_dir or
+            args.build_type or args.open_cuda is not None or args.open_audio is not None or
+            args.v4l_device_number is not None or args.v4l_label is not None or
+            args.v4l_exclusive_caps is not None)
+        route = "advanced" if advanced_requested else "recommended"
         rec = recommend(facts, args.workflow, prior, route=route)
         plan = create_plan(args, facts, rec)
         if args.command == "plan": output(legacy_plan_text(plan)); return 0
@@ -2043,7 +2349,14 @@ def main(argv: list[str]) -> int:
         except BackendError as exc:
             print(f"{exc.code}: {exc.message}", file=sys.stderr)
             output(failed_result(exc, plan)); return 2
-        result, code = Executor(plan).execute(); output(result); return code
+        try:
+            result, code = Executor(plan).execute()
+        except Exception as unexpected:
+            error = (unexpected if isinstance(unexpected, BackendError) else
+                     BackendError("operation.unexpected_failure", "Installer transaction could not start",
+                                  {"exception_type": type(unexpected).__name__}))
+            output(failed_result(error, plan)); return 2
+        output(result); return code
     if args.command in {"apply-plan", "execute-plan"}:
         plan = load_json(Path(args.plan)); facts = normalize_fixture(load_json(Path(args.facts))) if args.facts else None
         try:
@@ -2051,7 +2364,14 @@ def main(argv: list[str]) -> int:
         except BackendError as exc:
             print(f"{exc.code}: {exc.message}", file=sys.stderr)
             output(failed_result(exc, plan)); return 2
-        result, code = Executor(plan, args.dry_run).execute(); output(result); return code
+        try:
+            result, code = Executor(plan, args.dry_run).execute()
+        except Exception as unexpected:
+            error = (unexpected if isinstance(unexpected, BackendError) else
+                     BackendError("operation.unexpected_failure", "Installer transaction could not start",
+                                  {"exception_type": type(unexpected).__name__}))
+            output(failed_result(error, plan)); return 2
+        output(result); return code
     if args.command == "manifest":
         path = roots()["data"] / "install-manifest.json"; value = load_json(path)
         if args.migrate_v1 and value.get("schema_version") == 1:

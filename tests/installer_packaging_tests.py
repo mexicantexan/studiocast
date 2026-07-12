@@ -68,7 +68,9 @@ class PackagingIntegrationTests(unittest.TestCase):
         trust = installer / "trust/keys"
         trust.mkdir(parents=True)
         shutil.copy2(self.fixture / "fixture-ed25519-public.pem", trust / f"{KEY_ID}.pem")
-        shutil.copy2(ROOT / "VERSION", self.root / "AppDir/usr/share/VERSION")
+        # Exercise a fixture installer that meets the signed manifest's stated
+        # minimum so source acquisition can proceed after Apply.
+        (self.root / "AppDir/usr/share/VERSION").write_text("0.2.9\n")
         self.facts_path = self.root / "facts.json"
         self.facts_path.write_text(json.dumps(facts()), encoding="utf-8")
 
@@ -90,8 +92,13 @@ class PackagingIntegrationTests(unittest.TestCase):
             "--release-signature", str(self.fixture / "manifest.json.sig"),
             "--release-archive", str(self.fixture / "source.tar.gz"),
             "--release-receipt-out", str(receipt),
-            "--release-cache-dir", str(self.root / "release-cache")).stdout)
+            "--release-cache-dir", str(self.root / "cache/studiocast/release")).stdout)
         return value, receipt
+
+    @staticmethod
+    def terminal_result(text: str) -> dict:
+        marker = text.rfind("\n{")
+        return json.loads(text[marker + 1 if marker >= 0 else 0:])
 
     def test_installer_component_stages_release_primitives_and_production_trust_contract(self) -> None:
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -158,18 +165,19 @@ class PackagingIntegrationTests(unittest.TestCase):
             "--no-v4l2loopback", "--no-service", "--no-models").stdout)
         codes = {item["code"] for item in plan["blockers"]}
         self.assertNotIn("source.signed_verification_receipt_required", codes)
-        self.assertIn("release.installer_update_required", codes)
+        self.assertNotIn("release.installer_update_required", codes)
         self.assertTrue(plan["source"]["official"])
         self.assertEqual(receipt["archive_sha256"], plan["source"]["archive_sha256"])
         self.assertEqual("studiocast-source", plan["downloads"][0]["artifact_id"])
         self.assertTrue(plan["downloads"][0]["required_for_core"])
 
-    def test_boolean_never_blesses_archive_and_production_missing_key_fails_closed(self) -> None:
+    def test_arbitrary_archive_routes_advanced_without_becoming_official(self) -> None:
         plan = json.loads(self.backend("plan", "install", "--json", "--facts", str(self.facts_path),
                                    "--release-archive", str(self.fixture / "source.tar.gz"),
                                    "--official-source", "--no-v4l2loopback", "--no-service", "--no-models").stdout)
         self.assertFalse(plan["source"]["official"])
-        self.assertIn("source.signed_verification_receipt_required", {x["code"] for x in plan["blockers"]})
+        self.assertEqual("advanced", plan["route"])
+        self.assertNotIn("source.signed_verification_receipt_required", {x["code"] for x in plan["blockers"]})
         failed = self.backend("verify-release", "--release-manifest", str(self.fixture / "manifest.json"),
                           "--release-signature", str(self.fixture / "manifest.json.sig"),
                           "--release-archive", str(self.fixture / "source.tar.gz"), check=False, production=True)
@@ -225,6 +233,86 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertFalse(offline["self_update"]["running_artifact_replaced"])
         self.assertEqual(before, running.read_bytes())
         self.assertNotEqual(str(running), offline["self_update"]["verified_appimage"])
+
+    def test_release_metadata_is_read_only_and_source_acquisition_is_reviewed_apply_work(self) -> None:
+        metadata_cache = self.root / "metadata-only-cache"
+        status = json.loads(self.backend(
+            "release-status", "--stable-url", (self.fixture / "manifest.json").resolve().as_uri(),
+            "--stable-signature-url", (self.fixture / "manifest.json.sig").resolve().as_uri(),
+            "--release-cache-dir", str(metadata_cache), "--installed-version", "0.2.9").stdout)
+        self.assertEqual(status["source_archive_state"], "acquisition_pending")
+        self.assertTrue(status["source_acquisition_required"])
+        self.assertFalse((metadata_cache / "artifacts/source.tar.gz").exists())
+
+        receipt, receipt_path = self.verified_receipt()
+        cache_path = Path(receipt["archive_path"])
+        self.assertFalse(cache_path.exists())
+        plan = json.loads(self.backend("plan", "install", "--facts", str(self.facts_path),
+            "--release-receipt", str(receipt_path), "--no-v4l2loopback", "--no-service",
+            "--no-models", "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        acquire = next(op for op in plan["operations"] if op["kind"] == "release_acquire")
+        self.assertEqual(acquire["id"], "source.release.acquire")
+        self.assertEqual(acquire["inputs"]["artifact"]["sha256"], receipt["archive_sha256"])
+        plan_path = self.root / "release-plan.json"; plan_path.write_text(json.dumps(plan))
+        applied = self.backend("apply-plan", "--plan", str(plan_path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.facts_path), check=False)
+        terminal = self.terminal_result(applied.stdout)
+        self.assertEqual(terminal["error"]["code"], "archive.unsupported")
+        self.assertEqual(cache_path.read_bytes(), (self.fixture / "source.tar.gz").read_bytes())
+        journal = json.loads((self.root / "data/studiocast/install-manifest.json").read_text())["journal"]
+        self.assertEqual([(item["operation_id"], item["state"]) for item in journal[:3]],
+                         [("preflight.validate", "completed"),
+                          ("source.release.acquire", "completed"),
+                          ("source.archive.extract", "failed")])
+
+    def test_release_acquire_offline_hit_miss_and_bad_candidate_preserve_good_cache(self) -> None:
+        receipt, receipt_path = self.verified_receipt()
+        cache_path = Path(receipt["archive_path"])
+        cache_path.parent.mkdir(parents=True)
+        shutil.copy2(self.fixture / "source.tar.gz", cache_path)
+        good = cache_path.read_bytes()
+
+        def reset_install_state() -> None:
+            data = self.root / "data/studiocast"
+            if data.exists(): shutil.rmtree(data)
+
+        # The candidate may change after review; an already verified cache is
+        # retained and used without replacing it from the bad candidate.
+        plan = json.loads(self.backend("plan", "install", "--facts", str(self.facts_path),
+            "--release-receipt", str(receipt_path), "--no-v4l2loopback", "--no-service",
+            "--no-models", "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        (self.fixture / "source.tar.gz").write_bytes(b"changed after review")
+        path = self.root / "bad-candidate-plan.json"; path.write_text(json.dumps(plan))
+        result = self.backend("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.facts_path), check=False)
+        self.assertEqual(self.terminal_result(result.stdout)["error"]["code"], "archive.unsupported")
+        self.assertEqual(cache_path.read_bytes(), good)
+
+        # A metadata-only receipt can use the verified content-addressed cache offline.
+        reset_install_state()
+        pending = self.root / "pending-receipt.json"
+        metadata = json.loads(self.backend("verify-release", "--release-manifest", str(self.fixture / "manifest.json"),
+            "--release-signature", str(self.fixture / "manifest.json.sig"),
+            "--release-receipt-out", str(pending), "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        self.assertEqual(metadata["archive_state"], "acquisition_pending")
+        plan = json.loads(self.backend("plan", "install", "--facts", str(self.facts_path),
+            "--release-receipt", str(pending), "--offline", "--no-v4l2loopback", "--no-service",
+            "--no-models", "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        path.write_text(json.dumps(plan))
+        hit = self.backend("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.facts_path), check=False)
+        self.assertEqual(self.terminal_result(hit.stdout)["error"]["code"], "archive.unsupported")
+
+        reset_install_state()
+        cache_path.unlink()
+        plan = json.loads(self.backend("plan", "install", "--facts", str(self.facts_path),
+            "--release-receipt", str(pending), "--offline", "--no-v4l2loopback", "--no-service",
+            "--no-models", "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        path.write_text(json.dumps(plan))
+        miss = self.backend("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.facts_path), check=False)
+        self.assertEqual(self.terminal_result(miss.stdout)["error"]["code"], "release.cache.miss")
+        self.assertFalse(cache_path.exists())
 
     def test_terminal_result_is_bound_to_reviewed_plan(self) -> None:
         plan = json.loads(self.backend("plan", "install", "--json", "--facts", str(self.facts_path),

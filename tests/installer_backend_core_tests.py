@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,6 +23,26 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
+
+
+def terminal_result(text: str) -> dict:
+    marker = text.rfind("\n{")
+    value = json.loads(text[marker + 1 if marker >= 0 else 0:])
+    if value.get("result_version") != "installer-result/v1":
+        raise AssertionError("terminal installer result is missing")
+    return value
+
+
+def progress_events(text: str) -> list[dict]:
+    events = []
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("event_version") == "installer-progress/v1":
+            events.append(value)
+    return events
 
 
 def base_facts(**installation):
@@ -73,7 +94,8 @@ class Sandbox:
         self.env.update({"HOME": str(self.root / "home"), "XDG_DATA_HOME": str(self.root / "data"),
                          "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
                          "XDG_CACHE_HOME": str(self.root / "cache"),
-                         "STUDIOCAST_INSTALLER_OFFLINE": "1"})
+                         "STUDIOCAST_INSTALLER_OFFLINE": "1",
+                         "STUDIOCAST_INSTALLER_TEST_MODE": "1"})
         self.facts = self.root / "facts.json"
         self.write_facts(base_facts())
 
@@ -170,8 +192,17 @@ class InstallerBackendCoreTests(unittest.TestCase):
         path = self.s.root / "plan.json"; path.write_text(json.dumps(plan), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], "--facts", str(self.s.facts), "--dry-run")
-        value = json.loads(result.stdout[result.stdout.find("{"):])
+        value = terminal_result(result.stdout)
         self.assertEqual(value["reviewed_operation_ids"], value["executed_operation_ids"])
+        events = progress_events(result.stdout)
+        self.assertEqual(len(events), len(plan["operations"]) * 2)
+        self.assertEqual([event["sequence"] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual([(event["operation_id"], event["boundary"]) for event in events],
+                         [(op["id"], boundary) for op in plan["operations"]
+                          for boundary in ("before", "after")])
+        self.assertTrue(all(event["plan_id"] == plan["plan_id"] and
+                            event["plan_digest"] == plan["plan_digest"] and
+                            event["transaction_id"] == value["transaction_id"] for event in events))
         plan = self.plan(); plan["operations"][1]["id"] = "tampered"
         path.write_text(json.dumps(plan), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
@@ -196,13 +227,94 @@ class InstallerBackendCoreTests(unittest.TestCase):
     def test_pack_catalog_is_exact_seven_ids_eight_hashed_artifacts(self):
         plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                            "--no-v4l2loopback", "--no-service", "--models", "--allow-unsupported")
-        self.assertEqual([x["artifact_id"] for x in plan["downloads"]], DEFAULT_PACKS)
-        verify = [x for x in plan["operations"] if x["kind"] == "model_verify"]
-        artifacts = [a for op in verify for a in op["inputs"]["artifacts"]]
-        self.assertEqual(len(artifacts), 8)
-        self.assertTrue(all(a["sha256"].startswith("sha256:") for a in artifacts))
-        self.assertEqual([a["path"] for a in next(x for x in verify if x["inputs"]["pack_id"] == "gaze_correction_cam_flx_v0_1_1")["inputs"]["artifacts"]],
+        downloads = plan["downloads"]
+        self.assertEqual(len(downloads), 8)
+        self.assertEqual({x["pack_id"] for x in downloads}, set(DEFAULT_PACKS))
+        self.assertTrue(all(x["sha256"].startswith("sha256:") for x in downloads))
+        transactions = [x for x in plan["operations"] if x["kind"] == "model_transaction"]
+        self.assertEqual(len(transactions), 7)
+        gaze = next(x for x in transactions if x["inputs"]["pack_id"] == "gaze_correction_cam_flx_v0_1_1")
+        self.assertEqual([a["name"] for a in gaze["inputs"]["pack"]["artifacts"]],
                          ["gaze_flx_left.onnx", "gaze_flx_right.onnx"])
+
+    def test_backend_executes_packaged_atomic_model_transaction_and_degrades_on_missing_source(self):
+        component = self.s.root / "component"
+        installer_root = component / "installer"
+        staged_backend = installer_root / "studiocast-installer-backend"
+        installer_root.mkdir(parents=True)
+        shutil.copy2(BACKEND, staged_backend); staged_backend.chmod(0o755)
+        model_dir = installer_root / "models"; model_dir.mkdir()
+        for name in ("__init__.py", "model_transactions.py"):
+            shutil.copy2(SOURCE / "installer/models" / name, model_dir / name)
+        metadata_root = component / "resources/model_packs/fixture"
+        metadata_root.mkdir(parents=True)
+        model_json = b'{"id":"fastenhancer_s_vd_v1"}\n'
+        license_text = b"fixture license\n"
+        (metadata_root / "model.json").write_bytes(model_json)
+        (metadata_root / "LICENSE.txt").write_bytes(license_text)
+        transport_root = self.s.root / "model-source"
+        artifact_path = transport_root / "objects/model.onnx"
+        artifact_path.parent.mkdir(parents=True)
+        artifact = b"backend model transaction fixture\n"
+        artifact_path.write_bytes(artifact)
+        sha = lambda value: hashlib.sha256(value).hexdigest()
+        catalog = {"schema_version": 1, "catalog_version": "fixture-v1", "policy_version": 1,
+            "default_source": str(transport_root),
+            "size_metadata": {"trusted": True, "reason_code": "fixture_sizes"},
+            "packs": [{"id": "fastenhancer_s_vd_v1", "family": "open_audio",
+                "task": "audio_enhancement", "default": True, "pack_path": "Fixture Pack",
+                "metadata": [
+                    {"source": "resources/model_packs/fixture/model.json", "destination": "model.json", "sha256": sha(model_json)},
+                    {"source": "resources/model_packs/fixture/LICENSE.txt", "destination": "LICENSE.txt", "sha256": sha(license_text)}],
+                "license": {"spdx": "MIT"}, "provenance": {"project": "fixture"},
+                "artifacts": [{"name": "model.onnx", "sha256": sha(artifact),
+                    "size_bytes": len(artifact), "size_status": "known",
+                    "source_paths": ["objects/model.onnx"]}]}]}
+        catalog_path = component / "packaging/models/curated-model-catalog-v1.json"
+        catalog_path.parent.mkdir(parents=True)
+        catalog_path.write_text(json.dumps(catalog))
+
+        def run_for(root: Path, *, expect_success: bool) -> tuple[subprocess.CompletedProcess[str], dict]:
+            env = self.s.env | {"HOME": str(root / "home"), "XDG_DATA_HOME": str(root / "data"),
+                "XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
+                "XDG_CACHE_HOME": str(root / "cache"), "STUDIOCAST_INSTALLER_TEST_MODE": "1",
+                "STUDIOCAST_INSTALLER_OFFLINE": "0"}
+            facts_path = root / "facts.json"; root.mkdir(parents=True, exist_ok=True)
+            facts_path.write_text(json.dumps(base_facts()))
+            custom = root / "data/studiocast/models/open_audio/custom-pack"
+            custom.mkdir(parents=True); (custom / "keep.txt").write_text("keep")
+            plan_process = subprocess.run([str(staged_backend), "plan", "advanced", "--facts", str(facts_path),
+                "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+                "--model-id", "fastenhancer_s_vd_v1", "--model-source", str(transport_root),
+                "--allow-unsupported"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(plan_process.returncode, 0, plan_process.stderr)
+            plan = json.loads(plan_process.stdout)
+            plan_path = root / "plan.json"; plan_path.write_text(json.dumps(plan))
+            fake_tools = self._fake_cmake()
+            fake_env = env | {"PATH": fake_tools["PATH"]}
+            result = subprocess.run([str(staged_backend), "apply-plan", "--plan", str(plan_path),
+                "--digest", plan["plan_digest"], "--token", plan["approval_token"],
+                "--facts", str(facts_path)], env=fake_env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            value = terminal_result(result.stdout)
+            self.assertTrue((custom / "keep.txt").is_file())
+            if expect_success:
+                self.assertEqual((result.returncode, value["state"]), (0, "committed"),
+                                 (result.stderr, value))
+                pack = root / "data/studiocast/models/open_audio/Fixture Pack"
+                self.assertEqual((pack / "model.onnx").read_bytes(), artifact)
+                self.assertTrue((pack / "model.json").is_file() and (pack / "LICENSE.txt").is_file())
+                self.assertTrue((pack / ".studiocast-curated-pack.json").is_file())
+            return result, value
+
+        installed, value = run_for(self.s.root / "model-success", expect_success=True)
+        self.assertEqual((installed.returncode, value["state"]), (0, "committed"))
+        artifact_path.unlink()
+        degraded, value = run_for(self.s.root / "model-missing", expect_success=False)
+        self.assertEqual((degraded.returncode, value["state"], value["core_committed"]),
+                         (3, "degraded", True))
+        self.assertEqual(value["retryable_operation_ids"],
+                         ["model.pack.fastenhancer_s_vd_v1.transaction"])
 
     def test_packaged_style_uninstall_is_self_contained_and_preserves_data(self):
         data = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast"
@@ -213,7 +325,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
         plan = self.s.json("plan", "uninstall", "--facts", str(self.s.facts), "--preserve-user-data")
         path = self.s.root / "uninstall.json"; path.write_text(json.dumps(plan), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"], "--token", plan["approval_token"])
-        self.assertEqual(json.loads(result.stdout)["state"], "committed")
+        self.assertEqual(terminal_result(result.stdout)["state"], "committed")
         self.assertFalse((data / "payloads").exists()); self.assertTrue((models / "mine").exists()); self.assertTrue((config / "daemon.conf").exists())
         self.assertEqual(json.loads((data / "install-manifest.json").read_text())["transaction"]["state"], "uninstalled")
 
@@ -242,7 +354,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
                             "STUDIOCAST_INSTALLER_TEST_PKEXEC": str(pkexec)}
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], "--facts", str(self.s.facts), "--dry-run", env=env)
-        value = json.loads(result.stdout[result.stdout.find("{"):])
+        value = terminal_result(result.stdout)
         self.assertEqual(value["reviewed_operation_ids"], value["executed_operation_ids"])
 
     def test_host_analyzer_consumes_runtime_diagnostics_and_real_vulkan_compute_evidence(self):
@@ -309,6 +421,81 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         blocked = self.s.json("plan", "install", "--facts", str(self.s.facts),
                               "--no-v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
         self.assertIn("os.unsupported.override_requires_advanced", [item["code"] for item in blocked["blockers"]])
+
+    def test_advanced_flags_are_digest_bound_and_paths_and_ids_fail_closed(self):
+        model_root = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/models/alternate"
+        plan = self.s.json("plan", "advanced", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+            "--model-id", "fastenhancer_s_vd_v1", "--model-destination", str(model_root),
+            "--no-open-backends", "--open-audio", "--open-cuda",
+            "--v4l-device-number", "22", "--v4l-label", "StudioCast Test Camera",
+            "--no-v4l-exclusive-caps", "--allow-unsupported")
+        self.assertEqual(plan["route"], "advanced")
+        self.assertEqual(plan["desired_state"]["features"]["open_cuda"], True)
+        self.assertEqual(plan["desired_state"]["features"]["open_audio"], True)
+        self.assertEqual(plan["desired_state"]["model_pack_ids"], ["fastenhancer_s_vd_v1"])
+        self.assertEqual(plan["desired_state"]["model_destination"], str(model_root))
+        self.assertEqual(plan["desired_state"]["virtual_camera"]["device_number"], 22)
+        self.assertFalse(plan["desired_state"]["virtual_camera"]["exclusive_caps"])
+        transaction = next(op for op in plan["operations"] if op["kind"] == "model_transaction")
+        self.assertEqual(transaction["inputs"]["destination_root"], str(model_root))
+        outside = self.s.run("plan", "advanced", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+            "--model-id", "fastenhancer_s_vd_v1", "--model-destination", str(self.s.root / "outside"),
+            "--allow-unsupported", check=False)
+        self.assertEqual(outside.returncode, 2)
+        self.assertIn("path.outside_allowed_root", outside.stderr)
+        unknown = self.s.run("plan", "advanced", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+            "--model-id", "not-a-catalog-pack", "--allow-unsupported", check=False)
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("model.catalog_missing_default", unknown.stderr)
+
+    def test_service_unavailable_degrades_after_core_commit(self):
+        facts = base_facts()
+        facts["systemd_user"] = {"systemctl_present": False, "manager_usable": False,
+                                 "reason_codes": ["service.user_manager.unavailable"]}
+        self.s.write_facts(facts)
+        plan = self.s.json("plan", "install", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--service", "--no-models",
+            "--allow-unsupported")
+        self.assertIn("service.user_manager.unavailable_degraded",
+                      [warning["code"] for warning in plan["warnings"]])
+        path = self.s.root / "service-plan.json"; path.write_text(json.dumps(plan))
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.s.facts), check=False,
+            env=self._fake_cmake())
+        value = terminal_result(result.stdout)
+        self.assertEqual((result.returncode, value["state"], value["core_committed"]), (3, "degraded", True))
+        self.assertIn("service.state.reconcile", value["retryable_operation_ids"])
+
+    def test_prefix_spoof_link_is_rejected_and_unexpected_oserror_is_journaled(self):
+        spoof = Path(self.s.env["HOME"]) / ".local/bin/studiocast"
+        spoof.parent.mkdir(parents=True)
+        spoof.symlink_to(Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current-evil/bin/studiocast")
+        plan = self.plan(); path = self.s.root / "spoof.json"; path.write_text(json.dumps(plan))
+        rejected = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.s.facts), "--dry-run", check=False)
+        self.assertEqual(terminal_result(rejected.stdout)["error"]["code"], "ownership.mismatch")
+        spoof.unlink()
+        data_root = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast"
+        if data_root.exists():
+            import shutil
+            shutil.rmtree(data_root)
+
+        plan = self.plan(); path.write_text(json.dumps(plan))
+        only_python = self.s.root / "only-python"; only_python.mkdir()
+        (only_python / "python3").symlink_to(sys.executable)
+        failed = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.s.facts), check=False,
+            env=self.s.env | {"PATH": str(only_python)})
+        value = terminal_result(failed.stdout)
+        self.assertEqual(value["error"]["code"], "operation.unexpected_failure")
+        manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) /
+                               "studiocast/install-manifest.json").read_text())
+        entry = next(item for item in manifest["journal"] if item["operation_id"] == "build.configure")
+        self.assertEqual((entry["state"], entry["error"]["code"]),
+                         ("failed", "operation.unexpected_failure"))
 
     def test_repair_healthy_core_is_minimal_and_reuses_prior_configuration(self):
         facts = base_facts(classification="healthy", active_version="0.2.9", target_version="0.2.9",
@@ -388,7 +575,7 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         path = self.s.root / "install.json"; path.write_text(json.dumps(plan), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], env=self._fake_cmake())
-        self.assertEqual(json.loads(result.stdout)["state"], "committed")
+        self.assertEqual(terminal_result(result.stdout)["state"], "committed")
         current = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current"
         active_before = current.resolve()
         cache = Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast"
@@ -417,7 +604,7 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], check=False, env=env)
         self.assertEqual(result.returncode, 2)
-        value = json.loads(result.stdout)
+        value = terminal_result(result.stdout)
         self.assertEqual(value["error"]["code"], "payload.version_mismatch")
         self.assertFalse((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current").exists())
 
@@ -448,7 +635,7 @@ exit 0
         process.send_signal(signal.SIGINT)
         stdout, stderr = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 130, stderr)
-        self.assertEqual(json.loads(stdout)["state"], "cancelled")
+        self.assertEqual(terminal_result(stdout)["state"], "cancelled")
         for _ in range(100):
             try:
                 os.kill(pid, 0)
@@ -492,7 +679,7 @@ exit 0
             if timeout: env["STUDIOCAST_INSTALLER_TEST_AUTH_TIMEOUT"] = timeout
             result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                                 "--token", plan["approval_token"], check=False, env=env)
-            return result, json.loads(result.stdout) if result.stdout.strip().startswith("{") else None
+            return result, terminal_result(result.stdout) if result.stdout.strip().startswith("{") else None
 
         success_script = f"""cat >'{captured}'
 python3 -c 'import json; p={json.dumps(str(captured))}; r=json.load(open(p)); o=r[\"operations\"][0]; print(json.dumps({{\"schema_version\":1,\"request_id\":r[\"request_id\"],\"transaction_id\":r[\"transaction_id\"],\"plan_digest\":r[\"plan_digest\"],\"state\":\"succeeded\",\"results\":[{{\"id\":o[\"id\"],\"type\":o[\"type\"],\"status\":\"succeeded\",\"files\":[]}}]}}))'
@@ -544,7 +731,7 @@ print(json.dumps({"schema_version":1,"request_id":r["request_id"],"transaction_i
             "STUDIOCAST_INSTALLER_TEST_PKEXEC": str(adapter)}
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], "--facts", str(self.s.facts), env=env)
-        self.assertEqual(json.loads(result.stdout)["state"], "committed")
+        self.assertEqual(terminal_result(result.stdout)["state"], "committed")
         manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
         self.assertEqual(manifest["v4l"]["actual"]["persistence_state"], "configured")
         self.assertEqual(len(manifest["v4l"]["owned_configuration"]), 2)
