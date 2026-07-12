@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -27,8 +28,11 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QRegularExpression>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QStandardPaths>
 #include <QStyle>
 #include <QTemporaryFile>
@@ -63,6 +67,32 @@ QString defaultCacheBuildDir() {
     return QDir(cache).filePath(QStringLiteral("build"));
   }
   return QDir::home().filePath(QStringLiteral(".cache/studiocast/build"));
+}
+
+QStringList defaultModelPackIds() {
+  return {QStringLiteral("fastenhancer_s_vd_v1"),
+          QStringLiteral("fastenhancer_m_vd_v1"),
+          QStringLiteral("modnet-webnn-256-fp32"),
+          QStringLiteral("yunet_opencv_zoo_2023mar_fp32"),
+          QStringLiteral("dlib_68_ibug_300w"),
+          QStringLiteral("gaze_correction_cam_flx_v0_1_1"),
+          QStringLiteral("fastdvdnet_sigma15")};
+}
+
+QString defaultModelDestination() {
+  QString data =
+      QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+  if (data.isEmpty())
+    data = QDir::home().filePath(QStringLiteral(".local/share"));
+  return QDir(data).filePath(QStringLiteral("studiocast/models"));
+}
+
+bool isUserLocalModelDestination(const QString &path) {
+  const QString candidate = QDir::cleanPath(path.trimmed());
+  const QString root = QDir::cleanPath(defaultModelDestination());
+  return QFileInfo(candidate).isAbsolute() &&
+         (candidate == root ||
+          candidate.startsWith(root + QDir::separator()));
 }
 
 QString findBackendPath() {
@@ -441,6 +471,8 @@ InstallerWizard::InstallerWizard(QWidget *parent) : QWizard(parent) {
     useReleaseArchive_ = true;
   }
   buildDir_ = defaultCacheBuildDir();
+  modelPackIds_ = defaultModelPackIds();
+  modelDestination_ = defaultModelDestination();
 
   setWindowTitle(QStringLiteral("StudioCast Installer"));
   setWizardStyle(QWizard::ModernStyle);
@@ -490,7 +522,11 @@ bool InstallerWizard::configureV4l2Loopback() const {
 bool InstallerWizard::loadLoopback() const { return loadLoopback_; }
 bool InstallerWizard::persistLoopback() const { return persistLoopback_; }
 bool InstallerWizard::installService() const { return installService_; }
-bool InstallerWizard::openBackendsSetup() const { return openBackendsSetup_; }
+bool InstallerWizard::openBackendsSetup() const {
+  return openCuda_ || openAudio_;
+}
+bool InstallerWizard::openCuda() const { return openCuda_; }
+bool InstallerWizard::openAudio() const { return openAudio_; }
 bool InstallerWizard::openVulkan() const { return openVulkan_; }
 bool InstallerWizard::installVulkanRuntime() const {
   return installVulkanRuntime_;
@@ -498,6 +534,11 @@ bool InstallerWizard::installVulkanRuntime() const {
 bool InstallerWizard::installMesaVulkan() const { return installMesaVulkan_; }
 bool InstallerWizard::installShaderTools() const { return installShaderTools_; }
 bool InstallerWizard::installModels() const { return installModels_; }
+QStringList InstallerWizard::modelPackIds() const { return modelPackIds_; }
+QString InstallerWizard::modelDestination() const { return modelDestination_; }
+int InstallerWizard::v4lDeviceNumber() const { return v4lDeviceNumber_; }
+QString InstallerWizard::v4lLabel() const { return v4lLabel_; }
+bool InstallerWizard::v4lExclusiveCaps() const { return v4lExclusiveCaps_; }
 bool InstallerWizard::freshBuild() const { return freshBuild_; }
 bool InstallerWizard::allowUnsupported() const { return allowUnsupported_; }
 bool InstallerWizard::removeUserData() const { return removeUserData_; }
@@ -584,9 +625,20 @@ void InstallerWizard::setInstallService(bool enabled) {
   installService_ = enabled;
 }
 void InstallerWizard::setOpenBackendsSetup(bool enabled) {
-  if (openBackendsSetup_ != enabled)
+  if (openCuda_ != enabled || openAudio_ != enabled)
     invalidatePlan();
-  openBackendsSetup_ = enabled;
+  openCuda_ = enabled;
+  openAudio_ = enabled;
+}
+void InstallerWizard::setOpenCuda(bool enabled) {
+  if (openCuda_ != enabled)
+    invalidatePlan();
+  openCuda_ = enabled;
+}
+void InstallerWizard::setOpenAudio(bool enabled) {
+  if (openAudio_ != enabled)
+    invalidatePlan();
+  openAudio_ = enabled;
 }
 void InstallerWizard::setOpenVulkan(bool enabled) {
   if (openVulkan_ != enabled)
@@ -618,6 +670,39 @@ void InstallerWizard::setInstallModels(bool enabled) {
   if (installModels_ != enabled)
     invalidatePlan();
   installModels_ = enabled;
+}
+void InstallerWizard::setModelPackIds(const QStringList &ids) {
+  QStringList normalized;
+  const QStringList defaults = defaultModelPackIds();
+  for (const QString &id : defaults) {
+    if (ids.contains(id))
+      normalized.append(id);
+  }
+  if (modelPackIds_ != normalized)
+    invalidatePlan();
+  modelPackIds_ = normalized;
+}
+void InstallerWizard::setModelDestination(const QString &path) {
+  const QString normalized = QDir::cleanPath(path.trimmed());
+  if (modelDestination_ != normalized)
+    invalidatePlan();
+  modelDestination_ = normalized;
+}
+void InstallerWizard::setV4lDeviceNumber(int number) {
+  if (v4lDeviceNumber_ != number)
+    invalidatePlan();
+  v4lDeviceNumber_ = number;
+}
+void InstallerWizard::setV4lLabel(const QString &label) {
+  const QString normalized = label.trimmed();
+  if (v4lLabel_ != normalized)
+    invalidatePlan();
+  v4lLabel_ = normalized;
+}
+void InstallerWizard::setV4lExclusiveCaps(bool enabled) {
+  if (v4lExclusiveCaps_ != enabled)
+    invalidatePlan();
+  v4lExclusiveCaps_ = enabled;
 }
 void InstallerWizard::setFreshBuild(bool enabled) {
   if (freshBuild_ != enabled)
@@ -944,9 +1029,8 @@ void InstallerWizard::seedFromPriorDesiredConfiguration() {
     buildType_ = jsonString(prior, QStringLiteral("build_type"), buildType_);
     const QJsonObject features =
         prior.value(QStringLiteral("features")).toObject();
-    openBackendsSetup_ =
-        jsonBool(features, QStringLiteral("open_cuda"), openBackendsSetup_) ||
-        jsonBool(features, QStringLiteral("open_audio"), openBackendsSetup_);
+    openCuda_ = jsonBool(features, QStringLiteral("open_cuda"), openCuda_);
+    openAudio_ = jsonBool(features, QStringLiteral("open_audio"), openAudio_);
     openVulkan_ = jsonBool(features, QStringLiteral("open_vulkan"), false);
     const QJsonObject service = prior.value(QStringLiteral("service")).toObject();
     installService_ =
@@ -958,13 +1042,27 @@ void InstallerWizard::seedFromPriorDesiredConfiguration() {
     loadLoopback_ = configureV4l2Loopback_;
     persistLoopback_ = jsonBool(camera, QStringLiteral("persist"),
                                 persistLoopback_);
-    installModels_ = !prior.value(QStringLiteral("model_pack_ids"))
-                          .toArray()
-                          .isEmpty();
+    v4lDeviceNumber_ =
+        camera.value(QStringLiteral("device_number")).toInt(v4lDeviceNumber_);
+    v4lLabel_ = jsonString(camera, QStringLiteral("label"), v4lLabel_);
+    v4lExclusiveCaps_ =
+        jsonBool(camera, QStringLiteral("exclusive_caps"), v4lExclusiveCaps_);
+    const QJsonArray priorModels =
+        prior.value(QStringLiteral("model_pack_ids")).toArray();
+    QStringList selectedModels;
+    for (const QJsonValue &value : priorModels) {
+      if (value.isString())
+        selectedModels.append(value.toString());
+    }
+    setModelPackIds(selectedModels);
+    installModels_ = !modelPackIds_.isEmpty();
+    modelDestination_ = jsonString(prior, QStringLiteral("model_destination"),
+                                   modelDestination_);
     removeUserData_ =
         !jsonBool(prior, QStringLiteral("preserve_settings"), true);
   } else {
     installModels_ = true;
+    modelPackIds_ = defaultModelPackIds();
     openVulkan_ = false;
   }
 }
@@ -1085,6 +1183,10 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
 
   const bool needsSource = workflow_ != QStringLiteral("uninstall") &&
                            workflow_ != QStringLiteral("advanced");
+  const bool recommendedSelection =
+      !customRoute_ && detectedRoute() == QStringLiteral("recommended") &&
+      (workflow_ == QStringLiteral("install") ||
+       workflow_ == QStringLiteral("update"));
   if (needsSource) {
     if (!customRoute_ && !verifiedReleaseReceiptPath_.isEmpty()) {
       args << QStringLiteral("--release-receipt")
@@ -1097,8 +1199,10 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
     if (!buildDir_.isEmpty()) {
       args << QStringLiteral("--build-dir") << buildDir_;
     }
-    if (!buildType_.isEmpty()) {
-      args << QStringLiteral("--build-type") << buildType_;
+    const QString effectiveBuildType =
+        recommendedSelection ? QStringLiteral("Release") : buildType_;
+    if (!effectiveBuildType.isEmpty()) {
+      args << QStringLiteral("--build-type") << effectiveBuildType;
     }
     if (workflow_ == QStringLiteral("repair") ||
         workflow_ == QStringLiteral("reinstall") ||
@@ -1114,31 +1218,56 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
     args << QStringLiteral("--skip-deps");
   }
 
-  if (configureV4l2Loopback_) {
+  const bool effectiveV4l = recommendedSelection || configureV4l2Loopback_;
+  if (effectiveV4l) {
     args << QStringLiteral("--v4l2loopback");
   } else {
     args << QStringLiteral("--no-v4l2loopback");
   }
-  args << (loadLoopback_ ? QStringLiteral("--load-loopback")
-                         : QStringLiteral("--no-load-loopback"));
-  args << (persistLoopback_ ? QStringLiteral("--persist-loopback")
-                            : QStringLiteral("--no-persist-loopback"));
+  args << ((effectiveV4l && (recommendedSelection || loadLoopback_))
+               ? QStringLiteral("--load-loopback")
+               : QStringLiteral("--no-load-loopback"));
+  args << ((effectiveV4l && (recommendedSelection || persistLoopback_))
+               ? QStringLiteral("--persist-loopback")
+               : QStringLiteral("--no-persist-loopback"));
+  args << QStringLiteral("--v4l-device-number")
+       << QString::number(recommendedSelection ? 10 : v4lDeviceNumber_);
+  args << QStringLiteral("--v4l-label")
+       << (recommendedSelection ? QStringLiteral("StudioCast Camera")
+                                : v4lLabel_);
+  args << ((recommendedSelection || v4lExclusiveCaps_)
+               ? QStringLiteral("--v4l-exclusive-caps")
+               : QStringLiteral("--no-v4l-exclusive-caps"));
   args << (installService_ ? QStringLiteral("--service")
                            : QStringLiteral("--no-service"));
-  args << (openBackendsSetup_ ? QStringLiteral("--open-backends")
-                              : QStringLiteral("--no-open-backends"));
+  args << ((recommendedSelection || openCuda_)
+               ? QStringLiteral("--open-cuda")
+               : QStringLiteral("--no-open-cuda"));
+  args << ((recommendedSelection || openAudio_)
+               ? QStringLiteral("--open-audio")
+               : QStringLiteral("--no-open-audio"));
   args << (openVulkan_ ? QStringLiteral("--open-vulkan")
                        : QStringLiteral("--no-open-vulkan"));
   args << (installVulkanRuntime_ ? QStringLiteral("--vulkan-runtime")
                                  : QStringLiteral("--no-vulkan-runtime"));
-  if (installMesaVulkan_) {
+  if (!recommendedSelection && installMesaVulkan_) {
     args << QStringLiteral("--mesa-vulkan");
   }
-  if (installShaderTools_) {
+  if (!recommendedSelection && installShaderTools_) {
     args << QStringLiteral("--shader-tools");
   }
-  args << (installModels_ ? QStringLiteral("--models")
-                          : QStringLiteral("--no-models"));
+  const bool effectiveModels = recommendedSelection || installModels_;
+  args << (effectiveModels ? QStringLiteral("--models")
+                           : QStringLiteral("--no-models"));
+  const QStringList effectiveModelIds =
+      recommendedSelection ? defaultModelPackIds() : modelPackIds_;
+  if (effectiveModels) {
+    for (const QString &id : effectiveModelIds)
+      args << QStringLiteral("--model-id") << id;
+  }
+  args << QStringLiteral("--model-destination")
+       << (recommendedSelection ? defaultModelDestination()
+                                : modelDestination_);
   args << (freshBuild_ ? QStringLiteral("--fresh-build")
                        : QStringLiteral("--no-fresh-build"));
   args << (removeUserData_ ? QStringLiteral("--remove-user-data")
@@ -1890,50 +2019,105 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   setTitle(QStringLiteral("Service and Optional Components"));
   setSubTitle(
       QStringLiteral("Choose runtime integration and optional downloads."));
-  auto *layout = new QVBoxLayout(this);
+  auto *pageLayout = new QVBoxLayout(this);
+  auto *scroll = new QScrollArea(this);
+  scroll->setWidgetResizable(true);
+  auto *content = new QWidget(scroll);
+  auto *layout = new QVBoxLayout(content);
+  scroll->setWidget(content);
+  pageLayout->addWidget(scroll);
 
   installService_ = new QCheckBox(
       QStringLiteral("Install and start the systemd user service"), this);
   configureV4l2_ = new QCheckBox(
       QStringLiteral("Install/configure v4l2loopback virtual camera support"),
       this);
+  configureV4l2_->setObjectName(QStringLiteral("scInstallerConfigureV4l"));
   loadLoopback_ = new QCheckBox(
       QStringLiteral("Load the StudioCast virtual camera now"), this);
+  loadLoopback_->setObjectName(QStringLiteral("scInstallerLoadV4l"));
   persistLoopback_ = new QCheckBox(
       QStringLiteral("Persist the virtual camera across reboot"), this);
-  openBackendsSetup_ =
-      new QCheckBox(QStringLiteral("Enable Open Source Backend Setup"), this);
-  openBackendsSetup_->setObjectName(QStringLiteral("scInstallerOpenBackends"));
-  openBackendsSetup_->setToolTip(QStringLiteral(
-      "Configures and rebuilds StudioCast with Open Video/Open CUDA and Open "
-      "Audio enabled. Dependency setup can install ONNX Runtime; model "
-      "downloads stay controlled by the model-pack checkbox."));
-  installModels_ = new QCheckBox(
-      QStringLiteral("Download default Open Audio/Open Video model packs"),
+  persistLoopback_->setObjectName(QStringLiteral("scInstallerPersistV4l"));
+  v4lDeviceNumber_ = new QSpinBox(this);
+  v4lDeviceNumber_->setRange(0, 63);
+  v4lDeviceNumber_->setObjectName(
+      QStringLiteral("scInstallerV4lDeviceNumber"));
+  v4lLabel_ = new QLineEdit(this);
+  v4lLabel_->setMaxLength(64);
+  v4lLabel_->setObjectName(QStringLiteral("scInstallerV4lLabel"));
+  v4lExclusiveCaps_ =
+      new QCheckBox(QStringLiteral("Exclusive capture mode"), this);
+  v4lExclusiveCaps_->setObjectName(
+      QStringLiteral("scInstallerV4lExclusiveCaps"));
+  cameraLimitationAck_ = new QCheckBox(
+      QStringLiteral("I understand this installation will not provide a "
+                     "StudioCast camera and will be marked degraded"),
       this);
+  cameraLimitationAck_->setObjectName(
+      QStringLiteral("scInstallerCameraLimitationAcknowledged"));
+  openCuda_ = new QCheckBox(
+      QStringLiteral("Enable Open Video / Open CUDA backend"), this);
+  openCuda_->setObjectName(QStringLiteral("scInstallerOpenCuda"));
+  openAudio_ =
+      new QCheckBox(QStringLiteral("Enable Open Audio backend"), this);
+  openAudio_->setObjectName(QStringLiteral("scInstallerOpenAudio"));
+  installModels_ = new QCheckBox(
+      QStringLiteral("Download selected curated model packs"), this);
+  installModels_->setObjectName(QStringLiteral("scInstallerInstallModels"));
   installModels_->setToolTip(
-      QStringLiteral("Downloads exactly seven default packs containing eight "
-                     "verified model artifact files, including open-source "
-                     "fallbacks when Maxine is present."));
+      QStringLiteral("Recommended downloads exactly seven default packs with "
+                     "eight verified artifacts. Custom may select individual "
+                     "curated packs; Maxine does not disable these fallbacks."));
   removeUserData_ = new QCheckBox(
       QStringLiteral("Preserve settings"), this);
   removeUserData_->setObjectName(QStringLiteral("scInstallerPreserveSettings"));
 
   layout->addWidget(installService_);
   layout->addWidget(line(this));
-  layout->addWidget(configureV4l2_);
-  layout->addWidget(loadLoopback_);
-  layout->addWidget(persistLoopback_);
+  auto *cameraBox = new QGroupBox(QStringLiteral("Virtual camera"), this);
+  auto *cameraLayout = new QFormLayout(cameraBox);
+  cameraLayout->addRow(configureV4l2_);
+  cameraLayout->addRow(loadLoopback_);
+  cameraLayout->addRow(persistLoopback_);
+  cameraLayout->addRow(QStringLiteral("Device number"), v4lDeviceNumber_);
+  cameraLayout->addRow(QStringLiteral("Camera label"), v4lLabel_);
+  cameraLayout->addRow(v4lExclusiveCaps_);
   auto *cameraLimitation = mutedLabel(
-      QStringLiteral("Without the virtual camera, StudioCast cannot be selected "
-                     "as a camera. Custom installation will complete in a "
-                     "degraded state."),
+      QStringLiteral("LIMITATION: without the virtual camera, StudioCast "
+                     "cannot be selected as a camera. Custom installation "
+                     "will complete in a degraded state, not full success."),
       this);
   cameraLimitation->setObjectName(QStringLiteral("scInstallerCameraLimitation"));
-  layout->addWidget(cameraLimitation);
+  cameraLayout->addRow(cameraLimitation);
+  cameraLayout->addRow(cameraLimitationAck_);
+  layout->addWidget(cameraBox);
   layout->addWidget(line(this));
-  layout->addWidget(openBackendsSetup_);
-  layout->addWidget(installModels_);
+  auto *openBox = new QGroupBox(QStringLiteral("Open-source backends"), this);
+  auto *openLayout = new QVBoxLayout(openBox);
+  openLayout->addWidget(openCuda_);
+  openLayout->addWidget(openAudio_);
+  layout->addWidget(openBox);
+  auto *modelsBox = new QGroupBox(QStringLiteral("Curated model packs"), this);
+  auto *modelsLayout = new QGridLayout(modelsBox);
+  modelsLayout->addWidget(installModels_, 0, 0, 1, 2);
+  const QStringList packs = defaultModelPackIds();
+  for (int index = 0; index < packs.size(); ++index) {
+    auto *pack = new QCheckBox(packs.at(index), modelsBox);
+    pack->setObjectName(QStringLiteral("scInstallerModelPack_%1")
+                            .arg(packs.at(index)));
+    pack->setProperty("modelPackId", packs.at(index));
+    modelPackChecks_.append(pack);
+    modelsLayout->addWidget(pack, 1 + index / 2, index % 2);
+  }
+  modelDestination_ = new QLineEdit(modelsBox);
+  modelDestination_->setObjectName(
+      QStringLiteral("scInstallerModelDestination"));
+  modelsLayout->addWidget(new QLabel(QStringLiteral("User-local destination"),
+                                    modelsBox),
+                          5, 0);
+  modelsLayout->addWidget(modelDestination_, 5, 1);
+  layout->addWidget(modelsBox);
 
   auto *vulkanBox =
       new QGroupBox(QStringLiteral("Open Vulkan (optional)"), this);
@@ -1996,10 +2180,25 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   connect(configureV4l2_, &QCheckBox::toggled, this, [this](bool checked) {
     loadLoopback_->setEnabled(checked);
     persistLoopback_->setEnabled(checked);
+    v4lDeviceNumber_->setEnabled(checked);
+    v4lLabel_->setEnabled(checked);
+    v4lExclusiveCaps_->setEnabled(checked);
+    if (!checked) {
+      loadLoopback_->setChecked(false);
+      persistLoopback_->setChecked(false);
+    }
     if (auto *limitation = findChild<QLabel *>(
             QStringLiteral("scInstallerCameraLimitation"))) {
       limitation->setVisible(!checked);
     }
+    cameraLimitationAck_->setVisible(!checked);
+    if (checked)
+      cameraLimitationAck_->setChecked(false);
+  });
+  connect(installModels_, &QCheckBox::toggled, this, [this](bool checked) {
+    for (QCheckBox *pack : modelPackChecks_)
+      pack->setEnabled(checked);
+    modelDestination_->setEnabled(checked);
   });
   connect(installVulkanRuntime_, &QCheckBox::toggled, this,
           [this](bool checked) {
@@ -2024,7 +2223,11 @@ void ServiceOptionsPage::initializePage() {
   configureV4l2_->setEnabled(installLike);
   loadLoopback_->setEnabled(installLike && w->configureV4l2Loopback());
   persistLoopback_->setEnabled(installLike && w->configureV4l2Loopback());
-  openBackendsSetup_->setEnabled(installLike);
+  v4lDeviceNumber_->setEnabled(installLike && w->configureV4l2Loopback());
+  v4lLabel_->setEnabled(installLike && w->configureV4l2Loopback());
+  v4lExclusiveCaps_->setEnabled(installLike && w->configureV4l2Loopback());
+  openCuda_->setEnabled(installLike);
+  openAudio_->setEnabled(installLike);
   openVulkan_->setEnabled(installLike);
   installVulkanRuntime_->setEnabled(installLike);
   installShaderTools_->setEnabled(installLike);
@@ -2036,9 +2239,16 @@ void ServiceOptionsPage::initializePage() {
 
   installService_->setChecked(w->installService());
   configureV4l2_->setChecked(w->configureV4l2Loopback());
-  loadLoopback_->setChecked(w->loadLoopback());
-  persistLoopback_->setChecked(w->persistLoopback());
-  openBackendsSetup_->setChecked(w->openBackendsSetup());
+  loadLoopback_->setChecked(w->configureV4l2Loopback() && w->loadLoopback());
+  persistLoopback_->setChecked(w->configureV4l2Loopback() &&
+                               w->persistLoopback());
+  v4lDeviceNumber_->setValue(w->v4lDeviceNumber());
+  v4lLabel_->setText(w->v4lLabel());
+  v4lExclusiveCaps_->setChecked(w->v4lExclusiveCaps());
+  cameraLimitationAck_->setChecked(false);
+  cameraLimitationAck_->setVisible(!configureV4l2_->isChecked());
+  openCuda_->setChecked(w->openCuda());
+  openAudio_->setChecked(w->openAudio());
   openVulkan_->setChecked(w->openVulkan());
   installVulkanRuntime_->setChecked(w->installVulkanRuntime());
   installMesaVulkan_->setChecked(w->installMesaVulkan());
@@ -2046,6 +2256,13 @@ void ServiceOptionsPage::initializePage() {
                                  installVulkanRuntime_->isChecked());
   installShaderTools_->setChecked(w->installShaderTools());
   installModels_->setChecked(w->installModels());
+  for (QCheckBox *pack : modelPackChecks_) {
+    pack->setChecked(
+        w->modelPackIds().contains(pack->property("modelPackId").toString()));
+    pack->setEnabled(installLike && installModels_->isChecked());
+  }
+  modelDestination_->setText(w->modelDestination());
+  modelDestination_->setEnabled(installLike && installModels_->isChecked());
   removeUserData_->setChecked(!w->removeUserData());
   if (auto *limitation = findChild<QLabel *>(
           QStringLiteral("scInstallerCameraLimitation"))) {
@@ -2060,16 +2277,58 @@ void ServiceOptionsPage::initializePage() {
 
 bool ServiceOptionsPage::validatePage() {
   auto *w = installerWizard(this);
+  QStringList selectedModels;
+  for (QCheckBox *pack : modelPackChecks_) {
+    if (pack->isChecked())
+      selectedModels.append(pack->property("modelPackId").toString());
+  }
+  if (!configureV4l2_->isChecked() &&
+      !cameraLimitationAck_->isChecked()) {
+    QMessageBox::warning(
+        this, QStringLiteral("Virtual camera limitation"),
+        QStringLiteral("Confirm that this Custom installation may complete "
+                       "degraded without a StudioCast virtual camera."));
+    return false;
+  }
+  static const QRegularExpression labelPattern(
+      QStringLiteral("^[ A-Za-z0-9_.()+-]{1,64}$"));
+  if (configureV4l2_->isChecked() &&
+      !labelPattern.match(v4lLabel_->text().trimmed()).hasMatch()) {
+    QMessageBox::warning(
+        this, QStringLiteral("Invalid camera label"),
+        QStringLiteral("Use 1-64 letters, numbers, spaces, or . _ ( ) + -."));
+    return false;
+  }
+  if (installModels_->isChecked() && selectedModels.isEmpty()) {
+    QMessageBox::warning(this, QStringLiteral("No model packs selected"),
+                         QStringLiteral("Select at least one curated model "
+                                        "pack or disable model downloads."));
+    return false;
+  }
+  if (installModels_->isChecked() &&
+      !isUserLocalModelDestination(modelDestination_->text())) {
+    QMessageBox::warning(
+        this, QStringLiteral("Invalid model destination"),
+        QStringLiteral("Choose an absolute destination inside %1.")
+            .arg(defaultModelDestination()));
+    return false;
+  }
   w->setInstallService(installService_->isChecked());
   w->setConfigureV4l2Loopback(configureV4l2_->isChecked());
   w->setLoadLoopback(loadLoopback_->isChecked());
   w->setPersistLoopback(persistLoopback_->isChecked());
-  w->setOpenBackendsSetup(openBackendsSetup_->isChecked());
+  w->setV4lDeviceNumber(v4lDeviceNumber_->value());
+  w->setV4lLabel(v4lLabel_->text());
+  w->setV4lExclusiveCaps(v4lExclusiveCaps_->isChecked());
+  w->setOpenCuda(openCuda_->isChecked());
+  w->setOpenAudio(openAudio_->isChecked());
   w->setOpenVulkan(openVulkan_->isChecked());
   w->setInstallVulkanRuntime(installVulkanRuntime_->isChecked());
   w->setInstallMesaVulkan(installMesaVulkan_->isChecked());
   w->setInstallShaderTools(installShaderTools_->isChecked());
   w->setInstallModels(installModels_->isChecked());
+  w->setModelPackIds(selectedModels);
+  w->setModelDestination(modelDestination_->text());
   if (w->workflow() == QStringLiteral("reinstall") ||
       w->workflow() == QStringLiteral("clean-install")) {
     w->setRemoveUserData(!removeUserData_->isChecked());

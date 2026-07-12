@@ -11,9 +11,12 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QRegularExpression>
+#include <QSpinBox>
 #include <QTemporaryDir>
 #include <QThread>
 
@@ -874,6 +877,119 @@ bool TestCancellationCleansChild(FakeBackend &backend) {
 #endif
 }
 
+bool TestCustomAdvancedSelectionsAndRecommendedDefaults(FakeBackend &backend) {
+  backend.setScenario(BaseFacts(),
+                      Status(QStringLiteral("absent"), QStringLiteral("recommended"),
+                             QStringLiteral("install")),
+                      Plan(), Result(QStringLiteral("committed"), true), 0);
+  studiocast::installer::InstallerWizard custom;
+  custom.setCustomRoute(true);
+  auto *page = custom.page(studiocast::installer::PageServiceOptions);
+  page->initializePage();
+  auto *openCuda = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerOpenCuda"));
+  auto *openAudio = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerOpenAudio"));
+  auto *device = page->findChild<QSpinBox *>(
+      QStringLiteral("scInstallerV4lDeviceNumber"));
+  auto *label =
+      page->findChild<QLineEdit *>(QStringLiteral("scInstallerV4lLabel"));
+  auto *exclusive = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerV4lExclusiveCaps"));
+  auto *destination = page->findChild<QLineEdit *>(
+      QStringLiteral("scInstallerModelDestination"));
+  auto *installModels = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerInstallModels"));
+  bool ok = Expect(openCuda && openAudio && device && label && exclusive &&
+                       destination && installModels,
+                   "Custom route should expose typed backend, v4l, and model controls");
+  openCuda->setChecked(false);
+  openAudio->setChecked(true);
+  device->setValue(42);
+  label->setText(QStringLiteral("StudioCast Custom Camera"));
+  exclusive->setChecked(false);
+  installModels->setChecked(true);
+  const auto packChecks = page->findChildren<QCheckBox *>(
+      QRegularExpression(QStringLiteral("^scInstallerModelPack_")));
+  for (QCheckBox *pack : packChecks)
+    pack->setChecked(false);
+  page->findChild<QCheckBox *>(
+          QStringLiteral("scInstallerModelPack_fastenhancer_s_vd_v1"))
+      ->setChecked(true);
+  page->findChild<QCheckBox *>(QStringLiteral(
+          "scInstallerModelPack_gaze_correction_cam_flx_v0_1_1"))
+      ->setChecked(true);
+  ok = Expect(page->validatePage(),
+              "valid Custom Advanced selections should pass validation") && ok;
+  const QStringList customArgs = custom.backendOptions(true);
+  ok = Expect(customArgs.contains(QStringLiteral("--no-open-cuda")) &&
+                  customArgs.contains(QStringLiteral("--open-audio")) &&
+                  !customArgs.contains(QStringLiteral("--open-backends")) &&
+                  customArgs.value(customArgs.indexOf(
+                                       QStringLiteral("--v4l-device-number")) + 1) ==
+                      QStringLiteral("42") &&
+                  customArgs.value(customArgs.indexOf(
+                                       QStringLiteral("--v4l-label")) + 1) ==
+                      QStringLiteral("StudioCast Custom Camera") &&
+                  customArgs.contains(QStringLiteral("--no-v4l-exclusive-caps")) &&
+                  customArgs.count(QStringLiteral("--model-id")) == 2 &&
+                  customArgs.contains(
+                      QStringLiteral("gaze_correction_cam_flx_v0_1_1")) &&
+                  customArgs.contains(QStringLiteral("--model-destination")),
+              "Custom plan arguments should preserve each reviewed typed selection") && ok;
+
+  auto *configure = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerConfigureV4l"));
+  configure->setChecked(false);
+  auto *limitation = page->findChild<QLabel *>(
+      QStringLiteral("scInstallerCameraLimitation"));
+  auto *ack = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerCameraLimitationAcknowledged"));
+  ok = Expect(limitation && !limitation->isHidden() && ack && !ack->isHidden(),
+              "Custom camera opt-out should show a prominent degraded-state "
+              "limitation and acknowledgement") && ok;
+  ack->setChecked(true);
+  ok = Expect(page->validatePage() &&
+                  custom.backendOptions(true).contains(
+                      QStringLiteral("--no-v4l2loopback")),
+              "acknowledged Custom camera opt-out should remain available") && ok;
+
+  studiocast::installer::InstallerWizard recommended;
+  recommended.setBuildType(QStringLiteral("Debug"));
+  recommended.setConfigureV4l2Loopback(false);
+  recommended.setLoadLoopback(false);
+  recommended.setPersistLoopback(false);
+  recommended.setOpenCuda(false);
+  recommended.setOpenAudio(false);
+  recommended.setInstallModels(false);
+  recommended.setModelPackIds({});
+  recommended.setModelDestination(QStringLiteral("/tmp/not-user-models"));
+  recommended.setInstallMesaVulkan(true);
+  recommended.setInstallShaderTools(true);
+  const QStringList recommendedArgs = recommended.backendOptions(true);
+  const qsizetype buildTypeIndex =
+      recommendedArgs.indexOf(QStringLiteral("--build-type"));
+  const qsizetype destinationIndex =
+      recommendedArgs.indexOf(QStringLiteral("--model-destination"));
+  ok = Expect(buildTypeIndex >= 0 &&
+                  recommendedArgs.value(buildTypeIndex + 1) ==
+                      QStringLiteral("Release") &&
+                  recommendedArgs.contains(QStringLiteral("--v4l2loopback")) &&
+                  recommendedArgs.contains(QStringLiteral("--load-loopback")) &&
+                  recommendedArgs.contains(QStringLiteral("--persist-loopback")) &&
+                  recommendedArgs.contains(QStringLiteral("--open-cuda")) &&
+                  recommendedArgs.contains(QStringLiteral("--open-audio")) &&
+                  recommendedArgs.count(QStringLiteral("--model-id")) == 7 &&
+                  destinationIndex >= 0 &&
+                  recommendedArgs.value(destinationIndex + 1)
+                      .endsWith(QStringLiteral("/studiocast/models")) &&
+                  !recommendedArgs.contains(QStringLiteral("--mesa-vulkan")) &&
+                  !recommendedArgs.contains(QStringLiteral("--shader-tools")),
+              "Recommended planning should enforce Release, required camera, "
+              "open fallbacks, seven packs, and a user-local destination") && ok;
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -890,5 +1006,6 @@ int main(int argc, char **argv) {
   ok = TestFailureAndDegradedCompletionTruth(backend) && ok;
   ok = TestStructuredProgressAndDegradedRetry(backend) && ok;
   ok = TestCancellationCleansChild(backend) && ok;
+  ok = TestCustomAdvancedSelectionsAndRecommendedDefaults(backend) && ok;
   return ok ? 0 : 1;
 }
