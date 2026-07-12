@@ -1,6 +1,6 @@
 # Installer Privilege and AppImage Trust-Boundary Audit
 
-Date: 2026-07-12  
+Date: 2026-07-12
 Audited baseline: `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
 
 ## Outcome

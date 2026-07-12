@@ -1,7 +1,7 @@
 # StudioCast installer backend audit and contract proposal
 
-Date: 2026-07-12  
-Audited baseline: `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`  
+Date: 2026-07-12
+Audited baseline: `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
 Scope: the current shell backend, its delegated install/uninstall helpers, and
 the backend-, wizard-, and CMake-cache-facing tests. This is a Wave 1 contract
 document; it intentionally changes no production code.
@@ -788,4 +788,3 @@ real sudo/pkexec, apt, modprobe, systemctl mutation, network, or model download.
 - Release signatures, installer self-update transport, and the concrete public
   key/signature format are owned by the release/update contract. Plan and
   manifest fields above are designed to carry those verified results.
-
