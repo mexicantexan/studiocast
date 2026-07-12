@@ -1297,7 +1297,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         # verifier must replace this blocker with signed manifest/archive
         # evidence when the two components are integrated.
         blockers.append({"code": "source.signed_verification_receipt_required", "applies_to": "source"})
-    if getattr(args, "allow_unsupported", False):
+    if getattr(args, "allow_unsupported", False) and intent != "uninstall":
         if rec["route"] != "advanced":
             blockers.append({"code": "os.unsupported.override_requires_advanced",
                              "applies_to": "installation"})

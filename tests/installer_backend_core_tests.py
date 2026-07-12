@@ -329,6 +329,19 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertFalse((data / "payloads").exists()); self.assertTrue((models / "mine").exists()); self.assertTrue((config / "daemon.conf").exists())
         self.assertEqual(json.loads((data / "install-manifest.json").read_text())["transaction"]["state"], "uninstalled")
 
+    def test_uninstall_remains_available_with_unsupported_override_flag(self):
+        facts = base_facts()
+        facts["os"]["supported"] = False
+        facts["os"]["reason_codes"] = ["os.unsupported.distribution"]
+        self.s.write_facts(facts)
+
+        plan = self.s.json("plan", "uninstall", "--facts", str(self.s.facts),
+                           "--no-v4l2loopback", "--no-service", "--no-models",
+                           "--allow-unsupported", "--preserve-user-data")
+
+        self.assertEqual(plan["blockers"], [])
+        self.assertEqual(plan["intent"], "uninstall")
+
     def test_uninstall_removes_only_hash_bound_v4l_persistence(self):
         facts = base_facts()
         facts["privileged_helper"].update(present=True, trusted=True, compatible=True)
