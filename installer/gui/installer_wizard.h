@@ -2,6 +2,7 @@
 
 #include <QJsonObject>
 #include <QProcess>
+#include <QStringList>
 #include <QWizard>
 #include <QWizardPage>
 
@@ -31,6 +32,7 @@ enum WizardPageId {
 class InstallerWizard : public QWizard {
 public:
   explicit InstallerWizard(QWidget *parent = nullptr);
+  ~InstallerWizard() override;
 
   QString backendPath() const;
   QString workflow() const;
@@ -57,15 +59,28 @@ public:
 
   QJsonObject statusObject() const { return statusObject_; }
   QJsonObject osObject() const { return osObject_; }
+  QJsonObject factsObject() const { return factsObject_; }
   QJsonObject planObject() const { return planObject_; }
+  QJsonObject executionResult() const { return executionResult_; }
+  bool analysisAvailable() const { return analysisAvailable_; }
+  QString analysisError() const { return analysisError_; }
+  QString detectedRoute() const;
+  QString primaryAction() const;
+  bool customRoute() const { return customRoute_; }
+  bool planReady() const { return planReady_; }
+  QString planError() const { return planError_; }
+  QString reviewedPlanPath() const { return reviewedPlanPath_; }
 
   void refreshStatus();
   bool refreshPlan(QString *error = nullptr);
+  QStringList executionCommandArguments() const;
   QStringList backendOptions(bool forPlan) const;
   QStringList workflowCommandArguments(bool dryRun = false) const;
   int nextId() const override;
+  void reject() override;
 
   void setWorkflow(const QString &workflow);
+  void setCustomRoute(bool enabled);
   void setSourceDir(const QString &path);
   void setReleaseArchive(const QString &path);
   void setUseReleaseArchive(bool enabled);
@@ -85,11 +100,15 @@ public:
   void setFreshBuild(bool enabled);
   void setAllowUnsupported(bool enabled);
   void setRemoveUserData(bool enabled);
+  void setExecutionResult(const QJsonObject &result);
 
 private:
   bool runBackendJson(const QStringList &args, QJsonObject *object,
                       QString *error) const;
   void updatePreferenceProgressBars();
+  void invalidatePlan();
+  void seedFromPriorDesiredConfiguration();
+  bool validateAndPersistPlan(const QJsonObject &plan, QString *error);
   QString backendPath_;
   QString workflow_ = QStringLiteral("install");
   QString sourceDir_;
@@ -112,10 +131,19 @@ private:
   bool freshBuild_ = false;
   bool allowUnsupported_ = false;
   bool removeUserData_ = false;
+  bool customRoute_ = false;
+  bool priorConfigurationSeeded_ = false;
+  bool analysisAvailable_ = false;
+  bool planReady_ = false;
 
+  QString analysisError_;
+  QString planError_;
+  QString reviewedPlanPath_;
+  QJsonObject factsObject_;
   QJsonObject statusObject_;
   QJsonObject osObject_;
   QJsonObject planObject_;
+  QJsonObject executionResult_;
 };
 
 class IntroPage : public QWizardPage {
@@ -123,12 +151,18 @@ public:
   explicit IntroPage(QWidget *parent = nullptr);
   void initializePage() override;
   bool validatePage() override;
+  bool isComplete() const override;
 
 private:
   QLabel *osValue_ = nullptr;
   QLabel *versionValue_ = nullptr;
   QLabel *installValue_ = nullptr;
   QButtonGroup *workflowGroup_ = nullptr;
+  QRadioButton *primaryAction_ = nullptr;
+  QRadioButton *customizeAction_ = nullptr;
+  QRadioButton *repairAction_ = nullptr;
+  QRadioButton *reinstallAction_ = nullptr;
+  QRadioButton *uninstallAction_ = nullptr;
 };
 
 class CompatibilityPage : public QWizardPage {
@@ -157,6 +191,7 @@ public:
   explicit UninstallPage(QWidget *parent = nullptr);
   void initializePage() override;
   bool validatePage() override;
+  bool isComplete() const override;
 
 private:
   void refreshPlanText();
@@ -220,6 +255,7 @@ class ReviewPage : public QWizardPage {
 public:
   explicit ReviewPage(QWidget *parent = nullptr);
   void initializePage() override;
+  bool isComplete() const override;
 
 private:
   QPlainTextEdit *reviewText_ = nullptr;
@@ -231,6 +267,8 @@ public:
   void initializePage() override;
   bool isComplete() const override;
   bool validatePage() override;
+  void requestCancellation();
+  bool isRunning() const;
 
 private:
   void appendOutput(const QByteArray &bytes);
@@ -240,6 +278,9 @@ private:
   bool started_ = false;
   bool complete_ = false;
   int exitCode_ = -1;
+  QByteArray stdoutBuffer_;
+  QByteArray stderrBuffer_;
+  bool cancellationRequested_ = false;
 };
 
 class FinishPage : public QWizardPage {
