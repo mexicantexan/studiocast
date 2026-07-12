@@ -408,7 +408,11 @@ Open Vulkan is optional and runtime-loaded. Build with
 `-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it. Ubuntu-family setup can
 install loader/diagnostic packages with `./scripts/setup.sh --vulkan-runtime`
 and Mesa Intel/AMD ICD packages with `--mesa-vulkan`; these packages do not
-promise hardware support.
+promise hardware support. Runtime/device availability also does not imply
+production Vulkan virtual-background matting readiness: until a
+device-resident Vulkan matting runtime is available, daemon status must report
+Open Vulkan virtual background as blocked/degraded instead of silently running
+CUDA.
 
 Canonical video effects are persisted under `video.effects.json` in the daemon
 config.

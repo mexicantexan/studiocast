@@ -235,13 +235,13 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
     }
   }
 
-  impl_->buffers_ready = true;
   if (impl_->opts.require_device_residency &&
       !DeviceResidentInferenceAvailable()) {
     if (error_out)
       *error_out = kDeviceResidentInferenceUnavailable;
     return false;
   }
+  impl_->buffers_ready = true;
   return true;
 }
 
@@ -274,9 +274,12 @@ bool OpenVulkanMattingSession::Run(
       *error_out = "OpenVulkanMattingSession::Run: output_alpha_gpu is null.";
     return false;
   }
-  if (!EnsureInitialized(input_rgb_gpu.width(), input_rgb_gpu.height(),
-                         error_out)) {
-    return false;
+  if (!impl_->buffers_ready || impl_->last_frame_w != input_rgb_gpu.width() ||
+      impl_->last_frame_h != input_rgb_gpu.height()) {
+    if (!EnsureInitialized(input_rgb_gpu.width(), input_rgb_gpu.height(),
+                           error_out)) {
+      return false;
+    }
   }
   if (!input_rgb_gpu.Valid()) {
     if (error_out)

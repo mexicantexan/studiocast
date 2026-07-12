@@ -53,6 +53,8 @@
 #include "core/video/effects/effect_chain.h"
 #include "core/video/image_ppm.h"
 #include "core/video/mjpeg_decode.h"
+#include "core/video/open_vulkan_matting_setup_policy.h"
+#include "core/video/replace_background_cache_policy.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
 
@@ -133,9 +135,10 @@ ParseComputeBackendPreferenceOr(std::string_view value,
   return parsed;
 }
 
-ComputeBackendSelection ResolveComputeBackendSelection(
-    ComputeBackendPreference pref, const ComputeBackendAvailability &available,
-    bool compute_work_requested) {
+ComputeBackendSelection
+ResolveComputeBackendSelection(ComputeBackendPreference pref,
+                               const ComputeBackendAvailability &available,
+                               bool compute_work_requested) {
   ComputeBackendSelection out;
   out.preference = pref;
 
@@ -197,6 +200,21 @@ ComputeBackendSelection ResolveComputeBackendSelection(
 }
 
 namespace {
+
+detail::PreparedReplaceBackgroundSource
+PrepareReplaceBackgroundSourceForEffects(
+    const studiocast::video::effects::BroadcastCameraEffects &fx) {
+  detail::PreparedReplaceBackgroundSource prepared;
+  if (fx.virtual_background.mode !=
+      studiocast::video::effects::VirtualBackgroundMode::replace) {
+    return prepared;
+  }
+
+  std::string error;
+  (void)detail::PrepareReplaceBackgroundSourceForConfig(
+      fx.virtual_background.replace_path, &prepared, &error);
+  return prepared;
+}
 
 std::string ChooseDefaultOutputLoopback(std::string *error) {
   const auto rep = ProbeLoopback();
@@ -576,12 +594,16 @@ CameraPipeline::~CameraPipeline() { Stop(); }
 void CameraPipeline::SetMirrorEnabled(bool enabled) {
   std::lock_guard<std::mutex> lock(effects_mu_);
   effects_.mirror = enabled;
+  ++effects_generation_;
 }
 
 void CameraPipeline::SetEffects(
     const studiocast::video::effects::BroadcastCameraEffects &effects) {
+  const auto replace_source = PrepareReplaceBackgroundSourceForEffects(effects);
   std::lock_guard<std::mutex> lock(effects_mu_);
   effects_ = effects;
+  replace_background_source_ = replace_source;
+  ++effects_generation_;
 }
 
 CameraPipelineStatus CameraPipeline::Status() const {
@@ -672,6 +694,9 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
     return false;
   }
 
+  const auto replace_source =
+      PrepareReplaceBackgroundSourceForEffects(cfg.effects);
+
   std::unique_lock<std::mutex> lock(mu_);
   if (running_ || starting_) {
     if (error)
@@ -690,6 +715,8 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   {
     std::lock_guard<std::mutex> fxLock(effects_mu_);
     effects_ = cfg.effects;
+    replace_background_source_ = replace_source;
+    ++effects_generation_;
   }
 
   last_error_.clear();
@@ -1412,8 +1439,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   const bool resize_needed =
       (capA.width != outA.width) || (capA.height != outA.height);
   const bool compute_effects_configured = [&] {
-    const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(
-        cfg.effects);
+    const auto plan =
+        studiocast::video::effects::BuildBroadcastEffectsPlan(cfg.effects);
     const std::set<std::string> planned(plan.ordered_effect_ids.begin(),
                                         plan.ordered_effect_ids.end());
     const auto has = [&](std::string_view id) {
@@ -1590,6 +1617,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   studiocast::video::effects::EffectChain chain;
   studiocast::video::effects::BroadcastCameraEffects appliedFx{};
   studiocast::video::effects::BroadcastEffectsPlan appliedPlan{};
+  std::uint64_t appliedEffectsGeneration = 0;
 
   // Optional deferred GPU output (used to avoid CPU resize when scaling is
   // needed and no CPU tail effects are active).
@@ -2538,6 +2566,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool cached_bg_dst_valid = false;
     std::uint64_t cached_bg_dst_src_gen = 0;
 
+    detail::PreparedReplaceBackgroundSource prepared_bg_src;
     std::vector<std::uint8_t> tmp_replace_rgb_src;
 
     std::uint64_t matte_frame_upload_calls = 0;
@@ -2597,11 +2626,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       cached_bg_dst_h = 0;
       cached_bg_dst_valid = false;
       cached_bg_dst_src_gen = 0;
+      prepared_bg_src = {};
       tmp_replace_rgb_src.clear();
 
       initialized = false;
       enabled = false;
       last_error.clear();
+    }
+
+    void ConfigureReplaceBackgroundSource(
+        const detail::PreparedReplaceBackgroundSource &source) {
+      prepared_bg_src = source;
     }
 
     void ClearMatteArtifactKeys() {
@@ -2656,8 +2691,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (!matte_artifact_keys_valid) {
         return nullptr;
       }
-      if (storage ==
-          studiocast::open_video::FrameMatteStorage::cpu_f32_alpha) {
+      if (storage == studiocast::open_video::FrameMatteStorage::cpu_f32_alpha) {
         return &cpu_matte_artifact_key;
       }
       if (storage ==
@@ -2905,24 +2939,29 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = "Open CUDA: virtual_background.replace_path not set.";
         return false;
       }
-
-      std::error_code ec;
-      const auto mtime = std::filesystem::last_write_time(path, ec);
-      if (ec) {
+      if (!prepared_bg_src.valid || prepared_bg_src.path != path) {
         if (error)
-          *error = "Open CUDA: failed to stat replace image: " + ec.message();
+          *error = prepared_bg_src.error.empty()
+                       ? "Open CUDA: replace image was not prepared."
+                       : "Open CUDA: " + prepared_bg_src.error;
         return false;
       }
 
-      const bool src_cache_hit =
-          (cached_bg_src_valid && cached_bg_src_path == path &&
-           cached_bg_src_mtime == mtime && bg_src_rgb.Valid());
+      const detail::ReplaceBackgroundSourceCacheSnapshot source_cache{
+          cached_bg_src_path, cached_bg_src_mtime,
+          cached_bg_src_valid && bg_src_rgb.Valid(), cached_bg_src_gen};
+      const detail::ReplaceBackgroundResizeCacheSnapshot resize_cache{
+          cached_bg_dst_w, cached_bg_dst_h,
+          cached_bg_dst_valid && bg_rgb.Valid(), cached_bg_dst_src_gen};
+      const auto cache_decision = detail::DecideReplaceBackgroundFrameCache(
+          prepared_bg_src, source_cache, resize_cache, width, height);
 
-      if (!src_cache_hit) {
+      if (cache_decision.refresh_source) {
         int iw = 0, ih = 0;
         std::string img_err;
-        if (!studiocast::video::LoadImageRgb24(
-                path, &iw, &ih, &tmp_replace_rgb_src, &img_err)) {
+        if (!studiocast::video::LoadImageRgb24(prepared_bg_src.path, &iw, &ih,
+                                               &tmp_replace_rgb_src,
+                                               &img_err)) {
           if (error)
             *error = "Open CUDA: failed to load replace image: " + img_err;
           return false;
@@ -2944,22 +2983,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           return false;
         }
 
-        cached_bg_src_path = path;
-        cached_bg_src_mtime = mtime;
+        cached_bg_src_path = prepared_bg_src.path;
+        cached_bg_src_mtime = prepared_bg_src.mtime;
         cached_bg_src_w = iw;
         cached_bg_src_h = ih;
         cached_bg_src_valid = true;
-        ++cached_bg_src_gen;
+        cached_bg_src_gen = cache_decision.source_generation_after_refresh;
 
         // Source changed -> destination must be re-generated.
         cached_bg_dst_valid = false;
       }
 
-      const bool dst_cache_hit =
-          (cached_bg_dst_valid && cached_bg_dst_w == width &&
-           cached_bg_dst_h == height &&
-           cached_bg_dst_src_gen == cached_bg_src_gen && bg_rgb.Valid());
-      if (dst_cache_hit) {
+      if (!cache_decision.refresh_resized_destination) {
         return true;
       }
 
@@ -3141,8 +3176,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (width > 0 && height > 0 && cached_cpu_matte_key &&
           cached_alpha_cpu_valid &&
           cached_alpha_cpu_sequence == capture_sequence &&
-          matte_artifacts.FindMatte(capture_sequence,
-                                    *cached_cpu_matte_key)) {
+          matte_artifacts.FindMatte(capture_sequence, *cached_cpu_matte_key)) {
         if (out_alpha)
           *out_alpha = &alpha_cpu;
         if (pack.has_value()) {
@@ -3195,10 +3229,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = "Open CUDA: matte artifact key not initialized.";
         return false;
       }
-      PublishMatteArtifact(
-          capture_sequence, *cpu_matte_key,
-          reinterpret_cast<std::uintptr_t>(alpha_cpu.data()),
-          static_cast<std::uintptr_t>(alpha_cpu.size()));
+      PublishMatteArtifact(capture_sequence, *cpu_matte_key,
+                           reinterpret_cast<std::uintptr_t>(alpha_cpu.data()),
+                           static_cast<std::uintptr_t>(alpha_cpu.size()));
       if (out_alpha)
         *out_alpha = &alpha_cpu;
       if (out_alpha_w)
@@ -3461,6 +3494,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::string last_error;
     std::string active_model_id;
     std::string active_requested_model_id;
+    bool matting_session_initialized = false;
+    bool matting_session_warmed = false;
+    int matting_session_frame_w = 0;
+    int matting_session_frame_h = 0;
 
     studiocast::vulkan::kernels::UtilityKernels kernels;
     std::optional<studiocast::open_video::ModelPack> model_pack;
@@ -3471,16 +3508,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::open_video::FrameMatteArtifactKey vulkan_matte_artifact_key;
     bool vulkan_matte_artifact_key_valid = false;
 
-    studiocast::vulkan::VulkanImage frame_rgb;     // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage out_rgb;       // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage alpha_model;   // f32_1, model WxH
-    studiocast::vulkan::VulkanImage alpha_resized; // f32_1, frame WxH
-    studiocast::vulkan::VulkanImage alpha_tmp;     // f32_1, frame WxH
-    studiocast::vulkan::VulkanImage alpha_feather; // f32_1, frame WxH
-    studiocast::vulkan::VulkanImage blur_tmp;      // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage blurred;       // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage bg_rgb;        // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage bg_src_rgb;    // rgb_u8, source WxH
+    studiocast::vulkan::VulkanImage frame_rgb;      // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage out_rgb;        // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage alpha_model;    // f32_1, model WxH
+    studiocast::vulkan::VulkanImage alpha_resized;  // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage alpha_tmp;      // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage alpha_feather;  // f32_1, frame WxH
+    studiocast::vulkan::VulkanImage blur_tmp;       // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage blurred;        // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage bg_rgb;         // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage bg_src_rgb;     // rgb_u8, source WxH
     studiocast::vulkan::VulkanImage auto_frame_rgb; // rgb_u8, WxH
 
     std::filesystem::path cached_bg_src_path;
@@ -3493,6 +3530,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     int cached_bg_dst_h = 0;
     bool cached_bg_dst_valid = false;
     std::uint64_t cached_bg_dst_src_gen = 0;
+    detail::PreparedReplaceBackgroundSource prepared_bg_src;
     std::vector<std::uint8_t> tmp_replace_rgb_src;
 
     std::uint64_t cached_matte_sequence = 0;
@@ -3520,6 +3558,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       FreeImages();
       matting_session.reset();
       model_pack.reset();
+      ResetMattingSessionState();
       kernels.Shutdown();
       initialized = false;
       enabled = false;
@@ -3539,7 +3578,20 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       cached_bg_dst_h = 0;
       cached_bg_dst_valid = false;
       cached_bg_dst_src_gen = 0;
+      prepared_bg_src = {};
       tmp_replace_rgb_src.clear();
+    }
+
+    void ConfigureReplaceBackgroundSource(
+        const detail::PreparedReplaceBackgroundSource &source) {
+      prepared_bg_src = source;
+    }
+
+    void ResetMattingSessionState() {
+      matting_session_initialized = false;
+      matting_session_warmed = false;
+      matting_session_frame_w = 0;
+      matting_session_frame_h = 0;
     }
 
     void FreeImages() {
@@ -3580,8 +3632,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                      std::string *error_out) {
       if (!image) {
         if (error_out)
-          *error_out = std::string("Open Vulkan: null image for ") + label +
-                       ".";
+          *error_out =
+              std::string("Open Vulkan: null image for ") + label + ".";
         return false;
       }
       if (image->Valid() && image->width() == width &&
@@ -3590,11 +3642,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return true;
       }
       std::string err;
-      if (!image->Allocate(kernels.device(), width, height, format,
-                           map_memory, &err)) {
+      if (!image->Allocate(kernels.device(), width, height, format, map_memory,
+                           &err)) {
         if (error_out)
-          *error_out = std::string("Open Vulkan: failed to allocate ") +
-                       label + ": " + err;
+          *error_out = std::string("Open Vulkan: failed to allocate ") + label +
+                       ": " + err;
         return false;
       }
       return true;
@@ -3621,13 +3673,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       studiocast::vulkan::PackRgb24ToRgba32(
           rgb, stride, width, height,
-          static_cast<std::uint32_t *>(image->mapped()),
-          image->pitch_pixels());
+          static_cast<std::uint32_t *>(image->mapped()), image->pitch_pixels());
       std::string ferr;
       if (!image->Flush(&ferr)) {
         if (error_out)
-          *error_out = "Open Vulkan: failed to flush RGB upload image: " +
-                       ferr;
+          *error_out = "Open Vulkan: failed to flush RGB upload image: " + ferr;
         return false;
       }
       return true;
@@ -3655,8 +3705,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::string ierr;
       if (!image.Invalidate(&ierr)) {
         if (error_out)
-          *error_out = "Open Vulkan: failed to invalidate RGB download image: " +
-                       ierr;
+          *error_out =
+              "Open Vulkan: failed to invalidate RGB download image: " + ierr;
         return false;
       }
       studiocast::vulkan::UnpackRgba32ToRgb24(
@@ -3699,7 +3749,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       const int matte_w = model_pack->matting->input.width;
       const int matte_h = model_pack->matting->input.height;
-      const auto device_handle = reinterpret_cast<std::uintptr_t>(kernels.device());
+      const auto device_handle =
+          reinterpret_cast<std::uintptr_t>(kernels.device());
       const auto queue_handle =
           reinterpret_cast<std::uintptr_t>(kernels.device()->queue());
       if (vulkan_matte_artifact_key_valid &&
@@ -3717,8 +3768,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       studiocast::open_video::FrameMatteArtifactKey key;
       key.provider_id = "open_vulkan";
       key.model_id = active_model_id;
-      key.storage =
-          studiocast::open_video::FrameMatteStorage::device_f32_alpha;
+      key.storage = studiocast::open_video::FrameMatteStorage::device_f32_alpha;
       key.frame_width = frame_w;
       key.frame_height = frame_h;
       key.matte_width = matte_w;
@@ -3751,20 +3801,32 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return false;
       }
 
-      const auto registry =
-          studiocast::open_video::ModelPackRegistry::ScanDefault();
       const std::string requested_model_id = fx.virtual_background.model_id;
-      const std::string model_id =
-          ResolveMattingModelId(registry, requested_model_id);
-      if (model_id.empty()) {
-        last_error = "Open Vulkan: no matting model pack is installed.";
-        if (error_out)
-          *error_out = last_error;
-        return false;
-      }
 
-      if (!model_pack || active_model_id != model_id ||
-          active_requested_model_id != requested_model_id) {
+      detail::OpenVulkanMattingSetupSnapshot setup_state;
+      setup_state.has_model_pack = model_pack.has_value();
+      setup_state.has_matting_session = static_cast<bool>(matting_session);
+      setup_state.session_initialized = matting_session_initialized;
+      setup_state.session_warmed = matting_session_warmed;
+      setup_state.session_frame_w = matting_session_frame_w;
+      setup_state.session_frame_h = matting_session_frame_h;
+      setup_state.active_model_id = active_model_id;
+      setup_state.active_requested_model_id = active_requested_model_id;
+      const auto setup_decision = detail::DecideOpenVulkanMattingSetup(
+          setup_state, frame_w, frame_h, requested_model_id);
+
+      if (setup_decision.scan_model_registry) {
+        const auto registry =
+            studiocast::open_video::ModelPackRegistry::ScanDefault();
+        const std::string model_id =
+            ResolveMattingModelId(registry, requested_model_id);
+        if (model_id.empty()) {
+          last_error = "Open Vulkan: no matting model pack is installed.";
+          if (error_out)
+            *error_out = last_error;
+          return false;
+        }
+
         auto resolved = registry.Find("matting", model_id);
         if (!resolved) {
           last_error = "Open Vulkan: matting model pack '" + model_id +
@@ -3775,6 +3837,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
 
         matting_session.reset();
+        ResetMattingSessionState();
         model_pack = std::move(resolved);
         active_model_id = model_id;
         active_requested_model_id = requested_model_id;
@@ -3795,17 +3858,29 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return false;
       }
 
-      if (!matting_session->EnsureInitialized(frame_w, frame_h, &e)) {
-        last_error = "Open Vulkan: " + e;
-        if (error_out)
-          *error_out = last_error;
-        return false;
+      if (setup_decision.initialize_session) {
+        if (!matting_session->EnsureInitialized(frame_w, frame_h, &e)) {
+          matting_session_initialized = false;
+          matting_session_warmed = false;
+          last_error = "Open Vulkan: " + e;
+          if (error_out)
+            *error_out = last_error;
+          return false;
+        }
+        matting_session_initialized = true;
+        matting_session_warmed = false;
+        matting_session_frame_w = frame_w;
+        matting_session_frame_h = frame_h;
       }
-      if (!matting_session->Warmup(&e)) {
-        last_error = "Open Vulkan: " + e;
-        if (error_out)
-          *error_out = last_error;
-        return false;
+      if (setup_decision.warmup_session || !matting_session_warmed) {
+        if (!matting_session->Warmup(&e)) {
+          matting_session_warmed = false;
+          last_error = "Open Vulkan: " + e;
+          if (error_out)
+            *error_out = last_error;
+          return false;
+        }
+        matting_session_warmed = true;
       }
 
       RefreshMatteArtifactKey(frame_w, frame_h);
@@ -3874,25 +3949,30 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error_out = "Open Vulkan: virtual_background.replace_path not set.";
         return false;
       }
-
-      std::error_code ec;
-      const auto mtime = std::filesystem::last_write_time(path, ec);
-      if (ec) {
+      if (!prepared_bg_src.valid || prepared_bg_src.path != path) {
         if (error_out)
-          *error_out = "Open Vulkan: failed to stat replace image: " +
-                       ec.message();
+          *error_out = prepared_bg_src.error.empty()
+                           ? "Open Vulkan: replace image was not prepared."
+                           : "Open Vulkan: " + prepared_bg_src.error;
         return false;
       }
 
-      const bool src_cache_hit =
-          cached_bg_src_valid && cached_bg_src_path == path &&
-          cached_bg_src_mtime == mtime && bg_src_rgb.Valid();
-      if (!src_cache_hit) {
+      const detail::ReplaceBackgroundSourceCacheSnapshot source_cache{
+          cached_bg_src_path, cached_bg_src_mtime,
+          cached_bg_src_valid && bg_src_rgb.Valid(), cached_bg_src_gen};
+      const detail::ReplaceBackgroundResizeCacheSnapshot resize_cache{
+          cached_bg_dst_w, cached_bg_dst_h,
+          cached_bg_dst_valid && bg_rgb.Valid(), cached_bg_dst_src_gen};
+      const auto cache_decision = detail::DecideReplaceBackgroundFrameCache(
+          prepared_bg_src, source_cache, resize_cache, width, height);
+
+      if (cache_decision.refresh_source) {
         int iw = 0;
         int ih = 0;
         std::string img_err;
-        if (!studiocast::video::LoadImageRgb24(
-                path, &iw, &ih, &tmp_replace_rgb_src, &img_err)) {
+        if (!studiocast::video::LoadImageRgb24(prepared_bg_src.path, &iw, &ih,
+                                               &tmp_replace_rgb_src,
+                                               &img_err)) {
           if (error_out)
             *error_out =
                 "Open Vulkan: failed to load replace image: " + img_err;
@@ -3909,20 +3989,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
         ++background_upload_calls;
 
-        cached_bg_src_path = path;
-        cached_bg_src_mtime = mtime;
+        cached_bg_src_path = prepared_bg_src.path;
+        cached_bg_src_mtime = prepared_bg_src.mtime;
         cached_bg_src_w = iw;
         cached_bg_src_h = ih;
         cached_bg_src_valid = true;
-        ++cached_bg_src_gen;
+        cached_bg_src_gen = cache_decision.source_generation_after_refresh;
         cached_bg_dst_valid = false;
       }
 
-      const bool dst_cache_hit =
-          cached_bg_dst_valid && cached_bg_dst_w == width &&
-          cached_bg_dst_h == height &&
-          cached_bg_dst_src_gen == cached_bg_src_gen && bg_rgb.Valid();
-      if (dst_cache_hit) {
+      if (!cache_decision.refresh_resized_destination) {
         return true;
       }
 
@@ -4067,12 +4143,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::string ierr;
       if (!alpha_model.Invalidate(&ierr)) {
         if (error_out)
-          *error_out =
-              "Open Vulkan: failed to invalidate alpha image: " + ierr;
+          *error_out = "Open Vulkan: failed to invalidate alpha image: " + ierr;
         return false;
       }
-      const auto count = static_cast<std::size_t>(matte_w) *
-                         static_cast<std::size_t>(matte_h);
+      const auto count =
+          static_cast<std::size_t>(matte_w) * static_cast<std::size_t>(matte_h);
       const auto *src = static_cast<const float *>(alpha_model.mapped());
       alpha_cpu.assign(src, src + count);
       ++alpha_download_calls;
@@ -4163,8 +4238,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
         ++composite_dispatch_calls;
         ++forced_sync_calls;
-      } else if (fx.virtual_background.mode ==
-                 VirtualBackgroundMode::remove) {
+      } else if (fx.virtual_background.mode == VirtualBackgroundMode::remove) {
         std::uint32_t rgb_hex = 0x000000u;
         if (!ParseRgbHex(fx.virtual_background.remove_color, &rgb_hex)) {
           rgb_hex = 0x000000u;
@@ -4176,25 +4250,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         if (!kernels.CompositeAlphaSolidU8x3(in_rgb, *alpha_use, r, g, b,
                                              *out_rgb_img, &kerr)) {
           if (error_out)
-            *error_out =
-                "Open Vulkan: composite(solid) failed: " + kerr;
+            *error_out = "Open Vulkan: composite(solid) failed: " + kerr;
           return false;
         }
         ++composite_dispatch_calls;
         ++forced_sync_calls;
-      } else if (fx.virtual_background.mode ==
-                 VirtualBackgroundMode::replace) {
+      } else if (fx.virtual_background.mode == VirtualBackgroundMode::replace) {
         if (!EnsureReplaceBackgroundGpu(
-                width, height, fx.virtual_background.replace_path,
-                error_out)) {
+                width, height, fx.virtual_background.replace_path, error_out)) {
           return false;
         }
         std::string kerr;
         if (!kernels.CompositeAlphaU8x3(in_rgb, bg_rgb, *alpha_use,
                                         *out_rgb_img, &kerr)) {
           if (error_out)
-            *error_out =
-                "Open Vulkan: composite(replace) failed: " + kerr;
+            *error_out = "Open Vulkan: composite(replace) failed: " + kerr;
           return false;
         }
         ++composite_dispatch_calls;
@@ -4681,8 +4751,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                        out_aspect, knobs);
       } else {
         const float strength01 =
-            std::clamp(static_cast<float>(knobs.strength) / 100.0f, 0.0f,
-                       1.0f);
+            std::clamp(static_cast<float>(knobs.strength) / 100.0f, 0.0f, 1.0f);
         const float zoom = 1.0f + strength01 * 0.5f; // up to ~1.5x
         target_crop =
             studiocast::maxine::effects::ArAutoFrameTracker::CenterCrop(
@@ -4718,8 +4787,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (std::abs(crop_smoothed_px.x) <= kEpsPx &&
           std::abs(crop_smoothed_px.y) <= kEpsPx &&
           std::abs(crop_smoothed_px.w - static_cast<float>(width)) <= kEpsPx &&
-          std::abs(crop_smoothed_px.h - static_cast<float>(height)) <=
-              kEpsPx) {
+          std::abs(crop_smoothed_px.h - static_cast<float>(height)) <= kEpsPx) {
         return true;
       }
 
@@ -5312,18 +5380,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = init_err;
         return false;
       }
-      if (!matte->EnsureFrameAlphaForFrameGpu(
-              in_rgb, capture_sequence, in_rgb.width(), in_rgb.height(), fx,
-              error)) {
+      if (!matte->EnsureFrameAlphaForFrameGpu(in_rgb, capture_sequence,
+                                              in_rgb.width(), in_rgb.height(),
+                                              fx, error)) {
         if (error && !error->empty()) {
           *error = "Open Vulkan Virtual Key Light: " + *error;
         }
         return false;
       }
-      if (!matte->EnsureImage(
-              out_rgb_img, in_rgb.width(), in_rgb.height(),
-              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "key_light_out", error)) {
+      if (!matte->EnsureImage(out_rgb_img, in_rgb.width(), in_rgb.height(),
+                              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                              /*map_memory=*/true, "key_light_out", error)) {
         return false;
       }
 
@@ -5431,8 +5498,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         std::string vk_err;
         if (!matte->kernels.Initialize(&vk_err)) {
           last_error =
-              "Open Vulkan Auto Frame: utility kernels unavailable: " +
-              vk_err;
+              "Open Vulkan Auto Frame: utility kernels unavailable: " + vk_err;
           if (error)
             *error = last_error;
           return false;
@@ -5549,9 +5615,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       TrackingBox resolved_box;
       bool found = false;
-      if (tracking_box &&
-          OpenCudaAutoFrameContext::IsUsableTrackingBox(*tracking_box, width,
-                                                        height)) {
+      if (tracking_box && OpenCudaAutoFrameContext::IsUsableTrackingBox(
+                              *tracking_box, width, height)) {
         resolved_box = *tracking_box;
         found = true;
       } else if (!tracking_provider_ran) {
@@ -5584,8 +5649,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                        out_aspect, knobs);
       } else {
         const float strength01 =
-            std::clamp(static_cast<float>(knobs.strength) / 100.0f, 0.0f,
-                       1.0f);
+            std::clamp(static_cast<float>(knobs.strength) / 100.0f, 0.0f, 1.0f);
         const float zoom = 1.0f + strength01 * 0.5f;
         target_crop =
             studiocast::maxine::effects::ArAutoFrameTracker::CenterCrop(
@@ -5619,8 +5683,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (std::abs(crop_smoothed_px.x) <= kEpsPx &&
           std::abs(crop_smoothed_px.y) <= kEpsPx &&
           std::abs(crop_smoothed_px.w - static_cast<float>(width)) <= kEpsPx &&
-          std::abs(crop_smoothed_px.h - static_cast<float>(height)) <=
-              kEpsPx) {
+          std::abs(crop_smoothed_px.h - static_cast<float>(height)) <= kEpsPx) {
         return true;
       }
 
@@ -5636,9 +5699,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                    const studiocast::vulkan::VulkanImage &in_rgb,
                    studiocast::vulkan::VulkanImage *out_rgb,
                    const studiocast::video::effects::BroadcastCameraEffects &fx,
-                   const TrackingBox *tracking_box,
-                   bool tracking_provider_ran, DeferredGpuOut *deferred_out,
-                   std::string *error) {
+                   const TrackingBox *tracking_box, bool tracking_provider_ran,
+                   DeferredGpuOut *deferred_out, std::string *error) {
       if (!fx.auto_frame.enabled)
         return true;
       if (!matte || !out_rgb || !deferred_out) {
@@ -5682,9 +5744,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return false;
       }
       std::string kerr;
-      if (!matte->kernels.CropResizeBilinear(
-              in_rgb, *out_rgb, plan.crop_px.x, plan.crop_px.y,
-              plan.crop_px.w, plan.crop_px.h, &kerr)) {
+      if (!matte->kernels.CropResizeBilinear(in_rgb, *out_rgb, plan.crop_px.x,
+                                             plan.crop_px.y, plan.crop_px.w,
+                                             plan.crop_px.h, &kerr)) {
         if (error)
           *error = "Open Vulkan Auto Frame: GPU crop/resize failed: " + kerr;
         return false;
@@ -7701,8 +7763,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   };
 
   auto rebuildChain = [&](const studiocast::video::effects::
-                              BroadcastCameraEffects &fx) {
+                              BroadcastCameraEffects &fx,
+                          const detail::PreparedReplaceBackgroundSource
+                              &replace_source,
+                          std::uint64_t effects_generation) {
     chain.Clear();
+    open_cuda_vb.ConfigureReplaceBackgroundSource(replace_source);
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    open_vulkan_vb.ConfigureReplaceBackgroundSource(replace_source);
+#endif
 
     auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(fx);
 
@@ -7888,8 +7957,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
       remove_stage_from_plan(
           studiocast::video::effects::contract::kEffectIdEyeContact);
-      remove_stage_from_plan(studiocast::video::effects::contract::
-                                 kEffectIdVirtualBackgroundBlur);
+      remove_stage_from_plan(
+          studiocast::video::effects::contract::kEffectIdVirtualBackgroundBlur);
       remove_stage_from_plan(studiocast::video::effects::contract::
                                  kEffectIdVirtualBackgroundRemove);
       remove_stage_from_plan(studiocast::video::effects::contract::
@@ -8184,8 +8253,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (vb_effect_id.has_value())
             remove_stage_from_plan(*vb_effect_id);
         }
-      } else if (fx.engine ==
-          studiocast::video::effects::EffectsEnginePreference::open_cuda) {
+      } else if (fx.engine == studiocast::video::effects::
+                                  EffectsEnginePreference::open_cuda) {
         want_open_cuda_vb = true;
         std::string oc_err;
         if (open_cuda_vb.EnsureInitialized(capA.width, capA.height, fx,
@@ -8502,8 +8571,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
         want_open_vulkan_key_light = true;
         std::string vk_err;
-        if (open_vulkan_key_light.EnsureInitialized(capA.width, capA.height,
-                                                    fx, &vk_err)) {
+        if (open_vulkan_key_light.EnsureInitialized(capA.width, capA.height, fx,
+                                                    &vk_err)) {
           have_open_vulkan_key_light = true;
           compute_available.vulkan_available = true;
           set_backend(stage_id, "open_vulkan");
@@ -8653,11 +8722,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       const bool have_any_maxine_compute =
           have_maxine_bg_blur || have_maxine_auto_frame ||
-          have_maxine_eye_contact || have_maxine_relight ||
-          have_maxine_denoise;
-      const bool have_any_vulkan_compute =
-          have_open_vulkan_vb || have_open_vulkan_auto_frame ||
-          have_open_vulkan_key_light;
+          have_maxine_eye_contact || have_maxine_relight || have_maxine_denoise;
+      const bool have_any_vulkan_compute = have_open_vulkan_vb ||
+                                           have_open_vulkan_auto_frame ||
+                                           have_open_vulkan_key_light;
       const bool have_any_cuda_compute =
           have_any_maxine_compute || have_open_cuda_vb ||
           have_open_cuda_auto_frame || have_open_cuda_key_light ||
@@ -8741,16 +8809,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     appliedPlan = plan;
     appliedFx = fx;
+    appliedEffectsGeneration = effects_generation;
   };
 
   // Initial chain based on config at pipeline start.
   {
     studiocast::video::effects::BroadcastCameraEffects fx;
+    detail::PreparedReplaceBackgroundSource replace_source;
+    std::uint64_t effects_generation = 0;
     {
       std::lock_guard<std::mutex> fxLock(effects_mu_);
       fx = effects_;
+      replace_source = replace_background_source_;
+      effects_generation = effects_generation_;
     }
-    rebuildChain(fx);
+    rebuildChain(fx, replace_source, effects_generation);
   }
 
   struct Ema {
@@ -8940,14 +9013,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 
     CaptureFormat fallback = cap.Actual();
-    if (fallback.format != CapturePixelFormat::yuyv || fallback.width != old_w ||
-        fallback.height != old_h) {
+    if (fallback.format != CapturePixelFormat::yuyv ||
+        fallback.width != old_w || fallback.height != old_h) {
       if (error) {
         std::ostringstream oss;
-        oss << reason << " Raw YUYV fallback negotiated "
-            << fallback.width << "x" << fallback.height << " "
-            << fallback.pixfmt << ", expected " << old_w << "x" << old_h
-            << " YUYV.";
+        oss << reason << " Raw YUYV fallback negotiated " << fallback.width
+            << "x" << fallback.height << " " << fallback.pixfmt << ", expected "
+            << old_w << "x" << old_h << " YUYV.";
         *error = oss.str();
       }
       return false;
@@ -9420,12 +9492,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool fx_failed = false;
     {
       studiocast::video::effects::BroadcastCameraEffects fx;
+      detail::PreparedReplaceBackgroundSource replace_source;
+      std::uint64_t effects_generation = 0;
       {
         std::lock_guard<std::mutex> fxLock(effects_mu_);
         fx = effects_;
+        replace_source = replace_background_source_;
+        effects_generation = effects_generation_;
       }
-      if (fx != appliedFx) {
-        rebuildChain(fx);
+      if (fx != appliedFx || effects_generation != appliedEffectsGeneration) {
+        rebuildChain(fx, replace_source, effects_generation);
       }
 
       studiocast::video::effects::Rgb24FrameView view;
@@ -9499,8 +9575,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       const bool open_vulkan_key_light_stage_enabled =
           have_open_vulkan_key_light &&
-          has_stage(studiocast::video::effects::contract::
-                        kEffectIdVirtualKeyLight);
+          has_stage(
+              studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
       const bool open_vulkan_auto_frame_stage_enabled =
           have_open_vulkan_auto_frame &&
           has_stage(studiocast::video::effects::contract::kEffectIdAutoFrame);
@@ -9808,21 +9884,19 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
               ++open_vulkan_runtime_failure_frames;
               std::lock_guard<std::mutex> lock(mu_);
-              last_error_ =
-                  "Open Vulkan virtual key light failed: " + vk_err;
+              last_error_ = "Open Vulkan virtual key light failed: " + vk_err;
               return;
             }
 
             if (!open_vulkan_next) {
-              open_vulkan_next =
-                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                      ? &open_vulkan_vb.out_rgb
-                      : &open_vulkan_vb.frame_rgb;
+              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                                     ? &open_vulkan_vb.out_rgb
+                                     : &open_vulkan_vb.frame_rgb;
             }
 
             if (open_vulkan_key_light.ApplyVulkanRgb(
-                    *open_vulkan_curr, open_vulkan_next, fx,
-                    capture_sequence, &vk_err, &deferred_gpu_out)) {
+                    *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
+                    &vk_err, &deferred_gpu_out)) {
               if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
                 const bool curr_was_frame =
                     (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
@@ -9836,8 +9910,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   open_vulkan_auto_frame_stage_enabled &&
                   stage_appears_after(
                       stage_id,
-                      studiocast::video::effects::contract::
-                          kEffectIdAutoFrame);
+                      studiocast::video::effects::contract::kEffectIdAutoFrame);
               if (defer_readback) {
                 have_deferred_gpu_out = true;
                 return;
@@ -9983,16 +10056,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
               ++open_vulkan_runtime_failure_frames;
               std::lock_guard<std::mutex> lock(mu_);
-              last_error_ =
-                  "Open Vulkan virtual background failed: " + vk_err;
+              last_error_ = "Open Vulkan virtual background failed: " + vk_err;
               return;
             }
 
             if (!open_vulkan_next) {
-              open_vulkan_next =
-                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                      ? &open_vulkan_vb.out_rgb
-                      : &open_vulkan_vb.frame_rgb;
+              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                                     ? &open_vulkan_vb.out_rgb
+                                     : &open_vulkan_vb.frame_rgb;
             }
 
             if (!open_vulkan_vb.ApplyVulkanRgb(
@@ -10000,8 +10071,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &vk_err, &deferred_gpu_out)) {
               ++open_vulkan_runtime_failure_frames;
               std::lock_guard<std::mutex> lock(mu_);
-              last_error_ =
-                  "Open Vulkan virtual background failed: " + vk_err;
+              last_error_ = "Open Vulkan virtual background failed: " + vk_err;
               return;
             }
 
@@ -10428,10 +10498,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               return;
             }
             if (!open_vulkan_next) {
-              open_vulkan_next =
-                  open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                      ? &open_vulkan_vb.out_rgb
-                      : &open_vulkan_vb.frame_rgb;
+              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                                     ? &open_vulkan_vb.out_rgb
+                                     : &open_vulkan_vb.frame_rgb;
             }
 
             DeferredGpuOut auto_frame_gpu_out{};
@@ -10465,8 +10534,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 }
                 have_deferred_gpu_out = false;
               }
-              mark_open_vulkan_auto_frame_cpu_tail(
-                  tracking_tail_source, /*cpu_crop_resize=*/false);
+              mark_open_vulkan_auto_frame_cpu_tail(tracking_tail_source,
+                                                   /*cpu_crop_resize=*/false);
               return;
             }
 
@@ -10886,8 +10955,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::string gerr;
       bool ok = true;
 
-      if (!deferred_gpu_out.vulkan_img ||
-          !deferred_gpu_out.vulkan_kernels) {
+      if (!deferred_gpu_out.vulkan_img || !deferred_gpu_out.vulkan_kernels) {
         ok = false;
         gerr = "Deferred Open Vulkan output reference is incomplete.";
       }
@@ -10917,8 +10985,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           vulkan_rgb_scaled_allocated = true;
         }
         if (ok && !deferred_gpu_out.vulkan_kernels->ResizeBilinear(
-                      *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled,
-                      &gerr)) {
+                      *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
           ok = false;
         } else if (ok) {
           ++open_vulkan_forced_sync_calls;
@@ -10949,8 +11016,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         bool readback_ok = false;
         if (deferred_gpu_out.vulkan_img) {
           if (open_vulkan_vb.DownloadImageToRgb(*deferred_gpu_out.vulkan_img,
-                                                rgb.data(), rgbStride,
-                                                &derr)) {
+                                                rgb.data(), rgbStride, &derr)) {
             ++open_vulkan_download_calls;
             ++open_vulkan_cpu_continuation_download_calls;
             readback_ok = true;
@@ -11505,9 +11571,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const std::size_t tightStride = static_cast<std::size_t>(outW) * 3u;
       if (ok) {
         rgbScaled.resize(tightStride * static_cast<std::size_t>(outH));
-        if (!vulkan_scaler.resize.Resize(rgbOut, rgbOutStride,
-                                         rgbScaled.data(), tightStride,
-                                         &gerr)) {
+        if (!vulkan_scaler.resize.Resize(rgbOut, rgbOutStride, rgbScaled.data(),
+                                         tightStride, &gerr)) {
           ok = false;
         }
       }
@@ -11640,8 +11705,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     } else {
       // Output is YUYV; convert RGB -> YUYV into outBuf with output stride.
       Rgb24ToYuyvWithScratch(
-          rgbOut, outW, outH, rgbOutStride, outBuf.data(),
-          outA.bytes_per_line,
+          rgbOut, outW, outH, rgbOutStride, outBuf.data(), outA.bytes_per_line,
           yuyvConversionScratch.empty() ? nullptr
                                         : yuyvConversionScratch.data(),
           yuyvConversionScratch.size());
@@ -11786,7 +11850,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_cuda_frame_upload_calls + open_cuda_vb.matte_frame_upload_calls +
           open_cuda_denoise_tensor_upload_calls;
       open_cuda_transfers_.download_calls =
-          open_cuda_rgb_download_calls +
+          open_cuda_rgb_download_calls + open_cuda_vb.alpha_download_calls +
           open_cuda_denoise_tensor_download_calls;
       open_cuda_transfers_.final_download_calls =
           open_cuda_final_download_calls;
@@ -11824,8 +11888,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_cuda_denoise_cpu_tail_calls;
 
       open_vulkan_transfers_.active_frames = open_vulkan_active_frames;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      open_vulkan_transfers_.upload_calls =
+          open_vulkan_upload_calls + open_vulkan_vb.background_upload_calls;
+      open_vulkan_transfers_.download_calls =
+          open_vulkan_download_calls + open_vulkan_vb.alpha_download_calls;
+#else
       open_vulkan_transfers_.upload_calls = open_vulkan_upload_calls;
       open_vulkan_transfers_.download_calls = open_vulkan_download_calls;
+#endif
       open_vulkan_transfers_.final_download_calls =
           open_vulkan_final_download_calls;
       open_vulkan_transfers_.cpu_continuation_download_calls =

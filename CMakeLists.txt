@@ -364,6 +364,10 @@ add_library(studiocast_core
         src/core/video/v4l2_capture.cpp
         src/core/video/camera_pipeline.h
         src/core/video/camera_pipeline.cpp
+        src/core/video/open_vulkan_matting_setup_policy.h
+        src/core/video/open_vulkan_matting_setup_policy.cpp
+        src/core/video/replace_background_cache_policy.h
+        src/core/video/replace_background_cache_policy.cpp
         src/core/video/camera_effects_json.h
         src/core/video/camera_effects_json.cpp
         src/core/video/broadcast_camera_effects_json.h
@@ -1253,6 +1257,8 @@ if (BUILD_TESTING)
             tests/open_video_denoise_contract_tests.cpp
             tests/frame_artifact_cache_tests.cpp
             tests/cuda_kernel_cache_tests.cpp
+            tests/open_vulkan_matting_setup_policy_tests.cpp
+            tests/replace_background_cache_policy_tests.cpp
             tests/v4l2_capture_negotiation_tests.cpp
             tests/video_effect_cpu_tests.cpp
             tests/rgb_yuyv_convert_tests.cpp

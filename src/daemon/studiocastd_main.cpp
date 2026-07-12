@@ -1291,6 +1291,25 @@ std::string DiagnosticUnavailableReason(const EngineDiagnosticsSummary &diag) {
   return "diagnostics_unavailable";
 }
 
+std::string DiagnosticBlockedOrDegradedReason(
+    const EngineDiagnosticsSummary &diag) {
+  if (!diag.present)
+    return {};
+  if (!diag.degraded_reason.empty())
+    return diag.degraded_reason;
+  if (!diag.fallback_reason.empty())
+    return diag.fallback_reason;
+  if (!diag.blocked_reason.empty())
+    return diag.blocked_reason;
+  if (!diag.blocked_effects.empty())
+    return diag.blocked_effects.begin()->second;
+  if (!diag.error.empty())
+    return diag.error;
+  if (!diag.summary.empty())
+    return diag.summary;
+  return {};
+}
+
 std::string NormalizeComputeEngineName(const std::string &backend) {
   if (backend == "cuda" || backend == "open_cuda" ||
       backend == "open_video")
@@ -1503,29 +1522,36 @@ void AppendVideoComputeStatusJson(
   oss << "\"transfers\":{";
   oss << "\"open_cuda\":{";
   oss << "\"active_frames\":" << cu.active_frames << ",";
-  oss << "\"uploads\":"
-      << (cu.upload_calls + cu.matte_frame_upload_calls +
-          cu.denoise_tensor_upload_calls + cu.standalone_scaler_upload_calls)
+  oss << "\"uploads\":" << cu.upload_calls << ",";
+  oss << "\"downloads\":" << cu.download_calls << ",";
+  oss << "\"final_downloads\":" << cu.final_download_calls << ",";
+  oss << "\"cpu_continuation_downloads\":" << cu.cpu_continuation_download_calls
       << ",";
-  oss << "\"downloads\":"
-      << (cu.download_calls + cu.final_download_calls +
-          cu.cpu_continuation_download_calls + cu.alpha_download_calls +
-          cu.denoise_tensor_download_calls +
-          cu.standalone_scaler_download_calls)
+  oss << "\"alpha_downloads\":" << cu.alpha_download_calls << ",";
+  oss << "\"matte_frame_uploads\":" << cu.matte_frame_upload_calls << ",";
+  oss << "\"standalone_scaler_uploads\":" << cu.standalone_scaler_upload_calls
+      << ",";
+  oss << "\"standalone_scaler_downloads\":"
+      << cu.standalone_scaler_download_calls << ",";
+  oss << "\"denoise_tensor_uploads\":" << cu.denoise_tensor_upload_calls << ",";
+  oss << "\"denoise_tensor_downloads\":" << cu.denoise_tensor_download_calls
       << ",";
   oss << "\"forced_syncs\":" << cu.forced_sync_calls;
   oss << "},";
   oss << "\"open_vulkan\":{";
   oss << "\"active_frames\":" << vk.active_frames << ",";
-  oss << "\"uploads\":"
-      << (vk.upload_calls + vk.matte_frame_upload_calls +
-          vk.background_upload_calls + vk.standalone_scaler_upload_calls)
+  oss << "\"uploads\":" << vk.upload_calls << ",";
+  oss << "\"downloads\":" << vk.download_calls << ",";
+  oss << "\"final_downloads\":" << vk.final_download_calls << ",";
+  oss << "\"cpu_continuation_downloads\":" << vk.cpu_continuation_download_calls
       << ",";
-  oss << "\"downloads\":"
-      << (vk.download_calls + vk.final_download_calls +
-          vk.cpu_continuation_download_calls + vk.alpha_download_calls +
-          vk.standalone_scaler_download_calls)
+  oss << "\"alpha_downloads\":" << vk.alpha_download_calls << ",";
+  oss << "\"matte_frame_uploads\":" << vk.matte_frame_upload_calls << ",";
+  oss << "\"background_uploads\":" << vk.background_upload_calls << ",";
+  oss << "\"standalone_scaler_uploads\":" << vk.standalone_scaler_upload_calls
       << ",";
+  oss << "\"standalone_scaler_downloads\":"
+      << vk.standalone_scaler_download_calls << ",";
   oss << "\"dispatches\":"
       << (vk.preprocess_dispatch_calls + vk.alpha_resize_dispatch_calls +
           vk.blur_dispatch_calls + vk.composite_dispatch_calls +
@@ -1538,11 +1564,14 @@ void AppendVideoComputeStatusJson(
   oss << "\"maxine\":{";
   oss << "\"active_frames\":" << mx.active_frames << ",";
   oss << "\"uploads\":" << mx.upload_calls << ",";
-  oss << "\"downloads\":"
-      << (mx.download_calls + mx.final_download_calls +
-          mx.cpu_continuation_download_calls +
-          mx.standalone_scaler_download_calls)
+  oss << "\"downloads\":" << mx.download_calls << ",";
+  oss << "\"final_downloads\":" << mx.final_download_calls << ",";
+  oss << "\"cpu_continuation_downloads\":" << mx.cpu_continuation_download_calls
       << ",";
+  oss << "\"standalone_scaler_uploads\":" << mx.standalone_scaler_upload_calls
+      << ",";
+  oss << "\"standalone_scaler_downloads\":"
+      << mx.standalone_scaler_download_calls << ",";
   oss << "\"forced_syncs\":" << mx.forced_sync_calls << ",";
   oss << "\"deferred_readbacks\":" << mx.deferred_readbacks;
   oss << "}";
@@ -1640,8 +1669,12 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
       computeActive = "cpu";
       if (computeFallback.empty()) {
         computeFallback =
-            "Vulkan compute backend requested, but Vulkan compute is not "
-            "available in this build.";
+            DiagnosticBlockedOrDegradedReason(computeOpenVulkanDiag);
+        if (computeFallback.empty()) {
+          computeFallback =
+              "Vulkan compute backend requested, but Vulkan compute is not "
+              "available in this build.";
+        }
       }
       if (computeDegraded.empty())
         computeDegraded = computeFallback;

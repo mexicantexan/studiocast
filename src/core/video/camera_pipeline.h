@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/video/effects/broadcast_effects.h"
+#include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
 
@@ -66,9 +67,10 @@ bool ParseComputeBackendPreference(std::string_view value,
 ComputeBackendPreference
 ParseComputeBackendPreferenceOr(std::string_view value,
                                 ComputeBackendPreference fallback);
-ComputeBackendSelection ResolveComputeBackendSelection(
-    ComputeBackendPreference pref, const ComputeBackendAvailability &available,
-    bool compute_work_requested);
+ComputeBackendSelection
+ResolveComputeBackendSelection(ComputeBackendPreference pref,
+                               const ComputeBackendAvailability &available,
+                               bool compute_work_requested);
 
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0
@@ -412,6 +414,8 @@ private:
   // Effects: updated live by SetEffects.
   mutable std::mutex effects_mu_;
   studiocast::video::effects::BroadcastCameraEffects effects_{};
+  detail::PreparedReplaceBackgroundSource replace_background_source_{};
+  std::uint64_t effects_generation_ = 0;
 
   // Effect runtime info (written by pipeline thread when effects chain
   // changes).

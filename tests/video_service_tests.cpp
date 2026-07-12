@@ -37,6 +37,14 @@ bool TestOpenCudaF32ResizeBorderContractIsReplicateNoGpuSafe();
 bool TestOpenCudaAlphaClampAndSolidBgrContractNoGpuSafe();
 bool TestCudaU8ResizeRoundingContractIsNoGpuSafe();
 bool TestCudaResizeAvailabilityProbeIsThreadSafe();
+bool TestOpenVulkanMattingFirstUseDoesSetupWork();
+bool TestOpenVulkanMattingRepeatedFramesDoNotRepeatSetupWork();
+bool TestOpenVulkanMattingModelIdChangeTriggersSetupWork();
+bool TestOpenVulkanMattingFrameSizeChangeOnlyRefreshesSession();
+bool TestOpenVulkanMattingRepeatedFrameProcessingKeepsSetupCountersStable();
+bool TestReplaceBackgroundRepeatedFramePathDoesNotStatImage();
+bool TestReplaceBackgroundSamePathExplicitRefreshUsesPreparedMtime();
+bool TestReplaceBackgroundFrameSizeChangeOnlyRefreshesResizedBackground();
 bool TestV4l2CapturePreferenceTreats720pAsMjpegWorthy();
 bool TestV4l2YuyvRequestTriesMjpegFirstAtHdWhenPreferred();
 bool TestV4l2YuyvRequestFallsBackToMjpegAfterYuyvAtLowResolution();
@@ -985,7 +993,8 @@ bool TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers() {
           /*have_deferred_gpu_out=*/true,
           /*allow_cpu_resize=*/false,
           /*same_backend_effects_ran=*/true)) {
-    std::cerr << "standalone GPU scaler should skip when no scaling is needed\n";
+    std::cerr
+        << "standalone GPU scaler should skip when no scaling is needed\n";
     return false;
   }
 
@@ -1024,9 +1033,9 @@ bool TestComputeBackendSelectionPolicyIsNoGpuSafe() {
   available.cuda_available = false;
   available.vulkan_available = true;
   available.cuda_unavailable_reason = "cuda unavailable";
-  selected = ResolveComputeBackendSelection(
-      ComputeBackendPreference::cuda, available,
-      /*compute_work_requested=*/true);
+  selected =
+      ResolveComputeBackendSelection(ComputeBackendPreference::cuda, available,
+                                     /*compute_work_requested=*/true);
   if (selected.resolved != ComputeBackendKind::cpu || !selected.degraded ||
       selected.fallback_reason.empty()) {
     std::cerr << "explicit CUDA should degrade visibly to CPU instead of "
@@ -1037,9 +1046,9 @@ bool TestComputeBackendSelectionPolicyIsNoGpuSafe() {
   available.cuda_available = true;
   available.vulkan_available = false;
   available.vulkan_unavailable_reason = "vulkan unavailable";
-  selected = ResolveComputeBackendSelection(
-      ComputeBackendPreference::vulkan, available,
-      /*compute_work_requested=*/true);
+  selected = ResolveComputeBackendSelection(ComputeBackendPreference::vulkan,
+                                            available,
+                                            /*compute_work_requested=*/true);
   if (selected.resolved != ComputeBackendKind::cpu || !selected.degraded ||
       selected.fallback_reason.empty()) {
     std::cerr << "explicit Vulkan should degrade visibly to CPU instead of "
@@ -1148,12 +1157,33 @@ int main() {
        &studiocast::tests::
            TestOpenCudaF32ResizeBorderContractIsReplicateNoGpuSafe},
       {"Open CUDA alpha clamp and solid BGR contract are no-GPU safe",
-       &studiocast::tests::
-           TestOpenCudaAlphaClampAndSolidBgrContractNoGpuSafe},
+       &studiocast::tests::TestOpenCudaAlphaClampAndSolidBgrContractNoGpuSafe},
       {"CUDA u8 resize rounding contract is no-GPU safe",
        &studiocast::tests::TestCudaU8ResizeRoundingContractIsNoGpuSafe},
       {"CUDA resize availability probe is thread-safe",
        &studiocast::tests::TestCudaResizeAvailabilityProbeIsThreadSafe},
+      {"Open Vulkan matting first use does setup work",
+       &studiocast::tests::TestOpenVulkanMattingFirstUseDoesSetupWork},
+      {"Open Vulkan matting repeated frames skip setup work",
+       &studiocast::tests::
+           TestOpenVulkanMattingRepeatedFramesDoNotRepeatSetupWork},
+      {"Open Vulkan matting model id change refreshes setup",
+       &studiocast::tests::TestOpenVulkanMattingModelIdChangeTriggersSetupWork},
+      {"Open Vulkan matting frame size change only refreshes session",
+       &studiocast::tests::
+           TestOpenVulkanMattingFrameSizeChangeOnlyRefreshesSession},
+      {"Open Vulkan matting repeated frame processing keeps setup stable",
+       &studiocast::tests::
+           TestOpenVulkanMattingRepeatedFrameProcessingKeepsSetupCountersStable},
+      {"replace background repeated frames do not stat image",
+       &studiocast::tests::
+           TestReplaceBackgroundRepeatedFramePathDoesNotStatImage},
+      {"replace background same-path refresh uses prepared mtime",
+       &studiocast::tests::
+           TestReplaceBackgroundSamePathExplicitRefreshUsesPreparedMtime},
+      {"replace background frame size change refreshes resize only",
+       &studiocast::tests::
+           TestReplaceBackgroundFrameSizeChangeOnlyRefreshesResizedBackground},
       {"V4L2 capture treats 720p as MJPEG-worthy",
        &studiocast::tests::TestV4l2CapturePreferenceTreats720pAsMjpegWorthy},
       {"V4L2 YUYV request tries MJPEG first at HD when preferred",

@@ -490,6 +490,112 @@ bool TestVideoComputeStatusReportsCachedCountersAndProvider() {
                 "transfer summary should include forced sync count");
 }
 
+bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  videoStatus.service_running = true;
+  videoStatus.virtual_device_present = true;
+  videoStatus.virtual_device_available = true;
+  videoStatus.pipeline.running = true;
+
+  auto &cu = videoStatus.pipeline.open_cuda_transfers;
+  cu.upload_calls = 17;
+  cu.download_calls = 19;
+  cu.matte_frame_upload_calls = 5;
+  cu.standalone_scaler_upload_calls = 7;
+  cu.denoise_tensor_upload_calls = 11;
+  cu.final_download_calls = 3;
+  cu.cpu_continuation_download_calls = 4;
+  cu.alpha_download_calls = 6;
+  cu.standalone_scaler_download_calls = 8;
+  cu.denoise_tensor_download_calls = 10;
+
+  auto &vk = videoStatus.pipeline.open_vulkan_transfers;
+  vk.upload_calls = 23;
+  vk.download_calls = 29;
+  vk.background_upload_calls = 13;
+  vk.standalone_scaler_upload_calls = 17;
+  vk.final_download_calls = 19;
+  vk.cpu_continuation_download_calls = 2;
+  vk.alpha_download_calls = 3;
+  vk.standalone_scaler_download_calls = 5;
+
+  auto &mx = videoStatus.pipeline.maxine_transfers;
+  mx.upload_calls = 31;
+  mx.download_calls = 37;
+  mx.final_download_calls = 7;
+  mx.cpu_continuation_download_calls = 11;
+  mx.standalone_scaler_upload_calls = 13;
+  mx.standalone_scaler_download_calls = 17;
+
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.enabled = true;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(
+          StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                       std::filesystem::path("/tmp/studiocastd-test.sock"),
+                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                       /*loopbackJson=*/""),
+          &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *compute =
+      ObjectAt(*video, "compute", "video.compute should exist");
+  if (!compute)
+    return false;
+  const JsonObject *transfers =
+      ObjectAt(*compute, "transfers", "compute transfers should exist");
+  if (!transfers)
+    return false;
+
+  const JsonObject *openCuda =
+      ObjectAt(*transfers, "open_cuda", "open_cuda transfers should exist");
+  const JsonObject *openVulkan =
+      ObjectAt(*transfers, "open_vulkan", "open_vulkan transfers should exist");
+  const JsonObject *maxine =
+      ObjectAt(*transfers, "maxine", "maxine transfers should exist");
+  if (!openCuda || !openVulkan || !maxine)
+    return false;
+
+  return Expect(JsonNumberField(*openCuda, "uploads", -1.0) == 17.0,
+                "Open CUDA uploads should be the aggregate total") &&
+         Expect(JsonNumberField(*openCuda, "downloads", -1.0) == 19.0,
+                "Open CUDA downloads should be the aggregate total") &&
+         Expect(JsonNumberField(*openCuda, "matte_frame_uploads", -1.0) == 5.0,
+                "Open CUDA matte upload subcounter should remain available") &&
+         Expect(
+             JsonNumberField(*openCuda, "denoise_tensor_downloads", -1.0) ==
+                 10.0,
+             "Open CUDA denoise download subcounter should remain available") &&
+         Expect(JsonNumberField(*openVulkan, "uploads", -1.0) == 23.0,
+                "Open Vulkan uploads should be the aggregate total") &&
+         Expect(JsonNumberField(*openVulkan, "downloads", -1.0) == 29.0,
+                "Open Vulkan downloads should be the aggregate total") &&
+         Expect(JsonNumberField(*openVulkan, "background_uploads", -1.0) ==
+                    13.0,
+                "Open Vulkan background upload subcounter should remain "
+                "available") &&
+         Expect(JsonNumberField(*maxine, "uploads", -1.0) == 31.0,
+                "Maxine uploads should be the aggregate total") &&
+         Expect(JsonNumberField(*maxine, "downloads", -1.0) == 37.0,
+                "Maxine downloads should be the aggregate total") &&
+         Expect(JsonNumberField(*maxine, "standalone_scaler_downloads", -1.0) ==
+                    17.0,
+                "Maxine scaler download subcounter should remain available");
+}
+
 bool TestVideoConfigMapsComputeBackendPreference() {
   studiocast::config::DaemonConfig daemonConfig;
   daemonConfig.video_compute_backend = "cuda";
@@ -656,14 +762,59 @@ bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
       "\"open_vulkan_matting_unavailable\"},"
       "\"installed_models\":[\"modnet-webnn-256-fp32\"],"
       "\"default_model_id\":\"modnet-webnn-256-fp32\","
-      "\"blocked_reason\":\"open_vulkan_matting_unavailable\"}";
+      "\"blocked_reason\":\"open_vulkan_matting_unavailable\","
+      "\"degraded_reason\":\"Open Vulkan runtime is available, but no "
+      "production device-resident matting inference runtime is available.\"}";
 
-  const ReadinessFields entry = ReadinessEntryFor(
-      StatusForVideoConfigWithDiagnostics(videoConfig, /*maxineJson=*/"",
-                                          /*openCudaJson=*/"",
-                                          openVulkanJson),
-      "virtual_background.blur");
+  const std::string statusJson = StatusForVideoConfigWithDiagnostics(
+      videoConfig, /*maxineJson=*/"", /*openCudaJson=*/"", openVulkanJson);
+
+  const ReadinessFields entry =
+      ReadinessEntryFor(statusJson, "virtual_background.blur");
   if (!entry.present)
+    return false;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(statusJson, &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *compute =
+      ObjectAt(*video, "compute", "video.compute should exist");
+  if (!compute)
+    return false;
+  const std::string *resolved = StringAt(
+      *compute, "resolved_backend", "compute resolved backend should exist");
+  const std::string *active =
+      StringAt(*compute, "active_backend", "compute active backend should exist");
+  const std::string *fallback =
+      StringAt(*compute, "fallback_reason", "compute fallback should exist");
+  const std::string *degraded =
+      StringAt(*compute, "degraded_reason", "compute degraded should exist");
+  const JsonObject *fallbackObject =
+      ObjectAt(*compute, "fallback", "compute fallback object should exist");
+  const JsonObject *provider =
+      ObjectAt(*compute, "provider", "compute provider should exist");
+  const JsonObject *unavailable = ObjectAt(
+      *compute, "unavailable_reasons",
+      "compute unavailable_reasons should exist");
+  if (!resolved || !active || !fallback || !degraded || !fallbackObject ||
+      !provider || !unavailable)
+    return false;
+  const std::string *fallbackCode =
+      StringAt(*fallbackObject, "code", "compute fallback code should exist");
+  const std::string *providerMode =
+      StringAt(*provider, "mode", "compute provider mode should exist");
+  const std::string *vulkanUnavailable = StringAt(
+      *unavailable, "vulkan", "compute vulkan unavailable reason should exist");
+  if (!fallbackCode || !providerMode || !vulkanUnavailable)
     return false;
 
   return Expect(entry.backend == "open_vulkan",
@@ -671,7 +822,28 @@ bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
          Expect(entry.state == "backend_unavailable",
                 "blocked Vulkan VB should report backend_unavailable") &&
          Expect(entry.reason == "open_vulkan_matting_unavailable",
-                "blocked Vulkan VB should report Vulkan matting reason");
+                "blocked Vulkan VB should report Vulkan matting reason") &&
+         Expect(*resolved == "cpu",
+                "blocked explicit Vulkan should resolve compute to cpu") &&
+         Expect(*active == "cpu",
+                "blocked explicit Vulkan should report active cpu") &&
+         Expect(fallback->find("production device-resident matting") !=
+                    std::string::npos,
+                "blocked explicit Vulkan fallback should report matting "
+                "readiness") &&
+         Expect(*degraded == *fallback,
+                "blocked explicit Vulkan degraded reason should match "
+                "fallback") &&
+         Expect(vulkanUnavailable->find("production device-resident matting") !=
+                    std::string::npos,
+                "blocked explicit Vulkan unavailable reason should report "
+                "matting readiness") &&
+         Expect(JsonBoolField(*fallbackObject, "active", false),
+                "blocked explicit Vulkan should mark fallback active") &&
+         Expect(*fallbackCode == "vulkan_unavailable",
+                "blocked explicit Vulkan should use vulkan_unavailable code") &&
+         Expect(*providerMode == "cpu",
+                "blocked explicit Vulkan must not report a CUDA provider");
 }
 
 bool TestBuiltinEffectReadyWithoutDiagnostics() {
@@ -808,6 +980,7 @@ int main() {
   ok = TestVideoStatusReportsRequestedOutputFormat() && ok;
   ok = TestVideoStatusReportsComputeBackend() && ok;
   ok = TestVideoComputeStatusReportsCachedCountersAndProvider() && ok;
+  ok = TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;
