@@ -162,6 +162,8 @@ verify_staged_metadata() {
     --help
   require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
   require_file "${appdir}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json"
+  require_file "${appdir}/usr/share/studiocast/installer/privileged/__init__.py"
+  require_file "${appdir}/usr/share/studiocast/installer/privileged/client_contract.py"
   require_file "${appdir}/usr/share/studiocast/installer/trust/keys/README.md"
   local model_launcher="${appdir}/usr/share/studiocast/installer/models/studiocast-model-transaction"
   require_executable "${model_launcher}"

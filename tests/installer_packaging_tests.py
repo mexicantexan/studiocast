@@ -118,8 +118,10 @@ class PackagingIntegrationTests(unittest.TestCase):
         for required in ("packaging/release/release_channel.py", "release-manifest-v1.schema.json",
                          "packaging/release/keys/README.md", "installer/models/studiocast-model-transaction",
                          "installer/models/model_transactions.py", "curated-model-catalog-v1.json",
-                         "resources/model_packs/"):
+                         "resources/model_packs/", "installer/privileged/client_contract.py"):
             self.assertIn(required, cmake)
+        verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
+        self.assertIn("installer/privileged/client_contract.py", verifier)
         self.assertIn('PATTERN "model.json"', cmake)
         self.assertIn('PATTERN "LICENSE.txt"', cmake)
         for forbidden_pattern in ('PATTERN "*.onnx"', 'PATTERN "*.dat"', 'PATTERN "*.bin"'):

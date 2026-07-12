@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -426,6 +427,39 @@ class PersistenceTests(HelperHarness):
 
 
 class ClientContractTests(unittest.TestCase):
+    @staticmethod
+    def preflight_fixture(root: Path) -> dict[str, Path]:
+        helper = root / "helper"
+        helper.write_text("#!/bin/sh\nexit 0\n")
+        helper.chmod(0o755)
+        pkexec = root / "pkexec"
+        pkexec.write_text("#!/bin/sh\nexit 99\n")
+        pkexec.chmod(0o755)
+        policy = root / "com.studiocast.Installer1.policy"
+        policy.write_text(
+            "<policyconfig>"
+            '<action id="com.studiocast.Installer1.manage-host-integration">'
+            '<annotate key="org.freedesktop.policykit.exec.path">'
+            f"{helper}</annotate>"
+            '<annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>'
+            "</action></policyconfig>"
+        )
+        policy.chmod(0o644)
+        service = root / "org.freedesktop.PolicyKit1.service"
+        service.write_text("[D-BUS Service]\nName=org.freedesktop.PolicyKit1\n")
+        service.chmod(0o644)
+        bus = root / "system_bus_socket"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(bus))
+        listener.close()
+        return {
+            "helper_path": helper,
+            "pkexec_path": pkexec,
+            "policy_path": policy,
+            "system_bus_path": bus,
+            "polkit_service_path": service,
+        }
+
     def test_authorization_outcomes_have_stable_codes(self):
         for status, reason in client_mod.AUTHORIZATION_REASONS.items():
             self.assertEqual(client_mod.authorization_record(status), {"status": status, "reason_code": reason})
@@ -456,6 +490,138 @@ class ClientContractTests(unittest.TestCase):
             self.assertEqual(result.reason_code, "privileged_helper_incompatible")
             result = client_mod.probe_helper(path, version_probe=version, required_uid=os.getuid(), test_mode=True)
             self.assertTrue(result.trusted)
+
+    def test_preflight_success_is_structured_and_never_invokes_pkexec(self):
+        with tempfile.TemporaryDirectory(prefix="studiocast-helper-preflight-") as directory:
+            root = Path(directory)
+            paths = self.preflight_fixture(root)
+            invoked = []
+
+            def version_probe(path):
+                invoked.append(path)
+                return '{"helper_version":"1.0.0","protocol_versions":[1]}'
+
+            result = client_mod.preflight_trusted_helper(
+                **paths, version_probe=version_probe,
+                required_uid=os.getuid(), test_mode=True,
+            )
+            self.assertEqual(invoked, [paths["helper_path"]])
+            self.assertEqual(
+                result.as_dict(),
+                {
+                    "path": str(paths["helper_path"]),
+                    "present": True,
+                    "trusted": True,
+                    "compatible": True,
+                    "authorization_transport_available": True,
+                    "helper_version": "1.0.0",
+                    "protocol_versions": [1],
+                    "pkexec_path": str(paths["pkexec_path"]),
+                    "policy_path": str(paths["policy_path"]),
+                    "reason_codes": ["privileged_helper_usable"],
+                },
+            )
+
+    def test_default_version_probe_is_bounded_unprivileged_and_non_authorizing(self):
+        with tempfile.TemporaryDirectory(prefix="studiocast-helper-preflight-") as directory:
+            root = Path(directory)
+            paths = self.preflight_fixture(root)
+            pkexec_marker = root / "pkexec-invoked"
+            paths["helper_path"].write_text(
+                "#!/bin/sh\n"
+                "[ \"$1 $2\" = \"--version --json\" ] || exit 41\n"
+                "printf '%s\\n' '{\"helper_version\":\"1.0.0\",\"protocol_versions\":[1]}'\n"
+            )
+            paths["helper_path"].chmod(0o755)
+            paths["pkexec_path"].write_text(
+                f"#!/bin/sh\ntouch '{pkexec_marker}'\nexit 99\n"
+            )
+            paths["pkexec_path"].chmod(0o755)
+            result = client_mod.preflight_trusted_helper(
+                **paths, required_uid=os.getuid(), test_mode=True,
+            )
+            self.assertTrue(result.trusted)
+            self.assertFalse(pkexec_marker.exists())
+
+    def test_preflight_fails_closed_for_each_helper_and_transport_boundary(self):
+        version = lambda _: '{"helper_version":"1.0.0","protocol_versions":[1]}'
+        with tempfile.TemporaryDirectory(prefix="studiocast-helper-preflight-") as directory:
+            root = Path(directory)
+            paths = self.preflight_fixture(root)
+
+            paths["helper_path"].unlink()
+            missing = client_mod.preflight_trusted_helper(
+                **paths, version_probe=version, required_uid=os.getuid(), test_mode=True)
+            self.assertEqual(missing.as_dict()["reason_codes"], ["privileged_helper_missing"])
+
+            helper = paths["helper_path"]
+            helper.write_text("helper")
+            helper.chmod(0o777)
+            version_called = []
+            untrusted = client_mod.preflight_trusted_helper(
+                **paths, version_probe=lambda path: version_called.append(path) or version(path),
+                required_uid=os.getuid(), test_mode=True)
+            self.assertEqual(untrusted.as_dict()["reason_codes"], ["privileged_helper_untrusted"])
+            self.assertEqual(version_called, [])
+            helper.chmod(0o755)
+
+            incompatible = client_mod.preflight_trusted_helper(
+                **paths, version_probe=lambda _: "{}", required_uid=os.getuid(), test_mode=True)
+            self.assertEqual(incompatible.as_dict()["reason_codes"], ["privileged_helper_incompatible"])
+
+            paths["pkexec_path"].chmod(0o777)
+            unavailable = client_mod.preflight_trusted_helper(
+                **paths, version_probe=version, required_uid=os.getuid(), test_mode=True)
+            self.assertEqual(
+                unavailable.as_dict()["reason_codes"],
+                ["authorization_transport_unavailable"],
+            )
+            self.assertTrue(unavailable.compatible)
+            self.assertFalse(unavailable.trusted)
+
+    def test_preflight_requires_each_non_authorizing_transport_component(self):
+        version = lambda _: '{"helper_version":"1.0.0","protocol_versions":[1]}'
+        for missing_name in (
+            "pkexec_path", "policy_path", "system_bus_path", "polkit_service_path"
+        ):
+            with self.subTest(missing_name=missing_name), tempfile.TemporaryDirectory(
+                prefix="studiocast-helper-preflight-"
+            ) as directory:
+                paths = self.preflight_fixture(Path(directory))
+                paths[missing_name].unlink()
+                result = client_mod.preflight_trusted_helper(
+                    **paths, version_probe=version,
+                    required_uid=os.getuid(), test_mode=True,
+                )
+                self.assertEqual(
+                    result.as_dict()["reason_codes"],
+                    ["authorization_transport_unavailable"],
+                )
+
+    def test_preflight_rejects_wrong_policy_binding_and_production_path_override(self):
+        version = lambda _: '{"helper_version":"1.0.0","protocol_versions":[1]}'
+        with tempfile.TemporaryDirectory(prefix="studiocast-helper-preflight-") as directory:
+            root = Path(directory)
+            paths = self.preflight_fixture(root)
+            paths["policy_path"].write_text(
+                "<policyconfig>"
+                '<action id="com.studiocast.Installer1.manage-host-integration">'
+                '<annotate key="org.freedesktop.policykit.exec.path">/tmp/wrong</annotate>'
+                '<annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>'
+                "</action></policyconfig>"
+            )
+            wrong_binding = client_mod.preflight_trusted_helper(
+                **paths, version_probe=version, required_uid=os.getuid(), test_mode=True)
+            self.assertEqual(
+                wrong_binding.as_dict()["reason_codes"],
+                ["authorization_transport_unavailable"],
+            )
+            production_override = client_mod.preflight_trusted_helper(
+                **paths, version_probe=version, required_uid=os.getuid(), test_mode=False)
+            self.assertEqual(
+                production_override.as_dict()["reason_codes"],
+                ["privileged_helper_untrusted"],
+            )
 
 
 class PackagingContractTests(unittest.TestCase):

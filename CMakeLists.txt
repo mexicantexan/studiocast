@@ -918,6 +918,13 @@ install(PROGRAMS installer/backend/studiocast-installer-backend
 )
 
 install(FILES
+        installer/privileged/__init__.py
+        installer/privileged/client_contract.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/privileged"
+        COMPONENT Installer
+)
+
+install(FILES
         packaging/release/__init__.py
         packaging/release/release_channel.py
         packaging/release/release-manifest-v1.schema.json
