@@ -163,11 +163,57 @@ verify_staged_metadata() {
   require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
   require_file "${appdir}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json"
   require_file "${appdir}/usr/share/studiocast/installer/trust/keys/README.md"
+  local model_launcher="${appdir}/usr/share/studiocast/installer/models/studiocast-model-transaction"
+  require_executable "${model_launcher}"
+  require_file "${appdir}/usr/share/studiocast/installer/models/model_transactions.py"
+  require_file "${appdir}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json"
+
+  local model_summary
+  model_summary="$(capture_command "packaged curated model catalog" "${model_launcher}" list --json)"
+  python3 - "${model_summary}" <<'PY'
+import json
+import sys
+
+summary = json.loads(sys.argv[1])
+defaults = [pack for pack in summary["packs"] if pack["default"]]
+if len(defaults) != 7:
+    raise SystemExit(f"packaged catalog has {len(defaults)} default packs, expected 7")
+if sum(len(pack["artifacts"]) for pack in defaults) != 8:
+    raise SystemExit("packaged default catalog does not contain exactly 8 artifacts")
+PY
+
+  local forbidden
+  forbidden="$(find "${appdir}/usr/share/studiocast" -type f \
+    \( -name '*.onnx' -o -name '*.ort' -o -name '*.engine' -o \
+       -name '*.plan' -o -name '*.dat' -o -name '*.bin' \) -print -quit)"
+  [[ -z "${forbidden}" ]] ||
+    die "AppDir redistributes a model binary: ${forbidden}"
 
   local service
   while IFS= read -r service; do
     validate_service_file "${service}"
   done < <(find "${appdir}" -type f -name '*.service' -print)
+}
+
+verify_trust_roots() {
+  local appdir="$1"
+  local required="$2"
+  local trust_dir="${appdir}/usr/share/studiocast/installer/trust/keys"
+  local count=0 key key_id
+  while IFS= read -r key; do
+    count=$((count + 1))
+    [[ ! -L "${key}" ]] || die "release trust root may not be a symlink: ${key}"
+    key_id="$(basename "${key}" .pem)"
+    [[ "${key_id}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] ||
+      die "invalid release trust-root key ID: ${key_id}"
+    [[ ! "${key_id}" =~ (^|[._-])(test|fixture)([._-]|$) ]] ||
+      die "test/fixture key was staged in the production trust root: ${key_id}"
+    openssl pkey -pubin -in "${key}" -text -noout 2>/dev/null |
+      grep -q 'ED25519' || die "release trust root is not Ed25519: ${key}"
+  done < <(find "${trust_dir}" -maxdepth 1 -type f -name '*.pem' -print | sort)
+  if [[ "${required}" -eq 1 && "${count}" -eq 0 ]]; then
+    die "release AppImage contains no production release trust root"
+  fi
 }
 
 verify_packaged_backend_layout() {
@@ -498,6 +544,12 @@ main() {
     "${appdir_base}/usr/share/studiocast/installer/trust/keys/README.md" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/models/studiocast-model-transaction" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/applications/studiocast-installer.desktop" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
@@ -506,6 +558,7 @@ main() {
 
   verify_staged_metadata "${APPDIR}" "${VERSION}" "${source_archive_path}" \
     "${staged_source_archive}"
+  verify_trust_roots "${APPDIR}" "${REQUIRE_APPIMAGE}"
   verify_packaged_backend_layout "${APPDIR}"
   verify_source_archive_layout "${source_archive_path}" "${source_prefix}" \
     "${VERSION}"

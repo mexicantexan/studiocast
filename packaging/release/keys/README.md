@@ -10,3 +10,9 @@ stable channel therefore fails closed until release engineering provisions that
 public trust root. Never copy the test key from `tests/data/installer_release/`
 here, and never commit a private key, seed, signing token, or base64 private-key
 secret.
+
+Pass each externally provisioned public key to the AppImage builder as
+`--trusted-release-key <key-id>=<public-key.pem>`. Release-grade packaging
+refuses to proceed without a validated Ed25519 public key and writes the key to
+this installed directory. The release manifest and artifact signatures must use
+the matching key ID.

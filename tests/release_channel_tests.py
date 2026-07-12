@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import pathlib
 import subprocess
@@ -59,6 +60,23 @@ class MappingTransport(rc.Transport):
             outgoing.write(incoming.read())
 
 
+class FakeHttpsResponse(io.BytesIO):
+    def __init__(self, body: bytes, final_url: str, *, status: int = 200, content_range: str | None = None):
+        super().__init__(body)
+        self.status = status
+        self._final_url = final_url
+        self.headers = {} if content_range is None else {"Content-Range": content_range}
+
+    def geturl(self) -> str:
+        return self._final_url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
 class ReleaseChannelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.keys = rc.TrustedKeyStore({"fixture-ed25519-2026": FIXTURES / "fixture-ed25519-public.pem"})
@@ -79,6 +97,12 @@ class ReleaseChannelTests(unittest.TestCase):
         unknown = copy.deepcopy(self.manifest)
         unknown["surprise"] = True
         self.assertCode("release.manifest.schema", lambda: rc.validate_manifest(unknown))
+        invalid_timestamp = copy.deepcopy(self.manifest)
+        invalid_timestamp["generated_at"] = "2026-02-31T00:00:00Z"
+        self.assertCode("release.manifest.schema", lambda: rc.validate_manifest(invalid_timestamp))
+        confused_artifact = copy.deepcopy(self.manifest)
+        confused_artifact["artifacts"]["source_archive"]["artifact_id"] = "different-product"
+        self.assertCode("release.manifest.schema", lambda: rc.validate_manifest(confused_artifact))
 
     def test_bad_manifest_signature_and_unknown_key_fail_closed(self) -> None:
         changed = self.raw_manifest.replace(b'"0.3.0"', b'"0.3.1"', 1)
@@ -184,6 +208,26 @@ class ReleaseChannelTests(unittest.TestCase):
                 "release.manifest_cache.corrupt",
                 lambda: rc.fetch_release_manifest(cache, self.keys, offline=True),
             )
+            # A subsequent verified online fetch repairs this same manifest
+            # generation instead of leaving the corrupt directory selected.
+            repaired = rc.fetch_release_manifest(
+                cache,
+                self.keys,
+                manifest_url=manifest_url,
+                signature_url=signature_url,
+                transport=transport,
+            )
+            self.assertEqual(loaded, repaired)
+            self.assertEqual(loaded, rc.fetch_release_manifest(cache, self.keys, offline=True))
+
+            outside = cache.parent / "outside-pointer"
+            outside.write_text(generation + "\n", encoding="ascii")
+            (cache / "current").unlink()
+            (cache / "current").symlink_to(outside)
+            self.assertCode(
+                "release.manifest_cache.corrupt",
+                lambda: rc.fetch_release_manifest(cache, self.keys, offline=True),
+            )
         with tempfile.TemporaryDirectory() as empty:
             self.assertCode(
                 "release.manifest_cache.miss",
@@ -206,6 +250,53 @@ class ReleaseChannelTests(unittest.TestCase):
             self.assertEqual([0, 7], transport.offsets)
             rc.verify_artifact(result, metadata, self.keys)
             self.assertFalse((cache / ".source.tar.gz.part").exists())
+
+    def test_https_redirect_downgrade_and_bad_resume_range_fail_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = pathlib.Path(temporary) / "artifact.part"
+            transport = rc.UrlTransport(
+                opener=lambda *_args, **_kwargs: FakeHttpsResponse(b"body", "http://mirror.invalid/artifact")
+            )
+            self.assertCode(
+                "release.download.redirect_scheme",
+                lambda: transport.append("https://example.invalid/artifact", destination, 0),
+            )
+            self.assertFalse(destination.exists())
+
+            destination.write_bytes(b"partial")
+            transport = rc.UrlTransport(
+                opener=lambda *_args, **_kwargs: FakeHttpsResponse(
+                    b"rest",
+                    "https://example.invalid/artifact",
+                    status=206,
+                    content_range="bytes 0-3/7",
+                )
+            )
+            self.assertCode(
+                "release.download.resume_mismatch",
+                lambda: transport.append("https://example.invalid/artifact", destination, 7),
+            )
+            self.assertEqual(b"partial", destination.read_bytes())
+
+    def test_partial_cache_hardlink_is_rejected_without_mutating_source(self) -> None:
+        metadata = copy.deepcopy(self.manifest["artifacts"]["source_archive"])
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = pathlib.Path(temporary) / "cache"
+            cache.mkdir()
+            victim = pathlib.Path(temporary) / "victim"
+            victim.write_bytes(b"do not append")
+            partial = cache / f".{metadata['filename']}.part"
+            partial.hardlink_to(victim)
+            self.assertCode(
+                "release.cache.unsafe_path",
+                lambda: rc.acquire_artifact(
+                    metadata,
+                    cache,
+                    self.keys,
+                    transport=RecordingTransport(FIXTURES / "source.tar.gz"),
+                ),
+            )
+            self.assertEqual(b"do not append", victim.read_bytes())
 
     def test_failed_refresh_preserves_verified_existing_file(self) -> None:
         metadata = copy.deepcopy(self.manifest["artifacts"]["source_archive"])
@@ -301,6 +392,28 @@ class ReleaseChannelTests(unittest.TestCase):
             )
             generated = rc.verify_manifest(output.read_bytes(), signature.read_bytes(), rc.TrustedKeyStore({"ephemeral-test": public}))
             rc.verify_artifact(source, generated["artifacts"]["source_archive"], rc.TrustedKeyStore({"ephemeral-test": public}))
+
+            output_before = output.read_bytes()
+            signature_before = signature.read_bytes()
+            invalid_key = root / "invalid-private.pem"
+            invalid_key.write_text("not a private key", encoding="ascii")
+            failed = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "packaging/release/release_tool.py"),
+                    "--version", "1.0.1", "--minimum-installer-version", "0.2.9",
+                    "--source-archive", str(source), "--installer-appimage", str(appimage),
+                    "--base-url", "https://example.invalid/v1.0.1",
+                    "--release-page-url", "https://example.invalid/v1.0.1",
+                    "--commit", "b" * 40, "--workflow-run-url", "https://example.invalid/run/2",
+                    "--private-key", str(invalid_key), "--key-id", "ephemeral-test",
+                    "--output", str(output), "--signature-output", str(signature),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(0, failed.returncode)
+            self.assertEqual(output_before, output.read_bytes())
+            self.assertEqual(signature_before, signature.read_bytes())
 
 
 if __name__ == "__main__":
