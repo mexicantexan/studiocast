@@ -6,9 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -70,7 +72,8 @@ class Sandbox:
         self.env = os.environ.copy()
         self.env.update({"HOME": str(self.root / "home"), "XDG_DATA_HOME": str(self.root / "data"),
                          "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
-                         "XDG_CACHE_HOME": str(self.root / "cache")})
+                         "XDG_CACHE_HOME": str(self.root / "cache"),
+                         "STUDIOCAST_INSTALLER_OFFLINE": "1"})
         self.facts = self.root / "facts.json"
         self.write_facts(base_facts())
 
@@ -159,6 +162,8 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertIn("v4l.module.load", ids); self.assertIn("v4l.persistence.write", ids)
         self.assertNotIn("scripts/setup.sh", json.dumps(plan))
         self.assertTrue(all(x["privilege"] == "trusted_helper" for x in plan["operations"] if x["id"].startswith("v4l.")))
+        for op in (item for item in plan["operations"] if item["id"] in {"v4l.module.load", "v4l.persistence.write"}):
+            self.assertEqual(set(op["inputs"]), {"operation_type", "device_number", "label", "exclusive_caps"})
 
     def test_apply_rejects_tamper_and_exact_dry_run_executes(self):
         plan = self.plan()
@@ -172,6 +177,11 @@ class InstallerBackendCoreTests(unittest.TestCase):
         result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
                             "--token", plan["approval_token"], check=False)
         self.assertNotEqual(result.returncode, 0); self.assertIn("plan.digest_mismatch", result.stderr)
+        plan = self.plan(); plan["plan_id"] = "../../outside"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], check=False)
+        self.assertEqual(result.returncode, 2); self.assertIn("plan.invalid_id", result.stderr)
 
     def test_manifest_v1_migration_does_not_trust_paths(self):
         path = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json"; path.parent.mkdir(parents=True)
@@ -206,6 +216,99 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["state"], "committed")
         self.assertFalse((data / "payloads").exists()); self.assertTrue((models / "mine").exists()); self.assertTrue((config / "daemon.conf").exists())
         self.assertEqual(json.loads((data / "install-manifest.json").read_text())["transaction"]["state"], "uninstalled")
+
+    def test_uninstall_removes_only_hash_bound_v4l_persistence(self):
+        facts = base_facts()
+        facts["privileged_helper"].update(present=True, trusted=True, compatible=True)
+        facts["v4l2"]["owned_configuration"] = [
+            {"id": "v4l_modules_load", "path": "/etc/modules-load.d/studiocast-v4l2loopback.conf",
+             "sha256": "sha256:" + "1" * 64},
+            {"id": "v4l_modprobe", "path": "/etc/modprobe.d/studiocast-v4l2loopback.conf",
+             "sha256": "sha256:" + "2" * 64},
+        ]
+        self.s.write_facts(facts)
+        plan = self.s.json("plan", "uninstall", "--facts", str(self.s.facts), "--preserve-user-data")
+        remove = next(item for item in plan["operations"] if item["id"] == "v4l.persistence.remove")
+        self.assertEqual(remove["failure_policy"], "degrade")
+        self.assertEqual(remove["inputs"], {"operation_type": "v4l.persistence.remove.v1",
+            "expected_hashes": {"v4l_modules_load": "sha256:" + "1" * 64,
+                                "v4l_modprobe": "sha256:" + "2" * 64}})
+        path = self.s.root / "uninstall-v4l.json"; path.write_text(json.dumps(plan))
+        helper = self.s.root / "helper"; pkexec = self.s.root / "pkexec"
+        for executable in (helper, pkexec):
+            executable.write_text("#!/bin/sh\nexit 99\n"); executable.chmod(0o755)
+        env = self.s.env | {"STUDIOCAST_INSTALLER_TEST_MODE": "1",
+                            "STUDIOCAST_INSTALLER_TEST_HELPER": str(helper),
+                            "STUDIOCAST_INSTALLER_TEST_PKEXEC": str(pkexec)}
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], "--facts", str(self.s.facts), "--dry-run", env=env)
+        value = json.loads(result.stdout[result.stdout.find("{"):])
+        self.assertEqual(value["reviewed_operation_ids"], value["executed_operation_ids"])
+
+    def test_host_analyzer_consumes_runtime_diagnostics_and_real_vulkan_compute_evidence(self):
+        current_bin = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current/bin"
+        current_bin.mkdir(parents=True)
+        diagnostics = {"engines": {
+            "maxine": {"ok": True, "available_effects": ["auto_frame"], "components": {},
+                       "vfx": {"root_found": True, "library_loadable": True, "ok": True},
+                       "ar": {"root_found": False, "library_loadable": False, "ok": False},
+                       "afx": {"root_found": False, "library_loadable": False, "ok": False}},
+            "open_cuda": {"onnxruntime_version": "1.20.0",
+                          "onnxruntime_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                          "onnxruntime_cuda_provider_present": True,
+                          "onnxruntime_cpu_provider_present": True, "cuda_context_available": True,
+                          "available_effects": ["virtual_background.blur"]},
+            "open_audio": {}, "open_vulkan": {"available_effects": ["auto_frame"]}}}
+        ctl = current_bin / "studiocastctl"
+        ctl.write_text("#!/bin/sh\nprintf '%s\\n' " + repr(json.dumps(diagnostics)) + "\n")
+        ctl.chmod(0o755)
+        fake = self.s.root / "probe-bin"; fake.mkdir()
+        (fake / "vulkaninfo").write_text("""#!/bin/sh
+if [ "${1:-}" = --summary ]; then
+cat <<'EOF'
+GPU0:
+    deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName = Test GPU
+EOF
+else
+printf 'GPU id = 0 (Test GPU)\\nqueueFlags = VK_QUEUE_COMPUTE_BIT\\n'
+fi
+""")
+        (fake / "nvidia-smi").write_text("""#!/bin/sh
+case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; *) printf 'CUDA Version: 12.4\\n';; esac
+""")
+        for name in ("vulkaninfo", "nvidia-smi"):
+            (fake / name).chmod(0o755)
+        env = self.s.env | {"PATH": str(fake) + ":/usr/bin:/bin"}
+        facts = self.s.json("analyze", "--target-version", "0.2.9", env=env)
+        self.assertTrue(facts["gpus"]["vulkan"]["compute_device_usable"])
+        self.assertEqual(facts["gpus"]["vulkan"]["reason_codes"], ["vulkan_compute_device_usable"])
+        self.assertTrue(facts["gpus"]["nvidia"]["cuda_usable"])
+        self.assertEqual(facts["runtime"]["onnxruntime"]["probe"], "daemon_runtime_diagnostics")
+        self.assertTrue(facts["runtime"]["onnxruntime"]["providers"]["cuda"])
+        self.assertEqual(facts["effects"]["capabilities"]["auto_frame"]["maxine"], "production_usable")
+        self.assertEqual(facts["effects"]["capabilities"]["auto_frame"]["vulkan"],
+                         "usable_with_degraded_behavior")
+
+    def test_unsupported_override_is_advanced_only_and_rewires_removed_privilege(self):
+        facts = base_facts(); facts["os"]["supported"] = False
+        facts["os"]["reason_codes"] = ["os.unsupported.distribution"]
+        facts["v4l2"].update(module_available=False, module_loaded=False, device_present=False,
+                             persistence_state="absent")
+        facts["privileged_helper"].update(present=True, trusted=True, compatible=True)
+        self.s.write_facts(facts)
+        plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
+                           "--v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
+        self.assertFalse(any(item["privilege"] == "trusted_helper" for item in plan["operations"]))
+        previous = None
+        for op in plan["operations"]:
+            self.assertEqual(op["depends_on"], [] if previous is None else [previous])
+            previous = op["id"]
+
+        # Without an Advanced source selection the same override remains blocked.
+        blocked = self.s.json("plan", "install", "--facts", str(self.s.facts),
+                              "--no-v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
+        self.assertIn("os.unsupported.override_requires_advanced", [item["code"] for item in blocked["blockers"]])
 
     def test_repair_healthy_core_is_minimal_and_reuses_prior_configuration(self):
         facts = base_facts(classification="healthy", active_version="0.2.9", target_version="0.2.9",
@@ -253,9 +356,32 @@ class InstallerBackendCoreTests(unittest.TestCase):
         # A literal full wipe does not recreate or restore the user's settings.
         (config / "daemon.conf").write_text("remove")
         (data / "models/custom").mkdir(parents=True, exist_ok=True); (data / "models/custom/mine").write_text("remove")
+        self.s.write_facts(self.s.json("analyze", "--target-version", "0.2.9"))
         result, _ = self._apply_clean(False)
         self.assertEqual(result.returncode, 3)
         self.assertFalse(config.exists()); self.assertFalse((data / "models/custom/mine").exists())
+
+    def test_clean_failure_restores_settings_and_preserves_non_build_caches(self):
+        config = Path(self.s.env["XDG_CONFIG_HOME"]) / "studiocast"
+        config.mkdir(parents=True); (config / "daemon.conf").write_text("preserved")
+        cache = Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast"
+        for relative in ("release/artifacts/source.tar", "models/custom/model.onnx", "builds/old/junk", "sources/old/junk"):
+            path = cache / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(relative)
+        # A fatal configure failure exercises compensation after settings and
+        # old build caches have already been removed.
+        plan = self.s.json("plan", "clean-install", "--facts", str(self.s.facts),
+                           "--source-dir", str(SOURCE), "--no-v4l2loopback", "--no-service",
+                           "--no-models", "--allow-unsupported", "--preserve-user-data")
+        path = self.s.root / "clean-fail.json"; path.write_text(json.dumps(plan))
+        failed = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], check=False, env=self._fake_cmake(fail=True))
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual((config / "daemon.conf").read_text(), "preserved")
+        self.assertTrue((cache / "release/artifacts/source.tar").is_file())
+        self.assertTrue((cache / "models/custom/model.onnx").is_file())
+        self.assertFalse((cache / "sources/old/junk").exists())
+        manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
+        self.assertIn("settings.restore.compensation", [item["operation_id"] for item in manifest["journal"]])
 
     def test_versioned_payload_survives_cache_removal_and_core_failure_rolls_back(self):
         plan = self.plan()
@@ -270,6 +396,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
         shutil.rmtree(cache)
         self.assertEqual(subprocess.run([str(current / "bin/studiocast")]).returncode, 0)
 
+        self.s.write_facts(self.s.json("analyze", "--target-version", "0.2.9"))
         update = self.s.json("plan", "update", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                              "--no-v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
         path.write_text(json.dumps(update), encoding="utf-8")
@@ -294,6 +421,47 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(value["error"]["code"], "payload.version_mismatch")
         self.assertFalse((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current").exists())
 
+    def test_cancellation_terminates_process_group_and_journals_cancelled_state(self):
+        plan = self.plan()
+        path = self.s.root / "cancel-plan.json"; path.write_text(json.dumps(plan))
+        fake = self.s.root / "cancel-bin"; fake.mkdir()
+        child_pid = self.s.root / "child.pid"
+        cmake = fake / "cmake"
+        cmake.write_text(f"""#!/bin/sh
+if [ "${{1:-}}" = -S ]; then
+  sleep 60 &
+  printf '%s' "$!" >'{child_pid}'
+  wait
+fi
+exit 0
+"""); cmake.chmod(0o755)
+        env = self.s.env | {"PATH": str(fake) + ":/usr/bin:/bin"}
+        process = subprocess.Popen([str(BACKEND), "apply-plan", "--plan", str(path),
+                                    "--digest", plan["plan_digest"], "--token", plan["approval_token"],
+                                    "--facts", str(self.s.facts)], env=env, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 5
+        while not child_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(child_pid.exists(), "fake build child did not start")
+        pid = int(child_pid.read_text())
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 130, stderr)
+        self.assertEqual(json.loads(stdout)["state"], "cancelled")
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("cancelled build child was not reaped")
+        manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
+        self.assertEqual(manifest["transaction"]["state"], "cancelled")
+        cancelled = next(item for item in manifest["journal"] if item["operation_id"] == "build.configure")
+        self.assertEqual(cancelled["state"], "cancelled")
+
     def test_fake_polkit_transport_envelope_and_structured_failures(self):
         facts = base_facts(); facts["v4l2"].update(module_available=True, module_loaded=False,
                                                   device_present=False, persistence_state="configured")
@@ -307,6 +475,15 @@ class InstallerBackendCoreTests(unittest.TestCase):
             "STUDIOCAST_INSTALLER_TEST_REQUEST": str(captured)}
 
         def invoke(script, timeout=None):
+            # Each authorization outcome starts from the same absent fixture;
+            # a preceding success must not make the next plan stale.
+            import shutil
+            data_root = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast"
+            if data_root.exists(): shutil.rmtree(data_root)
+            bin_root = Path(self.s.env["HOME"]) / ".local/bin"
+            if bin_root.exists():
+                for entry in bin_root.iterdir():
+                    if entry.is_symlink(): entry.unlink()
             adapter.write_text("#!/bin/sh\n" + script, encoding="utf-8"); adapter.chmod(0o755)
             plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                                "--skip-deps", "--v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
@@ -317,7 +494,10 @@ class InstallerBackendCoreTests(unittest.TestCase):
                                 "--token", plan["approval_token"], check=False, env=env)
             return result, json.loads(result.stdout) if result.stdout.strip().startswith("{") else None
 
-        success, value = invoke(f"cat >'{captured}'\nprintf '{{\"state\":\"succeeded\"}}\\n'\n")
+        success_script = f"""cat >'{captured}'
+python3 -c 'import json; p={json.dumps(str(captured))}; r=json.load(open(p)); o=r[\"operations\"][0]; print(json.dumps({{\"schema_version\":1,\"request_id\":r[\"request_id\"],\"transaction_id\":r[\"transaction_id\"],\"plan_digest\":r[\"plan_digest\"],\"state\":\"succeeded\",\"results\":[{{\"id\":o[\"id\"],\"type\":o[\"type\"],\"status\":\"succeeded\",\"files\":[]}}]}}))'
+"""
+        success, value = invoke(success_script)
         self.assertEqual(success.returncode, 0); self.assertEqual(value["state"], "committed")
         request = json.loads(captured.read_text())
         self.assertEqual(request["policy_version"], 1)
@@ -330,8 +510,45 @@ class InstallerBackendCoreTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2); self.assertEqual(value["error"]["code"], reason)
         result, value = invoke("printf 'not-json\\n'\n", None)
         self.assertEqual(result.returncode, 2); self.assertEqual(value["error"]["code"], "privilege.malformed_result")
+        result, value = invoke("printf '{\"schema_version\":1,\"state\":\"succeeded\",\"results\":[]}\\n'\n")
+        self.assertEqual(result.returncode, 2); self.assertEqual(value["error"]["code"], "privilege.result_binding_mismatch")
         result, value = invoke("sleep 1\n", "0.05")
         self.assertEqual(result.returncode, 2); self.assertEqual(value["error"]["code"], "authorization_timeout")
+
+    def test_persistence_helper_hashes_are_recorded_as_owned_manifest_state(self):
+        facts = base_facts()
+        facts["v4l2"].update(module_available=True, module_loaded=True, device_present=True,
+                             persistence_state="absent")
+        facts["privileged_helper"].update(present=True, trusted=True, compatible=True)
+        self.s.write_facts(facts)
+        adapter = self.s.root / "persist-pkexec"
+        helper = self.s.root / "persist-helper"
+        helper.write_text("#!/bin/sh\nexit 0\n"); helper.chmod(0o755)
+        adapter.write_text("""#!/usr/bin/python3
+import json, sys
+r = json.load(sys.stdin)
+o = r["operations"][0]
+files = [
+ {"id":"v4l_modules_load","path":"/etc/modules-load.d/studiocast-v4l2loopback.conf","sha256":"sha256:" + "1"*64},
+ {"id":"v4l_modprobe","path":"/etc/modprobe.d/studiocast-v4l2loopback.conf","sha256":"sha256:" + "2"*64},
+]
+print(json.dumps({"schema_version":1,"request_id":r["request_id"],"transaction_id":r["transaction_id"],
+ "plan_digest":r["plan_digest"],"state":"succeeded","results":[{"id":o["id"],"type":o["type"],
+ "status":"succeeded","files":files}]}))
+"""); adapter.chmod(0o755)
+        plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
+                           "--v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
+        path = self.s.root / "persist-plan.json"; path.write_text(json.dumps(plan))
+        env = self._fake_cmake() | {"STUDIOCAST_INSTALLER_TEST_MODE": "1",
+            "STUDIOCAST_INSTALLER_TEST_HELPER": str(helper),
+            "STUDIOCAST_INSTALLER_TEST_PKEXEC": str(adapter)}
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], "--facts", str(self.s.facts), env=env)
+        self.assertEqual(json.loads(result.stdout)["state"], "committed")
+        manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
+        self.assertEqual(manifest["v4l"]["actual"]["persistence_state"], "configured")
+        self.assertEqual(len(manifest["v4l"]["owned_configuration"]), 2)
+        self.assertEqual(len(manifest["ownership"]["system_configuration"]), 2)
 
     def test_unknown_and_corrupt_manifest_fail_closed(self):
         path = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json"; path.parent.mkdir(parents=True)
