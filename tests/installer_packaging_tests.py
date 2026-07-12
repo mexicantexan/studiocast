@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
+DEFAULT_PACKS = [
+    "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
+    "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
+    "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
+]
 
 
 def facts() -> dict:
@@ -65,6 +70,14 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.backend_path.chmod(0o755)
         shutil.copytree(ROOT / "packaging/release", installer / "release",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(ROOT / "installer/models", installer / "models",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        component_root = installer.parent
+        model_catalog = component_root / "packaging/models"
+        model_catalog.mkdir(parents=True)
+        shutil.copy2(ROOT / "packaging/models/curated-model-catalog-v1.json", model_catalog)
+        shutil.copytree(ROOT / "resources/model_packs", component_root / "resources/model_packs",
+                        ignore=shutil.ignore_patterns("*.onnx", "*.dat", "*.bin"))
         trust = installer / "trust/keys"
         trust.mkdir(parents=True)
         shutil.copy2(self.fixture / "fixture-ed25519-public.pem", trust / f"{KEY_ID}.pem")
@@ -170,6 +183,32 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertEqual(receipt["archive_sha256"], plan["source"]["archive_sha256"])
         self.assertEqual("studiocast-source", plan["downloads"][0]["artifact_id"])
         self.assertTrue(plan["downloads"][0]["required_for_core"])
+
+    def test_gui_shaped_verified_plan_stays_recommended_with_explicit_selections(self) -> None:
+        receipt, path = self.verified_receipt()
+        build_dir = self.root / "cache/studiocast/builds/0.3.0"
+        model_destination = self.root / "data/studiocast/models"
+        args = ["plan", "install", "--facts", str(self.facts_path),
+            "--release-receipt", str(path), "--build-dir", str(build_dir),
+            "--build-type", "Release", "--skip-deps", "--v4l2loopback",
+            "--v4l-device-number", "10", "--v4l-label", "StudioCast Camera",
+            "--v4l-exclusive-caps", "--no-service", "--open-cuda", "--open-audio",
+            "--no-open-vulkan", "--models", "--model-destination", str(model_destination)]
+        for pack_id in DEFAULT_PACKS:
+            args += ["--model-id", pack_id]
+        plan = json.loads(self.backend(*args).stdout)
+        self.assertEqual(plan["route"], "recommended")
+        self.assertTrue(plan["source"]["official"])
+        self.assertEqual(plan["desired_state"]["model_pack_ids"], DEFAULT_PACKS)
+        self.assertEqual(plan["desired_state"]["model_destination"], str(model_destination))
+        self.assertEqual(plan["paths"]["build_cache"], str(build_dir))
+        self.assertTrue(plan["desired_state"]["virtual_camera"]["required_for_success"])
+        self.assertEqual(plan["desired_state"]["features"], {
+            "open_audio": True, "open_cuda": True, "open_vulkan": False})
+        self.assertNotIn("source.signed_verification_receipt_required",
+                         {item["code"] for item in plan["blockers"]})
+        self.assertEqual(len([item for item in plan["downloads"]
+                              if not item["required_for_core"]]), 8)
 
     def test_arbitrary_archive_routes_advanced_without_becoming_official(self) -> None:
         plan = json.loads(self.backend("plan", "install", "--json", "--facts", str(self.facts_path),

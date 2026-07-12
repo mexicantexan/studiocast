@@ -469,6 +469,46 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         self.assertEqual((result.returncode, value["state"], value["core_committed"]), (3, "degraded", True))
         self.assertIn("service.state.reconcile", value["retryable_operation_ids"])
 
+    def test_service_unit_uses_xdg_payload_and_preserves_user_edit(self):
+        adapter = self.s.root / "fake-systemctl"
+        adapter.write_text("#!/bin/sh\nexit 0\n"); adapter.chmod(0o755)
+        plan = self.s.json("plan", "install", "--facts", str(self.s.facts),
+            "--source-dir", str(SOURCE), "--no-v4l2loopback", "--service", "--no-models",
+            "--allow-unsupported")
+        path = self.s.root / "service-owned.json"; path.write_text(json.dumps(plan))
+        env = self._fake_cmake() | {"STUDIOCAST_INSTALLER_TEST_MODE": "1",
+                                    "STUDIOCAST_INSTALLER_TEST_SYSTEMCTL": str(adapter)}
+        # Restore the sandbox roots overwritten by the fake-tool helper.
+        env.update({key: self.s.env[key] for key in
+                    ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")})
+        installed = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+            "--token", plan["approval_token"], "--facts", str(self.s.facts), env=env)
+        self.assertEqual(terminal_result(installed.stdout)["state"], "committed")
+        unit = Path(self.s.env["XDG_CONFIG_HOME"]) / "systemd/user/studiocastd.service"
+        content = unit.read_text()
+        self.assertIn(str(Path(self.s.env["XDG_DATA_HOME"]) /
+                          "studiocast/current/bin/studiocastd"), content)
+        self.assertNotIn("%h/.local/share", content)
+        edited = content + "# user edit\n"
+        unit.write_text(edited)
+
+        healthy = base_facts(classification="healthy", active_version="0.2.9",
+            target_version="0.2.9", version_relation="same",
+            desired_configuration={"build_type": "Release",
+                "features": {"open_cuda": True, "open_audio": True, "open_vulkan": False},
+                "service": {"desired": "enabled_started"},
+                "v4l": {"desired": False, "required_for_success": False},
+                "model_pack_ids": [], "preserve_settings": True})
+        healthy["service"] = {"actual": "active"}
+        self.s.write_facts(healthy)
+        uninstall = self.s.json("plan", "uninstall", "--facts", str(self.s.facts),
+                                "--preserve-user-data")
+        path.write_text(json.dumps(uninstall))
+        removed = self.s.run("apply-plan", "--plan", str(path), "--digest", uninstall["plan_digest"],
+            "--token", uninstall["approval_token"], "--facts", str(self.s.facts), env=env)
+        self.assertEqual(terminal_result(removed.stdout)["state"], "committed")
+        self.assertEqual(unit.read_text(), edited)
+
     def test_prefix_spoof_link_is_rejected_and_unexpected_oserror_is_journaled(self):
         spoof = Path(self.s.env["HOME"]) / ".local/bin/studiocast"
         spoof.parent.mkdir(parents=True)

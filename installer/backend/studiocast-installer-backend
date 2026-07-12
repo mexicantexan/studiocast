@@ -342,6 +342,17 @@ def roots() -> dict[str, Path]:
     }
 
 
+def service_unit_content(data_root: Path) -> str:
+    executable = str(data_root / "current/bin/studiocastd")
+    if any(character in executable for character in ("\x00", "\n", "\r")):
+        raise BackendError("service.path_invalid", "Service executable path contains control characters")
+    escaped = executable.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("%", "%%").replace("$", "$$")
+    return ("[Unit]\nDescription=StudioCast daemon\n[Service]\n"
+            f'ExecStart="{escaped}"\nRestart=on-failure\n'
+            "[Install]\nWantedBy=default.target\n")
+
+
 def is_beneath(path: Path, root: Path, allow_root: bool = False) -> bool:
     try:
         rel = path.absolute().relative_to(root.absolute())
@@ -1797,12 +1808,29 @@ class Executor:
 
     def reconcile_service_unit(self, desired: str) -> None:
         unit = self.r["systemd"] / SERVICE_NAME; validate_mutation_path(unit, [self.r["systemd"]])
+        canonical = service_unit_content(self.r["data"])
+        recorded = (self.manifest_before or {}).get("service", {})
+        recorded_hash = (recorded.get("unit_sha256") if recorded.get("unit_path") == str(unit) else None)
+        owned = False
+        if unit.is_file() and not unit.is_symlink():
+            current_hash = file_sha256(unit)
+            owned = (unit.read_text(encoding="utf-8", errors="strict") == canonical or
+                     (re.fullmatch(r"sha256:[0-9a-f]{64}", str(recorded_hash or "")) is not None and
+                      current_hash == recorded_hash))
         if desired in {"absent", "disabled"}:
-            if not self.dry_run and unit.is_file() and "StudioCast" in unit.read_text(encoding="utf-8", errors="ignore"): unit.unlink()
+            if not self.dry_run and owned: unit.unlink()
             return
         if self.dry_run: return
+        if (unit.exists() or unit.is_symlink()) and not owned:
+            raise BackendError("ownership.mismatch", "Refusing to replace an unowned StudioCast service unit")
         unit.parent.mkdir(parents=True, exist_ok=True)
-        unit.write_text("[Unit]\nDescription=StudioCast daemon\n[Service]\nExecStart=%h/.local/share/studiocast/current/bin/studiocastd\nRestart=on-failure\n[Install]\nWantedBy=default.target\n", encoding="utf-8")
+        temporary = unit.with_name(f".{unit.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(canonical, encoding="utf-8")
+            temporary.chmod(0o644)
+            os.replace(temporary, unit)
+        finally:
+            if temporary.exists(): temporary.unlink()
 
     def reconcile_service_state(self, desired: str) -> None:
         manager = self.plan.get("observed_state", {}).get("systemd_user", {})
@@ -2167,6 +2195,7 @@ def legacy_plan_text(plan: dict[str, Any]) -> dict[str, Any]:
 
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--route", choices=("recommended", "custom", "advanced"))
     parser.add_argument("--facts", "--facts-file", dest="facts_file")
     parser.add_argument("--source-dir")
     parser.add_argument("--release-archive")
@@ -2257,7 +2286,7 @@ def main(argv: list[str]) -> int:
     detect_p = sub.add_parser("detect-os"); add_common(detect_p)
     status_p = sub.add_parser("status"); add_common(status_p)
     recommend_p = sub.add_parser("recommend"); add_common(recommend_p)
-    recommend_p.add_argument("--intent", default="auto"); recommend_p.add_argument("--prior-desired"); recommend_p.add_argument("--policy-version", default=POLICY_VERSION); recommend_p.add_argument("--route", choices=("recommended", "custom", "advanced"), default="recommended")
+    recommend_p.add_argument("--intent", default="auto"); recommend_p.add_argument("--prior-desired"); recommend_p.add_argument("--policy-version", default=POLICY_VERSION)
     for name in ("plan", "run"):
         p = sub.add_parser(name); p.add_argument("workflow", choices=("install", "update", "repair", "reinstall", "clean-install", "uninstall", "modify", "advanced"), nargs="?", default="install"); add_common(p)
     for name in ("install", "update", "repair", "reinstall", "clean-install", "uninstall"):
@@ -2328,17 +2357,18 @@ def main(argv: list[str]) -> int:
         output(value); return 0
     if args.command == "recommend":
         facts = load_facts(args); prior = load_json(Path(args.prior_desired)) if args.prior_desired else None
-        output(recommend(facts, args.intent, prior, args.policy_version, args.route)); return 0
+        output(recommend(facts, args.intent, prior, args.policy_version, args.route or "recommended")); return 0
     if args.command in {"plan", "run", "install", "update", "repair", "reinstall", "clean-install", "uninstall"}:
         verify_release_evidence(args)
         facts = load_facts(args); prior = facts.get("installation", {}).get("desired_configuration") if args.workflow in {"update", "repair", "reinstall", "clean-install", "modify"} else None
-        advanced_requested = bool(args.workflow == "advanced" or args.source_dir or
+        unverified_source = bool(args.source_dir or
             (args.release_archive and not getattr(args, "verified_release", None)) or
-            args.model_ids or args.model_destination or args.model_source or args.build_dir or
-            args.build_type or args.open_cuda is not None or args.open_audio is not None or
-            args.v4l_device_number is not None or args.v4l_label is not None or
-            args.v4l_exclusive_caps is not None)
-        route = "advanced" if advanced_requested else "recommended"
+            args.model_source)
+        inferred_route = "advanced" if args.workflow == "advanced" or unverified_source else "recommended"
+        route = args.route or inferred_route
+        if route != "advanced" and unverified_source:
+            raise BackendError("source.arbitrary_requires_advanced",
+                               "Arbitrary source and model locations require Advanced mode")
         rec = recommend(facts, args.workflow, prior, route=route)
         plan = create_plan(args, facts, rec)
         if args.command == "plan": output(legacy_plan_text(plan)); return 0
