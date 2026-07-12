@@ -1,3 +1,5 @@
+#include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 
@@ -10,9 +12,14 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QRadioButton>
 #include <QTemporaryDir>
 #include <QThread>
+
+#ifdef Q_OS_UNIX
+#include <unistd.h>
+#endif
 
 #include "installer_wizard.h"
 
@@ -50,17 +57,38 @@ QJsonObject BaseFacts(const QString &classification = QStringLiteral("absent"),
 
 QJsonObject Status(const QString &classification, const QString &route,
                    const QString &action, bool installed = false) {
-  return {{QStringLiteral("schema_version"), 2},
-          {QStringLiteral("classification"), classification},
-          {QStringLiteral("installed"), installed},
-          {QStringLiteral("installed_version"),
-           installed ? QStringLiteral("0.2.8") : QString()},
-          {QStringLiteral("target_version"), QStringLiteral("0.2.9")},
-          {QStringLiteral("version_relation"),
-           installed ? QStringLiteral("upgrade")
-                     : QStringLiteral("not_installed")},
-          {QStringLiteral("route"), route},
-          {QStringLiteral("primary_action"), action}};
+  return {
+      {QStringLiteral("schema_version"), 2},
+      {QStringLiteral("classification"), classification},
+      {QStringLiteral("installed"), installed},
+      {QStringLiteral("installed_version"),
+       installed ? QStringLiteral("0.2.8") : QString()},
+      {QStringLiteral("target_version"), QStringLiteral("0.2.9")},
+      {QStringLiteral("version_relation"),
+       installed ? QStringLiteral("upgrade") : QStringLiteral("not_installed")},
+      {QStringLiteral("route"), route},
+      {QStringLiteral("primary_action"), action},
+      {QStringLiteral("stable_release"),
+       QJsonObject{{QStringLiteral("verified"), true},
+                   {QStringLiteral("channel"), QStringLiteral("stable")},
+                   {QStringLiteral("version"), QStringLiteral("0.2.9")}}}};
+}
+
+QJsonObject ReleaseStatus(const QString &archive, bool offline = false) {
+  return {
+      {QStringLiteral("schema_version"), 1},
+      {QStringLiteral("release_status_version"),
+       QStringLiteral("installer-release-status/v1")},
+      {QStringLiteral("channel"), QStringLiteral("stable")},
+      {QStringLiteral("available_version"), QStringLiteral("0.2.9")},
+      {QStringLiteral("installed_version"), QJsonValue()},
+      {QStringLiteral("action"), QStringLiteral("install")},
+      {QStringLiteral("relation"), QStringLiteral("not_installed")},
+      {QStringLiteral("reason_code"), QStringLiteral("release.install")},
+      {QStringLiteral("minimum_installer_version"), QStringLiteral("0.2.9")},
+      {QStringLiteral("installer_meets_minimum"), true},
+      {QStringLiteral("offline"), offline},
+      {QStringLiteral("verified_source_archive"), archive}};
 }
 
 QStringList DefaultPacks() {
@@ -144,31 +172,71 @@ public:
     status_ = dir_.filePath(QStringLiteral("status.json"));
     plan_ = dir_.filePath(QStringLiteral("plan.json"));
     result_ = dir_.filePath(QStringLiteral("result.json"));
+    release_ = dir_.filePath(QStringLiteral("release.json"));
     args_ = dir_.filePath(QStringLiteral("args.txt"));
+    planArgs_ = dir_.filePath(QStringLiteral("plan-args.txt"));
+    releaseCalls_ = dir_.filePath(QStringLiteral("release-calls.txt"));
+    childPid_ = dir_.filePath(QStringLiteral("child.pid"));
     archive_ = dir_.filePath(QStringLiteral("official-source.tar.gz"));
     script_ = dir_.filePath(QStringLiteral("backend"));
     QFile script(script_);
     script.open(QIODevice::WriteOnly | QIODevice::Truncate);
-    script.write("#!/bin/sh\n"
-                 "case \"$1\" in\n"
-                 " analyze) cat \"$SC_FAKE_FACTS\";;\n"
-                 " status) cat \"$SC_FAKE_STATUS\";;\n"
-                 " plan) if [ \"${SC_FAKE_PLAN_FAIL:-0}\" = 1 ]; then echo plan-failed >&2; exit 2; fi; cat \"$SC_FAKE_PLAN\";;\n"
-                 " execute-plan) printf '%s\\n' \"$@\" >\"$SC_FAKE_ARGS\"; cat \"$SC_FAKE_RESULT\"; exit \"${SC_FAKE_EXIT:-0}\";;\n"
-                 " *) exit 2;;\n"
-                 "esac\n");
+    script.write(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        " analyze) cat \"$SC_FAKE_FACTS\";;\n"
+        " status) cat \"$SC_FAKE_STATUS\";;\n"
+        " release-status) printf '%s\\n' \"$@\" >>\"$SC_FAKE_RELEASE_CALLS\"; "
+        "offline=0; receipt=; previous=; for argument in \"$@\"; do if [ "
+        "\"$previous\" = receipt ]; then receipt=$argument; previous=; elif [ "
+        "\"$argument\" = --release-receipt-out ]; then previous=receipt; elif "
+        "[ \"$argument\" = --offline ]; then offline=1; fi; done; if [ "
+        "\"$offline\" = 0 ] && [ \"${SC_FAKE_RELEASE_FAIL_ONLINE:-0}\" = 1 ]; "
+        "then echo online-release-failed >&2; exit 2; fi; if [ \"$offline\" = "
+        "1 ] && [ \"${SC_FAKE_RELEASE_FAIL_OFFLINE:-0}\" = 1 ]; then echo "
+        "offline-cache-miss >&2; exit 2; fi; printf "
+        "'{\"schema_version\":1,\"receipt_version\":\"studiocast-verified-"
+        "release/v1\"}\\n' >\"$receipt\"; cat \"$SC_FAKE_RELEASE\";;\n"
+        " plan) printf '%s\\n' \"$@\" >\"$SC_FAKE_PLAN_ARGS\"; if [ "
+        "\"${SC_FAKE_PLAN_FAIL:-0}\" = 1 ]; then echo plan-failed >&2; exit 2; "
+        "fi; cat \"$SC_FAKE_PLAN\";;\n"
+        " execute-plan) printf '%s\\n' \"$@\" >\"$SC_FAKE_ARGS\"; if [ "
+        "\"${SC_FAKE_CANCEL_CHILD:-0}\" = 1 ]; then trap 'kill \"$child\" "
+        "2>/dev/null || true; wait \"$child\" 2>/dev/null || true; cat "
+        "\"$SC_FAKE_RESULT\"; exit 130' INT TERM; sleep 30 & child=$!; printf "
+        "'%s\\n' \"$child\" >\"$SC_FAKE_CHILD_PID\"; wait \"$child\"; fi; if [ "
+        "\"${SC_FAKE_PROGRESS:-0}\" = 1 ]; then printf "
+        "'{\"event_version\":\"installer-progress/"
+        "v1\",\"plan_id\":\"plan-1\",\"plan_digest\":\"sha256:reviewed\","
+        "\"phase\":\"payload\",\"operation_id\":\"preflight.validate\","
+        "\"state\":\"running\"}\\n'; sleep \"${SC_FAKE_PROGRESS_HOLD:-0}\"; "
+        "fi; cat \"$SC_FAKE_RESULT\"; exit \"${SC_FAKE_EXIT:-0}\";;\n"
+        " *) exit 2;;\n"
+        "esac\n");
     script.close();
     script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner |
                           QFileDevice::ExeOwner);
     QFile archive(archive_);
     archive.open(QIODevice::WriteOnly);
     archive.write("verified fixture archive");
+    archive.close();
+    write(release_, ReleaseStatus(archive_));
     qputenv("STUDIOCAST_INSTALLER_BACKEND", script_.toLocal8Bit());
     qputenv("SC_FAKE_FACTS", facts_.toLocal8Bit());
     qputenv("SC_FAKE_STATUS", status_.toLocal8Bit());
     qputenv("SC_FAKE_PLAN", plan_.toLocal8Bit());
     qputenv("SC_FAKE_RESULT", result_.toLocal8Bit());
+    qputenv("SC_FAKE_RELEASE", release_.toLocal8Bit());
     qputenv("SC_FAKE_ARGS", args_.toLocal8Bit());
+    qputenv("SC_FAKE_PLAN_ARGS", planArgs_.toLocal8Bit());
+    qputenv("SC_FAKE_RELEASE_CALLS", releaseCalls_.toLocal8Bit());
+    qputenv("SC_FAKE_CHILD_PID", childPid_.toLocal8Bit());
+    qputenv("STUDIOCAST_STABLE_CHANNEL_URL",
+            "https://fixture.invalid/manifest.json");
+    qputenv("STUDIOCAST_STABLE_CHANNEL_SIGNATURE_URL",
+            "https://fixture.invalid/manifest.json.sig");
+    qputenv("STUDIOCAST_RELEASE_CACHE_DIR",
+            dir_.filePath(QStringLiteral("release-cache")).toLocal8Bit());
     setScenario(BaseFacts(), Status(QStringLiteral("absent"),
                                     QStringLiteral("recommended"),
                                     QStringLiteral("install")),
@@ -179,6 +247,14 @@ public:
     qunsetenv("STUDIOCAST_INSTALLER_BACKEND");
     qunsetenv("SC_FAKE_PLAN_FAIL");
     qunsetenv("SC_FAKE_EXIT");
+    qunsetenv("SC_FAKE_RELEASE_FAIL_ONLINE");
+    qunsetenv("SC_FAKE_RELEASE_FAIL_OFFLINE");
+    qunsetenv("SC_FAKE_CANCEL_CHILD");
+    qunsetenv("SC_FAKE_PROGRESS");
+    qunsetenv("SC_FAKE_PROGRESS_HOLD");
+    qunsetenv("STUDIOCAST_STABLE_CHANNEL_URL");
+    qunsetenv("STUDIOCAST_STABLE_CHANNEL_SIGNATURE_URL");
+    qunsetenv("STUDIOCAST_RELEASE_CACHE_DIR");
   }
 
   void setScenario(const QJsonObject &facts, const QJsonObject &status,
@@ -193,12 +269,26 @@ public:
   }
 
   void failPlan() { qputenv("SC_FAKE_PLAN_FAIL", "1"); }
+  void setReleaseFailures(bool online, bool offline) {
+    qputenv("SC_FAKE_RELEASE_FAIL_ONLINE", online ? "1" : "0");
+    qputenv("SC_FAKE_RELEASE_FAIL_OFFLINE", offline ? "1" : "0");
+  }
+  void enableCancellationChild(bool enabled) {
+    qputenv("SC_FAKE_CANCEL_CHILD", enabled ? "1" : "0");
+  }
+  void enableProgressEvent(bool enabled, const QByteArray &hold = "0") {
+    qputenv("SC_FAKE_PROGRESS", enabled ? "1" : "0");
+    qputenv("SC_FAKE_PROGRESS_HOLD", hold);
+  }
   QString arguments() const {
     QFile file(args_);
     file.open(QIODevice::ReadOnly);
     return QString::fromUtf8(file.readAll());
   }
   QString archive() const { return archive_; }
+  QString planArguments() const { return read(planArgs_); }
+  QString releaseCalls() const { return read(releaseCalls_); }
+  qint64 childPid() const { return read(childPid_).trimmed().toLongLong(); }
 
 private:
   static void write(const QString &path, const QJsonObject &object) {
@@ -207,8 +297,16 @@ private:
     file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
   }
 
+  static QString read(const QString &path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+      return {};
+    return QString::fromUtf8(file.readAll());
+  }
+
   QTemporaryDir dir_;
-  QString facts_, status_, plan_, result_, args_, script_, archive_;
+  QString facts_, status_, plan_, result_, release_, args_, planArgs_,
+      releaseCalls_, childPid_, script_, archive_;
 };
 
 bool WaitForProgress(studiocast::installer::ProgressPage *page) {
@@ -219,6 +317,59 @@ bool WaitForProgress(studiocast::installer::ProgressPage *page) {
     QThread::msleep(5);
   }
   return page->isComplete();
+}
+
+bool TestSignedReleaseAndOfflineReceipt(FakeBackend &backend) {
+  backend.setScenario(BaseFacts(),
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("install")),
+                      Plan(), Result(QStringLiteral("committed"), true), 0);
+  backend.setReleaseFailures(false, false);
+  studiocast::installer::InstallerWizard online;
+  online.page(studiocast::installer::PageReview)->initializePage();
+  const QString onlinePlanArgs = backend.planArguments();
+  bool ok =
+      Expect(online.planReady() &&
+                 !online.verifiedReleaseReceiptPath().isEmpty(),
+             "Recommended should require verified signed-release evidence") &&
+      Expect(
+          onlinePlanArgs.contains(QStringLiteral("--release-receipt")) &&
+              !onlinePlanArgs.contains(QStringLiteral("--official-source")) &&
+              !onlinePlanArgs.contains(QStringLiteral("--release-archive")),
+          "Recommended planning must use a reverified receipt, not an "
+          "official-source claim") &&
+      Expect(backend.releaseCalls().contains(
+                 QStringLiteral("https://fixture.invalid/manifest.json")) &&
+                 backend.releaseCalls().contains(QStringLiteral(
+                     "https://fixture.invalid/manifest.json.sig")),
+             "GUI should pass the configurable stable manifest endpoints");
+
+  backend.setReleaseFailures(true, false);
+  studiocast::installer::InstallerWizard cached;
+  cached.page(studiocast::installer::PageReview)->initializePage();
+  ok =
+      Expect(
+          cached.planReady() &&
+              backend.releaseCalls().contains(QStringLiteral("--offline")) &&
+              backend.releaseCalls().contains(QStringLiteral("release-cache")),
+          "Verified offline cache should remain usable after online failure") &&
+      ok;
+
+  backend.setReleaseFailures(true, true);
+  studiocast::installer::InstallerWizard unavailable;
+  auto *intro = unavailable.page(studiocast::installer::PageIntro);
+  intro->initializePage();
+  ok = Expect(!intro->isComplete() &&
+                  unavailable.detectedRoute() == QStringLiteral("offline"),
+              "Missing online and offline signed evidence must fail closed") &&
+       ok;
+  unavailable.page(studiocast::installer::PageReview)->initializePage();
+  ok = Expect(!unavailable.planReady(),
+              "Signed-release failure must block Apply before mutation") &&
+       ok;
+  backend.setReleaseFailures(false, false);
+  return ok;
 }
 
 bool TestStateDrivenRoutes(FakeBackend &backend) {
@@ -408,6 +559,12 @@ bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
                   !executed.contains(QStringLiteral("--source-dir")) &&
                   !executed.contains(QStringLiteral("--v4l2loopback")),
               "executor args must not reconstruct reviewed selection flags") && ok;
+  ok = Expect(backend.planArguments().contains(
+                  QStringLiteral("--release-receipt")) &&
+                  !backend.planArguments().contains(
+                      QStringLiteral("--official-source")),
+              "reviewed plan must be built from signed receipt evidence") &&
+       ok;
 
   backend.setScenario(BaseFacts(),
                       Status(QStringLiteral("absent"), QStringLiteral("recommended"),
@@ -495,9 +652,116 @@ bool TestFailureAndDegradedCompletionTruth(FakeBackend &backend) {
                       summary->text().contains(QStringLiteral("retry"),
                                                Qt::CaseInsensitive),
                   "degraded completion should offer accurate Retry/Continue guidance") && ok;
+      auto *retry = finish->findChild<QPushButton *>(
+          QStringLiteral("scInstallerDegradedRetry"));
+      auto *continueButton = finish->findChild<QPushButton *>(
+          QStringLiteral("scInstallerDegradedContinue"));
+      ok = Expect(retry && !retry->isHidden() && retry->isEnabled() &&
+                      continueButton && !continueButton->isHidden(),
+                  "degraded completion must expose dedicated Retry and "
+                  "Continue controls") &&
+           ok;
+      continueButton->click();
+      ok = Expect(wizard.result() == QDialog::Accepted,
+                  "Continue should explicitly accept the degraded outcome") &&
+           ok;
     }
   }
   return ok;
+}
+
+bool TestStructuredProgressAndDegradedRetry(FakeBackend &backend) {
+  backend.setScenario(BaseFacts(QStringLiteral("healthy")),
+                      Status(QStringLiteral("healthy"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("update"), true),
+                      Plan(QStringLiteral("update")),
+                      Result(QStringLiteral("degraded"), true), 3);
+  backend.enableProgressEvent(true, "0.25");
+  studiocast::installer::InstallerWizard wizard;
+  wizard.setWorkflow(QStringLiteral("update"));
+  wizard.page(studiocast::installer::PageReview)->initializePage();
+  auto *progress = dynamic_cast<studiocast::installer::ProgressPage *>(
+      wizard.page(studiocast::installer::PageProgress));
+  progress->initializePage();
+  auto *phase =
+      progress->findChild<QLabel *>(QStringLiteral("scInstallerProgressPhase"));
+  QElapsedTimer timer;
+  timer.start();
+  while (phase && !phase->text().contains(QStringLiteral("Phase:")) &&
+         timer.elapsed() < 1000) {
+    QApplication::processEvents();
+    QThread::msleep(5);
+  }
+  bool ok =
+      Expect(phase && phase->text().contains(QStringLiteral("payload")) &&
+                 phase->text().contains(QStringLiteral("preflight.validate")),
+             "bound backend events should drive structured progress phases") &&
+      Expect(WaitForProgress(progress),
+             "structured progress fixture should finish");
+  auto *finish = wizard.page(studiocast::installer::PageFinish);
+  finish->initializePage();
+  auto *retry = finish->findChild<QPushButton *>(
+      QStringLiteral("scInstallerDegradedRetry"));
+  retry->click();
+  QApplication::processEvents();
+  ok =
+      Expect(
+          wizard.workflow() == QStringLiteral("repair") &&
+              wizard.currentId() == studiocast::installer::PageReview &&
+              wizard.planReady(),
+          "Retry should re-analyze and present a new repair plan for review") &&
+      ok;
+  backend.enableProgressEvent(false);
+  return ok;
+}
+
+bool TestCancellationCleansChild(FakeBackend &backend) {
+#ifdef Q_OS_UNIX
+  backend.setScenario(BaseFacts(),
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("recommended"),
+                             QStringLiteral("install")),
+                      Plan(), Result(QStringLiteral("cancelled"), false), 130);
+  backend.enableCancellationChild(true);
+  studiocast::installer::InstallerWizard wizard;
+  wizard.page(studiocast::installer::PageReview)->initializePage();
+  auto *progress = dynamic_cast<studiocast::installer::ProgressPage *>(
+      wizard.page(studiocast::installer::PageProgress));
+  progress->initializePage();
+  QElapsedTimer timer;
+  timer.start();
+  while (backend.childPid() <= 0 && timer.elapsed() < 1000) {
+    QApplication::processEvents();
+    QThread::msleep(5);
+  }
+  const qint64 child = backend.childPid();
+  bool ok =
+      Expect(child > 0, "cancellation fixture should start a child process");
+  progress->requestCancellation();
+  ok = Expect(WaitForProgress(progress),
+              "cancelled backend should reach a structured terminal result") &&
+       ok;
+  timer.restart();
+  while (::kill(static_cast<pid_t>(child), 0) == 0 && timer.elapsed() < 1000) {
+    QThread::msleep(5);
+  }
+  errno = 0;
+  const int probe = ::kill(static_cast<pid_t>(child), 0);
+  ok = Expect(probe == -1 && errno == ESRCH,
+              "cancellation must not leave the backend child running") &&
+       ok;
+  ok = Expect(
+           wizard.executionResult().value(QStringLiteral("state")).toString() ==
+               QStringLiteral("cancelled"),
+           "cancellation should preserve the backend's structured result") &&
+       ok;
+  backend.enableCancellationChild(false);
+  return ok;
+#else
+  Q_UNUSED(backend);
+  return true;
+#endif
 }
 
 } // namespace
@@ -507,10 +771,13 @@ int main(int argc, char **argv) {
   QApplication app(argc, argv);
   FakeBackend backend;
   bool ok = true;
+  ok = TestSignedReleaseAndOfflineReceipt(backend) && ok;
   ok = TestStateDrivenRoutes(backend) && ok;
   ok = TestRecommendedCustomAndContextualRoutes(backend) && ok;
   ok = TestUnsupportedOfflineAndPriorReuse(backend) && ok;
   ok = TestPlanValidationExactExecutionAndLabels(backend) && ok;
   ok = TestFailureAndDegradedCompletionTruth(backend) && ok;
+  ok = TestStructuredProgressAndDegradedRetry(backend) && ok;
+  ok = TestCancellationCleansChild(backend) && ok;
   return ok ? 0 : 1;
 }
