@@ -23,6 +23,7 @@ APPIMAGE_REQUIRED=0
 SKIP_APPIMAGE=0
 CLEAN=0
 APPDIR_EXPLICIT=0
+TRUSTED_RELEASE_KEYS=()
 CMAKE_ARGS=(
   -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF
   -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF
@@ -53,6 +54,10 @@ Options:
                             Defaults to \$LINUXDEPLOY or PATH lookup.
   --skip-appimage           Only stage and archive the AppDir.
   --appimage-required       Fail if linuxdeploy cannot produce an AppImage.
+  --trusted-release-key ID=PATH
+                            Stage a production Ed25519 public key under ID.
+                            Repeat for key rotation. Required with
+                            --appimage-required.
   --clean                   Remove the CMake build dir and previous artifacts first.
 
 Artifacts:
@@ -109,6 +114,85 @@ write_file() {
     printf '%s\n' "$@"
   } > "${path}"
   chmod "${mode}" "${path}"
+}
+
+validate_recursive_output_path() {
+  local label="$1"
+  local path="$2"
+  local resolved
+  resolved="$(realpath -m -- "${path}")"
+  case "${resolved}" in
+    /|"${HOME}"|"${REPO_ROOT}"|"${REPO_ROOT}"/..)
+      die "unsafe ${label}: ${resolved}"
+      ;;
+  esac
+  if [[ "${REPO_ROOT}" == "${resolved}"/* ]]; then
+    die "${label} may not contain the repository root: ${resolved}"
+  fi
+  if [[ -L "${path}" ]]; then
+    die "${label} may not be a symlink: ${path}"
+  fi
+}
+
+validate_trusted_release_key() {
+  local specification="$1"
+  local key_id="${specification%%=*}"
+  local key_path="${specification#*=}"
+  [[ "${specification}" == *=* && -n "${key_path}" ]] ||
+    die "--trusted-release-key requires ID=PATH"
+  [[ "${key_id}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] ||
+    die "invalid trusted release key ID: ${key_id}"
+  [[ ! "${key_id}" =~ (^|[._-])(test|fixture)([._-]|$) ]] ||
+    die "test/fixture release keys cannot be staged as production trust roots"
+  [[ -f "${key_path}" && ! -L "${key_path}" ]] ||
+    die "trusted release key must be a regular non-symlink file: ${key_path}"
+  case "$(realpath -m -- "${key_path}")" in
+    "${REPO_ROOT}"/tests/*)
+      die "test fixture keys cannot be staged as production trust roots"
+      ;;
+  esac
+  openssl pkey -pubin -in "${key_path}" -text -noout 2>/dev/null |
+    grep -q 'ED25519' ||
+    die "trusted release key is not a valid Ed25519 public key: ${key_path}"
+}
+
+validate_paths_and_trust() {
+  if [[ "${APPIMAGE_REQUIRED}" -eq 1 && "${SKIP_APPIMAGE}" -eq 1 ]]; then
+    die "--appimage-required and --skip-appimage cannot be combined"
+  fi
+  validate_recursive_output_path "CMake build directory" "${CMAKE_BUILD_DIR}"
+  validate_recursive_output_path "AppDir" "${APPDIR}"
+  if [[ "$(realpath -m -- "${CMAKE_BUILD_DIR}")" == "$(realpath -m -- "${APPDIR}")" ]]; then
+    die "CMake build directory and AppDir must be different"
+  fi
+  local key key_id seen_ids=" "
+  for key in "${TRUSTED_RELEASE_KEYS[@]}"; do
+    validate_trusted_release_key "${key}"
+    key_id="${key%%=*}"
+    [[ "${seen_ids}" != *" ${key_id} "* ]] ||
+      die "duplicate trusted release key ID: ${key_id}"
+    seen_ids+="${key_id} "
+  done
+  if [[ "${APPIMAGE_REQUIRED}" -eq 1 && "${#TRUSTED_RELEASE_KEYS[@]}" -eq 0 ]]; then
+    die "release AppImages require at least one --trusted-release-key ID=PATH"
+  fi
+}
+
+validate_source_identity() {
+  command -v git >/dev/null 2>&1 ||
+    die "git is required to create an official source archive"
+  git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "official source archives must be created from a Git worktree"
+  git -C "${REPO_ROOT}" rev-parse --verify HEAD^{commit} >/dev/null 2>&1 ||
+    die "official source archive HEAD is unavailable"
+  local committed_version status
+  committed_version="$(git -C "${REPO_ROOT}" show HEAD:VERSION | tr -d '[:space:]')" ||
+    die "VERSION is not committed at HEAD"
+  [[ "${committed_version}" == "${VERSION}" ]] ||
+    die "working VERSION ${VERSION} differs from committed HEAD VERSION ${committed_version}"
+  status="$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all --ignore-submodules=none)"
+  [[ -z "${status}" ]] ||
+    die "official bundles require a clean worktree so built and archived bytes share one source identity"
 }
 
 find_linuxdeploy() {
@@ -212,6 +296,11 @@ parse_args() {
         APPIMAGE_REQUIRED=1
         shift
         ;;
+      --trusted-release-key)
+        [[ $# -ge 2 ]] || die "--trusted-release-key requires ID=PATH"
+        TRUSTED_RELEASE_KEYS+=("$2")
+        shift 2
+        ;;
       --clean)
         CLEAN=1
         shift
@@ -250,28 +339,11 @@ create_source_archive() {
   log "Creating source archive ${SOURCE_ARCHIVE_PATH}"
   run rm -f -- "${SOURCE_ARCHIVE_PATH}"
 
-  if command -v git >/dev/null 2>&1 &&
-      git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
-      git -C "${REPO_ROOT}" rev-parse --verify HEAD^{commit} >/dev/null 2>&1; then
-    run git -C "${REPO_ROOT}" archive \
-      --format=tar.gz \
-      --prefix="StudioCast-${VERSION}/" \
-      --output="${SOURCE_ARCHIVE_PATH}" \
-      HEAD
-  else
-    log "git archive is unavailable; falling back to a working-tree tarball"
-    local parent_dir repo_dir
-    parent_dir="$(dirname "${REPO_ROOT}")"
-    repo_dir="$(basename "${REPO_ROOT}")"
-    run tar -C "${parent_dir}" \
-      --exclude="${repo_dir}/.git" \
-      --exclude="${repo_dir}/build" \
-      --exclude="${repo_dir}/dist" \
-      --exclude="${repo_dir}/cmake-build-*" \
-      -czf "${SOURCE_ARCHIVE_PATH}" \
-      --transform "s#^${repo_dir}#StudioCast-${VERSION}#" \
-      "${repo_dir}"
-  fi
+  run git -C "${REPO_ROOT}" archive \
+    --format=tar.gz \
+    --prefix="StudioCast-${VERSION}/" \
+    --output="${SOURCE_ARCHIVE_PATH}" \
+    HEAD
 
   if [[ "${DRY_RUN}" -eq 0 && ! -f "${SOURCE_ARCHIVE_PATH}" ]]; then
     die "source archive was not created: ${SOURCE_ARCHIVE_PATH}"
@@ -292,6 +364,14 @@ stage_appdir() {
   run install -d -m 0755 "${desktop_dir}" "${icon_dir}" "${source_dir}"
   run install -m 0644 "${REPO_ROOT}/VERSION" "${APPDIR}/usr/share/VERSION"
   run install -m 0644 "${SOURCE_ARCHIVE_PATH}" "${STAGED_SOURCE_ARCHIVE}"
+
+  local trust_dir="${APPDIR}/usr/share/studiocast/installer/trust/keys"
+  local specification key_id key_path
+  for specification in "${TRUSTED_RELEASE_KEYS[@]}"; do
+    key_id="${specification%%=*}"
+    key_path="${specification#*=}"
+    run install -m 0644 "${key_path}" "${trust_dir}/${key_id}.pem"
+  done
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     print_cmd sed "s/@VERSION@/${VERSION}/g" \
@@ -330,12 +410,26 @@ stage_appdir() {
     die "staged release manifest schema is missing"
   fi
   if [[ "${DRY_RUN}" -eq 0 &&
+        ! -x "${APPDIR}/usr/share/studiocast/installer/models/studiocast-model-transaction" ]]; then
+    die "staged trusted model transaction launcher is missing"
+  fi
+  if [[ "${DRY_RUN}" -eq 0 &&
+        ! -f "${APPDIR}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json" ]]; then
+    die "staged curated model catalog is missing"
+  fi
+  if [[ "${DRY_RUN}" -eq 0 &&
         ! -f "${APPDIR}/usr/share/studiocast/installer/trust/keys/README.md" ]]; then
     die "staged production trust-root contract is missing"
   fi
   if [[ "${DRY_RUN}" -eq 0 && ! -f "${STAGED_SOURCE_ARCHIVE}" ]]; then
     die "staged source archive is missing: ${STAGED_SOURCE_ARCHIVE}"
   fi
+  for specification in "${TRUSTED_RELEASE_KEYS[@]}"; do
+    key_id="${specification%%=*}"
+    if [[ "${DRY_RUN}" -eq 0 && ! -f "${trust_dir}/${key_id}.pem" ]]; then
+      die "staged production trust root is missing: ${key_id}"
+    fi
+  done
 }
 
 build_appimage() {
@@ -390,14 +484,6 @@ build_appimage() {
   fi
 
   if [[ "${DRY_RUN}" -eq 0 && ! -f "${APPIMAGE_PATH}" ]]; then
-    local generated
-    generated="$(find "${REPO_ROOT}" "${DIST_DIR}" -maxdepth 1 -type f -name '*.AppImage' -print | head -n 1 || true)"
-    if [[ -n "${generated}" ]]; then
-      run mv -f -- "${generated}" "${APPIMAGE_PATH}"
-    fi
-  fi
-
-  if [[ "${DRY_RUN}" -eq 0 && ! -f "${APPIMAGE_PATH}" ]]; then
     if [[ "${APPIMAGE_REQUIRED}" -eq 1 ]]; then
       die "expected AppImage was not created: ${APPIMAGE_PATH}"
     fi
@@ -435,6 +521,8 @@ write_checksums() {
 main() {
   parse_args "$@"
   refresh_artifact_paths
+  validate_paths_and_trust
+  validate_source_identity
 
   if [[ "${CLEAN}" -eq 1 ]]; then
     log "Cleaning previous build and artifacts"

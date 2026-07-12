@@ -96,10 +96,57 @@ class PackagingIntegrationTests(unittest.TestCase):
     def test_installer_component_stages_release_primitives_and_production_trust_contract(self) -> None:
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         for required in ("packaging/release/release_channel.py", "release-manifest-v1.schema.json",
-                         "packaging/release/keys/README.md"):
+                         "packaging/release/keys/README.md", "installer/models/studiocast-model-transaction",
+                         "installer/models/model_transactions.py", "curated-model-catalog-v1.json",
+                         "resources/model_packs/"):
             self.assertIn(required, cmake)
+        self.assertIn('PATTERN "model.json"', cmake)
+        self.assertIn('PATTERN "LICENSE.txt"', cmake)
+        for forbidden_pattern in ('PATTERN "*.onnx"', 'PATTERN "*.dat"', 'PATTERN "*.bin"'):
+            self.assertNotIn(forbidden_pattern, cmake)
         self.assertEqual([], list((ROOT / "packaging/release/keys").glob("*.pem")))
         self.assertNotIn("fixture-ed25519-public.pem", cmake)
+        packaging_script = (ROOT / "packaging/appimage/build_appimage.sh").read_text(encoding="utf-8")
+        self.assertIn("--trusted-release-key", packaging_script)
+        self.assertNotIn("falling back to a working-tree tarball", packaging_script)
+        self.assertNotIn("find \"${REPO_ROOT}\" \"${DIST_DIR}\"", packaging_script)
+        self.assertIn("official bundles require a clean worktree", packaging_script)
+
+        missing_key = subprocess.run(
+            [str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run", "--appimage-required"],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(2, missing_key.returncode)
+        self.assertIn("require at least one --trusted-release-key", missing_key.stderr)
+
+        contradictory = subprocess.run(
+            [
+                str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run",
+                "--appimage-required", "--skip-appimage",
+            ],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(2, contradictory.returncode)
+        self.assertIn("cannot be combined", contradictory.stderr)
+
+        fixture_key = subprocess.run(
+            [
+                str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run", "--skip-appimage",
+                "--trusted-release-key", f"fixture-key={self.fixture / 'fixture-ed25519-public.pem'}",
+            ],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(2, fixture_key.returncode)
+        self.assertIn("test/fixture", fixture_key.stderr)
 
     def test_valid_receipt_is_bound_and_reverified_for_recommended_plan(self) -> None:
         receipt, path = self.verified_receipt()

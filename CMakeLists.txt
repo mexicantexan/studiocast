@@ -925,6 +925,34 @@ install(FILES
         COMPONENT Installer
 )
 
+# Curated model transactions execute from the trusted Installer component, not
+# from a target-built or user-selected source tree. Keep the installed relative
+# layout expected by model_transactions.py while staging metadata only.
+install(PROGRAMS installer/models/studiocast-model-transaction
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/models"
+        COMPONENT Installer
+)
+
+install(FILES
+        installer/models/__init__.py
+        installer/models/model_transactions.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/models"
+        COMPONENT Installer
+)
+
+install(FILES packaging/models/curated-model-catalog-v1.json
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/packaging/models"
+        COMPONENT Installer
+)
+
+install(DIRECTORY resources/model_packs/
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/resources/model_packs"
+        COMPONENT Installer
+        FILES_MATCHING
+        PATTERN "model.json"
+        PATTERN "LICENSE.txt"
+)
+
 # Production release engineering installs <key-id>.pem trust roots here.  No
 # production key is committed yet, so stable-channel verification fails closed.
 install(FILES packaging/release/keys/README.md

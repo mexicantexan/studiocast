@@ -19,7 +19,10 @@
     "artifacts": {
       "type": "object", "additionalProperties": false,
       "required": ["source_archive", "installer_appimage"],
-      "properties": {"source_archive": {"$ref": "#/$defs/artifact"}, "installer_appimage": {"$ref": "#/$defs/artifact"}}
+      "properties": {
+        "source_archive": {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"artifact_id": {"const": "studiocast-source"}}}]},
+        "installer_appimage": {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"artifact_id": {"const": "studiocast-installer-appimage"}}}]}
+      }
     },
     "activation": {
       "type": "object", "additionalProperties": false,

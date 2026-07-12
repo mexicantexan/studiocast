@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 import os
@@ -110,6 +111,10 @@ def _expect_timestamp(value: Any, where: str) -> str:
     timestamp = _expect_string(value, where)
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", timestamp):
         raise ReleaseChannelError("release.manifest.schema", f"{where} must be a UTC RFC 3339 timestamp")
+    try:
+        dt.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ReleaseChannelError("release.manifest.schema", f"{where} is not a valid UTC timestamp") from exc
     return timestamp
 
 
@@ -241,13 +246,17 @@ def parse_signature_envelope(raw: bytes | str) -> tuple[str, str]:
     return _expect_string(envelope["key_id"], "signature.key_id"), _expect_string(envelope["signature"], "signature.signature")
 
 
-def _validate_artifact(value: Any, name: str, *, allow_file_urls: bool) -> dict[str, Any]:
+def _validate_artifact(value: Any, name: str, artifact_id: str, *, allow_file_urls: bool) -> dict[str, Any]:
     artifact = _expect_object(
         value,
         f"artifacts.{name}",
         {"artifact_id", "filename", "url", "size_bytes", "sha256", "signature", "provenance", "license"},
     )
-    _expect_string(artifact["artifact_id"], f"artifacts.{name}.artifact_id")
+    if _expect_string(artifact["artifact_id"], f"artifacts.{name}.artifact_id") != artifact_id:
+        raise ReleaseChannelError(
+            "release.manifest.schema",
+            f"artifacts.{name}.artifact_id must be {artifact_id}",
+        )
     filename = _expect_string(artifact["filename"], f"artifacts.{name}.filename")
     if Path(filename).name != filename or filename in {".", ".."}:
         raise ReleaseChannelError("release.manifest.path", f"unsafe artifact filename: {filename}")
@@ -301,8 +310,18 @@ def validate_manifest(value: Any, *, allow_file_urls: bool = False) -> dict[str,
     _validate_https_url(release["page_url"], "release.page_url", allow_file=False)
     SemVer.parse(_expect_string(manifest["minimum_installer_version"], "minimum_installer_version"))
     artifacts = _expect_object(manifest["artifacts"], "artifacts", {"source_archive", "installer_appimage"})
-    _validate_artifact(artifacts["source_archive"], "source_archive", allow_file_urls=allow_file_urls)
-    _validate_artifact(artifacts["installer_appimage"], "installer_appimage", allow_file_urls=allow_file_urls)
+    _validate_artifact(
+        artifacts["source_archive"],
+        "source_archive",
+        "studiocast-source",
+        allow_file_urls=allow_file_urls,
+    )
+    _validate_artifact(
+        artifacts["installer_appimage"],
+        "installer_appimage",
+        "studiocast-installer-appimage",
+        allow_file_urls=allow_file_urls,
+    )
     activation = _expect_object(manifest["activation"], "activation", {"mode", "retain_previous", "rollback_supported"})
     if activation != {"mode": "side_by_side_atomic_pointer", "retain_previous": True, "rollback_supported": True}:
         raise ReleaseChannelError("release.manifest.activation", "stable releases require side-by-side atomic activation and rollback")
@@ -358,11 +377,24 @@ class UrlTransport(Transport):
             raise ReleaseChannelError("release.download.scheme", "only HTTPS and local file transports are supported")
         request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
         try:
-            with self._opener(request, timeout=30) as incoming, destination.open("ab") as outgoing:
+            with self._opener(request, timeout=30) as incoming:
+                final_url = getattr(incoming, "geturl", lambda: url)()
+                if urllib.parse.urlparse(final_url).scheme != "https":
+                    raise ReleaseChannelError(
+                        "release.download.redirect_scheme",
+                        "HTTPS download redirected to a non-HTTPS URL",
+                    )
                 status = getattr(incoming, "status", 200)
                 if offset and status != 206:
                     raise ReleaseChannelError("release.download.resume_unsupported", "server did not honor range request")
-                shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+                content_range = incoming.headers.get("Content-Range") if offset and hasattr(incoming, "headers") else None
+                if offset and (not content_range or not content_range.startswith(f"bytes {offset}-")):
+                    raise ReleaseChannelError(
+                        "release.download.resume_mismatch",
+                        "server returned an invalid range for the partial artifact",
+                    )
+                with destination.open("ab") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
         except ReleaseChannelError:
             raise
         except (OSError, urllib.error.URLError) as exc:
@@ -382,12 +414,17 @@ def fetch_release_manifest(
     """Fetch and atomically select a verified manifest/signature generation."""
 
     root = Path(cache_dir)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise ReleaseChannelError("release.cache.unsafe_path", f"manifest cache is unavailable: {root}") from exc
     if root.is_symlink():
         raise ReleaseChannelError("release.cache.unsafe_path", "manifest cache may not be a symlink")
     pointer = root / "current"
 
     def load_current() -> dict[str, Any]:
+        if pointer.is_symlink() or (pointer.exists() and not pointer.is_file()):
+            raise ReleaseChannelError("release.manifest_cache.corrupt", "manifest cache pointer is unsafe")
         try:
             generation = pointer.read_text(encoding="ascii").strip()
         except (OSError, UnicodeError) as exc:
@@ -395,9 +432,16 @@ def fetch_release_manifest(
         if not _SHA256_RE.fullmatch(generation):
             raise ReleaseChannelError("release.manifest_cache.corrupt", "invalid manifest cache pointer")
         directory = root / generation
-        if directory.is_symlink():
+        if directory.is_symlink() or not directory.is_dir():
             raise ReleaseChannelError("release.manifest_cache.corrupt", "manifest generation may not be a symlink")
         try:
+            for filename in ("manifest.json", "manifest.json.sig"):
+                candidate = directory / filename
+                if candidate.is_symlink() or not candidate.is_file():
+                    raise ReleaseChannelError(
+                        "release.manifest_cache.corrupt",
+                        f"cached {filename} is not a regular file",
+                    )
             return verify_manifest(
                 (directory / "manifest.json").read_bytes(),
                 (directory / "manifest.json.sig").read_bytes(),
@@ -427,11 +471,28 @@ def fetch_release_manifest(
         manifest = verify_manifest(raw_manifest, raw_signature, keys, allow_file_urls=allow_file_urls)
         generation = hashlib.sha256(raw_manifest).hexdigest()
         final_generation = root / generation
-        if not final_generation.exists():
+        generation_is_current = False
+        if final_generation.is_dir() and not final_generation.is_symlink():
+            manifest_file = final_generation / "manifest.json"
+            signature_file = final_generation / "manifest.json.sig"
+            generation_is_current = (
+                manifest_file.is_file()
+                and not manifest_file.is_symlink()
+                and signature_file.is_file()
+                and not signature_file.is_symlink()
+                and manifest_file.read_bytes() == raw_manifest
+                and signature_file.read_bytes() == raw_signature
+            )
+        if not generation_is_current:
             generation_staging = Path(tempfile.mkdtemp(prefix=f".{generation}.staging-", dir=root))
             try:
                 (generation_staging / "manifest.json").write_bytes(raw_manifest)
                 (generation_staging / "manifest.json.sig").write_bytes(raw_signature)
+                if final_generation.exists() or final_generation.is_symlink():
+                    if final_generation.is_dir() and not final_generation.is_symlink():
+                        shutil.rmtree(final_generation)
+                    else:
+                        final_generation.unlink()
                 os.replace(generation_staging, final_generation)
             finally:
                 if generation_staging.exists():
@@ -445,7 +506,10 @@ def fetch_release_manifest(
 def _safe_cache_target(cache_dir: Path, filename: str) -> Path:
     if Path(filename).name != filename or filename in {".", ".."}:
         raise ReleaseChannelError("release.cache.unsafe_path", f"unsafe cache filename: {filename}")
-    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise ReleaseChannelError("release.cache.unsafe_path", f"cache directory is unavailable: {cache_dir}") from exc
     if cache_dir.is_symlink():
         raise ReleaseChannelError("release.cache.unsafe_path", "cache directory may not be a symlink")
     return cache_dir / filename
@@ -476,7 +540,11 @@ def acquire_artifact(
     if offline:
         raise ReleaseChannelError("release.cache.miss", f"verified offline artifact is unavailable: {target.name}")
     partial = target.with_name(f".{target.name}.part")
-    if partial.is_symlink() or (partial.exists() and not partial.is_file()):
+    if (
+        partial.is_symlink()
+        or (partial.exists() and not partial.is_file())
+        or (partial.exists() and partial.stat().st_nlink != 1)
+    ):
         raise ReleaseChannelError("release.cache.unsafe_path", "partial cache path is unsafe")
     offset = partial.stat().st_size if partial.exists() else 0
     if offset > metadata["size_bytes"]:

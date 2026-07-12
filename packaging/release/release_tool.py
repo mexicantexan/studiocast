@@ -56,7 +56,33 @@ def artifact(path: Path, artifact_id: str, url: str, args: argparse.Namespace) -
     }
 
 
+def atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def generate(args: argparse.Namespace) -> None:
+    destinations = {args.output.resolve(), args.signature_output.resolve()}
+    protected_inputs = {
+        args.source_archive.resolve(),
+        args.installer_appimage.resolve(),
+        args.private_key.resolve(),
+    }
+    if len(destinations) != 2:
+        raise SystemExit("manifest and signature outputs must be different files")
+    if destinations & protected_inputs:
+        raise SystemExit("release outputs must not overwrite an artifact or private key")
     now = args.generated_at or dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     base = args.base_url.rstrip("/")
     manifest = {
@@ -78,16 +104,21 @@ def generate(args: argparse.Namespace) -> None:
         "activation": {"mode": "side_by_side_atomic_pointer", "retain_previous": True, "rollback_supported": True},
     }
     validate_manifest(manifest)
-    args.output.write_bytes(canonical_json(manifest))
+    raw_manifest = canonical_json(manifest)
+    with tempfile.TemporaryDirectory(prefix="studiocast-release-manifest-") as temporary:
+        staged_manifest = Path(temporary) / "manifest.json"
+        staged_manifest.write_bytes(raw_manifest)
+        manifest_signature = sign_file(staged_manifest, args.private_key)
     signature = {
         "schema_version": 1,
         "algorithm": "ed25519",
         "key_id": args.key_id,
-        "signature": sign_file(args.output, args.private_key),
+        "signature": manifest_signature,
     }
-    args.signature_output.write_bytes(canonical_json(signature))
-    os.chmod(args.output, 0o644)
-    os.chmod(args.signature_output, 0o644)
+    # Both signatures are complete before either previous output is replaced.
+    # Write the detached signature first so the manifest remains the commit point.
+    atomic_write(args.signature_output, canonical_json(signature))
+    atomic_write(args.output, raw_manifest)
 
 
 def parser() -> argparse.ArgumentParser:

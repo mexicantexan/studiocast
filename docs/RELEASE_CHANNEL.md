@@ -30,6 +30,22 @@ must report `release.signature.unknown_key` and stop. The key in
 `tests/data/installer_release` is visibly test-only and must never be trusted by
 a shipped installer.
 
+Release-grade AppImage packaging also requires each production public key
+explicitly:
+
+```bash
+packaging/appimage/build_appimage.sh --appimage-required \
+  --trusted-release-key studiocast-release-2026=/run/release-public/studiocast-release-2026.pem
+```
+
+The packaging script validates that each input is a non-symlink Ed25519 public
+key, rejects fixture/test key IDs and paths, and stages it as
+`usr/share/studiocast/installer/trust/keys/<key-id>.pem`. It refuses
+`--appimage-required` without at least one key, so a release bundle cannot be
+produced that is cryptographically incapable of consuming its stable channel.
+The published-release workflow must be wired to the matching public key before
+the first release; a signing secret alone is insufficient.
+
 ## Manifest v1
 
 The normative machine-readable shape is
@@ -104,6 +120,26 @@ moved with `os.replace` only after size, SHA-256, and Ed25519 checks succeed.
 generation directory named by the manifest SHA-256 and atomically replaces a
 small `current` pointer. Offline analysis reads only that selected generation,
 so a crash cannot expose a new manifest with an old detached signature.
+Unsafe cache pointers, symlinked generation content, and hard-linked partial
+artifacts are rejected. A verified online refresh repairs a corrupt generation
+without selecting the corrupt bytes. HTTPS transport rejects redirects to a
+weaker scheme and validates the start offset of resumed responses.
+
+## Packaged source and model surface
+
+Official source archives are always generated with `git archive HEAD`. There
+is no working-tree tar fallback: it could capture untracked files or produce
+bytes that do not correspond to the signed commit. Packaging also rejects a
+working `VERSION` that differs from the value committed at `HEAD`, and refuses
+dirty worktrees so the built installer and archived source share one commit
+identity.
+
+The Installer component contains the curated model transaction launcher,
+module, catalog, and referenced `model.json`/`LICENSE.txt` resources. These
+files form a trusted metadata and transaction surface independent of a
+user-selected source tree. No ONNX, dlib, TensorRT, or other model binary is
+redistributed in the AppDir. The verifier asserts the exact seven default packs
+represent eight artifacts and rejects staged model binaries.
 
 ## Installer self-update
 
