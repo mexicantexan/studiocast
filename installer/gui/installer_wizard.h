@@ -9,9 +9,11 @@
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QPushButton;
 class QRadioButton;
 
 namespace studiocast::installer {
@@ -61,6 +63,7 @@ public:
   QJsonObject osObject() const { return osObject_; }
   QJsonObject factsObject() const { return factsObject_; }
   QJsonObject planObject() const { return planObject_; }
+  QJsonObject releaseStatusObject() const { return releaseStatusObject_; }
   QJsonObject executionResult() const { return executionResult_; }
   bool analysisAvailable() const { return analysisAvailable_; }
   QString analysisError() const { return analysisError_; }
@@ -70,9 +73,13 @@ public:
   bool planReady() const { return planReady_; }
   QString planError() const { return planError_; }
   QString reviewedPlanPath() const { return reviewedPlanPath_; }
+  QString verifiedReleaseReceiptPath() const {
+    return verifiedReleaseReceiptPath_;
+  }
 
   void refreshStatus();
   bool refreshPlan(QString *error = nullptr);
+  bool launchVerifiedSelfUpdate(QString *error = nullptr);
   QStringList executionCommandArguments() const;
   QStringList backendOptions(bool forPlan) const;
   QStringList workflowCommandArguments(bool dryRun = false) const;
@@ -105,6 +112,8 @@ public:
 private:
   bool runBackendJson(const QStringList &args, QJsonObject *object,
                       QString *error) const;
+  bool refreshReleaseStatus(QString *error);
+  QStringList releaseChannelOptions(bool offline) const;
   void updatePreferenceProgressBars();
   void invalidatePlan();
   void seedFromPriorDesiredConfiguration();
@@ -139,10 +148,12 @@ private:
   QString analysisError_;
   QString planError_;
   QString reviewedPlanPath_;
+  QString verifiedReleaseReceiptPath_;
   QJsonObject factsObject_;
   QJsonObject statusObject_;
   QJsonObject osObject_;
   QJsonObject planObject_;
+  QJsonObject releaseStatusObject_;
   QJsonObject executionResult_;
 };
 
@@ -163,6 +174,10 @@ private:
   QRadioButton *repairAction_ = nullptr;
   QRadioButton *reinstallAction_ = nullptr;
   QRadioButton *uninstallAction_ = nullptr;
+  QGroupBox *selfUpdateBox_ = nullptr;
+  QLabel *selfUpdateLabel_ = nullptr;
+  QPushButton *restartInstallerButton_ = nullptr;
+  QPushButton *manualDownloadButton_ = nullptr;
 };
 
 class CompatibilityPage : public QWizardPage {
@@ -264,6 +279,7 @@ private:
 class ProgressPage : public QWizardPage {
 public:
   explicit ProgressPage(QWidget *parent = nullptr);
+  ~ProgressPage() override;
   void initializePage() override;
   bool isComplete() const override;
   bool validatePage() override;
@@ -272,6 +288,8 @@ public:
 
 private:
   void appendOutput(const QByteArray &bytes);
+  void consumeStructuredProgress(const QByteArray &bytes);
+  void signalProcessGroup(int signal);
   QPlainTextEdit *logText_ = nullptr;
   QLabel *stateLabel_ = nullptr;
   QProcess *process_ = nullptr;
@@ -280,7 +298,9 @@ private:
   int exitCode_ = -1;
   QByteArray stdoutBuffer_;
   QByteArray stderrBuffer_;
+  QByteArray progressLineBuffer_;
   bool cancellationRequested_ = false;
+  bool isolatedProcessGroup_ = false;
 };
 
 class FinishPage : public QWizardPage {
@@ -291,6 +311,8 @@ public:
 private:
   QLabel *summaryLabel_ = nullptr;
   QPlainTextEdit *details_ = nullptr;
+  QPushButton *retryButton_ = nullptr;
+  QPushButton *continueButton_ = nullptr;
 };
 
 } // namespace studiocast::installer

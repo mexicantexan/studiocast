@@ -6,8 +6,9 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
-#include <QDir>
 #include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,8 +20,8 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMessageBox>
 #include <QMap>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcessEnvironment>
 #include <QProgressBar>
@@ -38,6 +39,9 @@
 
 #include <algorithm>
 #include <csignal>
+#ifdef Q_OS_UNIX
+#include <unistd.h>
+#endif
 
 #include "studiocast/version.h"
 
@@ -464,7 +468,12 @@ InstallerWizard::InstallerWizard(QWidget *parent) : QWizard(parent) {
   refreshStatus();
 }
 
-InstallerWizard::~InstallerWizard() { invalidatePlan(); }
+InstallerWizard::~InstallerWizard() {
+  invalidatePlan();
+  if (!verifiedReleaseReceiptPath_.isEmpty()) {
+    QFile::remove(verifiedReleaseReceiptPath_);
+  }
+}
 
 QString InstallerWizard::backendPath() const { return backendPath_; }
 QString InstallerWizard::workflow() const { return workflow_; }
@@ -680,14 +689,200 @@ bool InstallerWizard::runBackendJson(const QStringList &args,
   return true;
 }
 
+QStringList InstallerWizard::releaseChannelOptions(bool offline) const {
+  const QProcessEnvironment environment =
+      QProcessEnvironment::systemEnvironment();
+  QStringList options;
+  const QString stableUrl =
+      environment.value(QStringLiteral("STUDIOCAST_STABLE_CHANNEL_URL"));
+  const QString stableSignatureUrl = environment.value(
+      QStringLiteral("STUDIOCAST_STABLE_CHANNEL_SIGNATURE_URL"));
+  const QString releaseCache =
+      environment.value(QStringLiteral("STUDIOCAST_RELEASE_CACHE_DIR"));
+  if (!stableUrl.isEmpty())
+    options << QStringLiteral("--stable-url") << stableUrl;
+  if (!stableSignatureUrl.isEmpty())
+    options << QStringLiteral("--stable-signature-url") << stableSignatureUrl;
+  if (!releaseCache.isEmpty())
+    options << QStringLiteral("--release-cache-dir") << releaseCache;
+  options << QStringLiteral("--prepare-self-update");
+  const QString appImage = environment.value(QStringLiteral("APPIMAGE"));
+  const QFileInfo appImageInfo(appImage);
+  if (appImageInfo.isAbsolute() && appImageInfo.isFile() &&
+      !appImageInfo.isSymLink()) {
+    options << QStringLiteral("--appimage-path")
+            << appImageInfo.absoluteFilePath();
+  }
+  if (offline)
+    options << QStringLiteral("--offline");
+  return options;
+}
+
+bool InstallerWizard::refreshReleaseStatus(QString *error) {
+  releaseStatusObject_ = {};
+  if (!verifiedReleaseReceiptPath_.isEmpty()) {
+    QFile::remove(verifiedReleaseReceiptPath_);
+    verifiedReleaseReceiptPath_.clear();
+  }
+
+  const QString tempRoot =
+      QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+  QTemporaryFile receipt(QDir(tempRoot).filePath(
+      QStringLiteral("studiocast-verified-release-XXXXXX.json")));
+  receipt.setAutoRemove(false);
+  if (!receipt.open()) {
+    if (error)
+      *error = QStringLiteral("Could not allocate a private release receipt.");
+    return false;
+  }
+  const QString receiptPath = receipt.fileName();
+  receipt.close();
+  QFile::remove(receiptPath);
+
+  QString onlineError;
+  QJsonObject releaseStatus;
+  QStringList args{QStringLiteral("release-status"), QStringLiteral("--json"),
+                   QStringLiteral("--release-receipt-out"), receiptPath};
+  args += releaseChannelOptions(false);
+  bool verified = runBackendJson(args, &releaseStatus, &onlineError);
+  QString offlineError;
+  if (!verified) {
+    args = {QStringLiteral("release-status"), QStringLiteral("--json"),
+            QStringLiteral("--release-receipt-out"), receiptPath};
+    args += releaseChannelOptions(true);
+    verified = runBackendJson(args, &releaseStatus, &offlineError);
+  }
+
+  if (!verified ||
+      releaseStatus.value(QStringLiteral("schema_version")).toInt() != 1 ||
+      releaseStatus.value(QStringLiteral("release_status_version"))
+              .toString() != QStringLiteral("installer-release-status/v1") ||
+      releaseStatus.value(QStringLiteral("available_version"))
+          .toString()
+          .isEmpty() ||
+      !QFileInfo(receiptPath).isFile()) {
+    QFile::remove(receiptPath);
+    if (error) {
+      if (!offlineError.trimmed().isEmpty()) {
+        *error =
+            QStringLiteral("Stable release verification failed online (%1) "
+                           "and no verified offline cache was usable (%2).")
+                .arg(onlineError.trimmed(), offlineError.trimmed());
+      } else if (!onlineError.trimmed().isEmpty()) {
+        *error = onlineError.trimmed();
+      } else {
+        *error = QStringLiteral("Stable release status or signed receipt "
+                                "evidence was incomplete.");
+      }
+    }
+    return false;
+  }
+
+  QFile(receiptPath)
+      .setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  verifiedReleaseReceiptPath_ = receiptPath;
+  releaseStatusObject_ = releaseStatus;
+  return true;
+}
+
+bool InstallerWizard::launchVerifiedSelfUpdate(QString *error) {
+  const QJsonObject selfUpdate =
+      releaseStatusObject_.value(QStringLiteral("self_update")).toObject();
+  const QJsonArray commandValue =
+      selfUpdate.value(QStringLiteral("relaunch_command")).toArray();
+  QStringList command;
+  for (const QJsonValue &value : commandValue) {
+    if (!value.isString() || value.toString().isEmpty()) {
+      if (error)
+        *error = QStringLiteral("The verified restart command is malformed.");
+      return false;
+    }
+    command << value.toString();
+  }
+  const QString verifiedPath =
+      jsonString(selfUpdate, QStringLiteral("verified_appimage"));
+  const QFileInfo verifiedInfo(verifiedPath);
+  const QProcessEnvironment environment =
+      QProcessEnvironment::systemEnvironment();
+  const QString currentPath =
+      jsonString(selfUpdate, QStringLiteral("current_appimage"));
+  const QFileInfo currentInfo(currentPath);
+  const QFileInfo detectedInfo(environment.value(QStringLiteral("APPIMAGE")));
+  if (jsonString(selfUpdate, QStringLiteral("state")) !=
+          QStringLiteral("offer_restart") ||
+      !jsonBool(selfUpdate, QStringLiteral("requires_confirmation")) ||
+      jsonBool(selfUpdate, QStringLiteral("running_artifact_replaced"), true) ||
+      command.size() != 1 || command.first() != verifiedPath ||
+      !verifiedInfo.isAbsolute() || !verifiedInfo.isFile() ||
+      verifiedInfo.isSymLink() || !verifiedInfo.isExecutable() ||
+      verifiedInfo.canonicalFilePath() != verifiedInfo.absoluteFilePath() ||
+      !currentInfo.isFile() || currentInfo.isSymLink() ||
+      currentInfo.canonicalFilePath() != detectedInfo.canonicalFilePath() ||
+      currentInfo.canonicalFilePath() == verifiedInfo.canonicalFilePath()) {
+    if (error)
+      *error = QStringLiteral(
+          "The installer update is not a valid verified restart offer.");
+    return false;
+  }
+
+  const bool testConfirmed =
+      environment.value(
+          QStringLiteral("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE")) ==
+      QStringLiteral("1");
+  if (!testConfirmed &&
+      QMessageBox::question(
+          this, QStringLiteral("Restart with verified installer update?"),
+          QStringLiteral("StudioCast verified a newer installer at:\n%1\n\n"
+                         "Restart now? The running AppImage will not be "
+                         "overwritten.")
+              .arg(verifiedPath),
+          QMessageBox::Yes | QMessageBox::No,
+          QMessageBox::No) != QMessageBox::Yes) {
+    if (error)
+      error->clear();
+    return false;
+  }
+
+  const QString launchLog = environment.value(
+      QStringLiteral("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG"));
+  if (!launchLog.isEmpty()) {
+    QFile file(launchLog);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      if (error)
+        *error = QStringLiteral("Could not record the test restart command.");
+      return false;
+    }
+    file.write(QJsonDocument(QJsonArray::fromStringList(command))
+                   .toJson(QJsonDocument::Compact));
+    return true;
+  }
+
+  const QString program = command.takeFirst();
+  if (!QProcess::startDetached(program, command)) {
+    if (error)
+      *error =
+          QStringLiteral("Could not launch the verified installer update.");
+    return false;
+  }
+  QCoreApplication::quit();
+  return true;
+}
+
 void InstallerWizard::refreshStatus() {
   analysisAvailable_ = false;
   analysisError_.clear();
+  QString releaseError;
+  const bool releaseVerified = refreshReleaseStatus(&releaseError);
   QString error;
   QJsonObject facts;
-  if (!runBackendJson(
-          QStringList{QStringLiteral("analyze"), QStringLiteral("--json")},
-          &facts, &error)) {
+  QStringList analyzeArgs{QStringLiteral("analyze"), QStringLiteral("--json")};
+  if (releaseVerified) {
+    analyzeArgs << QStringLiteral("--target-version")
+                << releaseStatusObject_
+                       .value(QStringLiteral("available_version"))
+                       .toString();
+  }
+  if (!runBackendJson(analyzeArgs, &facts, &error)) {
     factsObject_ = {};
     statusObject_ = {{QStringLiteral("backend_error"), error},
                      {QStringLiteral("route"), QStringLiteral("analysis_error")},
@@ -697,9 +892,12 @@ void InstallerWizard::refreshStatus() {
     return;
   }
   QJsonObject status;
-  if (runBackendJson(
-          QStringList{QStringLiteral("status"), QStringLiteral("--json")},
-          &status, &error)) {
+  QStringList statusArgs{QStringLiteral("status"), QStringLiteral("--json")};
+  if (releaseVerified) {
+    statusArgs << QStringLiteral("--release-receipt")
+               << verifiedReleaseReceiptPath_;
+  }
+  if (runBackendJson(statusArgs, &status, &error)) {
     if (facts.value(QStringLiteral("facts_version")).toString() !=
             QStringLiteral("installer-facts/v1") ||
         status.value(QStringLiteral("schema_version")).toInt() != 2) {
@@ -713,6 +911,13 @@ void InstallerWizard::refreshStatus() {
     }
     factsObject_ = facts;
     statusObject_ = status;
+    if (!releaseVerified &&
+        jsonString(statusObject_, QStringLiteral("route")) !=
+            QStringLiteral("unsupported")) {
+      statusObject_[QStringLiteral("route")] = QStringLiteral("offline");
+      statusObject_[QStringLiteral("primary_action")] = QStringLiteral("stop");
+      statusObject_[QStringLiteral("release_error")] = releaseError;
+    }
     osObject_ = facts.value(QStringLiteral("os")).toObject();
     analysisAvailable_ = true;
     seedFromPriorDesiredConfiguration();
@@ -785,10 +990,10 @@ bool InstallerWizard::refreshPlan(QString *error) {
   }
   if (!customRoute_ && workflow_ != QStringLiteral("repair") &&
       workflow_ != QStringLiteral("uninstall") &&
-      (!useReleaseArchive_ || releaseArchive_.isEmpty() ||
-       !QFileInfo(releaseArchive_).isFile())) {
+      (verifiedReleaseReceiptPath_.isEmpty() ||
+       !QFileInfo(verifiedReleaseReceiptPath_).isFile())) {
     planError_ = QStringLiteral(
-        "Recommended installation requires the verified official release archive.");
+        "Recommended installation requires a current signed-release receipt.");
     if (error)
       *error = planError_;
     return false;
@@ -881,11 +1086,11 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
   const bool needsSource = workflow_ != QStringLiteral("uninstall") &&
                            workflow_ != QStringLiteral("advanced");
   if (needsSource) {
-    if (useReleaseArchive_ && !releaseArchive_.isEmpty()) {
+    if (!customRoute_ && !verifiedReleaseReceiptPath_.isEmpty()) {
+      args << QStringLiteral("--release-receipt")
+           << verifiedReleaseReceiptPath_;
+    } else if (useReleaseArchive_ && !releaseArchive_.isEmpty()) {
       args << QStringLiteral("--release-archive") << releaseArchive_;
-      if (!customRoute_) {
-        args << QStringLiteral("--official-source");
-      }
     } else if (!sourceDir_.isEmpty()) {
       args << QStringLiteral("--source-dir") << sourceDir_;
     }
@@ -894,6 +1099,12 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
     }
     if (!buildType_.isEmpty()) {
       args << QStringLiteral("--build-type") << buildType_;
+    }
+    if (workflow_ == QStringLiteral("repair") ||
+        workflow_ == QStringLiteral("reinstall") ||
+        workflow_ == QStringLiteral("clean-install") ||
+        workflow_ == QStringLiteral("modify")) {
+      args << QStringLiteral("--allow-same-version");
     }
   }
 
@@ -1070,6 +1281,41 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   workflowBox->setLayout(workflowLayout);
   layout->addWidget(workflowBox);
 
+  selfUpdateBox_ = new QGroupBox(QStringLiteral("Installer update"), this);
+  auto *selfUpdateLayout = new QVBoxLayout(selfUpdateBox_);
+  selfUpdateLabel_ = new QLabel(selfUpdateBox_);
+  selfUpdateLabel_->setWordWrap(true);
+  selfUpdateLayout->addWidget(selfUpdateLabel_);
+  auto *selfUpdateActions = new QHBoxLayout;
+  restartInstallerButton_ = new QPushButton(
+      QStringLiteral("Restart with verified update"), selfUpdateBox_);
+  restartInstallerButton_->setObjectName(
+      QStringLiteral("scInstallerSelfUpdateRestart"));
+  manualDownloadButton_ =
+      new QPushButton(QStringLiteral("Open manual download"), selfUpdateBox_);
+  manualDownloadButton_->setObjectName(
+      QStringLiteral("scInstallerSelfUpdateManual"));
+  selfUpdateActions->addWidget(restartInstallerButton_);
+  selfUpdateActions->addWidget(manualDownloadButton_);
+  selfUpdateActions->addStretch(1);
+  selfUpdateLayout->addLayout(selfUpdateActions);
+  selfUpdateBox_->setVisible(false);
+  layout->addWidget(selfUpdateBox_);
+
+  connect(restartInstallerButton_, &QPushButton::clicked, this, [this] {
+    QString error;
+    if (!installerWizard(this)->launchVerifiedSelfUpdate(&error) &&
+        !error.isEmpty()) {
+      QMessageBox::warning(
+          this, QStringLiteral("Installer restart unavailable"), error);
+    }
+  });
+  connect(manualDownloadButton_, &QPushButton::clicked, this, [this] {
+    const QUrl url(manualDownloadButton_->property("downloadUrl").toString());
+    if (url.scheme() == QStringLiteral("https"))
+      QDesktopServices::openUrl(url);
+  });
+
   layout->addWidget(mutedLabel(
       QStringLiteral("The GUI is not run as root. Privileged operations are "
                      "delegated only through the trusted, typed StudioCast "
@@ -1084,6 +1330,36 @@ void IntroPage::initializePage() {
   w->refreshStatus();
   const QJsonObject status = w->statusObject();
   const QJsonObject os = w->osObject();
+  const QJsonObject selfUpdate =
+      w->releaseStatusObject().value(QStringLiteral("self_update")).toObject();
+  const QString selfUpdateState =
+      jsonString(selfUpdate, QStringLiteral("state"));
+  const QString manualUrl =
+      jsonString(selfUpdate, QStringLiteral("manual_download_url"));
+  const QUrl parsedManualUrl(manualUrl);
+  const bool manualAvailable =
+      parsedManualUrl.isValid() &&
+      parsedManualUrl.scheme() == QStringLiteral("https");
+  const bool restartAvailable =
+      selfUpdateState == QStringLiteral("offer_restart") &&
+      jsonBool(selfUpdate, QStringLiteral("requires_confirmation"));
+  selfUpdateBox_->setVisible(
+      restartAvailable || selfUpdateState == QStringLiteral("manual_download"));
+  restartInstallerButton_->setVisible(restartAvailable);
+  manualDownloadButton_->setVisible(manualAvailable);
+  manualDownloadButton_->setProperty("downloadUrl", manualUrl);
+  manualDownloadButton_->setToolTip(manualUrl);
+  if (restartAvailable) {
+    selfUpdateLabel_->setText(QStringLiteral(
+        "A newer installer AppImage was downloaded and verified. Restart is "
+        "offered explicitly; the running AppImage will not be replaced."));
+  } else if (selfUpdateState == QStringLiteral("manual_download")) {
+    selfUpdateLabel_->setText(
+        QStringLiteral("Automatic installer restart is unavailable (%1). Use "
+                       "the verified release's manual download link.")
+            .arg(jsonString(selfUpdate, QStringLiteral("reason_code"),
+                            QStringLiteral("self_update.unavailable"))));
+  }
 
   if (!w->analysisAvailable()) {
     osValue_->setText(QStringLiteral("Analysis unavailable"));
@@ -1113,11 +1389,18 @@ void IntroPage::initializePage() {
                installedVersion.isEmpty() ? QStringLiteral("not installed")
                                           : installedVersion));
 
-  installValue_->setText(QStringLiteral("%1 (%2)")
-                             .arg(jsonString(status, QStringLiteral("classification"),
-                                             QStringLiteral("unknown")),
-                                  jsonString(status, QStringLiteral("version_relation"),
-                                             QStringLiteral("unknown"))));
+  QString installText = QStringLiteral("%1 (%2)").arg(
+      jsonString(status, QStringLiteral("classification"),
+                 QStringLiteral("unknown")),
+      jsonString(status, QStringLiteral("version_relation"),
+                 QStringLiteral("unknown")));
+  const QString releaseError =
+      jsonString(status, QStringLiteral("release_error"));
+  if (!releaseError.isEmpty()) {
+    installText +=
+        QStringLiteral("\nStable release unavailable: %1").arg(releaseError);
+  }
+  installValue_->setText(installText);
 
   const QString route = w->detectedRoute();
   const QString action = w->primaryAction();
@@ -1828,11 +2111,22 @@ ProgressPage::ProgressPage(QWidget *parent) : QWizardPage(parent) {
 
   auto *layout = new QVBoxLayout(this);
   stateLabel_ = new QLabel(QStringLiteral("Waiting to start"), this);
+  stateLabel_->setObjectName(QStringLiteral("scInstallerProgressPhase"));
   stateLabel_->setWordWrap(true);
   layout->addWidget(stateLabel_);
   logText_ = new QPlainTextEdit(this);
   setReadOnlyLogStyle(logText_);
   layout->addWidget(logText_, 1);
+}
+
+ProgressPage::~ProgressPage() {
+  if (isRunning()) {
+#ifdef Q_OS_UNIX
+    signalProcessGroup(SIGKILL);
+#endif
+    process_->kill();
+    process_->waitForFinished(1000);
+  }
 }
 
 void ProgressPage::initializePage() {
@@ -1844,7 +2138,9 @@ void ProgressPage::initializePage() {
   exitCode_ = -1;
   stdoutBuffer_.clear();
   stderrBuffer_.clear();
+  progressLineBuffer_.clear();
   cancellationRequested_ = false;
+  isolatedProcessGroup_ = false;
   emit completeChanged();
 
   auto *w = installerWizard(this);
@@ -1856,10 +2152,15 @@ void ProgressPage::initializePage() {
     setSubTitle(QStringLiteral("Backend output is streamed here."));
   }
   process_ = new QProcess(this);
+#if defined(Q_OS_UNIX) && QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+  process_->setChildProcessModifier([] { ::setpgid(0, 0); });
+  isolatedProcessGroup_ = true;
+#endif
   process_->setProcessChannelMode(QProcess::SeparateChannels);
   connect(process_, &QProcess::readyReadStandardOutput, this, [this] {
     const QByteArray bytes = process_->readAllStandardOutput();
     stdoutBuffer_ += bytes;
+    consumeStructuredProgress(bytes);
     appendOutput(bytes);
   });
   connect(process_, &QProcess::readyReadStandardError, this, [this] {
@@ -2009,7 +2310,7 @@ void ProgressPage::requestCancellation() {
   cancellationRequested_ = true;
   stateLabel_->setText(QStringLiteral("Cancelling; waiting for backend rollback result…"));
 #ifdef Q_OS_UNIX
-  ::kill(static_cast<pid_t>(process_->processId()), SIGINT);
+  signalProcessGroup(SIGINT);
 #else
   process_->terminate();
 #endif
@@ -2017,9 +2318,56 @@ void ProgressPage::requestCancellation() {
     if (isRunning()) {
       stateLabel_->setText(QStringLiteral(
           "Cancellation timed out; transaction state is uncertain."));
+#ifdef Q_OS_UNIX
+      signalProcessGroup(SIGKILL);
+#endif
       process_->kill();
     }
   });
+}
+
+void ProgressPage::signalProcessGroup(int signal) {
+#ifdef Q_OS_UNIX
+  if (!process_ || process_->processId() <= 0)
+    return;
+  const pid_t pid = static_cast<pid_t>(process_->processId());
+  ::kill(isolatedProcessGroup_ ? -pid : pid, signal);
+#else
+  Q_UNUSED(signal);
+#endif
+}
+
+void ProgressPage::consumeStructuredProgress(const QByteArray &bytes) {
+  progressLineBuffer_ += bytes;
+  qsizetype newline = -1;
+  while ((newline = progressLineBuffer_.indexOf('\n')) >= 0) {
+    const QByteArray line = progressLineBuffer_.left(newline).trimmed();
+    progressLineBuffer_.remove(0, newline + 1);
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject())
+      continue;
+    const QJsonObject event = document.object();
+    if (jsonString(event, QStringLiteral("event_version")) !=
+        QStringLiteral("installer-progress/v1"))
+      continue;
+    const auto *w = dynamic_cast<const InstallerWizard *>(window());
+    if (!w ||
+        jsonString(event, QStringLiteral("plan_id")) !=
+            jsonString(w->planObject(), QStringLiteral("plan_id")) ||
+        jsonString(event, QStringLiteral("plan_digest")) !=
+            jsonString(w->planObject(), QStringLiteral("plan_digest")))
+      continue;
+    const QString phase = jsonString(event, QStringLiteral("phase"));
+    if (phase.isEmpty())
+      continue;
+    const QString operation = jsonString(event, QStringLiteral("operation_id"));
+    const QString state = jsonString(event, QStringLiteral("state"));
+    stateLabel_->setText(
+        operation.isEmpty() ? QStringLiteral("Phase: %1 (%2)").arg(phase, state)
+                            : QStringLiteral("Phase: %1 — %2 (%3)")
+                                  .arg(phase, operation, state));
+  }
 }
 
 void ProgressPage::appendOutput(const QByteArray &bytes) {
@@ -2036,9 +2384,32 @@ FinishPage::FinishPage(QWidget *parent) : QWizardPage(parent) {
   summaryLabel_->setObjectName(QStringLiteral("scInstallerCompletionSummary"));
   summaryLabel_->setWordWrap(true);
   layout->addWidget(summaryLabel_);
+  auto *actions = new QHBoxLayout;
+  retryButton_ =
+      new QPushButton(QStringLiteral("Retry optional operations"), this);
+  retryButton_->setObjectName(QStringLiteral("scInstallerDegradedRetry"));
+  continueButton_ =
+      new QPushButton(QStringLiteral("Continue with limitations"), this);
+  continueButton_->setObjectName(QStringLiteral("scInstallerDegradedContinue"));
+  retryButton_->setVisible(false);
+  continueButton_->setVisible(false);
+  actions->addWidget(retryButton_);
+  actions->addWidget(continueButton_);
+  actions->addStretch(1);
+  layout->addLayout(actions);
   details_ = new QPlainTextEdit(this);
   setReadOnlyLogStyle(details_);
   layout->addWidget(details_, 1);
+
+  connect(retryButton_, &QPushButton::clicked, this, [this] {
+    auto *w = installerWizard(this);
+    w->setWorkflow(QStringLiteral("repair"));
+    w->setCustomRoute(false);
+    w->setStartId(PageReview);
+    w->restart();
+  });
+  connect(continueButton_, &QPushButton::clicked, this,
+          [this] { installerWizard(this)->accept(); });
 }
 
 void FinishPage::initializePage() {
@@ -2046,6 +2417,19 @@ void FinishPage::initializePage() {
   const QJsonObject result = w->executionResult();
   const QString state = jsonString(result, QStringLiteral("state"),
                                    QStringLiteral("failed"));
+  const bool degraded = state == QStringLiteral("degraded");
+  retryButton_->setVisible(degraded);
+  continueButton_->setVisible(degraded);
+  retryButton_->setEnabled(
+      !result.value(QStringLiteral("retryable_operation_ids"))
+           .toArray()
+           .isEmpty());
+  retryButton_->setToolTip(
+      retryButton_->isEnabled()
+          ? QStringLiteral(
+                "Re-analyze and review a repair plan before retrying.")
+          : QStringLiteral(
+                "The backend did not report a retryable operation."));
   if (state == QStringLiteral("committed")) {
     setTitle(actionLabel(w->workflow()) + QStringLiteral(" complete"));
     summaryLabel_->setText(
