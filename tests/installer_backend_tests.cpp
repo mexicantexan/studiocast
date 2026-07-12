@@ -273,6 +273,32 @@ bool TestRepairPlanCanDisableOpenBackendConfigureFlags() {
                 "configure flag");
 }
 
+bool TestUninstallPlanOmitsInstallOnlyDetails() {
+  ScopedTempDir temp("studiocast-installer-backend-uninstall-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan uninstall --json", "--preserve-user-data"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend uninstall plan should exit successfully") &&
+         ExpectContains("installer backend uninstall plan", result.stdout_str,
+                        "Current installed version") &&
+         ExpectContains("installer backend uninstall plan", result.stdout_str,
+                        "downloaded model packs") &&
+         Expect(result.stdout_str.find("Target StudioCast version") ==
+                    std::string::npos,
+                "uninstall plan should omit target version") &&
+         Expect(result.stdout_str.find("Source:") == std::string::npos,
+                "uninstall plan should omit source") &&
+         Expect(result.stdout_str.find("Build directory:") == std::string::npos,
+                "uninstall plan should omit build details");
+}
+
 bool TestRepairDryRunIncludesOpenBackendConfigureFlags() {
   ScopedTempDir temp("studiocast-installer-backend-dry-run");
   if (!Expect(temp.ok(), temp.error().c_str()))
@@ -495,6 +521,7 @@ int main() {
   ok = TestRepairPlanInstallsOnlySelectedVulkanPackages() && ok;
   ok = TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() && ok;
   ok = TestRepairPlanCanDisableOpenBackendConfigureFlags() && ok;
+  ok = TestUninstallPlanOmitsInstallOnlyDetails() && ok;
   ok = TestRepairDryRunIncludesOpenBackendConfigureFlags() && ok;
   ok = TestStatusReportsOptionalComponents() && ok;
   ok = TestPackageSafetyDoesNotBundleOrInstallMaxineArtifacts() && ok;

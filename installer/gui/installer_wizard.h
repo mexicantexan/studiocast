@@ -25,6 +25,7 @@ enum WizardPageId {
   PageReview,
   PageProgress,
   PageFinish,
+  PageUninstall,
 };
 
 class InstallerWizard : public QWizard {
@@ -62,6 +63,7 @@ public:
   bool refreshPlan(QString *error = nullptr);
   QStringList backendOptions(bool forPlan) const;
   QStringList workflowCommandArguments(bool dryRun = false) const;
+  int nextId() const override;
 
   void setWorkflow(const QString &workflow);
   void setSourceDir(const QString &path);
@@ -87,6 +89,7 @@ public:
 private:
   bool runBackendJson(const QStringList &args, QJsonObject *object,
                       QString *error) const;
+  void updatePreferenceProgressBars();
   QString backendPath_;
   QString workflow_ = QStringLiteral("install");
   QString sourceDir_;
@@ -146,6 +149,20 @@ public:
   void initializePage() override;
 
 private:
+  QPlainTextEdit *planText_ = nullptr;
+};
+
+class UninstallPage : public QWizardPage {
+public:
+  explicit UninstallPage(QWidget *parent = nullptr);
+  void initializePage() override;
+  bool validatePage() override;
+
+private:
+  void refreshPlanText();
+  QLabel *statusLabel_ = nullptr;
+  QLabel *dataWarning_ = nullptr;
+  QCheckBox *removeUserData_ = nullptr;
   QPlainTextEdit *planText_ = nullptr;
 };
 

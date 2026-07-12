@@ -129,6 +129,67 @@ bool TestReviewPageUsesFinishCommitButton() {
                 "review page commit button should read Finish");
 }
 
+bool TestUninstallUsesDedicatedShortRoute() {
+  studiocast::installer::InstallerWizard wizard;
+  wizard.setWorkflow(QStringLiteral("uninstall"));
+  wizard.setStartId(studiocast::installer::PageIntro);
+  wizard.restart();
+
+  if (!Expect(wizard.currentId() == studiocast::installer::PageIntro,
+              "wizard should restart on the workflow page") ||
+      !Expect(wizard.nextId() == studiocast::installer::PageUninstall,
+              "uninstall should bypass compatibility and install pages")) {
+    return false;
+  }
+
+  wizard.setStartId(studiocast::installer::PageUninstall);
+  wizard.restart();
+  return Expect(wizard.currentId() == studiocast::installer::PageUninstall,
+                "uninstall confirmation page should be reachable") &&
+         Expect(wizard.nextId() == studiocast::installer::PageProgress,
+                "uninstall confirmation should proceed directly to progress");
+}
+
+bool TestUninstallConfirmationAndArguments() {
+  studiocast::installer::InstallerWizard wizard;
+  wizard.setWorkflow(QStringLiteral("uninstall"));
+  QWizardPage *page = wizard.page(studiocast::installer::PageUninstall);
+  if (!Expect(page != nullptr, "uninstall confirmation page should exist")) {
+    return false;
+  }
+  page->initializePage();
+
+  auto *removeUserData = page->findChild<QCheckBox *>(
+      QStringLiteral("scInstallerUninstallRemoveUserData"));
+  if (!Expect(page->isCommitPage(),
+              "uninstall confirmation should be a commit page") ||
+      !Expect(wizard.buttonText(QWizard::CommitButton) ==
+                  QStringLiteral("Uninstall"),
+              "uninstall commit button should describe the action") ||
+      !Expect(removeUserData != nullptr,
+              "uninstall should expose its user-data choice") ||
+      !Expect(!removeUserData->isChecked(),
+              "uninstall should preserve user data by default")) {
+    return false;
+  }
+
+  QStringList args = wizard.workflowCommandArguments(false);
+  if (!Expect(
+          args == QStringList{QStringLiteral("uninstall"),
+                              QStringLiteral("--preserve-user-data"),
+                              QStringLiteral("--yes")},
+          "default uninstall command should contain only removal options")) {
+    return false;
+  }
+
+  removeUserData->setChecked(true);
+  args = wizard.workflowCommandArguments(false);
+  return Expect(args == QStringList{QStringLiteral("uninstall"),
+                                    QStringLiteral("--remove-user-data"),
+                                    QStringLiteral("--yes")},
+                "user-data removal should be explicit in uninstall arguments");
+}
+
 bool TestPreferenceProgressBars() {
   studiocast::installer::InstallerWizard wizard;
   constexpr int kFirstPage = studiocast::installer::PageIntro;
@@ -167,6 +228,30 @@ bool TestPreferenceProgressBars() {
          ok;
   }
 
+  QWizardPage *uninstallPage =
+      wizard.page(studiocast::installer::PageUninstall);
+  auto *uninstallBar =
+      uninstallPage ? uninstallPage->findChild<QProgressBar *>(
+                          QStringLiteral("scInstallerPreferenceProgress"))
+                    : nullptr;
+  ok = Expect(uninstallBar != nullptr,
+              "uninstall confirmation should include a progress bar") &&
+       ok;
+  if (uninstallBar) {
+    ok = Expect(uninstallBar->maximum() == 2 && uninstallBar->value() == 2,
+                "uninstall confirmation should be step two of two") &&
+         ok;
+  }
+
+  wizard.setWorkflow(QStringLiteral("uninstall"));
+  auto *introBar = wizard.page(studiocast::installer::PageIntro)
+                       ->findChild<QProgressBar *>(
+                           QStringLiteral("scInstallerPreferenceProgress"));
+  ok = Expect(introBar != nullptr && introBar->maximum() == 2 &&
+                  introBar->value() == 1,
+              "uninstall selection should show a two-step preference flow") &&
+       ok;
+
   return ok;
 }
 
@@ -181,6 +266,8 @@ int main(int argc, char **argv) {
   ok = TestVulkanInstallerArguments() && ok;
   ok = TestVulkanControlsAreVisibleForRepair() && ok;
   ok = TestReviewPageUsesFinishCommitButton() && ok;
+  ok = TestUninstallUsesDedicatedShortRoute() && ok;
+  ok = TestUninstallConfirmationAndArguments() && ok;
   ok = TestPreferenceProgressBars() && ok;
   return ok ? 0 : 1;
 }

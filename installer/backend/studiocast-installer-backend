@@ -708,11 +708,13 @@ plan_workflow() {
     plan_source_dir="${SOURCE_DIR}"
   fi
 
-  PLAN_SUMMARY+=("Detected OS: ${OS_PRETTY_NAME:-unknown}; ${OS_SUPPORT_REASON}")
   PLAN_SUMMARY+=("Current installed version: ${current_version:-not installed}")
-  PLAN_SUMMARY+=("Target StudioCast version: ${target_version:-unknown}")
-  PLAN_SUMMARY+=("Source: ${source_label}")
-  PLAN_SUMMARY+=("Build directory: ${BUILD_DIR} (${BUILD_TYPE})")
+  if [[ "${WORKFLOW}" != "uninstall" ]]; then
+    PLAN_SUMMARY+=("Detected OS: ${OS_PRETTY_NAME:-unknown}; ${OS_SUPPORT_REASON}")
+    PLAN_SUMMARY+=("Target StudioCast version: ${target_version:-unknown}")
+    PLAN_SUMMARY+=("Source: ${source_label}")
+    PLAN_SUMMARY+=("Build directory: ${BUILD_DIR} (${BUILD_TYPE})")
+  fi
 
   case "${WORKFLOW}" in
     install)

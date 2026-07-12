@@ -23,6 +23,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QStandardPaths>
 #include <QStyle>
@@ -232,18 +233,20 @@ QString sectionText(const QString &title, const QStringList &items) {
 
 QString planTextFromObject(const QJsonObject &plan) {
   QString text;
-  text +=
-      QStringLiteral("Workflow: ") +
-      jsonString(plan, QStringLiteral("workflow"), QStringLiteral("unknown")) +
-      QStringLiteral("\n");
-  text += QStringLiteral("Supported OS: ") +
-          QString(jsonBool(plan, QStringLiteral("supported"))
-                      ? QStringLiteral("yes")
-                      : QStringLiteral("no")) +
-          QStringLiteral("\n");
-  text += QStringLiteral("Support: ") +
-          jsonString(plan, QStringLiteral("support_reason")) +
-          QStringLiteral("\n\n");
+  const QString workflow =
+      jsonString(plan, QStringLiteral("workflow"), QStringLiteral("unknown"));
+  text += QStringLiteral("Workflow: ") + workflow + QStringLiteral("\n");
+  if (workflow != QStringLiteral("uninstall")) {
+    text += QStringLiteral("Supported OS: ") +
+            QString(jsonBool(plan, QStringLiteral("supported"))
+                        ? QStringLiteral("yes")
+                        : QStringLiteral("no")) +
+            QStringLiteral("\n");
+    text += QStringLiteral("Support: ") +
+            jsonString(plan, QStringLiteral("support_reason")) +
+            QStringLiteral("\n");
+  }
+  text += QStringLiteral("\n");
   text += sectionText(QStringLiteral("Summary:"),
                       jsonStringList(plan, QStringLiteral("summary")));
   text += sectionText(QStringLiteral("Changes:"),
@@ -293,14 +296,13 @@ int preferenceProgressValue(int pageId) {
   return std::clamp(pageId - PageIntro + 1, 1, preferenceProgressMaximum());
 }
 
-void addPreferenceProgressBar(QWizardPage *page, int pageId) {
+void addPreferenceProgressBar(QWizardPage *page, int progressValue,
+                              int progressMaximum) {
   auto *layout = qobject_cast<QBoxLayout *>(page->layout());
   if (!layout) {
     return;
   }
 
-  const int progressValue = preferenceProgressValue(pageId);
-  const int progressMaximum = preferenceProgressMaximum();
   auto *bar = new QProgressBar(page);
   bar->setObjectName(QStringLiteral("scInstallerPreferenceProgress"));
   bar->setProperty("scRole", "installerPreferenceProgress");
@@ -319,8 +321,12 @@ void addPreferenceProgressBar(QWizardPage *page, int pageId) {
 void addPreferenceProgressBars(QWizard *wizard) {
   for (int pageId = PageIntro; pageId <= PageReview; ++pageId) {
     if (auto *page = wizard->page(pageId)) {
-      addPreferenceProgressBar(page, pageId);
+      addPreferenceProgressBar(page, preferenceProgressValue(pageId),
+                               preferenceProgressMaximum());
     }
+  }
+  if (auto *page = wizard->page(PageUninstall)) {
+    addPreferenceProgressBar(page, 2, 2);
   }
 }
 
@@ -356,7 +362,9 @@ InstallerWizard::InstallerWizard(QWidget *parent) : QWizard(parent) {
   setPage(PageReview, new ReviewPage);
   setPage(PageProgress, new ProgressPage);
   setPage(PageFinish, new FinishPage);
+  setPage(PageUninstall, new UninstallPage);
   addPreferenceProgressBars(this);
+  updatePreferenceProgressBars();
   setStartId(PageIntro);
 
   resize(920, 680);
@@ -392,6 +400,7 @@ bool InstallerWizard::removeUserData() const { return removeUserData_; }
 
 void InstallerWizard::setWorkflow(const QString &workflow) {
   workflow_ = workflow;
+  updatePreferenceProgressBars();
 }
 void InstallerWizard::setSourceDir(const QString &path) { sourceDir_ = path; }
 void InstallerWizard::setReleaseArchive(const QString &path) {
@@ -532,6 +541,15 @@ bool InstallerWizard::refreshPlan(QString *error) {
 QStringList InstallerWizard::backendOptions(bool forPlan) const {
   QStringList args;
 
+  if (workflow_ == QStringLiteral("uninstall")) {
+    args << (removeUserData_ ? QStringLiteral("--remove-user-data")
+                             : QStringLiteral("--preserve-user-data"));
+    if (!forPlan) {
+      args << QStringLiteral("--yes");
+    }
+    return args;
+  }
+
   const bool needsSource = workflow_ != QStringLiteral("uninstall") &&
                            workflow_ != QStringLiteral("advanced");
   if (needsSource) {
@@ -604,6 +622,56 @@ QStringList InstallerWizard::workflowCommandArguments(bool dryRun) const {
   return args;
 }
 
+int InstallerWizard::nextId() const {
+  switch (currentId()) {
+  case PageIntro:
+    return workflow_ == QStringLiteral("uninstall") ? PageUninstall
+                                                    : PageCompatibility;
+  case PageCompatibility:
+    return PageDependencyPlan;
+  case PageDependencyPlan:
+    return PageBuildOptions;
+  case PageBuildOptions:
+    return PageInstallLocation;
+  case PageInstallLocation:
+    return PageServiceOptions;
+  case PageServiceOptions:
+    return PageReview;
+  case PageReview:
+  case PageUninstall:
+    return PageProgress;
+  case PageProgress:
+    return PageFinish;
+  case PageFinish:
+  default:
+    return -1;
+  }
+}
+
+void InstallerWizard::updatePreferenceProgressBars() {
+  const bool uninstall = workflow_ == QStringLiteral("uninstall");
+  for (int pageId = PageIntro; pageId <= PageReview; ++pageId) {
+    auto *page = this->page(pageId);
+    auto *bar = page ? page->findChild<QProgressBar *>(
+                           QStringLiteral("scInstallerPreferenceProgress"))
+                     : nullptr;
+    if (!bar) {
+      continue;
+    }
+    if (uninstall && pageId == PageIntro) {
+      bar->setRange(0, 2);
+      bar->setValue(1);
+      bar->setAccessibleDescription(QStringLiteral("Step 1 of 2"));
+    } else {
+      bar->setRange(0, preferenceProgressMaximum());
+      bar->setValue(preferenceProgressValue(pageId));
+      bar->setAccessibleDescription(QStringLiteral("Step %1 of %2")
+                                        .arg(preferenceProgressValue(pageId))
+                                        .arg(preferenceProgressMaximum()));
+    }
+  }
+}
+
 IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   setTitle(QStringLiteral("StudioCast Installer"));
   setSubTitle(QStringLiteral("Select the workflow to run on this system."));
@@ -638,6 +706,13 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
     radio->setProperty("workflow", workflow.first);
     workflowGroup_->addButton(radio, id++);
     workflowLayout->addWidget(radio);
+    connect(radio, &QRadioButton::toggled, this, [this, radio](bool checked) {
+      if (checked) {
+        if (auto *w = installerWizard(this)) {
+          w->setWorkflow(radio->property("workflow").toString());
+        }
+      }
+    });
     if (workflow.first == QStringLiteral("install")) {
       radio->setChecked(true);
     }
@@ -798,6 +873,93 @@ void DependencyPlanPage::initializePage() {
                        workflow != QStringLiteral("advanced"));
   w->setFreshBuild(workflow == QStringLiteral("clean-install"));
 
+  QString error;
+  if (w->refreshPlan(&error)) {
+    planText_->setPlainText(planTextFromObject(w->planObject()));
+  } else {
+    planText_->setPlainText(error);
+  }
+}
+
+UninstallPage::UninstallPage(QWidget *parent) : QWizardPage(parent) {
+  setTitle(QStringLiteral("Uninstall StudioCast"));
+  setSubTitle(QStringLiteral(
+      "Review what will be removed before uninstalling StudioCast."));
+  setCommitPage(true);
+
+  auto *layout = new QVBoxLayout(this);
+  statusLabel_ = new QLabel(this);
+  statusLabel_->setObjectName(QStringLiteral("scInstallerUninstallStatus"));
+  statusLabel_->setWordWrap(true);
+  layout->addWidget(statusLabel_);
+
+  removeUserData_ = new QCheckBox(
+      QStringLiteral("Also remove user config, downloaded models, logs, and "
+                     "cache"),
+      this);
+  removeUserData_->setObjectName(
+      QStringLiteral("scInstallerUninstallRemoveUserData"));
+  layout->addWidget(removeUserData_);
+
+  dataWarning_ = mutedLabel(
+      QStringLiteral("The additional user-data removal is permanent. Leave "
+                     "this unchecked to preserve your settings and downloads."),
+      this);
+  dataWarning_->setObjectName(
+      QStringLiteral("scInstallerUninstallDataWarning"));
+  layout->addWidget(dataWarning_);
+
+  auto *planBox = new QGroupBox(QStringLiteral("Uninstall summary"), this);
+  auto *planLayout = new QVBoxLayout(planBox);
+  planText_ = new QPlainTextEdit(planBox);
+  planText_->setObjectName(QStringLiteral("scInstallerUninstallPlan"));
+  setReadOnlyLogStyle(planText_);
+  planLayout->addWidget(planText_);
+  layout->addWidget(planBox, 1);
+
+  connect(removeUserData_, &QCheckBox::toggled, this, [this](bool checked) {
+    auto *w = installerWizard(this);
+    w->setRemoveUserData(checked);
+    dataWarning_->setVisible(checked);
+    refreshPlanText();
+  });
+}
+
+void UninstallPage::initializePage() {
+  auto *w = installerWizard(this);
+  w->setButtonText(QWizard::CommitButton, QStringLiteral("Uninstall"));
+
+  const QJsonObject status = w->statusObject();
+  const QString installedVersion =
+      jsonString(status, QStringLiteral("installed_version"));
+  if (jsonBool(status, QStringLiteral("installed"))) {
+    statusLabel_->setText(
+        QStringLiteral("StudioCast %1 is installed and ready to be removed.")
+            .arg(installedVersion.isEmpty()
+                     ? QStringLiteral("(version unknown)")
+                     : installedVersion));
+  } else {
+    statusLabel_->setText(QStringLiteral(
+        "No installer-managed StudioCast installation was detected. "
+        "Continuing will clean up any remaining app links, user service, "
+        "desktop entry, and runtime artifacts."));
+  }
+
+  {
+    const QSignalBlocker blocker(removeUserData_);
+    removeUserData_->setChecked(w->removeUserData());
+  }
+  dataWarning_->setVisible(removeUserData_->isChecked());
+  refreshPlanText();
+}
+
+bool UninstallPage::validatePage() {
+  installerWizard(this)->setRemoveUserData(removeUserData_->isChecked());
+  return true;
+}
+
+void UninstallPage::refreshPlanText() {
+  auto *w = installerWizard(this);
   QString error;
   if (w->refreshPlan(&error)) {
     planText_->setPlainText(planTextFromObject(w->planObject()));
@@ -1188,6 +1350,7 @@ ReviewPage::ReviewPage(QWidget *parent) : QWizardPage(parent) {
 
 void ReviewPage::initializePage() {
   auto *w = installerWizard(this);
+  w->setButtonText(QWizard::CommitButton, QStringLiteral("Finish"));
   QString error;
   if (w->refreshPlan(&error)) {
     reviewText_->setPlainText(planTextFromObject(w->planObject()));
@@ -1219,6 +1382,13 @@ void ProgressPage::initializePage() {
   emit completeChanged();
 
   auto *w = installerWizard(this);
+  if (w->workflow() == QStringLiteral("uninstall")) {
+    setTitle(QStringLiteral("Uninstalling StudioCast"));
+    setSubTitle(QStringLiteral("StudioCast app files are being removed."));
+  } else {
+    setTitle(QStringLiteral("Progress"));
+    setSubTitle(QStringLiteral("Backend output is streamed here."));
+  }
   if (w->workflow() == QStringLiteral("advanced")) {
     logText_->setPlainText(planTextFromObject(w->planObject()));
     stateLabel_->setText(QStringLiteral("Advanced plan shown. No changes were "
@@ -1242,7 +1412,12 @@ void ProgressPage::initializePage() {
         exitCode_ = code;
         complete_ = true;
         if (status == QProcess::NormalExit && code == 0) {
-          stateLabel_->setText(QStringLiteral("Workflow completed."));
+          const auto *pageWizard = installerWizard(this);
+          stateLabel_->setText(
+              pageWizard &&
+                      pageWizard->workflow() == QStringLiteral("uninstall")
+                  ? QStringLiteral("StudioCast was uninstalled successfully.")
+                  : QStringLiteral("Workflow completed."));
         } else {
           stateLabel_->setText(
               QStringLiteral("Workflow failed with exit code %1.").arg(code));
@@ -1292,19 +1467,29 @@ FinishPage::FinishPage(QWidget *parent) : QWizardPage(parent) {
 
 void FinishPage::initializePage() {
   auto *w = installerWizard(this);
+  const bool uninstall = w->workflow() == QStringLiteral("uninstall");
+  setTitle(uninstall ? QStringLiteral("Uninstall complete")
+                     : QStringLiteral("Finish"));
+  setSubTitle(uninstall ? QStringLiteral("StudioCast removal summary.")
+                        : QStringLiteral("Installer workflow summary."));
   w->refreshStatus();
   const QJsonObject status = w->statusObject();
   const QString installedVersion =
       jsonString(status, QStringLiteral("installed_version"));
   const bool installed = jsonBool(status, QStringLiteral("installed"));
 
-  summaryLabel_->setText(
-      installed
-          ? QStringLiteral("StudioCast is installed. Version: %1")
-                .arg(installedVersion.isEmpty() ? QStringLiteral("unknown")
-                                                : installedVersion)
-          : QStringLiteral("StudioCast is not currently installed through the "
-                           "installer manifest."));
+  if (uninstall && !installed) {
+    summaryLabel_->setText(QStringLiteral("StudioCast was removed."));
+  } else {
+    summaryLabel_->setText(
+        installed
+            ? QStringLiteral("StudioCast is installed. Version: %1")
+                  .arg(installedVersion.isEmpty() ? QStringLiteral("unknown")
+                                                  : installedVersion)
+            : QStringLiteral(
+                  "StudioCast is not currently installed through the "
+                  "installer manifest."));
+  }
 
   QString text;
   text += QStringLiteral("Workflow: ") + w->workflow() + QStringLiteral("\n");
