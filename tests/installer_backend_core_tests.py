@@ -224,10 +224,10 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(plan["desired_state"]["build_type"], "Debug")
         self.assertNotIn("build.configure", ids)
 
-    def _fake_cmake(self):
+    def _fake_cmake(self, fail=False):
         bindir = self.s.root / "fake-bin"; bindir.mkdir(exist_ok=True)
         cmake = bindir / "cmake"
-        cmake.write_text("#!/bin/sh\nif [ \"$1\" = --build ]; then\n d=$2\n mkdir -p \"$d\"\n for n in studiocast studiocastd studiocastctl studiocast-probe studiocast-open studiocast-maxine studiocast-video studiocast-audio; do printf '#!/bin/sh\\nexit 0\\n' >\"$d/$n\"; chmod 755 \"$d/$n\"; done\nfi\nexit 0\n", encoding="utf-8")
+        cmake.write_text("#!/bin/sh\n" + ("exit 41\n" if fail else "if [ \"$1\" = --build ]; then\n d=$2\n mkdir -p \"$d\"\n for n in studiocast studiocastd studiocastctl studiocast-probe studiocast-open studiocast-maxine studiocast-video studiocast-audio; do printf '#!/bin/sh\\n[ \"$1\" = --version ] && echo StudioCast-0.2.9\\nexit 0\\n' >\"$d/$n\"; chmod 755 \"$d/$n\"; done\nfi\nexit 0\n"), encoding="utf-8")
         cmake.chmod(0o755)
         return self.s.env | {"PATH": str(bindir) + ":/usr/bin:/bin"}
 
@@ -256,6 +256,43 @@ class InstallerBackendCoreTests(unittest.TestCase):
         result, _ = self._apply_clean(False)
         self.assertEqual(result.returncode, 3)
         self.assertFalse(config.exists()); self.assertFalse((data / "models/custom/mine").exists())
+
+    def test_versioned_payload_survives_cache_removal_and_core_failure_rolls_back(self):
+        plan = self.plan()
+        path = self.s.root / "install.json"; path.write_text(json.dumps(plan), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], env=self._fake_cmake())
+        self.assertEqual(json.loads(result.stdout)["state"], "committed")
+        current = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current"
+        active_before = current.resolve()
+        cache = Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast"
+        import shutil
+        shutil.rmtree(cache)
+        self.assertEqual(subprocess.run([str(current / "bin/studiocast")]).returncode, 0)
+
+        update = self.s.json("plan", "update", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
+                             "--no-v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
+        path.write_text(json.dumps(update), encoding="utf-8")
+        failed = self.s.run("apply-plan", "--plan", str(path), "--digest", update["plan_digest"],
+                            "--token", update["approval_token"], check=False, env=self._fake_cmake(fail=True))
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(current.resolve(), active_before)
+        manifest = json.loads((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/install-manifest.json").read_text())
+        self.assertEqual(manifest["payloads"]["active"]["path"], str(active_before))
+        self.assertEqual(manifest["transaction"]["state"], "failed")
+
+    def test_payload_validation_runs_version_probe_before_activation(self):
+        plan = self.plan()
+        path = self.s.root / "version-plan.json"; path.write_text(json.dumps(plan), encoding="utf-8")
+        env = self._fake_cmake()
+        cmake = self.s.root / "fake-bin/cmake"
+        cmake.write_text(cmake.read_text().replace("StudioCast-0.2.9", "StudioCast-9.9.9"), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
+                            "--token", plan["approval_token"], check=False, env=env)
+        self.assertEqual(result.returncode, 2)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["error"]["code"], "payload.version_mismatch")
+        self.assertFalse((Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current").exists())
 
     def test_fake_polkit_transport_envelope_and_structured_failures(self):
         facts = base_facts(); facts["v4l2"].update(module_available=True, module_loaded=False,

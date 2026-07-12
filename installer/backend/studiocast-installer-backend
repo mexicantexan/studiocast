@@ -369,6 +369,24 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/lib/x86_64-linux-gnu/libvulkan.so.1"))
     module_available = Path("/sys/module/v4l2loopback").exists()
     device_present = Path("/dev/video10").exists()
+    device_label = ""
+    try:
+        device_label = Path("/sys/class/video4linux/video10/name").read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    device_conflict = device_present and bool(device_label) and "studiocast" not in device_label.lower()
+    persistence_paths = (Path("/etc/modules-load.d/studiocast-v4l2loopback.conf"),
+                         Path("/etc/modprobe.d/studiocast-v4l2loopback.conf"))
+    persistence_state = "configured" if all(path.is_file() and not path.is_symlink() for path in persistence_paths) else "partial" if any(path.exists() for path in persistence_paths) else "absent"
+    package_state = "unknown"
+    if command_exists("dpkg-query"):
+        try:
+            package_probe = subprocess.run(["dpkg-query", "-W", "-f=${Status}", "v4l2loopback-utils"],
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           text=True, timeout=2, check=False)
+            package_state = "installed" if package_probe.returncode == 0 and "install ok installed" in package_probe.stdout else "missing"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     headers = Path(f"/lib/modules/{platform.release()}/build").exists()
     secure_boot = "unknown"
     try:
@@ -392,9 +410,13 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
     model_packs: dict[str, Any] = {}
     for pack, artifacts in MODEL_ARTIFACTS.items():
         matches = list((r["data"] / "models").rglob(pack)) if (r["data"] / "models").is_dir() else []
-        verified = any(all((root / artifact).is_file() for artifact in artifacts) for root in matches)
-        model_packs[pack] = {"integrity": "verified" if verified else "absent",
-                             "reason_codes": [f"model.{pack}.{'verified' if verified else 'absent'}"]}
+        present = any(all((root / artifact).is_file() for artifact in artifacts) for root in matches)
+        verified = any(all((root / artifact).is_file() and not (root / artifact).is_symlink() and
+                               file_sha256(root / artifact) == "sha256:" + _MODEL_HASHES[pack][index]
+                               for index, artifact in enumerate(artifacts)) for root in matches)
+        integrity = "verified" if verified else "corrupt" if present else "absent"
+        model_packs[pack] = {"integrity": integrity,
+                             "reason_codes": [f"model.{pack}.{integrity}"]}
     result = {
         "schema_version": 1, "facts_version": FACTS_VERSION, "captured_at": utc_now(),
         "os": os_facts(),
@@ -416,9 +438,9 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
             "providers": {"cpu": False, "cuda": False}, "probe": "not_run", "reason_codes": ["runtime.ort.unknown"]}},
         "systemd_user": {"systemctl_present": systemd_present, "manager_usable": systemd_usable,
             "reason_codes": [systemd_reason]},
-        "v4l2": {"package_state": "unknown", "module_available": module_available,
+        "v4l2": {"package_state": package_state, "module_available": module_available,
             "module_loaded": module_available, "device_present": device_present, "device_number": 10,
-            "device_number_conflict": False, "persistence_state": "unknown",
+            "device_label": device_label, "device_number_conflict": device_conflict, "persistence_state": persistence_state,
             "kernel_headers_usable": headers, "dkms_viable": headers, "secure_boot": secure_boot,
             "reason_codes": ["v4l.device.present" if device_present else "v4l.device.absent"]},
         "privileged_helper": helper_facts(),
@@ -735,9 +757,11 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     if any(op["privilege"] == "trusted_helper" for op in ops) and not facts.get("privileged_helper", {}).get("trusted", False):
         if not any(item.get("code") == "privileged_helper_missing" for item in blockers):
             blockers.append({"code": "privileged_helper_missing", "applies_to": "system_changes"})
-    if rec["route"] == "recommended" and intent != "uninstall" and not (
-            source_kind == "archive" and bool(getattr(args, "official_source", False))):
-        blockers.append({"code": "source.official_archive_required", "applies_to": "source"})
+    if rec["route"] == "recommended" and intent != "uninstall":
+        # A caller-supplied boolean is not provenance.  The release-channel
+        # verifier must replace this blocker with signed manifest/archive
+        # evidence when the two components are integrated.
+        blockers.append({"code": "source.signed_verification_receipt_required", "applies_to": "source"})
     if getattr(args, "allow_unsupported", False):
         # Developer override permits only unprivileged work; automatic package or
         # module operations remain removed/fail-closed on unsupported systems.
@@ -757,7 +781,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
         "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
             "target_payload": str(target_payload), "current_link": str(current)},
-        "source": {"kind": source_kind, "path": source_path, "official": source_kind == "archive" and bool(getattr(args, "official_source", False))},
+        "source": {"kind": source_kind, "path": source_path, "official": False,
+                   "official_claimed": source_kind == "archive" and bool(getattr(args, "official_source", False))},
         "downloads": [{"artifact_id": pack, "url": None, "size": sum(a["size"] or 0 for a in MODEL_METADATA.get(pack, {}).get("artifacts", [])),
             "sha256": None, "signature": None, "provenance": MODEL_METADATA.get(pack, {}).get("provenance"),
             "license": MODEL_METADATA.get(pack, {}).get("license"), "cache_path": str(r["cache"] / "models" / pack),
@@ -823,9 +848,15 @@ class Executor:
             print("+ " + " ".join(argv))
             return
         self.child = subprocess.Popen(argv, start_new_session=True)
+        previous_handlers: dict[int, Any] = {}
+        def cancel(signum: int, _frame: Any) -> None:
+            self.cancelled = True
+            raise BackendError("operation.cancelled", f"Operation cancelled by signal {signum}")
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, cancel)
         try:
             code = self.child.wait()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, BackendError) as exc:
             self.cancelled = True
             try: os.killpg(self.child.pid, signal.SIGTERM)
             except ProcessLookupError: pass
@@ -834,8 +865,12 @@ class Executor:
                 try: os.killpg(self.child.pid, signal.SIGKILL)
                 except ProcessLookupError: pass
                 self.child.wait()
-            raise BackendError("operation.cancelled", "Operation cancelled")
+            if isinstance(exc, BackendError):
+                raise
+            raise BackendError("operation.cancelled", "Operation cancelled") from exc
         finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
             self.child = None
         if code != 0:
             raise BackendError("process.exit", f"Process exited with status {code}", {"argv0": argv[0], "exit_code": code})
@@ -844,6 +879,9 @@ class Executor:
         self.journal.append({"sequence": len(self.journal) + 1, "operation_id": op_id, "state": state,
             "finished_at": utc_now(), "exit": {"kind": "backend_result", "code": 0 if error is None else 1, "signal": None},
             "error": None if error is None else {"code": error.code, "message": error.message, "details": error.details}, "compensation_operation_ids": []})
+        if not self.dry_run:
+            checkpoint = "cancelled" if self.cancelled else "core_committed" if self.core_committed else "executing"
+            self.write_manifest(checkpoint, error)
 
     def execute(self) -> tuple[dict[str, Any], int]:
         completed: set[str] = set()
@@ -871,7 +909,7 @@ class Executor:
         state = "cancelled" if self.cancelled else "failed" if failure else "degraded" if self.retryable else "committed"
         if state in {"failed", "cancelled"} and not self.core_committed:
             self.restore_previous_pointer()
-        if self.core_committed or self.plan["intent"] == "uninstall":
+        if not self.dry_run:
             self.write_manifest(state, failure)
         result = {"transaction_id": self.transaction_id, "state": state,
             "core_committed": self.core_committed, "active_version": self.plan["desired_state"].get("version") or self.plan["paths"]["target_payload"].rstrip("/").split("/")[-1] if self.core_committed else (self.active_before or {}).get("version"),
@@ -963,6 +1001,20 @@ class Executor:
         for name in names:
             path = staging / "bin" / name
             if not path.is_file() or not os.access(path, os.X_OK): raise BackendError("payload.validation_failed", f"Payload binary not executable: {path}")
+        expected = next((op["inputs"].get("version") for op in self.plan["operations"] if op["id"] == "payload.stage"), None)
+        try:
+            smoke = subprocess.run([str(staging / "bin/studiocast"), "--version"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BackendError("payload.smoke_test_failed", "Staged StudioCast version probe could not run") from exc
+        if smoke.returncode != 0:
+            raise BackendError("payload.smoke_test_failed", "Staged StudioCast version probe failed",
+                               {"exit_code": smoke.returncode})
+        reported = (smoke.stdout + " " + smoke.stderr).strip()
+        if expected and expected != "unknown" and expected not in reported:
+            raise BackendError("payload.version_mismatch", "Staged payload reported a different version",
+                               {"expected": expected, "reported": reported})
 
     def run_helper(self, inputs: dict[str, Any]) -> None:
         if any(key in FORBIDDEN_HELPER_FIELDS for key in inputs): raise BackendError("privilege.forbidden_field", "Privileged request contains a forbidden field")
