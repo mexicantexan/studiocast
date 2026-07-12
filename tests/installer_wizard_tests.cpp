@@ -74,8 +74,8 @@ QJsonObject Status(const QString &classification, const QString &route,
                    {QStringLiteral("version"), QStringLiteral("0.2.9")}}}};
 }
 
-QJsonObject ReleaseStatus(const QString &archive, bool offline = false) {
-  return {
+QJsonObject ReleaseStatus(const QString &archive = {}, bool offline = false) {
+  QJsonObject status = {
       {QStringLiteral("schema_version"), 1},
       {QStringLiteral("release_status_version"),
        QStringLiteral("installer-release-status/v1")},
@@ -87,8 +87,33 @@ QJsonObject ReleaseStatus(const QString &archive, bool offline = false) {
       {QStringLiteral("reason_code"), QStringLiteral("release.install")},
       {QStringLiteral("minimum_installer_version"), QStringLiteral("0.2.9")},
       {QStringLiteral("installer_meets_minimum"), true},
-      {QStringLiteral("offline"), offline},
-      {QStringLiteral("verified_source_archive"), archive}};
+      {QStringLiteral("offline"), offline}};
+  if (!archive.isEmpty())
+    status[QStringLiteral("verified_source_archive")] = archive;
+  return status;
+}
+
+QJsonObject
+SelfUpdateStatus(const QString &currentAppImage,
+                 const QString &verifiedAppImage, const QString &manualUrl,
+                 const QString &state = QStringLiteral("offer_restart")) {
+  QJsonObject status = ReleaseStatus();
+  status[QStringLiteral("self_update")] = QJsonObject{
+      {QStringLiteral("state"), state},
+      {QStringLiteral("reason_code"),
+       state == QStringLiteral("offer_restart")
+           ? QStringLiteral("self_update.verified_offer")
+           : QStringLiteral("self_update.appimage_not_detected")},
+      {QStringLiteral("current_appimage"), currentAppImage},
+      {QStringLiteral("verified_appimage"), verifiedAppImage},
+      {QStringLiteral("relaunch_command"),
+       verifiedAppImage.isEmpty() ? QJsonValue(QJsonArray{})
+                                  : QJsonValue(QJsonArray{verifiedAppImage})},
+      {QStringLiteral("manual_download_url"), manualUrl},
+      {QStringLiteral("requires_confirmation"),
+       state == QStringLiteral("offer_restart")},
+      {QStringLiteral("running_artifact_replaced"), false}};
+  return status;
 }
 
 QStringList DefaultPacks() {
@@ -220,7 +245,7 @@ public:
     archive.open(QIODevice::WriteOnly);
     archive.write("verified fixture archive");
     archive.close();
-    write(release_, ReleaseStatus(archive_));
+    write(release_, ReleaseStatus());
     qputenv("STUDIOCAST_INSTALLER_BACKEND", script_.toLocal8Bit());
     qputenv("SC_FAKE_FACTS", facts_.toLocal8Bit());
     qputenv("SC_FAKE_STATUS", status_.toLocal8Bit());
@@ -255,6 +280,9 @@ public:
     qunsetenv("STUDIOCAST_STABLE_CHANNEL_URL");
     qunsetenv("STUDIOCAST_STABLE_CHANNEL_SIGNATURE_URL");
     qunsetenv("STUDIOCAST_RELEASE_CACHE_DIR");
+    qunsetenv("APPIMAGE");
+    qunsetenv("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE");
+    qunsetenv("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG");
   }
 
   void setScenario(const QJsonObject &facts, const QJsonObject &status,
@@ -280,6 +308,7 @@ public:
     qputenv("SC_FAKE_PROGRESS", enabled ? "1" : "0");
     qputenv("SC_FAKE_PROGRESS_HOLD", hold);
   }
+  void setReleaseStatus(const QJsonObject &status) { write(release_, status); }
   QString arguments() const {
     QFile file(args_);
     file.open(QIODevice::ReadOnly);
@@ -369,6 +398,87 @@ bool TestSignedReleaseAndOfflineReceipt(FakeBackend &backend) {
               "Signed-release failure must block Apply before mutation") &&
        ok;
   backend.setReleaseFailures(false, false);
+  return ok;
+}
+
+bool TestExplicitSelfUpdateOffer(FakeBackend &backend) {
+  QTemporaryDir directory;
+  const QString runningPath =
+      directory.filePath(QStringLiteral("running.AppImage"));
+  const QString verifiedPath =
+      directory.filePath(QStringLiteral("verified.AppImage"));
+  const QString launchLog = directory.filePath(QStringLiteral("launch.json"));
+  QFile running(runningPath);
+  running.open(QIODevice::WriteOnly);
+  running.write("running image remains unchanged");
+  running.close();
+  QFile verified(verifiedPath);
+  verified.open(QIODevice::WriteOnly);
+  verified.write("cryptographically verified fixture image");
+  verified.close();
+  verified.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner |
+                          QFileDevice::ExeOwner);
+
+  backend.setReleaseStatus(SelfUpdateStatus(
+      runningPath, verifiedPath,
+      QStringLiteral("https://fixture.invalid/installer.AppImage")));
+  qputenv("APPIMAGE", runningPath.toLocal8Bit());
+  qputenv("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE", "1");
+  qputenv("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG",
+          launchLog.toLocal8Bit());
+  studiocast::installer::InstallerWizard offered;
+  auto *intro = offered.page(studiocast::installer::PageIntro);
+  intro->initializePage();
+  auto *restart = intro->findChild<QPushButton *>(
+      QStringLiteral("scInstallerSelfUpdateRestart"));
+  auto *manual = intro->findChild<QPushButton *>(
+      QStringLiteral("scInstallerSelfUpdateManual"));
+  bool ok =
+      Expect(
+          restart && !restart->isHidden() && manual && !manual->isHidden(),
+          "verified self-update should expose restart and manual fallback") &&
+      Expect(!QFileInfo(launchLog).exists(),
+             "verified self-update must not relaunch before explicit consent") &&
+      Expect(backend.releaseCalls().contains(
+                 QStringLiteral("--prepare-self-update")) &&
+                 backend.releaseCalls().contains(runningPath),
+             "AppImage detection should request a verified self-update offer");
+  restart->click();
+  QFile launch(launchLog);
+  launch.open(QIODevice::ReadOnly);
+  const QJsonArray command = QJsonDocument::fromJson(launch.readAll()).array();
+  running.open(QIODevice::ReadOnly);
+  ok =
+      Expect(
+          command.size() == 1 && command.first().toString() == verifiedPath,
+          "restart must launch only the verified AppImage without a shell") &&
+      Expect(running.readAll() == QByteArray("running image remains unchanged"),
+             "self-update must never overwrite the running AppImage") &&
+      ok;
+
+  backend.setReleaseStatus(SelfUpdateStatus(
+      runningPath, {},
+      QStringLiteral("https://fixture.invalid/manual.AppImage"),
+      QStringLiteral("manual_download")));
+  studiocast::installer::InstallerWizard fallback;
+  auto *fallbackIntro = fallback.page(studiocast::installer::PageIntro);
+  fallbackIntro->initializePage();
+  auto *fallbackRestart = fallbackIntro->findChild<QPushButton *>(
+      QStringLiteral("scInstallerSelfUpdateRestart"));
+  auto *fallbackManual = fallbackIntro->findChild<QPushButton *>(
+      QStringLiteral("scInstallerSelfUpdateManual"));
+  ok = Expect(fallbackRestart && fallbackRestart->isHidden() &&
+                  fallbackManual && !fallbackManual->isHidden() &&
+                  fallbackManual->toolTip() ==
+                      QStringLiteral("https://fixture.invalid/manual.AppImage"),
+              "unavailable relaunch should retain an HTTPS manual-download "
+              "fallback") &&
+       ok;
+
+  backend.setReleaseStatus(ReleaseStatus());
+  qunsetenv("APPIMAGE");
+  qunsetenv("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE");
+  qunsetenv("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG");
   return ok;
 }
 
@@ -772,6 +882,7 @@ int main(int argc, char **argv) {
   FakeBackend backend;
   bool ok = true;
   ok = TestSignedReleaseAndOfflineReceipt(backend) && ok;
+  ok = TestExplicitSelfUpdateOffer(backend) && ok;
   ok = TestStateDrivenRoutes(backend) && ok;
   ok = TestRecommendedCustomAndContextualRoutes(backend) && ok;
   ok = TestUnsupportedOfflineAndPriorReuse(backend) && ok;

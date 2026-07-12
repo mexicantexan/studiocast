@@ -9,6 +9,7 @@
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
@@ -78,6 +79,7 @@ public:
 
   void refreshStatus();
   bool refreshPlan(QString *error = nullptr);
+  bool launchVerifiedSelfUpdate(QString *error = nullptr);
   QStringList executionCommandArguments() const;
   QStringList backendOptions(bool forPlan) const;
   QStringList workflowCommandArguments(bool dryRun = false) const;
@@ -172,6 +174,10 @@ private:
   QRadioButton *repairAction_ = nullptr;
   QRadioButton *reinstallAction_ = nullptr;
   QRadioButton *uninstallAction_ = nullptr;
+  QGroupBox *selfUpdateBox_ = nullptr;
+  QLabel *selfUpdateLabel_ = nullptr;
+  QPushButton *restartInstallerButton_ = nullptr;
+  QPushButton *manualDownloadButton_ = nullptr;
 };
 
 class CompatibilityPage : public QWizardPage {

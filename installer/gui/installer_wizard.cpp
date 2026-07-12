@@ -6,8 +6,9 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
-#include <QDir>
 #include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,8 +20,8 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMessageBox>
 #include <QMap>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcessEnvironment>
 #include <QProgressBar>
@@ -704,6 +705,14 @@ QStringList InstallerWizard::releaseChannelOptions(bool offline) const {
     options << QStringLiteral("--stable-signature-url") << stableSignatureUrl;
   if (!releaseCache.isEmpty())
     options << QStringLiteral("--release-cache-dir") << releaseCache;
+  options << QStringLiteral("--prepare-self-update");
+  const QString appImage = environment.value(QStringLiteral("APPIMAGE"));
+  const QFileInfo appImageInfo(appImage);
+  if (appImageInfo.isAbsolute() && appImageInfo.isFile() &&
+      !appImageInfo.isSymLink()) {
+    options << QStringLiteral("--appimage-path")
+            << appImageInfo.absoluteFilePath();
+  }
   if (offline)
     options << QStringLiteral("--offline");
   return options;
@@ -751,10 +760,7 @@ bool InstallerWizard::refreshReleaseStatus(QString *error) {
       releaseStatus.value(QStringLiteral("available_version"))
           .toString()
           .isEmpty() ||
-      !QFileInfo(receiptPath).isFile() ||
-      !QFileInfo(releaseStatus.value(QStringLiteral("verified_source_archive"))
-                     .toString())
-           .isFile()) {
+      !QFileInfo(receiptPath).isFile()) {
     QFile::remove(receiptPath);
     if (error) {
       if (!offlineError.trimmed().isEmpty()) {
@@ -765,7 +771,7 @@ bool InstallerWizard::refreshReleaseStatus(QString *error) {
       } else if (!onlineError.trimmed().isEmpty()) {
         *error = onlineError.trimmed();
       } else {
-        *error = QStringLiteral("Stable release status or verified archive "
+        *error = QStringLiteral("Stable release status or signed receipt "
                                 "evidence was incomplete.");
       }
     }
@@ -776,9 +782,89 @@ bool InstallerWizard::refreshReleaseStatus(QString *error) {
       .setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
   verifiedReleaseReceiptPath_ = receiptPath;
   releaseStatusObject_ = releaseStatus;
-  releaseArchive_ =
-      releaseStatus.value(QStringLiteral("verified_source_archive")).toString();
-  useReleaseArchive_ = true;
+  return true;
+}
+
+bool InstallerWizard::launchVerifiedSelfUpdate(QString *error) {
+  const QJsonObject selfUpdate =
+      releaseStatusObject_.value(QStringLiteral("self_update")).toObject();
+  const QJsonArray commandValue =
+      selfUpdate.value(QStringLiteral("relaunch_command")).toArray();
+  QStringList command;
+  for (const QJsonValue &value : commandValue) {
+    if (!value.isString() || value.toString().isEmpty()) {
+      if (error)
+        *error = QStringLiteral("The verified restart command is malformed.");
+      return false;
+    }
+    command << value.toString();
+  }
+  const QString verifiedPath =
+      jsonString(selfUpdate, QStringLiteral("verified_appimage"));
+  const QFileInfo verifiedInfo(verifiedPath);
+  const QProcessEnvironment environment =
+      QProcessEnvironment::systemEnvironment();
+  const QString currentPath =
+      jsonString(selfUpdate, QStringLiteral("current_appimage"));
+  const QFileInfo currentInfo(currentPath);
+  const QFileInfo detectedInfo(environment.value(QStringLiteral("APPIMAGE")));
+  if (jsonString(selfUpdate, QStringLiteral("state")) !=
+          QStringLiteral("offer_restart") ||
+      !jsonBool(selfUpdate, QStringLiteral("requires_confirmation")) ||
+      jsonBool(selfUpdate, QStringLiteral("running_artifact_replaced"), true) ||
+      command.size() != 1 || command.first() != verifiedPath ||
+      !verifiedInfo.isAbsolute() || !verifiedInfo.isFile() ||
+      verifiedInfo.isSymLink() || !verifiedInfo.isExecutable() ||
+      verifiedInfo.canonicalFilePath() != verifiedInfo.absoluteFilePath() ||
+      !currentInfo.isFile() || currentInfo.isSymLink() ||
+      currentInfo.canonicalFilePath() != detectedInfo.canonicalFilePath() ||
+      currentInfo.canonicalFilePath() == verifiedInfo.canonicalFilePath()) {
+    if (error)
+      *error = QStringLiteral(
+          "The installer update is not a valid verified restart offer.");
+    return false;
+  }
+
+  const bool testConfirmed =
+      environment.value(
+          QStringLiteral("STUDIOCAST_INSTALLER_TEST_CONFIRM_SELF_UPDATE")) ==
+      QStringLiteral("1");
+  if (!testConfirmed &&
+      QMessageBox::question(
+          this, QStringLiteral("Restart with verified installer update?"),
+          QStringLiteral("StudioCast verified a newer installer at:\n%1\n\n"
+                         "Restart now? The running AppImage will not be "
+                         "overwritten.")
+              .arg(verifiedPath),
+          QMessageBox::Yes | QMessageBox::No,
+          QMessageBox::No) != QMessageBox::Yes) {
+    if (error)
+      error->clear();
+    return false;
+  }
+
+  const QString launchLog = environment.value(
+      QStringLiteral("STUDIOCAST_INSTALLER_TEST_SELF_UPDATE_LAUNCH_LOG"));
+  if (!launchLog.isEmpty()) {
+    QFile file(launchLog);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      if (error)
+        *error = QStringLiteral("Could not record the test restart command.");
+      return false;
+    }
+    file.write(QJsonDocument(QJsonArray::fromStringList(command))
+                   .toJson(QJsonDocument::Compact));
+    return true;
+  }
+
+  const QString program = command.takeFirst();
+  if (!QProcess::startDetached(program, command)) {
+    if (error)
+      *error =
+          QStringLiteral("Could not launch the verified installer update.");
+    return false;
+  }
+  QCoreApplication::quit();
   return true;
 }
 
@@ -905,12 +991,9 @@ bool InstallerWizard::refreshPlan(QString *error) {
   if (!customRoute_ && workflow_ != QStringLiteral("repair") &&
       workflow_ != QStringLiteral("uninstall") &&
       (verifiedReleaseReceiptPath_.isEmpty() ||
-       !QFileInfo(verifiedReleaseReceiptPath_).isFile() ||
-       !useReleaseArchive_ || releaseArchive_.isEmpty() ||
-       !QFileInfo(releaseArchive_).isFile())) {
+       !QFileInfo(verifiedReleaseReceiptPath_).isFile())) {
     planError_ = QStringLiteral(
-        "Recommended installation requires a current signed-release receipt "
-        "and its verified official source archive.");
+        "Recommended installation requires a current signed-release receipt.");
     if (error)
       *error = planError_;
     return false;
@@ -1198,6 +1281,41 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   workflowBox->setLayout(workflowLayout);
   layout->addWidget(workflowBox);
 
+  selfUpdateBox_ = new QGroupBox(QStringLiteral("Installer update"), this);
+  auto *selfUpdateLayout = new QVBoxLayout(selfUpdateBox_);
+  selfUpdateLabel_ = new QLabel(selfUpdateBox_);
+  selfUpdateLabel_->setWordWrap(true);
+  selfUpdateLayout->addWidget(selfUpdateLabel_);
+  auto *selfUpdateActions = new QHBoxLayout;
+  restartInstallerButton_ = new QPushButton(
+      QStringLiteral("Restart with verified update"), selfUpdateBox_);
+  restartInstallerButton_->setObjectName(
+      QStringLiteral("scInstallerSelfUpdateRestart"));
+  manualDownloadButton_ =
+      new QPushButton(QStringLiteral("Open manual download"), selfUpdateBox_);
+  manualDownloadButton_->setObjectName(
+      QStringLiteral("scInstallerSelfUpdateManual"));
+  selfUpdateActions->addWidget(restartInstallerButton_);
+  selfUpdateActions->addWidget(manualDownloadButton_);
+  selfUpdateActions->addStretch(1);
+  selfUpdateLayout->addLayout(selfUpdateActions);
+  selfUpdateBox_->setVisible(false);
+  layout->addWidget(selfUpdateBox_);
+
+  connect(restartInstallerButton_, &QPushButton::clicked, this, [this] {
+    QString error;
+    if (!installerWizard(this)->launchVerifiedSelfUpdate(&error) &&
+        !error.isEmpty()) {
+      QMessageBox::warning(
+          this, QStringLiteral("Installer restart unavailable"), error);
+    }
+  });
+  connect(manualDownloadButton_, &QPushButton::clicked, this, [this] {
+    const QUrl url(manualDownloadButton_->property("downloadUrl").toString());
+    if (url.scheme() == QStringLiteral("https"))
+      QDesktopServices::openUrl(url);
+  });
+
   layout->addWidget(mutedLabel(
       QStringLiteral("The GUI is not run as root. Privileged operations are "
                      "delegated only through the trusted, typed StudioCast "
@@ -1212,6 +1330,36 @@ void IntroPage::initializePage() {
   w->refreshStatus();
   const QJsonObject status = w->statusObject();
   const QJsonObject os = w->osObject();
+  const QJsonObject selfUpdate =
+      w->releaseStatusObject().value(QStringLiteral("self_update")).toObject();
+  const QString selfUpdateState =
+      jsonString(selfUpdate, QStringLiteral("state"));
+  const QString manualUrl =
+      jsonString(selfUpdate, QStringLiteral("manual_download_url"));
+  const QUrl parsedManualUrl(manualUrl);
+  const bool manualAvailable =
+      parsedManualUrl.isValid() &&
+      parsedManualUrl.scheme() == QStringLiteral("https");
+  const bool restartAvailable =
+      selfUpdateState == QStringLiteral("offer_restart") &&
+      jsonBool(selfUpdate, QStringLiteral("requires_confirmation"));
+  selfUpdateBox_->setVisible(
+      restartAvailable || selfUpdateState == QStringLiteral("manual_download"));
+  restartInstallerButton_->setVisible(restartAvailable);
+  manualDownloadButton_->setVisible(manualAvailable);
+  manualDownloadButton_->setProperty("downloadUrl", manualUrl);
+  manualDownloadButton_->setToolTip(manualUrl);
+  if (restartAvailable) {
+    selfUpdateLabel_->setText(QStringLiteral(
+        "A newer installer AppImage was downloaded and verified. Restart is "
+        "offered explicitly; the running AppImage will not be replaced."));
+  } else if (selfUpdateState == QStringLiteral("manual_download")) {
+    selfUpdateLabel_->setText(
+        QStringLiteral("Automatic installer restart is unavailable (%1). Use "
+                       "the verified release's manual download link.")
+            .arg(jsonString(selfUpdate, QStringLiteral("reason_code"),
+                            QStringLiteral("self_update.unavailable"))));
+  }
 
   if (!w->analysisAvailable()) {
     osValue_->setText(QStringLiteral("Analysis unavailable"));
