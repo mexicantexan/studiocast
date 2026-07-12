@@ -115,7 +115,8 @@ std::string BackendCommand(const ScopedTempDir &root,
   const fs::path repo = fs::path(STUDIOCAST_SOURCE_DIR);
   const fs::path backend =
       repo / "installer" / "backend" / "studiocast-installer-backend";
-  const fs::path buildDir = root.path() / "build";
+  const fs::path buildDir = root.path() / "home" / ".cache" / "studiocast" /
+                            "builds" / "test";
   std::string command =
       "HOME=" + ShellQuote((root.path() / "home").string()) + " " +
       ShellQuote(backend.string()) + " " + subcommand + " --source-dir " +
@@ -175,25 +176,19 @@ bool TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() {
   return Expect(result.exit_code == 0,
                 "installer backend Vulkan plan should exit successfully") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "--vulkan-runtime") &&
+                        "libvulkan1") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "--mesa-vulkan") &&
+                        "mesa-vulkan-drivers") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "--shader-tools") &&
+                        "glslang-tools") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
                         "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "optional Vulkan loader/diagnostic packages") &&
+                        "dependencies.packages.ensure") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "Mesa Intel/AMD Vulkan ICD") &&
-         ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "developer shader tools") &&
-         ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "runtime-loaded Open Vulkan") &&
-         ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "working GPU driver/ICD") &&
-         ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "virtual-background matting remains blocked");
+                        "packages.ensure.v1") &&
+         Expect(result.stdout_str.find("scripts/setup.sh") == std::string::npos,
+                "installer must not execute selected-source setup scripts with privilege");
 }
 
 bool TestRepairPlanInstallsOnlySelectedVulkanPackages() {
@@ -214,12 +209,11 @@ bool TestRepairPlanInstallsOnlySelectedVulkanPackages() {
                 "successfully") &&
          ExpectContains("installer backend Vulkan-only repair plan",
                         result.stdout_str,
-                        "scripts/setup.sh --vulkan-runtime --mesa-vulkan "
-                        "--shader-tools") &&
-         Expect(result.stdout_str.find("scripts/setup.sh --deps") ==
-                    std::string::npos,
-                "Vulkan-only repair should not force the full dependency "
-                "bundle");
+                        "\"packages\": [") &&
+         ExpectContains("installer backend Vulkan-only repair plan",
+                        result.stdout_str, "libvulkan1") &&
+         Expect(result.stdout_str.find("scripts/setup.sh") == std::string::npos,
+                "Vulkan package work must use only the typed trusted helper");
 }
 
 bool TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() {
@@ -236,13 +230,9 @@ bool TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() {
                 "installer backend Vulkan runtime-only plan should exit "
                 "successfully") &&
          ExpectContains("installer backend Vulkan runtime-only plan",
-                        result.stdout_str,
-                        "Open Vulkan is optional and runtime-loaded") &&
+                        result.stdout_str, "libvulkan1") &&
          ExpectContains("installer backend Vulkan runtime-only plan",
-                        result.stdout_str, "working GPU driver/ICD") &&
-         ExpectContains("installer backend Vulkan runtime-only plan",
-                        result.stdout_str,
-                        "virtual-background matting remains blocked") &&
+                        result.stdout_str, "vulkan-tools") &&
          Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
                     std::string::npos,
                 "runtime-only package selection should not implicitly enable "
@@ -270,7 +260,11 @@ bool TestRepairPlanCanDisableOpenBackendConfigureFlags() {
          Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") ==
                     std::string::npos,
                 "disabled Open Source backend setup should omit Open Audio "
-                "configure flag");
+                "configure flag") &&
+         ExpectContains("installer backend disabled plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF") &&
+         ExpectContains("installer backend disabled plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF");
 }
 
 bool TestUninstallPlanOmitsInstallOnlyDetails() {
@@ -316,7 +310,9 @@ bool TestRepairDryRunIncludesOpenBackendConfigureFlags() {
          ExpectContains("installer backend repair dry-run", result.stdout_str,
                         "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") &&
          ExpectContains("installer backend repair dry-run", result.stdout_str,
-                        "video.scaling.allow_cpu_resize");
+                        "\"reviewed_operation_ids\"") &&
+         ExpectContains("installer backend repair dry-run", result.stdout_str,
+                        "\"executed_operation_ids\"");
 }
 
 bool TestStatusReportsOptionalComponents() {

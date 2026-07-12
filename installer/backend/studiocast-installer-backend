@@ -1,1391 +1,1298 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""StudioCast user-local installer transaction backend.
 
-# StudioCast installer backend.
-#
-# This script is intentionally usable without the GUI. The GUI calls it for
-# detection, planning, and execution; CI/SSH/recovery users can call it directly.
+The installed copy is deliberately self-contained.  Host mutations are never
+performed by this program: they are represented as typed requests for the
+separately packaged, root-owned StudioCast system helper.
+"""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-BACKEND_PATH="${SCRIPT_DIR}/studiocast-installer-backend"
+from __future__ import annotations
 
-APP_ID="studiocast"
-SERVICE_NAME="studiocastd.service"
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+import zipfile
+from pathlib import Path
+from typing import Any
 
-HOME_DIR="${HOME:-}"
-if [[ -z "${HOME_DIR}" ]]; then
-  echo "[installer] ERROR: HOME is not set" >&2
-  exit 2
-fi
 
-XDG_DATA_HOME_DIR="${XDG_DATA_HOME:-${HOME_DIR}/.local/share}"
-XDG_CONFIG_HOME_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
-XDG_STATE_HOME_DIR="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"
-XDG_CACHE_HOME_DIR="${XDG_CACHE_HOME:-${HOME_DIR}/.cache}"
-LOCAL_BIN_DIR="${HOME_DIR}/.local/bin"
-
-APP_DATA_DIR="${XDG_DATA_HOME_DIR}/${APP_ID}"
-APP_CONFIG_DIR="${XDG_CONFIG_HOME_DIR}/${APP_ID}"
-APP_STATE_DIR="${XDG_STATE_HOME_DIR}/${APP_ID}"
-APP_CACHE_DIR="${XDG_CACHE_HOME_DIR}/${APP_ID}"
-MANIFEST_PATH="${APP_DATA_DIR}/install-manifest.json"
-SYSTEMD_USER_DIR="${XDG_CONFIG_HOME_DIR}/systemd/user"
-SERVICE_PATH="${SYSTEMD_USER_DIR}/${SERVICE_NAME}"
-
-DEFAULT_SOURCE_DIR="${REPO_ROOT}"
-DEFAULT_BUILD_DIR="${APP_CACHE_DIR}/build"
-DEFAULT_BUILD_TYPE="Release"
-
-COMMAND="help"
-WORKFLOW=""
-SOURCE_DIR="${DEFAULT_SOURCE_DIR}"
-RELEASE_ARCHIVE=""
-BUILD_DIR="${DEFAULT_BUILD_DIR}"
-BUILD_TYPE="${DEFAULT_BUILD_TYPE}"
-
-JSON_OUTPUT=0
-DRY_RUN=0
-YES=0
-ALLOW_UNSUPPORTED=0
-WITH_DEPS=1
-WITH_V4L2=1
-LOAD_LOOPBACK=1
-PERSIST_LOOPBACK=1
-WITH_SERVICE=1
-WITH_MODELS=0
-OPEN_BACKENDS=1
-OPEN_VULKAN=0
-WITH_VULKAN_RUNTIME=0
-WITH_MESA_VULKAN=0
-WITH_SHADER_TOOLS=0
-FRESH_BUILD=0
-REMOVE_USER_DATA=0
-SOURCE_EXPLICIT=0
-BUILD_EXPLICIT=0
-
-EFFECTIVE_SOURCE_DIR=""
-PREPARED_ARCHIVE_SOURCE_DIR=""
-
-BINARIES=(
-  "studiocast"
-  "studiocastd"
-  "studiocastctl"
-  "studiocast-probe"
-  "studiocast-open"
-  "studiocast-maxine"
-  "studiocast-video"
-  "studiocast-audio"
+POLICY_VERSION = "studiocast-installer-policy/1"
+FACTS_VERSION = "installer-facts/v1"
+RECOMMENDATION_VERSION = "installer-recommendation/v1"
+PLAN_VERSION = "installer-plan/v1"
+HELPER_PATH = Path("/usr/libexec/studiocast/studiocast-system-helper")
+SERVICE_NAME = "studiocastd.service"
+BINARIES = (
+    "studiocast", "studiocastd", "studiocastctl", "studiocast-probe",
+    "studiocast-open", "studiocast-maxine", "studiocast-video", "studiocast-audio",
 )
-
-BUILD_TARGETS=(
-  "studiocast"
-  "studiocastd"
-  "studiocastctl"
-  "studiocast-probe"
-  "studiocast-open"
-  "studiocast-maxine"
-  "studiocast-video"
-  "studiocast-audio"
+DEFAULT_MODEL_PACKS = (
+    "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1",
+    "modnet-webnn-256-fp32", "yunet_opencv_zoo_2023mar_fp32",
+    "dlib_68_ibug_300w", "gaze_correction_cam_flx_v0_1_1",
+    "fastdvdnet_sigma15",
 )
-
-DEFAULT_OPEN_AUDIO_MODEL_IDS=(
-  "fastenhancer_s_vd_v1"
-  "fastenhancer_m_vd_v1"
-)
-
-DEFAULT_OPEN_VIDEO_MODEL_IDS=(
-  "modnet-webnn-256-fp32"
-  "yunet_opencv_zoo_2023mar_fp32"
-  "dlib_68_ibug_300w"
-  "gaze_correction_cam_flx_v0_1_1"
-  "fastdvdnet_sigma15"
-)
-
-usage() {
-  cat <<'EOF'
-StudioCast installer backend
-
-Usage:
-  installer/backend/studiocast-installer-backend <command> [workflow] [options]
-
-Commands:
-  detect-os                 Print detected OS support details.
-  status                    Print installed/project status.
-  plan <workflow>           Print the operations for a workflow.
-  run <workflow>            Execute a workflow.
-  install                   Shortcut for: run install
-  update                    Shortcut for: run update
-  repair                    Shortcut for: run repair
-  uninstall                 Shortcut for: run uninstall
-  clean-install             Shortcut for: run clean-install
-  advanced                  Shortcut for: plan advanced
-  manifest                  Print the current install manifest.
-  help                      Show this help.
-
-Workflows:
-  install                   Install from the selected source checkout/archive.
-  update                    Build/install selected source checkout/archive over the current install.
-  repair                    Rebuild/reinstall from manifest paths or selected source.
-  uninstall                 Remove app binaries/service/runtime artifacts.
-  clean-install             Uninstall app files, then install again.
-  advanced                  Show manual/backend commands without making changes.
-
-Common options:
-  --json                    Emit machine-readable JSON for detect-os/status/plan.
-  --source-dir DIR          Source checkout to build from (default: this repo).
-  --release-archive FILE    Source archive to extract and build from (.tar*, .tgz, .zip).
-  --build-dir DIR           CMake build directory (default: ~/.cache/studiocast/build).
-  --build-type TYPE         CMake build type (default: Release).
-  --dry-run                 Print commands without executing them.
-  -y, --yes                 Assume yes for delegated scripts.
-  --allow-unsupported       Do not block execution on unsupported distro detection.
-
-Install/update options:
-  --with-deps | --skip-deps
-  --v4l2loopback | --no-v4l2loopback
-  --load-loopback | --no-load-loopback
-  --persist-loopback | --no-persist-loopback
-  --service | --no-service
-  --models | --no-models    Download default Open Audio/Open Video model packs; default is off.
-  --open-backends | --no-open-backends
-                            Explicitly configure Open Video/Open CUDA and Open Audio support; default is on.
-  --open-vulkan | --no-open-vulkan
-                            Configure the optional Open Vulkan backend; default is off.
-  --vulkan-runtime | --no-vulkan-runtime
-                            Install optional Vulkan loader/diagnostic packages; default is off.
-  --mesa-vulkan             With --vulkan-runtime, install Mesa Intel/AMD Vulkan ICDs.
-  --shader-tools            Install optional developer Vulkan shader tools.
-  --fresh-build | --no-fresh-build
-
-Uninstall/clean-install options:
-  --preserve-user-data      Preserve config, models, logs, cache (default).
-  --remove-user-data        Also delete XDG StudioCast data/config/state/cache.
-
-Examples:
-  installer/backend/studiocast-installer-backend status --json
-  installer/backend/studiocast-installer-backend plan install --json
-  installer/backend/studiocast-installer-backend install --yes
-  installer/backend/studiocast-installer-backend update --source-dir /tmp/StudioCast-0.3.0 --yes
-  installer/backend/studiocast-installer-backend clean-install --dry-run
-EOF
+MODEL_ARTIFACTS = {
+    "fastenhancer_s_vd_v1": ("model.onnx",),
+    "fastenhancer_m_vd_v1": ("model.onnx",),
+    "modnet-webnn-256-fp32": ("model.onnx",),
+    "yunet_opencv_zoo_2023mar_fp32": ("model.onnx",),
+    "dlib_68_ibug_300w": ("shape_predictor_68_face_landmarks.dat",),
+    "gaze_correction_cam_flx_v0_1_1": ("gaze_flx_left.onnx", "gaze_flx_right.onnx"),
+    "fastdvdnet_sigma15": ("model.onnx",),
+}
+_MODEL_HASHES = {
+    "fastenhancer_s_vd_v1": ("e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8",),
+    "fastenhancer_m_vd_v1": ("367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa",),
+    "modnet-webnn-256-fp32": ("07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",),
+    "yunet_opencv_zoo_2023mar_fp32": ("8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",),
+    "dlib_68_ibug_300w": ("fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f",),
+    "gaze_correction_cam_flx_v0_1_1": ("1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00", "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"),
+    "fastdvdnet_sigma15": ("500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc",),
+}
+_MODEL_LICENSES = {
+    "fastenhancer_s_vd_v1": ("MIT", "FastEnhancer release"),
+    "fastenhancer_m_vd_v1": ("MIT", "FastEnhancer release"),
+    "modnet-webnn-256-fp32": ("Apache-2.0", "onnx-community/modnet-webnn"),
+    "yunet_opencv_zoo_2023mar_fp32": ("MIT", "OpenCV Zoo YuNet 2023mar"),
+    "dlib_68_ibug_300w": ("LicenseRef-iBUG-300W-non-commercial", "dlib iBUG 300-W predictor"),
+    "gaze_correction_cam_flx_v0_1_1": ("BSD-3-Clause", "gaze-correction-cam v0.1.1 StudioCast ONNX export"),
+    "fastdvdnet_sigma15": ("MIT", "FastDVDnet StudioCast ONNX export"),
+}
+MODEL_METADATA = {pack: {
+    "license": {"identifier": _MODEL_LICENSES[pack][0], "name": _MODEL_LICENSES[pack][0], "url": None},
+    "provenance": _MODEL_LICENSES[pack][1],
+    "artifacts": [{"path": name, "size": None, "sha256": "sha256:" + checksum}
+                  for name, checksum in zip(files, _MODEL_HASHES[pack])],
+} for pack, files in MODEL_ARTIFACTS.items()}
+ALLOWED_OPERATION_KINDS = {
+    "preflight", "settings_snapshot", "source_extract", "build_cache_prepare",
+    "build_configure", "build_compile", "payload_stage", "payload_validate",
+    "trusted_helper", "payload_activate", "links_reconcile", "service_unit_reconcile",
+    "service_state_reconcile", "model_obtain", "model_verify", "model_activate",
+    "settings_restore", "cleanup", "manifest_commit", "uninstall_tombstone",
+}
+PRIVILEGED_TYPES = {
+    "packages.ensure.v1", "v4l.module.load.v1", "v4l.persistence.write.v1",
+    "v4l.persistence.remove.v1",
+}
+FORBIDDEN_HELPER_FIELDS = {
+    "command", "executable", "argv", "shell", "script", "script_path",
+    "source_path", "archive_path", "build_path", "destination_path", "cwd",
+    "environment", "url", "download", "file_content", "module_name",
+    "package_manager_flags",
 }
 
-log() { echo "[installer] $*" >&2; }
-die() { echo "[installer] ERROR: $*" >&2; exit 2; }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-expand_path() {
-  local path="$1"
-  if [[ "${path}" == "~"* ]]; then
-    path="${path/#~/${HOME_DIR}}"
-  fi
-  printf '%s\n' "${path}"
-}
-
-abs_existing_dir() {
-  local path
-  path="$(expand_path "$1")"
-  [[ -d "${path}" ]] || die "Directory not found: ${path}"
-  cd "${path}" && pwd
-}
-
-abs_existing_file() {
-  local path
-  path="$(expand_path "$1")"
-  [[ -f "${path}" ]] || die "File not found: ${path}"
-  cd "$(dirname "${path}")" && printf '%s/%s\n' "$(pwd)" "$(basename "${path}")"
-}
-
-print_cmd() {
-  printf '+ '
-  printf '%q ' "$@"
-  printf '\n'
-}
-
-run_cmd() {
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    print_cmd "$@"
-    return 0
-  fi
-  "$@"
-}
-
-json_escape() {
-  local s="${1:-}"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  s="${s//$'\t'/\\t}"
-  printf '%s' "${s}"
-}
-
-json_string() {
-  printf '"'
-  json_escape "${1:-}"
-  printf '"'
-}
-
-json_bool() {
-  if [[ "${1:-0}" == "1" || "${1:-}" == "true" ]]; then
-    printf 'true'
-  else
-    printf 'false'
-  fi
-}
-
-json_string_array() {
-  local first=1
-  printf '['
-  local item
-  for item in "$@"; do
-    if [[ "${first}" -eq 0 ]]; then
-      printf ','
-    fi
-    first=0
-    json_string "${item}"
-  done
-  printf ']'
-}
-
-manifest_field() {
-  local key="$1"
-  [[ -f "${MANIFEST_PATH}" ]] || return 1
-  sed -nE 's/^[[:space:]]*"'"${key}"'":[[:space:]]*"(([^"\\]|\\.)*)",?[[:space:]]*$/\1/p' \
-    "${MANIFEST_PATH}" | head -n 1 | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
-}
-
-project_version_from() {
-  local dir="$1"
-  local version_file="${dir}/VERSION"
-  if [[ -f "${version_file}" ]]; then
-    tr -d '[:space:]' < "${version_file}"
-  else
-    printf 'unknown'
-  fi
-}
-
-installed_binary_version() {
-  local bin="${LOCAL_BIN_DIR}/studiocast"
-  if [[ -x "${bin}" ]]; then
-    "${bin}" --version 2>/dev/null | awk '{print $2; exit}' || true
-  fi
-}
-
-read_os_release() {
-  OS_ID=""
-  OS_VERSION_ID=""
-  OS_VERSION_CODENAME=""
-  OS_UBUNTU_CODENAME=""
-  OS_ID_LIKE=""
-  OS_PRETTY_NAME=""
-
-  if [[ -f /etc/os-release ]]; then
-    local key value
-    while IFS='=' read -r key value || [[ -n "${key:-}" ]]; do
-      case "${key}" in
-        ID|VERSION_ID|VERSION_CODENAME|UBUNTU_CODENAME|ID_LIKE|PRETTY_NAME)
-          value="${value%\"}"
-          value="${value#\"}"
-          value="${value%\'}"
-          value="${value#\'}"
-          ;;
-      esac
-
-      case "${key}" in
-        ID) OS_ID="${value}" ;;
-        VERSION_ID) OS_VERSION_ID="${value}" ;;
-        VERSION_CODENAME) OS_VERSION_CODENAME="${value}" ;;
-        UBUNTU_CODENAME) OS_UBUNTU_CODENAME="${value}" ;;
-        ID_LIKE) OS_ID_LIKE="${value}" ;;
-        PRETTY_NAME) OS_PRETTY_NAME="${value}" ;;
-      esac
-    done < /etc/os-release
-  fi
-
-  OS_BASE_ID=""
-  OS_BASE_VERSION_ID=""
-  OS_BASE_CODENAME=""
-  OS_MAPPING_NOTE=""
-  OS_SUPPORTED=0
-  OS_SUPPORT_REASON=""
-
-  local id_like_padded=" ${OS_ID_LIKE} "
-  if [[ "${OS_ID}" == "ubuntu" ]]; then
-    OS_BASE_ID="ubuntu"
-    OS_BASE_VERSION_ID="${OS_VERSION_ID}"
-    OS_BASE_CODENAME="${OS_VERSION_CODENAME}"
-    OS_MAPPING_NOTE="Native Ubuntu release."
-  elif [[ "${OS_ID}" == "linuxmint" ]]; then
-    OS_BASE_ID="ubuntu"
-    if [[ "${OS_UBUNTU_CODENAME}" == "jammy" ]]; then
-      OS_BASE_VERSION_ID="22.04"
-      OS_BASE_CODENAME="jammy"
-      OS_MAPPING_NOTE="Linux Mint mapped through UBUNTU_CODENAME=jammy (Ubuntu 22.04 base)."
-    elif [[ "${OS_UBUNTU_CODENAME}" == "noble" ]]; then
-      OS_BASE_VERSION_ID="24.04"
-      OS_BASE_CODENAME="noble"
-      OS_MAPPING_NOTE="Linux Mint mapped through UBUNTU_CODENAME=noble (Ubuntu 24.04 base)."
-    elif [[ "${OS_VERSION_ID}" == 21* ]]; then
-      OS_BASE_VERSION_ID="22.04"
-      OS_BASE_CODENAME="jammy"
-      OS_MAPPING_NOTE="Linux Mint ${OS_VERSION_ID} mapped to Ubuntu 22.04 base by Mint major version."
-    elif [[ "${OS_VERSION_ID}" == 22* ]]; then
-      OS_BASE_VERSION_ID="24.04"
-      OS_BASE_CODENAME="noble"
-      OS_MAPPING_NOTE="Linux Mint ${OS_VERSION_ID} mapped to Ubuntu 24.04 base by Mint major version."
-    else
-      OS_MAPPING_NOTE="Linux Mint detected, but Ubuntu base could not be mapped reliably."
-    fi
-  elif [[ "${id_like_padded}" == *" ubuntu "* && -n "${OS_UBUNTU_CODENAME}" ]]; then
-    OS_BASE_ID="ubuntu"
-    OS_BASE_CODENAME="${OS_UBUNTU_CODENAME}"
-    case "${OS_UBUNTU_CODENAME}" in
-      jammy) OS_BASE_VERSION_ID="22.04" ;;
-      noble) OS_BASE_VERSION_ID="24.04" ;;
-      *) OS_BASE_VERSION_ID="" ;;
-    esac
-    OS_MAPPING_NOTE="Ubuntu-family distro mapped through UBUNTU_CODENAME=${OS_UBUNTU_CODENAME}."
-  fi
-
-  if [[ "${OS_BASE_ID}" == "ubuntu" ]]; then
-    case "${OS_BASE_VERSION_ID}:${OS_BASE_CODENAME}" in
-      22.04:*|*:jammy)
-        OS_SUPPORTED=1
-        OS_SUPPORT_REASON="Supported Ubuntu 22.04/Jammy base."
-        ;;
-      24.04:*|*:noble)
-        OS_SUPPORTED=1
-        OS_SUPPORT_REASON="Supported Ubuntu 24.04/Noble base."
-        ;;
-      *)
-        OS_SUPPORT_REASON="Detected Ubuntu-family system, but only Ubuntu 22.04/Jammy and 24.04/Noble bases are supported by the installer."
-        ;;
-    esac
-  else
-    OS_SUPPORT_REASON="Unsupported distro for the GUI installer backend. Manual source builds may still work; see docs/SETUP.md."
-  fi
-}
-
-print_os_human() {
-  read_os_release
-  cat <<EOF
-Detected OS: ${OS_PRETTY_NAME:-unknown}
-ID: ${OS_ID:-unknown}
-VERSION_ID: ${OS_VERSION_ID:-unknown}
-VERSION_CODENAME: ${OS_VERSION_CODENAME:-unknown}
-UBUNTU_CODENAME: ${OS_UBUNTU_CODENAME:-unknown}
-ID_LIKE: ${OS_ID_LIKE:-unknown}
-Ubuntu base: ${OS_BASE_VERSION_ID:-unknown} (${OS_BASE_CODENAME:-unknown})
-Supported: $([[ "${OS_SUPPORTED}" -eq 1 ]] && echo yes || echo no)
-Reason: ${OS_SUPPORT_REASON}
-Mapping: ${OS_MAPPING_NOTE:-none}
-EOF
-}
-
-print_os_json() {
-  read_os_release
-  printf '{'
-  printf '"pretty_name":'; json_string "${OS_PRETTY_NAME}"; printf ','
-  printf '"id":'; json_string "${OS_ID}"; printf ','
-  printf '"version_id":'; json_string "${OS_VERSION_ID}"; printf ','
-  printf '"version_codename":'; json_string "${OS_VERSION_CODENAME}"; printf ','
-  printf '"ubuntu_codename":'; json_string "${OS_UBUNTU_CODENAME}"; printf ','
-  printf '"id_like":'; json_string "${OS_ID_LIKE}"; printf ','
-  printf '"base_id":'; json_string "${OS_BASE_ID}"; printf ','
-  printf '"base_version_id":'; json_string "${OS_BASE_VERSION_ID}"; printf ','
-  printf '"base_codename":'; json_string "${OS_BASE_CODENAME}"; printf ','
-  printf '"supported":'; json_bool "${OS_SUPPORTED}"; printf ','
-  printf '"support_reason":'; json_string "${OS_SUPPORT_REASON}"; printf ','
-  printf '"mapping_note":'; json_string "${OS_MAPPING_NOTE}"
-  printf '}\n'
-}
-
-service_state_value() {
-  local mode="$1"
-  if ! have_cmd systemctl; then
-    printf 'systemctl-unavailable'
-    return 0
-  fi
-  local value
-  value="$(systemctl --user "${mode}" "${SERVICE_NAME}" 2>/dev/null || true)"
-  if [[ -z "${value}" ]]; then
-    value="unknown"
-  fi
-  printf '%s' "${value}"
-}
-
-onnxruntime_library_dirs() {
-  local d
-  if have_cmd pkg-config && pkg-config --exists onnxruntime; then
-    d="$(pkg-config --variable=libdir onnxruntime 2>/dev/null || true)"
-    [[ -n "${d}" ]] && printf '%s\n' "${d}"
-    pkg-config --libs-only-L onnxruntime 2>/dev/null | tr ' ' '\n' |
-      sed -n 's/^-L//p'
-  fi
-
-  printf '%s\n' \
-    /usr/local/lib \
-    /usr/lib \
-    /usr/lib/x86_64-linux-gnu \
-    /opt/studiocast/onnxruntime/*/onnxruntime-linux-*/lib
-}
-
-detect_onnxruntime_cuda_provider_path() {
-  local d provider
-  while IFS= read -r d; do
-    [[ -n "${d}" ]] || continue
-    for provider in "${d}/libonnxruntime_providers_cuda.so"; do
-      if [[ -f "${provider}" ]]; then
-        printf '%s\n' "${provider}"
-        return 0
-      fi
-    done
-  done < <(onnxruntime_library_dirs | awk '!seen[$0]++')
-  return 1
-}
-
-detect_vulkan_loader_path() {
-  if have_cmd ldconfig; then
-    local from_ldconfig
-    from_ldconfig="$(ldconfig -p 2>/dev/null | awk '/libvulkan[.]so[.]1/ {print $NF; exit}')"
-    if [[ -n "${from_ldconfig}" ]]; then
-      printf '%s\n' "${from_ldconfig}"
-      return 0
-    fi
-  fi
-
-  local candidate
-  for candidate in \
-    /usr/lib/libvulkan.so.1 \
-    /usr/lib64/libvulkan.so.1 \
-    /usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
-    /lib/x86_64-linux-gnu/libvulkan.so.1; do
-    if [[ -e "${candidate}" ]]; then
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-detect_maxine_base_dir() {
-  printf '%s\n' "${XDG_DATA_HOME_DIR}/${APP_ID}/maxine"
-}
-
-print_optional_components_json() {
-  local cuda_available=0 cuda_summary cuda_details
-  if have_cmd nvidia-smi; then
-    if cuda_details="$(nvidia-smi -L 2>&1)" && [[ -n "${cuda_details}" ]]; then
-      cuda_available=1
-      cuda_summary="NVIDIA driver/GPU detected with nvidia-smi."
-    else
-      cuda_details="${cuda_details:-nvidia-smi did not report a GPU.}"
-      cuda_summary="NVIDIA CUDA driver/GPU was not detected."
-    fi
-  else
-    cuda_details="nvidia-smi was not found."
-    cuda_summary="NVIDIA CUDA driver/GPU was not detected."
-  fi
-
-  local ort_present=0 ort_version="" ort_cuda_provider=0 ort_provider_path=""
-  if have_cmd pkg-config && pkg-config --exists onnxruntime; then
-    ort_present=1
-    ort_version="$(pkg-config --modversion onnxruntime 2>/dev/null || true)"
-  elif have_cmd ldconfig && ldconfig -p 2>/dev/null | grep -q 'libonnxruntime\.so'; then
-    ort_present=1
-    ort_version="found-via-ldconfig"
-  fi
-  if ort_provider_path="$(detect_onnxruntime_cuda_provider_path 2>/dev/null || true)" &&
-     [[ -n "${ort_provider_path}" ]]; then
-    ort_cuda_provider=1
-  fi
-
-  local maxine_base vfx_root ar_root afx_root
-  local maxine_vfx=0 maxine_ar=0 maxine_afx=0 maxine_complete=0
-  maxine_base="$(detect_maxine_base_dir)"
-  vfx_root="${maxine_base}/VideoFX"
-  ar_root="${maxine_base}/ARSDK"
-  afx_root="${maxine_base}/Audio_Effects_SDK"
-  [[ -d "${vfx_root}" ]] && maxine_vfx=1
-  [[ -d "${ar_root}" ]] && maxine_ar=1
-  [[ -d "${afx_root}" ]] && maxine_afx=1
-  [[ "${maxine_vfx}" -eq 1 && "${maxine_ar}" -eq 1 && "${maxine_afx}" -eq 1 ]] && maxine_complete=1
-
-  local vulkan_loader=0 vulkan_loader_path="" vulkaninfo_present=0
-  if vulkan_loader_path="$(detect_vulkan_loader_path 2>/dev/null || true)" &&
-     [[ -n "${vulkan_loader_path}" ]]; then
-    vulkan_loader=1
-  fi
-  if have_cmd vulkaninfo; then
-    vulkaninfo_present=1
-  fi
-
-  printf '{'
-  printf '"cuda":{'
-  printf '"available":'; json_bool "${cuda_available}"; printf ','
-  printf '"summary":'; json_string "${cuda_summary}"; printf ','
-  printf '"details":'; json_string "${cuda_details}"; printf ','
-  printf '"install_docs":'; json_string "docs/open_source_video_models_install.md"
-  printf '},'
-  printf '"onnxruntime_cuda":{'
-  printf '"present":'; json_bool "${ort_present}"; printf ','
-  printf '"version":'; json_string "${ort_version}"; printf ','
-  printf '"cuda_provider_present":'; json_bool "${ort_cuda_provider}"; printf ','
-  printf '"cuda_provider_path":'; json_string "${ort_provider_path}"; printf ','
-  printf '"install_docs":'; json_string "docs/open_source_video_models_install.md"
-  printf '},'
-  printf '"maxine_sdk":{'
-  printf '"complete":'; json_bool "${maxine_complete}"; printf ','
-  printf '"base_dir":'; json_string "${maxine_base}"; printf ','
-  printf '"vfx_present":'; json_bool "${maxine_vfx}"; printf ','
-  printf '"ar_present":'; json_bool "${maxine_ar}"; printf ','
-  printf '"afx_present":'; json_bool "${maxine_afx}"; printf ','
-  printf '"install_docs":'; json_string "docs/maxine_install.md"
-  printf '},'
-  printf '"vulkan":{'
-  printf '"loader_present":'; json_bool "${vulkan_loader}"; printf ','
-  printf '"loader_path":'; json_string "${vulkan_loader_path}"; printf ','
-  printf '"vulkaninfo_present":'; json_bool "${vulkaninfo_present}"; printf ','
-  printf '"runtime_packages":'; json_string_array "libvulkan1" "vulkan-tools"; printf ','
-  printf '"mesa_icd_package":'; json_string "mesa-vulkan-drivers"; printf ','
-  printf '"shader_tools_package":'; json_string "glslang-tools"; printf ','
-  printf '"summary":'; json_string "Optional Vulkan packages provide the loader and diagnostics only; Open Vulkan also requires -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON plus a GPU driver/ICD exposing a compute-capable device."; printf ','
-  printf '"install_docs":'; json_string "docs/SETUP.md"
-  printf '}'
-  printf '}'
-}
-
-print_status_human() {
-  local project_version installed_version manifest_state active enabled
-  project_version="$(project_version_from "${REPO_ROOT}")"
-  installed_version="$(installed_binary_version)"
-  if [[ -z "${installed_version}" ]]; then
-    installed_version="$(manifest_field installed_version 2>/dev/null || true)"
-  fi
-  manifest_state="$(manifest_field state 2>/dev/null || true)"
-  active="$(service_state_value is-active)"
-  enabled="$(service_state_value is-enabled)"
-
-  cat <<EOF
-Project version: ${project_version}
-Installed version: ${installed_version:-not installed}
-Manifest: ${MANIFEST_PATH}$([[ -f "${MANIFEST_PATH}" ]] && echo " (present)" || echo " (missing)")
-Manifest state: ${manifest_state:-unknown}
-Local bin: ${LOCAL_BIN_DIR}
-User service: ${SERVICE_PATH}$([[ -f "${SERVICE_PATH}" ]] && echo " (present)" || echo " (missing)")
-Service active: ${active}
-Service enabled: ${enabled}
-EOF
-}
-
-print_status_json() {
-  read_os_release
-  local project_version installed_version manifest_state active enabled installed
-  project_version="$(project_version_from "${REPO_ROOT}")"
-  installed_version="$(installed_binary_version)"
-  if [[ -z "${installed_version}" ]]; then
-    installed_version="$(manifest_field installed_version 2>/dev/null || true)"
-  fi
-  manifest_state="$(manifest_field state 2>/dev/null || true)"
-  active="$(service_state_value is-active)"
-  enabled="$(service_state_value is-enabled)"
-  installed=0
-  if [[ -f "${MANIFEST_PATH}" && "${manifest_state}" != "uninstalled" && -x "${LOCAL_BIN_DIR}/studiocast" ]]; then
-    installed=1
-  fi
-
-  printf '{'
-  printf '"project_version":'; json_string "${project_version}"; printf ','
-  printf '"installed":'; json_bool "${installed}"; printf ','
-  printf '"installed_version":'; json_string "${installed_version:-}"; printf ','
-  printf '"manifest_path":'; json_string "${MANIFEST_PATH}"; printf ','
-  printf '"manifest_exists":'; json_bool "$([[ -f "${MANIFEST_PATH}" ]] && echo 1 || echo 0)"; printf ','
-  printf '"manifest_state":'; json_string "${manifest_state:-}"; printf ','
-  printf '"source_path":'; json_string "$(manifest_field source_path 2>/dev/null || true)"; printf ','
-  printf '"build_path":'; json_string "$(manifest_field build_path 2>/dev/null || true)"; printf ','
-  printf '"local_bin_dir":'; json_string "${LOCAL_BIN_DIR}"; printf ','
-  printf '"service":{'
-  printf '"path":'; json_string "${SERVICE_PATH}"; printf ','
-  printf '"installed":'; json_bool "$([[ -f "${SERVICE_PATH}" ]] && echo 1 || echo 0)"; printf ','
-  printf '"active":'; json_string "${active}"; printf ','
-  printf '"enabled":'; json_string "${enabled}"
-  printf '},'
-  printf '"os":'
-  print_os_json | tr -d '\n'
-  printf ','
-  printf '"binaries":['
-  local first=1 b path
-  for b in "${BINARIES[@]}"; do
-    path="${LOCAL_BIN_DIR}/${b}"
-    if [[ "${first}" -eq 0 ]]; then
-      printf ','
-    fi
-    first=0
-    printf '{'
-    printf '"name":'; json_string "${b}"; printf ','
-    printf '"path":'; json_string "${path}"; printf ','
-    printf '"exists":'; json_bool "$([[ -e "${path}" || -L "${path}" ]] && echo 1 || echo 0)"; printf ','
-    printf '"executable":'; json_bool "$([[ -x "${path}" ]] && echo 1 || echo 0)"
-    printf '}'
-  done
-  printf '],'
-  printf '"optional_components":'
-  print_optional_components_json
-  printf '}\n'
-}
-
-archive_version() {
-  local archive="$1"
-  local member=""
-  case "${archive}" in
-    *.zip)
-      have_cmd unzip || { printf 'unknown'; return 0; }
-      member="$(unzip -Z1 "${archive}" 2>/dev/null | awk '(^$0 == "VERSION" || $0 ~ /\/VERSION$/) {print; exit}')"
-      if [[ -n "${member}" ]]; then
-        unzip -p "${archive}" "${member}" 2>/dev/null | tr -d '[:space:]' || true
-      else
-        printf 'unknown'
-      fi
-      ;;
-    *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2)
-      have_cmd tar || { printf 'unknown'; return 0; }
-      member="$(tar -tf "${archive}" 2>/dev/null | awk '(^$0 == "VERSION" || $0 ~ /\/VERSION$/) {print; exit}')"
-      if [[ -n "${member}" ]]; then
-        tar -xOf "${archive}" "${member}" 2>/dev/null | tr -d '[:space:]' || true
-      else
-        printf 'unknown'
-      fi
-      ;;
-    *)
-      printf 'unknown'
-      ;;
-  esac
-}
-
-PLAN_SUMMARY=()
-PLAN_CHANGES=()
-PLAN_PRIVILEGED=()
-PLAN_PRESERVED=()
-PLAN_REMOVED=()
-PLAN_COMMANDS=()
-
-reset_plan() {
-  PLAN_SUMMARY=()
-  PLAN_CHANGES=()
-  PLAN_PRIVILEGED=()
-  PLAN_PRESERVED=()
-  PLAN_REMOVED=()
-  PLAN_COMMANDS=()
-}
-
-add_plan_command() {
-  local rendered
-  rendered="$(printf '%q ' "$@")"
-  PLAN_COMMANDS+=("${rendered% }")
-}
-
-plan_workflow() {
-  reset_plan
-  read_os_release
-
-  local current_version target_version source_label
-  local plan_source_dir
-  current_version="$(installed_binary_version)"
-  if [[ -z "${current_version}" ]]; then
-    current_version="$(manifest_field installed_version 2>/dev/null || true)"
-  fi
-
-  if [[ -n "${RELEASE_ARCHIVE}" ]]; then
-    target_version="$(archive_version "${RELEASE_ARCHIVE}")"
-    source_label="${RELEASE_ARCHIVE}"
-    plan_source_dir="<extracted source from ${RELEASE_ARCHIVE}>"
-  else
-    target_version="$(project_version_from "${SOURCE_DIR}")"
-    source_label="${SOURCE_DIR}"
-    plan_source_dir="${SOURCE_DIR}"
-  fi
-
-  PLAN_SUMMARY+=("Current installed version: ${current_version:-not installed}")
-  if [[ "${WORKFLOW}" != "uninstall" ]]; then
-    PLAN_SUMMARY+=("Detected OS: ${OS_PRETTY_NAME:-unknown}; ${OS_SUPPORT_REASON}")
-    PLAN_SUMMARY+=("Target StudioCast version: ${target_version:-unknown}")
-    PLAN_SUMMARY+=("Source: ${source_label}")
-    PLAN_SUMMARY+=("Build directory: ${BUILD_DIR} (${BUILD_TYPE})")
-  fi
-
-  case "${WORKFLOW}" in
-    install)
-      PLAN_CHANGES+=("Install StudioCast binaries into ${LOCAL_BIN_DIR}.")
-      PLAN_CHANGES+=("Configure and build StudioCast from the selected source.")
-      ;;
-    update)
-      PLAN_CHANGES+=("Update StudioCast binaries in ${LOCAL_BIN_DIR} from selected source/archive.")
-      PLAN_PRESERVED+=("User config, downloaded model packs, logs, and cache are preserved.")
-      ;;
-    repair)
-      PLAN_CHANGES+=("Rebuild and reinstall the current StudioCast app binaries and service wiring.")
-      PLAN_PRESERVED+=("User config, downloaded model packs, logs, and cache are preserved.")
-      ;;
-    uninstall)
-      PLAN_CHANGES+=("Stop/disable the StudioCast user service and remove app symlinks from ${LOCAL_BIN_DIR}.")
-      PLAN_REMOVED+=("${SERVICE_PATH}")
-      PLAN_REMOVED+=("StudioCast symlinks in ${LOCAL_BIN_DIR}")
-      if [[ "${REMOVE_USER_DATA}" -eq 1 ]]; then
-        PLAN_REMOVED+=("${APP_DATA_DIR}")
-        PLAN_REMOVED+=("${APP_CONFIG_DIR}")
-        PLAN_REMOVED+=("${APP_STATE_DIR}")
-        PLAN_REMOVED+=("${APP_CACHE_DIR}")
-      else
-        PLAN_PRESERVED+=("${APP_DATA_DIR} (manifest and downloaded model packs)")
-        PLAN_PRESERVED+=("${APP_CONFIG_DIR} (user settings)")
-        PLAN_PRESERVED+=("${APP_STATE_DIR} (logs/state)")
-        PLAN_PRESERVED+=("${APP_CACHE_DIR} (build/cache)")
-      fi
-      ;;
-    clean-install)
-      PLAN_CHANGES+=("Remove app binaries/service/runtime artifacts, then install from selected source/archive.")
-      PLAN_CHANGES+=("Configure and build StudioCast from the selected source.")
-      PLAN_CHANGES+=("Install StudioCast binaries into ${LOCAL_BIN_DIR}.")
-      PLAN_REMOVED+=("${SERVICE_PATH}")
-      PLAN_REMOVED+=("StudioCast symlinks in ${LOCAL_BIN_DIR}")
-      if [[ "${REMOVE_USER_DATA}" -eq 1 ]]; then
-        PLAN_REMOVED+=("${APP_DATA_DIR}")
-        PLAN_REMOVED+=("${APP_CONFIG_DIR}")
-        PLAN_REMOVED+=("${APP_STATE_DIR}")
-        PLAN_REMOVED+=("${APP_CACHE_DIR}")
-      else
-        PLAN_PRESERVED+=("User config, downloaded model packs, logs, and cache are preserved.")
-      fi
-      ;;
-    advanced)
-      PLAN_CHANGES+=("No changes are made by the advanced plan.")
-      PLAN_CHANGES+=("Use the displayed backend commands for CI, SSH, recovery, or manual debugging.")
-      ;;
-    *)
-      die "Unknown workflow: ${WORKFLOW}"
-      ;;
-  esac
-
-  if [[ "${WORKFLOW}" != "uninstall" && "${WORKFLOW}" != "advanced" ]]; then
-    if [[ "${WITH_DEPS}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Install/refresh build and runtime dependencies through scripts/setup.sh.")
-      PLAN_PRIVILEGED+=("apt package operations and /opt/ldconfig writes delegated to scripts/setup.sh via sudo.")
-    fi
-    if [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Install optional Vulkan loader/diagnostic packages; this does not guarantee Vulkan device support.")
-      PLAN_PRIVILEGED+=("Vulkan package operations are delegated to scripts/setup.sh via sudo.")
-    fi
-    if [[ "${WITH_MESA_VULKAN}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Install Mesa Intel/AMD Vulkan ICD packages when available from the distro.")
-    fi
-    if [[ "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Install optional developer shader tools for validating/regenerating embedded Vulkan SPIR-V.")
-    fi
-    if [[ "${WITH_V4L2}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Ensure v4l2loopback is installed for the StudioCast virtual camera.")
-      PLAN_PRIVILEGED+=("v4l2loopback package/module operations delegated to scripts/setup.sh via sudo.")
-      if [[ "${LOAD_LOOPBACK}" -eq 1 ]]; then
-        PLAN_CHANGES+=("Load the StudioCast v4l2loopback camera now.")
-      fi
-      if [[ "${PERSIST_LOOPBACK}" -eq 1 ]]; then
-        PLAN_CHANGES+=("Persist the StudioCast v4l2loopback camera across reboot.")
-      fi
-    fi
-    if [[ "${WITH_SERVICE}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Install and start ${SERVICE_NAME} as a systemd user service.")
-    else
-      PLAN_CHANGES+=("Install StudioCast binary symlinks only; do not install/start the user service.")
-    fi
-    if [[ "${WITH_MODELS}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Download/install default Open Audio and Open Video model packs.")
-    else
-      PLAN_PRESERVED+=("Maxine/NVIDIA SDK assets and model packs remain optional; missing SDKs do not block open-source build/install.")
-    fi
-    if [[ "${OPEN_BACKENDS}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Force Linux CMake configuration to keep Open Video/Open CUDA and Open Audio enabled.")
-    fi
-    if [[ "${OPEN_VULKAN}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Enable the optional, runtime-loaded Open Vulkan CMake backend.")
-    fi
-    if [[ "${OPEN_VULKAN}" -eq 1 || "${WITH_VULKAN_RUNTIME}" -eq 1 || "${WITH_MESA_VULKAN}" -eq 1 || "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Open Vulkan is optional and runtime-loaded, and still requires a working GPU driver/ICD exposing a compute-capable device; package/tool installation alone does not provide CUDA/NVIDIA effect parity.")
-      PLAN_CHANGES+=("Production Open Vulkan virtual-background matting remains blocked until a device-resident Vulkan inference runtime is implemented.")
-    fi
-    PLAN_CHANGES+=("Enable CPU resize fallback in the daemon config by default.")
-    PLAN_CHANGES+=("Write install manifest: ${MANIFEST_PATH}.")
-  fi
-
-  add_plan_command "${BACKEND_PATH}" detect-os
-  add_plan_command "${BACKEND_PATH}" status
-  case "${WORKFLOW}" in
-    install|update|repair|clean-install)
-      if [[ "${WITH_DEPS}" -eq 1 || "${WITH_VULKAN_RUNTIME}" -eq 1 || "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
-        local -a setup_args=()
-        [[ "${WITH_DEPS}" -eq 1 ]] && setup_args+=("--deps")
-        if [[ "${WITH_V4L2}" -eq 1 ]]; then
-          setup_args+=("--v4l2loopback")
-          [[ "${LOAD_LOOPBACK}" -eq 1 ]] && setup_args+=("--load-loopback")
-          [[ "${PERSIST_LOOPBACK}" -eq 1 ]] && setup_args+=("--persist-loopback")
-        fi
-        [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && setup_args+=("--vulkan-runtime")
-        [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && setup_args+=("--mesa-vulkan")
-        [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && setup_args+=("--shader-tools")
-        [[ "${YES}" -eq 1 ]] && setup_args+=("--yes")
-        add_plan_command "${plan_source_dir}/scripts/setup.sh" "${setup_args[@]}"
-      fi
-      local -a cmake_configure_args=(-S "${plan_source_dir}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE}")
-      if [[ "${OPEN_BACKENDS}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
-        cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON)
-      fi
-      if [[ "${OPEN_VULKAN}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
-        cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON)
-      fi
-      add_plan_command cmake "${cmake_configure_args[@]}"
-      add_plan_command cmake --build "${BUILD_DIR}" --target "${BUILD_TARGETS[@]}"
-      local -a install_args=("user-service" "--build-dir" "${BUILD_DIR}" "--yes")
-      [[ "${WITH_SERVICE}" -ne 1 ]] && install_args+=("--link-bins-only")
-      add_plan_command "${plan_source_dir}/scripts/install.sh" "${install_args[@]}"
-      if [[ "${WITH_MODELS}" -eq 1 ]]; then
-        local -a audio_model_args=("open-audio-models")
-        local audio_model_id
-        for audio_model_id in "${DEFAULT_OPEN_AUDIO_MODEL_IDS[@]}"; do
-          audio_model_args+=("--model" "${audio_model_id}")
-        done
-        add_plan_command "${plan_source_dir}/scripts/install.sh" "${audio_model_args[@]}"
-
-        local -a video_model_args=("open-video-models")
-        local video_model_id
-        for video_model_id in "${DEFAULT_OPEN_VIDEO_MODEL_IDS[@]}"; do
-          video_model_args+=("--model" "${video_model_id}")
-        done
-        add_plan_command "${plan_source_dir}/scripts/install.sh" "${video_model_args[@]}"
-      fi
-      ;;
-    uninstall)
-      add_plan_command "${REPO_ROOT}/scripts/uninstall.sh" --yes
-      ;;
-    advanced)
-      add_plan_command "${BACKEND_PATH}" plan install --dry-run
-      add_plan_command "${BACKEND_PATH}" install --dry-run
-      ;;
-  esac
-}
-
-print_plan_human() {
-  plan_workflow
-  echo "Workflow: ${WORKFLOW}"
-  echo
-  echo "Summary:"
-  printf '  - %s\n' "${PLAN_SUMMARY[@]}"
-  echo
-  echo "Changes:"
-  printf '  - %s\n' "${PLAN_CHANGES[@]}"
-  if [[ "${#PLAN_PRIVILEGED[@]}" -gt 0 ]]; then
-    echo
-    echo "Privileged operations:"
-    printf '  - %s\n' "${PLAN_PRIVILEGED[@]}"
-  fi
-  if [[ "${#PLAN_PRESERVED[@]}" -gt 0 ]]; then
-    echo
-    echo "Preserved:"
-    printf '  - %s\n' "${PLAN_PRESERVED[@]}"
-  fi
-  if [[ "${#PLAN_REMOVED[@]}" -gt 0 ]]; then
-    echo
-    echo "Removed:"
-    printf '  - %s\n' "${PLAN_REMOVED[@]}"
-  fi
-  echo
-  echo "Commands:"
-  printf '  %s\n' "${PLAN_COMMANDS[@]}"
-}
-
-print_plan_json() {
-  plan_workflow
-  printf '{'
-  printf '"workflow":'; json_string "${WORKFLOW}"; printf ','
-  printf '"supported":'; json_bool "${OS_SUPPORTED}"; printf ','
-  printf '"support_reason":'; json_string "${OS_SUPPORT_REASON}"; printf ','
-  printf '"summary":'; json_string_array "${PLAN_SUMMARY[@]}"; printf ','
-  printf '"changes":'; json_string_array "${PLAN_CHANGES[@]}"; printf ','
-  printf '"privileged_operations":'; json_string_array "${PLAN_PRIVILEGED[@]}"; printf ','
-  printf '"preserved":'; json_string_array "${PLAN_PRESERVED[@]}"; printf ','
-  printf '"removed":'; json_string_array "${PLAN_REMOVED[@]}"; printf ','
-  printf '"commands":'; json_string_array "${PLAN_COMMANDS[@]}"
-  printf '}\n'
-}
-
-ensure_supported_os() {
-  read_os_release
-  if [[ "${OS_SUPPORTED}" -ne 1 && "${ALLOW_UNSUPPORTED}" -ne 1 ]]; then
-    cat >&2 <<EOF
-[installer] Unsupported OS for the GUI installer backend.
-[installer] Detected: ${OS_PRETTY_NAME:-unknown}
-[installer] ID=${OS_ID:-unknown} VERSION_ID=${OS_VERSION_ID:-unknown} VERSION_CODENAME=${OS_VERSION_CODENAME:-unknown} UBUNTU_CODENAME=${OS_UBUNTU_CODENAME:-unknown} ID_LIKE=${OS_ID_LIKE:-unknown}
-[installer] Reason: ${OS_SUPPORT_REASON}
-[installer] Manual source-build instructions: docs/SETUP.md
-[installer] To proceed anyway: --allow-unsupported
-EOF
-    exit 2
-  fi
-}
-
-find_extracted_source_root() {
-  local root="$1"
-  if [[ -f "${root}/CMakeLists.txt" && -f "${root}/VERSION" ]]; then
-    printf '%s\n' "${root}"
-    return 0
-  fi
-  local found
-  found="$(find "${root}" -maxdepth 3 -type f -name CMakeLists.txt -print | head -n 1 || true)"
-  if [[ -n "${found}" && -f "$(dirname "${found}")/VERSION" ]]; then
-    dirname "${found}"
-    return 0
-  fi
-  return 1
-}
-
-prepare_source() {
-  if [[ -n "${RELEASE_ARCHIVE}" ]]; then
-    local stamp archive_base extract_root
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    archive_base="$(basename "${RELEASE_ARCHIVE}")"
-    archive_base="${archive_base//[^A-Za-z0-9._-]/_}"
-    extract_root="${APP_CACHE_DIR}/sources/${stamp}-${archive_base}"
-    PREPARED_ARCHIVE_SOURCE_DIR="${extract_root}"
-
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "Would extract release archive: ${RELEASE_ARCHIVE} -> ${extract_root}"
-      EFFECTIVE_SOURCE_DIR="${extract_root}"
-      return 0
-    fi
-
-    mkdir -p "${extract_root}"
-    case "${RELEASE_ARCHIVE}" in
-      *.zip)
-        have_cmd unzip || die "unzip is required to extract ${RELEASE_ARCHIVE}"
-        unzip -q "${RELEASE_ARCHIVE}" -d "${extract_root}"
-        ;;
-      *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2)
-        have_cmd tar || die "tar is required to extract ${RELEASE_ARCHIVE}"
-        tar -xf "${RELEASE_ARCHIVE}" -C "${extract_root}"
-        ;;
-      *)
-        die "Unsupported release archive type: ${RELEASE_ARCHIVE}"
-        ;;
-    esac
-
-    EFFECTIVE_SOURCE_DIR="$(find_extracted_source_root "${extract_root}")" ||
-      die "Could not find StudioCast source root inside ${RELEASE_ARCHIVE}"
-  else
-    EFFECTIVE_SOURCE_DIR="${SOURCE_DIR}"
-  fi
-
-  [[ -f "${EFFECTIVE_SOURCE_DIR}/CMakeLists.txt" ]] || die "Source dir missing CMakeLists.txt: ${EFFECTIVE_SOURCE_DIR}"
-  [[ -f "${EFFECTIVE_SOURCE_DIR}/VERSION" ]] || die "Source dir missing VERSION: ${EFFECTIVE_SOURCE_DIR}"
-  [[ -x "${EFFECTIVE_SOURCE_DIR}/scripts/setup.sh" ]] || die "Source dir missing executable scripts/setup.sh: ${EFFECTIVE_SOURCE_DIR}"
-  [[ -x "${EFFECTIVE_SOURCE_DIR}/scripts/install.sh" ]] || die "Source dir missing executable scripts/install.sh: ${EFFECTIVE_SOURCE_DIR}"
-}
-
-run_setup_deps() {
-  if [[ "${WITH_DEPS}" -ne 1 && "${WITH_VULKAN_RUNTIME}" -ne 1 && "${WITH_SHADER_TOOLS}" -ne 1 ]]; then
-    return 0
-  fi
-  local -a args=()
-  [[ "${WITH_DEPS}" -eq 1 ]] && args+=("--deps")
-  if [[ "${WITH_V4L2}" -eq 1 ]]; then
-    args+=("--v4l2loopback")
-    [[ "${LOAD_LOOPBACK}" -eq 1 ]] && args+=("--load-loopback")
-    [[ "${PERSIST_LOOPBACK}" -eq 1 ]] && args+=("--persist-loopback")
-  fi
-  [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && args+=("--vulkan-runtime")
-  [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && args+=("--mesa-vulkan")
-  [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && args+=("--shader-tools")
-  [[ "${YES}" -eq 1 ]] && args+=("--yes")
-  log "Installing/checking selected dependencies through scripts/setup.sh"
-  run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/setup.sh" "${args[@]}"
-}
-
-configure_build() {
-  if [[ "${FRESH_BUILD}" -eq 1 && -e "${BUILD_DIR}" ]]; then
-    case "${BUILD_DIR}" in
-      "${HOME_DIR}/"*|"${APP_CACHE_DIR}"/*|"${EFFECTIVE_SOURCE_DIR}/build"|\
-      "${EFFECTIVE_SOURCE_DIR}/cmake-build-debug"|"${EFFECTIVE_SOURCE_DIR}/cmake-build-release")
-        log "Removing build directory for fresh build: ${BUILD_DIR}"
-        run_cmd rm -rf -- "${BUILD_DIR}"
-        ;;
-      *)
-        die "Refusing to remove non-user/non-standard build dir for --fresh-build: ${BUILD_DIR}"
-        ;;
-    esac
-  fi
-
-  log "Configuring CMake build: ${BUILD_DIR}"
-  run_cmd mkdir -p -- "$(dirname "${BUILD_DIR}")"
-  local -a cmake_configure_args=(-S "${EFFECTIVE_SOURCE_DIR}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE}")
-  if [[ "${OPEN_BACKENDS}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
-    cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON)
-  fi
-  if [[ "${OPEN_VULKAN}" -eq 1 && "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
-    cmake_configure_args+=(-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON)
-  fi
-  run_cmd cmake "${cmake_configure_args[@]}"
-}
-
-build_studiocast() {
-  log "Building StudioCast targets"
-  run_cmd cmake --build "${BUILD_DIR}" --target "${BUILD_TARGETS[@]}"
-}
-
-install_binaries_and_service() {
-  local -a args=("user-service" "--build-dir" "${BUILD_DIR}" "--yes")
-  if [[ "${WITH_SERVICE}" -ne 1 ]]; then
-    args+=("--link-bins-only")
-  fi
-  log "Installing StudioCast binaries$([[ "${WITH_SERVICE}" -eq 1 ]] && echo " and user service" || echo "")"
-  run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/install.sh" "${args[@]}"
-}
-
-install_models_if_requested() {
-  [[ "${WITH_MODELS}" -eq 1 ]] || return 0
-  log "Installing default Open Audio and Open Video model packs"
-
-  local -a audio_args=("open-audio-models")
-  local audio_model_id
-  for audio_model_id in "${DEFAULT_OPEN_AUDIO_MODEL_IDS[@]}"; do
-    audio_args+=("--model" "${audio_model_id}")
-  done
-
-  local -a video_args=("open-video-models")
-  local video_model_id
-  for video_model_id in "${DEFAULT_OPEN_VIDEO_MODEL_IDS[@]}"; do
-    video_args+=("--model" "${video_model_id}")
-  done
-
-  run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/install.sh" "${audio_args[@]}"
-  run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/install.sh" "${video_args[@]}"
-}
-
-configure_daemon_defaults() {
-  local conf="${APP_CONFIG_DIR}/daemon.conf"
-  log "Ensuring daemon CPU resize fallback is enabled by default"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    print_cmd mkdir -p -- "${APP_CONFIG_DIR}"
-    printf '+ ensure-daemon-config %q %q\n' "${conf}" "video.scaling.allow_cpu_resize=true"
-    return 0
-  fi
-
-  mkdir -p -- "${APP_CONFIG_DIR}"
-  if [[ ! -f "${conf}" ]]; then
-    {
-      printf '# StudioCast daemon (studiocastd) configuration\n'
-      printf '# This file is managed by the StudioCast GUI / studiocastctl.\n\n'
-      printf 'video.scaling.allow_cpu_resize = true\n'
-    } > "${conf}"
-    return 0
-  fi
-
-  local tmp="${conf}.tmp"
-  awk '
-    BEGIN { done = 0 }
-    /^[[:space:]]*video[.]scaling[.]allow_cpu_resize[[:space:]]*=/ {
-      print "video.scaling.allow_cpu_resize = true"
-      done = 1
-      next
+class BackendError(Exception):
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code, self.message, self.details = code, message, details or {}
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise BackendError("json.duplicate_key", f"Duplicate JSON key: {key}")
+        out[key] = value
+    return out
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle, object_pairs_hook=reject_duplicates)
+    except BackendError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise BackendError("json.corrupt", f"Invalid JSON in {path}: {exc}") from exc
+    except OSError as exc:
+        raise BackendError("file.read_failed", f"Could not read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BackendError("json.type", f"Expected a JSON object in {path}")
+    return value
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def atomic_write(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+            handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+        dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def roots() -> dict[str, Path]:
+    home_text = os.environ.get("HOME")
+    if not home_text:
+        raise BackendError("path.home.unset", "HOME is not set")
+    home = Path(home_text).absolute()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")).absolute()
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")).absolute()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")).absolute()
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache")).absolute()
+    return {
+        "home": home, "data": data_home / "studiocast", "config": config_home / "studiocast",
+        "state": state_home / "studiocast", "cache": cache_home / "studiocast",
+        "bin": home / ".local/bin", "systemd": config_home / "systemd/user",
     }
-    { print }
-    END {
-      if (!done) {
-        print ""
-        print "video.scaling.allow_cpu_resize = true"
-      }
+
+
+def is_beneath(path: Path, root: Path, allow_root: bool = False) -> bool:
+    try:
+        rel = path.absolute().relative_to(root.absolute())
+    except ValueError:
+        return False
+    return allow_root or bool(rel.parts)
+
+
+def validate_mutation_path(path: Path, allowed_roots: list[Path], allow_root: bool = False) -> None:
+    if not path.is_absolute() or ".." in path.parts or str(path) == "/":
+        raise BackendError("path.unsafe", f"Unsafe mutation path: {path}")
+    if not any(is_beneath(path, root, allow_root) for root in allowed_roots):
+        raise BackendError("path.outside_allowed_root", f"Path is outside StudioCast roots: {path}")
+    current = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        current /= component
+        if current.is_symlink():
+            raise BackendError("path.symlink_parent", f"Symlink parent rejected: {current}")
+
+
+def safe_remove(path: Path, allowed_roots: list[Path], *, allow_root: bool = False) -> None:
+    validate_mutation_path(path, allowed_roots, allow_root)
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def read_version(source: Path | None) -> str:
+    if source:
+        try:
+            value = (source / "VERSION").read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "unknown"
+
+
+def semver_tuple(value: str | None) -> tuple[int, int, int, tuple[Any, ...]] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?", value)
+    if not match:
+        return None
+    pre: tuple[Any, ...] = ()
+    if match.group(4):
+        pre = tuple(int(x) if x.isdigit() else x for x in match.group(4).split("."))
+    else:
+        pre = (float("inf"),)
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), pre
+
+
+def version_relation(active: str | None, target: str | None) -> str:
+    if not active:
+        return "not_installed"
+    a, b = semver_tuple(active), semver_tuple(target)
+    if not a or not b:
+        return "unknown"
+    if a == b:
+        return "same"
+    return "upgrade" if a < b else "installed_newer"
+
+
+def parse_os_release() -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def os_facts() -> dict[str, Any]:
+    values = parse_os_release()
+    os_id, version = values.get("ID", "unknown"), values.get("VERSION_ID", "")
+    codename = values.get("UBUNTU_CODENAME") or values.get("VERSION_CODENAME", "")
+    base_id, base_version = os_id, version
+    if os_id == "linuxmint" or "ubuntu" in values.get("ID_LIKE", "").split():
+        base_id = "ubuntu"
+        base_version = {"jammy": "22.04", "noble": "24.04"}.get(codename, "")
+        if os_id == "linuxmint" and not base_version:
+            base_version = "22.04" if version.startswith("21") else "24.04" if version.startswith("22") else ""
+    supported = base_id == "ubuntu" and base_version in {"22.04", "24.04"} and platform.machine() in {"x86_64", "amd64"}
+    code = ("os.supported.ubuntu_jammy" if base_version == "22.04" else
+            "os.supported.ubuntu_noble" if base_version == "24.04" else
+            "arch.unsupported.machine" if platform.machine() not in {"x86_64", "amd64"} else
+            "os.unsupported.distribution")
+    return {"id": os_id, "version_id": version, "base_id": base_id,
+            "base_version_id": base_version, "architecture": platform.machine(),
+            "kernel_release": platform.release(), "supported": supported, "reason_codes": [code]}
+
+
+def manifest_state(path: Path) -> tuple[str, dict[str, Any] | None, list[str]]:
+    if not path.exists():
+        return "absent", None, ["install.manifest.absent"]
+    try:
+        value = load_json(path)
+    except BackendError as exc:
+        return "unhealthy", None, ["install.manifest.corrupt", exc.code]
+    schema = value.get("schema_version")
+    if schema not in {1, 2}:
+        return "unknown_schema", value, ["install.manifest.unknown_schema"]
+    if schema == 1:
+        if value.get("state") == "uninstalled":
+            return "tombstone", value, ["install.manifest.healthy", "install.state.tombstone"]
+        return "partial", value, ["install.manifest.legacy_v1"]
+    tx_state = value.get("transaction", {}).get("state")
+    if tx_state == "uninstalled":
+        return "tombstone", value, ["install.manifest.healthy", "install.state.tombstone"]
+    active = value.get("payloads", {}).get("active")
+    if tx_state == "degraded" and active:
+        return "partial", value, ["install.manifest.healthy", "install.state.degraded"]
+    if not active:
+        return "partial", value, ["install.payload.missing"]
+    active_path = Path(active.get("path", ""))
+    if not active_path.is_dir():
+        return "stale", value, ["install.payload.missing"]
+    return "healthy", value, ["install.manifest.healthy", "install.payload.healthy"]
+
+
+def helper_facts() -> dict[str, Any]:
+    result = {"path": str(HELPER_PATH), "present": False, "trusted": False,
+              "compatible": False, "reason_codes": ["privileged_helper_missing"]}
+    try:
+        info = HELPER_PATH.lstat()
+        result["present"] = True
+        trusted = stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not (info.st_mode & 0o022)
+        result["trusted"] = trusted
+        result["compatible"] = trusted
+        result["reason_codes"] = ["privileged_helper_usable" if trusted else "privileged_helper_untrusted"]
+    except OSError:
+        pass
+    return result
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def host_analyze(target_version: str | None) -> dict[str, Any]:
+    r = roots()
+    classification, manifest, install_reasons = manifest_state(r["data"] / "install-manifest.json")
+    active = None
+    previous = None
+    desired = None
+    if manifest:
+        if manifest.get("schema_version") == 2:
+            active = manifest.get("versions", {}).get("active")
+            previous = manifest.get("versions", {}).get("previous")
+            desired = manifest.get("desired_configuration")
+        else:
+            active = manifest.get("installed_version")
+    try:
+        disk = shutil.disk_usage(r["cache"]).free
+    except OSError:
+        try:
+            disk = shutil.disk_usage(r["home"]).free
+        except OSError:
+            disk = 0
+    gpu_devices: list[dict[str, Any]] = []
+    try:
+        for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+            vendor = (card / "device/vendor").read_text().strip()
+            device = (card / "device/device").read_text().strip()
+            gpu_devices.append({"id": card.name, "vendor_id": vendor, "device_id": device})
+    except OSError:
+        pass
+    nvidia_driver = command_exists("nvidia-smi")
+    # Loader presence is intentionally not promoted to device usability.  A full
+    # compute/device probe is supplied by daemon facts or fixtures.
+    vulkan_loader = command_exists("vulkaninfo") or any(Path(p).exists() for p in (
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/lib/x86_64-linux-gnu/libvulkan.so.1"))
+    module_available = Path("/sys/module/v4l2loopback").exists()
+    device_present = Path("/dev/video10").exists()
+    headers = Path(f"/lib/modules/{platform.release()}/build").exists()
+    secure_boot = "unknown"
+    try:
+        values = list(Path("/sys/firmware/efi/efivars").glob("SecureBoot-*"))
+        if values:
+            secure_boot = "enabled" if values[0].read_bytes()[-1:] == b"\x01" else "disabled"
+    except OSError:
+        pass
+    systemd_present = command_exists("systemctl")
+    systemd_usable = False
+    systemd_reason = "service.user_manager.unavailable"
+    if systemd_present:
+        try:
+            probe = subprocess.run(["systemctl", "--user", "show-environment"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=2, check=False)
+            systemd_usable = probe.returncode == 0
+            systemd_reason = "service.user_manager.usable" if systemd_usable else "service.user_manager.unreachable"
+        except (OSError, subprocess.TimeoutExpired):
+            systemd_reason = "service.user_manager.unreachable"
+    model_packs: dict[str, Any] = {}
+    for pack, artifacts in MODEL_ARTIFACTS.items():
+        matches = list((r["data"] / "models").rglob(pack)) if (r["data"] / "models").is_dir() else []
+        verified = any(all((root / artifact).is_file() for artifact in artifacts) for root in matches)
+        model_packs[pack] = {"integrity": "verified" if verified else "absent",
+                             "reason_codes": [f"model.{pack}.{'verified' if verified else 'absent'}"]}
+    result = {
+        "schema_version": 1, "facts_version": FACTS_VERSION, "captured_at": utc_now(),
+        "os": os_facts(),
+        "installation": {"classification": classification, "reason_codes": install_reasons,
+            "manifest": {"exists": manifest is not None, "health": classification,
+                         "schema_version": manifest.get("schema_version") if manifest else None},
+            "active_version": active, "previous_version": previous, "target_version": target_version,
+            "version_relation": version_relation(active, target_version),
+            "desired_configuration": desired, "payloads": []},
+        "paths": {"data_root": {"path": str(r["data"]), "writable": os.access(r["data"].parent, os.W_OK)},
+            "cache_root": {"path": str(r["cache"]), "writable": os.access(r["cache"].parent, os.W_OK)},
+            "config_root": {"path": str(r["config"]), "writable": os.access(r["config"].parent, os.W_OK)},
+            "free_bytes": disk, "required_bytes": {"download": 0, "build": 4_000_000_000, "staging": 1_000_000_000}},
+        "toolchain": {"tools": {name: command_exists(name) for name in ("cmake", "ninja", "c++", "pkg-config")},
+            "build_dependencies": ["cmake", "ninja", "c++", "pkg-config"],
+            "missing_build_dependencies": [name for name in ("cmake", "ninja", "c++", "pkg-config") if not command_exists(name)],
+            "reason_codes": []},
+        "runtime": {"dependencies": {}, "onnxruntime": {"present": False, "compatible": False,
+            "providers": {"cpu": False, "cuda": False}, "probe": "not_run", "reason_codes": ["runtime.ort.unknown"]}},
+        "systemd_user": {"systemctl_present": systemd_present, "manager_usable": systemd_usable,
+            "reason_codes": [systemd_reason]},
+        "v4l2": {"package_state": "unknown", "module_available": module_available,
+            "module_loaded": module_available, "device_present": device_present, "device_number": 10,
+            "device_number_conflict": False, "persistence_state": "unknown",
+            "kernel_headers_usable": headers, "dkms_viable": headers, "secure_boot": secure_boot,
+            "reason_codes": ["v4l.device.present" if device_present else "v4l.device.absent"]},
+        "privileged_helper": helper_facts(),
+        "gpus": {"devices": gpu_devices, "nvidia": {"driver_usable": nvidia_driver,
+            "cuda_usable": False, "reason_codes": ["gpu.cuda.not_probed"]},
+            "vulkan": {"loader_present": vulkan_loader, "physical_devices": [],
+                "compute_device_usable": False, "reason_codes": ["gpu.vulkan.device_not_probed"]}},
+        "maxine": {"components": {name: {"present": False, "usable": False} for name in ("video_fx", "ar", "audio_fx")},
+            "effects": {}, "reason_codes": ["maxine.sdk.not_probed"]},
+        "effects": {"capabilities": {}},
+        "models": {"packs": model_packs, "default_pack_ids": list(DEFAULT_MODEL_PACKS)},
+        "cache": {"release_artifacts": {}, "model_artifacts": {}},
+        "connectivity": {"release_source": {"state": "not_probed", "reason_codes": ["network.release.not_probed"]},
+            "model_source": {"state": "not_probed", "reason_codes": ["network.models.not_probed"]}},
+        "reason_codes": [],
     }
-  ' "${conf}" > "${tmp}"
-  mv -- "${tmp}" "${conf}"
-}
+    stable = copy.deepcopy(result)
+    stable.pop("captured_at", None)
+    result["host_fingerprint"] = digest(stable)
+    return result
 
-write_manifest() {
-  local state="$1"
-  local version="$2"
-  local dependency_method=""
-  [[ "${WITH_DEPS}" -eq 1 ]] && dependency_method="scripts/setup.sh --deps"
-  [[ "${WITH_V4L2}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }v4l2loopback"
-  [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }optional Vulkan runtime"
-  [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }Mesa Intel/AMD Vulkan ICDs"
-  [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }Vulkan shader tools"
-  [[ -n "${dependency_method}" ]] || dependency_method="skipped"
 
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "Would write manifest: ${MANIFEST_PATH}"
-    return 0
-  fi
+def normalize_fixture(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("schema_version") != 1 or value.get("facts_version", FACTS_VERSION) != FACTS_VERSION:
+        raise BackendError("facts.unsupported_schema", "Fixture is not installer facts v1")
+    out = copy.deepcopy(value)
+    out.setdefault("facts_version", FACTS_VERSION)
+    out.setdefault("captured_at", "fixture")
+    stable = copy.deepcopy(out)
+    stable.pop("host_fingerprint", None)
+    stable.pop("captured_at", None)
+    out["host_fingerprint"] = digest(stable)
+    return out
 
-  mkdir -p "${APP_DATA_DIR}"
-  local tmp="${MANIFEST_PATH}.tmp"
-  local timestamp active enabled
-  timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  active="$(service_state_value is-active)"
-  enabled="$(service_state_value is-enabled)"
 
-  {
-    printf '{\n'
-    printf '  "schema_version": 1,\n'
-    printf '  "state": '; json_string "${state}"; printf ',\n'
-    printf '  "installed_version": '; json_string "${version}"; printf ',\n'
-    printf '  "source_path": '; json_string "${EFFECTIVE_SOURCE_DIR:-${SOURCE_DIR}}"; printf ',\n'
-    printf '  "build_path": '; json_string "${BUILD_DIR}"; printf ',\n'
-    printf '  "install_paths": {\n'
-    printf '    "local_bin_dir": '; json_string "${LOCAL_BIN_DIR}"; printf ',\n'
-    printf '    "manifest_path": '; json_string "${MANIFEST_PATH}"; printf ',\n'
-    printf '    "service_path": '; json_string "${SERVICE_PATH}"; printf '\n'
-    printf '  },\n'
-    printf '  "binaries": [\n'
-    local first=1 b path
-    for b in "${BINARIES[@]}"; do
-      path="${LOCAL_BIN_DIR}/${b}"
-      if [[ "${first}" -eq 0 ]]; then
-        printf ',\n'
-      fi
-      first=0
-      printf '    {"name": '; json_string "${b}"; printf ', "path": '; json_string "${path}"; printf ', "exists": '; json_bool "$([[ -e "${path}" || -L "${path}" ]] && echo 1 || echo 0)"; printf '}'
-    done
-    printf '\n  ],\n'
-    printf '  "user_service": {\n'
-    printf '    "name": '; json_string "${SERVICE_NAME}"; printf ',\n'
-    printf '    "path": '; json_string "${SERVICE_PATH}"; printf ',\n'
-    printf '    "installed": '; json_bool "$([[ -f "${SERVICE_PATH}" ]] && echo 1 || echo 0)"; printf ',\n'
-    printf '    "active": '; json_string "${active}"; printf ',\n'
-    printf '    "enabled": '; json_string "${enabled}"; printf '\n'
-    printf '  },\n'
-    printf '  "dependency_install_method": '; json_string "${dependency_method}"; printf ',\n'
-    printf '  "installed_at": '; json_string "${timestamp}"; printf ',\n'
-    printf '  "user_data": {\n'
-    printf '    "config_preserved": '; json_bool "$([[ "${REMOVE_USER_DATA}" -eq 0 ]] && echo 1 || echo 0)"; printf ',\n'
-    printf '    "models_preserved": '; json_bool "$([[ "${REMOVE_USER_DATA}" -eq 0 ]] && echo 1 || echo 0)"; printf ',\n'
-    printf '    "logs_preserved": '; json_bool "$([[ "${REMOVE_USER_DATA}" -eq 0 ]] && echo 1 || echo 0)"; printf ',\n'
-    printf '    "cache_preserved": '; json_bool "$([[ "${REMOVE_USER_DATA}" -eq 0 ]] && echo 1 || echo 0)"; printf '\n'
-    printf '  }\n'
-    printf '}\n'
-  } > "${tmp}"
-  mv -- "${tmp}" "${MANIFEST_PATH}"
-}
+def route_for(facts: dict[str, Any]) -> tuple[str, str]:
+    if not facts.get("os", {}).get("supported", False):
+        return "unsupported", "manual_instructions"
+    classification = facts.get("installation", {}).get("classification", "absent")
+    connectivity = facts.get("connectivity", {}).get("release_source", {}).get("state")
+    cache = facts.get("cache", {}).get("release_artifacts", {})
+    if connectivity == "offline" and not any(v.get("verified") for v in cache.values() if isinstance(v, dict)):
+        return "offline", "stop"
+    relation = facts.get("installation", {}).get("version_relation")
+    if classification == "absent":
+        return "recommended", "install"
+    if classification == "healthy":
+        if relation == "upgrade":
+            return "recommended", "update"
+        if relation == "installed_newer":
+            return "current_newer", "keep"
+        return "modify", "modify"
+    if classification in {"partial", "unhealthy", "stale", "unknown_schema"}:
+        return "repair", "repair"
+    if classification == "tombstone":
+        return "repair", "reconstruct"
+    return "repair", "repair"
 
-remove_user_data_dirs() {
-  [[ "${REMOVE_USER_DATA}" -eq 1 ]] || return 0
-  log "Removing StudioCast user data/config/state/cache"
-  local p
-  for p in "${APP_CONFIG_DIR}" "${APP_DATA_DIR}" "${APP_STATE_DIR}" "${APP_CACHE_DIR}"; do
-    [[ -n "${p}" && "${p}" != "/" ]] || die "Refusing to remove unsafe path: ${p}"
-    if [[ -e "${p}" || -L "${p}" ]]; then
-      run_cmd rm -rf -- "${p}"
-    fi
-  done
-}
 
-run_uninstall_workflow() {
-  local previous_version
-  previous_version="$(manifest_field installed_version 2>/dev/null || true)"
-  log "Uninstalling StudioCast app files"
-  run_cmd "${REPO_ROOT}/scripts/uninstall.sh" --yes
-  remove_user_data_dirs
+def capability_usable(value: Any) -> bool:
+    return value is True or value in {"usable", "production_usable"}
 
-  if [[ "${REMOVE_USER_DATA}" -eq 0 ]]; then
-    EFFECTIVE_SOURCE_DIR="$(manifest_field source_path 2>/dev/null || printf '%s' "${SOURCE_DIR}")"
-    write_manifest "uninstalled" "${previous_version:-unknown}"
-  fi
-}
 
-run_install_like_workflow() {
-  ensure_supported_os
-  prepare_source
-  run_setup_deps
-  configure_build
-  build_studiocast
-  configure_daemon_defaults
-  install_binaries_and_service
-  install_models_if_requested
+def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
+              policy_version: str = POLICY_VERSION, route: str = "recommended") -> dict[str, Any]:
+    if facts.get("schema_version") != 1 or facts.get("facts_version") != FACTS_VERSION:
+        raise BackendError("facts.unsupported_schema", "Recommendation requires facts v1")
+    if policy_version != POLICY_VERSION:
+        raise BackendError("policy.unsupported", f"Unsupported policy: {policy_version}")
+    detected_route, primary = route_for(facts)
+    prior = copy.deepcopy(prior or facts.get("installation", {}).get("desired_configuration") or {})
+    selections: dict[str, Any] = {
+        "scope": "user", "source": {"kind": "official_release", "verified_required": True},
+        "build_type": prior.get("build_type", "Release"),
+        "service": copy.deepcopy(prior.get("service", {"desired": "enabled_started" if facts.get("systemd_user", {}).get("manager_usable") else "disabled"})),
+        "virtual_camera": copy.deepcopy(prior.get("v4l", {"desired": True, "required_for_success": route == "recommended", "device_number": 10,
+            "label": "StudioCast Camera", "exclusive_caps": True, "persist": True})),
+        "model_pack_ids": list(prior.get("model_pack_ids", DEFAULT_MODEL_PACKS)),
+        "effects": {}, "features": copy.deepcopy(prior.get("features", {})),
+        "shader_tools": False, "mesa_packages": False, "preserve_settings": prior.get("preserve_settings", True),
+    }
+    if route == "recommended":
+        selections["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
+        selections["virtual_camera"].update({"desired": True, "required_for_success": True})
+    for effect, matrix in sorted(facts.get("effects", {}).get("capabilities", {}).items()):
+        selected = "unavailable"
+        for engine in ("maxine", "cuda", "vulkan", "cpu"):
+            # v0.2.9 Vulkan has no production-recommendable canonical effect.
+            if engine == "vulkan" and route == "recommended":
+                continue
+            if capability_usable(matrix.get(engine)):
+                selected = engine
+                break
+        selections["effects"][effect] = {"engine_precedence": ["maxine", "cuda", "vulkan", "cpu"], "selected": selected}
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    if not facts.get("os", {}).get("supported", False):
+        blockers.append({"code": "os.unsupported.automatic_changes_blocked", "applies_to": "installation"})
+    free = facts.get("paths", {}).get("free_bytes", 0)
+    required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
+    if free < required:
+        blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths"})
+    if detected_route == "offline":
+        blockers.append({"code": "network.release.offline_no_verified_cache", "applies_to": "source"})
+    camera = selections["virtual_camera"]
+    if camera.get("desired"):
+        v4l = facts.get("v4l2", {})
+        if v4l.get("device_number_conflict"):
+            blockers.append({"code": "v4l.number.conflict", "applies_to": "virtual_camera"})
+        if (not v4l.get("kernel_headers_usable", True) or not v4l.get("dkms_viable", True)) and not v4l.get("module_available"):
+            blockers.append({"code": "v4l.dkms.not_viable", "applies_to": "virtual_camera"})
+        needs_change = not (v4l.get("device_present") and v4l.get("module_loaded") and (not camera.get("persist") or v4l.get("persistence_state") == "configured"))
+        if needs_change and not facts.get("privileged_helper", {}).get("trusted", False):
+            blockers.append({"code": "privileged_helper_missing", "applies_to": "virtual_camera"})
+    else:
+        warnings.append({"code": "install.degraded.no_virtual_camera", "applies_to": "virtual_camera"})
+    reasons = [
+        {"code": "scope.user_local.required", "applies_to": "scope"},
+        {"code": "source.official.required", "applies_to": "source"},
+        {"code": "models.open_fallbacks.default", "applies_to": "models"},
+        {"code": "effects.precedence.per_effect", "applies_to": "effects"},
+    ]
+    return {"schema_version": 1, "recommendation_version": RECOMMENDATION_VERSION,
+        "policy_version": policy_version, "facts_fingerprint": facts["host_fingerprint"],
+        "intent": intent, "route": detected_route if route == "recommended" else route,
+        "primary_action": primary, "selections": selections,
+        "reasons": reasons, "blockers": blockers, "warnings": warnings,
+        "alternatives": [{"code": "route.custom", "action": "customize"}]}
 
-  local version state
-  version="$(project_version_from "${EFFECTIVE_SOURCE_DIR}")"
-  state="${WORKFLOW}"
-  [[ "${state}" == "install" ]] && state="installed"
-  [[ "${state}" == "clean-install" ]] && state="clean-installed"
-  write_manifest "${state}" "${version}"
-}
 
-run_workflow() {
-  case "${WORKFLOW}" in
-    install|update)
-      run_install_like_workflow
-      ;;
-    repair)
-      if [[ "${SOURCE_EXPLICIT}" -eq 0 && -z "${RELEASE_ARCHIVE}" ]]; then
-        local manifest_source
-        manifest_source="$(manifest_field source_path 2>/dev/null || true)"
-        if [[ -n "${manifest_source}" && -d "${manifest_source}" ]]; then
-          SOURCE_DIR="${manifest_source}"
-        fi
-      fi
-      if [[ "${BUILD_EXPLICIT}" -eq 0 ]]; then
-        local manifest_build
-        manifest_build="$(manifest_field build_path 2>/dev/null || true)"
-        if [[ -n "${manifest_build}" ]]; then
-          BUILD_DIR="${manifest_build}"
-        fi
-      fi
-      run_install_like_workflow
-      ;;
-    uninstall)
-      run_uninstall_workflow
-      ;;
-    clean-install)
-      FRESH_BUILD=1
-      run_uninstall_workflow
-      run_install_like_workflow
-      ;;
-    advanced)
-      print_plan_human
-      ;;
-    *)
-      die "Unknown workflow: ${WORKFLOW}"
-      ;;
-  esac
-}
+def operation(op_id: str, kind: str, depends: list[str], inputs: dict[str, Any],
+              category: str, privilege: str = "user", failure: str = "abort_rollback",
+              source_paths: list[str] | None = None, target_paths: list[str] | None = None) -> dict[str, Any]:
+    return {"id": op_id, "kind": kind, "depends_on": depends, "inputs": inputs,
+        "source_paths": source_paths or [], "target_paths": target_paths or [],
+        "privilege": privilege, "authorization_operation": inputs.get("operation_type") if privilege == "trusted_helper" else None,
+        "reversibility": "reversible" if kind not in {"cleanup"} else "irreversible",
+        "failure_policy": failure, "preconditions": [], "validation": [],
+        "review": {"category": category, "message_code": "plan." + op_id}}
 
-parse_options() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --json) JSON_OUTPUT=1; shift ;;
-      --source-dir)
-        [[ $# -ge 2 ]] || die "--source-dir requires a path"
-        SOURCE_DIR="$(abs_existing_dir "$2")"
-        SOURCE_EXPLICIT=1
-        shift 2
-        ;;
-      --release-archive)
-        [[ $# -ge 2 ]] || die "--release-archive requires a file"
-        RELEASE_ARCHIVE="$(abs_existing_file "$2")"
-        shift 2
-        ;;
-      --build-dir)
-        [[ $# -ge 2 ]] || die "--build-dir requires a path"
-        BUILD_DIR="$(expand_path "$2")"
-        BUILD_EXPLICIT=1
-        shift 2
-        ;;
-      --build-type)
-        [[ $# -ge 2 ]] || die "--build-type requires a value"
-        BUILD_TYPE="$2"
-        shift 2
-        ;;
-      --dry-run) DRY_RUN=1; shift ;;
-      -y|--yes) YES=1; shift ;;
-      --allow-unsupported) ALLOW_UNSUPPORTED=1; shift ;;
-      --with-deps) WITH_DEPS=1; shift ;;
-      --skip-deps) WITH_DEPS=0; shift ;;
-      --v4l2loopback) WITH_V4L2=1; shift ;;
-      --no-v4l2loopback) WITH_V4L2=0; LOAD_LOOPBACK=0; PERSIST_LOOPBACK=0; shift ;;
-      --load-loopback) LOAD_LOOPBACK=1; shift ;;
-      --no-load-loopback) LOAD_LOOPBACK=0; shift ;;
-      --persist-loopback) PERSIST_LOOPBACK=1; shift ;;
-      --no-persist-loopback) PERSIST_LOOPBACK=0; shift ;;
-      --service) WITH_SERVICE=1; shift ;;
-      --no-service) WITH_SERVICE=0; shift ;;
-      --models) WITH_MODELS=1; shift ;;
-      --no-models) WITH_MODELS=0; shift ;;
-      --open-backends) OPEN_BACKENDS=1; shift ;;
-      --no-open-backends) OPEN_BACKENDS=0; shift ;;
-      --open-vulkan) OPEN_VULKAN=1; shift ;;
-      --no-open-vulkan) OPEN_VULKAN=0; shift ;;
-      --vulkan-runtime) WITH_VULKAN_RUNTIME=1; shift ;;
-      --no-vulkan-runtime) WITH_VULKAN_RUNTIME=0; WITH_MESA_VULKAN=0; shift ;;
-      --mesa-vulkan) WITH_VULKAN_RUNTIME=1; WITH_MESA_VULKAN=1; shift ;;
-      --shader-tools) WITH_SHADER_TOOLS=1; shift ;;
-      --fresh-build) FRESH_BUILD=1; shift ;;
-      --no-fresh-build) FRESH_BUILD=0; shift ;;
-      --preserve-user-data) REMOVE_USER_DATA=0; shift ;;
-      --remove-user-data) REMOVE_USER_DATA=1; shift ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        die "Unknown argument: $1"
-        ;;
-    esac
-  done
-}
 
-main() {
-  COMMAND="${1:-help}"
-  shift || true
+def desired_from_args(args: argparse.Namespace, recommendation: dict[str, Any]) -> dict[str, Any]:
+    desired = copy.deepcopy(recommendation["selections"])
+    if getattr(args, "build_type", None): desired["build_type"] = args.build_type
+    if getattr(args, "service", None) is not None: desired["service"] = {"desired": "enabled_started" if args.service else "disabled"}
+    if getattr(args, "v4l2", None) is not None: desired["virtual_camera"]["desired"] = args.v4l2
+    if getattr(args, "open_backends", None) is not None:
+        desired.setdefault("features", {})["open_cuda"] = args.open_backends
+        desired["features"]["open_audio"] = args.open_backends
+    if getattr(args, "open_vulkan", None) is not None: desired.setdefault("features", {})["open_vulkan"] = args.open_vulkan
+    if getattr(args, "models", None) is not None: desired["model_pack_ids"] = list(DEFAULT_MODEL_PACKS) if args.models else []
+    if getattr(args, "vulkan_runtime", False): desired["vulkan_runtime"] = True
+    if getattr(args, "mesa_vulkan", False): desired["mesa_packages"] = True
+    if getattr(args, "shader_tools", False): desired["shader_tools"] = True
+    if getattr(args, "preserve_settings", None) is not None: desired["preserve_settings"] = args.preserve_settings
+    desired.setdefault("features", {}).setdefault("open_cuda", True)
+    desired["features"].setdefault("open_audio", True)
+    desired["features"].setdefault("open_vulkan", False)
+    return desired
 
-  case "${COMMAND}" in
-    help|-h|--help)
-      usage
-      exit 0
-      ;;
-    detect-os|status|manifest)
-      parse_options "$@"
-      ;;
-    plan)
-      WORKFLOW="${1:-install}"
-      if [[ $# -gt 0 && "${1}" != --* ]]; then
-        shift
-      fi
-      parse_options "$@"
-      ;;
-    run)
-      WORKFLOW="${1:-install}"
-      if [[ $# -gt 0 && "${1}" != --* ]]; then
-        shift
-      fi
-      parse_options "$@"
-      ;;
-    install|update|repair|uninstall|clean-install)
-      WORKFLOW="${COMMAND}"
-      COMMAND="run"
-      parse_options "$@"
-      ;;
-    advanced)
-      WORKFLOW="advanced"
-      COMMAND="plan"
-      parse_options "$@"
-      ;;
-    *)
-      die "Unknown command: ${COMMAND}"
-      ;;
-  esac
 
-  if [[ -n "${RELEASE_ARCHIVE}" && "${SOURCE_EXPLICIT}" -eq 1 ]]; then
-    die "Use either --source-dir or --release-archive, not both."
-  fi
+def plan_digest(plan: dict[str, Any]) -> str:
+    unsigned = copy.deepcopy(plan)
+    unsigned.pop("plan_digest", None)
+    unsigned.pop("approval_token", None)
+    return digest(unsigned)
 
-  case "${COMMAND}" in
-    detect-os)
-      if [[ "${JSON_OUTPUT}" -eq 1 ]]; then print_os_json; else print_os_human; fi
-      ;;
-    status)
-      if [[ "${JSON_OUTPUT}" -eq 1 ]]; then print_status_json; else print_status_human; fi
-      ;;
-    manifest)
-      if [[ -f "${MANIFEST_PATH}" ]]; then
-        cat "${MANIFEST_PATH}"
-      else
-        die "Install manifest not found: ${MANIFEST_PATH}"
-      fi
-      ;;
-    plan)
-      if [[ "${JSON_OUTPUT}" -eq 1 ]]; then print_plan_json; else print_plan_human; fi
-      ;;
-    run)
-      run_workflow
-      ;;
-  esac
-}
 
-main "$@"
+def pending_path(plan_id: str) -> Path:
+    return roots()["state"] / "installer/pending-plans" / f"{plan_id}.json"
+
+
+def persist_pending(plan: dict[str, Any]) -> None:
+    atomic_write(pending_path(plan["plan_id"]), {"plan_id": plan["plan_id"], "digest": plan["plan_digest"],
+        "token": plan["approval_token"], "uid": os.getuid(), "expires_at": plan["expires_at"], "used": False})
+
+
+def source_for_plan(args: argparse.Namespace, target: str) -> tuple[str, str]:
+    if getattr(args, "release_archive", None):
+        return "archive", str(Path(args.release_archive).absolute())
+    if getattr(args, "source_dir", None):
+        return "directory", str(Path(args.source_dir).absolute())
+    # Installed AppImages normally pass their verified bundled archive.  The
+    # fallback is useful only to developer CLI callers.
+    repo = Path(__file__).resolve().parents[2]
+    return "directory", str(repo)
+
+
+def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, Any]) -> dict[str, Any]:
+    r = roots()
+    desired = desired_from_args(args, rec)
+    intent = args.workflow
+    target = getattr(args, "target_version", None) or facts.get("installation", {}).get("target_version") or read_version(Path(getattr(args, "source_dir", "")))
+    if target == "unknown": target = facts.get("installation", {}).get("active_version") or "unknown"
+    source_kind, source_path = source_for_plan(args, target)
+    build_cache = Path(getattr(args, "build_dir", "") or r["cache"] / "builds" / target).absolute()
+    payload_root = r["data"] / "payloads"
+    plan_id = str(uuid.uuid4())
+    staging = payload_root / f".staging-{plan_id}"
+    target_payload = payload_root / target
+    current = r["data"] / "current"
+    ops: list[dict[str, Any]] = [operation("preflight.validate", "preflight", [], {}, "validation", "none")]
+    last = "preflight.validate"
+    preservation = {"preserve_settings": bool(desired.get("preserve_settings", True)), "snapshot_path": None}
+    if intent in {"clean-install", "reinstall"}:
+        if preservation["preserve_settings"]:
+            # The clean-install state wipe must not erase its own backup.  Keep
+            # the short-lived copy as a sibling of the StudioCast config root.
+            snapshot = r["config"].parent / f".studiocast-settings-backup-{plan_id}"
+            preservation["snapshot_path"] = str(snapshot)
+            ops.append(operation("settings.snapshot", "settings_snapshot", [last], {"snapshot_path": str(snapshot)}, "preserved_items"))
+            last = "settings.snapshot"
+        for op_id, target_name in (("cleanup.payloads", "payloads"), ("cleanup.service", "service"),
+                ("cleanup.build_cache", "build_cache"), ("cleanup.runtime_state", "runtime_state"),
+                ("cleanup.models", "models")):
+            ops.append(operation(op_id, "cleanup", [last], {"target": target_name}, "removed_items"))
+            last = op_id
+        if not preservation["preserve_settings"]:
+            ops.append(operation("cleanup.settings", "cleanup", [last], {"target": "settings"}, "removed_items"))
+            last = "cleanup.settings"
+        desired["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
+    minimal_repair = intent == "repair" and facts.get("installation", {}).get("classification") == "healthy"
+    if intent == "uninstall":
+        for op_id, target_name in (("service.state.reconcile", "service_state"), ("service.unit.reconcile", "service_unit"),
+                ("links.reconcile", "links"), ("cleanup.payloads", "payloads"), ("cleanup.runtime_state", "runtime_state")):
+            kind = "service_state_reconcile" if target_name == "service_state" else "service_unit_reconcile" if target_name == "service_unit" else "links_reconcile" if target_name == "links" else "cleanup"
+            ops.append(operation(op_id, kind, [last], {"desired": "absent", "target": target_name}, "application_files"))
+            last = op_id
+        if not preservation["preserve_settings"]:
+            for op_id, target_name in (("cleanup.models", "models"), ("cleanup.settings", "settings"), ("cleanup.data", "data")):
+                ops.append(operation(op_id, "cleanup", [last], {"target": target_name}, "removed_items")); last = op_id
+        ops.append(operation("manifest.commit", "uninstall_tombstone", [last], {}, "application_files"))
+    elif minimal_repair:
+        v4l = desired["virtual_camera"]
+        vf = facts.get("v4l2", {})
+        if v4l.get("desired"):
+            helper_args = {"device_number": int(v4l.get("device_number", 10)),
+                           "card_label": str(v4l.get("label", "StudioCast Camera")),
+                           "exclusive_caps": bool(v4l.get("exclusive_caps", True)),
+                           "persist": bool(v4l.get("persist", True))}
+            if not vf.get("module_available"):
+                ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
+            if not vf.get("module_loaded") or not vf.get("device_present"):
+                ops.append(operation("v4l.module.load", "trusted_helper", [last], {"operation_type": "v4l.module.load.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.module.load"
+            if v4l.get("persist") and vf.get("persistence_state") != "configured":
+                ops.append(operation("v4l.persistence.write", "trusted_helper", [last], {"operation_type": "v4l.persistence.write.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.persistence.write"
+        if not facts.get("installation", {}).get("links_healthy", True):
+            ops.append(operation("links.reconcile", "links_reconcile", [last], {"desired": "present", "binaries": list(BINARIES)}, "application_files")); last = "links.reconcile"
+        service_actual = facts.get("service", {}).get("actual", "unknown")
+        service_desired = desired["service"]["desired"]
+        expected_actual = "active" if service_desired == "enabled_started" else "inactive"
+        if service_actual != expected_actual:
+            ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": service_desired}, "service_changes")); last = "service.unit.reconcile"
+            ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": service_desired}, "service_changes", failure="degrade")); last = "service.state.reconcile"
+        pack_facts = facts.get("models", {}).get("packs", {})
+        for pack in desired["model_pack_ids"]:
+            if pack_facts.get(pack, {}).get("integrity") == "verified":
+                continue
+            ops.append(operation(f"model.pack.{pack}.obtain", "model_obtain", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.obtain"
+            ops.append(operation(f"model.pack.{pack}.verify", "model_verify", [last], {"pack_id": pack, "artifacts": MODEL_METADATA.get(pack, {}).get("artifacts", [])}, "downloads", "none", "degrade")); last = f"model.pack.{pack}.verify"
+            ops.append(operation(f"model.pack.{pack}.activate", "model_activate", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.activate"
+        ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
+    else:
+        if source_kind == "archive":
+            extract_to = r["cache"] / "sources" / plan_id
+            ops.append(operation("source.archive.extract", "source_extract", [last], {"archive": source_path, "destination": str(extract_to)}, "downloads", source_paths=[source_path], target_paths=[str(extract_to)]))
+            last = "source.archive.extract"
+        ops.append(operation("build.cache.prepare", "build_cache_prepare", [last], {"fresh": bool(getattr(args, "fresh_build", False))}, "application_files", target_paths=[str(build_cache)])); last = "build.cache.prepare"
+        cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA": bool(desired["features"]["open_cuda"]),
+                 "STUDIOCAST_ENABLE_OPEN_AUDIO": bool(desired["features"]["open_audio"]),
+                 "STUDIOCAST_ENABLE_OPEN_VULKAN": bool(desired["features"]["open_vulkan"])}
+        ops.append(operation("build.configure", "build_configure", [last], {"source_kind": source_kind, "source_path": source_path,
+            "build_path": str(build_cache), "build_type": desired["build_type"], "cmake": cmake}, "application_files", source_paths=[source_path], target_paths=[str(build_cache)])); last = "build.configure"
+        ops.append(operation("build.compile", "build_compile", [last], {"build_path": str(build_cache), "targets": list(BINARIES)}, "application_files")); last = "build.compile"
+        ops.append(operation("payload.stage", "payload_stage", [last], {"version": target, "build_path": str(build_cache)}, "application_files", target_paths=[str(staging)])); last = "payload.stage"
+        ops.append(operation("payload.validate", "payload_validate", [last], {"required_binaries": list(BINARIES)}, "validation", "none")); last = "payload.validate"
+        packages: list[str] = []
+        if desired.get("vulkan_runtime"):
+            packages += ["libvulkan1", "vulkan-tools"]
+        if desired.get("mesa_packages"):
+            packages += ["mesa-vulkan-drivers"]
+        if desired.get("shader_tools"):
+            packages += ["glslang-tools"]
+        if packages:
+            ops.append(operation("dependencies.packages.ensure", "trusted_helper", [last],
+                                 {"operation_type": "packages.ensure.v1", "packages": packages},
+                                 "system_changes", "trusted_helper")); last = "dependencies.packages.ensure"
+        v4l = desired["virtual_camera"]
+        if v4l.get("desired"):
+            vf = facts.get("v4l2", {})
+            helper_args = {"device_number": int(v4l.get("device_number", 10)), "card_label": str(v4l.get("label", "StudioCast Camera")),
+                           "exclusive_caps": bool(v4l.get("exclusive_caps", True)), "persist": bool(v4l.get("persist", True))}
+            if not vf.get("module_available"):
+                ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
+            if not vf.get("module_loaded") or not vf.get("device_present"):
+                ops.append(operation("v4l.module.load", "trusted_helper", [last], {"operation_type": "v4l.module.load.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.module.load"
+            if v4l.get("persist") and vf.get("persistence_state") != "configured":
+                ops.append(operation("v4l.persistence.write", "trusted_helper", [last], {"operation_type": "v4l.persistence.write.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.persistence.write"
+        ops.append(operation("payload.activate", "payload_activate", [last], {"version": target}, "application_files", target_paths=[str(target_payload), str(current)])); last = "payload.activate"
+        ops.append(operation("links.reconcile", "links_reconcile", [last], {"desired": "present", "binaries": list(BINARIES)}, "application_files")); last = "links.reconcile"
+        ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes")); last = "service.unit.reconcile"
+        ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes", failure="degrade")); last = "service.state.reconcile"
+        for pack in desired["model_pack_ids"]:
+            ops.append(operation(f"model.pack.{pack}.obtain", "model_obtain", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.obtain"
+            ops.append(operation(f"model.pack.{pack}.verify", "model_verify", [last], {"pack_id": pack, "artifacts": MODEL_METADATA.get(pack, {}).get("artifacts", [])}, "downloads", "none", "degrade")); last = f"model.pack.{pack}.verify"
+            ops.append(operation(f"model.pack.{pack}.activate", "model_activate", [last], {"pack_id": pack}, "downloads", failure="degrade")); last = f"model.pack.{pack}.activate"
+        if intent in {"clean-install", "reinstall"} and preservation["preserve_settings"]:
+            ops.append(operation("settings.restore", "settings_restore", [last], {"snapshot_path": preservation["snapshot_path"]}, "preserved_items")); last = "settings.restore"
+        ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
+    blockers = copy.deepcopy(rec["blockers"])
+    warnings = copy.deepcopy(rec["warnings"])
+    if not desired["virtual_camera"].get("desired"):
+        blockers = [item for item in blockers if item.get("applies_to") != "virtual_camera"]
+    if any(op["privilege"] == "trusted_helper" for op in ops) and not facts.get("privileged_helper", {}).get("trusted", False):
+        if not any(item.get("code") == "privileged_helper_missing" for item in blockers):
+            blockers.append({"code": "privileged_helper_missing", "applies_to": "system_changes"})
+    if rec["route"] == "recommended" and intent != "uninstall" and not (
+            source_kind == "archive" and bool(getattr(args, "official_source", False))):
+        blockers.append({"code": "source.official_archive_required", "applies_to": "source"})
+    if getattr(args, "allow_unsupported", False):
+        # Developer override permits only unprivileged work; automatic package or
+        # module operations remain removed/fail-closed on unsupported systems.
+        blockers = [b for b in blockers if not b["code"].startswith("os.unsupported")]
+        if not facts.get("os", {}).get("supported", False):
+            ops = [op for op in ops if op["privilege"] != "trusted_helper"]
+            warnings.append({"code": "os.unsupported.developer_override_unprivileged_only", "applies_to": "installation"})
+    created = utc_now()
+    expires = (parse_time(created) + dt.timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    plan = {"schema_version": 1, "plan_version": PLAN_VERSION, "policy_version": POLICY_VERSION,
+        "plan_id": plan_id, "created_at": created, "expires_at": expires, "intent": intent,
+        "route": rec["route"], "facts_fingerprint": facts["host_fingerprint"],
+        "core_reuse": minimal_repair,
+        "privilege_preconditions": {"base_os": facts.get("os", {}).get("base_id"),
+            "base_release": facts.get("os", {}).get("base_version_id"),
+            "kernel_release": facts.get("os", {}).get("kernel_release")},
+        "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
+        "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
+            "target_payload": str(target_payload), "current_link": str(current)},
+        "source": {"kind": source_kind, "path": source_path, "official": source_kind == "archive" and bool(getattr(args, "official_source", False))},
+        "downloads": [{"artifact_id": pack, "url": None, "size": sum(a["size"] or 0 for a in MODEL_METADATA.get(pack, {}).get("artifacts", [])),
+            "sha256": None, "signature": None, "provenance": MODEL_METADATA.get(pack, {}).get("provenance"),
+            "license": MODEL_METADATA.get(pack, {}).get("license"), "cache_path": str(r["cache"] / "models" / pack),
+            "destination": str(r["data"] / "models"), "required_for_core": False} for pack in desired.get("model_pack_ids", [])],
+        "operations": ops, "preservation": preservation, "blockers": blockers, "warnings": warnings,
+        "expected_validation": [{"code": "payload.binaries.executable"}, {"code": "manifest.atomic"}],
+        "approval_token": uuid.uuid4().hex + uuid.uuid4().hex}
+    plan["plan_digest"] = plan_digest(plan)
+    persist_pending(plan)
+    return plan
+
+
+def migrate_v1(value: dict[str, Any], r: dict[str, Path]) -> dict[str, Any]:
+    if value.get("schema_version") != 1:
+        raise BackendError("manifest.not_v1", "Manifest is not schema v1")
+    state = "uninstalled" if value.get("state") == "uninstalled" else "prepared"
+    version = value.get("installed_version")
+    return {"schema_version": 2, "policy_version": POLICY_VERSION,
+        "transaction": {"id": str(uuid.uuid4()), "state": state, "intent": "migration", "started_at": utc_now(),
+            "updated_at": utc_now(), "completed_at": None, "plan_id": None, "plan_digest": None},
+        "install_scope": "user", "versions": {"active": version if state != "uninstalled" else None, "previous": None, "target": version, "relation_at_start": "unknown"},
+        "payloads": {"root": str(r["data"] / "payloads"), "current_link": str(r["data"] / "current"), "active": None, "previous": None, "target": None},
+        "source": {"channel": "legacy", "official": False, "legacy_hints": {"source_path": value.get("source_path"), "build_path": value.get("build_path")}},
+        "desired_configuration": {"build_type": "unknown", "features": {}, "service": {"desired": "unknown"},
+            "v4l": {"desired": "unknown"}, "model_pack_ids": [], "preserve_settings": True},
+        "effective_build_configuration": {"cmake": {}}, "service": {"desired": "unknown", "actual": "unknown"},
+        "v4l": {"desired": "unknown", "actual": {}, "owned_configuration": []}, "models": {"packs": {}},
+        "ownership": {"application_files": [], "links": [], "system_configuration": [], "shared_dependencies_observed": []},
+        "preservation": {"preserve_settings": True, "restored": False},
+        "health": {"core": "unknown", "overall": "migration_required", "validation": [{"code": "manifest.v1.paths_untrusted"}]}, "journal": []}
+
+
+class Executor:
+    def __init__(self, plan: dict[str, Any], dry_run: bool = False):
+        self.plan, self.dry_run, self.r = plan, dry_run, roots()
+        self.manifest_path = self.r["data"] / "install-manifest.json"
+        self.transaction_id = str(uuid.uuid4())
+        self.journal: list[dict[str, Any]] = []
+        self.executed: list[str] = []
+        self.active_before: dict[str, Any] | None = None
+        self.manifest_before: dict[str, Any] | None = None
+        self.source_root = Path(plan["source"]["path"])
+        self.reused_core = bool(plan.get("core_reuse"))
+        self.core_committed = self.reused_core
+        self.failed_operation: str | None = None
+        self.retryable: list[str] = []
+        self.cancelled = False
+        self.child: subprocess.Popen[bytes] | None = None
+        self._load_manifest()
+
+    def _load_manifest(self) -> None:
+        if not self.manifest_path.exists(): return
+        value = load_json(self.manifest_path)
+        if value.get("schema_version") == 1:
+            value = migrate_v1(value, self.r)
+        elif value.get("schema_version") != 2:
+            raise BackendError("manifest.unknown_schema", "Cannot execute with unknown manifest schema")
+        self.manifest_before = value
+        self.active_before = copy.deepcopy(value.get("payloads", {}).get("active"))
+
+    def run_process(self, argv: list[str]) -> None:
+        if self.dry_run:
+            print("+ " + " ".join(argv))
+            return
+        self.child = subprocess.Popen(argv, start_new_session=True)
+        try:
+            code = self.child.wait()
+        except KeyboardInterrupt:
+            self.cancelled = True
+            try: os.killpg(self.child.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+            try: self.child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(self.child.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                self.child.wait()
+            raise BackendError("operation.cancelled", "Operation cancelled")
+        finally:
+            self.child = None
+        if code != 0:
+            raise BackendError("process.exit", f"Process exited with status {code}", {"argv0": argv[0], "exit_code": code})
+
+    def append(self, op_id: str, state: str, error: BackendError | None = None) -> None:
+        self.journal.append({"sequence": len(self.journal) + 1, "operation_id": op_id, "state": state,
+            "finished_at": utc_now(), "exit": {"kind": "backend_result", "code": 0 if error is None else 1, "signal": None},
+            "error": None if error is None else {"code": error.code, "message": error.message, "details": error.details}, "compensation_operation_ids": []})
+
+    def execute(self) -> tuple[dict[str, Any], int]:
+        completed: set[str] = set()
+        failure: BackendError | None = None
+        for op in self.plan["operations"]:
+            if any(dep not in completed for dep in op["depends_on"]):
+                failure = BackendError("plan.dependency_order", f"Dependencies not completed for {op['id']}")
+                self.failed_operation = op["id"]; break
+            self.executed.append(op["id"])
+            try:
+                self.execute_one(op)
+                completed.add(op["id"])
+                self.append(op["id"], "completed")
+            except BackendError as exc:
+                self.append(op["id"], "cancelled" if self.cancelled else "failed", exc)
+                self.failed_operation = op["id"]
+                if op["failure_policy"] == "degrade" and self.core_committed:
+                    self.retryable.append(op["id"])
+                    # Preserve exact-plan accounting: remaining optional model
+                    # operations are recorded skipped, then manifest commits.
+                    completed.add(op["id"])
+                    continue
+                failure = exc
+                break
+        state = "cancelled" if self.cancelled else "failed" if failure else "degraded" if self.retryable else "committed"
+        if state in {"failed", "cancelled"} and not self.core_committed:
+            self.restore_previous_pointer()
+        if self.core_committed or self.plan["intent"] == "uninstall":
+            self.write_manifest(state, failure)
+        result = {"transaction_id": self.transaction_id, "state": state,
+            "core_committed": self.core_committed, "active_version": self.plan["desired_state"].get("version") or self.plan["paths"]["target_payload"].rstrip("/").split("/")[-1] if self.core_committed else (self.active_before or {}).get("version"),
+            "failed_operation_id": self.failed_operation, "error": None if failure is None else {"code": failure.code, "message": failure.message, "details": failure.details},
+            "retryable_operation_ids": self.retryable, "reviewed_operation_ids": [op["id"] for op in self.plan["operations"]],
+            "executed_operation_ids": self.executed, "exit": {"kind": "backend_result", "code": 0 if state == "committed" else 3 if state == "degraded" else 130 if state == "cancelled" else 2, "signal": None}}
+        return result, result["exit"]["code"]
+
+    def execute_one(self, op: dict[str, Any]) -> None:
+        kind, inputs = op["kind"], op["inputs"]
+        if kind not in ALLOWED_OPERATION_KINDS:
+            raise BackendError("plan.unknown_operation", f"Unknown operation kind: {kind}")
+        if kind == "preflight":
+            # Required link ownership is checked before payload activation so a
+            # conflicting user file cannot produce a half-switched install.
+            if any(item["kind"] == "links_reconcile" and item["inputs"].get("desired") == "present" for item in self.plan["operations"]):
+                for name in BINARIES:
+                    link = self.r["bin"] / name
+                    if link.exists() and not link.is_symlink():
+                        raise BackendError("ownership.mismatch", f"Refusing to replace non-link: {link}")
+                    if link.is_symlink() and not str(link.readlink()).startswith(str(self.r["data"] / "current")):
+                        raise BackendError("ownership.mismatch", f"Refusing to replace unowned link: {link}")
+            return
+        if kind == "settings_snapshot":
+            src, dst = self.r["config"], Path(inputs["snapshot_path"])
+            validate_mutation_path(dst, [self.r["config"].parent])
+            if not self.dry_run and src.exists(): shutil.copytree(src, dst, symlinks=False)
+        elif kind == "source_extract": self.extract_source(Path(inputs["archive"]), Path(inputs["destination"]))
+        elif kind == "build_cache_prepare":
+            path = Path(self.plan["paths"]["build_cache"]); validate_mutation_path(path, [self.r["cache"]])
+            if inputs.get("fresh") and path.exists() and not self.dry_run: safe_remove(path, [self.r["cache"]])
+            if not self.dry_run: path.mkdir(parents=True, exist_ok=True)
+        elif kind == "build_configure":
+            source = self.source_root
+            if inputs["source_kind"] == "archive": source = self.source_root
+            cmake = inputs["cmake"]
+            argv = ["cmake", "-S", str(source), "-B", inputs["build_path"], "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={inputs['build_type']}"]
+            argv += [f"-D{name}={'ON' if bool(value) else 'OFF'}" for name, value in sorted(cmake.items())]
+            self.run_process(argv)
+        elif kind == "build_compile": self.run_process(["cmake", "--build", inputs["build_path"], "--target", *inputs["targets"]])
+        elif kind == "payload_stage": self.stage_payload(Path(inputs["build_path"]))
+        elif kind == "payload_validate": self.validate_staging(inputs["required_binaries"])
+        elif kind == "trusted_helper": self.run_helper(inputs)
+        elif kind == "payload_activate": self.activate_payload(inputs["version"])
+        elif kind == "links_reconcile": self.reconcile_links(inputs.get("desired", "present"), inputs.get("binaries", BINARIES))
+        elif kind == "service_unit_reconcile": self.reconcile_service_unit(inputs.get("desired", "disabled"))
+        elif kind == "service_state_reconcile": self.reconcile_service_state(inputs.get("desired", "disabled"))
+        elif kind == "model_obtain": self.obtain_model(inputs["pack_id"])
+        elif kind == "model_verify": self.verify_model(inputs["pack_id"])
+        elif kind == "model_activate": self.activate_model(inputs["pack_id"])
+        elif kind == "settings_restore": self.restore_settings(Path(inputs["snapshot_path"]))
+        elif kind == "cleanup": self.cleanup(inputs["target"])
+        elif kind in {"manifest_commit", "uninstall_tombstone"}: return
+
+    def extract_source(self, archive: Path, destination: Path) -> None:
+        validate_mutation_path(destination, [self.r["cache"]])
+        if self.dry_run: self.source_root = destination; return
+        destination.mkdir(parents=True, exist_ok=False)
+        def safe_name(name: str) -> bool:
+            p = Path(name)
+            return not p.is_absolute() and ".." not in p.parts
+        if tarfile.is_tarfile(archive):
+            with tarfile.open(archive) as tf:
+                if any(not safe_name(m.name) or m.issym() or m.islnk() for m in tf.getmembers()):
+                    raise BackendError("archive.unsafe_entry", "Archive contains an unsafe path or link")
+                tf.extractall(destination, filter="data")
+        elif zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as zf:
+                if any(not safe_name(info.filename) for info in zf.infolist()):
+                    raise BackendError("archive.unsafe_entry", "Archive contains an unsafe path")
+                zf.extractall(destination)
+        else: raise BackendError("archive.unsupported", f"Unsupported archive: {archive}")
+        candidates = [destination] + [p.parent for p in destination.rglob("VERSION") if (p.parent / "CMakeLists.txt").is_file()]
+        self.source_root = next((p for p in candidates if (p / "CMakeLists.txt").is_file() and (p / "VERSION").is_file()), destination)
+
+    def stage_payload(self, build: Path) -> None:
+        staging = Path(self.plan["paths"]["staging_payload"]); validate_mutation_path(staging, [self.r["data"]])
+        if self.dry_run: return
+        if staging.exists(): safe_remove(staging, [self.r["data"]])
+        (staging / "bin").mkdir(parents=True)
+        for name in BINARIES:
+            source = build / name
+            if not source.is_file() or source.is_symlink(): raise BackendError("payload.binary_missing", f"Built binary missing: {source}")
+            shutil.copy2(source, staging / "bin" / name, follow_symlinks=False)
+
+    def validate_staging(self, names: list[str]) -> None:
+        if self.dry_run: return
+        staging = Path(self.plan["paths"]["staging_payload"])
+        for name in names:
+            path = staging / "bin" / name
+            if not path.is_file() or not os.access(path, os.X_OK): raise BackendError("payload.validation_failed", f"Payload binary not executable: {path}")
+
+    def run_helper(self, inputs: dict[str, Any]) -> None:
+        if any(key in FORBIDDEN_HELPER_FIELDS for key in inputs): raise BackendError("privilege.forbidden_field", "Privileged request contains a forbidden field")
+        if inputs.get("operation_type") not in PRIVILEGED_TYPES: raise BackendError("privilege.unknown_operation", "Unknown privileged operation")
+        test_mode = os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1"
+        helper_path = HELPER_PATH
+        pkexec = Path("/usr/bin/pkexec")
+        if test_mode:
+            helper_path = Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_HELPER", str(helper_path))).absolute()
+            pkexec = Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_PKEXEC", str(pkexec))).absolute()
+            if not helper_path.is_file() or not pkexec.is_file():
+                raise BackendError("privileged_helper_missing", "Test privilege adapters are missing")
+        else:
+            facts = helper_facts()
+            if not facts["trusted"]: raise BackendError(facts["reason_codes"][0], "Trusted StudioCast system helper is unavailable")
+        request = {"schema_version": 1, "request_id": str(uuid.uuid4()), "transaction_id": self.transaction_id,
+            "policy_version": 1, "plan_digest": self.plan["plan_digest"],
+            "preconditions": self.plan["privilege_preconditions"],
+            "operations": [{"id": self.executed[-1], "type": inputs["operation_type"],
+                            **{k: v for k, v in inputs.items() if k != "operation_type"}}]}
+        if self.dry_run: return
+        if not pkexec.is_file():
+            raise BackendError("authorization_unavailable", "The fixed polkit authorization client is unavailable")
+        try:
+            completed = subprocess.run([str(pkexec), str(helper_path), "--json-stdin"], input=canonical_bytes(request),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       timeout=float(os.environ.get("STUDIOCAST_INSTALLER_TEST_AUTH_TIMEOUT", "120")) if test_mode else 120)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendError("authorization_timeout", "Authorization timed out") from exc
+        # pkexec has stable process outcomes; helper results remain structured on
+        # stdout.  There is deliberately no sudo/password fallback.
+        if completed.returncode == 126:
+            raise BackendError("authorization_denied", "Authorization was denied")
+        if completed.returncode == 127:
+            raise BackendError("authorization_cancelled", "Authorization was cancelled or unavailable")
+        if completed.returncode:
+            raise BackendError("privilege.operation_failed", "Trusted helper operation failed", {"exit_code": completed.returncode})
+        try: response = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc: raise BackendError("privilege.malformed_result", "Trusted helper returned invalid JSON") from exc
+        if response.get("state") != "succeeded": raise BackendError(response.get("reason_code", "privilege.operation_failed"), "Trusted helper did not succeed")
+
+    def activate_payload(self, version: str) -> None:
+        staging, target, current = map(Path, (self.plan["paths"]["staging_payload"], self.plan["paths"]["target_payload"], self.plan["paths"]["current_link"]))
+        for path in (staging, target, current): validate_mutation_path(path, [self.r["data"]])
+        if self.dry_run: self.core_committed = True; return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists(): safe_remove(target, [self.r["data"]])
+        os.replace(staging, target)
+        tmp_link = current.with_name(f".{current.name}.{uuid.uuid4().hex}.tmp")
+        os.symlink(str(target), tmp_link)
+        os.replace(tmp_link, current)
+        self.core_committed = True
+
+    def restore_previous_pointer(self) -> None:
+        if not self.active_before: return
+        previous = Path(self.active_before.get("path", "")); current = self.r["data"] / "current"
+        if not is_beneath(previous, self.r["data"] / "payloads") or not previous.is_dir(): return
+        if not self.dry_run:
+            tmp = current.with_name(f".{current.name}.rollback-{uuid.uuid4().hex}")
+            os.symlink(previous, tmp); os.replace(tmp, current)
+
+    def reconcile_links(self, desired: str, names: Any) -> None:
+        self.r["bin"].mkdir(parents=True, exist_ok=True)
+        for name in names:
+            link = self.r["bin"] / name; validate_mutation_path(link, [self.r["bin"]])
+            if desired == "absent":
+                if link.is_symlink() and str(link.readlink()).startswith(str(self.r["data"] / "current")): link.unlink()
+                continue
+            if self.dry_run: continue
+            target = self.r["data"] / "current/bin" / name
+            if link.exists() and not link.is_symlink(): raise BackendError("ownership.mismatch", f"Refusing to replace non-link: {link}")
+            temp = link.with_name(f".{name}.{uuid.uuid4().hex}.tmp"); os.symlink(target, temp); os.replace(temp, link)
+
+    def reconcile_service_unit(self, desired: str) -> None:
+        unit = self.r["systemd"] / SERVICE_NAME; validate_mutation_path(unit, [self.r["systemd"]])
+        if desired in {"absent", "disabled"}:
+            if not self.dry_run and unit.is_file() and "StudioCast" in unit.read_text(encoding="utf-8", errors="ignore"): unit.unlink()
+            return
+        if self.dry_run: return
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Unit]\nDescription=StudioCast daemon\n[Service]\nExecStart=%h/.local/share/studiocast/current/bin/studiocastd\nRestart=on-failure\n[Install]\nWantedBy=default.target\n", encoding="utf-8")
+
+    def reconcile_service_state(self, desired: str) -> None:
+        if self.dry_run or not shutil.which("systemctl"): return
+        if desired == "enabled_started": self.run_process(["systemctl", "--user", "daemon-reload"]); self.run_process(["systemctl", "--user", "enable", "--now", SERVICE_NAME])
+        else:
+            completed = subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if completed.returncode not in {0, 1, 5}: raise BackendError("service.state_failed", "Could not disable StudioCast service")
+
+    def obtain_model(self, pack: str) -> None:
+        cache = self.r["cache"] / "models" / pack
+        if not cache.is_dir(): raise BackendError("network.models.offline", f"Verified cache unavailable for model pack {pack}")
+
+    def verify_model(self, pack: str) -> None:
+        cache = self.r["cache"] / "models" / pack
+        for index, name in enumerate(MODEL_ARTIFACTS.get(pack, ())):
+            path = cache / name
+            if not path.is_file() or path.is_symlink(): raise BackendError("model.artifact.missing", f"Model artifact missing: {name}")
+            expected = _MODEL_HASHES.get(pack, ())[index]
+            if file_sha256(path) != "sha256:" + expected:
+                raise BackendError("model.download.checksum_mismatch", f"Model artifact checksum mismatch: {name}")
+
+    def activate_model(self, pack: str) -> None:
+        source, dest = self.r["cache"] / "models" / pack, self.r["data"] / "models/curated" / pack
+        validate_mutation_path(dest, [self.r["data"]])
+        if not source.is_dir():
+            raise BackendError("model.cache.missing", f"Verified cache unavailable for model pack {pack}")
+        if not self.dry_run:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            temp = dest.with_name(f".{pack}.{uuid.uuid4().hex}.tmp")
+            shutil.copytree(source, temp, symlinks=False)
+            if dest.exists(): safe_remove(dest, [self.r["data"]])
+            os.replace(temp, dest)
+
+    def restore_settings(self, snapshot: Path) -> None:
+        if self.dry_run or not snapshot.exists(): return
+        if self.r["config"].exists(): safe_remove(self.r["config"], [self.r["config"].parent])
+        shutil.copytree(snapshot, self.r["config"], symlinks=False)
+        safe_remove(snapshot, [self.r["config"].parent])
+
+    def cleanup(self, target: str) -> None:
+        mapping = {"payloads": self.r["data"] / "payloads", "build_cache": self.r["cache"],
+            "runtime_state": self.r["state"], "models": self.r["data"] / "models", "settings": self.r["config"]}
+        if target == "service":
+            self.reconcile_service_state("disabled"); self.reconcile_service_unit("absent"); return
+        if target == "data":
+            # Ordinary uninstall removes fixed installer metadata, never arbitrary
+            # paths read from a stale manifest.
+            for path in (self.r["data"] / "current", self.r["data"] / "install-manifest.json"):
+                if not self.dry_run: safe_remove(path, [self.r["data"]])
+            return
+        path = mapping.get(target)
+        if path and path.exists() and not self.dry_run: safe_remove(path, [path.parent])
+
+    def write_manifest(self, state: str, failure: BackendError | None) -> None:
+        version = Path(self.plan["paths"]["target_payload"]).name
+        target = Path(self.plan["paths"]["target_payload"])
+        active = (self.active_before if self.reused_core else
+                  {"version": version, "path": str(target), "tree_hash": None,
+                   "validation": self.plan["expected_validation"]}) if self.core_committed else self.active_before
+        previous = self.active_before if self.core_committed else (self.manifest_before or {}).get("payloads", {}).get("previous")
+        if self.plan["intent"] == "uninstall": active = None
+        manifest = {"schema_version": 2, "policy_version": POLICY_VERSION,
+            "transaction": {"id": self.transaction_id, "state": "uninstalled" if self.plan["intent"] == "uninstall" and state == "committed" else state,
+                "intent": self.plan["intent"], "started_at": self.plan["created_at"], "updated_at": utc_now(), "completed_at": utc_now(),
+                "plan_id": self.plan["plan_id"], "plan_digest": self.plan["plan_digest"]},
+            "install_scope": "user", "versions": {"active": active.get("version") if active else None,
+                "previous": previous.get("version") if previous else None, "target": version, "relation_at_start": self.plan["current_state"].get("version_relation")},
+            "payloads": {"root": str(self.r["data"] / "payloads"), "current_link": str(self.r["data"] / "current"),
+                "active": active, "previous": previous, "target": None},
+            "source": {"channel": "stable" if self.plan["source"].get("official") else "advanced", "official": self.plan["source"].get("official", False),
+                "archive_sha256": file_sha256(Path(self.plan["source"]["path"])) if self.plan["source"]["kind"] == "archive" and Path(self.plan["source"]["path"]).is_file() else None},
+            "desired_configuration": {"build_type": self.plan["desired_state"]["build_type"], "features": self.plan["desired_state"]["features"],
+                "service": self.plan["desired_state"]["service"], "v4l": self.plan["desired_state"]["virtual_camera"],
+                "model_pack_ids": self.plan["desired_state"].get("model_pack_ids", []), "preserve_settings": self.plan["preservation"]["preserve_settings"]},
+            "effective_build_configuration": {"cmake": next((op["inputs"]["cmake"] for op in self.plan["operations"] if op["id"] == "build.configure"), {})},
+            "service": {"desired": self.plan["desired_state"]["service"]["desired"], "actual": "unknown", "unit_path": str(self.r["systemd"] / SERVICE_NAME), "unit_sha256": None},
+            "v4l": {"desired": self.plan["desired_state"]["virtual_camera"].get("desired"), "actual": {}, "owned_configuration": []},
+            "models": {"packs": {pack: {**MODEL_METADATA.get(pack, {}), "state": "installed" if (self.r["data"] / "models/curated" / pack).is_dir() else "missing"} for pack in self.plan["desired_state"].get("model_pack_ids", [])}},
+            "ownership": {"application_files": [{"path": str(target / "bin" / name), "type": "file", "creating_operation": "payload.stage", "namespace": "studiocast"} for name in BINARIES] if active else [],
+                "links": [{"path": str(self.r["bin"] / name), "type": "symlink", "target": str(self.r["data"] / "current/bin" / name), "creating_operation": "links.reconcile", "namespace": "studiocast"} for name in BINARIES] if active else [],
+                "system_configuration": [], "shared_dependencies_observed": []},
+            "preservation": {"preserve_settings": self.plan["preservation"]["preserve_settings"], "restored": "settings.restore" in self.executed},
+            "health": {"core": "healthy" if active else "absent", "overall": state,
+                "validation": self.plan["expected_validation"], "failure": None if failure is None else {"code": failure.code, "message": failure.message}},
+            "journal": self.journal}
+        atomic_write(self.manifest_path, manifest)
+
+
+def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts: dict[str, Any] | None) -> None:
+    if plan.get("schema_version") != 1 or plan.get("plan_version") != PLAN_VERSION or plan.get("policy_version") != POLICY_VERSION:
+        raise BackendError("plan.unsupported_schema", "Unsupported plan schema or policy")
+    calculated = plan_digest(plan)
+    if supplied_digest != calculated or plan.get("plan_digest") != calculated:
+        raise BackendError("plan.digest_mismatch", "Reviewed plan digest does not match")
+    if parse_time(plan["expires_at"]) < dt.datetime.now(dt.timezone.utc):
+        raise BackendError("plan.expired", "Reviewed plan has expired")
+    pending = load_json(pending_path(plan["plan_id"]))
+    if pending.get("used") or pending.get("uid") != os.getuid() or pending.get("digest") != calculated or pending.get("token") != token:
+        raise BackendError("plan.token_invalid", "Plan approval token is missing, used, or invalid")
+    if facts is not None and facts.get("host_fingerprint") != plan.get("facts_fingerprint"):
+        raise BackendError("plan.precondition_changed", "Machine facts changed after review")
+    if plan.get("blockers"):
+        raise BackendError("plan.blocked", "Plan contains unresolved blockers", {"blockers": plan["blockers"]})
+    known: set[str] = set()
+    for op in plan.get("operations", []):
+        if op.get("kind") not in ALLOWED_OPERATION_KINDS or op.get("privilege") not in {"none", "user", "trusted_helper"}:
+            raise BackendError("plan.unknown_operation", f"Unsupported plan operation: {op.get('id')}")
+        if not isinstance(op.get("depends_on"), list) or any(dep not in known for dep in op["depends_on"]):
+            raise BackendError("plan.dependency_order", f"Invalid dependency order for {op.get('id')}")
+        if op.get("privilege") == "trusted_helper":
+            inputs = op.get("inputs", {})
+            if inputs.get("operation_type") not in PRIVILEGED_TYPES or any(key in FORBIDDEN_HELPER_FIELDS for key in inputs):
+                raise BackendError("plan.unsafe_privilege", f"Unsafe privileged operation: {op.get('id')}")
+        known.add(op["id"])
+    pending["used"] = True
+    atomic_write(pending_path(plan["plan_id"]), pending)
+
+
+def legacy_plan_text(plan: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility fields retained while GUI migrates to operation objects."""
+    out = copy.deepcopy(plan)
+    cmake = next((op["inputs"] for op in plan["operations"] if op["id"] == "build.configure"), None)
+    commands: list[str] = []
+    if cmake:
+        flags = " ".join(f"-D{k}={'ON' if v else 'OFF'}" for k, v in sorted(cmake["cmake"].items()))
+        commands.append(f"cmake -S {cmake['source_path']} -B {cmake['build_path']} -DCMAKE_BUILD_TYPE={cmake['build_type']} {flags}")
+    out["workflow"] = plan["intent"]
+    out["supported"] = not any(x["code"].startswith("os.unsupported") for x in plan["blockers"])
+    out["summary"] = [f"Current installed version: {plan['current_state'].get('active_version') or 'not installed'}"]
+    if plan["intent"] != "uninstall": out["summary"] += [f"Target StudioCast version: {Path(plan['paths']['target_payload']).name}", f"Build directory: {plan['paths']['build_cache']}"]
+    out["changes"] = ["Enable CPU resize fallback in the daemon config by default", "Force Linux CMake configuration to keep Open Video/Open CUDA and Open Audio enabled with explicit ON/OFF values"]
+    out["privileged_operations"] = [op["id"] for op in plan["operations"] if op["privilege"] == "trusted_helper"]
+    out["preserved"] = ["user settings", "downloaded model packs"] if plan["intent"] == "uninstall" and plan["preservation"]["preserve_settings"] else []
+    out["removed"] = [op["id"] for op in plan["operations"] if op["kind"] == "cleanup"]
+    out["commands"] = commands
+    # Compatibility review fields are part of the reviewed document and are
+    # therefore covered by the digest as well; execution never discards them.
+    out["plan_digest"] = plan_digest(out)
+    persist_pending(out)
+    return out
+
+
+def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--facts", "--facts-file", dest="facts_file")
+    parser.add_argument("--source-dir")
+    parser.add_argument("--release-archive")
+    parser.add_argument("--official-source", action="store_true")
+    parser.add_argument("--build-dir")
+    parser.add_argument("--build-type", default=None)
+    parser.add_argument("--target-version")
+    parser.add_argument("--allow-unsupported", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("-y", "--yes", action="store_true")
+    parser.add_argument("--input-fixture")
+    parser.add_argument("--with-deps", dest="deps", action="store_true")
+    parser.add_argument("--skip-deps", dest="deps", action="store_false")
+    parser.add_argument("--v4l2loopback", dest="v4l2", action="store_true")
+    parser.add_argument("--no-v4l2loopback", dest="v4l2", action="store_false")
+    parser.add_argument("--load-loopback", action="store_true")
+    parser.add_argument("--no-load-loopback", action="store_true")
+    parser.add_argument("--persist-loopback", action="store_true")
+    parser.add_argument("--no-persist-loopback", action="store_true")
+    parser.add_argument("--service", dest="service", action="store_true")
+    parser.add_argument("--no-service", dest="service", action="store_false")
+    parser.add_argument("--models", dest="models", action="store_true")
+    parser.add_argument("--no-models", dest="models", action="store_false")
+    parser.add_argument("--open-backends", dest="open_backends", action="store_true")
+    parser.add_argument("--no-open-backends", dest="open_backends", action="store_false")
+    parser.add_argument("--open-vulkan", dest="open_vulkan", action="store_true")
+    parser.add_argument("--no-open-vulkan", dest="open_vulkan", action="store_false")
+    parser.add_argument("--vulkan-runtime", dest="vulkan_runtime", action="store_true")
+    parser.add_argument("--no-vulkan-runtime", action="store_true")
+    parser.add_argument("--mesa-vulkan", dest="mesa_vulkan", action="store_true")
+    parser.add_argument("--shader-tools", dest="shader_tools", action="store_true")
+    parser.add_argument("--fresh-build", dest="fresh_build", action="store_true")
+    parser.add_argument("--no-fresh-build", dest="fresh_build", action="store_false")
+    parser.add_argument("--preserve-user-data", dest="preserve_settings", action="store_true")
+    parser.add_argument("--remove-user-data", dest="preserve_settings", action="store_false")
+    parser.set_defaults(v4l2=None, service=None, models=None, open_backends=None, open_vulkan=None,
+                        preserve_settings=None, fresh_build=False, deps=None)
+
+
+def output(value: Any, human: str | None = None) -> None:
+    if human is not None: print(human)
+    else: print(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def load_facts(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "facts_file", None): return normalize_fixture(load_json(Path(args.facts_file)))
+    if getattr(args, "input_fixture", None): return normalize_fixture(load_json(Path(args.input_fixture)))
+    return host_analyze(getattr(args, "target_version", None))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="studiocast-installer-backend")
+    sub = parser.add_subparsers(dest="command", required=True)
+    analyze_p = sub.add_parser("analyze"); add_common(analyze_p)
+    detect_p = sub.add_parser("detect-os"); add_common(detect_p)
+    status_p = sub.add_parser("status"); add_common(status_p)
+    recommend_p = sub.add_parser("recommend"); add_common(recommend_p)
+    recommend_p.add_argument("--intent", default="auto"); recommend_p.add_argument("--prior-desired"); recommend_p.add_argument("--policy-version", default=POLICY_VERSION); recommend_p.add_argument("--route", choices=("recommended", "custom", "advanced"), default="recommended")
+    for name in ("plan", "run"):
+        p = sub.add_parser(name); p.add_argument("workflow", choices=("install", "update", "repair", "reinstall", "clean-install", "uninstall", "modify", "advanced"), nargs="?", default="install"); add_common(p)
+    for name in ("install", "update", "repair", "reinstall", "clean-install", "uninstall"):
+        p = sub.add_parser(name); add_common(p); p.set_defaults(workflow=name)
+    apply_p = sub.add_parser("apply-plan", aliases=["execute-plan"]); apply_p.add_argument("--plan", required=True); apply_p.add_argument("--digest", required=True); apply_p.add_argument("--token", required=True); apply_p.add_argument("--facts"); apply_p.add_argument("--dry-run", action="store_true"); apply_p.add_argument("--json", action="store_true")
+    manifest_p = sub.add_parser("manifest"); manifest_p.add_argument("--migrate-v1", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command in {"analyze", "detect-os"}:
+        facts = load_facts(args)
+        output(facts if args.command == "analyze" else facts["os"]); return 0
+    if args.command == "status":
+        facts = load_facts(args); route, action = route_for(facts)
+        value = {"schema_version": 2, "installed": facts["installation"]["classification"] in {"healthy", "partial", "stale"},
+            "classification": facts["installation"]["classification"], "installed_version": facts["installation"].get("active_version"),
+            "target_version": facts["installation"].get("target_version"), "version_relation": facts["installation"].get("version_relation"),
+            "route": route, "primary_action": action, "reason_codes": facts["installation"]["reason_codes"],
+            "optional_components": {"onnxruntime_cuda": facts["runtime"]["onnxruntime"], "vulkan": {**facts["gpus"]["vulkan"], "runtime_packages": ["libvulkan1", "vulkan-tools"], "mesa_icd_package": "mesa-vulkan-drivers", "install_docs": "docs/open_source_video_models_install.md"}, "maxine_sdk": {**facts["maxine"], "install_docs": "docs/maxine_install.md"}}}
+        output(value); return 0
+    if args.command == "recommend":
+        facts = load_facts(args); prior = load_json(Path(args.prior_desired)) if args.prior_desired else None
+        output(recommend(facts, args.intent, prior, args.policy_version, args.route)); return 0
+    if args.command in {"plan", "run", "install", "update", "repair", "reinstall", "clean-install", "uninstall"}:
+        facts = load_facts(args); prior = facts.get("installation", {}).get("desired_configuration") if args.workflow in {"update", "repair", "reinstall", "clean-install", "modify"} else None
+        route = "advanced" if args.workflow == "advanced" or args.source_dir else "recommended"
+        rec = recommend(facts, args.workflow, prior, route=route)
+        plan = create_plan(args, facts, rec)
+        if args.command == "plan": output(legacy_plan_text(plan)); return 0
+        if args.dry_run:
+            result, code = Executor(plan, dry_run=True).execute(); output(result); return code
+        validate_plan(plan, plan["plan_digest"], plan["approval_token"], facts)
+        result, code = Executor(plan).execute(); output(result); return code
+    if args.command in {"apply-plan", "execute-plan"}:
+        plan = load_json(Path(args.plan)); facts = normalize_fixture(load_json(Path(args.facts))) if args.facts else None
+        validate_plan(plan, args.digest, args.token, facts)
+        result, code = Executor(plan, args.dry_run).execute(); output(result); return code
+    if args.command == "manifest":
+        path = roots()["data"] / "install-manifest.json"; value = load_json(path)
+        if args.migrate_v1 and value.get("schema_version") == 1:
+            value = migrate_v1(value, roots()); atomic_write(path, value)
+        output(value); return 0
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BackendError as exc:
+        print(json.dumps({"state": "failed", "error": {"code": exc.code, "message": exc.message, "details": exc.details},
+                          "exit": {"kind": "backend_result", "code": 2, "signal": None}}, sort_keys=True), file=sys.stderr)
+        raise SystemExit(2)
