@@ -1219,6 +1219,16 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-installer-backend-tests
             COMMAND studiocast-installer-backend-tests)
 
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME studiocast-installer-backend-core-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_backend_core_tests.py")
+        set_tests_properties(studiocast-installer-backend-core-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+
     add_executable(studiocast-installer-wizard-tests
             tests/installer_wizard_tests.cpp
             installer/gui/installer_wizard.h
