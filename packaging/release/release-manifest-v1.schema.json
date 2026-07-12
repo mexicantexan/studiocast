@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mexicantexan/studiocast/blob/master/packaging/release/release-manifest-v1.schema.json",
+  "title": "StudioCast stable release manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_version", "channel", "generated_at", "release", "minimum_installer_version", "artifacts", "activation"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "manifest_version": {"const": "studiocast-release-manifest/v1"},
+    "channel": {"const": "stable"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "minimum_installer_version": {"type": "string"},
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "tag", "published_at", "page_url"],
+      "properties": {"version": {"type": "string"}, "tag": {"type": "string"}, "published_at": {"type": "string", "format": "date-time"}, "page_url": {"type": "string", "format": "uri"}}
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_archive", "installer_appimage"],
+      "properties": {"source_archive": {"$ref": "#/$defs/artifact"}, "installer_appimage": {"$ref": "#/$defs/artifact"}}
+    },
+    "activation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "retain_previous", "rollback_supported"],
+      "properties": {"mode": {"const": "side_by_side_atomic_pointer"}, "retain_previous": {"const": true}, "rollback_supported": {"const": true}}
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["artifact_id", "filename", "url", "size_bytes", "sha256", "signature", "provenance", "license"],
+      "properties": {
+        "artifact_id": {"type": "string"}, "filename": {"type": "string"}, "url": {"type": "string", "format": "uri"}, "size_bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "signature": {"type": "object", "additionalProperties": false, "required": ["algorithm", "key_id", "value"], "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"type": "string"}, "value": {"type": "string"}}},
+        "provenance": {"type": "object", "additionalProperties": false, "required": ["repository", "commit", "workflow_run_url"], "properties": {"repository": {"type": "string", "format": "uri"}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "workflow_run_url": {"type": "string", "format": "uri"}}},
+        "license": {"type": "object", "additionalProperties": false, "required": ["spdx_id", "name", "url"], "properties": {"spdx_id": {"type": "string"}, "name": {"type": "string"}, "url": {"type": "string", "format": "uri"}}}
+      }
+    }
+  }
+}
