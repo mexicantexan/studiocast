@@ -4,6 +4,7 @@
 #include <string>
 
 #include "core/open_video/model_pack_registry.h"
+#include "core/open_video/vulkan_matting_runtime.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
 
@@ -32,6 +33,13 @@ public:
       studiocast::vulkan::VulkanDevice *device,
       studiocast::vulkan::kernels::UtilityKernels *kernels,
       studiocast::open_video::ModelPack pack, Options opts);
+  // Runtime injection is a focused no-GPU test seam. Production construction
+  // uses the fail-closed adapter selected by the build.
+  OpenVulkanMattingSession(
+      studiocast::vulkan::VulkanDevice *device,
+      studiocast::vulkan::kernels::UtilityKernels *kernels,
+      studiocast::open_video::ModelPack pack, Options opts,
+      std::unique_ptr<VulkanMattingRuntime> runtime);
   ~OpenVulkanMattingSession();
 
   OpenVulkanMattingSession(const OpenVulkanMattingSession &) = delete;
@@ -46,6 +54,9 @@ public:
            std::string *error_out);
 
   bool DeviceResidentInferenceAvailable() const;
+  VulkanMattingRuntimeEvidence RuntimeEvidence() const;
+  VulkanMattingRuntimeFailure LatchedRuntimeFailure() const;
+  const std::string &LatchedRuntimeError() const;
 
   const studiocast::open_video::ModelPack &pack() const;
   const Options &options() const;

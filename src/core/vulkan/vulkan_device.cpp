@@ -5,7 +5,9 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string_view>
 #include <vector>
@@ -15,6 +17,21 @@
 namespace studiocast::vulkan {
 
 namespace {
+
+std::mutex &ProcessSelectionMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::optional<VulkanDeviceSelection> &ProcessSelectionStorage() {
+  static std::optional<VulkanDeviceSelection> selection;
+  return selection;
+}
+
+std::optional<VulkanDeviceSelection> ProcessSelection() {
+  std::lock_guard<std::mutex> lock(ProcessSelectionMutex());
+  return ProcessSelectionStorage();
+}
 
 std::string BoolJson(bool v) { return v ? "true" : "false"; }
 
@@ -146,6 +163,7 @@ void AppendJsonDeviceCandidates(
     *oss << "\"vendor_id\":" << c.vendor_id << ",";
     *oss << "\"device_id\":" << c.device_id << ",";
     *oss << "\"device_type\":" << c.device_type << ",";
+    *oss << "\"stable_id\":\"" << JsonEscape(c.stable_id) << "\",";
     *oss << "\"vendor_name\":\"" << JsonEscape(c.vendor_name) << "\",";
     *oss << "\"device_name\":\"" << JsonEscape(c.device_name) << "\",";
     *oss << "\"compute_queue_family_index\":" << c.compute_queue_family_index
@@ -214,6 +232,40 @@ bool ResultOk(VkResult result, const char *what, std::string *error_out) {
 
 namespace detail {
 
+std::string MakeVulkanDeviceStableId(std::uint32_t vendor_id,
+                                     std::uint32_t device_id,
+                                     std::uint32_t device_type,
+                                     std::string_view device_name) {
+  std::string normalized;
+  bool separator = false;
+  for (const char raw : device_name) {
+    const auto c = static_cast<unsigned char>(raw);
+    if (std::isalnum(c)) {
+      if (separator && !normalized.empty())
+        normalized.push_back('-');
+      normalized.push_back(static_cast<char>(std::tolower(c)));
+      separator = false;
+    } else {
+      separator = true;
+    }
+  }
+  if (normalized.empty())
+    normalized = "unnamed";
+  std::ostringstream out;
+  out << "v1:" << std::hex << std::nouppercase << std::setfill('0')
+      << std::setw(4) << vendor_id << ":" << std::setw(4) << device_id << ":"
+      << std::dec << device_type << ":" << normalized;
+  return out.str();
+}
+
+bool IsValidVulkanDeviceStableId(std::string_view stable_id) {
+  if (stable_id.size() < 10 || stable_id.rfind("v1:", 0) != 0)
+    return false;
+  return std::all_of(stable_id.begin(), stable_id.end(), [](unsigned char c) {
+    return std::isalnum(c) || c == ':' || c == '-';
+  });
+}
+
 bool ParseVulkanDeviceSelection(std::string_view requested_index,
                                 std::string_view allow_cpu_in_auto,
                                 VulkanDeviceSelection *selection,
@@ -274,6 +326,11 @@ SelectVulkanDeviceCandidate(std::vector<VulkanDeviceCandidateInfo> *candidates,
   }
 
   for (auto &candidate : *candidates) {
+    if (candidate.stable_id.empty()) {
+      candidate.stable_id = MakeVulkanDeviceStableId(
+          candidate.vendor_id, candidate.device_id, candidate.device_type,
+          candidate.device_name);
+    }
     candidate.eligible = false;
     candidate.selected = false;
     candidate.rejection_reason.clear();
@@ -282,12 +339,57 @@ SelectVulkanDeviceCandidate(std::vector<VulkanDeviceCandidateInfo> *candidates,
       continue;
     }
     if (!selection.requested_index.has_value() &&
+        selection.requested_stable_id.empty() &&
         candidate.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU &&
         !selection.allow_cpu_in_auto) {
       candidate.rejection_reason = "cpu_device_not_enabled";
       continue;
     }
     candidate.eligible = true;
+  }
+
+  if (!selection.requested_stable_id.empty()) {
+    const auto matches = std::count_if(
+        candidates->begin(), candidates->end(), [&](const auto &candidate) {
+          return candidate.stable_id == selection.requested_stable_id;
+        });
+    if (matches == 0) {
+      result.failure_reason = "vulkan_requested_device_not_found";
+      result.error = "Saved Vulkan device '" + selection.requested_stable_id +
+                     "' was not enumerated; selection was not changed.";
+      return result;
+    }
+    if (matches > 1) {
+      result.failure_reason = "vulkan_requested_device_ambiguous";
+      result.error = "Saved Vulkan device identity '" +
+                     selection.requested_stable_id +
+                     "' matched multiple adapters; select a unique adapter.";
+      return result;
+    }
+    const auto it = std::find_if(
+        candidates->begin(), candidates->end(), [&](const auto &candidate) {
+          return candidate.stable_id == selection.requested_stable_id;
+        });
+    if (it->compute_queue_family_index < 0) {
+      result.failure_reason = "vulkan_requested_device_no_compute_queue";
+      result.error = "Saved Vulkan device '" + selection.requested_stable_id +
+                     "' does not expose a compute-capable queue.";
+      return result;
+    }
+    for (auto &candidate : *candidates) {
+      if (candidate.stable_id != selection.requested_stable_id &&
+          candidate.rejection_reason.empty()) {
+        candidate.eligible = false;
+        candidate.rejection_reason = "not_requested";
+      }
+    }
+    it->eligible = true;
+    it->selected = true;
+    it->rejection_reason.clear();
+    result.ok = true;
+    result.candidate_vector_index =
+        static_cast<std::size_t>(std::distance(candidates->begin(), it));
+    return result;
   }
 
   if (selection.requested_index.has_value()) {
@@ -398,6 +500,8 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   else
     oss << selected_device_index;
   oss << ",";
+  oss << "\"selected_device_stable_id\":\""
+      << JsonEscape(selected_device_stable_id) << "\",";
   oss << "\"cpu_device_selected\":" << BoolJson(cpu_device_selected) << ",";
   oss << "\"device_candidates\":";
   AppendJsonDeviceCandidates(&oss, device_candidates);
@@ -454,24 +558,37 @@ std::string OpenVulkanDiagnostics::ToJson() const {
 VulkanDevice::~VulkanDevice() { Shutdown(); }
 
 bool VulkanDevice::Initialize(std::string *error_out) {
-  if (error_out)
-    error_out->clear();
-  if (initialized_)
-    return true;
+  if (const auto process_selection = ProcessSelection())
+    return Initialize(*process_selection, error_out);
 
-  diagnostics_ = OpenVulkanDiagnostics{};
+  VulkanDeviceSelection selection;
   std::string e;
   const char *requested_index = std::getenv("STUDIOCAST_VULKAN_DEVICE_INDEX");
   const char *allow_cpu = std::getenv("STUDIOCAST_VULKAN_ALLOW_CPU");
   if (!detail::ParseVulkanDeviceSelection(
           requested_index ? requested_index : "", allow_cpu ? allow_cpu : "",
-          &selection_, &e)) {
+          &selection, &e)) {
+    diagnostics_ = OpenVulkanDiagnostics{};
     diagnostics_.error = e;
     diagnostics_.fallback_reason = "vulkan_device_selection_invalid";
     if (error_out)
       *error_out = e;
     return false;
   }
+  return Initialize(selection, error_out);
+}
+
+bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
+                              std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (initialized_)
+    return true;
+
+  diagnostics_ = OpenVulkanDiagnostics{};
+  identity_ = VulkanDeviceIdentity{};
+  std::string e;
+  selection_ = selection;
   diagnostics_.device_selection_source = selection_.source;
   diagnostics_.device_selection_request = selection_.request;
 
@@ -600,6 +717,9 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
     candidate.vendor_id = props.vendorID;
     candidate.device_id = props.deviceID;
     candidate.device_type = static_cast<std::uint32_t>(props.deviceType);
+    candidate.stable_id = detail::MakeVulkanDeviceStableId(
+        props.vendorID, props.deviceID,
+        static_cast<std::uint32_t>(props.deviceType), props.deviceName);
     candidate.vendor_name = VendorName(props.vendorID);
     candidate.device_name = props.deviceName;
     candidate.score = DeviceScore(props);
@@ -646,6 +766,12 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
   diagnostics_.device_name = best.device_name;
   diagnostics_.compute_queue_family_index = queue_family_index_;
   diagnostics_.selected_device_index = static_cast<int>(best.enumeration_index);
+  diagnostics_.selected_device_stable_id = best.stable_id;
+  identity_.stable_id = best.stable_id;
+  identity_.vendor_id = best.vendor_id;
+  identity_.device_id = best.device_id;
+  identity_.device_type = best.device_type;
+  identity_.device_name = best.device_name;
   diagnostics_.cpu_device_selected =
       best.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU;
   if (diagnostics_.cpu_device_selected) {
@@ -880,6 +1006,16 @@ bool VulkanDevice::InvalidateMemory(VkDeviceMemory memory, VkDeviceSize offset,
   return ResultOk(
       loader_.f().vkInvalidateMappedMemoryRanges(device_, 1, &range),
       "vkInvalidateMappedMemoryRanges", error_out);
+}
+
+void SetProcessVulkanDeviceSelection(const VulkanDeviceSelection &selection) {
+  std::lock_guard<std::mutex> lock(ProcessSelectionMutex());
+  ProcessSelectionStorage() = selection;
+}
+
+void ClearProcessVulkanDeviceSelection() {
+  std::lock_guard<std::mutex> lock(ProcessSelectionMutex());
+  ProcessSelectionStorage().reset();
 }
 
 } // namespace studiocast::vulkan

@@ -2,40 +2,40 @@
 
 #include <array>
 #include <cmath>
-#include <filesystem>
+#include <cstdint>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace studiocast::open_vulkan {
 
 namespace {
 
-constexpr const char *kDeviceResidentInferenceUnavailable =
-    "OpenVulkanMattingSession: device-resident Vulkan matting inference "
-    "runtime is unavailable in this build. The current ncnn Vulkan spike uses "
-    "CPU Mat input/output and is not a production Vulkan virtual background "
-    "runtime.";
-
-bool FileExists(const std::filesystem::path &p) {
-  std::error_code ec;
-  return std::filesystem::exists(p, ec) && !ec;
+const char *DefaultUnavailableReason() {
+#if defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) &&                       \
+    STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  return "OpenVulkanMattingSession: production ncnn Vulkan dependencies are "
+         "enabled, but the shared-device runtime adapter is not implemented "
+         "in this milestone. The spike's CPU Mat bridge is intentionally not "
+         "used by production.";
+#else
+  return "OpenVulkanMattingSession: production ncnn Vulkan matting build "
+         "option is disabled (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=OFF). "
+         "The spike's CPU Mat bridge is intentionally not used by "
+         "production.";
+#endif
 }
 
 bool IsFinite3(const std::array<double, 3> &v) {
   return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-const studiocast::open_video::ModelFile *
-FindMainOnnxFile(const studiocast::open_video::ModelPack &p) {
-  for (const auto &f : p.files) {
-    if (f.kind == "onnx" && (f.role.empty() || f.role == "main"))
-      return &f;
+template <typename T> std::uintptr_t OpaqueHandle(T handle) {
+  if constexpr (std::is_pointer_v<T>) {
+    return reinterpret_cast<std::uintptr_t>(handle);
+  } else {
+    return static_cast<std::uintptr_t>(handle);
   }
-  for (const auto &f : p.files) {
-    if (f.kind == "onnx")
-      return &f;
-  }
-  return nullptr;
 }
 
 } // namespace
@@ -44,100 +44,132 @@ struct OpenVulkanMattingSession::Impl {
   studiocast::vulkan::VulkanDevice *device = nullptr;
   studiocast::vulkan::kernels::UtilityKernels *kernels = nullptr;
   studiocast::open_video::ModelPack pack;
-  std::filesystem::path onnx_path;
   Options opts;
 
+  bool pack_validation_attempted = false;
   bool validated_pack = false;
+  std::string pack_validation_error;
   bool buffers_ready = false;
   int last_frame_w = 0;
   int last_frame_h = 0;
 
   studiocast::vulkan::kernels::ModelPreprocessSpec preprocess{};
   studiocast::vulkan::VulkanTensor input_tensor;
+  VulkanMattingGraphDescriptor graph;
+  VulkanMattingPersistentResources resources;
+  std::unique_ptr<VulkanMattingRuntimeLifecycle> runtime_lifecycle;
+
+  bool PackValidationFailure(std::string message, std::string *error_out) {
+    pack_validation_error = std::move(message);
+    if (error_out)
+      *error_out = pack_validation_error;
+    return false;
+  }
 
   bool ValidatePack(std::string *error_out) {
     if (validated_pack)
       return true;
-
-    if (pack.task != "matting") {
+    if (pack_validation_attempted) {
       if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: model pack task must be 'matting'.";
+        *error_out = pack_validation_error;
       return false;
     }
+    pack_validation_attempted = true;
+
+    if (pack.task != "matting") {
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: model pack task must be 'matting'.",
+          error_out);
+    }
     if (!pack.matting.has_value()) {
-      if (error_out)
-        *error_out = "OpenVulkanMattingSession: matting model pack is missing "
-                     "required metadata.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: matting model pack is missing required "
+          "metadata.",
+          error_out);
     }
 
     const auto &spec = *pack.matting;
     if (spec.input.layout != "nchw") {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: only NCHW models are supported.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: only NCHW models are supported.",
+          error_out);
     }
     if (spec.input.dtype != "float32") {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: only float32 input models are "
-            "supported.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: only float32 input models are supported.",
+          error_out);
     }
     if (spec.output.dtype != "float32") {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: only float32 output models are "
-            "supported.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: only float32 output models are supported.",
+          error_out);
     }
     if (spec.input.channels != 3) {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: model input must have 3 channels.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: model input must have 3 channels.",
+          error_out);
     }
     if (spec.input.width <= 0 || spec.input.height <= 0) {
-      if (error_out)
-        *error_out = "OpenVulkanMattingSession: invalid model input size.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: invalid model input size.", error_out);
     }
     if (!IsFinite3(spec.preprocess.mean) || !IsFinite3(spec.preprocess.std)) {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: preprocess mean/std must be finite.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: preprocess mean/std must be finite.",
+          error_out);
     }
     if (spec.preprocess.std[0] == 0.0 || spec.preprocess.std[1] == 0.0 ||
         spec.preprocess.std[2] == 0.0) {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: preprocess std must be non-zero.";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: preprocess std must be non-zero.",
+          error_out);
     }
     if (spec.preprocess.color != "rgb" || spec.preprocess.range != "0..1") {
-      if (error_out)
-        *error_out = "OpenVulkanMattingSession: unsupported preprocess spec "
-                     "(expected rgb + 0..1).";
-      return false;
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: unsupported preprocess spec (expected "
+          "rgb + 0..1).",
+          error_out);
+    }
+    if (opts.allow_cpu_layers) {
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: production Vulkan matting does not permit "
+          "CPU fallback layers.",
+          error_out);
+    }
+    if (opts.warmup_runs != 1) {
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: production warmup_runs must be exactly 1.",
+          error_out);
     }
 
-    const auto *onnx = FindMainOnnxFile(pack);
-    if (!onnx) {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: missing ONNX file (kind=onnx).";
-      return false;
+    std::string contract_error;
+    if (!studiocast::open_video::ValidateProductionNcnnVulkanMattingPack(
+            pack, &contract_error)) {
+      return PackValidationFailure(
+          "OpenVulkanMattingSession: production ncnn Vulkan model contract "
+          "failed: " +
+              contract_error,
+          error_out);
     }
-    onnx_path = onnx->path;
-    if (!FileExists(onnx_path)) {
-      if (error_out)
-        *error_out = "OpenVulkanMattingSession: missing ONNX file at " +
-                     onnx_path.string();
-      return false;
-    }
+
+    const auto &ncnn = *pack.ncnn_vulkan;
+    graph.param_path = ncnn.param_path.string();
+    graph.bin_path = ncnn.bin_path.string();
+    graph.param_sha256 = ncnn.param_sha256;
+    graph.bin_sha256 = ncnn.bin_sha256;
+    graph.input_blob = ncnn.input_blob;
+    graph.output_blob = ncnn.output_blob;
+    graph.converter_name = ncnn.converter_name;
+    graph.converter_version = ncnn.converter_version;
+    graph.precision = ncnn.precision;
+    graph.input_n = 1;
+    graph.input_c = 3;
+    graph.input_h = spec.input.height;
+    graph.input_w = spec.input.width;
+    graph.output_n = 1;
+    graph.output_c = 1;
+    graph.output_h = spec.input.height;
+    graph.output_w = spec.input.width;
 
     preprocess.dst_w = spec.input.width;
     preprocess.dst_h = spec.input.height;
@@ -155,12 +187,25 @@ struct OpenVulkanMattingSession::Impl {
 OpenVulkanMattingSession::OpenVulkanMattingSession(
     studiocast::vulkan::VulkanDevice *device,
     studiocast::vulkan::kernels::UtilityKernels *kernels,
-    studiocast::open_video::ModelPack pack, Options opts)
+    studiocast::open_video::ModelPack pack, Options opts,
+    std::unique_ptr<VulkanMattingRuntime> runtime)
     : impl_(std::make_unique<Impl>()) {
   impl_->device = device;
   impl_->kernels = kernels;
   impl_->pack = std::move(pack);
   impl_->opts = opts;
+  impl_->runtime_lifecycle =
+      std::make_unique<VulkanMattingRuntimeLifecycle>(std::move(runtime));
+}
+
+OpenVulkanMattingSession::OpenVulkanMattingSession(
+    studiocast::vulkan::VulkanDevice *device,
+    studiocast::vulkan::kernels::UtilityKernels *kernels,
+    studiocast::open_video::ModelPack pack, Options opts)
+    : OpenVulkanMattingSession(
+          device, kernels, std::move(pack), opts,
+          CreateUnavailableVulkanMattingRuntime(
+              DefaultUnavailableReason())) {
 }
 
 OpenVulkanMattingSession::OpenVulkanMattingSession(
@@ -182,7 +227,26 @@ OpenVulkanMattingSession::options() const {
 }
 
 bool OpenVulkanMattingSession::DeviceResidentInferenceAvailable() const {
-  return false;
+  return impl_->runtime_lifecycle && impl_->runtime_lifecycle->available();
+}
+
+VulkanMattingRuntimeEvidence
+OpenVulkanMattingSession::RuntimeEvidence() const {
+  return impl_->runtime_lifecycle ? impl_->runtime_lifecycle->Evidence()
+                                  : VulkanMattingRuntimeEvidence{};
+}
+
+VulkanMattingRuntimeFailure
+OpenVulkanMattingSession::LatchedRuntimeFailure() const {
+  return impl_->runtime_lifecycle
+             ? impl_->runtime_lifecycle->latched_failure()
+             : VulkanMattingRuntimeFailure::unavailable;
+}
+
+const std::string &OpenVulkanMattingSession::LatchedRuntimeError() const {
+  static const std::string empty;
+  return impl_->runtime_lifecycle ? impl_->runtime_lifecycle->latched_error()
+                                  : empty;
 }
 
 bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
@@ -192,9 +256,6 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
 
   impl_->last_frame_w = frame_w;
   impl_->last_frame_h = frame_h;
-
-  (void)impl_->opts.device_id;
-  (void)impl_->opts.allow_cpu_layers;
 
   if (!impl_->device || !impl_->device->Initialized()) {
     if (error_out)
@@ -235,10 +296,36 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
     }
   }
 
-  if (impl_->opts.require_device_residency &&
-      !DeviceResidentInferenceAvailable()) {
+  studiocast::vulkan::VulkanTensorSize alpha_size;
+  std::string size_error;
+  if (!studiocast::vulkan::CheckedNchwF32Size(
+          1, 1, impl_->pack.matting->input.height,
+          impl_->pack.matting->input.width, &alpha_size, &size_error)) {
     if (error_out)
-      *error_out = kDeviceResidentInferenceUnavailable;
+      *error_out = "OpenVulkanMattingSession: invalid alpha allocation size: " +
+                   size_error;
+    return false;
+  }
+  impl_->resources.input_bytes = impl_->input_tensor.bytes();
+  impl_->resources.alpha_bytes = alpha_size.bytes;
+  impl_->resources.allow_cpu_layers = false;
+  impl_->resources.require_device_residency =
+      impl_->opts.require_device_residency;
+
+  VulkanMattingDeviceContext context;
+  context.ownership_domain = impl_->device;
+  context.physical_device = OpaqueHandle(impl_->device->physical_device());
+  context.logical_device = OpaqueHandle(impl_->device->device());
+  context.queue = OpaqueHandle(impl_->device->queue());
+  context.queue_family_index = impl_->device->queue_family_index();
+  context.vendor_id = impl_->device->identity().vendor_id;
+  context.device_id = impl_->device->identity().device_id;
+  context.selected_device_index =
+      impl_->device->diagnostics().selected_device_index;
+  context.stable_device_id = impl_->device->identity().stable_id;
+  if (!impl_->runtime_lifecycle ||
+      !impl_->runtime_lifecycle->Prepare(context, impl_->graph,
+                                         impl_->resources, error_out)) {
     return false;
   }
   impl_->buffers_ready = true;
@@ -254,12 +341,10 @@ bool OpenVulkanMattingSession::Warmup(std::string *error_out) {
                    "buffers.";
     return false;
   }
-  if (!DeviceResidentInferenceAvailable()) {
-    if (error_out)
-      *error_out = kDeviceResidentInferenceUnavailable;
+  if (!impl_->runtime_lifecycle ||
+      !impl_->runtime_lifecycle->Warmup(error_out)) {
     return false;
   }
-  (void)impl_->opts.warmup_runs;
   return true;
 }
 
@@ -286,6 +371,17 @@ bool OpenVulkanMattingSession::Run(
       *error_out = "OpenVulkanMattingSession::Run: invalid input image.";
     return false;
   }
+  if (input_rgb_gpu.device() != impl_->device) {
+    if (error_out)
+      *error_out = "OpenVulkanMattingSession::Run: input image belongs to a "
+                   "different Vulkan device ownership domain.";
+    return false;
+  }
+  if (!DeviceResidentInferenceAvailable()) {
+    if (error_out)
+      *error_out = DefaultUnavailableReason();
+    return false;
+  }
   if (!output_alpha_gpu->Valid() ||
       output_alpha_gpu->format() !=
           studiocast::vulkan::VulkanPixelFormat::f32_1 ||
@@ -300,6 +396,13 @@ bool OpenVulkanMattingSession::Run(
     }
     return false;
   }
+  if (output_alpha_gpu->device() != impl_->device) {
+    if (error_out)
+      *error_out =
+          "OpenVulkanMattingSession::Run: output alpha image belongs to a "
+          "different Vulkan device ownership domain.";
+    return false;
+  }
 
   std::string pp_err;
   if (!impl_->kernels->PreprocessToTensor(input_rgb_gpu, impl_->input_tensor,
@@ -310,9 +413,31 @@ bool OpenVulkanMattingSession::Run(
     return false;
   }
 
-  if (error_out)
-    *error_out = kDeviceResidentInferenceUnavailable;
-  return false;
+  VulkanMattingBufferBinding input_binding;
+  input_binding.ownership_domain = impl_->device;
+  input_binding.logical_device = OpaqueHandle(impl_->device->device());
+  input_binding.buffer = OpaqueHandle(impl_->input_tensor.buffer());
+  input_binding.byte_size = impl_->input_tensor.bytes();
+  input_binding.n = impl_->input_tensor.n();
+  input_binding.c = impl_->input_tensor.c();
+  input_binding.h = impl_->input_tensor.h();
+  input_binding.w = impl_->input_tensor.w();
+  input_binding.device_resident = impl_->input_tensor.Valid();
+
+  VulkanMattingBufferBinding alpha_binding;
+  alpha_binding.ownership_domain = impl_->device;
+  alpha_binding.logical_device = OpaqueHandle(impl_->device->device());
+  alpha_binding.buffer = OpaqueHandle(output_alpha_gpu->buffer());
+  alpha_binding.byte_size = static_cast<std::size_t>(
+      output_alpha_gpu->byte_size());
+  alpha_binding.n = 1;
+  alpha_binding.c = 1;
+  alpha_binding.h = output_alpha_gpu->height();
+  alpha_binding.w = output_alpha_gpu->width();
+  alpha_binding.device_resident = output_alpha_gpu->Valid();
+
+  return impl_->runtime_lifecycle->Run(input_binding, alpha_binding,
+                                       error_out);
 }
 
 } // namespace studiocast::open_vulkan

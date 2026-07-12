@@ -282,6 +282,14 @@ std::string TrimAscii(std::string s) {
   return s;
 }
 
+bool IsValidVulkanStableSelector(std::string_view value) {
+  if (value.size() < 10 || value.rfind("v1:", 0) != 0)
+    return false;
+  return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+    return std::isalnum(c) || c == ':' || c == '-';
+  });
+}
+
 struct DiagnosticsJsonSnapshot {
   std::string maxine;
   std::string open_cuda;
@@ -299,6 +307,38 @@ DiagnosticsJsonSnapshot &DiagnosticsJsonCacheStorage() {
   static DiagnosticsJsonSnapshot snapshot;
   return snapshot;
 }
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+bool ConfigureProcessVulkanSelection(
+    const studiocast::config::DaemonConfig &config, std::string *error) {
+  studiocast::vulkan::VulkanDeviceSelection selection;
+  if (config.video_vulkan_device != "auto" &&
+      !config.video_vulkan_device.empty()) {
+    selection.requested_stable_id = config.video_vulkan_device;
+    selection.allow_cpu_in_auto = config.video_vulkan_allow_cpu;
+    selection.request = "stable_id:" + config.video_vulkan_device;
+    selection.source = "daemon_config";
+  } else {
+    const char *index = std::getenv("STUDIOCAST_VULKAN_DEVICE_INDEX");
+    const char *allowCpu = std::getenv("STUDIOCAST_VULKAN_ALLOW_CPU");
+    if (!studiocast::vulkan::detail::ParseVulkanDeviceSelection(
+            index ? index : "", allowCpu ? allowCpu : "", &selection,
+            error)) {
+      studiocast::vulkan::ClearProcessVulkanDeviceSelection();
+      return false;
+    }
+    if (config.video_vulkan_allow_cpu) {
+      selection.allow_cpu_in_auto = true;
+      if (!selection.requested_index.has_value()) {
+        selection.request = "auto_with_cpu";
+        selection.source = "daemon_config";
+      }
+    }
+  }
+  studiocast::vulkan::SetProcessVulkanDeviceSelection(selection);
+  return true;
+}
+#endif
 
 DiagnosticsJsonSnapshot GetDiagnosticsJsonCacheSnapshot() {
   std::lock_guard<std::mutex> lock(DiagnosticsJsonCacheMutex());
@@ -1588,7 +1628,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
              const std::string &maxineJson, const std::string &openCudaJson,
              const std::string &openVulkanJson,
              const std::string &openAudioJson,
-             const std::string &loopbackJson) {
+             const std::string &loopbackJson,
+             const studiocast::config::DaemonConfig *daemonConfig = nullptr) {
   std::ostringstream oss;
   oss << "{";
   oss << "\"version\":\"" << JsonEscape(STUDIOCAST_VERSION) << "\",";
@@ -1697,6 +1738,14 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   oss << "\"always_on\":" << BoolJson(cfg.always_on) << ",";
   oss << "\"allow_cpu_resize\":" << BoolJson(cfg.pipeline.allow_cpu_resize)
       << ",";
+  oss << "\"vulkan_adapter\":{";
+  oss << "\"configured_device\":\""
+      << JsonEscape(daemonConfig ? daemonConfig->video_vulkan_device : "auto")
+      << "\",";
+  oss << "\"allow_cpu\":"
+      << BoolJson(daemonConfig && daemonConfig->video_vulkan_allow_cpu) << ",";
+  oss << "\"apply_policy\":\"next_vulkan_device_initialization\"";
+  oss << "},";
   oss << "\"compute\":";
   AppendVideoComputeStatusJson(oss, st.pipeline, computePreference,
                                computeResolved, computeActive,
@@ -2321,7 +2370,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
 }
 
 std::string
-ConfigToJson(const studiocast::video::VirtualCameraServiceConfig &cfg) {
+ConfigToJson(const studiocast::video::VirtualCameraServiceConfig &cfg,
+             const studiocast::config::DaemonConfig *daemonConfig = nullptr) {
   std::ostringstream oss;
   oss << "{";
   oss << "\"enabled\":" << BoolJson(cfg.enabled) << ",";
@@ -2347,6 +2397,13 @@ ConfigToJson(const studiocast::video::VirtualCameraServiceConfig &cfg) {
       << "\",";
   oss << "\"allow_cpu_resize\":" << BoolJson(cfg.pipeline.allow_cpu_resize)
       << ",";
+  oss << "\"vulkan_device\":\""
+      << JsonEscape(daemonConfig ? daemonConfig->video_vulkan_device : "auto")
+      << "\",";
+  oss << "\"vulkan_allow_cpu\":"
+      << BoolJson(daemonConfig && daemonConfig->video_vulkan_allow_cpu) << ",";
+  oss << "\"vulkan_selection_apply_policy\":"
+         "\"next_vulkan_device_initialization\",";
   oss << "\"mirror\":" << BoolJson(cfg.pipeline.effects.mirror) << ",";
   // Legacy flat fields (kept for compatibility): derived from the canonical
   // Broadcast schema.
@@ -2704,6 +2761,13 @@ int main(int argc, char **argv) {
 
   // Load persisted config and then apply CLI overrides for this run.
   auto daemonCfg = studiocast::config::LoadDaemonConfig();
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  std::string vulkanSelectionError;
+  if (!ConfigureProcessVulkanSelection(daemonCfg, &vulkanSelectionError)) {
+    std::cerr << "WARN: invalid Vulkan adapter selection: "
+              << vulkanSelectionError << "\n";
+  }
+#endif
   studiocast::video::VirtualCameraServiceConfig cfg =
       studiocast::config::ToVideoServiceConfig(daemonCfg);
   studiocast::audio::VirtualAudioServiceConfig acfg =
@@ -2897,7 +2961,8 @@ int main(int argc, char **argv) {
                      StatusToJson(st, current, ast, acurrent, socketPath,
                                   diagnostics.maxine, diagnostics.open_cuda,
                                   diagnostics.open_vulkan,
-                                  diagnostics.open_audio, diagnostics.loopback);
+                                  diagnostics.open_audio, diagnostics.loopback,
+                                  &daemonCfg);
             }
 
             if (pc.cmd == "GET_DIAGNOSTICS" ||
@@ -3031,6 +3096,9 @@ int main(int argc, char **argv) {
             if (pc.cmd == "SET_VIDEO_CONFIG") {
               std::lock_guard<std::mutex> lock(controlMu);
               auto newCfg = svc.Config();
+              std::string nextVulkanDevice = daemonCfg.video_vulkan_device;
+              bool nextVulkanAllowCpu = daemonCfg.video_vulkan_allow_cpu;
+              bool vulkanSelectionChanged = false;
 
               if (auto it = pc.kv.find("input"); it != pc.kv.end()) {
                 newCfg.pipeline.input_device =
@@ -3069,6 +3137,30 @@ int main(int argc, char **argv) {
                 }
                 newCfg.pipeline.compute_backend = pref;
               }
+              if (auto it = pc.kv.find("vulkan_device"); it != pc.kv.end()) {
+                if (it->second != "auto" &&
+                    !IsValidVulkanStableSelector(it->second)) {
+                  return std::string("ERR ") +
+                         ErrorJson("vulkan_device must be auto or a stable "
+                                   "v1:... identity from daemon status");
+                }
+                nextVulkanDevice = it->second;
+                vulkanSelectionChanged =
+                    nextVulkanDevice != daemonCfg.video_vulkan_device;
+              }
+              if (auto it = pc.kv.find("vulkan_allow_cpu");
+                  it != pc.kv.end()) {
+                bool v = false;
+                if (!ParseBoolArg(it->second, &v)) {
+                  return std::string("ERR ") +
+                         ErrorJson("vulkan_allow_cpu expects "
+                                   "0|1|true|false");
+                }
+                vulkanSelectionChanged =
+                    vulkanSelectionChanged ||
+                    v != daemonCfg.video_vulkan_allow_cpu;
+                nextVulkanAllowCpu = v;
+              }
               if (auto it = pc.kv.find("always_on"); it != pc.kv.end()) {
                 bool v = false;
                 if (!ParseBoolArg(it->second, &v)) {
@@ -3086,15 +3178,36 @@ int main(int argc, char **argv) {
                 newCfg.pipeline.allow_cpu_resize = v;
               }
 
+              auto nextDaemonCfg = daemonCfg;
+              studiocast::config::ApplyVideoServiceConfigToDaemonConfig(
+                  newCfg, &nextDaemonCfg);
+              nextDaemonCfg.video_vulkan_device = nextVulkanDevice;
+              nextDaemonCfg.video_vulkan_allow_cpu = nextVulkanAllowCpu;
               std::string perr;
-              if (!persistVideo(newCfg, &perr)) {
+              if (!studiocast::config::SaveDaemonConfig(nextDaemonCfg,
+                                                        &perr)) {
                 return std::string("ERR ") +
                        ErrorJson("failed to save config: " + perr);
               }
+              daemonCfg = nextDaemonCfg;
 
               svc.UpdateConfig(newCfg);
 
-              return std::string("OK ") + ConfigToJson(newCfg);
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+              if (vulkanSelectionChanged) {
+                std::string selectionError;
+                if (!ConfigureProcessVulkanSelection(daemonCfg,
+                                                     &selectionError)) {
+                  std::cerr << "WARN: invalid Vulkan compatibility selector: "
+                            << selectionError << "\n";
+                }
+                (void)RefreshDiagnosticsJsonCache();
+              }
+#else
+              (void)vulkanSelectionChanged;
+#endif
+
+              return std::string("OK ") + ConfigToJson(newCfg, &daemonCfg);
             }
 
             if (pc.cmd == "SET_VIDEO_EFFECTS_JSON") {
@@ -3145,7 +3258,8 @@ int main(int argc, char **argv) {
               svc.UpdateConfig(newCfg);
 
               return std::string("OK ") +
-                     AppendWarningsToObjectJson(ConfigToJson(newCfg), warnings);
+                     AppendWarningsToObjectJson(
+                         ConfigToJson(newCfg, &daemonCfg), warnings);
             }
 
             if (pc.cmd == "SET_VIDEO_EFFECTS") {
@@ -3339,7 +3453,8 @@ int main(int argc, char **argv) {
               svc.UpdateConfig(newCfg);
 
               return std::string("OK ") +
-                     AppendWarningsToObjectJson(ConfigToJson(newCfg), warnings);
+                     AppendWarningsToObjectJson(
+                         ConfigToJson(newCfg, &daemonCfg), warnings);
             }
 
             return std::string("ERR ") + ErrorJson("unknown_command");

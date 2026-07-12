@@ -98,3 +98,68 @@ The contained spike uses CPU `ncnn::Mat` input/output, so it measures ncnn
 Vulkan runtime behavior and output quality, but it explicitly reports device
 residency as `no`. A production Open Vulkan backend would need either ncnn-owned
 preprocess/composite kernels or a shared Vulkan device/allocator design.
+
+## Production Build and Model Contract
+
+The production integration has a separate, fail-closed build switch. It does
+not promote the CPU-transfer spike:
+
+```bash
+cmake -S . -B build-vulkan-ncnn-production -G Ninja \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+  -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+  -Dncnn_DIR=/path/to/vulkan-enabled/ncnn/lib/cmake/ncnn
+```
+
+Enabling `STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING` requires both Open Vulkan and
+ncnn compiled with Vulkan support; a missing dependency is a configure error.
+The option defaults to `OFF`, so Open Vulkan remains runtime-loaded and usable
+for its non-inference kernels without adding an ncnn dependency.
+
+Production artifacts are created offline. A schema-v2 matting manifest opts in
+with an `ncnn_vulkan` object, while the referenced artifacts and their installed
+SHA-256 values remain in the common `files` array:
+
+```json
+{
+  "schema_version": 2,
+  "task": "matting",
+  "files": [
+    {
+      "name": "model.ncnn.param",
+      "kind": "ncnn_param",
+      "role": "vulkan_matting",
+      "sha256": "<64 lowercase or uppercase hex characters>"
+    },
+    {
+      "name": "model.ncnn.bin",
+      "kind": "ncnn_bin",
+      "role": "vulkan_matting",
+      "sha256": "<64 lowercase or uppercase hex characters>"
+    }
+  ],
+  "ncnn_vulkan": {
+    "param_file": "model.ncnn.param",
+    "bin_file": "model.ncnn.bin",
+    "input_blob": "input",
+    "output_blob": "alpha",
+    "converter": {
+      "name": "pnnx",
+      "version": "20250503"
+    },
+    "precision": "fp32"
+  }
+}
+```
+
+`param_file` and `bin_file` must be safe relative paths, must refer to unique
+`files` entries of the matching kind, and must carry valid SHA-256 values.
+Input/output blob names, converter name/version, and precision (`fp32` or
+`fp16`) are mandatory. At one-time production session creation StudioCast
+resolves both paths inside the pack and recomputes both checksums. Missing
+metadata, path escape, missing files, and checksum mismatch all fail closed.
+Manifest parsing and hashing are forbidden in the frame loop.
+
+Current curated packs remain ONNX-only until reviewed ncnn conversions and
+their real checksums are produced. Consequently, this contract alone does not
+make production Vulkan matting available or device-resident.

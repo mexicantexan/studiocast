@@ -584,6 +584,27 @@ Expected:
 - Vulkan enumeration indices are not assumed to match NVIDIA `nvidia-smi`
   indices or the generic `STUDIOCAST_GPU_INDEX` setting.
 
+- [ ] Persist a candidate's `stable_id` through the daemon, then restart it:
+
+```bash
+build/studiocastctl video set vulkan_device=v1:VVVV:DDDD:T:normalized-name
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- `video.vulkan_adapter.configured_device` and
+  `engines.open_vulkan.device_selection_request` report the saved identity.
+- Reordering loader enumeration does not change the selected physical adapter.
+- If the saved identity is absent, status reports
+  `vulkan_requested_device_not_found` without choosing another adapter.
+- If multiple indistinguishable adapters match the fallback identity, status
+  reports `vulkan_requested_device_ambiguous` and fails closed. The v1 identity
+  is a stable-property fallback, not a PCI/UUID identity, so identical GPUs may
+  require a future stronger platform identifier.
+- A changed selection applies to subsequently initialized Vulkan devices;
+  restart the daemon before validating an already-running pipeline.
+
 - [ ] On a CPU-only Vulkan system, test the explicit software-device opt-in:
 
 ```bash

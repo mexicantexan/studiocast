@@ -615,6 +615,65 @@ bool TestVideoConfigMapsComputeBackendPreference() {
                 "runtime config should persist compute backend preference");
 }
 
+bool TestPersistentVulkanAdapterConfigAndStatus() {
+  const std::string stableId = "v1:8086:1234:1:intel-arc-integrated";
+  studiocast::config::DaemonConfig daemonConfig;
+  daemonConfig.video_vulkan_device = stableId;
+  daemonConfig.video_vulkan_allow_cpu = true;
+
+  auto runtime = studiocast::config::ToVideoServiceConfig(daemonConfig);
+  runtime.pipeline.width = 1920;
+  studiocast::config::ApplyVideoServiceConfigToDaemonConfig(runtime,
+                                                            &daemonConfig);
+  if (!Expect(daemonConfig.video_vulkan_device == stableId &&
+                  daemonConfig.video_vulkan_allow_cpu,
+              "video config patches must preserve Vulkan adapter fields")) {
+    return false;
+  }
+
+  const char *oldXdg = std::getenv("XDG_CONFIG_HOME");
+  const bool hadOldXdg = oldXdg != nullptr;
+  const std::string oldXdgValue = oldXdg ? oldXdg : "";
+  const auto temp = std::filesystem::temp_directory_path() /
+                    ("studiocast-vulkan-config-test-" +
+                     std::to_string(std::chrono::steady_clock::now()
+                                        .time_since_epoch()
+                                        .count()));
+  (void)setenv("XDG_CONFIG_HOME", temp.c_str(), 1);
+  std::string saveError;
+  const bool saved =
+      studiocast::config::SaveDaemonConfig(daemonConfig, &saveError);
+  const auto loaded = studiocast::config::LoadDaemonConfig();
+  std::error_code removeError;
+  std::filesystem::remove_all(temp, removeError);
+  if (hadOldXdg)
+    (void)setenv("XDG_CONFIG_HOME", oldXdgValue.c_str(), 1);
+  else
+    (void)unsetenv("XDG_CONFIG_HOME");
+  if (!Expect(saved, "Vulkan adapter config should save")) {
+    std::cerr << saveError << "\n";
+    return false;
+  }
+  if (!Expect(loaded.video_vulkan_device == stableId &&
+                  loaded.video_vulkan_allow_cpu,
+              "Vulkan adapter config should survive daemon reload")) {
+    return false;
+  }
+
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  videoStatus.service_running = true;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+  const std::string json = StatusToJson(
+      videoStatus, runtime, audioStatus, audioConfig,
+      std::filesystem::path("/tmp/studiocastd-test.sock"), "", "", "", "",
+      "", &daemonConfig);
+  return Expect(json.find("\"configured_device\":\"" + stableId +
+                          "\"") != std::string::npos &&
+                    json.find("\"allow_cpu\":true") != std::string::npos,
+                "daemon status should expose canonical Vulkan adapter config");
+}
+
 bool TestVideoStatusReportsCaptureFallbackState() {
   studiocast::video::VirtualCameraServiceStatus videoStatus;
   videoStatus.service_running = true;
@@ -982,6 +1041,7 @@ int main() {
   ok = TestVideoComputeStatusReportsCachedCountersAndProvider() && ok;
   ok = TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
+  ok = TestPersistentVulkanAdapterConfigAndStatus() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;
   ok = TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() && ok;

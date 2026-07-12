@@ -500,17 +500,74 @@ bool TestVulkanDeviceSelectionPolicy() {
                     selected.error.find("index 7") != std::string::npos,
                 "missing explicit Vulkan indices should fail clearly");
 
+  const std::string intelStableId =
+      studiocast::vulkan::detail::MakeVulkanDeviceStableId(
+          0x8086, 0x1234, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+          "Intel Arc Integrated");
+  ok &= Require(
+      intelStableId == "v1:8086:1234:1:intel-arc-integrated" &&
+          studiocast::vulkan::detail::IsValidVulkanDeviceStableId(
+              intelStableId),
+      "stable Vulkan identity should be deterministic and config-safe");
+  candidates = {
+      DeviceCandidate(7, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, 0,
+                      "AMD GPU"),
+      DeviceCandidate(2, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
+                      "Intel Arc Integrated")};
+  candidates[1].vendor_id = 0x8086;
+  candidates[1].device_id = 0x1234;
+  selection = VulkanDeviceSelection{};
+  selection.requested_stable_id = intelStableId;
+  selection.request = "stable_id:" + intelStableId;
+  selection.source = "daemon_config";
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(selected.ok && selected.candidate_vector_index == 1 &&
+                    candidates[1].selected,
+                "stable Vulkan identity should select independently of the "
+                "run-local enumeration index");
+
+  selection.requested_stable_id = "v1:1002:ffff:2:missing-amd";
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(!selected.ok &&
+                    selected.failure_reason ==
+                        "vulkan_requested_device_not_found",
+                "a missing saved Vulkan identity must fail closed");
+
+  candidates = {
+      DeviceCandidate(0, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
+                      "Identical GPU"),
+      DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
+                      "Identical GPU")};
+  const std::string ambiguousId =
+      studiocast::vulkan::detail::MakeVulkanDeviceStableId(
+          0, 0, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, "Identical GPU");
+  selection.requested_stable_id = ambiguousId;
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(!selected.ok &&
+                    selected.failure_reason ==
+                        "vulkan_requested_device_ambiguous",
+                "indistinguishable saved Vulkan identities must fail closed");
+
   studiocast::vulkan::OpenVulkanDiagnostics diagnostics;
   diagnostics.device_selection_source = "STUDIOCAST_VULKAN_DEVICE_INDEX";
   diagnostics.device_selection_request = "index:1";
   diagnostics.selected_device_index = 1;
-  diagnostics.device_candidates = candidates;
+  diagnostics.selected_device_stable_id = intelStableId;
+  diagnostics.device_candidates = {
+      DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
+                      "Intel GPU")};
+  diagnostics.device_candidates[0].stable_id = intelStableId;
   diagnostics.device_candidates[0].selected = true;
   const std::string json = diagnostics.ToJson();
   ok &= Require(
       json.find("\"device_selection_request\":\"index:1\"") !=
               std::string::npos &&
           json.find("\"selected_device_index\":1") != std::string::npos &&
+          json.find("\"selected_device_stable_id\":\"" + intelStableId +
+                    "\"") != std::string::npos &&
           json.find("\"device_candidates\":[{") != std::string::npos &&
           json.find("\"device_name\":\"Intel GPU\"") != std::string::npos,
       "Vulkan diagnostics JSON should expose selection candidates");
@@ -713,6 +770,21 @@ int main() {
         ReadU8(gpu_out),
         CompositeReference(fg, BlurU8Reference(fg, w, h, radius), alpha),
         "Vulkan batched blur/composite");
+
+    const std::uint64_t zero_radius_submissions_before =
+        kernels.synchronous_submission_count();
+    ok &= Require(kernels.BoxBlurCompositeAlphaU8x3(
+                      gpu_fg, gpu_tmp, gpu_blurred, gpu_alpha, gpu_out,
+                      /*radius=*/0, &error),
+                  "Vulkan zero-radius batched blur/composite should dispatch: " +
+                      error);
+    ok &= Require(kernels.synchronous_submission_count() ==
+                      zero_radius_submissions_before + 1,
+                  "Vulkan zero-radius batched blur/composite should use one "
+                  "synchronous submission");
+    invalidate(gpu_out);
+    ok &= CompareU8(ReadU8(gpu_out), fg,
+                    "Vulkan zero-radius batched blur/composite");
   }
 
   {

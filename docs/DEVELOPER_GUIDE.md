@@ -429,6 +429,16 @@ device-resident Vulkan matting runtime is available, daemon status must report
 Open Vulkan virtual background as blocked/degraded instead of silently running
 CUDA.
 
+The daemon persists Vulkan adapter intent as `video.vulkan.device` and
+`video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection
+and retains `STUDIOCAST_VULKAN_DEVICE_INDEX` as a compatibility override. A
+saved `v1:...` identity (vendor ID, device ID, device type, and normalized
+device name) takes precedence over the run-local index. Missing saved devices
+and indistinguishable duplicate identities fail closed; they are never replaced
+silently. CPU Vulkan remains an explicit software fallback. Adapter changes
+apply to subsequently initialized Vulkan devices, so restart the daemon before
+relying on a changed adapter for a running pipeline.
+
 Canonical video effects are persisted under `video.effects.json` in the daemon
 config.
 

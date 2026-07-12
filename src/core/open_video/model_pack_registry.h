@@ -57,6 +57,22 @@ struct MattingSpec {
   ModelPreprocessSpec preprocess;
 };
 
+// Offline-converted artifacts and graph metadata required by the production
+// ncnn Vulkan matting runtime. The corresponding manifest section is optional
+// so existing ONNX-only packs remain valid for Open CUDA, but every field is
+// mandatory when the section is present.
+struct NcnnVulkanMattingSpec {
+  std::filesystem::path param_path;
+  std::filesystem::path bin_path;
+  std::string param_sha256;
+  std::string bin_sha256;
+  std::string input_blob;
+  std::string output_blob;
+  std::string converter_name;
+  std::string converter_version;
+  std::string precision; // fp32 or fp16
+};
+
 struct ModelPack {
   // Schema version (1 for legacy packs using onnx_filename; 2 for v2 packs).
   int schema_version = 1;
@@ -75,6 +91,10 @@ struct ModelPack {
   // Optional task-specific metadata.
   // For task == "matting", this captures the v1-style IO/preprocess metadata.
   std::optional<MattingSpec> matting;
+
+  // Present only when a schema-v2 matting manifest declares a complete
+  // production ncnn Vulkan artifact contract.
+  std::optional<NcnnVulkanMattingSpec> ncnn_vulkan;
 
   // Derived from install layout.
   std::filesystem::path root_dir;
@@ -116,6 +136,14 @@ struct ModelPackVerification {
 
   std::vector<ModelFileVerification> files;
 };
+
+// Strict production gate for ncnn Vulkan matting artifacts. This performs file
+// hashing and is intended for one-time session creation/warmup, never for the
+// frame loop or daemon status polling. It fails closed when the manifest
+// section is missing/incomplete, paths escape the pack, or either checksum does
+// not match.
+bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
+                                             std::string *error);
 
 // Registry for model packs under:
 //   <models_root>/open_video/<subject>/<pack_dir>/

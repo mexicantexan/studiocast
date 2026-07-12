@@ -39,6 +39,12 @@ struct DaemonConfig {
   // Video compute backend preference: "auto" | "cpu" | "cuda" | "vulkan".
   std::string video_compute_backend = "auto";
 
+  // Persistent Open Vulkan adapter identity. "auto" keeps hardware-first
+  // selection and permits the legacy environment selector as a compatibility
+  // override. A stable v1:... identity fails closed when absent or ambiguous.
+  std::string video_vulkan_device = "auto";
+  bool video_vulkan_allow_cpu = false;
+
   // Allow CPU resize/scale fallback when output size mismatches cannot be
   // resolved on GPU. Users can opt out from Advanced settings.
   bool video_allow_cpu_resize = true;

@@ -143,8 +143,17 @@ endif()
 set(_studiocast_ncnn_found FALSE)
 set(_studiocast_ncnn_target "")
 set(_studiocast_ncnn_has_vulkan FALSE)
-if (STUDIOCAST_ENABLE_NCNN_SPIKE)
+if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING AND
+        NOT STUDIOCAST_ENABLE_OPEN_VULKAN)
+    message(FATAL_ERROR
+            "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON requires STUDIOCAST_ENABLE_OPEN_VULKAN=ON.")
+endif()
+
+if (STUDIOCAST_ENABLE_NCNN_SPIKE OR STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
     studiocast_configure_ncnn(_studiocast_ncnn_found _studiocast_ncnn_target _studiocast_ncnn_has_vulkan)
+endif()
+
+if (STUDIOCAST_ENABLE_NCNN_SPIKE)
     if (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan)
         message(STATUS "ncnn found (${_studiocast_ncnn_target}); experimental Vulkan matting spike can run ncnn Vulkan.")
     elseif (_studiocast_ncnn_found)
@@ -155,6 +164,19 @@ if (STUDIOCAST_ENABLE_NCNN_SPIKE)
     if (STUDIOCAST_REQUIRE_NCNN AND NOT (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan))
         message(FATAL_ERROR "STUDIOCAST_REQUIRE_NCNN=ON requires ncnn with Vulkan support. Set ncnn_DIR or NCNN_ROOT, or disable STUDIOCAST_REQUIRE_NCNN.")
     endif()
+endif()
+
+if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+    if (NOT (_studiocast_ncnn_found AND _studiocast_ncnn_has_vulkan))
+        message(FATAL_ERROR
+                "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON requires ncnn built with Vulkan support. "
+                "Set ncnn_DIR or NCNN_ROOT, or disable the production matting option.")
+    endif()
+    message(STATUS
+            "Production ncnn Vulkan matting build enabled (${_studiocast_ncnn_target}); "
+            "runtime availability remains gated by model artifacts, shared-device identity, warmup, and residency checks.")
+else()
+    message(STATUS "Production ncnn Vulkan matting build disabled.")
 endif()
 
 set(CMAKE_AUTOMOC ON)
@@ -424,6 +446,8 @@ endif()
 
 if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     target_sources(studiocast_core PRIVATE
+            src/core/open_video/vulkan_matting_runtime.h
+            src/core/open_video/vulkan_matting_runtime.cpp
             src/core/open_video/vulkan_matting_session.h
             src/core/open_video/vulkan_matting_session.cpp
             src/core/vulkan/vulkan_loader.h
@@ -434,6 +458,8 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
             src/core/vulkan/vulkan_image.cpp
             src/core/vulkan/vulkan_tensor.h
             src/core/vulkan/vulkan_tensor.cpp
+            src/core/vulkan/frame_execution_plan.h
+            src/core/vulkan/frame_execution_plan.cpp
             src/core/vulkan/kernels/resize_bilinear.h
             src/core/vulkan/kernels/resize_bilinear.cpp
             src/core/vulkan/kernels/utility_kernels.h
@@ -500,9 +526,14 @@ endif()
 target_compile_definitions(studiocast_core PUBLIC
     STUDIOCAST_ENABLE_OPEN_CUDA=$<BOOL:${STUDIOCAST_ENABLE_OPEN_CUDA}>
     STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
+    STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=$<BOOL:${STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING}>
     STUDIOCAST_ENABLE_OPEN_AUDIO=$<BOOL:${STUDIOCAST_ENABLE_OPEN_AUDIO}>
     STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>
 )
+
+if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+    target_link_libraries(studiocast_core PRIVATE "${_studiocast_ncnn_target}")
+endif()
 
 if (_studiocast_have_dlib)
     if (TARGET dlib::dlib)
@@ -1282,6 +1313,27 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-video-tests COMMAND studiocast-video-tests)
 
+    add_executable(studiocast-vulkan-frame-plan-tests
+            tests/vulkan_frame_execution_plan_tests.cpp
+            src/core/vulkan/frame_execution_plan.cpp
+    )
+
+    target_include_directories(studiocast-vulkan-frame-plan-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(studiocast-vulkan-frame-plan-tests)
+    studiocast_enable_sanitizers(studiocast-vulkan-frame-plan-tests)
+
+    set_target_properties(studiocast-vulkan-frame-plan-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-vulkan-frame-plan-tests
+            COMMAND studiocast-vulkan-frame-plan-tests)
+
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
         add_executable(studiocast-vulkan-kernel-tests
                 tests/vulkan_kernel_tests.cpp
@@ -1307,6 +1359,31 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-kernel-tests
                 COMMAND studiocast-vulkan-kernel-tests)
+
+        add_executable(studiocast-vulkan-matting-runtime-tests
+                tests/vulkan_matting_runtime_tests.cpp
+        )
+
+        target_link_libraries(studiocast-vulkan-matting-runtime-tests PRIVATE
+                studiocast_core
+        )
+
+        target_include_directories(studiocast-vulkan-matting-runtime-tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${STUDIOCAST_GENERATED_DIR}"
+        )
+
+        studiocast_set_project_warnings(studiocast-vulkan-matting-runtime-tests)
+        studiocast_enable_sanitizers(studiocast-vulkan-matting-runtime-tests)
+
+        set_target_properties(studiocast-vulkan-matting-runtime-tests PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF
+        )
+
+        add_test(NAME studiocast-vulkan-matting-runtime-tests
+                COMMAND studiocast-vulkan-matting-runtime-tests)
     endif()
 
     add_executable(studiocast-v4l2loopback-diagnostics-tests

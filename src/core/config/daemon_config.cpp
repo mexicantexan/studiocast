@@ -226,6 +226,15 @@ DaemonConfig LoadDaemonConfig() {
             studiocast::video::ComputeBackendPreferenceToString(pref);
       }
 
+      if (auto it = kv.find("video.vulkan.device"); it != kv.end()) {
+        const auto value = studiocast::util::TrimCopy(it->second);
+        s.video_vulkan_device = value.empty() ? "auto" : value;
+      }
+      if (auto it = kv.find("video.vulkan.allow_cpu"); it != kv.end()) {
+        s.video_vulkan_allow_cpu =
+            ParseBool(it->second, s.video_vulkan_allow_cpu);
+      }
+
       if (auto it = kv.find("video.scaling.allow_cpu_resize"); it != kv.end()) {
         s.video_allow_cpu_resize =
             ParseBool(it->second, s.video_allow_cpu_resize);
@@ -696,6 +705,9 @@ bool SaveDaemonConfig(const DaemonConfig &s, std::string *error) {
       << "\n";
   out << "video.scaling.backend = " << s.video_scaling_backend << "\n";
   out << "video.compute.backend = " << s.video_compute_backend << "\n";
+  out << "video.vulkan.device = " << s.video_vulkan_device << "\n";
+  out << "video.vulkan.allow_cpu = "
+      << (s.video_vulkan_allow_cpu ? "true" : "false") << "\n";
   out << "video.scaling.allow_cpu_resize = "
       << (s.video_allow_cpu_resize ? "true" : "false") << "\n";
   out << "\n";

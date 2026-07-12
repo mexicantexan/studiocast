@@ -17,6 +17,10 @@ selection, and clearer diagnostics for GPU-backed video effects.
   degraded reasons.
 - Reworked video pipeline backend decisions so explicit Vulkan requests report
   Vulkan fallback/degraded status instead of silently running CUDA.
+- Added hardware-first Vulkan adapter discovery plus persistent, daemon-owned
+  adapter selection for Intel, AMD, NVIDIA, and explicit CPU Vulkan fallback.
+- Added a fail-closed production ncnn Vulkan matting contract and runtime
+  lifecycle seam without promoting the CPU-transfer spike to production.
 - Expanded optional hardware validation with Vulkan runtime smoke jobs and
   CPU/CUDA/Vulkan resize benchmarking.
 
@@ -34,6 +38,19 @@ selection, and clearer diagnostics for GPU-backed video effects.
   key light.
 - Optional ncnn Vulkan matting spike tooling behind
   `STUDIOCAST_ENABLE_NCNN_SPIKE`.
+- Separate `STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING` production build gate,
+  requiring Open Vulkan and a Vulkan-enabled ncnn dependency.
+- Schema-v2 ncnn Vulkan model metadata for offline param/bin artifacts,
+  checksums, blob names, converter/version details, and precision.
+- A fakeable Vulkan matting runtime lifecycle with one-time graph load,
+  persistent allocation, warmup, device-identity/residency checks, CPU-layer
+  rejection, and latched fatal failures.
+- Persisted `video.vulkan.device` and `video.vulkan.allow_cpu` configuration,
+  stable adapter identities, cached candidates, and explicit missing or
+  ambiguous selection diagnostics.
+- A hardware-independent frame execution planner with unique per-dispatch
+  parameter/descriptor slots, compute dependency barriers, and a final
+  completion/readback boundary.
 - Optional `studiocast-resize-backend-bench` benchmark behind
   `STUDIOCAST_BUILD_BENCHMARKS=ON`.
 - Developer scripts for generating and validating embedded Vulkan SPIR-V
@@ -63,6 +80,14 @@ selection, and clearer diagnostics for GPU-backed video effects.
 - The setup helper now installs the ONNX Runtime GPU flavor only when
   `nvidia-smi` works or `--onnxruntime-flavor gpu` is requested; otherwise it
   installs the CPU flavor.
+- The installer exposes independent Open Vulkan build, loader/diagnostic,
+  Mesa Intel/AMD ICD, and shader-tool choices across install, update, repair,
+  and clean-install workflows.
+- Vulkan adapter auto-selection now prefers discrete, integrated, then virtual
+  hardware and excludes CPU implementations unless explicitly requested.
+- Background blur and alpha composite share one blocking submission: the
+  normal blur path is reduced from two submissions to one, and the feathered
+  path from three submissions to two.
 
 ### Fixed
 
@@ -85,6 +110,10 @@ selection, and clearer diagnostics for GPU-backed video effects.
   cache policy, Vulkan kernel wrappers, frame artifact caching, installer
   backend setup behavior, CMake backend cache behavior, and CUDA driver API
   fallback handling.
+- Added no-GPU coverage for production ncnn dependency policy, manifest
+  completeness/checksums, runtime lifecycle and failure latching, persistent
+  adapter selection, missing/ambiguous devices, CPU-device policy, and frame
+  submission/barrier planning.
 
 ### Compatibility Notes
 
@@ -94,6 +123,14 @@ selection, and clearer diagnostics for GPU-backed video effects.
   `-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it.
 - Installing Vulkan loader or ICD packages does not guarantee usable hardware
   support; runtime status reports device and fallback details.
+- Production Vulkan virtual-background matting remains unavailable until a
+  real ncnn adapter shares StudioCast's Vulkan device/queue/allocation domain,
+  runs a reviewed GPU-only graph, and proves device-resident input, alpha, and
+  output. The existing ncnn spike still uses CPU `ncnn::Mat` input/output and
+  is not a production fallback.
+- Persisted Vulkan adapter identities use stable device properties rather than
+  run-local enumeration indices. Indistinguishable identical adapters fail
+  closed pending a stronger UUID/PCI identity.
 - Open CUDA still requires an ONNX Runtime build with CUDA Execution Provider
   support and valid Open Video model packs. On machines where `nvidia-smi` is
   unavailable during setup, pass `--onnxruntime-flavor gpu` when CUDA support is

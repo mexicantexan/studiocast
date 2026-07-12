@@ -13,9 +13,18 @@ namespace studiocast::vulkan {
 
 struct VulkanDeviceSelection {
   std::optional<std::uint32_t> requested_index;
+  std::string requested_stable_id;
   bool allow_cpu_in_auto = false;
   std::string request = "auto";
   std::string source = "automatic";
+};
+
+struct VulkanDeviceIdentity {
+  std::string stable_id;
+  std::uint32_t vendor_id = 0;
+  std::uint32_t device_id = 0;
+  std::uint32_t device_type = 0;
+  std::string device_name;
 };
 
 struct VulkanDeviceCandidateInfo {
@@ -25,6 +34,7 @@ struct VulkanDeviceCandidateInfo {
   std::uint32_t vendor_id = 0;
   std::uint32_t device_id = 0;
   std::uint32_t device_type = 0;
+  std::string stable_id;
   std::string vendor_name;
   std::string device_name;
   int compute_queue_family_index = -1;
@@ -47,6 +57,13 @@ bool ParseVulkanDeviceSelection(std::string_view requested_index,
                                 std::string_view allow_cpu_in_auto,
                                 VulkanDeviceSelection *selection,
                                 std::string *error_out);
+
+std::string MakeVulkanDeviceStableId(std::uint32_t vendor_id,
+                                     std::uint32_t device_id,
+                                     std::uint32_t device_type,
+                                     std::string_view device_name);
+
+bool IsValidVulkanDeviceStableId(std::string_view stable_id);
 
 VulkanDeviceSelectionResult
 SelectVulkanDeviceCandidate(std::vector<VulkanDeviceCandidateInfo> *candidates,
@@ -76,6 +93,7 @@ struct OpenVulkanDiagnostics {
   std::string device_selection_source = "automatic";
   std::string device_selection_request = "auto";
   int selected_device_index = -1;
+  std::string selected_device_stable_id;
   bool cpu_device_selected = false;
   std::vector<VulkanDeviceCandidateInfo> device_candidates;
 
@@ -120,14 +138,18 @@ public:
   ~VulkanDevice();
 
   bool Initialize(std::string *error_out);
+  bool Initialize(const VulkanDeviceSelection &selection,
+                  std::string *error_out);
   void Shutdown() noexcept;
 
   bool Initialized() const { return initialized_; }
   const VulkanFunctions &f() const { return loader_.f(); }
+  VkPhysicalDevice physical_device() const { return physical_device_; }
   VkDevice device() const { return device_; }
   VkQueue queue() const { return queue_; }
   VkCommandPool command_pool() const { return command_pool_; }
   std::uint32_t queue_family_index() const { return queue_family_index_; }
+  const VulkanDeviceIdentity &identity() const { return identity_; }
   const VkPhysicalDeviceMemoryProperties &memory_properties() const {
     return memory_properties_;
   }
@@ -152,6 +174,7 @@ private:
 
   VulkanLoader loader_;
   VulkanDeviceSelection selection_;
+  VulkanDeviceIdentity identity_;
   VkInstance instance_ = nullptr;
   VkPhysicalDevice physical_device_ = nullptr;
   VkDevice device_ = nullptr;
@@ -165,5 +188,10 @@ private:
 };
 
 OpenVulkanDiagnostics DiagnoseOpenVulkanDefault();
+
+// Installs the daemon-authoritative selection used by subsequently initialized
+// VulkanDevice instances in this process. Existing devices are not migrated.
+void SetProcessVulkanDeviceSelection(const VulkanDeviceSelection &selection);
+void ClearProcessVulkanDeviceSelection();
 
 } // namespace studiocast::vulkan

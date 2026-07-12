@@ -229,6 +229,45 @@ bool WriteOpenVideoV2Pack(const std::filesystem::path &root,
          WriteTextFile(dir / "model.json", manifest);
 }
 
+bool WriteNcnnVulkanMattingPack(const std::filesystem::path &root,
+                                const std::string &id,
+                                const std::string &param_sha256,
+                                const std::string &bin_sha256,
+                                const std::string &ncnn_section,
+                                bool declare_bin = true) {
+  const auto dir = root / "matting" / id;
+  const std::string bin_entry =
+      declare_bin
+          ? std::string(
+                ",\n    {\"name\":\"model.ncnn.bin\",\"kind\":\"ncnn_bin\","
+                "\"role\":\"vulkan_matting\",\"sha256\":\"") +
+                bin_sha256 + "\"}"
+          : "";
+  const std::string manifest =
+      std::string("{\n") + "  \"schema_version\":2,\n" + "  \"id\":\"" +
+      id + "\",\n" + "  \"display_name\":\"" + id + "\",\n" +
+      "  \"task\":\"matting\",\n" +
+      "  \"input\":{\"name\":\"input\",\"layout\":\"nchw\","
+      "\"dtype\":\"float32\",\"width\":256,\"height\":256,"
+      "\"channels\":3},\n" +
+      "  \"output\":{\"name\":\"alpha\",\"kind\":\"alpha\","
+      "\"dtype\":\"float32\"},\n" +
+      "  \"preprocess\":{\"mean\":[0.5,0.5,0.5],"
+      "\"std\":[0.5,0.5,0.5],\"color\":\"rgb\","
+      "\"range\":\"0..1\"},\n" +
+      "  \"files\":[\n"
+      "    {\"name\":\"model.onnx\",\"kind\":\"onnx\","
+      "\"role\":\"main\",\"sha256\":\"\"},\n"
+      "    {\"name\":\"model.ncnn.param\",\"kind\":\"ncnn_param\","
+      "\"role\":\"vulkan_matting\",\"sha256\":\"" +
+      param_sha256 + "\"}" + bin_entry + "\n  ],\n" + ncnn_section +
+      "\n}\n";
+  return WriteTextFile(dir / "model.onnx", "synthetic matting model\n") &&
+         WriteTextFile(dir / "model.ncnn.param", "synthetic ncnn param\n") &&
+         WriteTextFile(dir / "model.ncnn.bin", "synthetic ncnn weights\n") &&
+         WriteTextFile(dir / "model.json", manifest);
+}
+
 bool DiagnosticsContainsModel(
     const studiocast::open_cuda::OpenCudaDiagnostics &d,
     const std::string &id, const std::string &task) {
@@ -306,6 +345,123 @@ bool TestOpenVideoIntegrity() {
     return false;
   return ExpectEq("video_placeholder_pack status", placeholder->status,
                   "placeholder");
+}
+
+bool TestProductionNcnnVulkanModelContract() {
+  namespace ov = studiocast::open_video;
+  ScopedDataHome data_home("studiocast-ncnn-vulkan-model-contract");
+  if (!Expect(data_home.ok(), data_home.error()))
+    return false;
+  const auto root =
+      data_home.path() / "studiocast" / "models" / "open_video";
+  constexpr const char *kParamSha =
+      "596bb1f4737715a50855892043c1b3cce8128a17c660d434f79ad6e2bd43b474";
+  constexpr const char *kBinSha =
+      "01a2da95e2c0d77e052f6696f6897a27f29ef2f489d3ce4801fdf7f4276c5e4a";
+  const std::string valid_section =
+      "  \"ncnn_vulkan\":{\n"
+      "    \"param_file\":\"model.ncnn.param\",\n"
+      "    \"bin_file\":\"model.ncnn.bin\",\n"
+      "    \"input_blob\":\"input\",\n"
+      "    \"output_blob\":\"alpha\",\n"
+      "    \"converter\":{\"name\":\"pnnx\",\"version\":\"20250503\"},\n"
+      "    \"precision\":\"fp32\"\n"
+      "  }";
+  const std::string missing_blob_section =
+      "  \"ncnn_vulkan\":{\n"
+      "    \"param_file\":\"model.ncnn.param\",\n"
+      "    \"bin_file\":\"model.ncnn.bin\",\n"
+      "    \"input_blob\":\"input\",\n"
+      "    \"converter\":{\"name\":\"pnnx\",\"version\":\"20250503\"},\n"
+      "    \"precision\":\"fp32\"\n"
+      "  }";
+  const std::string unsafe_path_section =
+      "  \"ncnn_vulkan\":{\n"
+      "    \"param_file\":\"../model.ncnn.param\",\n"
+      "    \"bin_file\":\"model.ncnn.bin\",\n"
+      "    \"input_blob\":\"input\",\n"
+      "    \"output_blob\":\"alpha\",\n"
+      "    \"converter\":{\"name\":\"pnnx\",\"version\":\"20250503\"},\n"
+      "    \"precision\":\"fp32\"\n"
+      "  }";
+
+  if (!WriteNcnnVulkanMattingPack(root, "ncnn_valid", kParamSha, kBinSha,
+                                  valid_section) ||
+      !WriteNcnnVulkanMattingPack(
+          root, "ncnn_bad_checksum",
+          "696bb1f4737715a50855892043c1b3cce8128a17c660d434f79ad6e2bd43b474",
+          kBinSha, valid_section) ||
+      !WriteNcnnVulkanMattingPack(root, "ncnn_missing_artifact", kParamSha,
+                                  kBinSha, valid_section, false) ||
+      !WriteNcnnVulkanMattingPack(root, "ncnn_missing_blob", kParamSha,
+                                  kBinSha, missing_blob_section) ||
+      !WriteNcnnVulkanMattingPack(root, "ncnn_unsafe_path", kParamSha, kBinSha,
+                                  unsafe_path_section) ||
+      !WriteOpenVideoMattingPack(root, "onnx-only", "onnx_only")) {
+    return false;
+  }
+
+  const auto registry = ov::ModelPackRegistry::Scan(root);
+  const auto valid = registry.ResolveModel("ncnn_valid");
+  if (!Expect(valid.has_value(), "complete ncnn Vulkan pack should scan") ||
+      !Expect(valid->ncnn_vulkan.has_value(),
+              "complete pack should expose ncnn Vulkan metadata")) {
+    return false;
+  }
+  const auto &spec = *valid->ncnn_vulkan;
+  if (!Expect(spec.param_path.is_absolute() && spec.bin_path.is_absolute(),
+              "ncnn artifact paths should resolve absolutely") ||
+      !ExpectEq("ncnn input blob", spec.input_blob, "input") ||
+      !ExpectEq("ncnn output blob", spec.output_blob, "alpha") ||
+      !ExpectEq("ncnn converter", spec.converter_name, "pnnx") ||
+      !ExpectEq("ncnn converter version", spec.converter_version,
+                "20250503") ||
+      !ExpectEq("ncnn precision", spec.precision, "fp32")) {
+    return false;
+  }
+
+  std::string error;
+  if (!Expect(ov::ValidateProductionNcnnVulkanMattingPack(*valid, &error),
+              "complete ncnn Vulkan pack should validate: " + error)) {
+    return false;
+  }
+
+  const auto bad_checksum = registry.ResolveModel("ncnn_bad_checksum");
+  if (!Expect(bad_checksum.has_value(),
+              "checksum mismatch is a session validation failure") ||
+      !Expect(!ov::ValidateProductionNcnnVulkanMattingPack(*bad_checksum,
+                                                           &error),
+              "checksum mismatch must fail closed") ||
+      !ExpectContains("ncnn checksum failure", error, "checksum_mismatch")) {
+    return false;
+  }
+
+  const auto onnx_only = registry.ResolveModel("onnx_only");
+  if (!Expect(onnx_only.has_value(), "ONNX-only matting pack should remain valid") ||
+      !Expect(!ov::ValidateProductionNcnnVulkanMattingPack(*onnx_only, &error),
+              "ONNX-only pack must not pass the production ncnn gate") ||
+      !ExpectContains("missing ncnn metadata", error, "missing required")) {
+    return false;
+  }
+
+  const auto &problems = registry.Problems();
+  const auto expect_problem = [&](const char *id, const char *needle) {
+    const auto it = problems.find(id);
+    return Expect(it != problems.end(), std::string(id) + " should be rejected") &&
+           ExpectContains(id, it->second, needle);
+  };
+  if (!expect_problem("ncnn_missing_artifact", "must be declared") ||
+      !expect_problem("ncnn_missing_blob", "output_blob") ||
+      !expect_problem("ncnn_unsafe_path", "safe relative paths")) {
+    return false;
+  }
+
+  const auto verification = ov::ModelPackRegistry::Verify(root);
+  const auto *bad_result = FindResult(verification, "ncnn_bad_checksum");
+  return Expect(bad_result && !bad_result->ok,
+                "explicit pack verification should reject bad ncnn checksum") &&
+         ExpectEq("ncnn bad checksum status", bad_result->status,
+                  "checksum_mismatch");
 }
 
 bool TestOpenCudaDiagnosticsReportAllOpenVideoTasks() {
@@ -757,6 +913,9 @@ bool TestOnnxWarningsPropagateToDiagnosticsJson() {
 int main() {
   bool ok = true;
   ok = RunNamedTest("open_video_integrity", TestOpenVideoIntegrity) && ok;
+  ok = RunNamedTest("production_ncnn_vulkan_model_contract",
+                    TestProductionNcnnVulkanModelContract) &&
+       ok;
   ok = RunNamedTest("open_cuda_diagnostics_open_video_tasks",
                     TestOpenCudaDiagnosticsReportAllOpenVideoTasks, true) &&
        ok;

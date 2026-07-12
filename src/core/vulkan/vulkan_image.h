@@ -62,6 +62,7 @@ public:
   void Free() noexcept;
 
   bool Valid() const { return storage_.Valid(); }
+  VulkanDevice *device() const { return storage_.device(); }
   VkBuffer buffer() const { return storage_.buffer(); }
   VkDeviceMemory memory() const { return storage_.memory(); }
   VkDeviceSize byte_size() const { return storage_.size(); }

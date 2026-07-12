@@ -136,6 +136,8 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
             ExpectContains("nested CMake cache", cache,
                            "STUDIOCAST_ENABLE_NCNN_SPIKE:BOOL=ON") &&
             ExpectContains("nested CMake cache", cache,
+                           "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING:BOOL=OFF") &&
+            ExpectContains("nested CMake cache", cache,
                            "STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON") &&
             Expect(cache.find("STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=OFF") ==
                        std::string::npos,
@@ -168,8 +170,58 @@ bool TestMissingOnnxRuntimeDoesNotForceOpenBackendsOff() {
 
   const std::string defaultCache =
       ReadFile(defaultBuildDir / "CMakeCache.txt");
-  return ExpectContains("nested default CMake cache", defaultCache,
-                        "STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=OFF");
+  if (!ExpectContains("nested default CMake cache", defaultCache,
+                      "STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=OFF") ||
+      !ExpectContains("nested default CMake cache", defaultCache,
+                      "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING:BOOL=OFF")) {
+    return false;
+  }
+
+  const fs::path missingNcnnBuild = temp.path() / "build-production-no-ncnn";
+  command = "env PKG_CONFIG_LIBDIR=" + ShellQuote(noPkgConfig.string()) + " " +
+            ShellQuote(STUDIOCAST_CMAKE_COMMAND) + " -S " +
+            ShellQuote(repo.string()) + " -B " +
+            ShellQuote(missingNcnnBuild.string()) +
+            " -DBUILD_TESTING=OFF"
+            " -DSTUDIOCAST_ENABLE_DLIB=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON"
+            " -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON"
+            " -DCMAKE_DISABLE_FIND_PACKAGE_ncnn=ON"
+            " 2>&1";
+  const auto missingNcnnResult =
+      studiocast::util::ExecCapture(command, options);
+  if (!Expect(missingNcnnResult.exit_code != 0,
+              "production ncnn Vulkan configure must reject a missing dependency") ||
+      !ExpectContains("missing production ncnn configure",
+                      missingNcnnResult.stdout_str,
+                      "requires ncnn built with Vulkan")) {
+    std::cerr << missingNcnnResult.stdout_str << "\n";
+    return false;
+  }
+
+  const fs::path noVulkanBuild = temp.path() / "build-production-no-vulkan";
+  command = ShellQuote(STUDIOCAST_CMAKE_COMMAND) + " -S " +
+            ShellQuote(repo.string()) + " -B " +
+            ShellQuote(noVulkanBuild.string()) +
+            " -DBUILD_TESTING=OFF"
+            " -DSTUDIOCAST_ENABLE_DLIB=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF"
+            " -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF"
+            " -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON"
+            " 2>&1";
+  const auto noVulkanResult = studiocast::util::ExecCapture(command, options);
+  if (!Expect(noVulkanResult.exit_code != 0,
+              "production ncnn Vulkan configure must require Open Vulkan") ||
+      !ExpectContains("missing Open Vulkan configure",
+                      noVulkanResult.stdout_str,
+                      "STUDIOCAST_ENABLE_OPEN_VULKAN=ON.")) {
+    std::cerr << noVulkanResult.stdout_str << "\n";
+    return false;
+  }
+  return true;
 }
 
 } // namespace
