@@ -40,6 +40,10 @@ PLAN_VERSION = "installer-plan/v1"
 RESULT_VERSION = "installer-result/v1"
 PROGRESS_VERSION = "installer-progress/v1"
 HELPER_PATH = Path("/usr/libexec/studiocast/studiocast-system-helper")
+PKEXEC_PATH = Path("/usr/bin/pkexec")
+POLKIT_POLICY_PATH = Path("/usr/share/polkit-1/actions/com.studiocast.Installer1.policy")
+SYSTEM_BUS_PATH = Path("/run/dbus/system_bus_socket")
+POLKIT_SERVICE_PATH = Path("/usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service")
 SERVICE_NAME = "studiocastd.service"
 BINARIES = (
     "studiocast", "studiocastd", "studiocastctl", "studiocast-probe",
@@ -147,6 +151,29 @@ def model_component_root() -> Path:
                  if (candidate / "packaging/models/curated-model-catalog-v1.json").is_file()), candidates[-1])
 
 
+def privilege_client_module() -> Any | None:
+    candidates = [
+        Path(__file__).resolve().parent / "privileged/client_contract.py",
+        Path(__file__).resolve().parent.parent / "privileged/client_contract.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        return None
+    spec = importlib.util.spec_from_file_location("studiocast_packaged_privilege_client", path)
+    if spec is None or spec.loader is None:
+        return None
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        if not callable(getattr(module, "preflight_trusted_helper", None)):
+            return None
+        return module
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        return None
+
+
 def load_model_catalog() -> tuple[Any, dict[str, Any], Path, str]:
     module = model_module()
     root = model_component_root()
@@ -185,6 +212,8 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
         if not getattr(args, "release_archive", None):
             args.release_archive = (receipt_input.get("archive_candidate_path")
                 if "archive_candidate_path" in receipt_input else receipt_input.get("archive_path"))
+        offline = offline or receipt_input.get("offline") is True
+        args.offline = offline
     if manifest_path or signature_path:
         if not manifest_path or not signature_path:
             raise BackendError("release.manifest.arguments", "Manifest and signature paths must be supplied together")
@@ -219,6 +248,13 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
             raise BackendError(exc.code, str(exc)) from exc
     signature_envelope = rc.strict_json_loads(signature_file.read_bytes())
     cache_path = release_cache_dir(args) / "artifacts" / source["filename"]
+    cached_verified = False
+    if archive is None and cache_path.is_file() and not cache_path.is_symlink():
+        try:
+            rc.verify_artifact(cache_path, source, keys)
+            cached_verified = True
+        except rc.ReleaseChannelError:
+            cached_verified = False
     receipt = {
         "schema_version": 1, "receipt_version": "studiocast-verified-release/v1",
         "channel": manifest["channel"], "version": manifest["release"]["version"],
@@ -229,6 +265,7 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
         "archive_path": str(cache_path),
         "archive_candidate_path": str(archive) if archive is not None else None,
         "archive_state": "candidate_verified" if archive is not None else "acquisition_pending",
+        "archive_cache_state": "cached_verified" if cached_verified else "absent_or_unverified",
         "archive_sha256": source["sha256"], "archive_size": source["size_bytes"],
         "archive_filename": source["filename"],
         "archive_signature": copy.deepcopy(source["signature"]),
@@ -236,6 +273,7 @@ def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
         "license": copy.deepcopy(source["license"]),
         "installer_appimage": copy.deepcopy(manifest["artifacts"]["installer_appimage"]),
         "release_page_url": manifest["release"]["page_url"],
+        "offline": offline,
     }
     # A receipt never substitutes for verification: receipt input reaches this
     # point only after manifest, signature, archive size/hash/signature are all
@@ -490,18 +528,54 @@ def manifest_state(path: Path) -> tuple[str, dict[str, Any] | None, list[str]]:
 
 
 def helper_facts() -> dict[str, Any]:
-    result = {"path": str(HELPER_PATH), "present": False, "trusted": False,
-              "compatible": False, "reason_codes": ["privileged_helper_missing"]}
+    unavailable = {"path": str(HELPER_PATH), "present": False, "trusted": False,
+        "compatible": False, "authorization_transport_available": False,
+        "helper_version": None, "protocol_versions": [], "pkexec_path": str(PKEXEC_PATH),
+        "policy_path": str(POLKIT_POLICY_PATH), "reason_codes": ["privileged_helper_missing"]}
+    test_mode = os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1"
+    client = privilege_client_module()
+    complete_test_contract = all(os.environ.get(name) for name in (
+        "STUDIOCAST_INSTALLER_TEST_HELPER", "STUDIOCAST_INSTALLER_TEST_PKEXEC",
+        "STUDIOCAST_INSTALLER_TEST_POLKIT_POLICY", "STUDIOCAST_INSTALLER_TEST_SYSTEM_BUS",
+        "STUDIOCAST_INSTALLER_TEST_POLKIT_SERVICE"))
+    if client is not None and (not test_mode or complete_test_contract):
+        kwargs: dict[str, Any] = {}
+        if test_mode and os.environ.get("STUDIOCAST_INSTALLER_TEST_HELPER"):
+            kwargs = {
+                "helper_path": Path(os.environ["STUDIOCAST_INSTALLER_TEST_HELPER"]),
+                "pkexec_path": Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_PKEXEC", str(PKEXEC_PATH))),
+                "policy_path": Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_POLKIT_POLICY", str(POLKIT_POLICY_PATH))),
+                "system_bus_path": Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_SYSTEM_BUS", str(SYSTEM_BUS_PATH))),
+                "polkit_service_path": Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_POLKIT_SERVICE", str(POLKIT_SERVICE_PATH))),
+                "required_uid": os.getuid(), "test_mode": True,
+                "version_probe": lambda _path: json.dumps(
+                    {"helper_version": "1.0.0", "protocol_versions": [1]}),
+            }
+        try:
+            return client.preflight_trusted_helper(**kwargs).as_dict()
+        except Exception:
+            return {**unavailable, "reason_codes": ["privileged_helper_untrusted"]}
+    if not test_mode:
+        # Packaging must include the read-only trusted-client contract.  A mode
+        # check alone is not enough to establish helper compatibility, the
+        # exact polkit binding, or authorization transport availability.
+        return {**unavailable, "reason_codes": ["privileged_helper_incompatible"]}
+    # Compatibility for hermetic backend tests on a branch before the packaged
+    # client module is staged.  This path is unreachable in production.
+    helper = Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_HELPER", ""))
+    pkexec = Path(os.environ.get("STUDIOCAST_INSTALLER_TEST_PKEXEC", ""))
     try:
-        info = HELPER_PATH.lstat()
-        result["present"] = True
-        trusted = stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not (info.st_mode & 0o022)
-        result["trusted"] = trusted
-        result["compatible"] = trusted
-        result["reason_codes"] = ["privileged_helper_usable" if trusted else "privileged_helper_untrusted"]
+        trusted = all(path.is_file() and not path.is_symlink() and
+                      path.stat().st_uid == os.getuid() and
+                      not (path.stat().st_mode & 0o022) and os.access(path, os.X_OK)
+                      for path in (helper, pkexec))
     except OSError:
-        pass
-    return result
+        trusted = False
+    return {**unavailable, "path": str(helper), "present": helper.is_file(),
+        "trusted": trusted, "compatible": trusted,
+        "authorization_transport_available": trusted, "helper_version": "test",
+        "protocol_versions": [1] if trusted else [], "pkexec_path": str(pkexec),
+        "reason_codes": ["privileged_helper_usable" if trusted else "privileged_helper_missing"]}
 
 
 def command_exists(name: str) -> bool:
@@ -884,6 +958,36 @@ def normalize_fixture(value: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def integrate_release_facts(facts: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    evidence = getattr(args, "verified_release", None)
+    if evidence is None:
+        return facts
+    out = copy.deepcopy(facts)
+    offline = bool(getattr(args, "offline", False) or evidence.get("offline") is True)
+    archive_state = evidence.get("archive_state")
+    verified_local = (archive_state == "candidate_verified" or
+                      evidence.get("archive_cache_state") == "cached_verified")
+    out.setdefault("cache", {}).setdefault("release_artifacts", {})["studiocast-source"] = {
+        "verified": verified_local,
+        "state": evidence.get("archive_cache_state") if verified_local else archive_state,
+        "version": evidence.get("version"), "sha256": evidence.get("archive_sha256"),
+        "path": (evidence.get("archive_candidate_path")
+                 if archive_state == "candidate_verified" else evidence.get("archive_path")),
+        "reason_codes": ["cache.release.verified" if verified_local else
+                         "cache.release.acquisition_required"],
+    }
+    if offline:
+        out.setdefault("connectivity", {})["release_source"] = {
+            "state": "offline", "reason_codes": ["network.release.offline_requested"]}
+        out["connectivity"]["model_source"] = {
+            "state": "offline", "reason_codes": ["network.models.offline_requested"]}
+    # Release evidence is independently signature/hash bound in the plan and
+    # revalidated by release_acquire.  Keep the machine-facts fingerprint
+    # stable so Apply can consume the exact fixture/host facts reviewed by the
+    # analyzer without requiring a receipt as an ambient bearer token.
+    return out
+
+
 def route_for(facts: dict[str, Any]) -> tuple[str, str]:
     if not facts.get("os", {}).get("supported", False):
         return "unsupported", "manual_instructions"
@@ -920,22 +1024,34 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         raise BackendError("policy.unsupported", f"Unsupported policy: {policy_version}")
     detected_route, primary = route_for(facts)
     prior = copy.deepcopy(prior or facts.get("installation", {}).get("desired_configuration") or {})
+    prior_service = copy.deepcopy(prior.get("service", {
+        "desired": "enabled_started" if facts.get("systemd_user", {}).get("manager_usable") else "disabled"}))
+    if not isinstance(prior_service, dict):
+        prior_service = {"desired": "unknown"}
+    prior_camera = copy.deepcopy(prior.get("v4l", {
+        "desired": True, "required_for_success": route == "recommended", "device_number": 10,
+        "label": "StudioCast Camera", "exclusive_caps": True, "load": True, "persist": True}))
+    if not isinstance(prior_camera, dict):
+        prior_camera = {"desired": "unknown"}
+    prior_camera.setdefault("load", True)
+    prior_camera.setdefault("persist", True)
     selections: dict[str, Any] = {
         "scope": "user", "source": {"kind": "official_release", "verified_required": True},
         "build_type": prior.get("build_type", "Release"),
-        "service": copy.deepcopy(prior.get("service", {"desired": "enabled_started" if facts.get("systemd_user", {}).get("manager_usable") else "disabled"})),
-        "virtual_camera": copy.deepcopy(prior.get("v4l", {"desired": True, "required_for_success": route == "recommended", "device_number": 10,
-            "label": "StudioCast Camera", "exclusive_caps": True, "persist": True})),
+        "service": prior_service, "virtual_camera": prior_camera,
         "model_pack_ids": list(prior.get("model_pack_ids", DEFAULT_MODEL_PACKS)),
         "model_destination": prior.get("model_destination"),
         "model_source": prior.get("model_source"),
         "model_offline": bool(prior.get("model_offline", False)),
         "effects": {}, "features": copy.deepcopy(prior.get("features", {})),
-        "shader_tools": False, "mesa_packages": False, "preserve_settings": prior.get("preserve_settings", True),
+        "shader_tools": False, "mesa_packages": False,
+        "manage_dependencies": bool(prior.get("manage_dependencies", route == "recommended")),
+        "preserve_settings": prior.get("preserve_settings", True),
     }
     if route == "recommended":
         selections["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
-        selections["virtual_camera"].update({"desired": True, "required_for_success": True})
+        if type(selections["virtual_camera"].get("desired")) is bool:
+            selections["virtual_camera"].update({"desired": True, "required_for_success": True})
     for effect, matrix in sorted(facts.get("effects", {}).get("capabilities", {}).items()):
         selected = "unavailable"
         for engine in ("maxine", "cuda", "vulkan", "cpu"):
@@ -956,16 +1072,24 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths"})
     if detected_route == "offline" and route == "recommended":
         blockers.append({"code": "network.release.offline_no_verified_cache", "applies_to": "source"})
+    if selections["service"].get("desired") not in {"enabled_started", "disabled"}:
+        blockers.append({"code": "configuration.service.selection_required", "applies_to": "service_changes"})
     camera = selections["virtual_camera"]
-    if camera.get("desired"):
+    if type(camera.get("desired")) is not bool:
+        blockers.append({"code": "configuration.virtual_camera.selection_required",
+                         "applies_to": "virtual_camera"})
+    elif camera.get("desired"):
         v4l = facts.get("v4l2", {})
         if v4l.get("device_number_conflict"):
             blockers.append({"code": "v4l.number.conflict", "applies_to": "virtual_camera"})
         if (not v4l.get("kernel_headers_usable", True) or not v4l.get("dkms_viable", True)) and not v4l.get("module_available"):
             blockers.append({"code": "v4l.dkms.not_viable", "applies_to": "virtual_camera"})
         needs_change = not (v4l.get("device_present") and v4l.get("module_loaded") and (not camera.get("persist") or v4l.get("persistence_state") == "configured"))
-        if needs_change and not facts.get("privileged_helper", {}).get("trusted", False):
-            blockers.append({"code": "privileged_helper_missing", "applies_to": "virtual_camera"})
+        helper = facts.get("privileged_helper", {})
+        if needs_change and not (helper.get("trusted", False) and
+                                 helper.get("authorization_transport_available", helper.get("trusted", False))):
+            blockers.append({"code": helper.get("reason_codes", ["privileged_helper_missing"])[0],
+                             "applies_to": "virtual_camera"})
     else:
         warnings.append({"code": "install.degraded.no_virtual_camera", "applies_to": "virtual_camera"})
     reasons = [
@@ -977,6 +1101,7 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
     return {"schema_version": 1, "recommendation_version": RECOMMENDATION_VERSION,
         "policy_version": policy_version, "facts_fingerprint": facts["host_fingerprint"],
         "intent": intent, "route": detected_route if route == "recommended" else route,
+        "selection_route": route,
         "primary_action": primary, "selections": selections,
         "reasons": reasons, "blockers": blockers, "warnings": warnings,
         "alternatives": [{"code": "route.custom", "action": "customize"}]}
@@ -997,7 +1122,13 @@ def desired_from_args(args: argparse.Namespace, recommendation: dict[str, Any]) 
     desired = copy.deepcopy(recommendation["selections"])
     if getattr(args, "build_type", None): desired["build_type"] = args.build_type
     if getattr(args, "service", None) is not None: desired["service"] = {"desired": "enabled_started" if args.service else "disabled"}
-    if getattr(args, "v4l2", None) is not None: desired["virtual_camera"]["desired"] = args.v4l2
+    if getattr(args, "v4l2", None) is not None:
+        desired["virtual_camera"]["desired"] = args.v4l2
+        desired["virtual_camera"]["required_for_success"] = bool(
+            args.v4l2 and recommendation.get("selection_route", recommendation.get("route")) == "recommended")
+    if getattr(args, "load_loopback", None) is not None: desired["virtual_camera"]["load"] = args.load_loopback
+    if getattr(args, "persist_loopback", None) is not None: desired["virtual_camera"]["persist"] = args.persist_loopback
+    if getattr(args, "deps", None) is not None: desired["manage_dependencies"] = args.deps
     if getattr(args, "open_backends", None) is not None:
         desired.setdefault("features", {})["open_cuda"] = args.open_backends
         desired["features"]["open_audio"] = args.open_backends
@@ -1081,7 +1212,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         if any(pack not in model_packs for pack in desired["model_pack_ids"]):
             raise BackendError("model.catalog_missing_default", "The packaged catalog omits a selected model pack")
         requested_source = getattr(args, "model_source", None)
-        if requested_source and rec["route"] != "advanced" and os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") != "1":
+        if (requested_source and rec.get("selection_route", rec["route"]) != "advanced" and
+                os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") != "1"):
             raise BackendError("model.source.advanced_only", "Custom model sources are available only in Advanced mode")
         model_source = requested_source or desired.get("model_source") or model_catalog["default_source"]
     model_offline = bool(getattr(args, "offline", False) or
@@ -1110,6 +1242,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                   "catalog_version": model_catalog["catalog_version"],
                   "catalog_sha256": model_catalog_sha256,
                   "source": model_source, "offline": model_offline, "retries": 2,
+                  "recommended": rec.get("selection_route", rec["route"]) == "recommended",
                   "destination_root": str(model_destination),
                   "pack": copy.deepcopy(pack)}
         ops.append(operation(op_id, "model_transaction", [last], inputs,
@@ -1136,7 +1269,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     minimal_repair = intent == "repair" and facts.get("installation", {}).get("classification") == "healthy"
     if intent == "uninstall":
         for op_id, target_name in (("service.state.reconcile", "service_state"), ("service.unit.reconcile", "service_unit"),
-                ("links.reconcile", "links"), ("cleanup.payloads", "payloads"), ("cleanup.runtime_state", "runtime_state")):
+                ("links.reconcile", "links"), ("cleanup.payloads", "payloads")):
             kind = "service_state_reconcile" if target_name == "service_state" else "service_unit_reconcile" if target_name == "service_unit" else "links_reconcile" if target_name == "links" else "cleanup"
             ops.append(operation(op_id, kind, [last], {"desired": "absent", "target": target_name}, "application_files"))
             last = op_id
@@ -1153,19 +1286,21 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             plan_specific_warnings.append({"code": "v4l.persistence.ownership_unverified_manual_cleanup",
                                            "applies_to": "system_changes"})
         if not preservation["preserve_settings"]:
-            for op_id, target_name in (("cleanup.models", "models"), ("cleanup.settings", "settings"), ("cleanup.data", "data")):
+            for op_id, target_name in (("cleanup.models", "models"), ("cleanup.settings", "settings"),
+                    ("cleanup.runtime_state", "runtime_state"), ("cleanup.cache", "cache"),
+                    ("cleanup.data", "data")):
                 ops.append(operation(op_id, "cleanup", [last], {"target": target_name}, "removed_items")); last = op_id
         ops.append(operation("manifest.commit", "uninstall_tombstone", [last], {}, "application_files"))
     elif minimal_repair:
         v4l = desired["virtual_camera"]
         vf = facts.get("v4l2", {})
-        if v4l.get("desired"):
+        if v4l.get("desired") is True:
             helper_args = {"device_number": int(v4l.get("device_number", 10)),
                            "label": str(v4l.get("label", "StudioCast Camera")),
                            "exclusive_caps": bool(v4l.get("exclusive_caps", True))}
             if not vf.get("module_available"):
                 ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
-            if not vf.get("module_loaded") or not vf.get("device_present"):
+            if v4l.get("load", True) and (not vf.get("module_loaded") or not vf.get("device_present")):
                 ops.append(operation("v4l.module.load", "trusted_helper", [last], {"operation_type": "v4l.module.load.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.module.load"
             if v4l.get("persist") and vf.get("persistence_state") != "configured":
                 ops.append(operation("v4l.persistence.write", "trusted_helper", [last], {"operation_type": "v4l.persistence.write.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.persistence.write"
@@ -1174,7 +1309,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         service_actual = facts.get("service", {}).get("actual", "unknown")
         service_desired = desired["service"]["desired"]
         expected_actual = "active" if service_desired == "enabled_started" else "inactive"
-        if service_actual != expected_actual:
+        if service_desired in {"enabled_started", "disabled"} and service_actual != expected_actual:
             ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": service_desired}, "service_changes")); last = "service.unit.reconcile"
             ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": service_desired}, "service_changes", failure="degrade")); last = "service.state.reconcile"
         pack_facts = facts.get("models", {}).get("packs", {})
@@ -1212,6 +1347,24 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             extract_to = r["cache"] / "sources" / plan_id
             ops.append(operation("source.archive.extract", "source_extract", [last], {"archive": source_path, "destination": str(extract_to)}, "downloads", source_paths=[source_path], target_paths=[str(extract_to)]))
             last = "source.archive.extract"
+        packages: list[str] = []
+        missing_build_packages = [{"cmake": "cmake", "ninja": "ninja-build", "c++": "build-essential",
+                                   "pkg-config": "pkg-config"}[name]
+                                  for name in facts.get("toolchain", {}).get("missing_build_dependencies", [])
+                                  if name in {"cmake", "ninja", "c++", "pkg-config"}]
+        if desired.get("manage_dependencies"):
+            packages += missing_build_packages
+        if desired.get("vulkan_runtime"):
+            packages += ["libvulkan1", "vulkan-tools"]
+        if desired.get("mesa_packages"):
+            packages += ["mesa-vulkan-drivers"]
+        if desired.get("shader_tools"):
+            packages += ["glslang-tools"]
+        packages = list(dict.fromkeys(packages))
+        if packages:
+            ops.append(operation("dependencies.packages.ensure", "trusted_helper", [last],
+                                 {"operation_type": "packages.ensure.v1", "packages": packages},
+                                 "system_changes", "trusted_helper")); last = "dependencies.packages.ensure"
         ops.append(operation("build.cache.prepare", "build_cache_prepare", [last], {"fresh": bool(getattr(args, "fresh_build", False))}, "application_files", target_paths=[str(build_cache)])); last = "build.cache.prepare"
         cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA": bool(desired["features"]["open_cuda"]),
                  "STUDIOCAST_ENABLE_OPEN_AUDIO": bool(desired["features"]["open_audio"]),
@@ -1221,32 +1374,33 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         ops.append(operation("build.compile", "build_compile", [last], {"build_path": str(build_cache), "targets": list(BINARIES)}, "application_files")); last = "build.compile"
         ops.append(operation("payload.stage", "payload_stage", [last], {"version": target, "build_path": str(build_cache)}, "application_files", target_paths=[str(staging)])); last = "payload.stage"
         ops.append(operation("payload.validate", "payload_validate", [last], {"required_binaries": list(BINARIES)}, "validation", "none")); last = "payload.validate"
-        packages: list[str] = []
-        if desired.get("vulkan_runtime"):
-            packages += ["libvulkan1", "vulkan-tools"]
-        if desired.get("mesa_packages"):
-            packages += ["mesa-vulkan-drivers"]
-        if desired.get("shader_tools"):
-            packages += ["glslang-tools"]
-        if packages:
-            ops.append(operation("dependencies.packages.ensure", "trusted_helper", [last],
-                                 {"operation_type": "packages.ensure.v1", "packages": packages},
-                                 "system_changes", "trusted_helper")); last = "dependencies.packages.ensure"
         v4l = desired["virtual_camera"]
-        if v4l.get("desired"):
+        if v4l.get("desired") is True:
             vf = facts.get("v4l2", {})
             helper_args = {"device_number": int(v4l.get("device_number", 10)), "label": str(v4l.get("label", "StudioCast Camera")),
                            "exclusive_caps": bool(v4l.get("exclusive_caps", True))}
             if not vf.get("module_available"):
                 ops.append(operation("v4l.package.ensure", "trusted_helper", [last], {"operation_type": "packages.ensure.v1", "packages": ["v4l2loopback-dkms", "v4l2loopback-utils"]}, "system_changes", "trusted_helper")); last = "v4l.package.ensure"
-            if not vf.get("module_loaded") or not vf.get("device_present"):
+            if v4l.get("load", True) and (not vf.get("module_loaded") or not vf.get("device_present")):
                 ops.append(operation("v4l.module.load", "trusted_helper", [last], {"operation_type": "v4l.module.load.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.module.load"
             if v4l.get("persist") and vf.get("persistence_state") != "configured":
                 ops.append(operation("v4l.persistence.write", "trusted_helper", [last], {"operation_type": "v4l.persistence.write.v1", **helper_args}, "system_changes", "trusted_helper")); last = "v4l.persistence.write"
+            elif not v4l.get("persist") and vf.get("persistence_state") == "configured":
+                owned = vf.get("owned_configuration", [])
+                expected_hashes = {item.get("id"): item.get("sha256") for item in owned
+                                   if isinstance(item, dict) and item.get("id") in V4L_OWNED_PATHS}
+                if set(expected_hashes) == set(V4L_OWNED_PATHS):
+                    ops.append(operation("v4l.persistence.remove", "trusted_helper", [last],
+                        {"operation_type": "v4l.persistence.remove.v1", "expected_hashes": expected_hashes},
+                        "system_changes", "trusted_helper")); last = "v4l.persistence.remove"
+                else:
+                    plan_specific_warnings.append({"code": "v4l.persistence.ownership_unverified_manual_cleanup",
+                                                   "applies_to": "system_changes"})
         ops.append(operation("payload.activate", "payload_activate", [last], {"version": target}, "application_files", target_paths=[str(target_payload), str(current)])); last = "payload.activate"
         ops.append(operation("links.reconcile", "links_reconcile", [last], {"desired": "present", "binaries": list(BINARIES)}, "application_files")); last = "links.reconcile"
-        ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes")); last = "service.unit.reconcile"
-        ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes", failure="degrade")); last = "service.state.reconcile"
+        if desired["service"].get("desired") in {"enabled_started", "disabled"}:
+            ops.append(operation("service.unit.reconcile", "service_unit_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes")); last = "service.unit.reconcile"
+            ops.append(operation("service.state.reconcile", "service_state_reconcile", [last], {"desired": desired["service"]["desired"]}, "service_changes", failure="degrade")); last = "service.state.reconcile"
         for pack in desired["model_pack_ids"]:
             append_model_transaction(pack)
         if intent in {"clean-install", "reinstall"} and preservation["preserve_settings"]:
@@ -1260,7 +1414,37 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         blockers = []
     if not desired["virtual_camera"].get("desired"):
         blockers = [item for item in blockers if item.get("applies_to") != "virtual_camera"]
-    if any(op["privilege"] == "trusted_helper" for op in ops) and not facts.get("privileged_helper", {}).get("trusted", False):
+    if desired.get("service", {}).get("desired") in {"enabled_started", "disabled"}:
+        blockers = [item for item in blockers
+                    if item.get("code") != "configuration.service.selection_required"]
+    if type(desired.get("virtual_camera", {}).get("desired")) is bool:
+        blockers = [item for item in blockers
+                    if item.get("code") != "configuration.virtual_camera.selection_required"]
+    if (intent != "uninstall" and rec.get("selection_route", rec["route"]) == "recommended" and
+            desired.get("model_pack_ids") and
+            (not model_catalog.get("size_metadata", {}).get("trusted", False) or
+             any(type(artifact.get("size_bytes")) is not int
+                 for pack_id in desired["model_pack_ids"]
+                 for artifact in model_packs[pack_id]["artifacts"]))):
+        blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
+    missing_build = facts.get("toolchain", {}).get("missing_build_dependencies", [])
+    if missing_build and not desired.get("manage_dependencies"):
+        blockers.append({"code": "toolchain.build_dependencies_missing", "applies_to": "system_changes",
+                         "missing": list(missing_build)})
+    camera = desired.get("virtual_camera", {})
+    if (camera.get("desired") is True and not camera.get("load", True) and
+            (not facts.get("v4l2", {}).get("module_loaded") or
+             not facts.get("v4l2", {}).get("device_present"))):
+        limitation = {"code": "v4l.load.disabled_device_unavailable", "applies_to": "virtual_camera"}
+        if camera.get("required_for_success"):
+            blockers.append(limitation)
+        else:
+            warnings.append(limitation)
+    helper = facts.get("privileged_helper", {})
+    helper_ready = bool(helper.get("trusted", False) and
+                        helper.get("compatible", helper.get("trusted", False)) and
+                        helper.get("authorization_transport_available", helper.get("trusted", False)))
+    if any(op["privilege"] == "trusted_helper" for op in ops) and not helper_ready:
         if intent == "uninstall":
             ops = [op for op in ops if op["privilege"] != "trusted_helper"]
             previous: str | None = None
@@ -1269,8 +1453,11 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                 previous = op["id"]
             warnings.append({"code": "v4l.persistence.helper_unavailable_manual_cleanup",
                              "applies_to": "system_changes"})
-        elif not any(item.get("code") == "privileged_helper_missing" for item in blockers):
-            blockers.append({"code": "privileged_helper_missing", "applies_to": "system_changes"})
+        elif not any(item.get("applies_to") == "system_changes" and
+                     item.get("code", "").startswith(("privileged_helper", "authorization_"))
+                     for item in blockers):
+            blockers.append({"code": helper.get("reason_codes", ["privileged_helper_missing"])[0],
+                             "applies_to": "system_changes"})
     if verified_release:
         active_version = facts.get("installation", {}).get("active_version")
         try:
@@ -1292,13 +1479,14 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             blockers.append({"code": "release.installer_update_required", "applies_to": "installer",
                              "minimum_version": verified_release["minimum_installer_version"],
                              "current_version": installer_version()})
-    if rec["route"] == "recommended" and intent != "uninstall" and not verified_release:
+    if (rec.get("selection_route", rec["route"]) == "recommended" and
+            intent != "uninstall" and not verified_release):
         # A caller-supplied boolean is not provenance.  The release-channel
         # verifier must replace this blocker with signed manifest/archive
         # evidence when the two components are integrated.
         blockers.append({"code": "source.signed_verification_receipt_required", "applies_to": "source"})
     if getattr(args, "allow_unsupported", False) and intent != "uninstall":
-        if rec["route"] != "advanced":
+        if rec.get("selection_route", rec["route"]) != "advanced":
             blockers.append({"code": "os.unsupported.override_requires_advanced",
                              "applies_to": "installation"})
         # Developer override permits only unprivileged work; automatic package or
@@ -1329,11 +1517,15 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
 
     plan = {"schema_version": 1, "plan_version": PLAN_VERSION, "policy_version": POLICY_VERSION,
         "plan_id": plan_id, "created_at": created, "expires_at": expires, "intent": intent,
-        "route": rec["route"], "facts_fingerprint": facts["host_fingerprint"],
+        "route": rec.get("selection_route", rec["route"]),
+        "detected_route": rec["route"], "facts_fingerprint": facts["host_fingerprint"],
         "core_reuse": minimal_repair,
         "privilege_preconditions": {"base_os": facts.get("os", {}).get("base_id"),
             "base_release": facts.get("os", {}).get("base_version_id"),
-            "kernel_release": facts.get("os", {}).get("kernel_release")},
+            "kernel_release": facts.get("os", {}).get("kernel_release"),
+            "helper": {key: copy.deepcopy(helper.get(key)) for key in (
+                "path", "trusted", "compatible", "authorization_transport_available",
+                "helper_version", "protocol_versions", "pkexec_path", "policy_path")}},
         "observed_state": {"service": copy.deepcopy(facts.get("service", {})),
                            "systemd_user": copy.deepcopy(facts.get("systemd_user", {})),
                            "v4l2": copy.deepcopy(facts.get("v4l2", {}))},
@@ -1415,6 +1607,8 @@ class Executor:
         self.source_root = Path(plan["source"]["path"])
         self.reused_core = bool(plan.get("core_reuse"))
         self.core_committed = self.reused_core
+        self.activated_new_payload = False
+        self.rollback_state: str | None = None
         self.failed_operation: str | None = None
         self.retryable: list[str] = []
         self.model_results: dict[str, dict[str, Any]] = {}
@@ -1526,15 +1720,18 @@ class Executor:
                 failure = exc
                 break
         state = "cancelled" if self.cancelled else "failed" if failure else "degraded" if self.retryable else "committed"
-        if state in {"failed", "cancelled"} and not self.core_committed:
-            self.restore_previous_pointer()
+        if state in {"failed", "cancelled"} and self.activated_new_payload:
+            self.rollback_after_activation(failure)
         if state in {"failed", "cancelled"}:
             self.compensate_settings()
+        if self.rollback_state == "rolled_back":
+            state = "rolled_back"
         if not self.dry_run:
             self.write_manifest(state, failure)
         result = {"schema_version": 1, "result_version": RESULT_VERSION,
             "plan_id": self.plan["plan_id"], "plan_digest": self.plan["plan_digest"],
             "transaction_id": self.transaction_id, "transaction_state": state, "state": state,
+            "rollback_state": self.rollback_state,
             "core_committed": self.core_committed, "active_version": self.plan["desired_state"].get("version") or self.plan["paths"]["target_payload"].rstrip("/").split("/")[-1] if self.core_committed else (self.active_before or {}).get("version"),
             "failed_operation_id": self.failed_operation, "error": None if failure is None else {"code": failure.code, "message": failure.message, "details": failure.details},
             "retryable_operation_ids": self.retryable, "reviewed_operation_ids": [op["id"] for op in self.plan["operations"]],
@@ -1715,10 +1912,14 @@ class Executor:
                 raise BackendError("privileged_helper_missing", "Test privilege adapters are missing")
         else:
             facts = helper_facts()
-            if not facts["trusted"]: raise BackendError(facts["reason_codes"][0], "Trusted StudioCast system helper is unavailable")
+            if not (facts["trusted"] and facts["compatible"] and
+                    facts["authorization_transport_available"]):
+                raise BackendError(facts["reason_codes"][0],
+                                   "Trusted StudioCast system helper authorization is unavailable")
         request = {"schema_version": 1, "request_id": str(uuid.uuid4()), "transaction_id": self.transaction_id,
             "policy_version": 1, "plan_digest": self.plan["plan_digest"],
-            "preconditions": self.plan["privilege_preconditions"],
+            "preconditions": {key: self.plan["privilege_preconditions"][key]
+                              for key in ("base_os", "base_release", "kernel_release")},
             "operations": [{"id": self.executed[-1], "type": inputs["operation_type"],
                             **{k: v for k, v in inputs.items() if k != "operation_type"}}]}
         if self.dry_run: return
@@ -1784,14 +1985,54 @@ class Executor:
         os.symlink(str(target), tmp_link)
         os.replace(tmp_link, current)
         self.core_committed = True
+        self.activated_new_payload = True
 
-    def restore_previous_pointer(self) -> None:
-        if not self.active_before: return
-        previous = Path(self.active_before.get("path", "")); current = self.r["data"] / "current"
-        if not is_beneath(previous, self.r["data"] / "payloads") or not previous.is_dir(): return
+    def rollback_after_activation(self, failure: BackendError | None) -> None:
+        self.rollback_state = "rolling_back"
+        self.journal.append({"sequence": len(self.journal) + 1,
+            "operation_id": "payload.rollback", "state": "rolling_back", "finished_at": utc_now(),
+            "exit": {"kind": "backend_result", "code": 0, "signal": None}, "error": None,
+            "compensation_operation_ids": ["payload.activate"]})
         if not self.dry_run:
-            tmp = current.with_name(f".{current.name}.rollback-{uuid.uuid4().hex}")
-            os.symlink(previous, tmp); os.replace(tmp, current)
+            self.write_manifest("rolling_back", failure)
+        try:
+            current = self.r["data"] / "current"
+            validate_mutation_path(current, [self.r["data"]])
+            expected_target = Path(self.plan["paths"]["target_payload"])
+            if not current.is_symlink() or current.readlink() != expected_target:
+                raise BackendError("rollback.current_pointer_changed",
+                                   "The active pointer changed during rollback")
+            if self.active_before:
+                previous = Path(self.active_before.get("path", ""))
+                if (not is_beneath(previous, self.r["data"] / "payloads") or
+                        not previous.is_dir() or previous.is_symlink()):
+                    raise BackendError("rollback.previous_payload_unavailable",
+                                       "The previous durable payload is unavailable")
+                if not self.dry_run:
+                    tmp = current.with_name(f".{current.name}.rollback-{uuid.uuid4().hex}")
+                    try:
+                        os.symlink(previous, tmp)
+                        os.replace(tmp, current)
+                    finally:
+                        if tmp.is_symlink():
+                            tmp.unlink()
+            elif not self.dry_run:
+                current.unlink()
+            self.core_committed = False
+            self.rollback_state = "rolled_back"
+            rollback_error = None
+        except (OSError, BackendError) as exc:
+            rollback_error = (exc if isinstance(exc, BackendError) else
+                              BackendError("rollback.pointer_restore_failed", str(exc)))
+            self.rollback_state = "rollback_failed"
+        self.journal.append({"sequence": len(self.journal) + 1,
+            "operation_id": "payload.rollback", "state": self.rollback_state,
+            "finished_at": utc_now(),
+            "exit": {"kind": "backend_result", "code": 0 if rollback_error is None else 1,
+                     "signal": None},
+            "error": None if rollback_error is None else {"code": rollback_error.code,
+                "message": rollback_error.message, "details": rollback_error.details},
+            "compensation_operation_ids": ["payload.activate"]})
 
     def reconcile_links(self, desired: str, names: Any) -> None:
         self.r["bin"].mkdir(parents=True, exist_ok=True)
@@ -1879,7 +2120,7 @@ class Executor:
                 Path(inputs["destination_root"]) / inputs["family"], self.r["cache"] / "models",
                 transport, offline=bool(inputs["offline"]), retries=int(inputs["retries"]))
             result = installer.install(inputs["family"], [inputs["pack_id"]], force=False,
-                                       recommended=False)
+                                       recommended=bool(inputs["recommended"]))
         except (OSError, module.CatalogError, module.TransactionError) as exc:
             raise BackendError(getattr(exc, "reason_code", "model.transaction_failed"), str(exc)) from exc
         self.model_results[inputs["pack_id"]] = copy.deepcopy(result)
@@ -1934,6 +2175,10 @@ class Executor:
         if target == "build_cache":
             for path in (self.r["cache"] / "builds", self.r["cache"] / "sources"):
                 if path.exists() and not self.dry_run: safe_remove(path, [self.r["cache"]])
+            return
+        if target == "cache":
+            if self.r["cache"].exists() and not self.dry_run:
+                safe_remove(self.r["cache"], [self.r["cache"].parent])
             return
         path = mapping.get(target)
         if path and path.exists() and not self.dry_run: safe_remove(path, [path.parent])
@@ -2032,7 +2277,7 @@ def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> Non
                     re.fullmatch(r"[ A-Za-z0-9_.()+-]{1,64}", str(inputs.get("label", ""))) is None):
                 raise BackendError("plan.unsafe_privilege", "Invalid reviewed v4l arguments")
     elif kind == "cleanup" and inputs.get("target") not in {
-            "payloads", "build_cache", "runtime_state", "models", "settings", "data", "service"}:
+            "payloads", "build_cache", "runtime_state", "models", "settings", "cache", "data", "service"}:
         raise BackendError("plan.operation_schema", f"Unknown cleanup target: {inputs.get('target')}")
     elif kind == "release_acquire":
         expected_fields = {"manifest_path", "signature_path", "manifest_sha256", "manifest_key_id",
@@ -2052,12 +2297,13 @@ def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> Non
             raise BackendError("plan.path_binding", "Release cache target differs from the reviewed source")
     elif kind == "model_transaction":
         expected_fields = {"pack_id", "family", "catalog_version", "catalog_sha256",
-                           "source", "offline", "retries", "destination_root", "pack"}
+                           "source", "offline", "retries", "recommended", "destination_root", "pack"}
         if (set(inputs) != expected_fields or inputs.get("pack_id") not in DEFAULT_MODEL_PACKS or
                 inputs.get("family") not in {"open_audio", "open_video"} or
                 re.fullmatch(r"sha256:[0-9a-f]{64}", str(inputs.get("catalog_sha256", ""))) is None or
                 not isinstance(inputs.get("source"), str) or not inputs["source"] or
                 type(inputs.get("offline")) is not bool or type(inputs.get("retries")) is not int or
+                type(inputs.get("recommended")) is not bool or
                 not 0 <= inputs["retries"] <= 10 or not isinstance(inputs.get("pack"), dict) or
                 inputs["pack"].get("id") != inputs["pack_id"] or
                 inputs["pack"].get("family") != inputs["family"]):
@@ -2107,15 +2353,24 @@ def validate_current_preconditions(plan: dict[str, Any]) -> None:
     if actual_active != reviewed.get("active_version"):
         raise BackendError("plan.precondition_changed", "Active installation version changed after review")
     if any(op.get("privilege") == "trusted_helper" for op in plan.get("operations", [])):
-        if os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") != "1":
+        test_mode = os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1"
+        if not test_mode:
             os_now = os_facts()
             expected = plan.get("privilege_preconditions", {})
             if (os_now["base_id"] != expected.get("base_os") or
                     os_now["base_version_id"] != expected.get("base_release") or
                     os_now["kernel_release"] != expected.get("kernel_release")):
                 raise BackendError("plan.precondition_changed", "Privileged host preconditions changed after review")
-            if not helper_facts().get("trusted"):
-                raise BackendError("privileged_helper_missing", "Trusted helper changed after review")
+        helper_now = helper_facts()
+        if not (helper_now.get("trusted") and helper_now.get("compatible") and
+                helper_now.get("authorization_transport_available")):
+            raise BackendError(helper_now.get("reason_codes", ["privileged_helper_missing"])[0],
+                               "Trusted helper changed or authorization is unavailable after review")
+        expected_helper = plan.get("privilege_preconditions", {}).get("helper", {})
+        for key in ("helper_version", "protocol_versions"):
+            if expected_helper.get(key) is not None and helper_now.get(key) != expected_helper.get(key):
+                raise BackendError("plan.precondition_changed",
+                                   "Trusted helper compatibility changed after review")
 
 
 def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts: dict[str, Any] | None) -> None:
@@ -2226,10 +2481,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--v4l-label")
     parser.add_argument("--v4l-exclusive-caps", dest="v4l_exclusive_caps", action="store_true")
     parser.add_argument("--no-v4l-exclusive-caps", dest="v4l_exclusive_caps", action="store_false")
-    parser.add_argument("--load-loopback", action="store_true")
-    parser.add_argument("--no-load-loopback", action="store_true")
-    parser.add_argument("--persist-loopback", action="store_true")
-    parser.add_argument("--no-persist-loopback", action="store_true")
+    parser.add_argument("--load-loopback", dest="load_loopback", action="store_true")
+    parser.add_argument("--no-load-loopback", dest="load_loopback", action="store_false")
+    parser.add_argument("--persist-loopback", dest="persist_loopback", action="store_true")
+    parser.add_argument("--no-persist-loopback", dest="persist_loopback", action="store_false")
     parser.add_argument("--service", dest="service", action="store_true")
     parser.add_argument("--no-service", dest="service", action="store_false")
     parser.add_argument("--models", dest="models", action="store_true")
@@ -2255,7 +2510,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--remove-user-data", dest="preserve_settings", action="store_false")
     parser.set_defaults(v4l2=None, service=None, models=None, open_backends=None, open_cuda=None,
                         open_audio=None, open_vulkan=None, v4l_exclusive_caps=None,
-                        preserve_settings=None, fresh_build=False, deps=None)
+                        preserve_settings=None, fresh_build=False, deps=None,
+                        load_loopback=None, persist_loopback=None)
 
 
 def output(value: Any, human: str | None = None) -> None:
@@ -2274,9 +2530,13 @@ def failed_result(error: BackendError, plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_facts(args: argparse.Namespace) -> dict[str, Any]:
-    if getattr(args, "facts_file", None): return normalize_fixture(load_json(Path(args.facts_file)))
-    if getattr(args, "input_fixture", None): return normalize_fixture(load_json(Path(args.input_fixture)))
-    return host_analyze(getattr(args, "target_version", None))
+    if getattr(args, "facts_file", None):
+        facts = normalize_fixture(load_json(Path(args.facts_file)))
+    elif getattr(args, "input_fixture", None):
+        facts = normalize_fixture(load_json(Path(args.input_fixture)))
+    else:
+        facts = host_analyze(getattr(args, "target_version", None))
+    return integrate_release_facts(facts, args)
 
 
 def main(argv: list[str]) -> int:
@@ -2323,7 +2583,8 @@ def main(argv: list[str]) -> int:
             "installer_meets_minimum": rc.installer_meets_minimum(installer_version(), evidence["minimum_installer_version"]),
             "offline": bool(args.offline), "verified_source_archive": evidence["archive_path"],
             "source_archive_state": evidence["archive_state"],
-            "source_acquisition_required": evidence["archive_state"] == "acquisition_pending",
+            "source_acquisition_required": (evidence["archive_state"] == "acquisition_pending" and
+                                            evidence.get("archive_cache_state") != "cached_verified"),
             "rollback": rc.rollback_metadata(evidence["version"], installed, roots()["data"] / "payloads")}
         if args.prepare_self_update:
             manifest_view = {"release": {"version": evidence["version"]},

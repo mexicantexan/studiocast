@@ -349,11 +349,17 @@ class PackagingIntegrationTests(unittest.TestCase):
         plan = json.loads(self.backend("plan", "install", "--facts", str(self.facts_path),
             "--release-receipt", str(pending), "--offline", "--no-v4l2loopback", "--no-service",
             "--no-models", "--release-cache-dir", str(cache_path.parent.parent)).stdout)
+        self.assertIn("network.release.offline_no_verified_cache",
+                      {item["code"] for item in plan["blockers"]})
         path.write_text(json.dumps(plan))
         miss = self.backend("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
             "--token", plan["approval_token"], "--facts", str(self.facts_path), check=False)
-        self.assertEqual(self.terminal_result(miss.stdout)["error"]["code"], "release.cache.miss")
+        terminal = self.terminal_result(miss.stdout)
+        self.assertEqual(terminal["error"]["code"], "plan.blocked")
+        self.assertIn("network.release.offline_no_verified_cache",
+                      {item["code"] for item in terminal["error"]["details"]["blockers"]})
         self.assertFalse(cache_path.exists())
+        self.assertFalse((self.root / "data/studiocast/install-manifest.json").exists())
 
     def test_terminal_result_is_bound_to_reviewed_plan(self) -> None:
         plan = json.loads(self.backend("plan", "install", "--json", "--facts", str(self.facts_path),
