@@ -1444,7 +1444,7 @@ class Executor:
 
     def run_process(self, argv: list[str]) -> None:
         if self.dry_run:
-            print("+ " + " ".join(argv), file=sys.stderr)
+            print("+ " + " ".join(argv))
             return
         self.child = subprocess.Popen(argv, start_new_session=True)
         previous_handlers: dict[int, Any] = {}
