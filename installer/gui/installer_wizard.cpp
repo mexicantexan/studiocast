@@ -7,6 +7,8 @@
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
+#include <QDateTime>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -18,6 +20,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMap>
 #include <QPlainTextEdit>
 #include <QProcessEnvironment>
 #include <QProgressBar>
@@ -27,11 +30,14 @@
 #include <QSizePolicy>
 #include <QStandardPaths>
 #include <QStyle>
+#include <QTemporaryFile>
 #include <QTextCursor>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <csignal>
 
 #include "studiocast/version.h"
 
@@ -233,20 +239,80 @@ QString sectionText(const QString &title, const QStringList &items) {
 
 QString planTextFromObject(const QJsonObject &plan) {
   QString text;
-  const QString workflow =
-      jsonString(plan, QStringLiteral("workflow"), QStringLiteral("unknown"));
-  text += QStringLiteral("Workflow: ") + workflow + QStringLiteral("\n");
-  if (workflow != QStringLiteral("uninstall")) {
-    text += QStringLiteral("Supported OS: ") +
-            QString(jsonBool(plan, QStringLiteral("supported"))
-                        ? QStringLiteral("yes")
-                        : QStringLiteral("no")) +
-            QStringLiteral("\n");
-    text += QStringLiteral("Support: ") +
-            jsonString(plan, QStringLiteral("support_reason")) +
-            QStringLiteral("\n");
+  text += QStringLiteral("Action: %1\nRoute: %2\nPlan: %3\nDigest: %4\n\n")
+              .arg(jsonString(plan, QStringLiteral("intent"),
+                              jsonString(plan, QStringLiteral("workflow"),
+                                         QStringLiteral("unknown"))),
+                   jsonString(plan, QStringLiteral("route"),
+                              QStringLiteral("unknown")),
+                   jsonString(plan, QStringLiteral("plan_id"),
+                              QStringLiteral("legacy")),
+                   jsonString(plan, QStringLiteral("plan_digest"),
+                              QStringLiteral("missing")));
+
+  const QJsonObject desired =
+      plan.value(QStringLiteral("desired_state")).toObject();
+  if (!desired.isEmpty()) {
+    text += QStringLiteral("Application files:\n  - User-local scope\n");
+    text += QStringLiteral("  - Build type: %1\n")
+                .arg(jsonString(desired, QStringLiteral("build_type"),
+                                QStringLiteral("unknown")));
+    const QJsonObject camera =
+        desired.value(QStringLiteral("virtual_camera")).toObject();
+    text += QStringLiteral("\nVirtual camera/system changes:\n  - %1\n")
+                .arg(jsonBool(camera, QStringLiteral("desired"))
+                         ? QStringLiteral("Required/selected StudioCast virtual camera")
+                         : QStringLiteral("Virtual camera disabled; installation will be degraded"));
+    const QJsonArray packs =
+        desired.value(QStringLiteral("model_pack_ids")).toArray();
+    text += QStringLiteral("\nModels/downloads (%1 pack IDs):\n").arg(packs.size());
+    int artifactCount = 0;
+    for (const QJsonValue &pack : packs) {
+      text += QStringLiteral("  - %1\n").arg(pack.toString());
+      artifactCount += pack.toString() ==
+                               QStringLiteral("gaze_correction_cam_flx_v0_1_1")
+                           ? 2
+                           : 1;
+    }
+    text += QStringLiteral("  %1 verified artifact files expected\n")
+                .arg(artifactCount);
   }
-  text += QStringLiteral("\n");
+
+  QMap<QString, QStringList> operationsByCategory;
+  const QJsonArray operations = plan.value(QStringLiteral("operations")).toArray();
+  for (const QJsonValue &value : operations) {
+    const QJsonObject operation = value.toObject();
+    const QString category =
+        jsonString(operation.value(QStringLiteral("review")).toObject(),
+                   QStringLiteral("category"), QStringLiteral("other"));
+    QString description = jsonString(operation, QStringLiteral("id"));
+    if (jsonString(operation, QStringLiteral("privilege")) ==
+        QStringLiteral("trusted_helper")) {
+      description += QStringLiteral(" [privileged trusted helper]");
+    }
+    operationsByCategory[category].push_back(description);
+  }
+  for (auto it = operationsByCategory.cbegin(); it != operationsByCategory.cend();
+       ++it) {
+    text += QStringLiteral("\n%1:\n").arg(it.key());
+    for (const QString &operation : it.value()) {
+      text += QStringLiteral("  - %1\n").arg(operation);
+    }
+  }
+
+  const auto codedItems = [&plan](const QString &key) {
+    QStringList items;
+    for (const QJsonValue &value : plan.value(key).toArray()) {
+      const QJsonObject item = value.toObject();
+      items.push_back(jsonString(item, QStringLiteral("code"),
+                                 QStringLiteral("unknown")));
+    }
+    return items;
+  };
+  text += sectionText(QStringLiteral("BLOCKERS:"),
+                      codedItems(QStringLiteral("blockers")));
+  text += sectionText(QStringLiteral("Warnings:"),
+                      codedItems(QStringLiteral("warnings")));
   text += sectionText(QStringLiteral("Summary:"),
                       jsonStringList(plan, QStringLiteral("summary")));
   text += sectionText(QStringLiteral("Changes:"),
@@ -261,6 +327,33 @@ QString planTextFromObject(const QJsonObject &plan) {
   text += sectionText(QStringLiteral("Backend commands:"),
                       jsonStringList(plan, QStringLiteral("commands")));
   return text.trimmed();
+}
+
+QJsonObject lastJsonObject(const QByteArray &bytes) {
+  for (qsizetype offset = bytes.size() - 1; offset >= 0; --offset) {
+    if (bytes.at(offset) != '{') {
+      continue;
+    }
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(bytes.mid(offset), &error);
+    if (error.error == QJsonParseError::NoError && document.isObject()) {
+      return document.object();
+    }
+  }
+  return {};
+}
+
+QString actionLabel(const QString &intent) {
+  if (intent == QStringLiteral("install"))
+    return QStringLiteral("Install");
+  if (intent == QStringLiteral("repair"))
+    return QStringLiteral("Repair");
+  if (intent == QStringLiteral("reinstall") ||
+      intent == QStringLiteral("clean-install"))
+    return QStringLiteral("Reinstall");
+  if (intent == QStringLiteral("uninstall"))
+    return QStringLiteral("Uninstall");
+  return QStringLiteral("Update");
 }
 
 QLabel *mutedLabel(const QString &text, QWidget *parent = nullptr) {
@@ -349,7 +442,7 @@ InstallerWizard::InstallerWizard(QWidget *parent) : QWizard(parent) {
   setWizardStyle(QWizard::ModernStyle);
   setOption(QWizard::NoBackButtonOnStartPage);
   setOption(QWizard::NoCancelButtonOnLastPage);
-  setButtonText(QWizard::CommitButton, QStringLiteral("Finish"));
+  setButtonText(QWizard::CommitButton, QStringLiteral("Install"));
   setPixmap(QWizard::LogoPixmap,
             style()->standardIcon(QStyle::SP_ComputerIcon).pixmap(48, 48));
 
@@ -370,6 +463,8 @@ InstallerWizard::InstallerWizard(QWidget *parent) : QWizard(parent) {
   resize(920, 680);
   refreshStatus();
 }
+
+InstallerWizard::~InstallerWizard() { invalidatePlan(); }
 
 QString InstallerWizard::backendPath() const { return backendPath_; }
 QString InstallerWizard::workflow() const { return workflow_; }
@@ -398,58 +493,139 @@ bool InstallerWizard::freshBuild() const { return freshBuild_; }
 bool InstallerWizard::allowUnsupported() const { return allowUnsupported_; }
 bool InstallerWizard::removeUserData() const { return removeUserData_; }
 
+QString InstallerWizard::detectedRoute() const {
+  return jsonString(statusObject_, QStringLiteral("route"));
+}
+
+QString InstallerWizard::primaryAction() const {
+  return jsonString(statusObject_, QStringLiteral("primary_action"));
+}
+
+void InstallerWizard::invalidatePlan() {
+  if (!reviewedPlanPath_.isEmpty()) {
+    QFile::remove(reviewedPlanPath_);
+  }
+  reviewedPlanPath_.clear();
+  planObject_ = {};
+  planReady_ = false;
+  planError_.clear();
+}
+
 void InstallerWizard::setWorkflow(const QString &workflow) {
+  if (workflow_ != workflow) {
+    invalidatePlan();
+  }
   workflow_ = workflow;
   updatePreferenceProgressBars();
 }
-void InstallerWizard::setSourceDir(const QString &path) { sourceDir_ = path; }
+void InstallerWizard::setCustomRoute(bool enabled) {
+  if (customRoute_ != enabled) {
+    invalidatePlan();
+  }
+  customRoute_ = enabled;
+}
+void InstallerWizard::setSourceDir(const QString &path) {
+  if (sourceDir_ != path)
+    invalidatePlan();
+  sourceDir_ = path;
+}
 void InstallerWizard::setReleaseArchive(const QString &path) {
+  if (releaseArchive_ != path)
+    invalidatePlan();
   releaseArchive_ = path;
 }
 void InstallerWizard::setUseReleaseArchive(bool enabled) {
+  if (useReleaseArchive_ != enabled)
+    invalidatePlan();
   useReleaseArchive_ = enabled;
 }
-void InstallerWizard::setBuildDir(const QString &path) { buildDir_ = path; }
-void InstallerWizard::setBuildType(const QString &type) { buildType_ = type; }
-void InstallerWizard::setInstallDeps(bool enabled) { installDeps_ = enabled; }
+void InstallerWizard::setBuildDir(const QString &path) {
+  if (buildDir_ != path)
+    invalidatePlan();
+  buildDir_ = path;
+}
+void InstallerWizard::setBuildType(const QString &type) {
+  if (buildType_ != type)
+    invalidatePlan();
+  buildType_ = type;
+}
+void InstallerWizard::setInstallDeps(bool enabled) {
+  if (installDeps_ != enabled)
+    invalidatePlan();
+  installDeps_ = enabled;
+}
 void InstallerWizard::setConfigureV4l2Loopback(bool enabled) {
+  if (configureV4l2Loopback_ != enabled)
+    invalidatePlan();
   configureV4l2Loopback_ = enabled;
 }
-void InstallerWizard::setLoadLoopback(bool enabled) { loadLoopback_ = enabled; }
+void InstallerWizard::setLoadLoopback(bool enabled) {
+  if (loadLoopback_ != enabled)
+    invalidatePlan();
+  loadLoopback_ = enabled;
+}
 void InstallerWizard::setPersistLoopback(bool enabled) {
+  if (persistLoopback_ != enabled)
+    invalidatePlan();
   persistLoopback_ = enabled;
 }
 void InstallerWizard::setInstallService(bool enabled) {
+  if (installService_ != enabled)
+    invalidatePlan();
   installService_ = enabled;
 }
 void InstallerWizard::setOpenBackendsSetup(bool enabled) {
+  if (openBackendsSetup_ != enabled)
+    invalidatePlan();
   openBackendsSetup_ = enabled;
 }
-void InstallerWizard::setOpenVulkan(bool enabled) { openVulkan_ = enabled; }
+void InstallerWizard::setOpenVulkan(bool enabled) {
+  if (openVulkan_ != enabled)
+    invalidatePlan();
+  openVulkan_ = enabled;
+}
 void InstallerWizard::setInstallVulkanRuntime(bool enabled) {
+  if (installVulkanRuntime_ != enabled)
+    invalidatePlan();
   installVulkanRuntime_ = enabled;
   if (!enabled) {
     installMesaVulkan_ = false;
   }
 }
 void InstallerWizard::setInstallMesaVulkan(bool enabled) {
+  if (installMesaVulkan_ != enabled)
+    invalidatePlan();
   installMesaVulkan_ = enabled;
   if (enabled) {
     installVulkanRuntime_ = true;
   }
 }
 void InstallerWizard::setInstallShaderTools(bool enabled) {
+  if (installShaderTools_ != enabled)
+    invalidatePlan();
   installShaderTools_ = enabled;
 }
 void InstallerWizard::setInstallModels(bool enabled) {
+  if (installModels_ != enabled)
+    invalidatePlan();
   installModels_ = enabled;
 }
-void InstallerWizard::setFreshBuild(bool enabled) { freshBuild_ = enabled; }
+void InstallerWizard::setFreshBuild(bool enabled) {
+  if (freshBuild_ != enabled)
+    invalidatePlan();
+  freshBuild_ = enabled;
+}
 void InstallerWizard::setAllowUnsupported(bool enabled) {
   allowUnsupported_ = enabled;
 }
 void InstallerWizard::setRemoveUserData(bool enabled) {
+  if (removeUserData_ != enabled)
+    invalidatePlan();
   removeUserData_ = enabled;
+}
+
+void InstallerWizard::setExecutionResult(const QJsonObject &result) {
+  executionResult_ = result;
 }
 
 bool InstallerWizard::runBackendJson(const QStringList &args,
@@ -505,37 +681,189 @@ bool InstallerWizard::runBackendJson(const QStringList &args,
 }
 
 void InstallerWizard::refreshStatus() {
+  analysisAvailable_ = false;
+  analysisError_.clear();
   QString error;
+  QJsonObject facts;
+  if (!runBackendJson(
+          QStringList{QStringLiteral("analyze"), QStringLiteral("--json")},
+          &facts, &error)) {
+    factsObject_ = {};
+    statusObject_ = {{QStringLiteral("backend_error"), error},
+                     {QStringLiteral("route"), QStringLiteral("analysis_error")},
+                     {QStringLiteral("primary_action"), QStringLiteral("retry")}};
+    osObject_ = {};
+    analysisError_ = error;
+    return;
+  }
   QJsonObject status;
   if (runBackendJson(
           QStringList{QStringLiteral("status"), QStringLiteral("--json")},
           &status, &error)) {
+    if (facts.value(QStringLiteral("facts_version")).toString() !=
+            QStringLiteral("installer-facts/v1") ||
+        status.value(QStringLiteral("schema_version")).toInt() != 2) {
+      analysisError_ = QStringLiteral("Unsupported installer analysis protocol.");
+      statusObject_ = {{QStringLiteral("backend_error"), analysisError_},
+                       {QStringLiteral("route"), QStringLiteral("analysis_error")},
+                       {QStringLiteral("primary_action"), QStringLiteral("retry")}};
+      factsObject_ = {};
+      osObject_ = {};
+      return;
+    }
+    factsObject_ = facts;
     statusObject_ = status;
-    osObject_ = status.value(QStringLiteral("os")).toObject();
+    osObject_ = facts.value(QStringLiteral("os")).toObject();
+    analysisAvailable_ = true;
+    seedFromPriorDesiredConfiguration();
   } else {
-    statusObject_ = QJsonObject{
-        {QStringLiteral("project_version"), QStringLiteral(STUDIOCAST_VERSION)},
-        {QStringLiteral("installed"), false},
-        {QStringLiteral("installed_version"), QString()},
-        {QStringLiteral("backend_error"), error},
-    };
-    osObject_ = QJsonObject{
-        {QStringLiteral("supported"), false},
-        {QStringLiteral("support_reason"), error},
-    };
+    factsObject_ = {};
+    statusObject_ = {{QStringLiteral("backend_error"), error},
+                     {QStringLiteral("route"), QStringLiteral("analysis_error")},
+                     {QStringLiteral("primary_action"), QStringLiteral("retry")}};
+    osObject_ = {};
+    analysisError_ = error;
+  }
+}
+
+void InstallerWizard::seedFromPriorDesiredConfiguration() {
+  if (priorConfigurationSeeded_) {
+    return;
+  }
+  priorConfigurationSeeded_ = true;
+  const QJsonObject installation =
+      factsObject_.value(QStringLiteral("installation")).toObject();
+  const QJsonObject prior =
+      installation.value(QStringLiteral("desired_configuration")).toObject();
+  if (!prior.isEmpty()) {
+    buildType_ = jsonString(prior, QStringLiteral("build_type"), buildType_);
+    const QJsonObject features =
+        prior.value(QStringLiteral("features")).toObject();
+    openBackendsSetup_ =
+        jsonBool(features, QStringLiteral("open_cuda"), openBackendsSetup_) ||
+        jsonBool(features, QStringLiteral("open_audio"), openBackendsSetup_);
+    openVulkan_ = jsonBool(features, QStringLiteral("open_vulkan"), false);
+    const QJsonObject service = prior.value(QStringLiteral("service")).toObject();
+    installService_ =
+        jsonString(service, QStringLiteral("desired")) ==
+        QStringLiteral("enabled_started");
+    const QJsonObject camera = prior.value(QStringLiteral("v4l")).toObject();
+    configureV4l2Loopback_ =
+        jsonBool(camera, QStringLiteral("desired"), configureV4l2Loopback_);
+    loadLoopback_ = configureV4l2Loopback_;
+    persistLoopback_ = jsonBool(camera, QStringLiteral("persist"),
+                                persistLoopback_);
+    installModels_ = !prior.value(QStringLiteral("model_pack_ids"))
+                          .toArray()
+                          .isEmpty();
+    removeUserData_ =
+        !jsonBool(prior, QStringLiteral("preserve_settings"), true);
+  } else {
+    installModels_ = true;
+    openVulkan_ = false;
   }
 }
 
 bool InstallerWizard::refreshPlan(QString *error) {
+  invalidatePlan();
+  if (!analysisAvailable_) {
+    planError_ = analysisError_.isEmpty()
+                     ? QStringLiteral("Analysis is unavailable.")
+                     : analysisError_;
+    if (error)
+      *error = planError_;
+    return false;
+  }
+  if (detectedRoute() == QStringLiteral("unsupported") ||
+      detectedRoute() == QStringLiteral("offline") ||
+      detectedRoute() == QStringLiteral("analysis_error")) {
+    planError_ = QStringLiteral(
+        "Automatic changes are blocked for this analyzed system state.");
+    if (error)
+      *error = planError_;
+    return false;
+  }
+  if (!customRoute_ && workflow_ != QStringLiteral("repair") &&
+      workflow_ != QStringLiteral("uninstall") &&
+      (!useReleaseArchive_ || releaseArchive_.isEmpty() ||
+       !QFileInfo(releaseArchive_).isFile())) {
+    planError_ = QStringLiteral(
+        "Recommended installation requires the verified official release archive.");
+    if (error)
+      *error = planError_;
+    return false;
+  }
   QJsonObject plan;
   QStringList args{QStringLiteral("plan"), workflow_, QStringLiteral("--json")};
   args += backendOptions(true);
   if (!runBackendJson(args, &plan, error)) {
-    planObject_ = QJsonObject();
+    planError_ = error ? *error : QStringLiteral("Plan generation failed.");
     return false;
   }
+  return validateAndPersistPlan(plan, error);
+}
+
+bool InstallerWizard::validateAndPersistPlan(const QJsonObject &plan,
+                                              QString *error) {
+  const QString digest = jsonString(plan, QStringLiteral("plan_digest"));
+  const QString token = jsonString(plan, QStringLiteral("approval_token"));
+  const QJsonArray operations = plan.value(QStringLiteral("operations")).toArray();
+  QString validationError;
+  if (plan.value(QStringLiteral("schema_version")).toInt() != 1 ||
+      jsonString(plan, QStringLiteral("plan_version")) !=
+          QStringLiteral("installer-plan/v1")) {
+    validationError = QStringLiteral("Unsupported reviewed plan schema.");
+  } else if (!digest.startsWith(QStringLiteral("sha256:")) || token.isEmpty()) {
+    validationError = QStringLiteral("Reviewed plan is missing its digest or approval token.");
+  } else if (operations.isEmpty()) {
+    validationError = QStringLiteral("Reviewed plan contains no operations.");
+  } else if (!plan.value(QStringLiteral("blockers")).toArray().isEmpty()) {
+    validationError = QStringLiteral("Reviewed plan contains blocking conditions.");
+  } else {
+    const QDateTime expiry = QDateTime::fromString(
+        jsonString(plan, QStringLiteral("expires_at")), Qt::ISODate);
+    if (!expiry.isValid() || expiry <= QDateTime::currentDateTimeUtc()) {
+      validationError = QStringLiteral("Reviewed plan is expired or has no valid expiry.");
+    }
+  }
+  if (!validationError.isEmpty()) {
+    planError_ = validationError;
+    if (error)
+      *error = validationError;
+    return false;
+  }
+
+  const QString tempRoot =
+      QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+  QTemporaryFile file(
+      QDir(tempRoot).filePath(QStringLiteral("studiocast-reviewed-plan-XXXXXX.json")));
+  file.setAutoRemove(false);
+  if (!file.open() ||
+      file.write(QJsonDocument(plan).toJson(QJsonDocument::Indented)) < 0 ||
+      !file.flush()) {
+    planError_ = QStringLiteral("Could not persist the exact reviewed plan privately.");
+    if (error)
+      *error = planError_;
+    return false;
+  }
+  file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  reviewedPlanPath_ = file.fileName();
+  file.close();
   planObject_ = plan;
+  planReady_ = true;
+  planError_.clear();
   return true;
+}
+
+QStringList InstallerWizard::executionCommandArguments() const {
+  if (!planReady_ || reviewedPlanPath_.isEmpty()) {
+    return {};
+  }
+  return {QStringLiteral("execute-plan"), QStringLiteral("--plan"),
+          reviewedPlanPath_, QStringLiteral("--digest"),
+          jsonString(planObject_, QStringLiteral("plan_digest")),
+          QStringLiteral("--token"),
+          jsonString(planObject_, QStringLiteral("approval_token"))};
 }
 
 QStringList InstallerWizard::backendOptions(bool forPlan) const {
@@ -555,6 +883,9 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
   if (needsSource) {
     if (useReleaseArchive_ && !releaseArchive_.isEmpty()) {
       args << QStringLiteral("--release-archive") << releaseArchive_;
+      if (!customRoute_) {
+        args << QStringLiteral("--official-source");
+      }
     } else if (!sourceDir_.isEmpty()) {
       args << QStringLiteral("--source-dir") << sourceDir_;
     }
@@ -601,9 +932,6 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
                        : QStringLiteral("--no-fresh-build"));
   args << (removeUserData_ ? QStringLiteral("--remove-user-data")
                            : QStringLiteral("--preserve-user-data"));
-  if (allowUnsupported_) {
-    args << QStringLiteral("--allow-unsupported");
-  }
   if (!forPlan) {
     args << QStringLiteral("--yes");
   }
@@ -611,11 +939,7 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
 }
 
 QStringList InstallerWizard::workflowCommandArguments(bool dryRun) const {
-  if (workflow_ == QStringLiteral("advanced")) {
-    return QStringList{QStringLiteral("advanced")};
-  }
-  QStringList args{workflow_};
-  args += backendOptions(false);
+  QStringList args = executionCommandArguments();
   if (dryRun) {
     args << QStringLiteral("--dry-run");
   }
@@ -625,8 +949,12 @@ QStringList InstallerWizard::workflowCommandArguments(bool dryRun) const {
 int InstallerWizard::nextId() const {
   switch (currentId()) {
   case PageIntro:
-    return workflow_ == QStringLiteral("uninstall") ? PageUninstall
-                                                    : PageCompatibility;
+    if (workflow_ == QStringLiteral("uninstall"))
+      return PageUninstall;
+    if (workflow_ == QStringLiteral("reinstall") ||
+        workflow_ == QStringLiteral("clean-install"))
+      return PageServiceOptions;
+    return customRoute_ ? PageDependencyPlan : PageReview;
   case PageCompatibility:
     return PageDependencyPlan;
   case PageDependencyPlan:
@@ -646,6 +974,15 @@ int InstallerWizard::nextId() const {
   default:
     return -1;
   }
+}
+
+void InstallerWizard::reject() {
+  auto *progress = dynamic_cast<ProgressPage *>(page(PageProgress));
+  if (currentId() == PageProgress && progress && progress->isRunning()) {
+    progress->requestCancellation();
+    return;
+  }
+  QWizard::reject();
 }
 
 void InstallerWizard::updatePreferenceProgressBars() {
@@ -674,7 +1011,7 @@ void InstallerWizard::updatePreferenceProgressBars() {
 
 IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   setTitle(QStringLiteral("StudioCast Installer"));
-  setSubTitle(QStringLiteral("Select the workflow to run on this system."));
+  setSubTitle(QStringLiteral("Choose an action based on the analyzed installation state."));
 
   auto *layout = new QVBoxLayout(this);
   auto *statusBox = new QGroupBox(QStringLiteral("Detected system"), this);
@@ -689,41 +1026,55 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   form->addRow(QStringLiteral("Install status"), installValue_);
   layout->addWidget(statusBox);
 
-  auto *workflowBox = new QGroupBox(QStringLiteral("Workflow"), this);
+  auto *workflowBox = new QGroupBox(QStringLiteral("Available actions"), this);
   auto *workflowLayout = new QVBoxLayout();
   workflowGroup_ = new QButtonGroup(workflowBox);
-  const QList<QPair<QString, QString>> workflows = {
-      {QStringLiteral("install"), QStringLiteral("Install StudioCast")},
-      {QStringLiteral("update"), QStringLiteral("Update StudioCast")},
-      {QStringLiteral("repair"), QStringLiteral("Repair installation")},
-      {QStringLiteral("uninstall"), QStringLiteral("Uninstall")},
-      {QStringLiteral("clean-install"), QStringLiteral("Clean install")},
-      {QStringLiteral("advanced"), QStringLiteral("Advanced/manual options")},
-  };
-  int id = 0;
-  for (const auto &workflow : workflows) {
-    auto *radio = new QRadioButton(workflow.second, workflowBox);
-    radio->setProperty("workflow", workflow.first);
-    workflowGroup_->addButton(radio, id++);
+  const auto addAction = [this, workflowBox,
+                          workflowLayout](const QString &name) {
+    auto *radio = new QRadioButton(workflowBox);
+    radio->setObjectName(name);
+    workflowGroup_->addButton(radio);
     workflowLayout->addWidget(radio);
     connect(radio, &QRadioButton::toggled, this, [this, radio](bool checked) {
       if (checked) {
         if (auto *w = installerWizard(this)) {
           w->setWorkflow(radio->property("workflow").toString());
+          w->setCustomRoute(radio->property("customRoute").toBool());
+          if (radio->property("recommended").toBool()) {
+            w->setBuildType(QStringLiteral("Release"));
+            w->setConfigureV4l2Loopback(true);
+            w->setLoadLoopback(true);
+            w->setPersistLoopback(true);
+            w->setInstallModels(true);
+            w->setOpenVulkan(false);
+            w->setInstallVulkanRuntime(false);
+            w->setInstallMesaVulkan(false);
+            w->setInstallShaderTools(false);
+            w->setInstallService(jsonBool(
+                w->factsObject()
+                    .value(QStringLiteral("systemd_user"))
+                    .toObject(),
+                QStringLiteral("manager_usable"), true));
+          }
         }
+        emit completeChanged();
       }
     });
-    if (workflow.first == QStringLiteral("install")) {
-      radio->setChecked(true);
-    }
-  }
+    return radio;
+  };
+  primaryAction_ = addAction(QStringLiteral("scInstallerPrimaryAction"));
+  customizeAction_ = addAction(QStringLiteral("scInstallerCustomizeAction"));
+  repairAction_ = addAction(QStringLiteral("scInstallerRepairAction"));
+  reinstallAction_ = addAction(QStringLiteral("scInstallerReinstallAction"));
+  uninstallAction_ = addAction(QStringLiteral("scInstallerUninstallAction"));
   workflowBox->setLayout(workflowLayout);
   layout->addWidget(workflowBox);
 
   layout->addWidget(mutedLabel(
       QStringLiteral("The GUI is not run as root. Privileged operations are "
-                     "delegated only to specific backend/setup commands when "
-                     "the selected plan requires them."),
+                     "delegated only through the trusted, typed StudioCast "
+                     "system helper when the exact reviewed plan requires it. "
+                     "Application files always remain user-local."),
       this));
   layout->addStretch(1);
 }
@@ -734,34 +1085,112 @@ void IntroPage::initializePage() {
   const QJsonObject status = w->statusObject();
   const QJsonObject os = w->osObject();
 
-  osValue_->setText(QStringLiteral("%1 (base %2 %3) - %4")
+  if (!w->analysisAvailable()) {
+    osValue_->setText(QStringLiteral("Analysis unavailable"));
+    versionValue_->setText(QStringLiteral("Unknown"));
+    installValue_->setText(w->analysisError());
+    for (QAbstractButton *button : workflowGroup_->buttons()) {
+      button->setVisible(false);
+    }
+    emit completeChanged();
+    return;
+  }
+
+  osValue_->setText(QStringLiteral("%1 (base %2 %3)")
                         .arg(jsonString(os, QStringLiteral("pretty_name"),
                                         QStringLiteral("unknown")),
+                             jsonString(os, QStringLiteral("base_id"),
+                                        QStringLiteral("unknown")),
                              jsonString(os, QStringLiteral("base_version_id"),
-                                        QStringLiteral("unknown")),
-                             jsonString(os, QStringLiteral("base_codename"),
-                                        QStringLiteral("unknown")),
-                             jsonString(os, QStringLiteral("support_reason"))));
+                                        QStringLiteral("unknown"))));
 
-  const QString projectVersion =
-      jsonString(status, QStringLiteral("project_version"),
-                 QStringLiteral(STUDIOCAST_VERSION));
   const QString installedVersion =
       jsonString(status, QStringLiteral("installed_version"));
   versionValue_->setText(
-      QStringLiteral("Project %1, installed %2")
-          .arg(projectVersion, installedVersion.isEmpty()
-                                   ? QStringLiteral("not installed")
-                                   : installedVersion));
+      QStringLiteral("Available %1, installed %2")
+          .arg(jsonString(status, QStringLiteral("target_version"),
+                          QStringLiteral(STUDIOCAST_VERSION)),
+               installedVersion.isEmpty() ? QStringLiteral("not installed")
+                                          : installedVersion));
 
-  installValue_->setText(
-      jsonBool(status, QStringLiteral("installed"))
-          ? QStringLiteral("Installed; service %1, manifest %2")
-                .arg(jsonString(
-                         status.value(QStringLiteral("service")).toObject(),
-                         QStringLiteral("active"), QStringLiteral("unknown")),
-                     jsonString(status, QStringLiteral("manifest_path")))
-          : QStringLiteral("Not installed through the StudioCast installer"));
+  installValue_->setText(QStringLiteral("%1 (%2)")
+                             .arg(jsonString(status, QStringLiteral("classification"),
+                                             QStringLiteral("unknown")),
+                                  jsonString(status, QStringLiteral("version_relation"),
+                                             QStringLiteral("unknown"))));
+
+  const QString route = w->detectedRoute();
+  const QString action = w->primaryAction();
+  QString primaryWorkflow;
+  QString primaryText;
+  bool primaryCustom = false;
+  if (action == QStringLiteral("install")) {
+    primaryWorkflow = QStringLiteral("install");
+    primaryText = QStringLiteral("Install recommended");
+  } else if (action == QStringLiteral("update")) {
+    primaryWorkflow = QStringLiteral("update");
+    primaryText = QStringLiteral("Update recommended");
+  } else if (action == QStringLiteral("modify")) {
+    primaryWorkflow = QStringLiteral("modify");
+    primaryText = QStringLiteral("Modify installation");
+    primaryCustom = true;
+  } else if (action == QStringLiteral("repair") ||
+             action == QStringLiteral("reconstruct")) {
+    primaryWorkflow = QStringLiteral("repair");
+    primaryText = action == QStringLiteral("reconstruct")
+                      ? QStringLiteral("Reconstruct/repair")
+                      : QStringLiteral("Repair recommended");
+  } else if (action == QStringLiteral("keep")) {
+    primaryWorkflow = QStringLiteral("keep");
+    primaryText = QStringLiteral("Keep current (no changes)");
+  } else {
+    primaryWorkflow = QStringLiteral("diagnostics");
+    primaryText = route == QStringLiteral("unsupported")
+                      ? QStringLiteral("View diagnostics and manual instructions")
+                      : route == QStringLiteral("offline")
+                            ? QStringLiteral("Required verified cache unavailable")
+                            : QStringLiteral("Retry analysis");
+  }
+  primaryAction_->setText(primaryText);
+  primaryAction_->setProperty("workflow", primaryWorkflow);
+  primaryAction_->setProperty("customRoute", primaryCustom);
+  primaryAction_->setProperty("recommended", !primaryCustom &&
+                                                 primaryWorkflow !=
+                                                     QStringLiteral("keep") &&
+                                                 primaryWorkflow !=
+                                                     QStringLiteral("diagnostics"));
+  primaryAction_->setVisible(true);
+
+  const QString classification =
+      jsonString(status, QStringLiteral("classification"));
+  const bool automaticAllowed = route != QStringLiteral("unsupported") &&
+                                route != QStringLiteral("offline") &&
+                                route != QStringLiteral("analysis_error");
+  const bool installed = jsonBool(status, QStringLiteral("installed"));
+  const QString customizableWorkflow =
+      primaryWorkflow == QStringLiteral("keep") ? QStringLiteral("modify")
+                                                 : primaryWorkflow;
+  customizeAction_->setText(QStringLiteral("Customize / Advanced"));
+  customizeAction_->setProperty("workflow", customizableWorkflow);
+  customizeAction_->setProperty("customRoute", true);
+  customizeAction_->setVisible(automaticAllowed &&
+                               customizableWorkflow != QStringLiteral("diagnostics"));
+  repairAction_->setText(QStringLiteral("Repair"));
+  repairAction_->setProperty("workflow", QStringLiteral("repair"));
+  repairAction_->setProperty("customRoute", false);
+  repairAction_->setVisible(automaticAllowed && installed &&
+                            classification != QStringLiteral("partial"));
+  reinstallAction_->setText(QStringLiteral("Reinstall / reset"));
+  reinstallAction_->setProperty("workflow", QStringLiteral("reinstall"));
+  reinstallAction_->setProperty("customRoute", false);
+  reinstallAction_->setVisible(automaticAllowed && installed);
+  uninstallAction_->setText(QStringLiteral("Uninstall"));
+  uninstallAction_->setProperty("workflow", QStringLiteral("uninstall"));
+  uninstallAction_->setProperty("customRoute", false);
+  uninstallAction_->setVisible(automaticAllowed && installed);
+
+  primaryAction_->setChecked(true);
+  emit completeChanged();
 }
 
 bool IntroPage::validatePage() {
@@ -770,7 +1199,18 @@ bool IntroPage::validatePage() {
   if (button) {
     w->setWorkflow(button->property("workflow").toString());
   }
-  return true;
+  return isComplete();
+}
+
+bool IntroPage::isComplete() const {
+  const auto *w = dynamic_cast<const InstallerWizard *>(window());
+  const QAbstractButton *button = workflowGroup_->checkedButton();
+  if (!w || !w->analysisAvailable() || !button) {
+    return false;
+  }
+  const QString selected = button->property("workflow").toString();
+  return selected != QStringLiteral("diagnostics") &&
+         selected != QStringLiteral("keep");
 }
 
 CompatibilityPage::CompatibilityPage(QWidget *parent) : QWizardPage(parent) {
@@ -789,7 +1229,8 @@ CompatibilityPage::CompatibilityPage(QWidget *parent) : QWizardPage(parent) {
   layout->addWidget(details_, 1);
 
   allowUnsupported_ = new QCheckBox(
-      QStringLiteral("Allow this workflow on an unsupported distro"), this);
+      QStringLiteral("Unsupported overrides are CLI/developer-only"), this);
+  allowUnsupported_->setEnabled(false);
   connect(allowUnsupported_, &QCheckBox::toggled, this, [this](bool checked) {
     installerWizard(this)->setAllowUnsupported(checked);
     emit completeChanged();
@@ -846,8 +1287,8 @@ bool CompatibilityPage::isComplete() const {
   if (!w) {
     return false;
   }
-  return jsonBool(w->osObject(), QStringLiteral("supported")) ||
-         allowUnsupported_->isChecked();
+  return w->analysisAvailable() &&
+         jsonBool(w->osObject(), QStringLiteral("supported"));
 }
 
 DependencyPlanPage::DependencyPlanPage(QWidget *parent) : QWizardPage(parent) {
@@ -862,17 +1303,6 @@ DependencyPlanPage::DependencyPlanPage(QWidget *parent) : QWizardPage(parent) {
 
 void DependencyPlanPage::initializePage() {
   auto *w = installerWizard(this);
-  const QString workflow = w->workflow();
-  w->setInstallDeps(workflow == QStringLiteral("install") ||
-                    workflow == QStringLiteral("clean-install"));
-  w->setConfigureV4l2Loopback(workflow == QStringLiteral("install") ||
-                              workflow == QStringLiteral("clean-install"));
-  w->setLoadLoopback(w->configureV4l2Loopback());
-  w->setPersistLoopback(w->configureV4l2Loopback());
-  w->setInstallService(workflow != QStringLiteral("uninstall") &&
-                       workflow != QStringLiteral("advanced"));
-  w->setFreshBuild(workflow == QStringLiteral("clean-install"));
-
   QString error;
   if (w->refreshPlan(&error)) {
     planText_->setPlainText(planTextFromObject(w->planObject()));
@@ -955,7 +1385,12 @@ void UninstallPage::initializePage() {
 
 bool UninstallPage::validatePage() {
   installerWizard(this)->setRemoveUserData(removeUserData_->isChecked());
-  return true;
+  return installerWizard(this)->planReady();
+}
+
+bool UninstallPage::isComplete() const {
+  const auto *w = dynamic_cast<const InstallerWizard *>(window());
+  return w && w->planReady();
 }
 
 void UninstallPage::refreshPlanText() {
@@ -966,6 +1401,7 @@ void UninstallPage::refreshPlanText() {
   } else {
     planText_->setPlainText(error);
   }
+  emit completeChanged();
 }
 
 BuildOptionsPage::BuildOptionsPage(QWidget *parent) : QWizardPage(parent) {
@@ -1193,17 +1629,25 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
       QStringLiteral("Download default Open Audio/Open Video model packs"),
       this);
   installModels_->setToolTip(
-      QStringLiteral("Downloads the default model packs used by automatic "
-                     "Open Audio and Open Video model selection."));
+      QStringLiteral("Downloads exactly seven default packs containing eight "
+                     "verified model artifact files, including open-source "
+                     "fallbacks when Maxine is present."));
   removeUserData_ = new QCheckBox(
-      QStringLiteral("Remove user config, downloaded models, logs, and cache"),
-      this);
+      QStringLiteral("Preserve settings"), this);
+  removeUserData_->setObjectName(QStringLiteral("scInstallerPreserveSettings"));
 
   layout->addWidget(installService_);
   layout->addWidget(line(this));
   layout->addWidget(configureV4l2_);
   layout->addWidget(loadLoopback_);
   layout->addWidget(persistLoopback_);
+  auto *cameraLimitation = mutedLabel(
+      QStringLiteral("Without the virtual camera, StudioCast cannot be selected "
+                     "as a camera. Custom installation will complete in a "
+                     "degraded state."),
+      this);
+  cameraLimitation->setObjectName(QStringLiteral("scInstallerCameraLimitation"));
+  layout->addWidget(cameraLimitation);
   layout->addWidget(line(this));
   layout->addWidget(openBackendsSetup_);
   layout->addWidget(installModels_);
@@ -1269,6 +1713,10 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   connect(configureV4l2_, &QCheckBox::toggled, this, [this](bool checked) {
     loadLoopback_->setEnabled(checked);
     persistLoopback_->setEnabled(checked);
+    if (auto *limitation = findChild<QLabel *>(
+            QStringLiteral("scInstallerCameraLimitation"))) {
+      limitation->setVisible(!checked);
+    }
   });
   connect(installVulkanRuntime_, &QCheckBox::toggled, this,
           [this](bool checked) {
@@ -1298,8 +1746,10 @@ void ServiceOptionsPage::initializePage() {
   installVulkanRuntime_->setEnabled(installLike);
   installShaderTools_->setEnabled(installLike);
   installModels_->setEnabled(installLike);
-  removeUserData_->setEnabled(workflow == QStringLiteral("uninstall") ||
-                              workflow == QStringLiteral("clean-install"));
+  const bool reinstall = workflow == QStringLiteral("reinstall") ||
+                         workflow == QStringLiteral("clean-install");
+  removeUserData_->setEnabled(reinstall);
+  removeUserData_->setVisible(reinstall);
 
   installService_->setChecked(w->installService());
   configureV4l2_->setChecked(w->configureV4l2Loopback());
@@ -1313,7 +1763,11 @@ void ServiceOptionsPage::initializePage() {
                                  installVulkanRuntime_->isChecked());
   installShaderTools_->setChecked(w->installShaderTools());
   installModels_->setChecked(w->installModels());
-  removeUserData_->setChecked(w->removeUserData());
+  removeUserData_->setChecked(!w->removeUserData());
+  if (auto *limitation = findChild<QLabel *>(
+          QStringLiteral("scInstallerCameraLimitation"))) {
+    limitation->setVisible(!configureV4l2_->isChecked());
+  }
 
   const QString optionalNotice =
       optionalComponentsNoticeText(w->statusObject(), w->sourceDir());
@@ -1333,7 +1787,10 @@ bool ServiceOptionsPage::validatePage() {
   w->setInstallMesaVulkan(installMesaVulkan_->isChecked());
   w->setInstallShaderTools(installShaderTools_->isChecked());
   w->setInstallModels(installModels_->isChecked());
-  w->setRemoveUserData(removeUserData_->isChecked());
+  if (w->workflow() == QStringLiteral("reinstall") ||
+      w->workflow() == QStringLiteral("clean-install")) {
+    w->setRemoveUserData(!removeUserData_->isChecked());
+  }
   return true;
 }
 
@@ -1350,13 +1807,19 @@ ReviewPage::ReviewPage(QWidget *parent) : QWizardPage(parent) {
 
 void ReviewPage::initializePage() {
   auto *w = installerWizard(this);
-  w->setButtonText(QWizard::CommitButton, QStringLiteral("Finish"));
+  w->setButtonText(QWizard::CommitButton, actionLabel(w->workflow()));
   QString error;
   if (w->refreshPlan(&error)) {
     reviewText_->setPlainText(planTextFromObject(w->planObject()));
   } else {
     reviewText_->setPlainText(error);
   }
+  emit completeChanged();
+}
+
+bool ReviewPage::isComplete() const {
+  const auto *w = dynamic_cast<const InstallerWizard *>(window());
+  return w && w->planReady();
 }
 
 ProgressPage::ProgressPage(QWidget *parent) : QWizardPage(parent) {
@@ -1379,6 +1842,9 @@ void ProgressPage::initializePage() {
   started_ = true;
   complete_ = false;
   exitCode_ = -1;
+  stdoutBuffer_.clear();
+  stderrBuffer_.clear();
+  cancellationRequested_ = false;
   emit completeChanged();
 
   auto *w = installerWizard(this);
@@ -1389,45 +1855,120 @@ void ProgressPage::initializePage() {
     setTitle(QStringLiteral("Progress"));
     setSubTitle(QStringLiteral("Backend output is streamed here."));
   }
-  if (w->workflow() == QStringLiteral("advanced")) {
-    logText_->setPlainText(planTextFromObject(w->planObject()));
-    stateLabel_->setText(QStringLiteral("Advanced plan shown. No changes were "
-                                        "made."));
-    complete_ = true;
-    emit completeChanged();
-    return;
-  }
-
   process_ = new QProcess(this);
   process_->setProcessChannelMode(QProcess::SeparateChannels);
-  connect(process_, &QProcess::readyReadStandardOutput, this,
-          [this] { appendOutput(process_->readAllStandardOutput()); });
-  connect(process_, &QProcess::readyReadStandardError, this,
-          [this] { appendOutput(process_->readAllStandardError()); });
+  connect(process_, &QProcess::readyReadStandardOutput, this, [this] {
+    const QByteArray bytes = process_->readAllStandardOutput();
+    stdoutBuffer_ += bytes;
+    appendOutput(bytes);
+  });
+  connect(process_, &QProcess::readyReadStandardError, this, [this] {
+    const QByteArray bytes = process_->readAllStandardError();
+    stderrBuffer_ += bytes;
+    appendOutput(bytes);
+  });
   connect(
       process_,
       static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(
           &QProcess::finished),
       this, [this](int code, QProcess::ExitStatus status) {
+        stdoutBuffer_ += process_->readAllStandardOutput();
+        stderrBuffer_ += process_->readAllStandardError();
         exitCode_ = code;
-        complete_ = true;
-        if (status == QProcess::NormalExit && code == 0) {
-          const auto *pageWizard = installerWizard(this);
-          stateLabel_->setText(
-              pageWizard &&
-                      pageWizard->workflow() == QStringLiteral("uninstall")
-                  ? QStringLiteral("StudioCast was uninstalled successfully.")
-                  : QStringLiteral("Workflow completed."));
-        } else {
-          stateLabel_->setText(
-              QStringLiteral("Workflow failed with exit code %1.").arg(code));
+        auto *pageWizard = installerWizard(this);
+        QJsonObject result = lastJsonObject(stdoutBuffer_);
+        if (result.isEmpty()) {
+          result = lastJsonObject(stderrBuffer_);
         }
+        QString protocolError;
+        const QString state = jsonString(result, QStringLiteral("state"));
+        if (jsonString(result, QStringLiteral("result_version")) !=
+            QStringLiteral("installer-result/v1")) {
+          protocolError = QStringLiteral("missing installer-result/v1 terminal result");
+        } else if (!pageWizard ||
+                   jsonString(result, QStringLiteral("plan_id")) !=
+                       jsonString(pageWizard->planObject(), QStringLiteral("plan_id")) ||
+                   jsonString(result, QStringLiteral("plan_digest")) !=
+                       jsonString(pageWizard->planObject(), QStringLiteral("plan_digest"))) {
+          protocolError = QStringLiteral("terminal result does not match the reviewed plan");
+        } else if (!QStringList{QStringLiteral("committed"),
+                                QStringLiteral("degraded"),
+                                QStringLiteral("failed"),
+                                QStringLiteral("rolled_back"),
+                                QStringLiteral("cancelled")}
+                        .contains(state)) {
+          protocolError = QStringLiteral("terminal result has an unknown state");
+        } else {
+          QStringList reviewed;
+          for (const QJsonValue &value :
+               result.value(QStringLiteral("reviewed_operation_ids")).toArray())
+            reviewed << value.toString();
+          QStringList planned;
+          for (const QJsonValue &value :
+               pageWizard->planObject().value(QStringLiteral("operations")).toArray())
+            planned << jsonString(value.toObject(), QStringLiteral("id"));
+          if (reviewed != planned)
+            protocolError = QStringLiteral("executed result names a different reviewed operation set");
+        }
+        const bool exitMatches =
+            status == QProcess::NormalExit &&
+            ((state == QStringLiteral("committed") && code == 0) ||
+             (state == QStringLiteral("degraded") && code == 3) ||
+             ((state == QStringLiteral("failed") ||
+               state == QStringLiteral("rolled_back")) &&
+              code != 0) ||
+             (state == QStringLiteral("cancelled") && code == 130));
+        if (protocolError.isEmpty() && !exitMatches) {
+          protocolError = QStringLiteral("process exit does not corroborate the terminal result");
+        }
+        if (!protocolError.isEmpty()) {
+          result = {{QStringLiteral("result_version"),
+                     QStringLiteral("installer-result/v1")},
+                    {QStringLiteral("plan_id"),
+                     pageWizard ? jsonString(pageWizard->planObject(),
+                                             QStringLiteral("plan_id"))
+                                : QString()},
+                    {QStringLiteral("plan_digest"),
+                     pageWizard ? jsonString(pageWizard->planObject(),
+                                             QStringLiteral("plan_digest"))
+                                : QString()},
+                    {QStringLiteral("state"), QStringLiteral("failed")},
+                    {QStringLiteral("core_committed"), false},
+                    {QStringLiteral("error"),
+                     QJsonObject{{QStringLiteral("code"),
+                                  cancellationRequested_
+                                      ? QStringLiteral("execution.interrupted_uncertain")
+                                      : QStringLiteral("execution.protocol_failure")},
+                                 {QStringLiteral("message"), protocolError}}}};
+        }
+        if (pageWizard)
+          pageWizard->setExecutionResult(result);
+        complete_ = true;
+        stateLabel_->setText(QStringLiteral("Transaction finished: %1")
+                                 .arg(jsonString(result, QStringLiteral("state"))));
         emit completeChanged();
       });
 
-  const QStringList args = w->workflowCommandArguments(false);
-  stateLabel_->setText(QStringLiteral("Running backend workflow: %1")
-                           .arg(args.join(QLatin1Char(' '))));
+  const QStringList args = w->executionCommandArguments();
+  if (args.isEmpty()) {
+    w->setExecutionResult(
+        {{QStringLiteral("result_version"), QStringLiteral("installer-result/v1")},
+         {QStringLiteral("state"), QStringLiteral("failed")},
+         {QStringLiteral("core_committed"), false},
+         {QStringLiteral("error"),
+          QJsonObject{{QStringLiteral("code"), QStringLiteral("plan.unavailable")},
+                      {QStringLiteral("message"),
+                       QStringLiteral("No valid reviewed plan is available.")}}}});
+    stateLabel_->setText(QStringLiteral("Execution blocked: reviewed plan unavailable."));
+    complete_ = true;
+    emit completeChanged();
+    return;
+  }
+  stateLabel_->setText(QStringLiteral("Executing %1 reviewed operations")
+                           .arg(w->planObject()
+                                    .value(QStringLiteral("operations"))
+                                    .toArray()
+                                    .size()));
   logText_->appendPlainText(QStringLiteral("$ %1 %2").arg(
       w->backendPath(), args.join(QLatin1Char(' '))));
   process_->start(w->backendPath(), args);
@@ -1435,6 +1976,18 @@ void ProgressPage::initializePage() {
     appendOutput(QStringLiteral("Failed to start installer backend: %1\n")
                      .arg(process_->errorString())
                      .toLocal8Bit());
+    w->setExecutionResult(
+        {{QStringLiteral("result_version"), QStringLiteral("installer-result/v1")},
+         {QStringLiteral("plan_id"),
+          jsonString(w->planObject(), QStringLiteral("plan_id"))},
+         {QStringLiteral("plan_digest"),
+          jsonString(w->planObject(), QStringLiteral("plan_digest"))},
+         {QStringLiteral("state"), QStringLiteral("failed")},
+         {QStringLiteral("core_committed"), false},
+         {QStringLiteral("error"),
+          QJsonObject{{QStringLiteral("code"),
+                       QStringLiteral("execution.start_failed")},
+                      {QStringLiteral("message"), process_->errorString()}}}});
     complete_ = true;
     emit completeChanged();
   }
@@ -1443,8 +1996,30 @@ void ProgressPage::initializePage() {
 bool ProgressPage::isComplete() const { return complete_; }
 
 bool ProgressPage::validatePage() {
-  installerWizard(this)->refreshStatus();
-  return true;
+  return complete_ && !installerWizard(this)->executionResult().isEmpty();
+}
+
+bool ProgressPage::isRunning() const {
+  return process_ && process_->state() != QProcess::NotRunning;
+}
+
+void ProgressPage::requestCancellation() {
+  if (!isRunning() || cancellationRequested_)
+    return;
+  cancellationRequested_ = true;
+  stateLabel_->setText(QStringLiteral("Cancelling; waiting for backend rollback result…"));
+#ifdef Q_OS_UNIX
+  ::kill(static_cast<pid_t>(process_->processId()), SIGINT);
+#else
+  process_->terminate();
+#endif
+  QTimer::singleShot(5000, this, [this] {
+    if (isRunning()) {
+      stateLabel_->setText(QStringLiteral(
+          "Cancellation timed out; transaction state is uncertain."));
+      process_->kill();
+    }
+  });
 }
 
 void ProgressPage::appendOutput(const QByteArray &bytes) {
@@ -1458,6 +2033,7 @@ FinishPage::FinishPage(QWidget *parent) : QWizardPage(parent) {
   setSubTitle(QStringLiteral("Installer workflow summary."));
   auto *layout = new QVBoxLayout(this);
   summaryLabel_ = new QLabel(this);
+  summaryLabel_->setObjectName(QStringLiteral("scInstallerCompletionSummary"));
   summaryLabel_->setWordWrap(true);
   layout->addWidget(summaryLabel_);
   details_ = new QPlainTextEdit(this);
@@ -1467,42 +2043,51 @@ FinishPage::FinishPage(QWidget *parent) : QWizardPage(parent) {
 
 void FinishPage::initializePage() {
   auto *w = installerWizard(this);
-  const bool uninstall = w->workflow() == QStringLiteral("uninstall");
-  setTitle(uninstall ? QStringLiteral("Uninstall complete")
-                     : QStringLiteral("Finish"));
-  setSubTitle(uninstall ? QStringLiteral("StudioCast removal summary.")
-                        : QStringLiteral("Installer workflow summary."));
+  const QJsonObject result = w->executionResult();
+  const QString state = jsonString(result, QStringLiteral("state"),
+                                   QStringLiteral("failed"));
+  if (state == QStringLiteral("committed")) {
+    setTitle(actionLabel(w->workflow()) + QStringLiteral(" complete"));
+    summaryLabel_->setText(
+        w->workflow() == QStringLiteral("uninstall")
+            ? QStringLiteral("StudioCast uninstall completed.")
+            : QStringLiteral("The reviewed transaction committed successfully."));
+  } else if (state == QStringLiteral("degraded")) {
+    setTitle(QStringLiteral("Complete with limitations"));
+    summaryLabel_->setText(QStringLiteral(
+        "The core installation is active, but optional operations failed. "
+        "You may retry those operations or continue with the listed limitations."));
+  } else if (state == QStringLiteral("rolled_back")) {
+    setTitle(QStringLiteral("Action failed; previous version restored"));
+    summaryLabel_->setText(QStringLiteral(
+        "The update did not commit. The prior active payload was preserved."));
+  } else if (state == QStringLiteral("cancelled")) {
+    setTitle(QStringLiteral("Action cancelled"));
+    summaryLabel_->setText(QStringLiteral(
+        "The backend reported cancellation and completed its transaction handling."));
+  } else {
+    setTitle(QStringLiteral("Action failed"));
+    const QJsonObject error = result.value(QStringLiteral("error")).toObject();
+    summaryLabel_->setText(
+        QStringLiteral("No successful outcome is being claimed. %1: %2")
+            .arg(jsonString(error, QStringLiteral("code"),
+                            QStringLiteral("execution.failed")),
+                 jsonString(error, QStringLiteral("message"),
+                            QStringLiteral("See details."))));
+  }
+  setSubTitle(QStringLiteral("Structured transaction result and reconciliation."));
+
+  const QJsonObject resultSnapshot = result;
   w->refreshStatus();
   const QJsonObject status = w->statusObject();
-  const QString installedVersion =
-      jsonString(status, QStringLiteral("installed_version"));
-  const bool installed = jsonBool(status, QStringLiteral("installed"));
-
-  if (uninstall && !installed) {
-    summaryLabel_->setText(QStringLiteral("StudioCast was removed."));
-  } else {
-    summaryLabel_->setText(
-        installed
-            ? QStringLiteral("StudioCast is installed. Version: %1")
-                  .arg(installedVersion.isEmpty() ? QStringLiteral("unknown")
-                                                  : installedVersion)
-            : QStringLiteral(
-                  "StudioCast is not currently installed through the "
-                  "installer manifest."));
-  }
 
   QString text;
-  text += QStringLiteral("Workflow: ") + w->workflow() + QStringLiteral("\n");
-  text += QStringLiteral("Manifest: ") +
-          jsonString(status, QStringLiteral("manifest_path")) +
-          QStringLiteral("\n");
-  text += QStringLiteral("Service: ") +
-          jsonString(status.value(QStringLiteral("service")).toObject(),
-                     QStringLiteral("active"), QStringLiteral("unknown")) +
-          QStringLiteral("\n");
-  text += QStringLiteral("Local bin: ") +
-          jsonString(status, QStringLiteral("local_bin_dir")) +
-          QStringLiteral("\n\n");
+  text += QStringLiteral("Terminal result (authoritative):\n");
+  text += QString::fromUtf8(
+      QJsonDocument(resultSnapshot).toJson(QJsonDocument::Indented));
+  text += QStringLiteral("\nRe-analysis (secondary evidence):\n");
+  text += QString::fromUtf8(QJsonDocument(status).toJson(QJsonDocument::Indented));
+  text += QStringLiteral("\nReviewed plan:\n");
   text += planTextFromObject(w->planObject());
   details_->setPlainText(text.trimmed());
 }
