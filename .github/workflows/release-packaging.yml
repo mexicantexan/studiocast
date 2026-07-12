@@ -91,6 +91,43 @@ jobs:
         run: |
           packaging/appimage/verify_bundle.sh --require-appimage
 
+      - name: Generate signed stable release manifest
+        if: github.event_name == 'release'
+        env:
+          RELEASE_SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY_B64 }}
+          RELEASE_SIGNING_KEY_ID: ${{ vars.RELEASE_SIGNING_KEY_ID }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          : "${RELEASE_SIGNING_KEY_B64:?Published releases require RELEASE_SIGNING_KEY_B64}"
+          : "${RELEASE_SIGNING_KEY_ID:?Published releases require RELEASE_SIGNING_KEY_ID}"
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "${RELEASE_TAG}" = "v${version}"
+          source_archive="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-${version}-source.tar.gz" -print -quit)"
+          installer_appimage="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-Installer-${version}-*.AppImage" -print -quit)"
+          test -n "${source_archive}"
+          test -n "${installer_appimage}"
+
+          private_key="$(mktemp)"
+          trap 'rm -f "${private_key}"' EXIT
+          chmod 0600 "${private_key}"
+          printf '%s' "${RELEASE_SIGNING_KEY_B64}" | base64 --decode > "${private_key}"
+
+          python3 packaging/release/release_tool.py \
+            --version "${version}" \
+            --minimum-installer-version "${version}" \
+            --source-archive "${source_archive}" \
+            --installer-appimage "${installer_appimage}" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}" \
+            --release-page-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${version}" \
+            --repository "https://github.com/${GITHUB_REPOSITORY}" \
+            --commit "${GITHUB_SHA}" \
+            --workflow-run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --private-key "${private_key}" \
+            --key-id "${RELEASE_SIGNING_KEY_ID}" \
+            --output dist/appimage/studiocast-release-manifest.json \
+            --signature-output dist/appimage/studiocast-release-manifest.json.sig
+
       - name: Upload release packaging artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -101,3 +138,5 @@ jobs:
             dist/appimage/StudioCast-Installer-*.AppDir.tar.gz
             dist/appimage/StudioCast-Installer-*.sha256
             dist/appimage/StudioCast-*-source.tar.gz
+            dist/appimage/studiocast-release-manifest.json
+            dist/appimage/studiocast-release-manifest.json.sig
