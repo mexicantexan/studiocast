@@ -131,10 +131,10 @@ backend:
   install/update/repair/uninstall/clean-install execution, and manifest writes.
 - `scripts/installer.sh` is the stable CLI entrypoint for CI, SSH, recovery,
   and debugging.
-- Existing `scripts/setup.sh`, `scripts/install.sh`, and `scripts/uninstall.sh`
-  remain compatibility entrypoints. The backend delegates dependency setup,
-  v4l2loopback setup, binary linking, model installs, and systemd user service
-  setup to those scripts instead of duplicating their logic.
+- Existing setup/install scripts remain developer compatibility entrypoints.
+  Recommended installation never elevates a selected-source script. Host work
+  is expressed as typed requests to the separately packaged root-owned helper;
+  user-local payload activation and uninstall are built into the backend.
 
 Backend examples:
 
@@ -171,19 +171,19 @@ Mint when `/etc/os-release` exposes a reliable Ubuntu base. Mint
 Ubuntu 24.04. If that field is absent, Mint 21.x maps to Jammy and Mint 22.x
 maps to Noble.
 
-The install manifest lives at:
+The atomic schema-v2 install manifest lives at:
 
 ```text
 ~/.local/share/studiocast/install-manifest.json
 ```
 
-It records installed version, source/build/install paths, installed binaries,
-systemd user service path/status, dependency install method, install timestamp,
-and whether config/models/logs/cache were preserved. Update and repair prefer
-manifest paths unless a source directory or release archive is explicitly
-selected. Uninstall removes app symlinks, service files, desktop entries, and
-runtime artifacts. Clean install preserves user config, downloaded models, logs,
-and cache unless `--remove-user-data` is explicitly selected.
+It records active/previous versioned payloads, desired and effective feature
+configuration, ownership evidence, service/v4l state, models, validation, and
+the operation journal. Production links target the durable `current` payload,
+not the build cache. Ordinary uninstall is packaged and self-contained and
+preserves settings/models/data by default. Clean install resets payload,
+service, cache, state/logs, and models; its single preservation option restores
+only user settings.
 
 Release packaging:
 
@@ -194,6 +194,11 @@ Release packaging:
 - The AppDir layout places the backend at
   `usr/share/studiocast/installer/studiocast-installer-backend`, which is the
   installed path the GUI already probes relative to the installer binary.
+- The Installer component also stages `release/release_channel.py`, the strict
+  manifest schema, and `trust/keys/`. Production public keys are named
+  `<key-id>.pem` in that trust root. No production key is committed yet, so a
+  production build fails closed until release engineering provisions one; test
+  keys are never copied there.
 - The same packaging script creates `StudioCast-<version>-source.tar.gz` from
   `HEAD` with `git archive` when available, stages it at
   `usr/share/studiocast/source/StudioCast-<version>-source.tar.gz`, and leaves
@@ -213,9 +218,26 @@ Release packaging:
   the installer bundle, AppDir archive, source archive, and checksum file as
   workflow artifacts. It does not tag commits or publish release assets by
   itself.
-- The packaged installer is still a source-build installer. The GUI defaults to
-  the bundled source archive, and users can still point it at another release
-  archive or a local checkout.
+- Recommended remains a target-machine source build, but only after the backend
+  verifies the signed stable manifest and source artifact signature/hash/size.
+  `--official-source` is not proof. Local directories/archives remain
+  Advanced-only. The backend supports configurable manifest URLs, verified
+  offline caches, semantic same/downgrade policy, and a verified AppImage
+  self-update offer that never overwrites the running image or relaunches
+  without confirmation.
+
+Hermetic release inspection example:
+
+```bash
+studiocast-installer-backend verify-release \
+  --release-manifest manifest.json --release-signature manifest.json.sig \
+  --release-archive StudioCast-<version>-source.tar.gz \
+  --release-receipt-out verified-release.json
+studiocast-installer-backend release-status --release-receipt verified-release.json
+```
+
+Receipts carry paths and identities but are not bearer authorization: every
+consumer re-verifies the manifest, signature, artifact, and current trust root.
 
 First release checklist:
 

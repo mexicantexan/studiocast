@@ -321,6 +321,18 @@ stage_appdir() {
         ! -x "${APPDIR}/usr/share/studiocast/installer/studiocast-installer-backend" ]]; then
     die "staged installer backend is missing: ${APPDIR}/usr/share/studiocast/installer/studiocast-installer-backend"
   fi
+  if [[ "${DRY_RUN}" -eq 0 &&
+        ! -f "${APPDIR}/usr/share/studiocast/installer/release/release_channel.py" ]]; then
+    die "staged signed-release verifier is missing"
+  fi
+  if [[ "${DRY_RUN}" -eq 0 &&
+        ! -f "${APPDIR}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json" ]]; then
+    die "staged release manifest schema is missing"
+  fi
+  if [[ "${DRY_RUN}" -eq 0 &&
+        ! -f "${APPDIR}/usr/share/studiocast/installer/trust/keys/README.md" ]]; then
+    die "staged production trust-root contract is missing"
+  fi
   if [[ "${DRY_RUN}" -eq 0 && ! -f "${STAGED_SOURCE_ARCHIVE}" ]]; then
     die "staged source archive is missing: ${STAGED_SOURCE_ARCHIVE}"
   fi

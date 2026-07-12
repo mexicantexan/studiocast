@@ -12,6 +12,7 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -34,6 +35,7 @@ POLICY_VERSION = "studiocast-installer-policy/1"
 FACTS_VERSION = "installer-facts/v1"
 RECOMMENDATION_VERSION = "installer-recommendation/v1"
 PLAN_VERSION = "installer-plan/v1"
+RESULT_VERSION = "installer-result/v1"
 HELPER_PATH = Path("/usr/libexec/studiocast/studiocast-system-helper")
 SERVICE_NAME = "studiocastd.service"
 BINARIES = (
@@ -96,6 +98,123 @@ FORBIDDEN_HELPER_FIELDS = {
     "environment", "url", "download", "file_content", "module_name",
     "package_manager_flags",
 }
+
+
+def release_module() -> Any:
+    candidates = [
+        Path(__file__).resolve().parent / "release/release_channel.py",
+        Path(__file__).resolve().parents[2] / "packaging/release/release_channel.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise BackendError("release.verifier_unavailable", "Packaged release verifier is unavailable")
+    spec = importlib.util.spec_from_file_location("studiocast_packaged_release_channel", path)
+    if spec is None or spec.loader is None:
+        raise BackendError("release.verifier_unavailable", "Could not load packaged release verifier")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def trust_root() -> Path:
+    installed = Path(__file__).resolve().parent / "trust/keys"
+    return installed if installed.is_dir() else Path(__file__).resolve().parents[2] / "packaging/release/keys"
+
+
+def release_keys(args: argparse.Namespace, rc: Any) -> Any:
+    keys = {path.stem: path for path in trust_root().glob("*.pem") if path.is_file() and not path.is_symlink()}
+    explicit = getattr(args, "trusted_key", []) or []
+    if explicit:
+        raise BackendError("release.signature.caller_key_forbidden",
+                           "Recommended installation accepts only packaged production trust roots")
+    if not keys:
+        raise BackendError("release.signature.production_key_missing",
+                           f"No production release public key is installed in {trust_root()}")
+    return rc.TrustedKeyStore(keys)
+
+
+def release_cache_dir(args: argparse.Namespace) -> Path:
+    value = getattr(args, "release_cache_dir", None)
+    return Path(value).absolute() if value else roots()["cache"] / "release"
+
+
+def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
+    receipt_path = getattr(args, "release_receipt", None)
+    manifest_path = getattr(args, "release_manifest", None)
+    signature_path = getattr(args, "release_signature", None)
+    stable_url = getattr(args, "stable_url", None)
+    offline = bool(getattr(args, "offline", False))
+    if not any((receipt_path, manifest_path, stable_url, offline)):
+        return None
+    rc = release_module()
+    keys = release_keys(args, rc)
+    allow_file = os.environ.get("STUDIOCAST_INSTALLER_TEST_MODE") == "1"
+    if receipt_path:
+        receipt = load_json(Path(receipt_path))
+        if receipt.get("schema_version") != 1 or receipt.get("receipt_version") != "studiocast-verified-release/v1":
+            raise BackendError("release.receipt.schema", "Unsupported verified-release receipt")
+        manifest_path = receipt.get("manifest_path")
+        signature_path = receipt.get("signature_path")
+        args.release_archive = receipt.get("archive_path")
+    if manifest_path or signature_path:
+        if not manifest_path or not signature_path:
+            raise BackendError("release.manifest.arguments", "Manifest and signature paths must be supplied together")
+        manifest_file, signature_file = Path(manifest_path).absolute(), Path(signature_path).absolute()
+        try:
+            manifest = rc.verify_manifest(manifest_file.read_bytes(), signature_file.read_bytes(), keys,
+                                          allow_file_urls=allow_file)
+        except (OSError, rc.ReleaseChannelError) as exc:
+            code = getattr(exc, "code", "release.manifest.unavailable")
+            raise BackendError(code, str(exc)) from exc
+    else:
+        cache = release_cache_dir(args) / "manifests"
+        manifest_url = stable_url or rc.DEFAULT_STABLE_MANIFEST_URL
+        signature_url = getattr(args, "stable_signature_url", None) or manifest_url + ".sig"
+        try:
+            manifest = rc.fetch_release_manifest(cache, keys, manifest_url=manifest_url,
+                                                 signature_url=signature_url, offline=offline,
+                                                 allow_file_urls=allow_file)
+        except rc.ReleaseChannelError as exc:
+            raise BackendError(exc.code, str(exc)) from exc
+        generation = (cache / "current").read_text(encoding="ascii").strip()
+        manifest_file = cache / generation / "manifest.json"
+        signature_file = cache / generation / "manifest.json.sig"
+    source = manifest["artifacts"]["source_archive"]
+    archive_arg = getattr(args, "release_archive", None)
+    try:
+        if archive_arg:
+            archive = Path(archive_arg).absolute()
+            rc.verify_artifact(archive, source, keys)
+        else:
+            archive = rc.acquire_artifact(source, release_cache_dir(args) / "artifacts", keys, offline=offline)
+    except rc.ReleaseChannelError as exc:
+        raise BackendError(exc.code, str(exc)) from exc
+    signature_envelope = rc.strict_json_loads(signature_file.read_bytes())
+    receipt = {
+        "schema_version": 1, "receipt_version": "studiocast-verified-release/v1",
+        "channel": manifest["channel"], "version": manifest["release"]["version"],
+        "minimum_installer_version": manifest["minimum_installer_version"],
+        "manifest_path": str(manifest_file), "signature_path": str(signature_file),
+        "manifest_sha256": hashlib.sha256(manifest_file.read_bytes()).hexdigest(),
+        "manifest_key_id": signature_envelope["key_id"], "archive_path": str(archive),
+        "archive_sha256": source["sha256"], "archive_size": source["size_bytes"],
+        "archive_signature": copy.deepcopy(source["signature"]),
+        "archive_url": source["url"], "provenance": copy.deepcopy(source["provenance"]),
+        "license": copy.deepcopy(source["license"]),
+        "installer_appimage": copy.deepcopy(manifest["artifacts"]["installer_appimage"]),
+        "release_page_url": manifest["release"]["page_url"],
+    }
+    # A receipt never substitutes for verification: receipt input reaches this
+    # point only after manifest, signature, archive size/hash/signature are all
+    # revalidated against the current trusted key store.
+    out = getattr(args, "release_receipt_out", None)
+    if out:
+        atomic_write(Path(out).absolute(), receipt)
+    args.release_archive = str(archive)
+    args.target_version = receipt["version"]
+    args.verified_release = receipt
+    return receipt
 
 
 class BackendError(Exception):
@@ -223,6 +342,18 @@ def read_version(source: Path | None) -> str:
     if source:
         try:
             value = (source / "VERSION").read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "unknown"
+
+
+def installer_version() -> str:
+    candidates = [Path(__file__).resolve().parents[2] / "VERSION"]
+    for candidate in candidates:
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
             if value:
                 return value
         except OSError:
@@ -633,9 +764,10 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     r = roots()
     desired = desired_from_args(args, rec)
     intent = args.workflow
-    target = getattr(args, "target_version", None) or facts.get("installation", {}).get("target_version") or read_version(Path(getattr(args, "source_dir", "")))
+    target = getattr(args, "target_version", None) or facts.get("installation", {}).get("target_version") or read_version(Path(getattr(args, "source_dir", None) or ""))
     if target == "unknown": target = facts.get("installation", {}).get("active_version") or "unknown"
     source_kind, source_path = source_for_plan(args, target)
+    verified_release = copy.deepcopy(getattr(args, "verified_release", None))
     build_cache = Path(getattr(args, "build_dir", "") or r["cache"] / "builds" / target).absolute()
     payload_root = r["data"] / "payloads"
     plan_id = str(uuid.uuid4())
@@ -752,12 +884,37 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         ops.append(operation("manifest.commit", "manifest_commit", [last], {}, "validation"))
     blockers = copy.deepcopy(rec["blockers"])
     warnings = copy.deepcopy(rec["warnings"])
+    if intent == "uninstall":
+        # User-local removal remains available on unsupported/offline/low-disk
+        # hosts and never needs a release source or build cache.
+        blockers = []
     if not desired["virtual_camera"].get("desired"):
         blockers = [item for item in blockers if item.get("applies_to") != "virtual_camera"]
     if any(op["privilege"] == "trusted_helper" for op in ops) and not facts.get("privileged_helper", {}).get("trusted", False):
         if not any(item.get("code") == "privileged_helper_missing" for item in blockers):
             blockers.append({"code": "privileged_helper_missing", "applies_to": "system_changes"})
-    if rec["route"] == "recommended" and intent != "uninstall":
+    if verified_release:
+        active_version = facts.get("installation", {}).get("active_version")
+        try:
+            update_decision = release_module().decide_update(
+                active_version, verified_release["version"],
+                allow_same_version=bool(getattr(args, "allow_same_version", False)),
+                allow_downgrade=bool(getattr(args, "allow_downgrade", False)))
+            if update_decision.action == "keep_current" and update_decision.relation in {"same", "installed_newer"}:
+                blockers.append({"code": update_decision.reason_code, "applies_to": "version",
+                                 "relation": update_decision.relation})
+        except Exception:
+            blockers.append({"code": "release.version.invalid", "applies_to": "version"})
+        try:
+            meets_minimum = release_module().installer_meets_minimum(
+                installer_version(), verified_release["minimum_installer_version"])
+        except Exception:
+            meets_minimum = False
+        if not meets_minimum:
+            blockers.append({"code": "release.installer_update_required", "applies_to": "installer",
+                             "minimum_version": verified_release["minimum_installer_version"],
+                             "current_version": installer_version()})
+    if rec["route"] == "recommended" and intent != "uninstall" and not verified_release:
         # A caller-supplied boolean is not provenance.  The release-channel
         # verifier must replace this blocker with signed manifest/archive
         # evidence when the two components are integrated.
@@ -781,9 +938,27 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
         "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
             "target_payload": str(target_payload), "current_link": str(current)},
-        "source": {"kind": source_kind, "path": source_path, "official": False,
-                   "official_claimed": source_kind == "archive" and bool(getattr(args, "official_source", False))},
-        "downloads": [{"artifact_id": pack, "url": None, "size": sum(a["size"] or 0 for a in MODEL_METADATA.get(pack, {}).get("artifacts", [])),
+        "source": ({"kind": "official_release", "path": source_path, "official": True,
+                    "channel": verified_release["channel"], "version": verified_release["version"],
+                    "manifest_sha256": verified_release["manifest_sha256"],
+                    "manifest_key_id": verified_release["manifest_key_id"],
+                    "archive_sha256": verified_release["archive_sha256"],
+                    "archive_size": verified_release["archive_size"],
+                    "archive_signature": verified_release["archive_signature"],
+                    "provenance": verified_release["provenance"]}
+                   if verified_release else
+                   {"kind": source_kind, "path": source_path, "official": False,
+                    "official_claimed": source_kind == "archive" and bool(getattr(args, "official_source", False))}),
+        "release": ({"minimum_installer_version": verified_release["minimum_installer_version"],
+                     "release_page_url": verified_release["release_page_url"],
+                     "installer_appimage": verified_release["installer_appimage"]}
+                    if verified_release else None),
+        "downloads": ([{"artifact_id": "studiocast-source", "url": verified_release["archive_url"],
+            "size": verified_release["archive_size"], "sha256": verified_release["archive_sha256"],
+            "signature": verified_release["archive_signature"], "provenance": verified_release["provenance"],
+            "license": verified_release["license"], "cache_path": verified_release["archive_path"],
+            "destination": str(build_cache), "required_for_core": True}] if verified_release else []) +
+            [{"artifact_id": pack, "url": None, "size": sum(a["size"] or 0 for a in MODEL_METADATA.get(pack, {}).get("artifacts", [])),
             "sha256": None, "signature": None, "provenance": MODEL_METADATA.get(pack, {}).get("provenance"),
             "license": MODEL_METADATA.get(pack, {}).get("license"), "cache_path": str(r["cache"] / "models" / pack),
             "destination": str(r["data"] / "models"), "required_for_core": False} for pack in desired.get("model_pack_ids", [])],
@@ -911,7 +1086,9 @@ class Executor:
             self.restore_previous_pointer()
         if not self.dry_run:
             self.write_manifest(state, failure)
-        result = {"transaction_id": self.transaction_id, "state": state,
+        result = {"schema_version": 1, "result_version": RESULT_VERSION,
+            "plan_id": self.plan["plan_id"], "plan_digest": self.plan["plan_digest"],
+            "transaction_id": self.transaction_id, "transaction_state": state, "state": state,
             "core_committed": self.core_committed, "active_version": self.plan["desired_state"].get("version") or self.plan["paths"]["target_payload"].rstrip("/").split("/")[-1] if self.core_committed else (self.active_before or {}).get("version"),
             "failed_operation_id": self.failed_operation, "error": None if failure is None else {"code": failure.code, "message": failure.message, "details": failure.details},
             "retryable_operation_ids": self.retryable, "reviewed_operation_ids": [op["id"] for op in self.plan["operations"]],
@@ -1166,7 +1343,7 @@ class Executor:
             "payloads": {"root": str(self.r["data"] / "payloads"), "current_link": str(self.r["data"] / "current"),
                 "active": active, "previous": previous, "target": None},
             "source": {"channel": "stable" if self.plan["source"].get("official") else "advanced", "official": self.plan["source"].get("official", False),
-                "archive_sha256": file_sha256(Path(self.plan["source"]["path"])) if self.plan["source"]["kind"] == "archive" and Path(self.plan["source"]["path"]).is_file() else None},
+                "archive_sha256": file_sha256(Path(self.plan["source"]["path"])) if self.plan["source"]["kind"] in {"archive", "official_release"} and Path(self.plan["source"]["path"]).is_file() else None},
             "desired_configuration": {"build_type": self.plan["desired_state"]["build_type"], "features": self.plan["desired_state"]["features"],
                 "service": self.plan["desired_state"]["service"], "v4l": self.plan["desired_state"]["virtual_camera"],
                 "model_pack_ids": self.plan["desired_state"].get("model_pack_ids", []), "preserve_settings": self.plan["preservation"]["preserve_settings"]},
@@ -1244,6 +1421,17 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-dir")
     parser.add_argument("--release-archive")
     parser.add_argument("--official-source", action="store_true")
+    parser.add_argument("--release-manifest")
+    parser.add_argument("--release-signature")
+    parser.add_argument("--release-receipt")
+    parser.add_argument("--release-receipt-out")
+    parser.add_argument("--release-cache-dir")
+    parser.add_argument("--trusted-key", action="append", default=[])
+    parser.add_argument("--stable-url")
+    parser.add_argument("--stable-signature-url")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--allow-same-version", action="store_true")
+    parser.add_argument("--allow-downgrade", action="store_true")
     parser.add_argument("--build-dir")
     parser.add_argument("--build-type", default=None)
     parser.add_argument("--target-version")
@@ -1284,6 +1472,16 @@ def output(value: Any, human: str | None = None) -> None:
     else: print(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 
+def failed_result(error: BackendError, plan: dict[str, Any]) -> dict[str, Any]:
+    return {"schema_version": 1, "result_version": RESULT_VERSION,
+            "plan_id": plan.get("plan_id"), "plan_digest": plan.get("plan_digest"),
+            "transaction_id": None, "transaction_state": "failed", "state": "failed",
+            "core_committed": False, "failed_operation_id": None,
+            "error": {"code": error.code, "message": error.message, "details": error.details},
+            "retryable_operation_ids": [],
+            "exit": {"kind": "backend_result", "code": 2, "signal": None}}
+
+
 def load_facts(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "facts_file", None): return normalize_fixture(load_json(Path(args.facts_file)))
     if getattr(args, "input_fixture", None): return normalize_fixture(load_json(Path(args.input_fixture)))
@@ -1304,22 +1502,71 @@ def main(argv: list[str]) -> int:
         p = sub.add_parser(name); add_common(p); p.set_defaults(workflow=name)
     apply_p = sub.add_parser("apply-plan", aliases=["execute-plan"]); apply_p.add_argument("--plan", required=True); apply_p.add_argument("--digest", required=True); apply_p.add_argument("--token", required=True); apply_p.add_argument("--facts"); apply_p.add_argument("--dry-run", action="store_true"); apply_p.add_argument("--json", action="store_true")
     manifest_p = sub.add_parser("manifest"); manifest_p.add_argument("--migrate-v1", action="store_true")
+    verify_release_p = sub.add_parser("verify-release"); add_common(verify_release_p)
+    release_status_p = sub.add_parser("release-status"); add_common(release_status_p)
+    release_status_p.add_argument("--installed-version")
+    release_status_p.add_argument("--prepare-self-update", action="store_true")
+    release_status_p.add_argument("--appimage-path")
     args = parser.parse_args(argv)
+    if args.command in {"verify-release", "release-status"}:
+        evidence = verify_release_evidence(args)
+        if evidence is None:
+            raise BackendError("release.manifest.required", "Signed release metadata is required")
+        if args.command == "verify-release":
+            output(evidence); return 0
+        rc = release_module()
+        installed = args.installed_version
+        if installed is None:
+            try:
+                installed = host_analyze(evidence["version"])["installation"]["active_version"]
+            except BackendError:
+                installed = None
+        decision = rc.decide_update(installed, evidence["version"],
+                                    allow_same_version=args.allow_same_version,
+                                    allow_downgrade=args.allow_downgrade)
+        release_status: dict[str, Any] = {
+            "schema_version": 1, "release_status_version": "installer-release-status/v1",
+            "channel": evidence["channel"], "available_version": evidence["version"],
+            "installed_version": installed, "action": decision.action, "relation": decision.relation,
+            "reason_code": decision.reason_code, "minimum_installer_version": evidence["minimum_installer_version"],
+            "installer_meets_minimum": rc.installer_meets_minimum(installer_version(), evidence["minimum_installer_version"]),
+            "offline": bool(args.offline), "verified_source_archive": evidence["archive_path"],
+            "rollback": rc.rollback_metadata(evidence["version"], installed, roots()["data"] / "payloads")}
+        if args.prepare_self_update:
+            manifest_view = {"release": {"version": evidence["version"]},
+                             "artifacts": {"installer_appimage": evidence["installer_appimage"]}}
+            offer = rc.prepare_self_update(manifest_view, installer_version(), release_cache_dir(args) / "installer",
+                                           release_keys(args, rc), appimage_path=args.appimage_path,
+                                           offline=args.offline)
+            release_status["self_update"] = {
+                "state": offer.state, "reason_code": offer.reason_code,
+                "current_appimage": offer.current_appimage,
+                "verified_appimage": offer.verified_appimage,
+                "relaunch_command": list(offer.relaunch_command),
+                "manual_download_url": offer.manual_download_url,
+                "requires_confirmation": offer.state == "offer_restart",
+                "running_artifact_replaced": False}
+        output(release_status); return 0
     if args.command in {"analyze", "detect-os"}:
         facts = load_facts(args)
         output(facts if args.command == "analyze" else facts["os"]); return 0
     if args.command == "status":
+        evidence = verify_release_evidence(args)
         facts = load_facts(args); route, action = route_for(facts)
         value = {"schema_version": 2, "installed": facts["installation"]["classification"] in {"healthy", "partial", "stale"},
             "classification": facts["installation"]["classification"], "installed_version": facts["installation"].get("active_version"),
             "target_version": facts["installation"].get("target_version"), "version_relation": facts["installation"].get("version_relation"),
             "route": route, "primary_action": action, "reason_codes": facts["installation"]["reason_codes"],
+            "stable_release": None if evidence is None else {"verified": True, "channel": evidence["channel"],
+                "version": evidence["version"], "minimum_installer_version": evidence["minimum_installer_version"],
+                "source_archive": evidence["archive_path"]},
             "optional_components": {"onnxruntime_cuda": facts["runtime"]["onnxruntime"], "vulkan": {**facts["gpus"]["vulkan"], "runtime_packages": ["libvulkan1", "vulkan-tools"], "mesa_icd_package": "mesa-vulkan-drivers", "install_docs": "docs/open_source_video_models_install.md"}, "maxine_sdk": {**facts["maxine"], "install_docs": "docs/maxine_install.md"}}}
         output(value); return 0
     if args.command == "recommend":
         facts = load_facts(args); prior = load_json(Path(args.prior_desired)) if args.prior_desired else None
         output(recommend(facts, args.intent, prior, args.policy_version, args.route)); return 0
     if args.command in {"plan", "run", "install", "update", "repair", "reinstall", "clean-install", "uninstall"}:
+        verify_release_evidence(args)
         facts = load_facts(args); prior = facts.get("installation", {}).get("desired_configuration") if args.workflow in {"update", "repair", "reinstall", "clean-install", "modify"} else None
         route = "advanced" if args.workflow == "advanced" or args.source_dir else "recommended"
         rec = recommend(facts, args.workflow, prior, route=route)
@@ -1327,11 +1574,19 @@ def main(argv: list[str]) -> int:
         if args.command == "plan": output(legacy_plan_text(plan)); return 0
         if args.dry_run:
             result, code = Executor(plan, dry_run=True).execute(); output(result); return code
-        validate_plan(plan, plan["plan_digest"], plan["approval_token"], facts)
+        try:
+            validate_plan(plan, plan["plan_digest"], plan["approval_token"], facts)
+        except BackendError as exc:
+            print(f"{exc.code}: {exc.message}", file=sys.stderr)
+            output(failed_result(exc, plan)); return 2
         result, code = Executor(plan).execute(); output(result); return code
     if args.command in {"apply-plan", "execute-plan"}:
         plan = load_json(Path(args.plan)); facts = normalize_fixture(load_json(Path(args.facts))) if args.facts else None
-        validate_plan(plan, args.digest, args.token, facts)
+        try:
+            validate_plan(plan, args.digest, args.token, facts)
+        except BackendError as exc:
+            print(f"{exc.code}: {exc.message}", file=sys.stderr)
+            output(failed_result(exc, plan)); return 2
         result, code = Executor(plan, args.dry_run).execute(); output(result); return code
     if args.command == "manifest":
         path = roots()["data"] / "install-manifest.json"; value = load_json(path)

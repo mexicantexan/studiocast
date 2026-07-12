@@ -917,6 +917,21 @@ install(PROGRAMS installer/backend/studiocast-installer-backend
         COMPONENT Installer
 )
 
+install(FILES
+        packaging/release/__init__.py
+        packaging/release/release_channel.py
+        packaging/release/release-manifest-v1.schema.json
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/release"
+        COMPONENT Installer
+)
+
+# Production release engineering installs <key-id>.pem trust roots here.  No
+# production key is committed yet, so stable-channel verification fails closed.
+install(FILES packaging/release/keys/README.md
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/trust/keys"
+        COMPONENT Installer
+)
+
 if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
     add_executable(studiocast-audio-tests
             tests/audio_service_tests.cpp
@@ -1226,6 +1241,13 @@ if (BUILD_TESTING)
                         "${Python3_EXECUTABLE}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_backend_core_tests.py")
         set_tests_properties(studiocast-installer-backend-core-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME studiocast-installer-packaging-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_packaging_tests.py")
+        set_tests_properties(studiocast-installer-packaging-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
 

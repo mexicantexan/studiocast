@@ -27,17 +27,20 @@ chmod +x StudioCast-Installer-<version>-<arch>.AppImage
 
 The packaged installer includes its backend at
 `usr/share/studiocast/installer/studiocast-installer-backend`, which matches the
-GUI lookup path. It also includes the matching release source archive at
+GUI lookup path. The same installed surface contains the signed stable-channel
+verifier, release-manifest schema, and production public-key directory. It also
+includes the matching release source archive at
 `usr/share/studiocast/source/StudioCast-<version>-source.tar.gz`; the GUI
 automatically selects "Build from selected release archive" with that archive
 prefilled. You can still choose a different release archive manually or build
 from a local checkout.
 
 The release AppImage/AppDir is self-contained for the installer GUI, backend,
-and matching source archive. Runtime dependencies such as Qt build packages,
-v4l2loopback support, PulseAudio tools, ONNX Runtime, and optional model/SDK
-assets are installed or checked through supported system packages and the
-backend scripts.
+user-local uninstall, release verification primitives, and matching source
+archive. Recommended accepts an archive only after signed-manifest and artifact
+signature/hash/size verification. If a production release public key has not
+been provisioned, it stops with `release.signature.production_key_missing`.
+It never trusts the repository's fixture key.
 
 Build and run the installer from a checkout:
 
@@ -47,10 +50,12 @@ cmake --build build --target studiocast-installer
 ./build/studiocast-installer
 ```
 
-The GUI calls the scriptable
-backend at `installer/backend/studiocast-installer-backend`, which uses the
-existing setup/install/uninstall helpers for privileged package/module steps,
-builds, binary links, and the systemd user service.
+The GUI calls the scriptable backend at
+`installer/backend/studiocast-installer-backend`. It performs user-local builds,
+versioned payload activation, service wiring, repair, rollback, and uninstall.
+Any host-level virtual-camera work uses only the fixed root-owned helper and a
+structured polkit authorization result; there is no selected-source or broad
+sudo fallback.
 
 On the **Service and Optional Components** page, users can separately select:
 
@@ -106,9 +111,10 @@ and whether user config/model/log/cache data was preserved. Update, repair,
 uninstall, and clean-install workflows use this manifest when available.
 
 Clean install removes app files and the user service before reinstalling. It
-preserves user config, downloaded model packs, logs, and cache by default; the
-GUI and backend require an explicit `--remove-user-data` choice before deleting
-those XDG directories.
+always resets payload, build cache, logs/state, and downloaded models. Preserve
+settings is checked by default and snapshots/restores only user configuration;
+turning it off performs a literal full wipe. Ordinary uninstall separately
+preserves settings, models, and data by default.
 
 ## 1) Install dependencies + v4l2loopback
 
