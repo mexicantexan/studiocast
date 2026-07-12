@@ -453,12 +453,14 @@ bool GazeCorrectionEyeContact::ConfigureRuntimeIo(EyeRuntime *rt,
   fix_shape(&rt->output_shape, rt->input_w, rt->input_h, rt->out_channels,
             rt->output_is_nhwc);
 
+  const std::size_t input_w_sz = static_cast<std::size_t>(rt->input_w);
+  const std::size_t input_h_sz = static_cast<std::size_t>(rt->input_h);
   const std::size_t eye_elems =
-      static_cast<std::size_t>(3) * rt->input_w * rt->input_h;
+      static_cast<std::size_t>(3) * input_w_sz * input_h_sz;
   const std::size_t anchor_elems =
-      static_cast<std::size_t>(rt->anchor_channels) * rt->input_w * rt->input_h;
+      static_cast<std::size_t>(rt->anchor_channels) * input_w_sz * input_h_sz;
   const std::size_t out_elems =
-      static_cast<std::size_t>(rt->out_channels) * rt->input_w * rt->input_h;
+      static_cast<std::size_t>(rt->out_channels) * input_w_sz * input_h_sz;
   rt->eye_tensor.assign(eye_elems, 0.f);
   rt->anchors_tensor.assign(anchor_elems, 0.f);
   rt->angles_tensor.assign(2, 0.f);
@@ -683,14 +685,16 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
   out->eye_rgb_u8 = std::move(resized);
 
   // Convert eye to NCHW float32 in 0..1.
-  out->eye_nchw_f32.assign(static_cast<std::size_t>(3) * input_w * input_h,
+  const std::size_t input_w_sz = static_cast<std::size_t>(input_w);
+  const std::size_t input_h_sz = static_cast<std::size_t>(input_h);
+  const std::size_t plane = input_w_sz * input_h_sz;
+  out->eye_nchw_f32.assign(static_cast<std::size_t>(3) * plane,
                            0.f);
-  const int plane = input_w * input_h;
   for (int y = 0; y < input_h; ++y) {
     for (int x = 0; x < input_w; ++x) {
-      const std::size_t src = static_cast<std::size_t>(y) * input_w * 3 +
-                              static_cast<std::size_t>(x) * 3;
-      const int idx = y * input_w + x;
+      const std::size_t idx =
+          static_cast<std::size_t>(y) * input_w_sz + static_cast<std::size_t>(x);
+      const std::size_t src = idx * 3u;
       out->eye_nchw_f32[idx] = out->eye_rgb_u8[src + 0] / 255.0f;
       out->eye_nchw_f32[plane + idx] = out->eye_rgb_u8[src + 1] / 255.0f;
       out->eye_nchw_f32[2 * plane + idx] = out->eye_rgb_u8[src + 2] / 255.0f;
@@ -705,7 +709,7 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
   std::array<int, 6> seq = left_eye ? std::array<int, 6>{3, 2, 1, 0, 5, 4}
                                     : std::array<int, 6>{0, 1, 2, 3, 4, 5};
 
-  out->anchors_nchw_f32.assign(static_cast<std::size_t>(12) * input_w * input_h,
+  out->anchors_nchw_f32.assign(static_cast<std::size_t>(12) * plane,
                                0.f);
 
   for (int i = 0; i < 6; ++i) {
@@ -721,14 +725,15 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
     const int c_x = 2 * i;
     const int c_y = 2 * i + 1;
     float *ch_x = out->anchors_nchw_f32.data() +
-                  static_cast<std::size_t>(c_x) * input_w * input_h;
+                  static_cast<std::size_t>(c_x) * plane;
     float *ch_y = out->anchors_nchw_f32.data() +
-                  static_cast<std::size_t>(c_y) * input_w * input_h;
+                  static_cast<std::size_t>(c_y) * plane;
 
     for (int y = 0; y < input_h; ++y) {
       const float dy = static_cast<float>(y - resize_y);
       for (int x = 0; x < input_w; ++x) {
-        const int idx = y * input_w + x;
+        const std::size_t idx = static_cast<std::size_t>(y) * input_w_sz +
+                                static_cast<std::size_t>(x);
         ch_x[idx] = static_cast<float>(x - resize_x);
         ch_y[idx] = dy;
       }
@@ -767,11 +772,13 @@ bool GazeCorrectionEyeContact::RunModelForEye(EyeRuntime *rt,
   } else {
     // NHWC
     rt->eye_tensor.assign(rt->eye_tensor.size(), 0.f);
-    const int plane = w * h;
+    const std::size_t w_sz = static_cast<std::size_t>(w);
+    const std::size_t plane = w_sz * static_cast<std::size_t>(h);
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
-        const int idx = y * w + x;
-        const std::size_t dst = (static_cast<std::size_t>(y) * w + x) * 3;
+        const std::size_t idx =
+            static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
+        const std::size_t dst = idx * 3u;
         rt->eye_tensor[dst + 0] = eye.eye_nchw_f32[idx];
         rt->eye_tensor[dst + 1] = eye.eye_nchw_f32[plane + idx];
         rt->eye_tensor[dst + 2] = eye.eye_nchw_f32[2 * plane + idx];
@@ -796,12 +803,14 @@ bool GazeCorrectionEyeContact::RunModelForEye(EyeRuntime *rt,
   } else {
     rt->anchors_tensor.assign(rt->anchors_tensor.size(), 0.f);
     const int C = rt->anchor_channels;
-    const int plane = w * h;
+    const std::size_t C_sz = static_cast<std::size_t>(C);
+    const std::size_t w_sz = static_cast<std::size_t>(w);
+    const std::size_t plane = w_sz * static_cast<std::size_t>(h);
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
-        const int idx = y * w + x;
-        const std::size_t dst_base =
-            (static_cast<std::size_t>(y) * w + x) * static_cast<std::size_t>(C);
+        const std::size_t idx =
+            static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
+        const std::size_t dst_base = idx * C_sz;
         for (int c = 0; c < C; ++c) {
           const std::size_t src = static_cast<std::size_t>(c) * plane + idx;
           if (src < eye.anchors_nchw_f32.size()) {
@@ -854,20 +863,22 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
 
   const int w = rt.input_w;
   const int h = rt.input_h;
-  const int plane = w * h;
+  const std::size_t w_sz = static_cast<std::size_t>(w);
+  const std::size_t h_sz = static_cast<std::size_t>(h);
+  const std::size_t plane = w_sz * h_sz;
 
   // If the model outputs RGB directly, just convert.
   if (rt.out_channels == 3) {
-    out_rgb_u8->assign(static_cast<std::size_t>(w) * h * 3, 0);
+    out_rgb_u8->assign(plane * 3u, 0);
     if (!rt.output_is_nhwc) {
       for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-          const int idx = y * w + x;
+          const std::size_t idx =
+              static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
           const float r = rt.output_tensor[idx];
           const float g = rt.output_tensor[plane + idx];
           const float b = rt.output_tensor[2 * plane + idx];
-          const std::size_t dst = static_cast<std::size_t>(y) * w * 3 +
-                                  static_cast<std::size_t>(x) * 3;
+          const std::size_t dst = idx * 3u;
           (*out_rgb_u8)[dst + 0] = static_cast<std::uint8_t>(ClampInt(
               static_cast<int>(std::round(Clamp01(r) * 255.f)), 0, 255));
           (*out_rgb_u8)[dst + 1] = static_cast<std::uint8_t>(ClampInt(
@@ -879,12 +890,13 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
     } else {
       for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-          const std::size_t src = (static_cast<std::size_t>(y) * w + x) * 3;
+          const std::size_t idx =
+              static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
+          const std::size_t src = idx * 3u;
           const float r = rt.output_tensor[src + 0];
           const float g = rt.output_tensor[src + 1];
           const float b = rt.output_tensor[src + 2];
-          const std::size_t dst = static_cast<std::size_t>(y) * w * 3 +
-                                  static_cast<std::size_t>(x) * 3;
+          const std::size_t dst = idx * 3u;
           (*out_rgb_u8)[dst + 0] = static_cast<std::uint8_t>(ClampInt(
               static_cast<int>(std::round(Clamp01(r) * 255.f)), 0, 255));
           (*out_rgb_u8)[dst + 1] = static_cast<std::uint8_t>(ClampInt(
@@ -905,7 +917,7 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
     return false;
   }
 
-  out_rgb_u8->assign(static_cast<std::size_t>(w) * h * 3, 0);
+  out_rgb_u8->assign(plane * 3u, 0);
 
   // Warp using the input eye as the source.
   for (int y = 0; y < h; ++y) {
@@ -913,11 +925,14 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
       float flow_x = 0.f;
       float flow_y = 0.f;
       if (!rt.output_is_nhwc) {
-        const int idx = y * w + x;
+        const std::size_t idx =
+            static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
         flow_x = rt.output_tensor[idx];
         flow_y = rt.output_tensor[plane + idx];
       } else {
-        const std::size_t src = (static_cast<std::size_t>(y) * w + x) * 2;
+        const std::size_t idx =
+            static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
+        const std::size_t src = idx * 2u;
         flow_x = rt.output_tensor[src + 0];
         flow_y = rt.output_tensor[src + 1];
       }
@@ -929,8 +944,9 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
       float r = 0.f, g = 0.f, b = 0.f;
       BilinearSampleRgbNchw(eye.eye_nchw_f32.data(), w, h, sx, sy, &r, &g, &b);
 
-      const std::size_t dst =
-          static_cast<std::size_t>(y) * w * 3 + static_cast<std::size_t>(x) * 3;
+      const std::size_t idx =
+          static_cast<std::size_t>(y) * w_sz + static_cast<std::size_t>(x);
+      const std::size_t dst = idx * 3u;
       (*out_rgb_u8)[dst + 0] = static_cast<std::uint8_t>(
           ClampInt(static_cast<int>(std::round(Clamp01(r) * 255.f)), 0, 255));
       (*out_rgb_u8)[dst + 1] = static_cast<std::uint8_t>(

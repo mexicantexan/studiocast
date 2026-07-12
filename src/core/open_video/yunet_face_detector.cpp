@@ -225,14 +225,20 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
 
     int stride = 0;
     const int si = stride_index(name);
-    if (si == 0)
-      stride = 8;
-    else if (si == 1)
-      stride = 16;
-    else if (si == 2)
-      stride = 32;
-    else
-      stride = 8;
+    switch (si) {
+      case 0:
+        stride = 8;
+        break;
+      case 1:
+        stride = 16;
+        break;
+      case 2:
+        stride = 32;
+        break;
+      default:
+        stride = 8;
+        break;
+    }
 
     const int rows = std::max(1, settings_.input_h / stride);
     const int cols = std::max(1, settings_.input_w / stride);
@@ -291,7 +297,7 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
   bbox_idx_ = {{find_out("bbox_8"), find_out("bbox_16"), find_out("bbox_32")}};
   kps_idx_ = {{find_out("kps_8"), find_out("kps_16"), find_out("kps_32")}};
 
-  for (int i = 0; i < 3; ++i) {
+  for (std::size_t i = 0; i < 3; ++i) {
     if (cls_idx_[i] < 0 || obj_idx_[i] < 0 || bbox_idx_[i] < 0 ||
         kps_idx_[i] < 0) {
       if (error) {
@@ -628,7 +634,7 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
   const int padH = settings_.input_h;
   const int strides[3] = {8, 16, 32};
 
-  for (int s = 0; s < 3; ++s) {
+  for (std::size_t s = 0; s < 3; ++s) {
     const int stride_px = strides[s];
     const int cols = padW / stride_px;
     const int rows = padH / stride_px;

@@ -419,9 +419,15 @@ config.
 
 ## Model installation and validation
 
-StudioCast keeps model binaries out of git. Metadata templates live under
-[../resources/model_packs](../resources/model_packs), and install scripts fetch
-curated assets into XDG data directories.
+StudioCast discovers runtime model packs from user-local XDG data directories.
+Source-tree pack entries live under
+[../resources/model_packs](../resources/model_packs) and may include metadata,
+license summaries, placeholders, and intentionally curated artifacts. Install
+scripts fetch curated runtime assets into XDG data directories.
+
+Policy:
+
+- [MODEL_POLICY.md](MODEL_POLICY.md)
 
 Open Video / Open CUDA:
 
