@@ -157,14 +157,69 @@ verify_staged_metadata() {
     "studiocast-installer ${expected_version}" \
     "${appdir}/AppRun" --version
   require_command_output_contains "installer backend --help" \
-    "StudioCast installer backend" \
+    "usage: studiocast-installer-backend" \
     "${appdir}/usr/share/studiocast/installer/studiocast-installer-backend" \
     --help
+  require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
+  require_file "${appdir}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json"
+  require_file "${appdir}/usr/share/studiocast/installer/trust/keys/README.md"
 
   local service
   while IFS= read -r service; do
     validate_service_file "${service}"
   done < <(find "${appdir}" -type f -name '*.service' -print)
+}
+
+verify_packaged_backend_layout() {
+  local appdir="$1"
+  local backend="${appdir}/usr/share/studiocast/installer/studiocast-installer-backend"
+  local temporary
+  temporary="$(mktemp -d)"
+
+  local home="${temporary}/home"
+  local data="${temporary}/data"
+  local config="${temporary}/config"
+  local state="${temporary}/state"
+  local cache="${temporary}/cache"
+  local fake_bin="${temporary}/bin"
+  install -d -m 0755 "${home}/.local/bin" "${data}/studiocast/payloads/fixture/bin" \
+    "${data}/studiocast/models/custom" "${config}/studiocast" "${state}" "${cache}" "${fake_bin}"
+  cat >"${fake_bin}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod 0755 "${fake_bin}/systemctl"
+  cat >"${data}/studiocast/payloads/fixture/bin/studiocast" <<'EOF'
+#!/usr/bin/env bash
+echo "studiocast fixture"
+EOF
+  chmod 0755 "${data}/studiocast/payloads/fixture/bin/studiocast"
+  ln -s "${data}/studiocast/payloads/fixture" "${data}/studiocast/current"
+  ln -s "${data}/studiocast/current/bin/studiocast" "${home}/.local/bin/studiocast"
+  printf 'preserve\n' >"${data}/studiocast/models/custom/user-model"
+  printf 'preserve\n' >"${config}/studiocast/daemon.conf"
+
+  local -a environment=(env "HOME=${home}" "XDG_DATA_HOME=${data}" "XDG_CONFIG_HOME=${config}"
+    "XDG_STATE_HOME=${state}" "XDG_CACHE_HOME=${cache}" "PATH=${fake_bin}:/usr/bin:/bin")
+  "${environment[@]}" "${backend}" status --json >/dev/null
+  local plan
+  plan="$("${environment[@]}" "${backend}" plan uninstall --json --preserve-user-data \
+    --no-v4l2loopback --no-service --no-models --allow-unsupported)"
+  [[ "${plan}" != *"usr/share/scripts"* ]] ||
+    die "packaged uninstall plan refers to a source-tree uninstall script"
+  [[ "${plan}" == *'"links.reconcile"'* ]] ||
+    die "packaged uninstall plan omits link reconciliation"
+
+  rm -rf -- "${cache}"
+  "${data}/studiocast/current/bin/studiocast" >/dev/null ||
+    die "active payload broke after build/release cache removal"
+  "${environment[@]}" "${backend}" uninstall --yes --preserve-user-data \
+    --no-v4l2loopback --no-service --no-models --allow-unsupported >/dev/null
+  [[ ! -e "${data}/studiocast/payloads" ]] || die "packaged uninstall left owned payloads"
+  [[ ! -L "${home}/.local/bin/studiocast" ]] || die "packaged uninstall left owned links"
+  [[ -f "${data}/studiocast/models/custom/user-model" ]] || die "packaged uninstall removed models by default"
+  [[ -f "${config}/studiocast/daemon.conf" ]] || die "packaged uninstall removed settings by default"
+  rm -rf -- "${temporary}"
 }
 
 verify_source_archive_layout() {
@@ -437,6 +492,12 @@ main() {
     "${appdir_base}/usr/share/studiocast/installer/studiocast-installer-backend" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/release/release_channel.py" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/trust/keys/README.md" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/applications/studiocast-installer.desktop" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
@@ -445,6 +506,7 @@ main() {
 
   verify_staged_metadata "${APPDIR}" "${VERSION}" "${source_archive_path}" \
     "${staged_source_archive}"
+  verify_packaged_backend_layout "${APPDIR}"
   verify_source_archive_layout "${source_archive_path}" "${source_prefix}" \
     "${VERSION}"
   verify_source_archive_metadata "${source_archive_path}" "${source_prefix}" \
