@@ -392,6 +392,131 @@ bool AllocateF32(studiocast::vulkan::kernels::UtilityKernels &kernels,
                          /*map_memory=*/true, error);
 }
 
+studiocast::vulkan::VulkanDeviceCandidateInfo
+DeviceCandidate(std::uint32_t index, std::uint32_t type, int score,
+                int compute_queue, const char *name) {
+  studiocast::vulkan::VulkanDeviceCandidateInfo candidate;
+  candidate.enumeration_index = index;
+  candidate.device_type = type;
+  candidate.score = score;
+  candidate.compute_queue_family_index = compute_queue;
+  candidate.device_name = name;
+  return candidate;
+}
+
+bool TestVulkanDeviceSelectionPolicy() {
+  using studiocast::vulkan::VK_PHYSICAL_DEVICE_TYPE_CPU;
+  using studiocast::vulkan::VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+  using studiocast::vulkan::VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+  using studiocast::vulkan::VulkanDeviceCandidateInfo;
+  using studiocast::vulkan::VulkanDeviceSelection;
+
+  bool ok = true;
+  std::string error;
+  VulkanDeviceSelection selection;
+  ok &= Require(studiocast::vulkan::detail::ParseVulkanDeviceSelection(
+                    "", "", &selection, &error),
+                "default Vulkan device selection should parse: " + error);
+  ok &= Require(
+      !selection.requested_index.has_value() && selection.request == "auto" &&
+          selection.source == "automatic" && !selection.allow_cpu_in_auto,
+      "default Vulkan device selection should be hardware auto");
+
+  ok &= Require(studiocast::vulkan::detail::ParseVulkanDeviceSelection(
+                    " 2 ", "true", &selection, &error),
+                "explicit Vulkan device selection should parse: " + error);
+  ok &= Require(selection.requested_index == 2 &&
+                    selection.request == "index:2" &&
+                    selection.source == "STUDIOCAST_VULKAN_DEVICE_INDEX",
+                "explicit Vulkan device selection should retain its source");
+  ok &= Require(!studiocast::vulkan::detail::ParseVulkanDeviceSelection(
+                    "-1", "", &selection, &error) &&
+                    error.find("non-negative") != std::string::npos,
+                "negative Vulkan device indices should fail clearly");
+  ok &= Require(!studiocast::vulkan::detail::ParseVulkanDeviceSelection(
+                    "", "sometimes", &selection, &error) &&
+                    error.find("boolean") != std::string::npos,
+                "invalid Vulkan CPU opt-in values should fail clearly");
+
+  std::vector<VulkanDeviceCandidateInfo> candidates = {
+      DeviceCandidate(0, VK_PHYSICAL_DEVICE_TYPE_CPU, 100, 0, "llvmpipe"),
+      DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 1,
+                      "Intel GPU"),
+      DeviceCandidate(2, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, 2,
+                      "AMD GPU"),
+      DeviceCandidate(3, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, -1,
+                      "No compute GPU"),
+  };
+  selection = VulkanDeviceSelection{};
+  auto selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(selected.ok && selected.candidate_vector_index == 2 &&
+                    candidates[2].selected,
+                "Vulkan auto selection should prefer a discrete GPU");
+  ok &= Require(!candidates[0].eligible &&
+                    candidates[0].rejection_reason == "cpu_device_not_enabled",
+                "Vulkan auto selection should reject CPU drivers by default");
+  ok &= Require(!candidates[3].eligible &&
+                    candidates[3].rejection_reason == "no_compute_queue",
+                "Vulkan candidates should diagnose missing compute queues");
+
+  selection.requested_index = 0;
+  selection.request = "index:0";
+  selection.source = "STUDIOCAST_VULKAN_DEVICE_INDEX";
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(selected.ok && selected.candidate_vector_index == 0 &&
+                    candidates[0].selected && candidates[0].eligible,
+                "an explicitly selected CPU Vulkan device should be allowed");
+  ok &= Require(candidates[2].rejection_reason == "not_requested",
+                "explicit Vulkan selection should identify other candidates");
+
+  candidates = {
+      DeviceCandidate(0, VK_PHYSICAL_DEVICE_TYPE_CPU, 100, 0, "lavapipe")};
+  selection = VulkanDeviceSelection{};
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(
+      !selected.ok &&
+          selected.failure_reason == "vulkan_only_cpu_devices_available" &&
+          selected.error.find("STUDIOCAST_VULKAN_ALLOW_CPU=1") !=
+              std::string::npos,
+      "CPU-only Vulkan auto selection should require explicit opt-in");
+  selection.allow_cpu_in_auto = true;
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(selected.ok && candidates[0].selected,
+                "Vulkan CPU auto opt-in should select a software device");
+
+  candidates = {DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300,
+                                0, "Intel GPU")};
+  selection = VulkanDeviceSelection{};
+  selection.requested_index = 7;
+  selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &candidates, selection);
+  ok &= Require(!selected.ok &&
+                    selected.failure_reason ==
+                        "vulkan_requested_device_not_found" &&
+                    selected.error.find("index 7") != std::string::npos,
+                "missing explicit Vulkan indices should fail clearly");
+
+  studiocast::vulkan::OpenVulkanDiagnostics diagnostics;
+  diagnostics.device_selection_source = "STUDIOCAST_VULKAN_DEVICE_INDEX";
+  diagnostics.device_selection_request = "index:1";
+  diagnostics.selected_device_index = 1;
+  diagnostics.device_candidates = candidates;
+  diagnostics.device_candidates[0].selected = true;
+  const std::string json = diagnostics.ToJson();
+  ok &= Require(
+      json.find("\"device_selection_request\":\"index:1\"") !=
+              std::string::npos &&
+          json.find("\"selected_device_index\":1") != std::string::npos &&
+          json.find("\"device_candidates\":[{") != std::string::npos &&
+          json.find("\"device_name\":\"Intel GPU\"") != std::string::npos,
+      "Vulkan diagnostics JSON should expose selection candidates");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -404,6 +529,8 @@ int main() {
 
   bool ok = true;
   std::string error;
+
+  ok &= TestVulkanDeviceSelectionPolicy();
 
   UtilityKernels validation_only;
   VulkanImage invalid;
@@ -545,6 +672,47 @@ int main() {
     invalidate(dst);
     ok &= CompareU8(ReadU8(dst), BlurU8Reference(rgb, w, h, radius),
                     "Vulkan RGB blur");
+  }
+
+  {
+    const int w = 3, h = 2, radius = 1;
+    const std::vector<std::uint8_t> fg = {
+        0,  10,  20,  30,  40,  50,  60,  70,  80,
+        90, 100, 110, 120, 130, 140, 150, 160, 170,
+    };
+    const std::vector<float> alpha = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 0.125f};
+    VulkanImage gpu_fg, gpu_tmp, gpu_blurred, gpu_alpha, gpu_out;
+    if (!AllocateU8(kernels, &gpu_fg, w, h, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(kernels, &gpu_tmp, w, h, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(kernels, &gpu_blurred, w, h, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateF32(kernels, &gpu_alpha, w, h, &error) ||
+        !AllocateU8(kernels, &gpu_out, w, h, VulkanPixelFormat::rgb_u8,
+                    &error)) {
+      return OptionalSkip("mapped batched blur/composite allocation failed: " +
+                          error);
+    }
+    FillU8(gpu_fg, fg);
+    FillF32(gpu_alpha, alpha);
+    flush(gpu_fg);
+    flush(gpu_alpha);
+    const std::uint64_t submissions_before =
+        kernels.synchronous_submission_count();
+    ok &= Require(kernels.BoxBlurCompositeAlphaU8x3(gpu_fg, gpu_tmp,
+                                                    gpu_blurred, gpu_alpha,
+                                                    gpu_out, radius, &error),
+                  "Vulkan batched blur/composite should dispatch: " + error);
+    ok &= Require(kernels.synchronous_submission_count() ==
+                      submissions_before + 1,
+                  "Vulkan batched blur/composite should use one synchronous "
+                  "submission");
+    invalidate(gpu_out);
+    ok &= CompareU8(
+        ReadU8(gpu_out),
+        CompositeReference(fg, BlurU8Reference(fg, w, h, radius), alpha),
+        "Vulkan batched blur/composite");
   }
 
   {

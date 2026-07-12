@@ -52,6 +52,20 @@ backend at `installer/backend/studiocast-installer-backend`, which uses the
 existing setup/install/uninstall helpers for privileged package/module steps,
 builds, binary links, and the systemd user service.
 
+On the **Service and Optional Components** page, users can separately select:
+
+- **Build StudioCast with Open Vulkan support** (`--open-vulkan`).
+- **Install Vulkan loader and diagnostic packages** (`--vulkan-runtime`).
+- **Install Mesa Intel/AMD Vulkan ICDs** (`--mesa-vulkan`).
+- **Install shader developer tools** (`--shader-tools`), which are only needed
+  to validate or regenerate the committed SPIR-V shaders.
+
+These choices are available for install, update, repair, and clean-install
+workflows. They are opt-in. Open Vulkan is runtime-loaded, and package
+installation alone does not make a Vulkan GPU usable: the system still needs a
+working GPU driver/ICD exposing a compute-capable Vulkan device. The review page
+shows the selected backend flags and package operations before anything runs.
+
 CLI equivalents:
 
 ```bash
@@ -208,6 +222,12 @@ These packages provide the Vulkan loader and diagnostics (`libvulkan1`, `vulkan-
 ```
 
 Explicit Vulkan selection does not silently run CUDA. If Vulkan is requested but the build/runtime/device path is unavailable, daemon status reports the Vulkan fallback/degraded reason and the active backend is CPU/pass-through where applicable.
+
+Open Vulkan install/build visibility is ahead of full effect parity. In
+particular, production Vulkan virtual-background matting remains blocked until
+a device-resident Vulkan inference runtime replaces the current stub. Installing
+the Vulkan loader or Mesa ICDs must not be read as a claim of CUDA/NVIDIA effect
+parity.
 
 ## 3b) Optional: Open Audio backend (no Maxine required)
 

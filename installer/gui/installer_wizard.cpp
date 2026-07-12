@@ -151,6 +151,8 @@ QString optionalComponentsNoticeText(const QJsonObject &status,
       optional.value(QStringLiteral("onnxruntime_cuda")).toObject();
   const QJsonObject maxine =
       optional.value(QStringLiteral("maxine_sdk")).toObject();
+  const QJsonObject vulkan =
+      optional.value(QStringLiteral("vulkan")).toObject();
 
   const QString openDocs = docLink(
       sourceDir, QStringLiteral("docs/open_source_video_models_install.md"),
@@ -158,6 +160,9 @@ QString optionalComponentsNoticeText(const QJsonObject &status,
   const QString maxineDocs =
       docLink(sourceDir, QStringLiteral("docs/maxine_install.md"),
               QStringLiteral("Maxine SDK install instructions"));
+  const QString vulkanDocs =
+      docLink(sourceDir, QStringLiteral("docs/SETUP.md"),
+              QStringLiteral("Open Vulkan setup instructions"));
 
   if (!jsonBool(cuda, QStringLiteral("available"))) {
     lines << QStringLiteral(
@@ -187,9 +192,27 @@ QString optionalComponentsNoticeText(const QJsonObject &status,
                  .arg(maxineDocs);
   }
 
+  if (!jsonBool(vulkan, QStringLiteral("loader_present"))) {
+    lines << QStringLiteral(
+                 "<b>Vulkan loader not detected.</b> Open Vulkan is optional "
+                 "and runtime-loaded. Select the Vulkan runtime packages "
+                 "below and ensure a working GPU driver/ICD is installed. "
+                 "See %1.")
+                 .arg(vulkanDocs);
+  } else if (!jsonBool(vulkan, QStringLiteral("vulkaninfo_present"))) {
+    lines << QStringLiteral(
+                 "<b>Vulkan diagnostics not detected.</b> The loader is "
+                 "present, but the optional Vulkan runtime package selection "
+                 "can add vulkaninfo. A working GPU driver/ICD is still "
+                 "required. See %1.")
+                 .arg(vulkanDocs);
+  }
+
   if (lines.isEmpty()) {
-    return QStringLiteral("CUDA, ONNX Runtime CUDA provider, and Maxine SDK "
-                          "assets were detected.");
+    return QStringLiteral("CUDA, ONNX Runtime CUDA provider, Maxine SDK "
+                          "assets, and Vulkan loader diagnostics were "
+                          "detected. Vulkan device/ICD usability is checked "
+                          "at runtime.");
   }
 
   return lines.join(QStringLiteral("<br>"));
@@ -356,6 +379,12 @@ bool InstallerWizard::loadLoopback() const { return loadLoopback_; }
 bool InstallerWizard::persistLoopback() const { return persistLoopback_; }
 bool InstallerWizard::installService() const { return installService_; }
 bool InstallerWizard::openBackendsSetup() const { return openBackendsSetup_; }
+bool InstallerWizard::openVulkan() const { return openVulkan_; }
+bool InstallerWizard::installVulkanRuntime() const {
+  return installVulkanRuntime_;
+}
+bool InstallerWizard::installMesaVulkan() const { return installMesaVulkan_; }
+bool InstallerWizard::installShaderTools() const { return installShaderTools_; }
 bool InstallerWizard::installModels() const { return installModels_; }
 bool InstallerWizard::freshBuild() const { return freshBuild_; }
 bool InstallerWizard::allowUnsupported() const { return allowUnsupported_; }
@@ -386,6 +415,22 @@ void InstallerWizard::setInstallService(bool enabled) {
 }
 void InstallerWizard::setOpenBackendsSetup(bool enabled) {
   openBackendsSetup_ = enabled;
+}
+void InstallerWizard::setOpenVulkan(bool enabled) { openVulkan_ = enabled; }
+void InstallerWizard::setInstallVulkanRuntime(bool enabled) {
+  installVulkanRuntime_ = enabled;
+  if (!enabled) {
+    installMesaVulkan_ = false;
+  }
+}
+void InstallerWizard::setInstallMesaVulkan(bool enabled) {
+  installMesaVulkan_ = enabled;
+  if (enabled) {
+    installVulkanRuntime_ = true;
+  }
+}
+void InstallerWizard::setInstallShaderTools(bool enabled) {
+  installShaderTools_ = enabled;
 }
 void InstallerWizard::setInstallModels(bool enabled) {
   installModels_ = enabled;
@@ -522,6 +567,16 @@ QStringList InstallerWizard::backendOptions(bool forPlan) const {
                            : QStringLiteral("--no-service"));
   args << (openBackendsSetup_ ? QStringLiteral("--open-backends")
                               : QStringLiteral("--no-open-backends"));
+  args << (openVulkan_ ? QStringLiteral("--open-vulkan")
+                       : QStringLiteral("--no-open-vulkan"));
+  args << (installVulkanRuntime_ ? QStringLiteral("--vulkan-runtime")
+                                 : QStringLiteral("--no-vulkan-runtime"));
+  if (installMesaVulkan_) {
+    args << QStringLiteral("--mesa-vulkan");
+  }
+  if (installShaderTools_) {
+    args << QStringLiteral("--shader-tools");
+  }
   args << (installModels_ ? QStringLiteral("--models")
                           : QStringLiteral("--no-models"));
   args << (freshBuild_ ? QStringLiteral("--fresh-build")
@@ -967,6 +1022,7 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
       QStringLiteral("Persist the virtual camera across reboot"), this);
   openBackendsSetup_ =
       new QCheckBox(QStringLiteral("Enable Open Source Backend Setup"), this);
+  openBackendsSetup_->setObjectName(QStringLiteral("scInstallerOpenBackends"));
   openBackendsSetup_->setToolTip(QStringLiteral(
       "Configures and rebuilds StudioCast with Open Video/Open CUDA and Open "
       "Audio enabled. Dependency setup can install ONNX Runtime; model "
@@ -989,6 +1045,49 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   layout->addWidget(line(this));
   layout->addWidget(openBackendsSetup_);
   layout->addWidget(installModels_);
+
+  auto *vulkanBox =
+      new QGroupBox(QStringLiteral("Open Vulkan (optional)"), this);
+  auto *vulkanLayout = new QVBoxLayout(vulkanBox);
+  openVulkan_ = new QCheckBox(
+      QStringLiteral("Build StudioCast with Open Vulkan support"), vulkanBox);
+  openVulkan_->setObjectName(QStringLiteral("scInstallerOpenVulkan"));
+  openVulkan_->setToolTip(QStringLiteral(
+      "Passes --open-vulkan so CMake enables the runtime-loaded Open Vulkan "
+      "backend. This does not prove that a Vulkan device or production "
+      "Vulkan matting runtime is available."));
+  installVulkanRuntime_ = new QCheckBox(
+      QStringLiteral("Install Vulkan loader and diagnostic packages"),
+      vulkanBox);
+  installVulkanRuntime_->setObjectName(
+      QStringLiteral("scInstallerVulkanRuntime"));
+  installVulkanRuntime_->setToolTip(QStringLiteral(
+      "Installs libvulkan1 and vulkan-tools. These packages do not include or "
+      "guarantee a working GPU driver/ICD."));
+  installMesaVulkan_ = new QCheckBox(
+      QStringLiteral("Install Mesa Intel/AMD Vulkan ICDs"), vulkanBox);
+  installMesaVulkan_->setObjectName(QStringLiteral("scInstallerMesaVulkan"));
+  installMesaVulkan_->setToolTip(QStringLiteral(
+      "Installs mesa-vulkan-drivers for supported Intel/AMD GPUs and also "
+      "selects the Vulkan loader/runtime packages."));
+  installShaderTools_ = new QCheckBox(
+      QStringLiteral("Install shader developer tools (optional)"), vulkanBox);
+  installShaderTools_->setObjectName(QStringLiteral("scInstallerShaderTools"));
+  installShaderTools_->setToolTip(QStringLiteral(
+      "Installs glslang-tools for developers who validate or regenerate "
+      "embedded SPIR-V. Normal StudioCast builds use committed shaders."));
+  vulkanLayout->addWidget(openVulkan_);
+  vulkanLayout->addWidget(installVulkanRuntime_);
+  vulkanLayout->addWidget(installMesaVulkan_);
+  vulkanLayout->addWidget(installShaderTools_);
+  vulkanLayout->addWidget(mutedLabel(
+      QStringLiteral(
+          "Open Vulkan is runtime-loaded and needs a working GPU driver/ICD. "
+          "Installing packages does not guarantee device support or full "
+          "CUDA/NVIDIA effect parity; production Vulkan virtual-background "
+          "matting is still unavailable."),
+      vulkanBox));
+  layout->addWidget(vulkanBox);
   layout->addWidget(removeUserData_);
   optionalComponentsNotice_ = new QLabel(this);
   optionalComponentsNotice_->setWordWrap(true);
@@ -1009,6 +1108,18 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
     loadLoopback_->setEnabled(checked);
     persistLoopback_->setEnabled(checked);
   });
+  connect(installVulkanRuntime_, &QCheckBox::toggled, this,
+          [this](bool checked) {
+            installMesaVulkan_->setEnabled(checked && openVulkan_->isEnabled());
+            if (!checked) {
+              installMesaVulkan_->setChecked(false);
+            }
+          });
+  connect(installMesaVulkan_, &QCheckBox::toggled, this, [this](bool checked) {
+    if (checked) {
+      installVulkanRuntime_->setChecked(true);
+    }
+  });
 }
 
 void ServiceOptionsPage::initializePage() {
@@ -1021,6 +1132,9 @@ void ServiceOptionsPage::initializePage() {
   loadLoopback_->setEnabled(installLike && w->configureV4l2Loopback());
   persistLoopback_->setEnabled(installLike && w->configureV4l2Loopback());
   openBackendsSetup_->setEnabled(installLike);
+  openVulkan_->setEnabled(installLike);
+  installVulkanRuntime_->setEnabled(installLike);
+  installShaderTools_->setEnabled(installLike);
   installModels_->setEnabled(installLike);
   removeUserData_->setEnabled(workflow == QStringLiteral("uninstall") ||
                               workflow == QStringLiteral("clean-install"));
@@ -1030,6 +1144,12 @@ void ServiceOptionsPage::initializePage() {
   loadLoopback_->setChecked(w->loadLoopback());
   persistLoopback_->setChecked(w->persistLoopback());
   openBackendsSetup_->setChecked(w->openBackendsSetup());
+  openVulkan_->setChecked(w->openVulkan());
+  installVulkanRuntime_->setChecked(w->installVulkanRuntime());
+  installMesaVulkan_->setChecked(w->installMesaVulkan());
+  installMesaVulkan_->setEnabled(installLike &&
+                                 installVulkanRuntime_->isChecked());
+  installShaderTools_->setChecked(w->installShaderTools());
   installModels_->setChecked(w->installModels());
   removeUserData_->setChecked(w->removeUserData());
 
@@ -1046,6 +1166,10 @@ bool ServiceOptionsPage::validatePage() {
   w->setLoadLoopback(loadLoopback_->isChecked());
   w->setPersistLoopback(persistLoopback_->isChecked());
   w->setOpenBackendsSetup(openBackendsSetup_->isChecked());
+  w->setOpenVulkan(openVulkan_->isChecked());
+  w->setInstallVulkanRuntime(installVulkanRuntime_->isChecked());
+  w->setInstallMesaVulkan(installMesaVulkan_->isChecked());
+  w->setInstallShaderTools(installShaderTools_->isChecked());
   w->setInstallModels(installModels_->isChecked());
   w->setRemoveUserData(removeUserData_->isChecked());
   return true;

@@ -771,16 +771,16 @@ plan_workflow() {
     if [[ "${WITH_DEPS}" -eq 1 ]]; then
       PLAN_CHANGES+=("Install/refresh build and runtime dependencies through scripts/setup.sh.")
       PLAN_PRIVILEGED+=("apt package operations and /opt/ldconfig writes delegated to scripts/setup.sh via sudo.")
-      if [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]]; then
-        PLAN_CHANGES+=("Install optional Vulkan loader/diagnostic packages; this does not guarantee Vulkan device support.")
-        PLAN_PRIVILEGED+=("Vulkan package operations are delegated to scripts/setup.sh via sudo.")
-      fi
-      if [[ "${WITH_MESA_VULKAN}" -eq 1 ]]; then
-        PLAN_CHANGES+=("Install Mesa Intel/AMD Vulkan ICD packages when available from the distro.")
-      fi
-      if [[ "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
-        PLAN_CHANGES+=("Install optional developer shader tools for validating/regenerating embedded Vulkan SPIR-V.")
-      fi
+    fi
+    if [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]]; then
+      PLAN_CHANGES+=("Install optional Vulkan loader/diagnostic packages; this does not guarantee Vulkan device support.")
+      PLAN_PRIVILEGED+=("Vulkan package operations are delegated to scripts/setup.sh via sudo.")
+    fi
+    if [[ "${WITH_MESA_VULKAN}" -eq 1 ]]; then
+      PLAN_CHANGES+=("Install Mesa Intel/AMD Vulkan ICD packages when available from the distro.")
+    fi
+    if [[ "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
+      PLAN_CHANGES+=("Install optional developer shader tools for validating/regenerating embedded Vulkan SPIR-V.")
     fi
     if [[ "${WITH_V4L2}" -eq 1 ]]; then
       PLAN_CHANGES+=("Ensure v4l2loopback is installed for the StudioCast virtual camera.")
@@ -806,7 +806,11 @@ plan_workflow() {
       PLAN_CHANGES+=("Force Linux CMake configuration to keep Open Video/Open CUDA and Open Audio enabled.")
     fi
     if [[ "${OPEN_VULKAN}" -eq 1 ]]; then
-      PLAN_CHANGES+=("Enable the optional Open Vulkan CMake backend; missing loader/device support is reported as degraded or unavailable at runtime.")
+      PLAN_CHANGES+=("Enable the optional, runtime-loaded Open Vulkan CMake backend.")
+    fi
+    if [[ "${OPEN_VULKAN}" -eq 1 || "${WITH_VULKAN_RUNTIME}" -eq 1 || "${WITH_MESA_VULKAN}" -eq 1 || "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
+      PLAN_CHANGES+=("Open Vulkan is optional and runtime-loaded, and still requires a working GPU driver/ICD exposing a compute-capable device; package/tool installation alone does not provide CUDA/NVIDIA effect parity.")
+      PLAN_CHANGES+=("Production Open Vulkan virtual-background matting remains blocked until a device-resident Vulkan inference runtime is implemented.")
     fi
     PLAN_CHANGES+=("Enable CPU resize fallback in the daemon config by default.")
     PLAN_CHANGES+=("Write install manifest: ${MANIFEST_PATH}.")
@@ -816,8 +820,9 @@ plan_workflow() {
   add_plan_command "${BACKEND_PATH}" status
   case "${WORKFLOW}" in
     install|update|repair|clean-install)
-      if [[ "${WITH_DEPS}" -eq 1 ]]; then
-        local -a setup_args=("--deps")
+      if [[ "${WITH_DEPS}" -eq 1 || "${WITH_VULKAN_RUNTIME}" -eq 1 || "${WITH_SHADER_TOOLS}" -eq 1 ]]; then
+        local -a setup_args=()
+        [[ "${WITH_DEPS}" -eq 1 ]] && setup_args+=("--deps")
         if [[ "${WITH_V4L2}" -eq 1 ]]; then
           setup_args+=("--v4l2loopback")
           [[ "${LOAD_LOOPBACK}" -eq 1 ]] && setup_args+=("--load-loopback")
@@ -984,8 +989,11 @@ prepare_source() {
 }
 
 run_setup_deps() {
-  [[ "${WITH_DEPS}" -eq 1 ]] || return 0
-  local -a args=("--deps")
+  if [[ "${WITH_DEPS}" -ne 1 && "${WITH_VULKAN_RUNTIME}" -ne 1 && "${WITH_SHADER_TOOLS}" -ne 1 ]]; then
+    return 0
+  fi
+  local -a args=()
+  [[ "${WITH_DEPS}" -eq 1 ]] && args+=("--deps")
   if [[ "${WITH_V4L2}" -eq 1 ]]; then
     args+=("--v4l2loopback")
     [[ "${LOAD_LOOPBACK}" -eq 1 ]] && args+=("--load-loopback")
@@ -995,7 +1003,7 @@ run_setup_deps() {
   [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && args+=("--mesa-vulkan")
   [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && args+=("--shader-tools")
   [[ "${YES}" -eq 1 ]] && args+=("--yes")
-  log "Installing/checking dependencies through scripts/setup.sh"
+  log "Installing/checking selected dependencies through scripts/setup.sh"
   run_cmd "${EFFECTIVE_SOURCE_DIR}/scripts/setup.sh" "${args[@]}"
 }
 
@@ -1101,10 +1109,13 @@ configure_daemon_defaults() {
 write_manifest() {
   local state="$1"
   local version="$2"
-  local dependency_method="skipped"
+  local dependency_method=""
   [[ "${WITH_DEPS}" -eq 1 ]] && dependency_method="scripts/setup.sh --deps"
-  [[ "${WITH_V4L2}" -eq 1 ]] && dependency_method="${dependency_method} + v4l2loopback"
-  [[ "${WITH_DEPS}" -eq 1 && "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && dependency_method="${dependency_method} + optional Vulkan runtime"
+  [[ "${WITH_V4L2}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }v4l2loopback"
+  [[ "${WITH_VULKAN_RUNTIME}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }optional Vulkan runtime"
+  [[ "${WITH_MESA_VULKAN}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }Mesa Intel/AMD Vulkan ICDs"
+  [[ "${WITH_SHADER_TOOLS}" -eq 1 ]] && dependency_method="${dependency_method:+${dependency_method} + }Vulkan shader tools"
+  [[ -n "${dependency_method}" ]] || dependency_method="skipped"
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "Would write manifest: ${MANIFEST_PATH}"

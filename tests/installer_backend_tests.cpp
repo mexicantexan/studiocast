@@ -148,8 +148,7 @@ bool TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() {
          Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
                     std::string::npos,
                 "default installer plan should not enable Open Vulkan") &&
-         Expect(result.stdout_str.find("--vulkan-runtime") ==
-                    std::string::npos,
+         Expect(result.stdout_str.find("--vulkan-runtime") == std::string::npos,
                 "default installer plan should not install Vulkan runtime "
                 "packages") &&
          ExpectContains("installer backend plan", result.stdout_str,
@@ -188,7 +187,66 @@ bool TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() {
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
                         "Mesa Intel/AMD Vulkan ICD") &&
          ExpectContains("installer backend Vulkan plan", result.stdout_str,
-                        "developer shader tools");
+                        "developer shader tools") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "runtime-loaded Open Vulkan") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "working GPU driver/ICD") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "virtual-background matting remains blocked");
+}
+
+bool TestRepairPlanInstallsOnlySelectedVulkanPackages() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-repair-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json",
+                     "--vulkan-runtime --mesa-vulkan --shader-tools "
+                     "--open-vulkan"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan-only repair plan should exit "
+                "successfully") &&
+         ExpectContains("installer backend Vulkan-only repair plan",
+                        result.stdout_str,
+                        "scripts/setup.sh --vulkan-runtime --mesa-vulkan "
+                        "--shader-tools") &&
+         Expect(result.stdout_str.find("scripts/setup.sh --deps") ==
+                    std::string::npos,
+                "Vulkan-only repair should not force the full dependency "
+                "bundle");
+}
+
+bool TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-runtime-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json", "--vulkan-runtime"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan runtime-only plan should exit "
+                "successfully") &&
+         ExpectContains("installer backend Vulkan runtime-only plan",
+                        result.stdout_str,
+                        "Open Vulkan is optional and runtime-loaded") &&
+         ExpectContains("installer backend Vulkan runtime-only plan",
+                        result.stdout_str, "working GPU driver/ICD") &&
+         ExpectContains("installer backend Vulkan runtime-only plan",
+                        result.stdout_str,
+                        "virtual-background matting remains blocked") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
+                    std::string::npos,
+                "runtime-only package selection should not implicitly enable "
+                "the Open Vulkan build");
 }
 
 bool TestRepairPlanCanDisableOpenBackendConfigureFlags() {
@@ -274,12 +332,10 @@ bool IsSkippedPackageSafetyDir(const fs::path &p) {
 bool IsForbiddenBundledMaxineArtifact(const fs::path &p) {
   const std::string name = p.filename().string();
   const char *forbidden_prefixes[] = {
-      "libVideoFX.so",       "libnvvfx.so",
-      "libNvVFX.so",         "libnvVideoEffects.so",
-      "libNVVideoEffects.so", "libnvARPose.so",
-      "libnvar.so",          "libNvAR.so",
-      "libnv_audiofx.so",    "NVIDIA_VFX_SDK_linux",
-      "NVIDIA_AR_SDK_linux", "Audio_Effects_SDK.tar",
+      "libVideoFX.so",        "libnvvfx.so",          "libNvVFX.so",
+      "libnvVideoEffects.so", "libNVVideoEffects.so", "libnvARPose.so",
+      "libnvar.so",           "libNvAR.so",           "libnv_audiofx.so",
+      "NVIDIA_VFX_SDK_linux", "NVIDIA_AR_SDK_linux",  "Audio_Effects_SDK.tar",
   };
   for (const char *prefix : forbidden_prefixes) {
     if (name.rfind(prefix, 0) == 0) {
@@ -292,8 +348,9 @@ bool IsForbiddenBundledMaxineArtifact(const fs::path &p) {
 bool CmakeInstallBlocksContainForbiddenMaxineArtifact(const std::string &cmake,
                                                       std::string *matched) {
   const std::string forbidden[] = {
-      "VideoFX",       "ARSDK",          "Audio_Effects_SDK",
-      "libVideoFX.so", "libnv_audiofx.so", "libnvARPose.so",
+      "VideoFX",           "ARSDK",
+      "Audio_Effects_SDK", "libVideoFX.so",
+      "libnv_audiofx.so",  "libnvARPose.so",
   };
 
   std::size_t pos = 0;
@@ -338,18 +395,17 @@ bool TestPackageSafetyDoesNotBundleOrInstallMaxineArtifacts() {
     }
     if (it->is_regular_file(ec) &&
         IsForbiddenBundledMaxineArtifact(it->path())) {
-      std::cerr << "forbidden bundled Maxine SDK artifact found: "
-                << it->path() << "\n";
+      std::cerr << "forbidden bundled Maxine SDK artifact found: " << it->path()
+                << "\n";
       return false;
     }
   }
 
-  const std::string cmake =
-      [&] {
-        std::ifstream in(repo / "CMakeLists.txt");
-        return std::string(std::istreambuf_iterator<char>(in),
-                           std::istreambuf_iterator<char>());
-      }();
+  const std::string cmake = [&] {
+    std::ifstream in(repo / "CMakeLists.txt");
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+  }();
   std::string matched;
   if (CmakeInstallBlocksContainForbiddenMaxineArtifact(cmake, &matched)) {
     std::cerr << "CMake install/package surface mentions forbidden Maxine "
@@ -436,6 +492,8 @@ int main() {
   bool ok = true;
   ok = TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() && ok;
   ok = TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() && ok;
+  ok = TestRepairPlanInstallsOnlySelectedVulkanPackages() && ok;
+  ok = TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() && ok;
   ok = TestRepairPlanCanDisableOpenBackendConfigureFlags() && ok;
   ok = TestRepairDryRunIncludesOpenBackendConfigureFlags() && ok;
   ok = TestStatusReportsOptionalComponents() && ok;

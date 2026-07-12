@@ -39,6 +39,8 @@ Options:
 Examples:
   ./scripts/setup.sh --deps --v4l2loopback --load-loopback --persist-loopback
   ./scripts/setup.sh --deps --onnxruntime-flavor gpu
+  ./scripts/setup.sh --vulkan-runtime --mesa-vulkan
+  ./scripts/setup.sh --shader-tools
 EOF
 }
 

@@ -1,9 +1,13 @@
 #include "core/vulkan/vulkan_device.h"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 #include "core/util/json.h"
@@ -95,6 +99,66 @@ int DeviceScore(const VkPhysicalDeviceProperties &props) {
   }
 }
 
+std::string TrimCopy(std::string_view value) {
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.front())))
+    value.remove_prefix(1);
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.back())))
+    value.remove_suffix(1);
+  return std::string(value);
+}
+
+std::string LowerCopy(std::string_view value) {
+  std::string out(value);
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return out;
+}
+
+bool ParseBool(std::string_view raw, bool *out) {
+  const std::string value = LowerCopy(TrimCopy(raw));
+  if (value.empty() || value == "0" || value == "false" || value == "no" ||
+      value == "off") {
+    *out = false;
+    return true;
+  }
+  if (value == "1" || value == "true" || value == "yes" || value == "on") {
+    *out = true;
+    return true;
+  }
+  return false;
+}
+
+void AppendJsonDeviceCandidates(
+    std::ostringstream *oss,
+    const std::vector<VulkanDeviceCandidateInfo> &candidates) {
+  *oss << "[";
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    if (i)
+      *oss << ",";
+    const auto &c = candidates[i];
+    *oss << "{";
+    *oss << "\"enumeration_index\":" << c.enumeration_index << ",";
+    *oss << "\"api_version\":" << c.api_version << ",";
+    *oss << "\"driver_version\":" << c.driver_version << ",";
+    *oss << "\"vendor_id\":" << c.vendor_id << ",";
+    *oss << "\"device_id\":" << c.device_id << ",";
+    *oss << "\"device_type\":" << c.device_type << ",";
+    *oss << "\"vendor_name\":\"" << JsonEscape(c.vendor_name) << "\",";
+    *oss << "\"device_name\":\"" << JsonEscape(c.device_name) << "\",";
+    *oss << "\"compute_queue_family_index\":" << c.compute_queue_family_index
+         << ",";
+    *oss << "\"score\":" << c.score << ",";
+    *oss << "\"eligible\":" << BoolJson(c.eligible) << ",";
+    *oss << "\"selected\":" << BoolJson(c.selected) << ",";
+    *oss << "\"rejection_reason\":\"" << JsonEscape(c.rejection_reason) << "\"";
+    *oss << "}";
+  }
+  *oss << "]";
+}
+
 template <typename T>
 bool LoadInstanceProc(const VulkanFunctions &f, VkInstance instance,
                       const char *name, T *out, std::string *error_out) {
@@ -148,6 +212,155 @@ bool ResultOk(VkResult result, const char *what, std::string *error_out) {
 
 } // namespace
 
+namespace detail {
+
+bool ParseVulkanDeviceSelection(std::string_view requested_index,
+                                std::string_view allow_cpu_in_auto,
+                                VulkanDeviceSelection *selection,
+                                std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (!selection) {
+    if (error_out)
+      *error_out = "Vulkan device selection output is null.";
+    return false;
+  }
+
+  *selection = VulkanDeviceSelection{};
+  const std::string raw_index = TrimCopy(requested_index);
+  if (!raw_index.empty()) {
+    std::uint32_t index = 0;
+    const char *begin = raw_index.data();
+    const char *end = begin + raw_index.size();
+    const auto parsed = std::from_chars(begin, end, index);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+      if (error_out) {
+        *error_out = "STUDIOCAST_VULKAN_DEVICE_INDEX must be a non-negative "
+                     "Vulkan enumeration index; got '" +
+                     raw_index + "'.";
+      }
+      return false;
+    }
+    selection->requested_index = index;
+    selection->request = "index:" + std::to_string(index);
+    selection->source = "STUDIOCAST_VULKAN_DEVICE_INDEX";
+  }
+
+  bool allow_cpu = false;
+  if (!ParseBool(allow_cpu_in_auto, &allow_cpu)) {
+    if (error_out) {
+      *error_out =
+          "STUDIOCAST_VULKAN_ALLOW_CPU must be a boolean value; got '" +
+          TrimCopy(allow_cpu_in_auto) + "'.";
+    }
+    return false;
+  }
+  selection->allow_cpu_in_auto = allow_cpu;
+  if (allow_cpu && !selection->requested_index.has_value()) {
+    selection->request = "auto_with_cpu";
+    selection->source = "STUDIOCAST_VULKAN_ALLOW_CPU";
+  }
+  return true;
+}
+
+VulkanDeviceSelectionResult
+SelectVulkanDeviceCandidate(std::vector<VulkanDeviceCandidateInfo> *candidates,
+                            const VulkanDeviceSelection &selection) {
+  VulkanDeviceSelectionResult result;
+  if (!candidates || candidates->empty()) {
+    result.failure_reason = "vulkan_no_physical_device";
+    result.error = "Vulkan runtime has no physical devices.";
+    return result;
+  }
+
+  for (auto &candidate : *candidates) {
+    candidate.eligible = false;
+    candidate.selected = false;
+    candidate.rejection_reason.clear();
+    if (candidate.compute_queue_family_index < 0) {
+      candidate.rejection_reason = "no_compute_queue";
+      continue;
+    }
+    if (!selection.requested_index.has_value() &&
+        candidate.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU &&
+        !selection.allow_cpu_in_auto) {
+      candidate.rejection_reason = "cpu_device_not_enabled";
+      continue;
+    }
+    candidate.eligible = true;
+  }
+
+  if (selection.requested_index.has_value()) {
+    const std::uint32_t requested = *selection.requested_index;
+    const auto it = std::find_if(
+        candidates->begin(), candidates->end(), [&](const auto &candidate) {
+          return candidate.enumeration_index == requested;
+        });
+    if (it == candidates->end()) {
+      result.failure_reason = "vulkan_requested_device_not_found";
+      result.error = "Requested Vulkan device index " +
+                     std::to_string(requested) + " was not enumerated.";
+      return result;
+    }
+    if (it->compute_queue_family_index < 0) {
+      result.failure_reason = "vulkan_requested_device_no_compute_queue";
+      result.error = "Requested Vulkan device index " +
+                     std::to_string(requested) +
+                     " does not expose a compute-capable queue.";
+      return result;
+    }
+    for (auto &candidate : *candidates) {
+      if (candidate.enumeration_index != requested &&
+          candidate.rejection_reason.empty()) {
+        candidate.eligible = false;
+        candidate.rejection_reason = "not_requested";
+      }
+    }
+    it->eligible = true;
+    it->selected = true;
+    it->rejection_reason.clear();
+    result.ok = true;
+    result.candidate_vector_index =
+        static_cast<std::size_t>(std::distance(candidates->begin(), it));
+    return result;
+  }
+
+  auto best = candidates->end();
+  for (auto it = candidates->begin(); it != candidates->end(); ++it) {
+    if (!it->eligible)
+      continue;
+    if (best == candidates->end() || it->score > best->score)
+      best = it;
+  }
+  if (best == candidates->end()) {
+    const bool cpu_compute_available =
+        std::any_of(candidates->begin(), candidates->end(), [](const auto &c) {
+          return c.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU &&
+                 c.compute_queue_family_index >= 0;
+        });
+    if (cpu_compute_available) {
+      result.failure_reason = "vulkan_only_cpu_devices_available";
+      result.error =
+          "Only CPU Vulkan devices were found. Set "
+          "STUDIOCAST_VULKAN_ALLOW_CPU=1 to opt into a software Vulkan "
+          "device, or install a working GPU driver/ICD.";
+    } else {
+      result.failure_reason = "vulkan_no_compute_queue";
+      result.error =
+          "No Vulkan physical device exposes a compute-capable queue.";
+    }
+    return result;
+  }
+
+  best->selected = true;
+  result.ok = true;
+  result.candidate_vector_index =
+      static_cast<std::size_t>(std::distance(candidates->begin(), best));
+  return result;
+}
+
+} // namespace detail
+
 std::string OpenVulkanDiagnostics::ToJson() const {
   std::ostringstream oss;
   oss << "{";
@@ -175,6 +388,20 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "\"device_name\":\"" << JsonEscape(device_name) << "\",";
   oss << "\"compute_queue_family_index\":" << compute_queue_family_index
       << ",";
+  oss << "\"device_selection_source\":\"" << JsonEscape(device_selection_source)
+      << "\",";
+  oss << "\"device_selection_request\":\""
+      << JsonEscape(device_selection_request) << "\",";
+  oss << "\"selected_device_index\":";
+  if (selected_device_index < 0)
+    oss << "null";
+  else
+    oss << selected_device_index;
+  oss << ",";
+  oss << "\"cpu_device_selected\":" << BoolJson(cpu_device_selected) << ",";
+  oss << "\"device_candidates\":";
+  AppendJsonDeviceCandidates(&oss, device_candidates);
+  oss << ",";
   oss << "\"error\":\"" << JsonEscape(error) << "\",";
   oss << "\"fallback_reason\":\"" << JsonEscape(fallback_reason) << "\",";
   oss << "\"blocked_reason\":\"" << JsonEscape(blocked_reason) << "\",";
@@ -234,6 +461,20 @@ bool VulkanDevice::Initialize(std::string *error_out) {
 
   diagnostics_ = OpenVulkanDiagnostics{};
   std::string e;
+  const char *requested_index = std::getenv("STUDIOCAST_VULKAN_DEVICE_INDEX");
+  const char *allow_cpu = std::getenv("STUDIOCAST_VULKAN_ALLOW_CPU");
+  if (!detail::ParseVulkanDeviceSelection(
+          requested_index ? requested_index : "", allow_cpu ? allow_cpu : "",
+          &selection_, &e)) {
+    diagnostics_.error = e;
+    diagnostics_.fallback_reason = "vulkan_device_selection_invalid";
+    if (error_out)
+      *error_out = e;
+    return false;
+  }
+  diagnostics_.device_selection_source = selection_.source;
+  diagnostics_.device_selection_request = selection_.request;
+
   if (!loader_.Load(&e)) {
     diagnostics_.error = e;
     diagnostics_.fallback_reason = "vulkan_runtime_not_found";
@@ -345,65 +586,73 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
   if (!ResultOk(result, "vkEnumeratePhysicalDevices(list)", error_out))
     return false;
 
-  struct Candidate {
-    VkPhysicalDevice device = nullptr;
-    VkPhysicalDeviceProperties properties{};
-    std::uint32_t queue_family_index = 0;
-    int score = 0;
-  };
-  std::vector<Candidate> candidates;
-  for (VkPhysicalDevice dev : devices) {
+  std::vector<VulkanDeviceCandidateInfo> candidate_infos;
+  candidate_infos.reserve(devices.size());
+  for (std::size_t device_index = 0; device_index < devices.size();
+       ++device_index) {
+    const VkPhysicalDevice dev = devices[device_index];
     VkPhysicalDeviceProperties props{};
     vf.vkGetPhysicalDeviceProperties(dev, &props);
+    VulkanDeviceCandidateInfo candidate;
+    candidate.enumeration_index = static_cast<std::uint32_t>(device_index);
+    candidate.api_version = props.apiVersion;
+    candidate.driver_version = props.driverVersion;
+    candidate.vendor_id = props.vendorID;
+    candidate.device_id = props.deviceID;
+    candidate.device_type = static_cast<std::uint32_t>(props.deviceType);
+    candidate.vendor_name = VendorName(props.vendorID);
+    candidate.device_name = props.deviceName;
+    candidate.score = DeviceScore(props);
     std::uint32_t q_count = 0;
     vf.vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, nullptr);
-    if (q_count == 0)
-      continue;
-    std::vector<VkQueueFamilyProperties> queues(q_count);
-    vf.vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, queues.data());
-    for (std::uint32_t i = 0; i < q_count; ++i) {
-      if ((queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
-          queues[i].queueCount > 0) {
-        Candidate c;
-        c.device = dev;
-        c.properties = props;
-        c.queue_family_index = i;
-        c.score = DeviceScore(props);
-        candidates.push_back(c);
-        break;
+    if (q_count > 0) {
+      std::vector<VkQueueFamilyProperties> queues(q_count);
+      vf.vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, queues.data());
+      for (std::uint32_t i = 0; i < q_count; ++i) {
+        if ((queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            queues[i].queueCount > 0) {
+          candidate.compute_queue_family_index = static_cast<int>(i);
+          break;
+        }
       }
     }
+    candidate_infos.push_back(std::move(candidate));
   }
 
-  if (candidates.empty()) {
-    diagnostics_.physical_device_found = true;
-    diagnostics_.fallback_reason = "vulkan_no_compute_queue";
+  const VulkanDeviceSelectionResult selected =
+      detail::SelectVulkanDeviceCandidate(&candidate_infos, selection_);
+  diagnostics_.physical_device_found = true;
+  diagnostics_.device_candidates = candidate_infos;
+  if (!selected.ok) {
+    diagnostics_.fallback_reason = selected.failure_reason;
     if (error_out)
-      *error_out = "No Vulkan physical device exposes a compute-capable queue.";
+      *error_out = selected.error;
     return false;
   }
 
-  const auto best =
-      std::max_element(candidates.begin(), candidates.end(),
-                       [](const Candidate &a, const Candidate &b) {
-                         return a.score < b.score;
-                       });
-  physical_device_ = best->device;
-  queue_family_index_ = best->queue_family_index;
-  vf.vkGetPhysicalDeviceMemoryProperties(physical_device_,
-                                         &memory_properties_);
+  const auto &best = candidate_infos[selected.candidate_vector_index];
+  physical_device_ = devices[best.enumeration_index];
+  queue_family_index_ =
+      static_cast<std::uint32_t>(best.compute_queue_family_index);
+  vf.vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties_);
 
-  diagnostics_.physical_device_found = true;
   diagnostics_.compute_queue_available = true;
-  diagnostics_.api_version = best->properties.apiVersion;
-  diagnostics_.driver_version = best->properties.driverVersion;
-  diagnostics_.vendor_id = best->properties.vendorID;
-  diagnostics_.device_id = best->properties.deviceID;
-  diagnostics_.device_type =
-      static_cast<std::uint32_t>(best->properties.deviceType);
-  diagnostics_.vendor_name = VendorName(best->properties.vendorID);
-  diagnostics_.device_name = best->properties.deviceName;
+  diagnostics_.api_version = best.api_version;
+  diagnostics_.driver_version = best.driver_version;
+  diagnostics_.vendor_id = best.vendor_id;
+  diagnostics_.device_id = best.device_id;
+  diagnostics_.device_type = best.device_type;
+  diagnostics_.vendor_name = best.vendor_name;
+  diagnostics_.device_name = best.device_name;
   diagnostics_.compute_queue_family_index = queue_family_index_;
+  diagnostics_.selected_device_index = static_cast<int>(best.enumeration_index);
+  diagnostics_.cpu_device_selected =
+      best.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+  if (diagnostics_.cpu_device_selected) {
+    diagnostics_.warnings.push_back(
+        "A CPU Vulkan device was selected; this is a software fallback, not "
+        "hardware GPU acceleration.");
+  }
   return true;
 }
 

@@ -150,6 +150,21 @@ Backend examples:
 ./scripts/installer.sh clean-install --yes
 ```
 
+The GUI installer exposes Open Vulkan as four independent, opt-in choices:
+build with the runtime-loaded backend, install loader/diagnostic packages,
+install Mesa Intel/AMD ICD packages, and install developer shader tools. The
+corresponding backend flags are `--open-vulkan`, `--vulkan-runtime`,
+`--mesa-vulkan`, and `--shader-tools`. Install, update, repair, and clean-install
+plans must preserve those selections in both the review text and the executed
+backend command. Vulkan package selection remains useful in repair flows even
+when the full dependency bundle is skipped.
+
+Installer review text must state that Open Vulkan is optional and runtime-loaded
+and still requires a working GPU driver/ICD. It must not equate loader/device
+availability with production inference parity: production Vulkan
+virtual-background matting remains blocked until a device-resident Vulkan
+inference runtime is implemented.
+
 The installer backend supports Ubuntu 22.04/Jammy, Ubuntu 24.04/Noble, and Linux
 Mint when `/etc/os-release` exposes a reliable Ubuntu base. Mint
 `UBUNTU_CODENAME=jammy` maps to Ubuntu 22.04; `UBUNTU_CODENAME=noble` maps to

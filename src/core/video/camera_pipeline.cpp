@@ -4257,20 +4257,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       if (fx.virtual_background.mode == VirtualBackgroundMode::blur) {
         std::string kerr;
-        if (!kernels.BoxBlurSeparableU8x3(in_rgb, blur_tmp, blurred, strength,
-                                          &kerr)) {
+        if (!kernels.BoxBlurCompositeAlphaU8x3(in_rgb, blur_tmp, blurred,
+                                               *alpha_use, *out_rgb_img,
+                                               strength, &kerr)) {
           if (error_out)
-            *error_out = "Open Vulkan: background blur failed: " + kerr;
+            *error_out =
+                "Open Vulkan: background blur/composite failed: " + kerr;
           return false;
         }
         ++blur_dispatch_calls;
-        ++forced_sync_calls;
-        if (!kernels.CompositeAlphaU8x3(in_rgb, blurred, *alpha_use,
-                                        *out_rgb_img, &kerr)) {
-          if (error_out)
-            *error_out = "Open Vulkan: composite failed: " + kerr;
-          return false;
-        }
         ++composite_dispatch_calls;
         ++forced_sync_calls;
       } else if (fx.virtual_background.mode == VirtualBackgroundMode::remove) {

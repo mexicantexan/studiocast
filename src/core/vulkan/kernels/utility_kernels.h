@@ -56,6 +56,9 @@ public:
   VulkanDevice *device() { return &device_; }
   const VulkanDevice *device() const { return &device_; }
   OpenVulkanDiagnostics Diagnostics() const;
+  std::uint64_t synchronous_submission_count() const {
+    return synchronous_submission_count_;
+  }
 
   bool CropResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                           float crop_x, float crop_y, float crop_w,
@@ -80,6 +83,15 @@ public:
   bool CompositeAlphaU8x3(const VulkanImage &fg, const VulkanImage &bg,
                           const VulkanImage &alpha, const VulkanImage &out,
                           std::string *error_out);
+  // Records the two-pass background blur and the dependent alpha composite in
+  // one command buffer. This keeps the intermediate image on the GPU and pays
+  // one queue submit/fence wait instead of one per public kernel call.
+  bool BoxBlurCompositeAlphaU8x3(const VulkanImage &fg,
+                                 const VulkanImage &blur_tmp,
+                                 const VulkanImage &blurred,
+                                 const VulkanImage &alpha,
+                                 const VulkanImage &out, int radius,
+                                 std::string *error_out);
   bool CompositeAlphaSolidU8x3(const VulkanImage &fg, const VulkanImage &alpha,
                                std::uint8_t bg_r, std::uint8_t bg_g,
                                std::uint8_t bg_b, const VulkanImage &out,
@@ -111,6 +123,11 @@ private:
   bool EnsurePipeline(std::string *error_out);
   bool EnsureDescriptors(std::string *error_out);
   bool EnsureCommandBuffer(std::string *error_out);
+  bool BindBuffersForSet(VkDescriptorSet descriptor_set, VkBuffer params_buffer,
+                         std::array<VkBuffer, 7> *bound_buffers,
+                         VkBuffer u8_src0, VkBuffer u8_src1, VkBuffer f32_src0,
+                         VkBuffer u8_out, VkBuffer f32_out, VkBuffer scratch,
+                         std::string *error_out);
   bool BindBuffers(VkBuffer u8_src0, VkBuffer u8_src1, VkBuffer f32_src0,
                    VkBuffer u8_out, VkBuffer f32_out, VkBuffer scratch,
                    std::string *error_out);
@@ -119,22 +136,27 @@ private:
   bool DispatchTwoPass(const Params &params, Op first, Op second,
                        std::uint32_t dispatch_w, std::uint32_t dispatch_h,
                        std::string *error_out);
+  bool SubmitRecorded(std::string *error_out);
 
   VulkanDevice device_;
   VulkanBuffer params_;
+  VulkanBuffer batch_params_;
   VulkanBuffer dummy_;
 
   VkDescriptorSetLayout descriptor_set_layout_ = nullptr;
   VkDescriptorPool descriptor_pool_ = nullptr;
   VkDescriptorSet descriptor_set_ = nullptr;
+  VkDescriptorSet batch_descriptor_set_ = nullptr;
   VkShaderModule shader_module_ = nullptr;
   VkPipelineLayout pipeline_layout_ = nullptr;
   VkPipeline pipeline_ = nullptr;
   VkCommandBuffer command_buffer_ = nullptr;
   std::array<VkBuffer, 7> bound_buffers_{};
+  std::array<VkBuffer, 7> batch_bound_buffers_{};
 
   bool initialized_ = false;
   bool pipeline_created_ = false;
+  std::uint64_t synchronous_submission_count_ = 0;
   std::string init_error_;
 };
 

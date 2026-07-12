@@ -45,6 +45,10 @@ public:
   bool persistLoopback() const;
   bool installService() const;
   bool openBackendsSetup() const;
+  bool openVulkan() const;
+  bool installVulkanRuntime() const;
+  bool installMesaVulkan() const;
+  bool installShaderTools() const;
   bool installModels() const;
   bool freshBuild() const;
   bool allowUnsupported() const;
@@ -71,6 +75,10 @@ public:
   void setPersistLoopback(bool enabled);
   void setInstallService(bool enabled);
   void setOpenBackendsSetup(bool enabled);
+  void setOpenVulkan(bool enabled);
+  void setInstallVulkanRuntime(bool enabled);
+  void setInstallMesaVulkan(bool enabled);
+  void setInstallShaderTools(bool enabled);
   void setInstallModels(bool enabled);
   void setFreshBuild(bool enabled);
   void setAllowUnsupported(bool enabled);
@@ -93,6 +101,10 @@ private:
   bool persistLoopback_ = true;
   bool installService_ = true;
   bool openBackendsSetup_ = true;
+  bool openVulkan_ = false;
+  bool installVulkanRuntime_ = false;
+  bool installMesaVulkan_ = false;
+  bool installShaderTools_ = false;
   bool installModels_ = false;
   bool freshBuild_ = false;
   bool allowUnsupported_ = false;
@@ -178,6 +190,10 @@ private:
   QCheckBox *loadLoopback_ = nullptr;
   QCheckBox *persistLoopback_ = nullptr;
   QCheckBox *openBackendsSetup_ = nullptr;
+  QCheckBox *openVulkan_ = nullptr;
+  QCheckBox *installVulkanRuntime_ = nullptr;
+  QCheckBox *installMesaVulkan_ = nullptr;
+  QCheckBox *installShaderTools_ = nullptr;
   QCheckBox *installModels_ = nullptr;
   QCheckBox *removeUserData_ = nullptr;
   QLabel *optionalComponentsNotice_ = nullptr;

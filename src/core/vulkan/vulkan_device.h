@@ -2,12 +2,57 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/vulkan/vulkan_loader.h"
 
 namespace studiocast::vulkan {
+
+struct VulkanDeviceSelection {
+  std::optional<std::uint32_t> requested_index;
+  bool allow_cpu_in_auto = false;
+  std::string request = "auto";
+  std::string source = "automatic";
+};
+
+struct VulkanDeviceCandidateInfo {
+  std::uint32_t enumeration_index = 0;
+  std::uint32_t api_version = 0;
+  std::uint32_t driver_version = 0;
+  std::uint32_t vendor_id = 0;
+  std::uint32_t device_id = 0;
+  std::uint32_t device_type = 0;
+  std::string vendor_name;
+  std::string device_name;
+  int compute_queue_family_index = -1;
+  int score = 0;
+  bool eligible = false;
+  bool selected = false;
+  std::string rejection_reason;
+};
+
+struct VulkanDeviceSelectionResult {
+  bool ok = false;
+  std::size_t candidate_vector_index = 0;
+  std::string failure_reason;
+  std::string error;
+};
+
+namespace detail {
+
+bool ParseVulkanDeviceSelection(std::string_view requested_index,
+                                std::string_view allow_cpu_in_auto,
+                                VulkanDeviceSelection *selection,
+                                std::string *error_out);
+
+VulkanDeviceSelectionResult
+SelectVulkanDeviceCandidate(std::vector<VulkanDeviceCandidateInfo> *candidates,
+                            const VulkanDeviceSelection &selection);
+
+} // namespace detail
 
 struct OpenVulkanDiagnostics {
   bool compiled_enabled = true;
@@ -28,6 +73,11 @@ struct OpenVulkanDiagnostics {
   std::string vendor_name;
   std::string device_name;
   std::uint32_t compute_queue_family_index = 0;
+  std::string device_selection_source = "automatic";
+  std::string device_selection_request = "auto";
+  int selected_device_index = -1;
+  bool cpu_device_selected = false;
+  std::vector<VulkanDeviceCandidateInfo> device_candidates;
 
   std::string error;
   std::string fallback_reason;
@@ -101,6 +151,7 @@ private:
   bool CreateCommandInfrastructure(std::string *error_out);
 
   VulkanLoader loader_;
+  VulkanDeviceSelection selection_;
   VkInstance instance_ = nullptr;
   VkPhysicalDevice physical_device_ = nullptr;
   VkDevice device_ = nullptr;
