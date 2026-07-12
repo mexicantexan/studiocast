@@ -567,7 +567,7 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
   layout->addWidget(statusBox);
 
   auto *workflowBox = new QGroupBox(QStringLiteral("Workflow"), this);
-  auto *workflowLayout = new QVBoxLayout(workflowBox);
+  auto *workflowLayout = new QVBoxLayout();
   workflowGroup_ = new QButtonGroup(workflowBox);
   const QList<QPair<QString, QString>> workflows = {
       {QStringLiteral("install"), QStringLiteral("Install StudioCast")},
@@ -587,6 +587,7 @@ IntroPage::IntroPage(QWidget *parent) : QWizardPage(parent) {
       radio->setChecked(true);
     }
   }
+  workflowBox->setLayout(workflowLayout);
   layout->addWidget(workflowBox);
 
   layout->addWidget(mutedLabel(

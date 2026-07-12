@@ -950,7 +950,8 @@ bool TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers() {
           /*allow_cpu_resize=*/true,
           /*same_backend_effects_ran=*/false)) {
     std::cerr << "standalone GPU scaler should skip when CPU resize is "
-                 "allowed and no same-backend effect ran\n";
+                 "allowed and no same-backend effect ran, including a "
+                 "configured Vulkan scaler with blocked effects\n";
     return false;
   }
 
@@ -995,6 +996,127 @@ bool TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers() {
           /*same_backend_effects_ran=*/true)) {
     std::cerr
         << "standalone GPU scaler should skip when no scaling is needed\n";
+    return false;
+  }
+
+  return true;
+}
+
+bool TestCudaVignetteHonorsComputeBackendPreference() {
+  using studiocast::video::ComputeBackendAllowsCudaVideoCompute;
+  using studiocast::video::ComputeBackendAvailability;
+  using studiocast::video::ComputeBackendKind;
+  using studiocast::video::ComputeBackendPreference;
+  using studiocast::video::ResolveActiveComputeBackendName;
+  using studiocast::video::ResolveComputeBackendSelection;
+
+  if (ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference::cpu)) {
+    std::cerr << "explicit CPU must not allow CUDA-backed vignette\n";
+    return false;
+  }
+  if (ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference::vulkan)) {
+    std::cerr << "explicit Vulkan must not allow CUDA-backed vignette\n";
+    return false;
+  }
+  if (!ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference::cuda)) {
+    std::cerr << "explicit CUDA should allow CUDA-backed vignette\n";
+    return false;
+  }
+  if (!ComputeBackendAllowsCudaVideoCompute(
+          ComputeBackendPreference::auto_select)) {
+    std::cerr << "auto compute backend should allow CUDA-backed vignette\n";
+    return false;
+  }
+
+  ComputeBackendAvailability available;
+  available.cuda_available = true;
+  available.vulkan_available = false;
+  available.vulkan_unavailable_reason = "vulkan unavailable";
+
+  auto selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::cpu, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cpu ||
+      ResolveActiveComputeBackendName(selected,
+                                      /*compute_work_requested=*/true,
+                                      /*maxine_compute_available=*/false,
+                                      /*cuda_compute_available=*/true,
+                                      /*vulkan_compute_available=*/false) !=
+          "cpu") {
+    std::cerr << "explicit CPU should report CPU even if CUDA vignette is "
+                 "otherwise available\n";
+    return false;
+  }
+
+  selected = ResolveComputeBackendSelection(ComputeBackendPreference::vulkan,
+                                            available,
+                                            /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cpu ||
+      ResolveActiveComputeBackendName(selected,
+                                      /*compute_work_requested=*/true,
+                                      /*maxine_compute_available=*/false,
+                                      /*cuda_compute_available=*/true,
+                                      /*vulkan_compute_available=*/false) !=
+          "cpu") {
+    std::cerr << "explicit Vulkan should not report CUDA when only CUDA "
+                 "vignette is available\n";
+    return false;
+  }
+
+  selected = ResolveComputeBackendSelection(ComputeBackendPreference::cuda,
+                                            available,
+                                            /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cuda ||
+      ResolveActiveComputeBackendName(selected,
+                                      /*compute_work_requested=*/true,
+                                      /*maxine_compute_available=*/false,
+                                      /*cuda_compute_available=*/true,
+                                      /*vulkan_compute_available=*/false) !=
+          "cuda") {
+    std::cerr << "explicit CUDA should report active CUDA when CUDA vignette "
+                 "is available\n";
+    return false;
+  }
+
+  selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::auto_select, available,
+      /*compute_work_requested=*/true);
+  if (selected.resolved != ComputeBackendKind::cuda ||
+      ResolveActiveComputeBackendName(selected,
+                                      /*compute_work_requested=*/true,
+                                      /*maxine_compute_available=*/false,
+                                      /*cuda_compute_available=*/true,
+                                      /*vulkan_compute_available=*/false) !=
+          "cuda") {
+    std::cerr << "auto compute backend should still report active CUDA when "
+                 "CUDA vignette is available\n";
+    return false;
+  }
+
+  return true;
+}
+
+bool TestGpuBackendActiveFrameMarkerCountsOncePerFrame() {
+  using studiocast::video::MarkGpuBackendActiveFrame;
+
+  bool active_this_frame = false;
+  std::uint64_t active_frames = 0;
+  if (!MarkGpuBackendActiveFrame(active_this_frame, active_frames) ||
+      active_frames != 1) {
+    std::cerr << "first backend touch should increment active frame count\n";
+    return false;
+  }
+  if (MarkGpuBackendActiveFrame(active_this_frame, active_frames) ||
+      active_frames != 1) {
+    std::cerr << "second backend touch in the same frame should not "
+                 "double-count active frames\n";
+    return false;
+  }
+
+  active_this_frame = false;
+  if (!MarkGpuBackendActiveFrame(active_this_frame, active_frames) ||
+      active_frames != 2) {
+    std::cerr << "new frame should increment active frame count once\n";
     return false;
   }
 
@@ -1105,6 +1227,10 @@ int main() {
        &TestVideoOutputRecoveryClearsUnavailableError},
       {"standalone GPU scaler skips inactive backend transfers",
        &TestStandaloneGpuScalerPolicySkipsInactiveBackendTransfers},
+      {"CUDA vignette honors compute backend preference",
+       &TestCudaVignetteHonorsComputeBackendPreference},
+      {"GPU backend active frame marker counts once per frame",
+       &TestGpuBackendActiveFrameMarkerCountsOncePerFrame},
       {"compute backend selection policy is no-GPU safe",
        &TestComputeBackendSelectionPolicyIsNoGpuSafe},
       {"latest-frame worker overwrites pending blocked work",

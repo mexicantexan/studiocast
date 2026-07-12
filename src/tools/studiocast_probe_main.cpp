@@ -1457,10 +1457,8 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
 
             if (!run_comp_solid_expect(alpha0, solid_cpu)) {
               ++failures;
-              ok = false;
             } else if (!run_comp_solid_expect(alpha1, fg_cpu)) {
               ++failures;
-              ok = false;
             }
           }
         }

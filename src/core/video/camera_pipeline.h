@@ -71,6 +71,13 @@ ComputeBackendSelection
 ResolveComputeBackendSelection(ComputeBackendPreference pref,
                                const ComputeBackendAvailability &available,
                                bool compute_work_requested);
+bool ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference pref);
+std::string ResolveActiveComputeBackendName(
+    const ComputeBackendSelection &selection, bool compute_work_requested,
+    bool maxine_compute_available, bool cuda_compute_available,
+    bool vulkan_compute_available);
+bool MarkGpuBackendActiveFrame(bool &active_this_frame,
+                               std::uint64_t &active_frames);
 
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0

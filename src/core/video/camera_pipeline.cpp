@@ -199,6 +199,42 @@ ResolveComputeBackendSelection(ComputeBackendPreference pref,
   }
 }
 
+bool ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference pref) {
+  return pref == ComputeBackendPreference::auto_select ||
+         pref == ComputeBackendPreference::cuda;
+}
+
+std::string ResolveActiveComputeBackendName(
+    const ComputeBackendSelection &selection, bool compute_work_requested,
+    bool maxine_compute_available, bool cuda_compute_available,
+    bool vulkan_compute_available) {
+  if (!compute_work_requested)
+    return "cpu";
+
+  if (selection.resolved == ComputeBackendKind::vulkan &&
+      vulkan_compute_available) {
+    return "vulkan";
+  }
+  if (selection.resolved == ComputeBackendKind::cuda &&
+      maxine_compute_available) {
+    return "maxine";
+  }
+  if (selection.resolved == ComputeBackendKind::cuda &&
+      cuda_compute_available) {
+    return "cuda";
+  }
+  return "cpu";
+}
+
+bool MarkGpuBackendActiveFrame(bool &active_this_frame,
+                               std::uint64_t &active_frames) {
+  if (active_this_frame)
+    return false;
+  active_this_frame = true;
+  ++active_frames;
+  return true;
+}
+
 namespace {
 
 detail::PreparedReplaceBackgroundSource
@@ -1461,8 +1497,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
            has(studiocast::video::effects::contract::kEffectIdVignette);
   }();
   const bool compute_backend_allows_cuda =
-      cfg.compute_backend != ComputeBackendPreference::cpu &&
-      cfg.compute_backend != ComputeBackendPreference::vulkan;
+      ComputeBackendAllowsCudaVideoCompute(cfg.compute_backend);
   const bool want_vulkan_runtime =
       compute_effects_configured &&
       cfg.compute_backend == ComputeBackendPreference::vulkan;
@@ -7946,6 +7981,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     };
 
     const bool compute_work_requested = plan_requests_compute();
+    const bool cuda_video_compute_allowed =
+        ComputeBackendAllowsCudaVideoCompute(cfg.compute_backend);
     ComputeBackendAvailability compute_available;
     compute_available.vulkan_available = false;
     compute_available.vulkan_unavailable_reason =
@@ -8699,7 +8736,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           have_maxine_eye_contact || have_maxine_bg_blur ||
           have_maxine_relight || have_maxine_auto_frame;
 
-      if (!have_any_maxine_gpu_stage) {
+      if (!have_any_maxine_gpu_stage && cuda_video_compute_allowed) {
         want_maxine_vignette_only = true;
         std::string mx_err;
         if (vignette_only.EnsureInitialized(capA.width, capA.height, &mx_err)) {
@@ -8714,6 +8751,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             note += "\n";
           note += "Vignette unavailable: " + mx_err;
         }
+      } else if (!have_any_maxine_gpu_stage) {
+        remove_stage_from_plan(
+            studiocast::video::effects::contract::kEffectIdVignette);
       }
     }
 
@@ -8738,7 +8778,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             "Vulkan compute backend requested, but no Vulkan-backed video "
             "effect was available.";
       }
-      compute_available.cuda_available = have_any_cuda_compute;
+      compute_available.cuda_available =
+          cuda_video_compute_allowed && have_any_cuda_compute;
       if (!compute_available.cuda_available) {
         compute_available.cuda_unavailable_reason =
             "CUDA compute backend requested, but no CUDA-backed video effect "
@@ -8747,31 +8788,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       compute_selection = ResolveComputeBackendSelection(
           cfg.compute_backend, compute_available, compute_work_requested);
 
-      if (compute_work_requested && have_any_vulkan_compute) {
-        compute_selection.resolved = ComputeBackendKind::vulkan;
-        compute_selection.degraded = false;
-        compute_selection.fallback_reason.clear();
-        compute_selection.degraded_reason.clear();
-      } else if (compute_work_requested && have_any_cuda_compute) {
-        compute_selection.resolved = ComputeBackendKind::cuda;
-        compute_selection.degraded = false;
-        compute_selection.fallback_reason.clear();
-        compute_selection.degraded_reason.clear();
-      }
-
-      std::string compute_active_backend = "cpu";
-      if (compute_work_requested &&
-          compute_selection.resolved == ComputeBackendKind::vulkan &&
-          compute_available.vulkan_available) {
-        compute_active_backend = "vulkan";
-      } else if (have_any_maxine_compute) {
-        compute_active_backend = "maxine";
-      } else if (have_any_cuda_compute) {
-        compute_active_backend = "cuda";
-      }
-      if (!compute_work_requested) {
-        compute_active_backend = "cpu";
-      }
+      const std::string compute_active_backend =
+          ResolveActiveComputeBackendName(
+              compute_selection, compute_work_requested, have_any_maxine_compute,
+              compute_available.cuda_available,
+              compute_available.vulkan_available);
 
       for (auto &breaker : optional_effect_breakers)
         breaker.Reset();
@@ -9253,6 +9274,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool open_cuda_active_this_frame = false;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     bool open_vulkan_active_this_frame = false;
+    bool open_vulkan_effect_ran_this_frame = false;
 #endif
     bool maxine_active_this_frame = false;
     int maxine_green_screen_calls_this_frame = 0;
@@ -9270,18 +9292,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 #endif
 
     auto mark_open_cuda_active_frame = [&]() {
-      if (!open_cuda_active_this_frame) {
-        open_cuda_active_this_frame = true;
-        ++open_cuda_active_frames;
-      }
+      (void)MarkGpuBackendActiveFrame(open_cuda_active_this_frame,
+                                      open_cuda_active_frames);
     };
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     auto mark_open_vulkan_active_frame = [&]() {
-      if (!open_vulkan_active_this_frame) {
-        open_vulkan_active_this_frame = true;
-        ++open_vulkan_active_frames;
-      }
+      (void)MarkGpuBackendActiveFrame(open_vulkan_active_this_frame,
+                                      open_vulkan_active_frames);
     };
 
     auto mark_open_vulkan_cpu_tail = [&](std::string_view stage_id) {
@@ -9426,10 +9444,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         };
 
     auto mark_maxine_active_frame = [&]() {
-      if (!maxine_active_this_frame) {
-        maxine_active_this_frame = true;
-        ++maxine_active_frames;
-      }
+      (void)MarkGpuBackendActiveFrame(maxine_active_this_frame,
+                                      maxine_active_frames);
     };
 
     auto count_maxine_stage = [&](bool deferred_readback,
@@ -9897,6 +9913,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             if (open_vulkan_key_light.ApplyVulkanRgb(
                     *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
                     &vk_err, &deferred_gpu_out)) {
+              open_vulkan_effect_ran_this_frame = true;
               if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
                 const bool curr_was_frame =
                     (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
@@ -10074,6 +10091,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               last_error_ = "Open Vulkan virtual background failed: " + vk_err;
               return;
             }
+            open_vulkan_effect_ran_this_frame = true;
 
             const bool curr_was_frame =
                 (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
@@ -10508,6 +10526,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     capture_sequence, *open_vulkan_curr, open_vulkan_next, fx,
                     tracking_box_ptr, tracking_provider_ran,
                     &auto_frame_gpu_out, &vk_err)) {
+              open_vulkan_effect_ran_this_frame = true;
               deferred_gpu_out = auto_frame_gpu_out;
               if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
                 const bool curr_was_frame =
@@ -11557,9 +11576,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             /*have_deferred_gpu_out=*/have_deferred_gpu_out,
             /*allow_cpu_resize=*/cfg.allow_cpu_resize,
             /*same_backend_effects_ran=*/
-            compute_effects_configured &&
-                cfg.compute_backend == ComputeBackendPreference::vulkan &&
-                vulkan_scaler.initialized)) {
+            open_vulkan_effect_ran_this_frame)) {
       std::string gerr;
       bool ok = vulkan_scaler.initialized;
       if (!ok) {
@@ -11578,7 +11595,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
 
       if (ok) {
-        ++open_vulkan_active_frames;
+        mark_open_vulkan_active_frame();
         ++open_vulkan_upload_calls;
         ++open_vulkan_download_calls;
         ++open_vulkan_final_download_calls;
@@ -11988,7 +12005,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     (void)gpu_rgb_scaled.Free(&open_cuda_vb.cuda, &derr);
   }
   gpu_rgb_scaled.ClearMetadata();
-  gpu_rgb_scaled_allocated = false;
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
   if (vulkan_rgb_scaled_allocated && vulkan_rgb_scaled.Valid()) {

@@ -242,10 +242,10 @@ bool TestCudaTensorCheckedShapeMathNoGpu() {
        ok;
 
   CudaTensor moved(std::move(tensor));
-  ok = Expect(!tensor.Valid(), "moved-from CudaTensor should be invalid") &&
-       ok;
-  ok = ExpectEqSize("moved-from CudaTensor element count",
-                    tensor.ElementCount(), 0u) &&
+  ok = Expect(tensor.ptr == 0 && tensor.pitch == 0 && tensor.bytes == 0 &&
+                  tensor.n == 0 && tensor.c == 0 && tensor.h == 0 &&
+                  tensor.w == 0 && !tensor.owns_memory,
+              "moved-from CudaTensor should reset metadata") &&
        ok;
   ok = Expect(moved.Valid(), "moved CudaTensor should preserve valid shape") &&
        ok;
