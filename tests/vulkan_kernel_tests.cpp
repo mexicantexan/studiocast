@@ -849,6 +849,65 @@ int main() {
   std::string error;
 
   ok &= TestVulkanDeviceSelectionPolicy();
+  {
+    const auto diagnostics =
+        studiocast::vulkan::DiagnoseOpenVulkanDefault();
+    const auto blocked = diagnostics.blocked_effects.find("eye_contact");
+    const bool falsely_available =
+        std::find(diagnostics.available_effects.begin(),
+                  diagnostics.available_effects.end(), "eye_contact") !=
+        diagnostics.available_effects.end();
+    const std::string json = diagnostics.ToJson();
+    ok &= Require(
+        blocked != diagnostics.blocked_effects.end() &&
+            blocked->second == "open_vulkan_eye_contact_unavailable" &&
+            !falsely_available &&
+            !diagnostics.eye_contact_production_ready &&
+            diagnostics.eye_contact_backend_compiled &&
+            !diagnostics.eye_contact_live_stage_implemented &&
+            !diagnostics.eye_contact_production_adapter_available &&
+            !diagnostics.eye_contact_vulkan_inference_provider_available &&
+            diagnostics.eye_contact_non_cpu_device_selected ==
+                diagnostics.non_cpu_device_selected &&
+            diagnostics.eye_contact_compute_queue_available ==
+                diagnostics.compute_queue_available &&
+            diagnostics.eye_contact_context_healthy ==
+                diagnostics.context_healthy &&
+            !diagnostics.eye_contact_shared_device_imported &&
+            !diagnostics.eye_contact_queue_ownership_explicit &&
+            !diagnostics.eye_contact_model_pack_selected &&
+            !diagnostics.eye_contact_artifact_contract_validated &&
+            !diagnostics.eye_contact_selectable_cpu_fallback &&
+            diagnostics.eye_contact_dispatch_count == 0 &&
+            diagnostics.eye_contact_cpu_readback_count == 0 &&
+            diagnostics.eye_contact_cpu_fallback_count == 0,
+        "default diagnostics must keep Vulkan eye contact unavailable with "
+        "separate hardware/live/provider/artifact/fallback facts");
+    ok &= Require(
+        diagnostics.eye_contact_blocker_code ==
+                "open_vulkan_eye_contact_runtime_unavailable" &&
+            json.find("\"eye_contact_production_ready\":false") !=
+                std::string::npos &&
+            json.find(
+                std::string("\"eye_contact_non_cpu_device_selected\":") +
+                (diagnostics.non_cpu_device_selected ? "true" : "false")) !=
+                std::string::npos &&
+            json.find(
+                std::string("\"eye_contact_compute_queue_available\":") +
+                (diagnostics.compute_queue_available ? "true" : "false")) !=
+                std::string::npos &&
+            json.find(std::string("\"eye_contact_context_healthy\":") +
+                      (diagnostics.context_healthy ? "true" : "false")) !=
+                std::string::npos &&
+            json.find("\"eye_contact_dispatch_count\":0") !=
+                std::string::npos &&
+            json.find("\"eye_contact_cpu_readback_count\":0") !=
+                std::string::npos &&
+            json.find("\"eye_contact_cpu_fallback_count\":0") !=
+                std::string::npos,
+        "serialized eye-contact diagnostics must mirror hardware facts and "
+        "expose the primary blocker with zero frame work");
+  }
   ok &= Require(
       !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(0, 7) &&
           !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(7, 7) &&

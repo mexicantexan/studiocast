@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/video/effects/broadcast_effects.h"
+#include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
@@ -103,6 +104,20 @@ struct OpenVulkanVignettePlanCompatibility {
 // fixed-center production behavior. A blocked result removes only vignette.
 OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
     const effects::BroadcastCameraEffects &fx,
+    effects::BroadcastEffectsPlan *retained_plan);
+
+struct OpenVulkanEyeContactPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+// Eye contact has no callable Open Vulkan production runtime. Explicit Vulkan
+// removes only this stage, records the exact nested blocker in the retained
+// plan, and leaves every independent effect untouched.
+OpenVulkanEyeContactPlanCompatibility
+ApplyOpenVulkanEyeContactPlanCompatibility(
     effects::BroadcastEffectsPlan *retained_plan);
 
 struct CameraPipelineConfig {

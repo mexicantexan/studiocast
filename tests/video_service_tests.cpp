@@ -25,6 +25,7 @@ bool TestFastDvdnetDenoiseTensorContractIsDeclared();
 bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared();
 bool TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed();
 bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared();
+bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed();
 bool TestFrameArtifactCacheReusesCompatibleMatteWithinFrame();
 bool TestFrameArtifactCacheReusesCompatibleMaxineMatteWithinFrame();
 bool TestFrameArtifactCacheSeparatesIncompatibleMatteKeys();
@@ -1409,6 +1410,75 @@ bool TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe() {
   return true;
 }
 
+bool TestOpenVulkanEyeContactPlanCompatibilityIsIsolatedAndFailClosed() {
+  namespace effects = studiocast::video::effects;
+
+  effects::BroadcastCameraEffects combined;
+  combined.video_noise_removal.enabled = true;
+  combined.eye_contact.enabled = true;
+  combined.virtual_background.mode = effects::VirtualBackgroundMode::blur;
+  combined.virtual_key_light.enabled = true;
+  combined.auto_frame.enabled = true;
+  combined.vignette.enabled = true;
+  combined.mirror = true;
+  auto plan = effects::BuildBroadcastEffectsPlan(combined);
+
+  const auto compatibility =
+      studiocast::video::ApplyOpenVulkanEyeContactPlanCompatibility(&plan);
+  const auto contains = [&](std::string_view effect_id) {
+    return std::find(plan.ordered_effect_ids.begin(),
+                     plan.ordered_effect_ids.end(), effect_id) !=
+           plan.ordered_effect_ids.end();
+  };
+
+  if (!compatibility.blocked ||
+      compatibility.reason_code !=
+          studiocast::video::kOpenVulkanEyeContactUnavailableReason ||
+      compatibility.blocker_code !=
+          studiocast::video::kOpenVulkanEyeContactRuntimeUnavailableReason ||
+      contains(effects::contract::kEffectIdEyeContact) ||
+      !contains(effects::contract::kEffectIdVideoNoiseRemoval) ||
+      !contains(effects::contract::kEffectIdVirtualBackgroundBlur) ||
+      !contains(effects::contract::kEffectIdVirtualKeyLight) ||
+      !contains(effects::contract::kEffectIdAutoFrame) ||
+      !contains(effects::contract::kEffectIdVignette) ||
+      !contains(effects::contract::kEffectIdMirror) ||
+      plan.vignette_attach_to_effect_id !=
+          effects::contract::kEffectIdAutoFrame ||
+      plan.disabled.size() != 1 ||
+      plan.disabled.front().id != effects::contract::kEffectIdEyeContact ||
+      plan.disabled.front().reason.find(
+          "[open_vulkan_eye_contact_unavailable] "
+          "[open_vulkan_eye_contact_runtime_unavailable]") ==
+          std::string::npos) {
+    std::cerr << "explicit Vulkan eye-contact compatibility must remove and "
+                 "diagnose only eye contact\n";
+    return false;
+  }
+
+  const std::size_t disabled_count = plan.disabled.size();
+  if (studiocast::video::ApplyOpenVulkanEyeContactPlanCompatibility(&plan)
+          .blocked ||
+      plan.disabled.size() != disabled_count) {
+    std::cerr << "eye-contact compatibility must be idempotent after removal\n";
+    return false;
+  }
+
+  effects::BroadcastCameraEffects mirror_only;
+  mirror_only.mirror = true;
+  auto mirror_plan = effects::BuildBroadcastEffectsPlan(mirror_only);
+  if (studiocast::video::ApplyOpenVulkanEyeContactPlanCompatibility(
+          &mirror_plan)
+          .blocked ||
+      mirror_plan.ordered_effect_ids.size() != 1 ||
+      mirror_plan.ordered_effect_ids.front() !=
+          effects::contract::kEffectIdMirror) {
+    std::cerr << "eye-contact compatibility must not alter unrelated plans\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1455,6 +1525,8 @@ int main() {
        &TestMirrorCanonicalPlanAndBackendContractIsNoGpuSafe},
       {"vignette canonical plan/default/backend contract is no-GPU safe",
        &TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe},
+      {"Open Vulkan eye contact plan compatibility is isolated/fail closed",
+       &TestOpenVulkanEyeContactPlanCompatibilityIsIsolatedAndFailClosed},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},
@@ -1475,6 +1547,9 @@ int main() {
       {"Open Video eye contact CPU tensor tail contract is declared",
        &studiocast::tests::
            TestOpenVideoEyeContactCpuTensorTailContractIsDeclared},
+      {"Open Vulkan eye contact capability facts are fail closed",
+       &studiocast::tests::
+           TestOpenVulkanEyeContactCapabilityFactsAreFailClosed},
       {"frame artifact cache reuses compatible matte within frame",
        &studiocast::tests::
            TestFrameArtifactCacheReusesCompatibleMatteWithinFrame},

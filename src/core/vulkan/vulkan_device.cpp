@@ -793,6 +793,56 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "\"blocked_effects\":";
   AppendJsonStringMap(&oss, blocked_effects);
   oss << ",";
+  oss << "\"eye_contact_production_ready\":"
+      << BoolJson(eye_contact_production_ready) << ",";
+  oss << "\"eye_contact_reason_code\":\""
+      << JsonEscape(eye_contact_reason_code) << "\",";
+  oss << "\"eye_contact_blocker_code\":\""
+      << JsonEscape(eye_contact_blocker_code) << "\",";
+  oss << "\"eye_contact_detail\":\"" << JsonEscape(eye_contact_detail)
+      << "\",";
+  oss << "\"eye_contact_backend_compiled\":"
+      << BoolJson(eye_contact_backend_compiled) << ",";
+  oss << "\"eye_contact_live_stage_implemented\":"
+      << BoolJson(eye_contact_live_stage_implemented) << ",";
+  oss << "\"eye_contact_production_adapter_available\":"
+      << BoolJson(eye_contact_production_adapter_available) << ",";
+  oss << "\"eye_contact_vulkan_inference_provider_available\":"
+      << BoolJson(eye_contact_vulkan_inference_provider_available) << ",";
+  oss << "\"eye_contact_non_cpu_device_selected\":"
+      << BoolJson(eye_contact_non_cpu_device_selected) << ",";
+  oss << "\"eye_contact_compute_queue_available\":"
+      << BoolJson(eye_contact_compute_queue_available) << ",";
+  oss << "\"eye_contact_context_healthy\":"
+      << BoolJson(eye_contact_context_healthy) << ",";
+  oss << "\"eye_contact_shared_device_imported\":"
+      << BoolJson(eye_contact_shared_device_imported) << ",";
+  oss << "\"eye_contact_queue_ownership_explicit\":"
+      << BoolJson(eye_contact_queue_ownership_explicit) << ",";
+  oss << "\"eye_contact_model_pack_selected\":"
+      << BoolJson(eye_contact_model_pack_selected) << ",";
+  oss << "\"eye_contact_artifact_contract_validated\":"
+      << BoolJson(eye_contact_artifact_contract_validated) << ",";
+  oss << "\"eye_contact_device_resident_analysis\":"
+      << BoolJson(eye_contact_device_resident_analysis) << ",";
+  oss << "\"eye_contact_device_resident_tensor_io\":"
+      << BoolJson(eye_contact_device_resident_tensor_io) << ",";
+  oss << "\"eye_contact_warmup_complete\":"
+      << BoolJson(eye_contact_warmup_complete) << ",";
+  oss << "\"eye_contact_bounded_reusable_allocations\":"
+      << BoolJson(eye_contact_bounded_reusable_allocations) << ",";
+  oss << "\"eye_contact_synchronization_contract_validated\":"
+      << BoolJson(eye_contact_synchronization_contract_validated) << ",";
+  oss << "\"eye_contact_parity_validated\":"
+      << BoolJson(eye_contact_parity_validated) << ",";
+  oss << "\"eye_contact_selectable_cpu_fallback\":"
+      << BoolJson(eye_contact_selectable_cpu_fallback) << ",";
+  oss << "\"eye_contact_dispatch_count\":" << eye_contact_dispatch_count
+      << ",";
+  oss << "\"eye_contact_cpu_readback_count\":"
+      << eye_contact_cpu_readback_count << ",";
+  oss << "\"eye_contact_cpu_fallback_count\":"
+      << eye_contact_cpu_fallback_count << ",";
   oss << "\"matting_runtime\":\"" << JsonEscape(matting_runtime) << "\",";
   oss << "\"matting_build_enabled\":" << BoolJson(matting_build_enabled) << ",";
   oss << "\"matting_adapter_available\":" << BoolJson(matting_adapter_available)

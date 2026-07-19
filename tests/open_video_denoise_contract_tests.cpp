@@ -6,6 +6,7 @@
 #include "core/open_video/fastdvdnet_denoiser.h"
 #include "core/open_video/gaze_correction_eye_contact.h"
 #include "core/open_video/yunet_face_detector.h"
+#include "core/video/open_vulkan_eye_contact.h"
 
 namespace {
 
@@ -155,6 +156,62 @@ bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared() {
   ok &= Require(status.summary.find("not a device-resident GPU path") !=
                     std::string::npos,
                 "eye contact summary should reject hidden GPU-resident claims");
+  return ok;
+}
+
+bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed() {
+  using studiocast::video::CurrentOpenVulkanEyeContactFacts;
+  using studiocast::video::EvaluateOpenVulkanEyeContactReadiness;
+  using studiocast::video::FormatOpenVulkanEyeContactReadiness;
+  using studiocast::video::kOpenVulkanEyeContactRuntimeUnavailableReason;
+  using studiocast::video::kOpenVulkanEyeContactUnavailableReason;
+
+  const auto facts = CurrentOpenVulkanEyeContactFacts();
+  const auto readiness = EvaluateOpenVulkanEyeContactReadiness(facts);
+  const std::string formatted =
+      FormatOpenVulkanEyeContactReadiness(readiness);
+
+  bool ok = true;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  ok &= Require(facts.backend_compiled,
+                "Vulkan-on build should report the backend compiled fact");
+#else
+  ok &= Require(!facts.backend_compiled,
+                "Vulkan-off build should report the backend disabled fact");
+#endif
+  ok &= Require(!facts.live_stage_implemented,
+                "eye contact must not claim a callable Vulkan live stage");
+  ok &= Require(!facts.production_adapter_available &&
+                    !facts.vulkan_inference_provider_available,
+                "eye contact must distinguish absent adapter and provider");
+  ok &= Require(!facts.shared_device_imported &&
+                    !facts.queue_ownership_explicit,
+                "eye contact must not claim shared device/queue ownership");
+  ok &= Require(!facts.model_pack_selected &&
+                    !facts.artifact_contract_validated,
+                "ONNX template presence must not satisfy Vulkan artifacts");
+  ok &= Require(!facts.device_resident_analysis &&
+                    !facts.device_resident_tensor_io,
+                "CPU analysis/tensors must not claim device residency");
+  ok &= Require(!facts.selectable_cpu_fallback,
+                "internal Open Video CPU work is not a selectable fallback");
+  ok &= Require(facts.dispatch_count == 0 && facts.cpu_readback_count == 0 &&
+                    facts.cpu_fallback_count == 0,
+                "diagnostics-only eye contact must perform no frame work");
+  ok &= Require(!readiness.production_ready &&
+                    readiness.reason_code ==
+                        kOpenVulkanEyeContactUnavailableReason &&
+                    readiness.blocker_code ==
+                        kOpenVulkanEyeContactRuntimeUnavailableReason,
+                "eye contact readiness must keep exact nested blockers");
+  ok &= Require(
+      formatted.find("[open_vulkan_eye_contact_unavailable]") !=
+              std::string::npos &&
+          formatted.find(
+              "[open_vulkan_eye_contact_runtime_unavailable]") !=
+              std::string::npos &&
+          formatted.find("CPU tensors") != std::string::npos,
+      "formatted readiness must expose the runtime/CPU boundary");
   return ok;
 }
 

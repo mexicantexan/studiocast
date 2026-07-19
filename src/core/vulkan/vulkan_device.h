@@ -251,6 +251,34 @@ struct OpenVulkanDiagnostics {
   std::map<std::string, std::string> blocked_effects;
   std::vector<std::string> install_hints;
 
+  bool eye_contact_production_ready = false;
+  std::string eye_contact_reason_code =
+      "open_vulkan_eye_contact_unavailable";
+  std::string eye_contact_blocker_code =
+      "open_vulkan_eye_contact_runtime_unavailable";
+  std::string eye_contact_detail;
+  bool eye_contact_backend_compiled = false;
+  bool eye_contact_live_stage_implemented = false;
+  bool eye_contact_production_adapter_available = false;
+  bool eye_contact_vulkan_inference_provider_available = false;
+  bool eye_contact_non_cpu_device_selected = false;
+  bool eye_contact_compute_queue_available = false;
+  bool eye_contact_context_healthy = false;
+  bool eye_contact_shared_device_imported = false;
+  bool eye_contact_queue_ownership_explicit = false;
+  bool eye_contact_model_pack_selected = false;
+  bool eye_contact_artifact_contract_validated = false;
+  bool eye_contact_device_resident_analysis = false;
+  bool eye_contact_device_resident_tensor_io = false;
+  bool eye_contact_warmup_complete = false;
+  bool eye_contact_bounded_reusable_allocations = false;
+  bool eye_contact_synchronization_contract_validated = false;
+  bool eye_contact_parity_validated = false;
+  bool eye_contact_selectable_cpu_fallback = false;
+  std::uint64_t eye_contact_dispatch_count = 0;
+  std::uint64_t eye_contact_cpu_readback_count = 0;
+  std::uint64_t eye_contact_cpu_fallback_count = 0;
+
   std::string matting_runtime;
   bool matting_build_enabled = false;
   bool matting_adapter_available = false;
