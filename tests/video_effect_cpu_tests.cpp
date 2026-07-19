@@ -1,6 +1,7 @@
 #include "core/video/effects/background_blur_cpu.h"
 #include "core/video/effects/background_remove_cpu.h"
 #include "core/video/effects/box_blur.h"
+#include "core/video/effects/mirror_effect.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -246,6 +247,55 @@ bool TestBackgroundBlurCpuMatchesReferenceAndPreservesPadding() {
     }
   }
 
+  return true;
+}
+
+bool TestMirrorCpuReferenceCoversPaddingOddEvenDegenerateAndDoubleMirror() {
+  const std::vector<EffectCase> cases{{1, 1, 5}, {5, 3, 7}, {6, 4, 11}};
+  video::effects::MirrorEffect effect;
+  video::effects::EffectContext ctx;
+
+  for (const EffectCase &tc : cases) {
+    const std::size_t stride = static_cast<std::size_t>(tc.width) * 3u +
+                               static_cast<std::size_t>(tc.padding);
+    std::vector<std::uint8_t> actual(
+        stride * static_cast<std::size_t>(tc.height), 0xd3u);
+    FillDeterministicRgb(
+        &actual, tc.width, tc.height, stride,
+        0x4d495252u + static_cast<std::uint32_t>(tc.width * 31 + tc.height));
+    const std::vector<std::uint8_t> original = actual;
+    std::vector<std::uint8_t> expected = original;
+    for (int y = 0; y < tc.height; ++y) {
+      const auto *src = original.data() + static_cast<std::size_t>(y) * stride;
+      auto *dst = expected.data() + static_cast<std::size_t>(y) * stride;
+      for (int x = 0; x < tc.width; ++x) {
+        const std::size_t src_offset =
+            static_cast<std::size_t>(tc.width - 1 - x) * 3u;
+        const std::size_t dst_offset = static_cast<std::size_t>(x) * 3u;
+        std::memcpy(dst + dst_offset, src + src_offset, 3u);
+      }
+    }
+
+    video::effects::Rgb24FrameView view;
+    view.data = actual.data();
+    view.width = tc.width;
+    view.height = tc.height;
+    view.stride_bytes = stride;
+    effect.Apply(view, &ctx);
+    if (actual != expected ||
+        !PaddingUnchanged(original, actual, tc.width, tc.height, stride)) {
+      std::cerr << "mirror CPU reference mismatch for " << tc.width << "x"
+                << tc.height << "\n";
+      return false;
+    }
+
+    effect.Apply(view, &ctx);
+    if (actual != original) {
+      std::cerr << "double mirror did not restore exact padded frame for "
+                << tc.width << "x" << tc.height << "\n";
+      return false;
+    }
+  }
   return true;
 }
 

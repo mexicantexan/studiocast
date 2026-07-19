@@ -58,8 +58,12 @@ FrameExecutionRequest FullFrameRequest() {
        "crop_resize",
        {"lit_rgb"},
        {"output_rgb"}},
+      {FrameExecutionStage::crop_resize,
+       "mirror",
+       {"output_rgb"},
+       {"mirrored_output_rgb"}},
   };
-  request.host_readbacks = {"output_rgb"};
+  request.host_readbacks = {"mirrored_output_rgb"};
   request.parameter_slot_capacity = request.dispatches.size();
   request.descriptor_slot_capacity = request.dispatches.size();
   return request;
@@ -70,7 +74,7 @@ bool TestFullFramePlan() {
   std::string error;
   bool ok = Require(BuildFrameExecutionPlan(FullFrameRequest(), &plan, &error),
                     "full frame plan should build: " + error);
-  ok &= Require(plan.dispatches.size() == 8,
+  ok &= Require(plan.dispatches.size() == 9,
                 "full frame plan should represent all candidate stages");
   ok &= Require(plan.completion_boundary == plan.dispatches.size(),
                 "completion boundary should follow the final dispatch");
@@ -92,6 +96,7 @@ bool TestFullFramePlan() {
   bool alpha_ready = false;
   bool blur_ready = false;
   bool composite_ready = false;
+  bool final_resize_to_mirror_ready = false;
   bool host_ready = false;
   for (const auto &barrier : plan.barriers) {
     if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
@@ -114,17 +119,62 @@ bool TestFullFramePlan() {
         barrier.producer_dispatch == 5 && barrier.consumer_boundary == 6) {
       composite_ready = true;
     }
-    if (barrier.kind == FrameBarrierKind::compute_write_to_host_read &&
+    if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
         barrier.resource == "output_rgb" && barrier.producer_dispatch == 7 &&
+        barrier.consumer_boundary == 8) {
+      final_resize_to_mirror_ready = true;
+    }
+    if (barrier.kind == FrameBarrierKind::compute_write_to_host_read &&
+        barrier.resource == "mirrored_output_rgb" &&
+        barrier.producer_dispatch == 8 &&
         barrier.consumer_boundary == plan.completion_boundary) {
       host_ready = true;
     }
   }
   ok &=
-      Require(tensor_ready && alpha_ready && blur_ready && composite_ready,
+      Require(tensor_ready && alpha_ready && blur_ready && composite_ready &&
+                  final_resize_to_mirror_ready,
               "planner should insert explicit compute write-to-read barriers");
   ok &= Require(host_ready,
                 "planner should insert the final host readback barrier");
+  return ok;
+}
+
+bool TestMirrorOnlyUploadDispatchAndFinalReadbackPlan() {
+  FrameExecutionRequest request;
+  request.initial_resources = {FrameInitialResource{
+      "captured_rgb", FrameInitialResourceState::host_write}};
+  request.dispatches = {{FrameExecutionStage::crop_resize,
+                         "mirror",
+                         {"captured_rgb"},
+                         {"mirrored_output_rgb"}}};
+  request.host_readbacks = {"mirrored_output_rgb"};
+  request.parameter_slot_capacity = 1;
+  request.descriptor_slot_capacity = 1;
+
+  FrameExecutionPlan plan;
+  std::string error;
+  bool ok = Require(BuildFrameExecutionPlan(request, &plan, &error),
+                    "mirror-only frame plan should build: " + error);
+  ok &= Require(plan.dispatches.size() == 1 &&
+                    plan.dispatches.front().label == "mirror" &&
+                    plan.host_readbacks.size() == 1,
+                "mirror-only plan should contain exactly one resident stage");
+  bool upload_visible = false;
+  bool final_readback_visible = false;
+  for (const auto &barrier : plan.barriers) {
+    upload_visible |=
+        barrier.kind == FrameBarrierKind::host_write_to_compute_read &&
+        barrier.resource == "captured_rgb" && barrier.consumer_boundary == 0;
+    final_readback_visible |=
+        barrier.kind == FrameBarrierKind::compute_write_to_host_read &&
+        barrier.resource == "mirrored_output_rgb" &&
+        barrier.producer_dispatch == 0 &&
+        barrier.consumer_boundary == plan.completion_boundary;
+  }
+  ok &= Require(upload_visible && final_readback_visible,
+                "mirror-only plan must expose one upload boundary and one "
+                "final readback boundary");
   return ok;
 }
 
@@ -261,6 +311,7 @@ bool TestExplicitInitialStatesAndWriteReuse() {
 int main() {
   bool ok = true;
   ok &= TestFullFramePlan();
+  ok &= TestMirrorOnlyUploadDispatchAndFinalReadbackPlan();
   ok &= TestInvalidRequests();
   ok &= TestMutatedPlanValidation();
   ok &= TestExplicitInitialStatesAndWriteReuse();

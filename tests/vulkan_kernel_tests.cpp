@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/video/open_vulkan_mirror.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
@@ -359,6 +360,34 @@ bool CompareU8(const std::vector<std::uint8_t> &actual,
   return ok;
 }
 
+bool CompareU8Exact(const std::vector<std::uint8_t> &actual,
+                    const std::vector<std::uint8_t> &expected,
+                    const std::string &what) {
+  if (actual == expected)
+    return true;
+  std::size_t mismatch = 0;
+  while (mismatch < actual.size() && mismatch < expected.size() &&
+         actual[mismatch] == expected[mismatch]) {
+    ++mismatch;
+  }
+  std::cerr << what << ": exact byte mismatch at " << mismatch << "\n";
+  return false;
+}
+
+std::vector<std::uint8_t>
+MirrorU8Reference(const std::vector<std::uint8_t> &src, int width, int height) {
+  std::vector<std::uint8_t> out(src.size());
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        out[ChannelIndex(x, y, width, c)] =
+            src[ChannelIndex(width - 1 - x, y, width, c)];
+      }
+    }
+  }
+  return out;
+}
+
 bool CompareF32(const std::vector<float> &actual,
                 const std::vector<float> &expected, const std::string &what) {
   bool ok = true;
@@ -614,6 +643,56 @@ int main() {
                 "runtime init");
   ok &= Require(error.find("invalid Vulkan image") != std::string::npos,
                 "Vulkan invalid image error should be clear");
+  ok &= Require(
+      !validation_only.MirrorHorizontalU8x3(invalid, invalid, &error) &&
+          error.find("invalid Vulkan image") != std::string::npos,
+      "Vulkan mirror wrapper should reject invalid images before runtime init");
+  {
+    studiocast::video::OpenVulkanMirror invalid_mirror;
+    ok &= Require(!invalid_mirror.EnsureInitialized(nullptr, 1, 1, &error) &&
+                      error.find("vulkan_effect_initialization_failed") !=
+                          std::string::npos,
+                  "mirror initialization failures need a stable reason code");
+  }
+  {
+    studiocast::vulkan::OpenVulkanDiagnostics diagnostics;
+    diagnostics.runtime_library_found = true;
+    diagnostics.physical_device_found = true;
+    diagnostics.non_cpu_device_selected = true;
+    diagnostics.compute_queue_available = true;
+    diagnostics.logical_device_created = true;
+    diagnostics.context_created = true;
+    diagnostics.context_healthy = true;
+    diagnostics.production_hardware_ready = true;
+    diagnostics.shader_pipeline_created = true;
+    diagnostics.ok = true;
+    ok &= Require(
+        studiocast::video::EvaluateOpenVulkanMirrorReadiness(diagnostics)
+            .production_ready,
+        "mirror readiness should accept complete production hardware facts");
+
+    diagnostics.cpu_device_selected = true;
+    diagnostics.non_cpu_device_selected = false;
+    diagnostics.production_hardware_ready = false;
+    const auto cpu_readiness =
+        studiocast::video::EvaluateOpenVulkanMirrorReadiness(diagnostics);
+    ok &= Require(!cpu_readiness.production_ready &&
+                      cpu_readiness.shared_reason_code ==
+                          "vulkan_only_cpu_devices_available",
+                  "CPU/software Vulkan must fail the mirror production "
+                  "readiness predicate with a stable shared reason");
+
+    diagnostics.cpu_device_selected = false;
+    diagnostics.non_cpu_device_selected = true;
+    diagnostics.production_hardware_ready = false;
+    const auto unproven_readiness =
+        studiocast::video::EvaluateOpenVulkanMirrorReadiness(diagnostics);
+    ok &= Require(!unproven_readiness.production_ready &&
+                      unproven_readiness.shared_reason_code ==
+                          "vulkan_production_hardware_not_ready",
+                  "mirror readiness must fail closed when the aggregate "
+                  "production hardware fact is not proven");
+  }
   ok &=
       Require(studiocast::vulkan::kernels::detail::CheckBoxBlurRadiusForKernel(
                   64, "test", &error),
@@ -660,6 +739,154 @@ int main() {
   }
 
   {
+    using studiocast::video::OpenVulkanMirror;
+    using studiocast::video::OpenVulkanMirrorCounters;
+    using studiocast::video::OpenVulkanMirrorFinalStageInput;
+
+    const struct MirrorCase {
+      int width;
+      int height;
+      VulkanPixelFormat format;
+      const char *label;
+    } cases[] = {
+        {1, 1, VulkanPixelFormat::rgb_u8, "RGB 1x1"},
+        {5, 3, VulkanPixelFormat::rgb_u8, "RGB odd"},
+        {6, 2, VulkanPixelFormat::rgb_u8, "RGB even"},
+        {5, 3, VulkanPixelFormat::bgr_u8, "BGR odd"},
+        {6, 2, VulkanPixelFormat::bgr_u8, "BGR even"},
+    };
+
+    for (const auto &tc : cases) {
+      std::vector<std::uint8_t> source(static_cast<std::size_t>(tc.width) *
+                                       static_cast<std::size_t>(tc.height) *
+                                       3u);
+      for (std::size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<std::uint8_t>((i * 73u + 19u) & 0xffu);
+
+      VulkanImage gpu_src, gpu_dst, gpu_round_trip;
+      if (!AllocateU8(kernels, &gpu_src, tc.width, tc.height, tc.format,
+                      &error) ||
+          !AllocateU8(kernels, &gpu_dst, tc.width, tc.height, tc.format,
+                      &error) ||
+          !AllocateU8(kernels, &gpu_round_trip, tc.width, tc.height, tc.format,
+                      &error)) {
+        return OptionalSkip(std::string("mirror allocation failed: ") + error);
+      }
+      FillU8(gpu_src, source);
+      ok &= Require(gpu_src.Flush(&error),
+                    std::string(tc.label) + " source flush failed: " + error);
+
+      OpenVulkanMirror mirror;
+      ok &= Require(
+          mirror.EnsureInitialized(&kernels, tc.width, tc.height, &error),
+          std::string(tc.label) + " mirror init should pass: " + error);
+      OpenVulkanMirrorCounters counters;
+      OpenVulkanMirrorFinalStageInput input;
+      input.src = &gpu_src;
+      input.dst = &gpu_dst;
+      ok &= Require(!mirror.ApplyFinal(input, &counters, &error) &&
+                        error.find("final-stage ordering boundary") !=
+                            std::string::npos &&
+                        counters.dispatch_calls == 0 &&
+                        counters.runtime_failure_frames == 0,
+                    std::string(tc.label) +
+                        " mirror must reject execution before final order "
+                        "inputs without dispatching");
+
+      input.unmirrored_analysis_complete = true;
+      input.output_geometry_ready = true;
+      ok &=
+          Require(mirror.ApplyFinal(input, &counters, &error),
+                  std::string(tc.label) + " mirror dispatch failed: " + error);
+      ok &= Require(gpu_dst.Invalidate(&error),
+                    std::string(tc.label) +
+                        " output invalidate failed: " + error);
+      ok &= CompareU8Exact(ReadU8(gpu_dst),
+                           MirrorU8Reference(source, tc.width, tc.height),
+                           std::string("Vulkan mirror ") + tc.label);
+
+      OpenVulkanMirrorFinalStageInput second;
+      second.src = &gpu_dst;
+      second.dst = &gpu_round_trip;
+      second.unmirrored_analysis_complete = true;
+      second.output_geometry_ready = true;
+      ok &= Require(mirror.ApplyFinal(second, &counters, &error),
+                    std::string(tc.label) +
+                        " double mirror dispatch failed: " + error);
+      ok &= Require(gpu_round_trip.Invalidate(&error),
+                    std::string(tc.label) +
+                        " round-trip invalidate failed: " + error);
+      ok &= CompareU8Exact(ReadU8(gpu_round_trip), source,
+                           std::string("Vulkan double mirror ") + tc.label);
+      ok &= Require(counters.dispatch_calls == 2 &&
+                        counters.runtime_failure_frames == 0,
+                    std::string(tc.label) +
+                        " mirror counters should track exactly two resident "
+                        "dispatches");
+    }
+
+    {
+      constexpr int src_w = 3;
+      constexpr int src_h = 2;
+      constexpr int dst_w = 5;
+      constexpr int dst_h = 3;
+      const std::vector<std::uint8_t> source = {
+          5,  17, 29, 41, 53, 65, 77, 89,  101,
+          13, 31, 47, 59, 71, 83, 97, 109, 127,
+      };
+      VulkanImage gpu_src, gpu_resized, gpu_dst;
+      if (!AllocateU8(kernels, &gpu_src, src_w, src_h,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(kernels, &gpu_resized, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(kernels, &gpu_dst, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error)) {
+        return OptionalSkip("mirror resize-batch allocation failed: " + error);
+      }
+      FillU8(gpu_src, source);
+      ok &= Require(gpu_src.Flush(&error),
+                    "mirror resize-batch source flush failed: " + error);
+
+      OpenVulkanMirror mirror;
+      ok &= Require(mirror.EnsureInitialized(&kernels, dst_w, dst_h, &error),
+                    "mirror resize-batch init should pass: " + error);
+      OpenVulkanMirrorCounters counters;
+      studiocast::video::OpenVulkanMirrorResizeFinalStageInput input;
+      input.src = &gpu_src;
+      input.resized = &gpu_resized;
+      input.dst = &gpu_dst;
+      input.unmirrored_analysis_complete = true;
+      const std::uint64_t submissions_before =
+          kernels.synchronous_submission_count();
+      const std::uint64_t completions_before =
+          kernels.frame_batch_completion_count();
+      ok &= Require(mirror.ApplyResizeFinal(input, &counters, &error),
+                    "Vulkan combined resize/mirror should dispatch: " + error);
+      ok &= Require(kernels.synchronous_submission_count() ==
+                            submissions_before + 1 &&
+                        kernels.frame_batch_completion_count() ==
+                            completions_before + 1 &&
+                        kernels.last_frame_batch_stage_count() == 2,
+                    "combined resize/mirror must record two dependent stages "
+                    "under exactly one submission/completion");
+      ok &= Require(counters.dispatch_calls == 1 &&
+                        counters.runtime_failure_frames == 0,
+                    "combined resize/mirror should count one final mirror "
+                    "operation");
+      ok &= Require(gpu_dst.Invalidate(&error),
+                    "combined resize/mirror invalidate failed: " + error);
+      ok &=
+          CompareU8(ReadU8(gpu_dst),
+                    MirrorU8Reference(
+                        ResizeU8Reference(source, src_w, src_h, dst_w, dst_h,
+                                          0.0f, 0.0f, static_cast<float>(src_w),
+                                          static_cast<float>(src_h)),
+                        dst_w, dst_h),
+                    "Vulkan combined resize/mirror");
+    }
+  }
+
+  {
     UtilityKernels foreign_kernels;
     if (!foreign_kernels.Initialize(&error))
       return OptionalSkip("second Vulkan context init failed: " + error);
@@ -683,6 +910,38 @@ int main() {
                     error.find("[vulkan_foreign_context]") != std::string::npos,
                 "utility descriptor binding must reject a foreign context "
                 "before dispatch");
+
+    studiocast::video::OpenVulkanMirror mirror;
+    ok &= Require(mirror.EnsureInitialized(&kernels, 2, 2, &error),
+                  "same-context mirror wrapper should initialize: " + error);
+    studiocast::video::OpenVulkanMirrorCounters alias_counters;
+    studiocast::video::OpenVulkanMirrorFinalStageInput alias_input;
+    alias_input.src = &same_src;
+    alias_input.dst = &same_src;
+    alias_input.unmirrored_analysis_complete = true;
+    alias_input.output_geometry_ready = true;
+    ok &= Require(!mirror.ApplyFinal(alias_input, &alias_counters, &error) &&
+                      error.find("src/dst must be distinct") !=
+                          std::string::npos &&
+                      alias_counters.dispatch_calls == 0 &&
+                      alias_counters.runtime_failure_frames == 1,
+                  "production mirror helper must reject in-place aliasing "
+                  "before dispatch");
+
+    studiocast::video::OpenVulkanMirrorCounters mirror_counters;
+    studiocast::video::OpenVulkanMirrorFinalStageInput mirror_input;
+    mirror_input.src = &same_src;
+    mirror_input.dst = &foreign_dst;
+    mirror_input.unmirrored_analysis_complete = true;
+    mirror_input.output_geometry_ready = true;
+    ok &= Require(
+        !mirror.ApplyFinal(mirror_input, &mirror_counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_foreign_context]") != std::string::npos &&
+            mirror_counters.dispatch_calls == 0 &&
+            mirror_counters.runtime_failure_frames == 1,
+        "production mirror helper must reject a foreign context before "
+        "dispatch with stable effect/context reasons");
   }
 
   {
@@ -838,6 +1097,92 @@ int main() {
                           "vulkan_submission_timeout",
                   "unsafe Vulkan timeout should poison and latch with a stable "
                   "reason");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_kernels;
+    if (!lost_kernels.Initialize(&error))
+      return OptionalSkip("mirror device-loss context init failed: " + error);
+    VulkanImage src, dst;
+    if (!AllocateU8(lost_kernels, &src, 2, 2, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(lost_kernels, &dst, 2, 2, VulkanPixelFormat::rgb_u8,
+                    &error)) {
+      return OptionalSkip("mirror device-loss allocation failed: " + error);
+    }
+    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    if (!src.Flush(&error))
+      return OptionalSkip("mirror device-loss source flush failed: " + error);
+
+    studiocast::video::OpenVulkanMirror mirror;
+    ok &= Require(mirror.EnsureInitialized(&lost_kernels, 2, 2, &error),
+                  "mirror device-loss wrapper should initialize: " + error);
+    lost_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanMirrorCounters counters;
+    studiocast::video::OpenVulkanMirrorFinalStageInput input;
+    input.src = &src;
+    input.dst = &dst;
+    input.unmirrored_analysis_complete = true;
+    input.output_geometry_ready = true;
+    ok &= Require(
+        !mirror.ApplyFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1,
+        "mirror device loss must retain shared and effect stable reasons and "
+        "count the failed submitted dispatch");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_batch_kernels;
+    if (!lost_batch_kernels.Initialize(&error)) {
+      return OptionalSkip("mirror batch device-loss context init failed: " +
+                          error);
+    }
+    VulkanImage src, resized, dst;
+    if (!AllocateU8(lost_batch_kernels, &src, 2, 2, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(lost_batch_kernels, &resized, 3, 3,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_batch_kernels, &dst, 3, 3, VulkanPixelFormat::rgb_u8,
+                    &error)) {
+      return OptionalSkip("mirror batch device-loss allocation failed: " +
+                          error);
+    }
+    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    if (!src.Flush(&error)) {
+      return OptionalSkip("mirror batch device-loss source flush failed: " +
+                          error);
+    }
+
+    studiocast::video::OpenVulkanMirror mirror;
+    ok &=
+        Require(mirror.EnsureInitialized(&lost_batch_kernels, 3, 3, &error),
+                "mirror batch device-loss wrapper should initialize: " + error);
+    lost_batch_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanMirrorCounters counters;
+    studiocast::video::OpenVulkanMirrorResizeFinalStageInput input;
+    input.src = &src;
+    input.resized = &resized;
+    input.dst = &dst;
+    input.unmirrored_analysis_complete = true;
+    ok &= Require(
+        !mirror.ApplyResizeFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1,
+        "combined resize/mirror device loss must retain shared and effect "
+        "stable reasons and count the failed submitted batch");
   }
 
   auto flush = [&](auto &resource) {

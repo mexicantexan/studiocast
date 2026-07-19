@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "core/video/effects/broadcast_effect_contract.h"
+#include "core/video/effects/broadcast_effect_rules.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/virtual_camera_service.h"
 
@@ -64,6 +65,7 @@ bool TestResizeRgb24BilinearPreservesActivePixelsAndZerosPadding();
 bool TestResizeRgb24BilinearHandlesDegenerateAxesAndPlanReuse();
 bool TestBackgroundRemoveCpuMatchesReferenceAndPreservesPadding();
 bool TestBackgroundBlurCpuMatchesReferenceAndPreservesPadding();
+bool TestMirrorCpuReferenceCoversPaddingOddEvenDegenerateAndDoubleMirror();
 } // namespace studiocast::tests
 
 namespace {
@@ -1191,6 +1193,70 @@ bool TestComputeBackendSelectionPolicyIsNoGpuSafe() {
   return true;
 }
 
+bool TestMirrorCanonicalPlanAndBackendContractIsNoGpuSafe() {
+  namespace effects = studiocast::video::effects;
+  using studiocast::video::ComputeBackendAvailability;
+  using studiocast::video::ComputeBackendKind;
+  using studiocast::video::ComputeBackendPreference;
+  using studiocast::video::ResolveComputeBackendSelection;
+
+  effects::BroadcastCameraEffects mirror_only;
+  mirror_only.mirror = true;
+  auto plan = effects::BuildBroadcastEffectsPlan(mirror_only);
+  if (plan.ordered_effect_ids.size() != 1 ||
+      plan.ordered_effect_ids.front() != effects::contract::kEffectIdMirror ||
+      !plan.disabled.empty() ||
+      !effects::BroadcastEffectsPlanRequestsCompute(plan)) {
+    std::cerr << "mirror-only plan must schedule final compute work\n";
+    return false;
+  }
+
+  effects::BroadcastCameraEffects combined;
+  combined.mirror = true;
+  combined.video_noise_removal.enabled = true;
+  combined.eye_contact.enabled = true;
+  combined.auto_frame.enabled = true;
+  combined.virtual_key_light.enabled = true;
+  combined.vignette.enabled = true;
+  combined.virtual_background.mode = effects::VirtualBackgroundMode::blur;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  if (plan.ordered_effect_ids.empty() ||
+      plan.ordered_effect_ids.back() != effects::contract::kEffectIdMirror ||
+      plan.vignette_attach_to_effect_id == effects::contract::kEffectIdMirror) {
+    std::cerr << "mirror must be last without becoming a vignette attachment "
+                 "target\n";
+    return false;
+  }
+
+  ComputeBackendAvailability available;
+  available.vulkan_available = true;
+  const auto selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::vulkan, available,
+      effects::BroadcastEffectsPlanRequestsCompute(
+          effects::BuildBroadcastEffectsPlan(mirror_only)));
+  if (selected.resolved != ComputeBackendKind::vulkan || selected.degraded) {
+    std::cerr << "mirror-only explicit Vulkan must resolve Vulkan compute\n";
+    return false;
+  }
+
+  CameraPipelineStatus::OpenVulkanTransfers counters;
+  ++counters.active_frames;
+  ++counters.upload_calls;
+  ++counters.mirror_dispatch_calls;
+  ++counters.download_calls;
+  ++counters.final_download_calls;
+  if (counters.active_frames != 1 || counters.upload_calls != 1 ||
+      counters.mirror_dispatch_calls != 1 || counters.download_calls != 1 ||
+      counters.final_download_calls != 1 ||
+      counters.cpu_continuation_download_calls != 0 ||
+      counters.cpu_tail_stage_calls != 0) {
+    std::cerr << "mirror transfer counter contract must be one resident "
+                 "section without a CPU tail\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1233,6 +1299,8 @@ int main() {
        &TestGpuBackendActiveFrameMarkerCountsOncePerFrame},
       {"compute backend selection policy is no-GPU safe",
        &TestComputeBackendSelectionPolicyIsNoGpuSafe},
+      {"mirror canonical plan and backend contract is no-GPU safe",
+       &TestMirrorCanonicalPlanAndBackendContractIsNoGpuSafe},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},
@@ -1357,6 +1425,9 @@ int main() {
       {"Background blur CPU matches reference and preserves padding",
        &studiocast::tests::
            TestBackgroundBlurCpuMatchesReferenceAndPreservesPadding},
+      {"Mirror CPU reference covers padded odd/even/1x1 and double mirror",
+       &studiocast::tests::
+           TestMirrorCpuReferenceCoversPaddingOddEvenDegenerateAndDoubleMirror},
   };
 
   int failed = 0;

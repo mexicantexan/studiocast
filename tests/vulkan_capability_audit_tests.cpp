@@ -112,14 +112,76 @@ bool TestExplicitVulkanFilteringMatchesAudit() {
                 "explicit Vulkan must continue removing eye contact");
   ok &= Require(Contains(filtering, "kEffectIdVignette"),
                 "explicit Vulkan must continue removing vignette");
+  ok &= Require(!Contains(filtering, "kEffectIdMirror"),
+                "explicit Vulkan must retain mirror in the canonical plan");
   ok &=
       Require(Contains(filtering, "virtual background, virtual key light, and"),
               "explicit Vulkan eligible-effect note changed; audit required");
 
   const std::string rules = ReadFile(root / "src" / "core" / "video" /
                                      "effects" / "broadcast_effect_rules.cpp");
-  ok &= Require(Contains(rules, "mirror is not supported (ignored)"),
-                "mirror planner behavior changed; capability audit required");
+  ok &= Require(Contains(rules, "kEffectIdMirror") &&
+                    Contains(rules, "Mirror is the final visual transform"),
+                "mirror must be scheduled as the canonical final transform");
+  return ok;
+}
+
+bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::size_t combined_input =
+      pipeline.find("OpenVulkanMirrorResizeFinalStageInput mirror_input");
+  const std::size_t analysis_boundary = pipeline.find(
+      "mirror_input.unmirrored_analysis_complete = true", combined_input);
+  const std::size_t combined_apply =
+      pipeline.find("open_vulkan_mirror.ApplyResizeFinal", analysis_boundary);
+  const std::size_t geometry_boundary = pipeline.find(
+      "mirror_input.output_geometry_ready = true", combined_apply);
+  const std::size_t apply =
+      pipeline.find("open_vulkan_mirror.ApplyFinal", geometry_boundary);
+  const std::size_t download =
+      pipeline.find("DownloadImageToRgb(*download_img", apply);
+  bool ok =
+      Require(combined_input != std::string::npos &&
+                  analysis_boundary != std::string::npos &&
+                  combined_apply != std::string::npos &&
+                  geometry_boundary != std::string::npos &&
+                  apply != std::string::npos && download != std::string::npos,
+              "mirror live final-output helper call is incomplete");
+  ok &= Require(combined_input < analysis_boundary &&
+                    analysis_boundary < combined_apply &&
+                    combined_apply < geometry_boundary &&
+                    geometry_boundary < apply && apply < download,
+                "live path must use the combined resize/mirror helper, retain "
+                "the same-size final helper, and mirror before readback");
+  ok &= Require(
+      Contains(pipeline, "have_open_vulkan_mirror") &&
+          Contains(pipeline, "!open_vulkan_mirror_attempt_this_frame") &&
+          Contains(pipeline, "set_backend(stage_id, \"open_vulkan\")") &&
+          Contains(pipeline, "open_vulkan_mirror_counters.dispatch_calls"),
+      "mirror batching, applied-backend, or counter evidence is missing");
+
+  const std::string helper =
+      ReadFile(root / "src" / "core" / "video" / "open_vulkan_mirror.cpp");
+  ok &= Require(Contains(helper, "vulkan_effect_initialization_failed") ||
+                    Contains(ReadFile(root / "src" / "core" / "video" /
+                                      "open_vulkan_mirror.h"),
+                             "vulkan_effect_initialization_failed"),
+                "mirror initialization stable reason is missing");
+  ok &= Require(Contains(helper, "OpenVulkanMirrorRuntimeFailure") &&
+                    Contains(helper, "MirrorHorizontalU8x3") &&
+                    Contains(helper, "ResizeMirrorHorizontalU8x3") &&
+                    Contains(helper, "production_hardware_ready"),
+                "mirror runtime stable reason or real kernel call is missing");
+  const std::string utility = ReadFile(root / "src" / "core" / "vulkan" /
+                                       "kernels" / "utility_kernels.cpp");
+  ok &= Require(Contains(utility, "output_resize") &&
+                    Contains(utility, "final_mirror") &&
+                    Contains(utility, "VulkanBufferAccess::compute_write") &&
+                    Contains(utility, "frame_batch_.Complete"),
+                "mirror resize batch must retain its dependency barrier and "
+                "single completion seam");
   return ok;
 }
 
@@ -178,6 +240,7 @@ int main() {
   bool ok = true;
   ok = TestAuditCoversCanonicalEffects() && ok;
   ok = TestExplicitVulkanFilteringMatchesAudit() && ok;
+  ok = TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestDefaultMattingDiagnosticsRemainFailClosed() && ok;
   ok = TestAutoFrameDegradedPathRemainsExplicit() && ok;
   return ok ? 0 : 1;

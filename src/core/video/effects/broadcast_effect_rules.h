@@ -41,4 +41,10 @@ struct BroadcastEffectsPlan {
 BroadcastEffectsPlan
 BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx);
 
+// Returns true when the canonical plan requests work from the selected video
+// compute backend. Mirror is compute work even when it is the only requested
+// effect; the live pipeline uses this seam when resolving an explicit Vulkan
+// backend and when deciding whether to initialize the shared Vulkan runtime.
+bool BroadcastEffectsPlanRequestsCompute(const BroadcastEffectsPlan &plan);
+
 } // namespace studiocast::video::effects
