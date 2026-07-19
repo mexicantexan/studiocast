@@ -85,6 +85,14 @@ blockers include:
 - `open_vulkan_runtime_diagnostics_unavailable` when installed daemon evidence
   cannot be obtained.
 
+Recommendation additionally emits
+`effect.<id>.<engine>.capability_evidence_missing` when a canonical per-effect
+or per-engine capability fact is absent. A production-looking Vulkan fact set
+that fails its exact evidence or success-attestation contract and supplies no
+more specific upstream Vulkan blocker emits
+`effect.<id>.vulkan.production_evidence_inconsistent`. Existing exact upstream
+blockers take precedence and are preserved verbatim.
+
 A loader-only host, CPU Vulkan device, missing compute queue, unhealthy or lost
 device, mismatched/absent per-effect evidence, missing model/artifact/runtime,
 failed warm-up, mismatched device identity, CPU layers/readbacks/tails, or
@@ -129,9 +137,11 @@ fallback inside another backend, and unused classes are not selectable CPU
 engine evidence. Installer facts report
 `effect.<id>.cpu.no_selectable_production_path` independently for every effect.
 
-Recommended selection enables the Open Vulkan build feature when at least one
-effect actually selects Vulkan. Maxine or CUDA still wins independently for an
-effect with higher-precedence production evidence.
+Recommended selection sets the Open Vulkan build feature to true exactly when
+at least one effect actually selects Vulkan, and explicitly sets it false when
+none does. Advanced/custom selections and an existing installation's Modify
+route retain their compatibility behavior. Maxine or CUDA still wins
+independently for an effect with higher-precedence production evidence.
 
 ## Evidence map
 

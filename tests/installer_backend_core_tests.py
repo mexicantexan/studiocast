@@ -24,6 +24,11 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
+CANONICAL_EFFECTS = [
+    "mirror", "virtual_background.blur", "virtual_background.remove",
+    "virtual_background.replace", "auto_frame", "eye_contact",
+    "video_noise_removal", "virtual_key_light", "vignette",
+]
 
 
 def terminal_result(text: str) -> dict:
@@ -353,6 +358,130 @@ class InstallerBackendCoreTests(unittest.TestCase):
         facts["effects"]["capabilities"]["virtual_background"]["maxine"] = "production_usable"
         self.assertEqual(self.recommendation(facts)["selections"]["effects"]["virtual_background"]["selected"], "maxine")
         self.assertEqual(self.recommendation(facts)["selections"]["model_pack_ids"], DEFAULT_PACKS)
+
+    def test_recommended_open_vulkan_feature_exactly_tracks_selected_effects(self):
+        zero = base_facts(desired_configuration={
+            "features": {"open_vulkan": True}})
+        zero["effects"]["capabilities"] = {}
+        zero_rec = self.recommendation(zero)
+        self.assertEqual(zero_rec["route"], "recommended")
+        self.assertFalse(zero_rec["selections"]["features"]["open_vulkan"])
+        self.assertFalse(any(
+            item["selected"] == "vulkan"
+            for item in zero_rec["selections"]["effects"].values()))
+
+        for retained in ("mirror", "vignette"):
+            with self.subTest(retained=retained):
+                facts = machine_recommendation_facts("amd")
+                facts["installation"]["desired_configuration"] = {
+                    "features": {"open_vulkan": False}}
+                removed = "vignette" if retained == "mirror" else "mirror"
+                matrix = facts["effects"]["capabilities"][removed]
+                matrix["vulkan"] = "unavailable"
+                matrix["vulkan_evidence"]["production_ready"] = False
+                matrix["success_reason_codes"]["vulkan"] = []
+                matrix["blocker_reason_codes"]["vulkan"] = [
+                    f"open_vulkan_{removed}_unavailable"]
+                rec = self.recommendation(facts)
+                selected = rec["selections"]["effects"]
+                self.assertEqual(
+                    [effect for effect, item in selected.items()
+                     if item["selected"] == "vulkan"],
+                    [retained])
+                self.assertTrue(rec["selections"]["features"]["open_vulkan"])
+
+    def test_non_recommended_routes_preserve_prior_open_vulkan_intent(self):
+        modify = base_facts(
+            classification="healthy", active_version="0.2.9",
+            version_relation="same", desired_configuration={
+                "features": {"open_vulkan": True}})
+        modify["effects"]["capabilities"] = {}
+        modify_rec = self.recommendation(modify)
+        self.assertEqual(modify_rec["route"], "modify")
+        self.assertTrue(modify_rec["selections"]["features"]["open_vulkan"])
+
+        valid = machine_recommendation_facts("amd")
+        valid["installation"]["desired_configuration"] = {
+            "features": {"open_vulkan": False}}
+        for route in ("advanced", "custom"):
+            with self.subTest(route=route):
+                rec = self.recommendation(valid, "--route", route)
+                self.assertEqual(rec["route"], route)
+                self.assertFalse(rec["selections"]["features"]["open_vulkan"])
+                self.assertTrue(any(
+                    item["selected"] == "vulkan"
+                    for item in rec["selections"]["effects"].values()))
+
+    def test_missing_and_partial_capability_maps_emit_all_canonical_effects(self):
+        for capabilities in ({}, []):
+            with self.subTest(capabilities=type(capabilities).__name__):
+                facts = base_facts()
+                facts["effects"]["capabilities"] = capabilities
+                selected = self.recommendation(facts)["selections"]["effects"]
+                self.assertEqual(list(selected), sorted(CANONICAL_EFFECTS))
+                for effect, item in selected.items():
+                    self.assertEqual(item["selected"], "unavailable")
+                    expected = {
+                        engine: [f"effect.{effect}.{engine}.capability_evidence_missing"]
+                        for engine in ("maxine", "cuda", "vulkan", "cpu")
+                    }
+                    self.assertEqual(
+                        item["capability_blocker_reason_codes"], expected)
+                    self.assertEqual(
+                        item["selected_reason_codes"],
+                        [codes[0] for codes in expected.values()])
+
+        partial = machine_recommendation_facts("amd")
+        partial["effects"]["capabilities"] = {
+            "mirror": partial["effects"]["capabilities"]["mirror"]}
+        rec = self.recommendation(partial)
+        selected = rec["selections"]["effects"]
+        self.assertEqual(list(selected), sorted(CANONICAL_EFFECTS))
+        self.assertEqual(selected["mirror"]["selected"], "vulkan")
+        self.assertTrue(rec["selections"]["features"]["open_vulkan"])
+        for effect in CANONICAL_EFFECTS[1:]:
+            self.assertEqual(selected[effect]["selected"], "unavailable")
+            self.assertEqual(
+                selected[effect]["capability_blocker_reason_codes"]["vulkan"],
+                [f"effect.{effect}.vulkan.capability_evidence_missing"])
+
+    def test_inconsistent_vulkan_attestation_has_stable_fallback_blocker(self):
+        mutations = (
+            ("success_missing", lambda matrix: matrix["success_reason_codes"].update(vulkan=[])),
+            ("success_wrong", lambda matrix: matrix["success_reason_codes"].update(
+                vulkan=["open_vulkan_wrong_production_ready"])),
+            ("common_evidence_missing", lambda matrix: matrix["vulkan_evidence"].pop(
+                "runtime_library_found")),
+            ("effect_evidence_missing", lambda matrix: matrix["vulkan_evidence"].pop(
+                "model_artifact_ready")),
+        )
+        for name, mutate in mutations:
+            with self.subTest(mutation=name):
+                facts = machine_recommendation_facts("amd")
+                matrix = promote_production_looking_vulkan(
+                    facts, "virtual_background.blur")
+                mutate(matrix)
+                item = self.recommendation(facts)["selections"]["effects"][
+                    "virtual_background.blur"]
+                reason = ("effect.virtual_background.blur.vulkan."
+                          "production_evidence_inconsistent")
+                self.assertNotEqual(item["selected"], "vulkan")
+                self.assertEqual(
+                    item["capability_blocker_reason_codes"]["vulkan"],
+                    [reason])
+                self.assertIn(reason, item["selected_reason_codes"])
+
+        facts = machine_recommendation_facts("amd")
+        matrix = promote_production_looking_vulkan(
+            facts, "virtual_background.blur")
+        matrix["vulkan_evidence"].pop("runtime_ready")
+        matrix["blocker_reason_codes"]["vulkan"] = [
+            "open_vulkan_matting_runtime_failure"]
+        item = self.recommendation(facts)["selections"]["effects"][
+            "virtual_background.blur"]
+        self.assertEqual(
+            item["capability_blocker_reason_codes"]["vulkan"],
+            ["open_vulkan_matting_runtime_failure"])
 
     def test_per_effect_recommendation_fixtures_cover_gpu_topologies_and_failures(self):
         valid_cases = (("nvidia", "valid"), ("amd", "valid"),
