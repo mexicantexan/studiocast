@@ -12,8 +12,11 @@
 #include "core/open_video/vulkan_matting_runtime.h"
 #include "core/util/xdg.h"
 #include "core/video/effects/broadcast_effect_contract.h"
+#include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_eye_contact.h"
+#include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
+#include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 
@@ -566,6 +569,79 @@ void BlockOpenVulkanVirtualBackground(OpenVulkanDiagnostics *d,
   d->blocked_effects[std::string(studiocast::video::effects::contract::
                                      kEffectIdVirtualBackgroundReplace)] =
       reason_code;
+  d->blocked_effects[std::string(
+      studiocast::video::effects::contract::kEffectIdVirtualKeyLight)] =
+      reason_code;
+}
+
+void SetOpenVulkanEffectAvailability(OpenVulkanDiagnostics *d,
+                                     std::string_view effect_id,
+                                     bool production_ready,
+                                     std::string_view blocker_code) {
+  if (!d)
+    return;
+  const std::string id(effect_id);
+  d->available_effects.erase(
+      std::remove(d->available_effects.begin(), d->available_effects.end(), id),
+      d->available_effects.end());
+  d->blocked_effects.erase(id);
+  if (production_ready) {
+    d->available_effects.push_back(id);
+  } else {
+    d->blocked_effects[id] = std::string(blocker_code);
+  }
+}
+
+void ApplyOpenVulkanPixelEffectReadiness(OpenVulkanDiagnostics *d) {
+  if (!d)
+    return;
+
+  const auto mirror =
+      studiocast::video::EvaluateOpenVulkanMirrorReadiness(*d);
+  d->mirror_production_ready = mirror.production_ready;
+  d->mirror_readiness_code =
+      mirror.production_ready
+          ? std::string(studiocast::video::
+                            kOpenVulkanMirrorProductionReadyReason)
+          : std::string{};
+  d->mirror_blocker_code =
+      mirror.production_ready ? std::string{} : mirror.shared_reason_code;
+  SetOpenVulkanEffectAvailability(
+      d, studiocast::video::effects::contract::kEffectIdMirror,
+      mirror.production_ready, d->mirror_blocker_code);
+
+  const auto vignette =
+      studiocast::video::EvaluateOpenVulkanVignetteReadiness(*d);
+  d->vignette_fixed_center_production_ready = vignette.production_ready;
+  d->vignette_readiness_code =
+      vignette.production_ready
+          ? std::string(studiocast::video::
+                            kOpenVulkanVignetteFixedCenterProductionReadyReason)
+          : std::string{};
+  d->vignette_blocker_code =
+      vignette.production_ready ? std::string{} : vignette.shared_reason_code;
+  d->vignette_parameter_contract = std::string(
+      studiocast::video::kOpenVulkanVignetteParameterContract);
+  SetOpenVulkanEffectAvailability(
+      d, studiocast::video::effects::contract::kEffectIdVignette,
+      vignette.production_ready, d->vignette_blocker_code);
+}
+
+void ApplyOpenVulkanAutoFrameReleaseReadiness(OpenVulkanDiagnostics *d) {
+  if (!d)
+    return;
+  d->auto_frame_crop_stage_implemented = true;
+  d->auto_frame_production_ready = false;
+  d->auto_frame_readiness_code.clear();
+  d->auto_frame_blocker_code = std::string(
+      studiocast::video::kOpenVulkanAutoFrameFaceProviderReason);
+  d->auto_frame_cpu_tail = true;
+  d->auto_frame_degraded_reason_code =
+      std::string(studiocast::video::kOpenVulkanAutoFrameCpuTailReason);
+  d->auto_frame_selectable_cpu_fallback = false;
+  SetOpenVulkanEffectAvailability(
+      d, studiocast::video::effects::contract::kEffectIdAutoFrame, false,
+      d->auto_frame_blocker_code);
 }
 
 void ApplyOpenVulkanEyeContactReadiness(OpenVulkanDiagnostics *d) {
@@ -709,6 +785,8 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
     BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
+    ApplyOpenVulkanPixelEffectReadiness(&d);
+    ApplyOpenVulkanAutoFrameReleaseReadiness(&d);
     ApplyOpenVulkanEyeContactReadiness(&d);
     ApplyOpenVulkanVideoNoiseRemovalReadiness(&d);
     return d;
@@ -727,6 +805,8 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
     BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
+    ApplyOpenVulkanPixelEffectReadiness(&d);
+    ApplyOpenVulkanAutoFrameReleaseReadiness(&d);
     ApplyOpenVulkanEyeContactReadiness(&d);
     ApplyOpenVulkanVideoNoiseRemovalReadiness(&d);
     return d;
@@ -753,6 +833,8 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
       "The milestone-4 ncnn Vulkan spike used CPU Mat input/output; it is not "
       "used for production Open Vulkan virtual background.");
   BlockOpenVulkanVirtualBackground(&d, d.matting_reason_code.c_str());
+  ApplyOpenVulkanPixelEffectReadiness(&d);
+  ApplyOpenVulkanAutoFrameReleaseReadiness(&d);
   ApplyOpenVulkanEyeContactReadiness(&d);
   ApplyOpenVulkanVideoNoiseRemovalReadiness(&d);
   return d;

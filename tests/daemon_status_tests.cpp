@@ -1568,10 +1568,41 @@ bool TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() {
   const std::string *primaryBlocker =
       StringAt(*diagnostics, "video_noise_removal_blocker_code",
                "Vulkan-off video-denoise primary blocker should be present");
-  if (!blockedReason || !primaryBlocker)
+  const std::string *mirrorBlocker =
+      StringAt(*blocked, "mirror",
+               "Vulkan-off mirror blocker should be present");
+  const std::string *vignetteBlocker =
+      StringAt(*blocked, "vignette",
+               "Vulkan-off vignette blocker should be present");
+  const std::string *autoFrameBlocker =
+      StringAt(*blocked, "auto_frame",
+               "Vulkan-off Auto Frame blocker should be present");
+  const std::string *vignetteContract = StringAt(
+      *diagnostics, "vignette_parameter_contract",
+      "Vulkan-off vignette parameter contract should be present");
+  if (!blockedReason || !primaryBlocker || !mirrorBlocker ||
+      !vignetteBlocker || !autoFrameBlocker || !vignetteContract)
     return false;
 
-  return Expect(*blockedReason == "open_vulkan_video_noise_removal_unavailable",
+  return Expect(*mirrorBlocker == "vulkan_backend_disabled_in_build" &&
+                    *vignetteBlocker == "vulkan_backend_disabled_in_build" &&
+                    *autoFrameBlocker == "vulkan_backend_disabled_in_build",
+                "Vulkan-off pixel/Auto Frame effects must fail closed with "
+                "the exact build blocker") &&
+         Expect(!JsonBoolField(*diagnostics, "mirror_production_ready", true) &&
+                    !JsonBoolField(
+                        *diagnostics,
+                        "vignette_fixed_center_production_ready", true) &&
+                    !JsonBoolField(*diagnostics,
+                                   "auto_frame_crop_stage_implemented", true) &&
+                    !JsonBoolField(*diagnostics,
+                                   "auto_frame_production_ready", true) &&
+                    !JsonBoolField(*diagnostics,
+                                   "auto_frame_selectable_cpu_fallback", true) &&
+                    *vignetteContract == "fixed_center",
+                "Vulkan-off additive readiness facts must remain false while "
+                "preserving the fixed-center contract") &&
+         Expect(*blockedReason == "open_vulkan_video_noise_removal_unavailable",
                 "Vulkan-off schema must preserve the stable outer reason") &&
          Expect(*primaryBlocker ==
                     "open_vulkan_video_noise_removal_runtime_unavailable",

@@ -1,135 +1,158 @@
 # Installer Vulkan Capability Audit
 
-This audit is the installer policy input for StudioCast `v0.2.9`. It describes
-the current product path, not what the Vulkan utility library could eventually
-support. The installer must evaluate capability per effect and must not treat a
-loadable Vulkan library, a physical device, or successful utility-kernel setup
-as proof that every Open Video effect is usable.
+This document is the per-effect installer policy input for StudioCast `v0.2.9`.
+It describes the canonical live pipeline after the Vulkan production program,
+not what a loader, source filename, utility kernel, benchmark, synthetic test
+seam, or unused helper could eventually support.
 
 The status vocabulary is:
 
-- **production usable**: implemented in the live pipeline, covered as a product
-  path, and suitable for automatic recommendation;
-- **usable with degraded behavior**: functionally connected to the live
-  pipeline, but contains a documented CPU tail or other material limitation;
-- **experimental**: a guarded implementation exists, but the default product
-  diagnostics or distributed artifacts do not make it available;
-- **diagnostics-only**: useful for probes or development measurements, but not
-  selectable as a live effect backend;
-- **stub/unavailable**: absent from the Vulkan live path or deliberately removed
-  when Vulkan is explicitly selected.
+- **production usable**: implemented in the canonical live pipeline, covered as
+  a product path, and eligible for automatic recommendation when exact runtime
+  evidence is true on the analyzed machine;
+- **usable with degraded behavior**: connected to the live pipeline, but with a
+  documented CPU tail or other material limitation;
+- **experimental**: a guarded live implementation exists, but distributed
+  runtime/model evidence does not make it production-ready;
+- **diagnostics-only**: facts and failure diagnostics exist, but no callable
+  canonical Vulkan effect stage exists;
+- **stub/unavailable**: no selectable Vulkan live stage is present.
 
 ## Per-effect matrix
 
-| Canonical effect ID | Current Vulkan status | Evidence and limitation | Selectable CPU fallback | Installer capability/reason code |
+| Canonical effect ID | Vulkan implementation status | Live evidence and limitation | Selectable production CPU fallback | Installer readiness/blocker codes |
 | --- | --- | --- | --- | --- |
-| `mirror` | stub/unavailable | The canonical planner explicitly disables mirror. A host-side `MirrorEffect` class exists, but the live planner never schedules it. | none | `vulkan_effect_not_implemented` |
-| `virtual_background.blur` | experimental | Vulkan blur/composite kernels and a fail-closed production matting-session contract exist. Default daemon diagnostics still block this effect because no production device-resident matting runtime is exposed. | none; the CPU class is an unwired center-focus placeholder, not semantic matting | `open_vulkan_matting_unavailable` |
-| `virtual_background.remove` | experimental | Same device-resident matting gate as blur. | none; the CPU class is an unwired center-focus placeholder | `open_vulkan_matting_unavailable` |
-| `virtual_background.replace` | experimental | Same device-resident matting gate as blur, plus the normal replacement-image validation. | none | `open_vulkan_matting_unavailable` |
-| `auto_frame` | usable with degraded behavior | The live Vulkan path performs crop/resize on Vulkan. Subject tracking is a CPU tail: YuNet face detection is preferred; otherwise a Vulkan matte is read back periodically for CPU box extraction. | none as a selectable CPU engine; the tracking tail is internal to this Vulkan path | `vulkan_effect_cpu_tail` |
-| `eye_contact` | stub/unavailable | Explicit Vulkan selection removes this stage. The Open Video implementation is not a Vulkan implementation. | none through the explicit CPU compute backend | `vulkan_effect_not_implemented` |
-| `video_noise_removal` | stub/unavailable | Explicit Vulkan selection removes this stage. FastDVDnet/Open Video and the lightweight temporal path are not Vulkan effect paths. | none through the explicit CPU compute backend | `vulkan_effect_not_implemented` |
-| `virtual_key_light` | experimental | The live Vulkan relight kernel is connected, but it requires the same foreground matte that default diagnostics mark unavailable. | none; CPU work seen in other backends is a tail, not a selectable CPU engine | `open_vulkan_matting_unavailable` |
-| `vignette` | stub/unavailable | Explicit Vulkan selection removes vignette; the standalone implementation is CUDA-only. | none | `vulkan_effect_not_implemented` |
+| `mirror` | production usable | The canonical final visual transform uses the shared production Vulkan context, stays resident through the final effect boundary, and is covered by deterministic parity/live-pipeline tests. Recommendation still requires exact per-effect readiness plus non-CPU device, compute queue, healthy context, and utility-kernel evidence. | none | ready: `open_vulkan_mirror_production_ready`; otherwise the exact common Vulkan blocker |
+| `virtual_background.blur` | experimental | A canonical resident blur/composite stage exists. Production remains fail-closed because the distributed packs are ONNX-only and no reviewed exact-device ncnn Vulkan adapter/runtime is available. Synthetic matting seams are test evidence only. | none; the CPU class is an unwired center-focus placeholder, not semantic matting | `open_vulkan_matting_unavailable`, with the exact nested adapter/artifact/runtime blocker |
+| `virtual_background.remove` | experimental | A canonical resident solid composite exists, behind the same production matting contract as blur. | none; the CPU class is an unwired center-focus placeholder | `open_vulkan_matting_unavailable`, with the exact nested blocker |
+| `virtual_background.replace` | experimental | A canonical resident replacement composite and bounded setup-time image upload lifecycle exist. It remains behind production matting readiness and validates the replacement image separately. | none | `open_vulkan_matting_unavailable`, with the exact nested blocker |
+| `auto_frame` | usable with degraded behavior; unavailable on the analyzed machine | The crop/resize stage is Vulkan, but tracking and crop-plan smoothing are explicit CPU tails. The shipped YuNet tracker/artifact is not production-ready on the analyzed machine, so cold daemon evidence is fail-closed even though the crop stage exists. A future valid CPU-only tracker would remain degraded, not Vulkan-native. | none; its CPU tracking is an internal tail, not a selectable CPU engine | unavailable: `vulkan_auto_frame_yunet_unavailable`; a valid degraded path reports `vulkan_effect_cpu_tail` |
+| `eye_contact` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but there is no callable Vulkan live stage, exact-device inference provider/adapter, validated Vulkan artifact contract, resident analysis/tensor path, or production gaze/look-away contract. | none | `open_vulkan_eye_contact_unavailable`, nested `open_vulkan_eye_contact_runtime_unavailable` |
+| `video_noise_removal` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but FastDVDnet currently uses CUDA/CPU providers, host temporal history, CPU preprocessing/postprocessing, and ONNX-only artifacts. There is no callable Vulkan stage or bounded resident temporal-history contract. | none | `open_vulkan_video_noise_removal_unavailable`, nested `open_vulkan_video_noise_removal_runtime_unavailable` |
+| `virtual_key_light` | experimental | The canonical relight stage is resident, but production readiness requires the same exact same-frame, exact-device production matte evidence as the virtual-background modes. | none; CPU work in other backends is not a selectable CPU engine | `open_vulkan_matting_unavailable`, with the exact nested blocker |
+| `vignette` | production usable (fixed center only) | The canonical final Vulkan stage matches the CUDA-reference fixed-center parameter contract and reuses a device-resident factor mask. `center_on_tracked_face` is not supported by this Vulkan implementation; when that semantic becomes observable with retained Auto Frame, only vignette is removed. | none | ready: `open_vulkan_vignette_fixed_center_production_ready`; tracked-center: `vulkan_vignette_tracked_center_not_supported`; otherwise the exact common Vulkan blocker |
 
-No canonical effect is currently in the **production usable** Vulkan category.
-The ncnn Vulkan spike is **diagnostics-only** and is not a canonical effect or a
-production fallback.
+Mirror and fixed-center vignette are the only canonical effects currently
+eligible for a Vulkan recommendation, and only when their exact daemon
+`production_ready` facts and all common runtime facts are true. The analyzed
+machine's cold diagnostics do not make Auto Frame, matting consumers, eye
+contact, or video noise removal production-ready.
 
-## Virtual-background conclusion
+## Evidence layers and fail-closed facts
 
-The documented production virtual-background limitation remains true for the
-default product surface.
+The analyzer and recommendation deliberately separate these layers:
 
-`DiagnoseOpenVulkanDefault()` reports utility-kernel/device readiness, but sets
-the matting runtime to `none`, device-residency mode to `unavailable`, and
-blocks all three virtual-background modes. The production session and runtime
-lifecycle in `src/core/open_video/vulkan_matting_session.*` and
-`vulkan_matting_runtime.*` are deliberately fail closed: they require an
-opt-in ncnn Vulkan build, reviewed schema-v2 `ncnn_vulkan` artifacts with
-checksums, matching Vulkan device ownership, no CPU layers, and device-resident
-input and alpha output. The curated default matting packs remain ONNX-only, so
-the presence of `modnet-webnn-256-fp32` does not satisfy this contract.
+1. **Build**: Open Vulkan is compiled in.
+2. **Loader/instance**: the runtime library loads and an instance is created.
+3. **Physical device**: a device exists and is not a CPU/software Vulkan
+   implementation.
+4. **Queue/device/context**: a compute queue, logical device, and healthy owned
+   context exist. Device loss or fatal submission state invalidates readiness.
+5. **Kernels**: the utility shader pipeline is created and healthy.
+6. **Runtime/model**: model-backed effects prove their exact runtime, artifact,
+   warm-up, and model contract. Loader or kernel success is not model evidence.
+7. **Residency/ownership**: the exact StudioCast device and queue are shared,
+   buffers stay resident, CPU layers/readbacks are absent, and allocations are
+   bounded.
+8. **Per-effect live stage**: the exact canonical effect has an implemented
+   live stage and an effect-specific production-ready attestation.
 
-The milestone spike does not change that conclusion. It uses CPU `ncnn::Mat`
-input/output and explicitly does not prove zero-copy interoperation with
-StudioCast's Vulkan allocations.
+`available_effects` is useful live-stage evidence but is never sufficient by
+itself. For mirror and vignette, the installer also requires the additive
+`mirror_production_ready` or `vignette_fixed_center_production_ready` fact, its
+matching success code, all common hardware/context/kernel facts, and the exact
+effect in `available_effects`. Missing, legacy, or internally inconsistent
+diagnostics fail closed. Matting's global `blocked_reason` must not disable
+unrelated mirror or vignette capability.
 
-## CPU fallback conclusion
-
-The installer must not infer a CPU fallback from source-file names or from an
-internal CPU tail. With `video.compute.backend=cpu`, the service suppresses the
-current compute effects. The CPU background blur/remove classes are standalone
-placeholder/benchmark implementations and are not scheduled by the canonical
-live planner. Mirror also has a host implementation but is explicitly disabled
-by that planner. Therefore none of the nine canonical effects currently has a
-selectable production CPU engine fallback for recommendation purposes.
-
-Some Open Video implementations can create CPU ONNX Runtime sessions after a
-provider failure, and Vulkan Auto Frame deliberately uses CPU tracking. These
-are degraded behavior inside another selected backend, not evidence for a
-general CPU effect engine.
-
-## Recommendation gates
-
-Recommended installation must not select Vulkan for an effect in this release.
-Custom/Advanced may expose Open Vulkan for diagnostics or explicit developer
-use, with the matrix limitation attached to each selected effect. Revisit this
-gate per effect when a row becomes **production usable**; do not promote the
-backend globally.
-
-At minimum, analyzer facts must distinguish:
+Success/readiness codes and blocker codes are separate facts. The stable common
+blockers include:
 
 - `vulkan_backend_disabled_in_build`;
-- `vulkan_loader_unavailable`;
+- `vulkan_runtime_not_found` and installer probe code
+  `vulkan_loader_unavailable`;
 - `vulkan_no_physical_device`;
 - `vulkan_no_compute_queue`;
 - `vulkan_only_cpu_devices_available`;
 - `vulkan_requested_device_not_found`;
 - `vulkan_requested_device_no_compute_queue`;
 - `vulkan_requested_device_ambiguous`;
+- `vulkan_device_create_failed`;
+- `vulkan_context_uninitialized`, `vulkan_device_lost`, and other latched
+  context-health reasons;
+- `vulkan_production_hardware_not_ready`;
 - `open_vulkan_utility_kernels_unavailable`;
-- `open_vulkan_matting_unavailable`;
-- `vulkan_effect_cpu_tail`;
-- `vulkan_effect_not_implemented`.
+- `open_vulkan_runtime_diagnostics_unavailable` when installed daemon evidence
+  cannot be obtained.
 
-The existing device-selection reason codes should be preserved verbatim where
-they already exist. A CPU Vulkan device such as lavapipe is not hardware compute
-capability unless the developer-only software-device opt-in is explicit.
+A loader-only host, CPU Vulkan device, missing compute queue, unhealthy or lost
+device, mismatched/absent per-effect evidence, missing model/artifact/runtime,
+failed warm-up, mismatched device identity, CPU layers/readbacks/tails, or
+missing live stage all prevent recommendation for the affected effect. They do
+not disable an unrelated effect whose exact evidence remains valid.
 
-For a future virtual-background or key-light promotion, the facts must require
-all of the following rather than loader presence alone:
+## Matting and model boundary
 
-1. Open Vulkan compiled in, loader and instance usable.
-2. A selected non-CPU physical device with a compute queue and logical device.
-3. Utility shader pipelines created successfully.
-4. The exact effect appears in daemon `available_effects` and not in
-   `blocked_effects`.
-5. A production matting runtime was created, its graph loaded and warmed, and
-   device identity matched StudioCast's selected Vulkan device.
-6. Input, alpha, and output residency evidence is true, with no CPU layers.
-7. The selected model pack contains verified, compatible `ncnn_vulkan`
-   artifacts. An ONNX-only matting pack is insufficient.
+The production matting lifecycle in
+`src/core/open_video/vulkan_matting_session.*` and
+`vulkan_matting_runtime.*` requires an opt-in ncnn Vulkan build, reviewed
+schema-v2 `ncnn_vulkan` parameter/bin artifacts with checksums, the exact
+StudioCast physical/logical device and compute queue, no CPU layers, warmed
+runtime/graph, device-resident input/alpha/output, synchronous ownership, and
+bounded reusable allocations.
 
-For Auto Frame, analyzer output must additionally expose the CPU tracking tail
-and its provider. Its present **usable with degraded behavior** status is not an
-automatic recommendation.
+The curated matting packs remain ONNX-only. Upstream ncnn does not expose the
+reviewed external-device import needed by StudioCast's selected device, queue,
+and buffers. The milestone spike uses CPU `ncnn::Mat` input/output and is
+diagnostics-only; it cannot satisfy production residency. Consequently the
+three virtual-background modes and virtual key light remain experimental and
+fail closed.
+
+## Recommendation and CPU fallback
+
+Recommendation is a pure per-effect choice with precedence:
+
+```text
+Maxine -> CUDA -> Vulkan -> CPU
+```
+
+Vulkan is selected only for an exact `production_usable` matrix value backed by
+that effect's `vulkan_evidence.production_ready=true`. A legacy status string,
+global Vulkan boolean, loader, device, utility kernel, or `available_effects`
+entry cannot promote it. Auto Frame's CPU-tail/degraded facts are never treated
+as production Vulkan evidence.
+
+The CPU step is considered only if that exact canonical effect has a selectable
+production CPU engine. None of the nine does today. Host mirror helpers,
+placeholder background classes, CPU tracking inside Auto Frame, CPU provider
+fallback inside another backend, and unused classes are not selectable CPU
+engine evidence. Installer facts report
+`effect.<id>.cpu.no_selectable_production_path` independently for every effect.
+
+Recommended selection enables the Open Vulkan build feature when at least one
+effect actually selects Vulkan. Maxine or CUDA still wins independently for an
+effect with higher-precedence production evidence.
 
 ## Evidence map
 
-- `src/core/video/camera_pipeline.cpp`: explicit-Vulkan stage filtering,
-  per-effect initialization, Vulkan Auto Frame CPU tails, and live stage calls.
-- `src/core/vulkan/kernels/resize_bilinear.cpp`:
-  `DiagnoseOpenVulkanDefault()` and the three virtual-background blockers.
+- `src/core/video/open_vulkan_mirror.*` and
+  `open_vulkan_vignette.*`: strict production predicates and canonical effect
+  wrappers.
+- `src/core/video/camera_pipeline.cpp`: canonical live calls, final-stage
+  ordering, fixed-center compatibility, Auto Frame CPU tails, matting consumers,
+  and fail-closed ML stage filtering.
+- `src/core/vulkan/kernels/resize_bilinear.cpp` and
+  `src/core/vulkan/vulkan_device.*`: daemon per-effect readiness publication,
+  common device/context/kernel evidence, model/runtime evidence, and JSON.
 - `src/core/open_video/vulkan_matting_runtime.*` and
-  `vulkan_matting_session.*`: fail-closed device-residency lifecycle.
-- `src/core/vulkan/vulkan_device.*`: loader, physical-device, compute-queue,
-  hardware-first selection, and stable device reason codes.
-- `src/core/video/effects/broadcast_effect_rules.cpp`: mirror suppression and
-  canonical effect ordering.
-- `tests/vulkan_kernel_tests.cpp`, `tests/vulkan_matting_runtime_tests.cpp`,
-  `tests/vulkan_frame_execution_plan_tests.cpp`,
-  `tests/open_vulkan_matting_setup_policy_tests.cpp`, and
-  `tests/daemon_status_tests.cpp`: device selection, runtime evidence,
-  frame-plan barriers, setup caching, and blocked status characterization.
+  `vulkan_matting_session.*`: schema-v2 artifact and resident-runtime contract.
+- `src/core/video/open_vulkan_eye_contact.*` and
+  `open_vulkan_video_noise_removal.*`: diagnostics-only exact blockers.
+- `installer/backend/studiocast-installer-backend`: per-effect facts and pure
+  recommendation precedence.
+- `tests/installer_backend_core_tests.py`: hermetic NVIDIA, AMD, Intel, hybrid,
+  no-GPU, loader-only, CPU-device-only, no-compute, device-loss, precedence,
+  isolation, fixed-center, and no-CPU-continuation fixtures.
+- `tests/vulkan_capability_audit_tests.cpp`, `tests/vulkan_kernel_tests.cpp`,
+  and `tests/daemon_status_tests.cpp`: documentation/source consistency,
+  strict readiness, daemon schema, and ON/OFF behavior.

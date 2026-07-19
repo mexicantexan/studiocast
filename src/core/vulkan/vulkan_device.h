@@ -251,6 +251,24 @@ struct OpenVulkanDiagnostics {
   std::map<std::string, std::string> blocked_effects;
   std::vector<std::string> install_hints;
 
+  bool mirror_production_ready = false;
+  std::string mirror_readiness_code;
+  std::string mirror_blocker_code;
+
+  bool vignette_fixed_center_production_ready = false;
+  std::string vignette_readiness_code;
+  std::string vignette_blocker_code;
+  std::string vignette_parameter_contract = "fixed_center";
+
+  bool auto_frame_crop_stage_implemented = false;
+  bool auto_frame_production_ready = false;
+  std::string auto_frame_readiness_code;
+  std::string auto_frame_blocker_code =
+      "vulkan_auto_frame_yunet_unavailable";
+  bool auto_frame_cpu_tail = false;
+  std::string auto_frame_degraded_reason_code = "vulkan_effect_cpu_tail";
+  bool auto_frame_selectable_cpu_fallback = false;
+
   bool eye_contact_production_ready = false;
   std::string eye_contact_reason_code =
       "open_vulkan_eye_contact_unavailable";

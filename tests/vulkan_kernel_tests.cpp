@@ -852,6 +852,69 @@ int main() {
   {
     const auto diagnostics =
         studiocast::vulkan::DiagnoseOpenVulkanDefault();
+    const auto mirror =
+        studiocast::video::EvaluateOpenVulkanMirrorReadiness(diagnostics);
+    const auto vignette =
+        studiocast::video::EvaluateOpenVulkanVignetteReadiness(diagnostics);
+    const auto has_available = [&](std::string_view id) {
+      const std::string value(id);
+      return std::find(diagnostics.available_effects.begin(),
+                       diagnostics.available_effects.end(), value) !=
+             diagnostics.available_effects.end();
+    };
+    const std::string json = diagnostics.ToJson();
+    ok &= Require(
+        diagnostics.mirror_production_ready == mirror.production_ready &&
+            has_available("mirror") == mirror.production_ready &&
+            (mirror.production_ready
+                 ? diagnostics.mirror_readiness_code ==
+                       "open_vulkan_mirror_production_ready" &&
+                       diagnostics.mirror_blocker_code.empty()
+                 : diagnostics.mirror_readiness_code.empty() &&
+                       diagnostics.mirror_blocker_code ==
+                           mirror.shared_reason_code),
+        "default mirror diagnostics must require the exact production "
+        "predicate in addition to available_effects");
+    ok &= Require(
+        diagnostics.vignette_fixed_center_production_ready ==
+                vignette.production_ready &&
+            has_available("vignette") == vignette.production_ready &&
+            diagnostics.vignette_parameter_contract == "fixed_center" &&
+            (vignette.production_ready
+                 ? diagnostics.vignette_readiness_code ==
+                       "open_vulkan_vignette_fixed_center_production_ready" &&
+                       diagnostics.vignette_blocker_code.empty()
+                 : diagnostics.vignette_readiness_code.empty() &&
+                       diagnostics.vignette_blocker_code ==
+                           vignette.shared_reason_code),
+        "default vignette diagnostics must publish only fixed-center exact "
+        "production evidence");
+    ok &= Require(
+        diagnostics.auto_frame_crop_stage_implemented &&
+            !diagnostics.auto_frame_production_ready &&
+            !has_available("auto_frame") && diagnostics.auto_frame_cpu_tail &&
+            diagnostics.auto_frame_blocker_code ==
+                "vulkan_auto_frame_yunet_unavailable" &&
+            diagnostics.auto_frame_degraded_reason_code ==
+                "vulkan_effect_cpu_tail" &&
+            !diagnostics.auto_frame_selectable_cpu_fallback,
+        "Auto Frame diagnostics must separate the crop implementation and "
+        "CPU tail from production and selectable fallback evidence");
+    ok &= Require(
+        json.find("\"mirror_production_ready\":") != std::string::npos &&
+            json.find("\"mirror_readiness_code\":") != std::string::npos &&
+            json.find("\"mirror_blocker_code\":") != std::string::npos &&
+            json.find("\"vignette_parameter_contract\":\"fixed_center\"") !=
+                std::string::npos &&
+            json.find("\"auto_frame_production_ready\":false") !=
+                std::string::npos &&
+            json.find("\"auto_frame_selectable_cpu_fallback\":false") !=
+                std::string::npos,
+        "serialized pixel-effect/Auto Frame readiness schema is incomplete");
+  }
+  {
+    const auto diagnostics =
+        studiocast::vulkan::DiagnoseOpenVulkanDefault();
     const auto blocked = diagnostics.blocked_effects.find("eye_contact");
     const bool falsely_available =
         std::find(diagnostics.available_effects.begin(),
