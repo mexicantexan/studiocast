@@ -1413,6 +1413,33 @@ def capability_usable(value: Any) -> bool:
     return value is True or value in {"usable", "production_usable"}
 
 
+def capability_reason_codes(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(code) for code in value if isinstance(code, str) and code]
+
+
+def missing_capability_evidence_reason(effect: str, engine: str) -> str:
+    return f"effect.{effect}.{engine}.capability_evidence_missing"
+
+
+def inconsistent_vulkan_evidence_reason(effect: str) -> str:
+    return f"effect.{effect}.vulkan.production_evidence_inconsistent"
+
+
+def vulkan_production_evidence_claimed(matrix: dict[str, Any]) -> bool:
+    evidence = matrix.get("vulkan_evidence")
+    successes = matrix.get("success_reason_codes")
+    return bool(
+        capability_usable(matrix.get("vulkan")) or
+        (isinstance(evidence, dict) and any(
+            evidence.get(key) is True for key in (
+                "daemon_production_ready", "effect_production_ready_attested",
+                "production_ready"))) or
+        (isinstance(successes, dict) and
+         capability_reason_codes(successes.get("vulkan"))))
+
+
 def engine_capability_usable(effect: str, matrix: dict[str, Any], engine: str) -> bool:
     if not capability_usable(matrix.get(engine)):
         return False
@@ -1552,16 +1579,41 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         selections["model_pack_ids"] = list(DEFAULT_MODEL_PACKS)
         if type(selections["virtual_camera"].get("desired")) is bool:
             selections["virtual_camera"].update({"desired": True, "required_for_success": True})
-    for effect, matrix in sorted(facts.get("effects", {}).get("capabilities", {}).items()):
+    raw_capabilities = facts.get("effects", {}).get("capabilities", {})
+    capabilities = raw_capabilities if isinstance(raw_capabilities, dict) else {}
+    ordered_effects = list(CANONICAL_EFFECTS)
+    ordered_effects.extend(sorted(
+        str(effect) for effect in capabilities if effect not in CANONICAL_EFFECTS))
+    selected_vulkan = False
+    for effect in ordered_effects:
+        raw_matrix = capabilities.get(effect)
+        matrix = raw_matrix if isinstance(raw_matrix, dict) else {}
         selected = "unavailable"
         for engine in ("maxine", "cuda", "vulkan", "cpu"):
             if engine_capability_usable(effect, matrix, engine):
                 selected = engine
                 break
-        successes = matrix.get("success_reason_codes", {})
-        blockers_by_engine = matrix.get("blocker_reason_codes", {})
-        successes = successes if isinstance(successes, dict) else {}
-        blockers_by_engine = blockers_by_engine if isinstance(blockers_by_engine, dict) else {}
+        raw_successes = matrix.get("success_reason_codes", {})
+        raw_blockers = matrix.get("blocker_reason_codes", {})
+        raw_successes = raw_successes if isinstance(raw_successes, dict) else {}
+        raw_blockers = raw_blockers if isinstance(raw_blockers, dict) else {}
+        successes = {
+            engine: capability_reason_codes(raw_successes.get(engine))
+            for engine in ("maxine", "cuda", "vulkan", "cpu")
+        }
+        blockers_by_engine = {
+            engine: capability_reason_codes(raw_blockers.get(engine))
+            for engine in ("maxine", "cuda", "vulkan", "cpu")
+        }
+        for engine in ("maxine", "cuda", "vulkan", "cpu"):
+            if (not engine_capability_usable(effect, matrix, engine) and
+                    not blockers_by_engine[engine]):
+                if engine == "vulkan" and vulkan_production_evidence_claimed(matrix):
+                    blockers_by_engine[engine].append(
+                        inconsistent_vulkan_evidence_reason(effect))
+                else:
+                    blockers_by_engine[engine].append(
+                        missing_capability_evidence_reason(effect, engine))
         selected_codes = list(successes.get(selected, [])) if selected != "unavailable" else [
             code for engine in ("maxine", "cuda", "vulkan", "cpu")
             for code in blockers_by_engine.get(engine, [])]
@@ -1572,9 +1624,9 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
             "capability_success_reason_codes": copy.deepcopy(successes),
             "capability_blocker_reason_codes": copy.deepcopy(blockers_by_engine),
         }
-    if route == "recommended" and any(
-            item.get("selected") == "vulkan" for item in selections["effects"].values()):
-        selections["features"]["open_vulkan"] = True
+        selected_vulkan = selected_vulkan or selected == "vulkan"
+    if route == "recommended" and detected_route == "recommended":
+        selections["features"]["open_vulkan"] = selected_vulkan
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if not facts.get("os", {}).get("supported", False):
