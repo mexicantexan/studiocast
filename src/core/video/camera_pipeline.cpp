@@ -237,6 +237,41 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   return true;
 }
 
+OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
+    const effects::BroadcastCameraEffects &fx,
+    effects::BroadcastEffectsPlan *retained_plan) {
+  OpenVulkanVignettePlanCompatibility result;
+  if (!retained_plan || !fx.vignette.enabled ||
+      !fx.vignette.center_on_tracked_face) {
+    return result;
+  }
+
+  const auto contains = [&](std::string_view effect_id) {
+    return std::find(retained_plan->ordered_effect_ids.begin(),
+                     retained_plan->ordered_effect_ids.end(),
+                     effect_id) != retained_plan->ordered_effect_ids.end();
+  };
+  if (!contains(effects::contract::kEffectIdVignette) ||
+      !contains(effects::contract::kEffectIdAutoFrame)) {
+    return result;
+  }
+
+  const std::string vignette_id(effects::contract::kEffectIdVignette);
+  retained_plan->ordered_effect_ids.erase(
+      std::remove(retained_plan->ordered_effect_ids.begin(),
+                  retained_plan->ordered_effect_ids.end(), vignette_id),
+      retained_plan->ordered_effect_ids.end());
+  retained_plan->vignette_attach_to_effect_id.clear();
+  result.blocked = true;
+  result.reason_code = kOpenVulkanVignetteTrackedCenterNotSupportedReason;
+  result.detail = kOpenVulkanVignetteTrackedCenterNotSupportedDetail;
+  retained_plan->disabled.push_back(effects::DisabledEffectByRule{
+      .id = vignette_id,
+      .reason = "[" + std::string(result.reason_code) + "] " +
+                std::string(result.detail)});
+  return result;
+}
+
 namespace {
 
 detail::PreparedReplaceBackgroundSource
@@ -8012,9 +8047,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
       remove_non_vulkan_vb_compute_stages_from_plan();
-      // Vulkan vignette is always a fixed-center final-output stage. It is not
-      // attached to a tracking/model stage and therefore introduces no hidden
-      // face-analysis tail.
+      // Vulkan vignette is a final-output stage rather than an attached model
+      // stage. Tracked-center compatibility is evaluated after Auto Frame
+      // readiness is known, so no hidden analysis tail is introduced.
       plan.vignette_attach_to_effect_id.clear();
       append_note("Open Vulkan: virtual background, virtual key light, and "
                   "auto frame are eligible for the Vulkan backend in this "
@@ -8721,9 +8756,27 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
-    // Vignette final-output stage. Explicit Vulkan always runs its fixed-center
-    // device-resident implementation after output geometry and before mirror.
-    // Other backends retain their existing attachment/standalone behavior.
+    // The default-true tracked-center field has observable semantics on the
+    // Auto Frame-attached CUDA path. Apply this backend compatibility rule only
+    // after unavailable Auto Frame stages have been removed. Standalone
+    // vignette therefore remains fixed-center production behavior, while the
+    // combined tracked request fails closed without CPU tracking/mask work.
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+      const auto compatibility =
+          ApplyOpenVulkanVignettePlanCompatibility(fx, &plan);
+      if (compatibility.blocked) {
+        planned.erase(std::string(
+            studiocast::video::effects::contract::kEffectIdVignette));
+        want_open_vulkan_vignette = true;
+        open_vulkan_vignette.Shutdown();
+      }
+    }
+#endif
+
+    // Vignette final-output stage. Compatible explicit Vulkan requests run the
+    // fixed-center device-resident implementation after output geometry and
+    // before mirror. Other backends retain their existing attachment behavior.
     if (has(studiocast::video::effects::contract::kEffectIdVignette) &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
       const std::string stage_id =
@@ -8754,7 +8807,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         compute_available.vulkan_available = true;
         set_backend(stage_id, "open_vulkan");
         append_note("Open Vulkan: Vignette (fixed center after framing; "
-                    "device-resident radial mask, no tracking CPU tail).");
+                    "device-resident attenuation mask, no tracking CPU tail).");
       } else {
         if (vk_err.find("[vulkan_effect_initialization_failed]") ==
             std::string::npos) {

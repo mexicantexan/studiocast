@@ -1306,6 +1306,68 @@ bool TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe() {
     return false;
   }
 
+  const auto tracked_center_compatibility =
+      studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan);
+  const auto retained_auto_frame =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdAutoFrame);
+  const auto blocked_vignette =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette);
+  const auto retained_mirror =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdMirror);
+  if (!tracked_center_compatibility.blocked ||
+      tracked_center_compatibility.reason_code !=
+          studiocast::video::
+              kOpenVulkanVignetteTrackedCenterNotSupportedReason ||
+      tracked_center_compatibility.detail !=
+          studiocast::video::
+              kOpenVulkanVignetteTrackedCenterNotSupportedDetail ||
+      retained_auto_frame == plan.ordered_effect_ids.end() ||
+      blocked_vignette != plan.ordered_effect_ids.end() ||
+      retained_mirror == plan.ordered_effect_ids.end() ||
+      !plan.vignette_attach_to_effect_id.empty() || plan.disabled.size() != 1 ||
+      plan.disabled.front().id != effects::contract::kEffectIdVignette ||
+      plan.disabled.front().reason.find(
+          "[vulkan_vignette_tracked_center_not_supported]") ==
+          std::string::npos) {
+    std::cerr << "explicit Vulkan tracked-center compatibility must visibly "
+                 "block only vignette while retaining Auto Frame and mirror\n";
+    return false;
+  }
+
+  combined.vignette.center_on_tracked_face = false;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  if (studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan)
+          .blocked ||
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette) ==
+          plan.ordered_effect_ids.end()) {
+    std::cerr << "explicit fixed-center Vulkan config must retain vignette\n";
+    return false;
+  }
+
+  combined.vignette.center_on_tracked_face = true;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  plan.ordered_effect_ids.erase(
+      std::remove(plan.ordered_effect_ids.begin(),
+                  plan.ordered_effect_ids.end(),
+                  std::string(effects::contract::kEffectIdAutoFrame)),
+      plan.ordered_effect_ids.end());
+  if (studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan)
+          .blocked ||
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette) ==
+          plan.ordered_effect_ids.end()) {
+    std::cerr << "vignette must remain when unavailable Auto Frame was removed "
+                 "before Vulkan compatibility evaluation\n";
+    return false;
+  }
+
   ComputeBackendAvailability available;
   available.vulkan_available = true;
   const auto selected = ResolveComputeBackendSelection(

@@ -18,6 +18,10 @@
 
 namespace studiocast::video {
 
+namespace effects {
+struct BroadcastEffectsPlan;
+}
+
 enum class CaptureMode {
   // Use the requested `width`/`height` (must be > 0).
   requested,
@@ -78,6 +82,28 @@ std::string ResolveActiveComputeBackendName(
     bool vulkan_compute_available);
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
+
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedReason =
+        "vulkan_vignette_tracked_center_not_supported";
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedDetail =
+        "tracked-center semantics require a device-resident center/mask "
+        "implementation";
+
+struct OpenVulkanVignettePlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view detail;
+};
+
+// Applies the explicit-Vulkan compatibility rule after backend setup has
+// removed unavailable stages. Only a still-retained Auto Frame stage makes a
+// default-true tracked-center vignette incompatible; standalone vignette stays
+// fixed-center production behavior. A blocked result removes only vignette.
+OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
+    const effects::BroadcastCameraEffects &fx,
+    effects::BroadcastEffectsPlan *retained_plan);
 
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0

@@ -145,24 +145,44 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
       pipeline.find("open_vulkan_vignette.ApplyFinal", ordering_boundary);
   const std::size_t download =
       pipeline.find("DownloadImageToRgb(*download_img", apply);
+  const std::size_t auto_frame_setup = pipeline.find("// Auto Frame.");
+  const std::size_t auto_frame_resolution = pipeline.find(
+      "If Auto Frame couldn't be initialized on any backend", auto_frame_setup);
+  const std::size_t compatibility_call = pipeline.find(
+      "ApplyOpenVulkanVignettePlanCompatibility(fx, &plan)", auto_frame_setup);
+  const std::size_t vignette_setup =
+      pipeline.find("// Vignette final-output stage.", compatibility_call);
+  const std::size_t compatibility_status_publish =
+      pipeline.find("append_rule_notes();", compatibility_call);
   bool ok = Require(
       input != std::string::npos && resize_binding != std::string::npos &&
           output_binding != std::string::npos &&
           mirror_binding != std::string::npos &&
           ordering_boundary != std::string::npos &&
-          apply != std::string::npos && download != std::string::npos,
+          apply != std::string::npos && download != std::string::npos &&
+          auto_frame_setup != std::string::npos &&
+          auto_frame_resolution != std::string::npos &&
+          compatibility_call != std::string::npos &&
+          vignette_setup != std::string::npos &&
+          compatibility_status_publish != std::string::npos,
       "vignette live final-output helper call is incomplete");
-  ok &=
-      Require(input < resize_binding && resize_binding < output_binding &&
-                  output_binding < mirror_binding &&
-                  mirror_binding < ordering_boundary &&
-                  ordering_boundary < apply && apply < download,
-              "live path must batch output resize, vignette, optional mirror, "
-              "then perform the final readback");
+  ok &= Require(
+      input < resize_binding && resize_binding < output_binding &&
+          output_binding < mirror_binding &&
+          mirror_binding < ordering_boundary && ordering_boundary < apply &&
+          apply < download && auto_frame_setup < auto_frame_resolution &&
+          auto_frame_resolution < compatibility_call &&
+          compatibility_call < vignette_setup &&
+          vignette_setup < compatibility_status_publish,
+      "live path must batch output resize, vignette, optional mirror, "
+      "then perform the final readback, with compatibility evaluated "
+      "after Auto Frame setup and its stable block published to status");
   ok &= Require(
       Contains(pipeline, "have_open_vulkan_vignette") &&
           Contains(pipeline,
                    "Open Vulkan: Vignette (fixed center after framing") &&
+          Contains(pipeline, "device-resident attenuation mask") &&
+          !Contains(pipeline, "device-resident radial mask") &&
           Contains(pipeline,
                    "open_vulkan_vignette_counters.factor_generation_calls") &&
           Contains(pipeline,
@@ -170,6 +190,32 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
           Contains(pipeline, "set_backend(stage_id, \"open_vulkan\")"),
       "vignette backend, setup accounting, or fixed-center evidence is "
       "missing");
+
+  const std::string compatibility =
+      Section(pipeline,
+              "ApplyOpenVulkanVignettePlanCompatibility(\n"
+              "    const effects::BroadcastCameraEffects &fx",
+              "namespace {");
+  ok &= Require(
+      !compatibility.empty() && Contains(compatibility, "kEffectIdAutoFrame") &&
+          Contains(compatibility, "kEffectIdVignette") &&
+          Contains(compatibility, "ordered_effect_ids.erase") &&
+          Contains(compatibility, "disabled.push_back") &&
+          Contains(compatibility,
+                   "kOpenVulkanVignetteTrackedCenterNotSupportedReason") &&
+          !Contains(compatibility, "kEffectIdMirror"),
+      "tracked-center compatibility must remove and visibly block only "
+      "vignette after confirming retained Auto Frame");
+  const std::string pipeline_header =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.h");
+  ok &=
+      Require(Contains(pipeline_header,
+                       "vulkan_vignette_tracked_center_not_supported") &&
+                  Contains(pipeline_header,
+                           "tracked-center semantics require a device-resident "
+                           "center/mask ") &&
+                  Contains(pipeline_header, "\"implementation\""),
+              "tracked-center compatibility stable reason/detail is missing");
 
   const std::string helper =
       ReadFile(root / "src" / "core" / "video" / "open_vulkan_vignette.cpp");

@@ -62,9 +62,10 @@ struct OpenVulkanVignetteCounters {
 
 // Production fixed-center Vulkan vignette. The attenuation-factor lookup is
 // generated and uploaded once per geometry/intensity/context configuration,
-// then all frame work stays device resident. `center_on_tracked_face` remains
-// a public compatibility field but is deliberately not consumed by this
-// backend: Vulkan vignette is after framing and introduces no analysis tail.
+// then all frame work stays device resident. This backend does not consume
+// tracked-center data: planning rejects that semantic when a retained Auto
+// Frame stage would make it observable, while standalone vignette remains
+// fixed-center and introduces no analysis tail.
 class OpenVulkanVignette {
 public:
   bool EnsureInitialized(studiocast::vulkan::kernels::UtilityKernels *kernels,
