@@ -138,6 +138,11 @@ effect with higher-precedence production evidence.
 - `src/core/video/open_vulkan_mirror.*` and
   `open_vulkan_vignette.*`: strict production predicates and canonical effect
   wrappers.
+- `src/core/video/open_vulkan_final_resident_stage.*` and
+  `tests/vulkan_final_resident_stage_integration_tests.cpp`: the exact
+  CameraPipeline final resident orchestration and its real-device executable
+  coverage for resize, fixed-center vignette, mirror, combined ordering,
+  isolation, allocation reuse, and the final-only readback boundary.
 - `src/core/video/camera_pipeline.cpp`: canonical live calls, final-stage
   ordering, fixed-center compatibility, Auto Frame CPU tails, matting consumers,
   and fail-closed ML stage filtering.

@@ -61,6 +61,7 @@
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
 #include "core/open_video/vulkan_matting_session.h"
 #include "core/video/open_vulkan_auto_frame.h"
+#include "core/video/open_vulkan_final_resident_stage.h"
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
@@ -9472,6 +9473,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::uint64_t open_vulkan_runtime_failure_frames = 0;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
   OpenVulkanMirrorCounters open_vulkan_mirror_counters;
+  OpenVulkanFinalResidentStageCounters open_vulkan_final_stage_counters;
 #endif
 
   const bool debug_maxine_transfers =
@@ -11721,170 +11723,76 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const std::size_t tightStride = static_cast<std::size_t>(outW) * 3u;
       const std::size_t tightBytes =
           tightStride * static_cast<std::size_t>(outH);
-      const bool vulkan_resize_needed = frameW != outW || frameH != outH;
+      if (ok) {
+        OpenVulkanFinalResidentStageInput final_input;
+        final_input.source = deferred_gpu_out.vulkan_img;
+        final_input.output_width = outW;
+        final_input.output_height = outH;
+        final_input.request_fixed_center_vignette =
+            open_vulkan_vignette_attempt_this_frame;
+        final_input.request_mirror = open_vulkan_mirror_attempt_this_frame;
+        final_input.vignette_intensity_percent = appliedFx.vignette.intensity;
+        // All analysis and preceding effects have completed before this exact
+        // live final-output call. The production helper keeps both boundaries
+        // explicit and independently rejects a caller that violates either.
+        final_input.preceding_effects_complete = true;
+        final_input.unmirrored_analysis_complete = true;
 
-      if (ok && vulkan_resize_needed) {
-        if (!open_vulkan_vb.EnsureImage(
-                &vulkan_rgb_scaled, outW, outH,
-                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                /*map_memory=*/true, "vulkan_rgb_scaled", &gerr)) {
-          ok = false;
-        } else {
+        OpenVulkanFinalResidentStageResources final_resources;
+        final_resources.kernels = deferred_gpu_out.vulkan_kernels;
+        final_resources.resize_scratch = &vulkan_rgb_scaled;
+        final_resources.vignette_output = &open_vulkan_vb.vignette_rgb;
+        final_resources.mirror_output = &open_vulkan_vb.mirror_rgb;
+        final_resources.vignette = &open_vulkan_vignette;
+        final_resources.vignette_counters = &open_vulkan_vignette_counters;
+        final_resources.mirror = &open_vulkan_mirror;
+        final_resources.mirror_counters = &open_vulkan_mirror_counters;
+
+        OpenVulkanFinalResidentStageResult final_result;
+        ok = ExecuteOpenVulkanFinalResidentStage(
+            final_input, final_resources, &open_vulkan_final_stage_counters,
+            &final_result);
+        if (vulkan_rgb_scaled.Valid())
           vulkan_rgb_scaled_allocated = true;
-        }
-        download_img = &vulkan_rgb_scaled;
-      }
+        open_vulkan_forced_sync_calls +=
+            final_result.synchronous_completion_count;
 
-      const auto apply_open_vulkan_mirror = [&]() {
-        std::string mirror_err;
-        bool mirror_ready = open_vulkan_mirror.EnsureInitialized(
-            deferred_gpu_out.vulkan_kernels, outW, outH, &mirror_err);
-        if (mirror_ready) {
-          mirror_ready = open_vulkan_vb.EnsureImage(
-              &open_vulkan_vb.mirror_rgb, outW, outH,
-              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "mirror_rgb", &mirror_err);
-        }
-
-        bool mirror_applied = false;
-        if (mirror_ready && vulkan_resize_needed) {
-          OpenVulkanMirrorResizeFinalStageInput mirror_input;
-          mirror_input.src = deferred_gpu_out.vulkan_img;
-          mirror_input.resized = &vulkan_rgb_scaled;
-          mirror_input.dst = &open_vulkan_vb.mirror_rgb;
-          mirror_input.unmirrored_analysis_complete = true;
-          mirror_applied = open_vulkan_mirror.ApplyResizeFinal(
-              mirror_input, &open_vulkan_mirror_counters, &mirror_err);
-        } else if (mirror_ready) {
-          OpenVulkanMirrorFinalStageInput mirror_input;
-          mirror_input.src = download_img;
-          mirror_input.dst = &open_vulkan_vb.mirror_rgb;
-          mirror_input.unmirrored_analysis_complete = true;
-          mirror_input.output_geometry_ready = true;
-          mirror_applied = open_vulkan_mirror.ApplyFinal(
-              mirror_input, &open_vulkan_mirror_counters, &mirror_err);
-        }
-        if (mirror_applied) {
-          ++open_vulkan_forced_sync_calls;
-          open_vulkan_effect_ran_this_frame = true;
-          download_img = &open_vulkan_vb.mirror_rgb;
-          clear_optional_effect_on_success(
-              optional_breaker(OptionalEffectSlot::mirror), f.sequence);
-        } else {
-          ++open_vulkan_fallback_frames;
-          if (mirror_ready) {
-            // ApplyFinal already counted the failed dispatch.
+        if (open_vulkan_vignette_attempt_this_frame) {
+          if (final_result.vignette_applied) {
+            open_vulkan_effect_ran_this_frame = true;
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::vignette), f.sequence);
           } else {
-            ++open_vulkan_runtime_failure_frames;
-            mirror_err = OpenVulkanMirrorRuntimeFailure(mirror_err);
+            ++open_vulkan_fallback_frames;
+            if (final_result.vignette_initialization_failed)
+              ++open_vulkan_runtime_failure_frames;
+            block_optional_effect(
+                OptionalEffectSlot::vignette,
+                studiocast::video::effects::contract::kEffectIdVignette,
+                "open_vulkan", final_result.vignette_error, f.sequence);
           }
-          block_optional_effect(
-              OptionalEffectSlot::mirror,
-              studiocast::video::effects::contract::kEffectIdMirror,
-              "open_vulkan", mirror_err, f.sequence);
-          open_vulkan_mirror_attempt_this_frame = false;
-          if (vulkan_resize_needed) {
-            // A failed combined submission cannot prove that the resize
-            // intermediate is complete. Enter the existing best-effort source
-            // readback/CPU output scaling path instead of reading partial GPU
-            // output.
-            ok = false;
-            gerr = "Open Vulkan combined resize/mirror failed: " + mirror_err;
-          }
-          // Same-size failures fail open by reading the original unmirrored
-          // resident frame; unrelated stages and camera output remain active.
+          open_vulkan_vignette_attempt_this_frame = false;
         }
-      };
-
-      if (ok && open_vulkan_vignette_attempt_this_frame) {
-        std::string vignette_err;
-        bool vignette_ready = open_vulkan_vignette.EnsureInitialized(
-            deferred_gpu_out.vulkan_kernels, outW, outH,
-            appliedFx.vignette.intensity, &open_vulkan_vignette_counters,
-            &vignette_err);
-        if (vignette_ready) {
-          vignette_ready = open_vulkan_vb.EnsureImage(
-              &open_vulkan_vb.vignette_rgb, outW, outH,
-              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "vignette_rgb", &vignette_err);
-        }
-        if (vignette_ready && open_vulkan_mirror_attempt_this_frame) {
-          vignette_ready = open_vulkan_vb.EnsureImage(
-              &open_vulkan_vb.mirror_rgb, outW, outH,
-              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "mirror_rgb", &vignette_err);
-        }
-
-        bool vignette_applied = false;
-        if (vignette_ready) {
-          OpenVulkanVignetteFinalStageInput vignette_input;
-          vignette_input.src = deferred_gpu_out.vulkan_img;
-          vignette_input.resize_scratch =
-              vulkan_resize_needed ? &vulkan_rgb_scaled : nullptr;
-          vignette_input.dst = &open_vulkan_vb.vignette_rgb;
-          vignette_input.mirrored_dst = open_vulkan_mirror_attempt_this_frame
-                                            ? &open_vulkan_vb.mirror_rgb
-                                            : nullptr;
-          vignette_input.preceding_effects_complete = true;
-          vignette_input.intensity_percent = appliedFx.vignette.intensity;
-          vignette_applied = open_vulkan_vignette.ApplyFinal(
-              vignette_input, &open_vulkan_vignette_counters, &vignette_err);
-        }
-
-        if (vignette_applied) {
-          ++open_vulkan_forced_sync_calls;
-          open_vulkan_effect_ran_this_frame = true;
-          download_img = &open_vulkan_vb.vignette_rgb;
-          clear_optional_effect_on_success(
-              optional_breaker(OptionalEffectSlot::vignette), f.sequence);
-          if (open_vulkan_mirror_attempt_this_frame) {
-            // The combined production helper recorded the exact mirror as the
-            // third resident stage under the same completion.
-            ++open_vulkan_mirror_counters.dispatch_calls;
-            download_img = &open_vulkan_vb.mirror_rgb;
+        if (open_vulkan_mirror_attempt_this_frame) {
+          if (final_result.mirror_applied) {
+            open_vulkan_effect_ran_this_frame = true;
             clear_optional_effect_on_success(
                 optional_breaker(OptionalEffectSlot::mirror), f.sequence);
-            open_vulkan_mirror_attempt_this_frame = false;
+          } else {
+            ++open_vulkan_fallback_frames;
+            if (final_result.mirror_initialization_failed)
+              ++open_vulkan_runtime_failure_frames;
+            block_optional_effect(
+                OptionalEffectSlot::mirror,
+                studiocast::video::effects::contract::kEffectIdMirror,
+                "open_vulkan", final_result.mirror_error, f.sequence);
           }
-        } else {
-          ++open_vulkan_fallback_frames;
-          if (!vignette_ready) {
-            ++open_vulkan_runtime_failure_frames;
-            if (vignette_err.find("[vulkan_effect_initialization_failed]") ==
-                std::string::npos) {
-              vignette_err =
-                  OpenVulkanVignetteInitializationFailure(vignette_err);
-            }
-          }
-          block_optional_effect(
-              OptionalEffectSlot::vignette,
-              studiocast::video::effects::contract::kEffectIdVignette,
-              "open_vulkan", vignette_err, f.sequence);
-          open_vulkan_vignette_attempt_this_frame = false;
-          download_img = deferred_gpu_out.vulkan_img;
-
-          // A vignette failure only trips vignette. Retry the independent
-          // mirror stage from the original resident source; a poisoned shared
-          // context will fail with its own nested reason instead of silently
-          // disabling mirror because another optional effect failed.
-          if (open_vulkan_mirror_attempt_this_frame) {
-            apply_open_vulkan_mirror();
-          } else if (vulkan_resize_needed) {
-            ok = false;
-            gerr =
-                "Open Vulkan combined resize/vignette failed: " + vignette_err;
-          }
+          open_vulkan_mirror_attempt_this_frame = false;
         }
-      } else if (ok && open_vulkan_mirror_attempt_this_frame) {
-        apply_open_vulkan_mirror();
-      } else if (ok && vulkan_resize_needed) {
-        // No final effect requested: preserve the existing one-stage resident
-        // resize and final readback.
-        if (!deferred_gpu_out.vulkan_kernels->ResizeBilinear(
-                *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
-          ok = false;
+        if (ok) {
+          download_img = final_result.output;
         } else {
-          ++open_vulkan_forced_sync_calls;
+          gerr = final_result.fatal_error;
         }
       }
 
