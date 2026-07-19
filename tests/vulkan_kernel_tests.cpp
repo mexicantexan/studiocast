@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
@@ -388,6 +390,43 @@ MirrorU8Reference(const std::vector<std::uint8_t> &src, int width, int height) {
   return out;
 }
 
+float CudaVignetteRadialSquaredReference(int x, int y, int width, int height,
+                                         float center_x, float center_y) {
+  const float inv_half_w = 2.0f / static_cast<float>(width);
+  const float inv_half_h = 2.0f / static_cast<float>(height);
+  const float fx = (static_cast<float>(x) + 0.5f - center_x) * inv_half_w;
+  const float fy = (static_cast<float>(y) + 0.5f - center_y) * inv_half_h;
+  float radius = std::sqrt(fx * fx + fy * fy) * 0.70710677f;
+  radius = std::clamp(radius, 0.0f, 1.0f);
+  return radius * radius;
+}
+
+std::vector<std::uint8_t>
+VignetteU8ReferencePadded(const std::vector<std::uint8_t> &src, int width,
+                          int height, std::size_t stride,
+                          int intensity_percent) {
+  std::vector<std::uint8_t> out = src;
+  const float intensity =
+      static_cast<float>(std::clamp(intensity_percent, 0, 100)) / 100.0f;
+  const float center_x = static_cast<float>(width) * 0.5f;
+  const float center_y = static_cast<float>(height) * 0.5f;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const float radial_squared = CudaVignetteRadialSquaredReference(
+          x, y, width, height, center_x, center_y);
+      const float factor = std::max(0.0f, 1.0f - intensity * radial_squared);
+      const std::size_t base = static_cast<std::size_t>(y) * stride +
+                               static_cast<std::size_t>(x) * 3u;
+      for (int c = 0; c < 3; ++c) {
+        out[base + static_cast<std::size_t>(c)] = RoundClampByte(
+            static_cast<float>(src[base + static_cast<std::size_t>(c)]) *
+            factor);
+      }
+    }
+  }
+  return out;
+}
+
 bool CompareF32(const std::vector<float> &actual,
                 const std::vector<float> &expected, const std::string &what) {
   bool ok = true;
@@ -655,6 +694,71 @@ int main() {
                   "mirror initialization failures need a stable reason code");
   }
   {
+    studiocast::video::OpenVulkanVignette invalid_vignette;
+    studiocast::video::OpenVulkanVignetteCounters counters;
+    ok &= Require(!invalid_vignette.EnsureInitialized(nullptr, 1, 1, 50,
+                                                      &counters, &error) &&
+                      error.find("vulkan_effect_initialization_failed") !=
+                          std::string::npos,
+                  "vignette initialization failures need a stable reason code");
+
+    const struct RadialCase {
+      int x;
+      int y;
+      int width;
+      int height;
+      float center_x;
+      float center_y;
+    } radial_cases[] = {
+        {0, 0, 1, 1, 0.5f, 0.5f},
+        {0, 0, 5, 3, 2.5f, 1.5f},
+        {4, 2, 5, 3, 2.5f, 1.5f},
+        {5, 3, 6, 4, 3.0f, 2.0f},
+        // Off-center coordinates prove the CUDA radius clamp at 1.0 rather
+        // than relying only on fixed-center production corners (<1.0).
+        {4, 4, 5, 5, 0.0f, 0.0f},
+    };
+    for (const auto &tc : radial_cases) {
+      const float actual =
+          studiocast::video::detail::OpenVulkanVignetteRadialSquaredAt(
+              tc.x, tc.y, tc.width, tc.height, tc.center_x, tc.center_y);
+      const float expected = CudaVignetteRadialSquaredReference(
+          tc.x, tc.y, tc.width, tc.height, tc.center_x, tc.center_y);
+      ok &= Require(actual == expected,
+                    "vignette radial mask must preserve the CUDA coordinate "
+                    "normalization and clamp operation order");
+    }
+    ok &= Require(
+        studiocast::video::detail::OpenVulkanVignetteRadialSquaredAt(
+            4, 4, 5, 5, 0.0f, 0.0f) == 1.0f,
+        "off-center vignette radius beyond one must clamp before squaring");
+
+    const int padded_w = 5;
+    const int padded_h = 3;
+    const std::size_t padded_stride = 19;
+    std::vector<std::uint8_t> padded(padded_stride * padded_h, 0xcd);
+    for (int y = 0; y < padded_h; ++y) {
+      for (int x = 0; x < padded_w * 3; ++x) {
+        padded[static_cast<std::size_t>(y) * padded_stride +
+               static_cast<std::size_t>(x)] =
+            static_cast<std::uint8_t>((y * 53 + x * 17) & 0xff);
+      }
+    }
+    const auto padded_out = VignetteU8ReferencePadded(
+        padded, padded_w, padded_h, padded_stride, 100);
+    bool padding_preserved = true;
+    for (int y = 0; y < padded_h; ++y) {
+      for (std::size_t x = static_cast<std::size_t>(padded_w) * 3u;
+           x < padded_stride; ++x) {
+        padding_preserved &=
+            padded_out[static_cast<std::size_t>(y) * padded_stride + x] == 0xcd;
+      }
+    }
+    ok &= Require(padding_preserved,
+                  "padded CPU vignette parity reference must leave row "
+                  "padding untouched");
+  }
+  {
     studiocast::vulkan::OpenVulkanDiagnostics diagnostics;
     diagnostics.runtime_library_found = true;
     diagnostics.physical_device_found = true;
@@ -692,6 +796,34 @@ int main() {
                           "vulkan_production_hardware_not_ready",
                   "mirror readiness must fail closed when the aggregate "
                   "production hardware fact is not proven");
+
+    diagnostics.production_hardware_ready = true;
+    ok &= Require(
+        studiocast::video::EvaluateOpenVulkanVignetteReadiness(diagnostics)
+            .production_ready,
+        "vignette readiness should accept complete production hardware facts");
+    diagnostics.cpu_device_selected = true;
+    diagnostics.non_cpu_device_selected = false;
+    diagnostics.production_hardware_ready = false;
+    const auto vignette_cpu_readiness =
+        studiocast::video::EvaluateOpenVulkanVignetteReadiness(diagnostics);
+    ok &= Require(!vignette_cpu_readiness.production_ready &&
+                      vignette_cpu_readiness.shared_reason_code ==
+                          "vulkan_only_cpu_devices_available",
+                  "CPU/software Vulkan must fail vignette readiness with the "
+                  "stable shared reason");
+    diagnostics.cpu_device_selected = false;
+    diagnostics.non_cpu_device_selected = true;
+    diagnostics.production_hardware_ready = true;
+    diagnostics.context_healthy = false;
+    diagnostics.context_failure_reason = "vulkan_device_lost";
+    const auto vignette_unhealthy_readiness =
+        studiocast::video::EvaluateOpenVulkanVignetteReadiness(diagnostics);
+    ok &= Require(!vignette_unhealthy_readiness.production_ready &&
+                      vignette_unhealthy_readiness.shared_reason_code ==
+                          "vulkan_device_lost",
+                  "an unhealthy reusable context must fail vignette readiness "
+                  "with its shared stable reason");
   }
   ok &=
       Require(studiocast::vulkan::kernels::detail::CheckBoxBlurRadiusForKernel(
@@ -887,6 +1019,239 @@ int main() {
   }
 
   {
+    using studiocast::video::OpenVulkanVignette;
+    using studiocast::video::OpenVulkanVignetteCounters;
+    using studiocast::video::OpenVulkanVignetteFinalStageInput;
+
+    const struct VignetteCase {
+      int width;
+      int height;
+      int intensity;
+      VulkanPixelFormat format;
+      const char *label;
+    } cases[] = {
+        {1, 1, 100, VulkanPixelFormat::rgb_u8, "RGB 1x1 intensity 100"},
+        {5, 3, 0, VulkanPixelFormat::rgb_u8, "RGB odd intensity 0"},
+        {6, 4, 100, VulkanPixelFormat::rgb_u8, "RGB even intensity 100"},
+        {21, 21, 100, VulkanPixelFormat::rgb_u8,
+         "RGB near-center low-radial intensity 100"},
+        {5, 3, 35, VulkanPixelFormat::bgr_u8, "BGR odd intensity 35"},
+        {6, 4, 73, VulkanPixelFormat::bgr_u8, "BGR even intensity 73"},
+    };
+
+    // Reuse one helper across alternating geometries. This exercises mask
+    // destruction/reallocation and possible opaque VkBuffer handle reuse.
+    OpenVulkanVignette vignette;
+    for (const auto &tc : cases) {
+      std::vector<std::uint8_t> source(static_cast<std::size_t>(tc.width) *
+                                       static_cast<std::size_t>(tc.height) *
+                                       3u);
+      for (std::size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<std::uint8_t>((i * 61u + 23u) & 0xffu);
+
+      VulkanImage gpu_src, gpu_dst;
+      if (!AllocateU8(kernels, &gpu_src, tc.width, tc.height, tc.format,
+                      &error) ||
+          !AllocateU8(kernels, &gpu_dst, tc.width, tc.height, tc.format,
+                      &error)) {
+        return OptionalSkip(std::string("vignette allocation failed: ") +
+                            error);
+      }
+      FillU8(gpu_src, source);
+      ok &= Require(gpu_src.Flush(&error),
+                    std::string(tc.label) + " source flush failed: " + error);
+
+      OpenVulkanVignetteCounters counters;
+      ok &= Require(vignette.EnsureInitialized(&kernels, tc.width, tc.height,
+                                               tc.intensity, &counters, &error),
+                    std::string(tc.label) +
+                        " vignette initialization failed: " + error);
+      const auto setup_stats = kernels.device()->allocation_stats();
+      ok &=
+          Require(vignette.EnsureInitialized(&kernels, tc.width, tc.height,
+                                             tc.intensity, &counters, &error) &&
+                      counters.factor_allocation_calls == 1 &&
+                      counters.factor_generation_calls == 1 &&
+                      counters.factor_upload_calls == 1,
+                  std::string(tc.label) +
+                      " repeated initialization must reuse one attenuation "
+                      "factor mask");
+      ok &= Require(kernels.device()->allocation_stats().current_bytes ==
+                            setup_stats.current_bytes &&
+                        kernels.device()->allocation_stats().allocation_count ==
+                            setup_stats.allocation_count,
+                    std::string(tc.label) +
+                        " repeated initialization must not allocate again");
+
+      OpenVulkanVignetteFinalStageInput input;
+      input.src = &gpu_src;
+      input.dst = &gpu_dst;
+      input.intensity_percent = tc.intensity;
+      ok &= Require(!vignette.ApplyFinal(input, &counters, &error) &&
+                        error.find("final-stage ordering boundary") !=
+                            std::string::npos &&
+                        counters.dispatch_calls == 0 &&
+                        counters.runtime_failure_frames == 0,
+                    std::string(tc.label) +
+                        " must reject execution before the final boundary");
+      input.preceding_effects_complete = true;
+
+      const auto allocations_before_frames =
+          kernels.device()->allocation_stats();
+      const std::uint64_t descriptor_updates_before_frames =
+          kernels.descriptor_binding_update_count();
+      for (int frame = 0; frame < 2; ++frame) {
+        const std::uint64_t submissions_before =
+            kernels.synchronous_submission_count();
+        ok &= Require(vignette.ApplyFinal(input, &counters, &error),
+                      std::string(tc.label) +
+                          " Vulkan vignette dispatch failed: " + error);
+        ok &= Require(kernels.synchronous_submission_count() ==
+                              submissions_before + 1 &&
+                          kernels.last_frame_batch_stage_count() == 1,
+                      std::string(tc.label) +
+                          " must use one stage and one bounded completion");
+        ok &= Require(gpu_dst.Invalidate(&error),
+                      std::string(tc.label) +
+                          " output invalidate failed: " + error);
+        const auto padded_reference = VignetteU8ReferencePadded(
+            source, tc.width, tc.height,
+            static_cast<std::size_t>(tc.width) * 3u, tc.intensity);
+        ok &= CompareU8(ReadU8(gpu_dst), padded_reference,
+                        std::string("Vulkan vignette ") + tc.label);
+      }
+      const auto allocations_after_frames =
+          kernels.device()->allocation_stats();
+      ok &= Require(
+          allocations_after_frames.current_bytes ==
+                  allocations_before_frames.current_bytes &&
+              allocations_after_frames.high_water_bytes ==
+                  allocations_before_frames.high_water_bytes &&
+              allocations_after_frames.allocation_count ==
+                  allocations_before_frames.allocation_count &&
+              counters.factor_allocation_calls == 1 &&
+              counters.factor_generation_calls == 1 &&
+              counters.factor_upload_calls == 1 &&
+              counters.dispatch_calls == 2 &&
+              kernels.descriptor_binding_update_count() ==
+                  descriptor_updates_before_frames + 1,
+          std::string(tc.label) +
+              " repeated frames must not allocate, regenerate, or upload the "
+              "attenuation mask or update stable descriptors");
+    }
+
+    // At 21x21 the neighbor of the exact center has radial^2 in (0, .02].
+    // The legacy key-light opcode would skip it, while CUDA vignette darkens a
+    // full-scale channel by at least one byte.
+    const float near_center_radial =
+        CudaVignetteRadialSquaredReference(11, 10, 21, 21, 10.5f, 10.5f);
+    ok &=
+        Require(near_center_radial > 0.0f && near_center_radial <= 0.02f &&
+                    RoundClampByte(255.0f * (1.0f - near_center_radial)) < 255,
+                "near-center fixture must detect the key-light alpha "
+                "early-out mismatch");
+
+    OpenVulkanVignetteCounters intensity_reconfigure_counters;
+    const auto intensity_reconfigure_allocations =
+        kernels.device()->allocation_stats();
+    ok &= Require(
+        vignette.EnsureInitialized(&kernels, 6, 4, 73,
+                                   &intensity_reconfigure_counters, &error) &&
+            intensity_reconfigure_counters.factor_allocation_calls == 0 &&
+            intensity_reconfigure_counters.factor_generation_calls == 0 &&
+            intensity_reconfigure_counters.factor_upload_calls == 0,
+        "unchanged geometry/intensity must not touch setup data");
+    ok &= Require(
+        vignette.EnsureInitialized(&kernels, 6, 4, 74,
+                                   &intensity_reconfigure_counters, &error) &&
+            intensity_reconfigure_counters.factor_allocation_calls == 0 &&
+            intensity_reconfigure_counters.factor_generation_calls == 1 &&
+            intensity_reconfigure_counters.factor_upload_calls == 1,
+        "intensity-only reconfigure must regenerate/upload once "
+        "without allocating");
+    ok &= Require(
+        vignette.EnsureInitialized(&kernels, 6, 4, 74,
+                                   &intensity_reconfigure_counters, &error) &&
+            intensity_reconfigure_counters.factor_generation_calls == 1 &&
+            intensity_reconfigure_counters.factor_upload_calls == 1 &&
+            kernels.device()->allocation_stats().allocation_count ==
+                intensity_reconfigure_allocations.allocation_count,
+        "repeated reconfigure must reuse the attenuation buffer");
+
+    {
+      constexpr int src_w = 3;
+      constexpr int src_h = 2;
+      constexpr int dst_w = 5;
+      constexpr int dst_h = 3;
+      constexpr int intensity = 73;
+      const std::vector<std::uint8_t> source = {
+          5,  17, 29, 41, 53, 65, 77, 89,  101,
+          13, 31, 47, 59, 71, 83, 97, 109, 127,
+      };
+      VulkanImage gpu_src, gpu_resized, gpu_vignette, gpu_mirror;
+      if (!AllocateU8(kernels, &gpu_src, src_w, src_h,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(kernels, &gpu_resized, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(kernels, &gpu_vignette, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(kernels, &gpu_mirror, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error)) {
+        return OptionalSkip("combined vignette allocation failed: " + error);
+      }
+      FillU8(gpu_src, source);
+      ok &= Require(gpu_src.Flush(&error),
+                    "combined vignette source flush failed: " + error);
+
+      OpenVulkanVignette combined_vignette;
+      OpenVulkanVignetteCounters counters;
+      ok &= Require(combined_vignette.EnsureInitialized(
+                        &kernels, dst_w, dst_h, intensity, &counters, &error),
+                    "combined vignette initialization failed: " + error);
+      OpenVulkanVignetteFinalStageInput input;
+      input.src = &gpu_src;
+      input.resize_scratch = &gpu_resized;
+      input.dst = &gpu_vignette;
+      input.mirrored_dst = &gpu_mirror;
+      input.preceding_effects_complete = true;
+      input.intensity_percent = intensity;
+      const std::uint64_t submissions_before =
+          kernels.synchronous_submission_count();
+      const std::uint64_t completions_before =
+          kernels.frame_batch_completion_count();
+      const auto allocations_before = kernels.device()->allocation_stats();
+      ok &= Require(combined_vignette.ApplyFinal(input, &counters, &error),
+                    "resize/vignette/mirror dispatch failed: " + error);
+      ok &= Require(kernels.synchronous_submission_count() ==
+                            submissions_before + 1 &&
+                        kernels.frame_batch_completion_count() ==
+                            completions_before + 1 &&
+                        kernels.last_frame_batch_stage_count() == 3,
+                    "resize/vignette/mirror must record three dependent "
+                    "stages under one completion");
+      ok &= Require(gpu_mirror.Invalidate(&error),
+                    "combined vignette/mirror invalidate failed: " + error);
+      const auto resized = ResizeU8Reference(
+          source, src_w, src_h, dst_w, dst_h, 0.0f, 0.0f,
+          static_cast<float>(src_w), static_cast<float>(src_h));
+      const auto vignetted = VignetteU8ReferencePadded(
+          resized, dst_w, dst_h, static_cast<std::size_t>(dst_w) * 3u,
+          intensity);
+      ok &= CompareU8(ReadU8(gpu_mirror),
+                      MirrorU8Reference(vignetted, dst_w, dst_h),
+                      "Vulkan resize/vignette/mirror parity");
+      ok &= Require(kernels.device()->allocation_stats().current_bytes ==
+                            allocations_before.current_bytes &&
+                        kernels.device()->allocation_stats().high_water_bytes ==
+                            allocations_before.high_water_bytes &&
+                        counters.factor_allocation_calls == 1 &&
+                        counters.factor_upload_calls == 1,
+                    "combined frame must not allocate or re-upload its factor "
+                    "mask");
+    }
+  }
+
+  {
     UtilityKernels foreign_kernels;
     if (!foreign_kernels.Initialize(&error))
       return OptionalSkip("second Vulkan context init failed: " + error);
@@ -941,6 +1306,35 @@ int main() {
             mirror_counters.dispatch_calls == 0 &&
             mirror_counters.runtime_failure_frames == 1,
         "production mirror helper must reject a foreign context before "
+        "dispatch with stable effect/context reasons");
+
+    studiocast::video::OpenVulkanVignette vignette;
+    studiocast::video::OpenVulkanVignetteCounters vignette_counters;
+    ok &= Require(vignette.EnsureInitialized(&kernels, 2, 2, 50,
+                                             &vignette_counters, &error),
+                  "same-context vignette wrapper should initialize: " + error);
+    studiocast::video::OpenVulkanVignetteFinalStageInput vignette_input;
+    vignette_input.src = &same_src;
+    vignette_input.dst = &same_src;
+    vignette_input.preceding_effects_complete = true;
+    vignette_input.intensity_percent = 50;
+    ok &= Require(
+        !vignette.ApplyFinal(vignette_input, &vignette_counters, &error) &&
+            error.find("stage images must be out-of-place") !=
+                std::string::npos &&
+            vignette_counters.dispatch_calls == 0 &&
+            vignette_counters.runtime_failure_frames == 1,
+        "production vignette helper must reject in-place aliasing before "
+        "dispatch");
+
+    vignette_input.dst = &foreign_dst;
+    ok &= Require(
+        !vignette.ApplyFinal(vignette_input, &vignette_counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_foreign_context]") != std::string::npos &&
+            vignette_counters.dispatch_calls == 0 &&
+            vignette_counters.runtime_failure_frames == 2,
+        "production vignette helper must reject a foreign context before "
         "dispatch with stable effect/context reasons");
   }
 
@@ -1183,6 +1577,75 @@ int main() {
             counters.runtime_failure_frames == 1,
         "combined resize/mirror device loss must retain shared and effect "
         "stable reasons and count the failed submitted batch");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_vignette_kernels;
+    if (!lost_vignette_kernels.Initialize(&error)) {
+      return OptionalSkip("vignette device-loss context init failed: " + error);
+    }
+    VulkanImage src, resized, vignetted, mirrored;
+    if (!AllocateU8(lost_vignette_kernels, &src, 2, 2,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_vignette_kernels, &resized, 3, 3,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_vignette_kernels, &vignetted, 3, 3,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_vignette_kernels, &mirrored, 3, 3,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("vignette device-loss allocation failed: " + error);
+    }
+    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    if (!src.Flush(&error)) {
+      return OptionalSkip("vignette device-loss source flush failed: " + error);
+    }
+
+    studiocast::video::OpenVulkanVignette vignette;
+    studiocast::video::OpenVulkanVignetteCounters counters;
+    ok &= Require(vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50,
+                                             &counters, &error),
+                  "vignette device-loss wrapper should initialize: " + error);
+    lost_vignette_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanVignetteFinalStageInput input;
+    input.src = &src;
+    input.resize_scratch = &resized;
+    input.dst = &vignetted;
+    input.mirrored_dst = &mirrored;
+    input.preceding_effects_complete = true;
+    input.intensity_percent = 50;
+    ok &= Require(
+        !vignette.ApplyFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1 &&
+            lost_vignette_kernels.last_frame_batch_stage_count() == 3,
+        "resize/vignette/mirror device loss must retain nested reasons, "
+        "record the bounded chain, and count the failed submitted frame");
+    const std::uint64_t submitted_after_loss =
+        lost_vignette_kernels.synchronous_submission_count();
+    const std::uint64_t generation_after_loss =
+        counters.factor_generation_calls;
+    const std::uint64_t upload_after_loss = counters.factor_upload_calls;
+    ok &= Require(
+        !vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50, &counters,
+                                    &error) &&
+            error.find("[vulkan_effect_initialization_failed]") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.factor_generation_calls == generation_after_loss &&
+            counters.factor_upload_calls == upload_after_loss,
+        "reusable vignette setup must re-evaluate and reject a poisoned "
+        "context without regenerating configuration data");
+    ok &= Require(!vignette.ApplyFinal(input, &counters, &error) &&
+                      lost_vignette_kernels.synchronous_submission_count() ==
+                          submitted_after_loss,
+                  "poisoned vignette context must reject a later frame without "
+                  "another submission");
   }
 
   auto flush = [&](auto &resource) {

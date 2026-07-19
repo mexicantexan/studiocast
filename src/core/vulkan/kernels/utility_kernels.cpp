@@ -175,6 +175,11 @@ bool UtilityKernels::Initialize(std::string *error_out) {
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                               /*map_memory=*/true, &e) ||
+      !final_params_.Allocate(&device_, sizeof(Params),
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              /*map_memory=*/true, &e) ||
       !dummy_.Allocate(&device_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                        /*required_memory_flags=*/0,
                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -226,6 +231,7 @@ void UtilityKernels::Shutdown() noexcept {
   descriptor_pool_ = nullptr;
   descriptor_set_ = nullptr;
   batch_descriptor_set_ = nullptr;
+  final_descriptor_set_ = nullptr;
   if (destroy_children && descriptor_set_layout_ &&
       vf.vkDestroyDescriptorSetLayout)
     vf.vkDestroyDescriptorSetLayout(device_.device(), descriptor_set_layout_,
@@ -233,14 +239,17 @@ void UtilityKernels::Shutdown() noexcept {
   descriptor_set_layout_ = nullptr;
 
   dummy_.Free();
+  final_params_.Free();
   batch_params_.Free();
   params_.Free();
   device_.Shutdown();
   bound_buffers_.fill(nullptr);
   batch_bound_buffers_.fill(nullptr);
+  final_bound_buffers_.fill(nullptr);
   initialized_ = false;
   pipeline_created_ = false;
   synchronous_submission_count_ = 0;
+  descriptor_binding_update_count_ = 0;
 }
 
 OpenVulkanDiagnostics UtilityKernels::Diagnostics() const {
@@ -323,9 +332,9 @@ bool UtilityKernels::EnsureDescriptors(std::string *error_out) {
   const auto &vf = device_.f();
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = 14;
+  pool_size.descriptorCount = 21;
   VkDescriptorPoolCreateInfo pool{};
-  pool.maxSets = 2;
+  pool.maxSets = 3;
   pool.poolSizeCount = 1;
   pool.pPoolSizes = &pool_size;
   VkResult result = vf.vkCreateDescriptorPool(device_.device(), &pool, nullptr,
@@ -336,9 +345,9 @@ bool UtilityKernels::EnsureDescriptors(std::string *error_out) {
 
   VkDescriptorSetAllocateInfo alloc{};
   alloc.descriptorPool = descriptor_pool_;
-  const std::array<VkDescriptorSetLayout, 2> layouts = {descriptor_set_layout_,
-                                                        descriptor_set_layout_};
-  std::array<VkDescriptorSet, 2> descriptor_sets{};
+  const std::array<VkDescriptorSetLayout, 3> layouts = {
+      descriptor_set_layout_, descriptor_set_layout_, descriptor_set_layout_};
+  std::array<VkDescriptorSet, 3> descriptor_sets{};
   alloc.descriptorSetCount = static_cast<std::uint32_t>(layouts.size());
   alloc.pSetLayouts = layouts.data();
   result = vf.vkAllocateDescriptorSets(device_.device(), &alloc,
@@ -348,12 +357,17 @@ bool UtilityKernels::EnsureDescriptors(std::string *error_out) {
     return false;
   descriptor_set_ = descriptor_sets[0];
   batch_descriptor_set_ = descriptor_sets[1];
+  final_descriptor_set_ = descriptor_sets[2];
 
   return BindBuffers(dummy_.buffer(), dummy_.buffer(), dummy_.buffer(),
                      dummy_.buffer(), dummy_.buffer(), dummy_.buffer(),
                      error_out) &&
          BindBuffersForSet(batch_descriptor_set_, batch_params_.buffer(),
                            &batch_bound_buffers_, dummy_.buffer(),
+                           dummy_.buffer(), dummy_.buffer(), dummy_.buffer(),
+                           dummy_.buffer(), dummy_.buffer(), error_out) &&
+         BindBuffersForSet(final_descriptor_set_, final_params_.buffer(),
+                           &final_bound_buffers_, dummy_.buffer(),
                            dummy_.buffer(), dummy_.buffer(), dummy_.buffer(),
                            dummy_.buffer(), dummy_.buffer(), error_out);
 }
@@ -410,8 +424,18 @@ bool UtilityKernels::BindBuffersForSet(VkDescriptorSet descriptor_set,
   device_.f().vkUpdateDescriptorSets(device_.device(),
                                      static_cast<std::uint32_t>(writes.size()),
                                      writes.data(), 0, nullptr);
+  descriptor_binding_update_count_.fetch_add(1, std::memory_order_relaxed);
   *bound_buffers = next;
   return true;
+}
+
+void UtilityKernels::InvalidateDescriptorBindingCacheForSetup() noexcept {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  // Invalidate all sets: the vignette final chain may use the primary set for
+  // resize, the batch set for vignette, and the final set for mirror.
+  bound_buffers_.fill(nullptr);
+  batch_bound_buffers_.fill(nullptr);
+  final_bound_buffers_.fill(nullptr);
 }
 
 bool UtilityKernels::BindBuffers(VkBuffer u8_src0, VkBuffer u8_src1,
@@ -1305,6 +1329,241 @@ bool UtilityKernels::ApplyKeyLightU8x3(const VulkanImage &src,
                    nullptr, error_out))
     return false;
   return Dispatch(p, Op::key_light, p.dst_w, p.dst_h, error_out);
+}
+
+bool UtilityKernels::ApplyFinalVignetteU8x3(
+    const VulkanImage &src, const VulkanImage *resize_scratch,
+    const VulkanImage &attenuation_factor, const VulkanImage &vignette_out,
+    const VulkanImage *mirrored_out, std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!ValidateRgbOrBgrImage(src, "ApplyFinalVignetteU8x3(src)", error_out) ||
+      !ValidateF32Image(attenuation_factor,
+                        "ApplyFinalVignetteU8x3(attenuation_factor)",
+                        error_out) ||
+      !ValidateRgbOrBgrImage(
+          vignette_out, "ApplyFinalVignetteU8x3(vignette_out)", error_out)) {
+    return false;
+  }
+  if (resize_scratch &&
+      !ValidateRgbOrBgrImage(*resize_scratch,
+                             "ApplyFinalVignetteU8x3(resize_scratch)",
+                             error_out)) {
+    return false;
+  }
+  if (mirrored_out &&
+      !ValidateRgbOrBgrImage(
+          *mirrored_out, "ApplyFinalVignetteU8x3(mirrored_out)", error_out)) {
+    return false;
+  }
+
+  const VulkanImage &vignette_src = resize_scratch ? *resize_scratch : src;
+  if (!SameDimensions(vignette_src, attenuation_factor) ||
+      !SameDimensions(vignette_src, vignette_out) ||
+      (mirrored_out && !SameDimensions(vignette_src, *mirrored_out))) {
+    if (error_out)
+      *error_out = "ApplyFinalVignetteU8x3: final dimension mismatch.";
+    return false;
+  }
+  if (src.format() != vignette_src.format() ||
+      src.format() != vignette_out.format() ||
+      (mirrored_out && src.format() != mirrored_out->format())) {
+    if (error_out)
+      *error_out = "ApplyFinalVignetteU8x3: RGB/BGR formats must match.";
+    return false;
+  }
+  if ((resize_scratch && src.buffer() == resize_scratch->buffer()) ||
+      vignette_src.buffer() == vignette_out.buffer() ||
+      (mirrored_out && (vignette_out.buffer() == mirrored_out->buffer() ||
+                        vignette_src.buffer() == mirrored_out->buffer()))) {
+    if (error_out) {
+      *error_out = "ApplyFinalVignetteU8x3: stage images must be out-of-place.";
+    }
+    return false;
+  }
+  if (!Initialize(error_out))
+    return false;
+  if (!ValidateContext(device_, src, "ApplyFinalVignetteU8x3(src)",
+                       error_out) ||
+      (resize_scratch &&
+       !ValidateContext(device_, *resize_scratch,
+                        "ApplyFinalVignetteU8x3(resize_scratch)", error_out)) ||
+      !ValidateContext(device_, attenuation_factor,
+                       "ApplyFinalVignetteU8x3(attenuation_factor)",
+                       error_out) ||
+      !ValidateContext(device_, vignette_out,
+                       "ApplyFinalVignetteU8x3(vignette_out)", error_out) ||
+      (mirrored_out &&
+       !ValidateContext(device_, *mirrored_out,
+                        "ApplyFinalVignetteU8x3(mirrored_out)", error_out))) {
+    return false;
+  }
+
+  Params resize_params{};
+  if (resize_scratch) {
+    resize_params.src_w = static_cast<std::uint32_t>(src.width());
+    resize_params.src_h = static_cast<std::uint32_t>(src.height());
+    resize_params.src_pitch = static_cast<std::uint32_t>(src.pitch_pixels());
+    resize_params.dst_w = static_cast<std::uint32_t>(resize_scratch->width());
+    resize_params.dst_h = static_cast<std::uint32_t>(resize_scratch->height());
+    resize_params.dst_pitch =
+        static_cast<std::uint32_t>(resize_scratch->pitch_pixels());
+    resize_params.crop_w = static_cast<float>(src.width());
+    resize_params.crop_h = static_cast<float>(src.height());
+  }
+
+  Params vignette_params{};
+  vignette_params.src_w = static_cast<std::uint32_t>(vignette_src.width());
+  vignette_params.src_h = static_cast<std::uint32_t>(vignette_src.height());
+  vignette_params.src_pitch =
+      static_cast<std::uint32_t>(vignette_src.pitch_pixels());
+  vignette_params.alpha_pitch =
+      static_cast<std::uint32_t>(attenuation_factor.pitch_pixels());
+  vignette_params.dst_w = vignette_params.src_w;
+  vignette_params.dst_h = vignette_params.src_h;
+  vignette_params.dst_pitch =
+      static_cast<std::uint32_t>(vignette_out.pitch_pixels());
+  // OP_COMPOSITE_SOLID with a black target and the setup-baked attenuation
+  // factor is exactly `src * max(0, 1 - intensity * radial^2)`. Unlike the
+  // key-light opcode it has no small-alpha early return. A zero solid target
+  // is independent of RGB/BGR channel order.
+  vignette_params.bg0 = 0;
+  vignette_params.bg1 = 0;
+  vignette_params.bg2 = 0;
+
+  Params mirror_params{};
+  if (mirrored_out) {
+    mirror_params.src_w = vignette_params.dst_w;
+    mirror_params.src_h = vignette_params.dst_h;
+    mirror_params.src_pitch =
+        static_cast<std::uint32_t>(vignette_out.pitch_pixels());
+    mirror_params.dst_w = vignette_params.dst_w;
+    mirror_params.dst_h = vignette_params.dst_h;
+    mirror_params.dst_pitch =
+        static_cast<std::uint32_t>(mirrored_out->pitch_pixels());
+    mirror_params.crop_x = static_cast<float>(vignette_out.width());
+    mirror_params.crop_w = -static_cast<float>(vignette_out.width());
+    mirror_params.crop_h = static_cast<float>(vignette_out.height());
+  }
+
+  if (resize_scratch) {
+    std::memcpy(params_.mapped(), &resize_params, sizeof(resize_params));
+    if (!params_.Flush(error_out) ||
+        !BindBuffers(src.buffer(), nullptr, nullptr, resize_scratch->buffer(),
+                     nullptr, nullptr, error_out)) {
+      return false;
+    }
+  }
+  std::memcpy(batch_params_.mapped(), &vignette_params,
+              sizeof(vignette_params));
+  if (!batch_params_.Flush(error_out) ||
+      !BindBuffersForSet(batch_descriptor_set_, batch_params_.buffer(),
+                         &batch_bound_buffers_, vignette_src.buffer(), nullptr,
+                         attenuation_factor.buffer(), vignette_out.buffer(),
+                         nullptr, nullptr, error_out)) {
+    return false;
+  }
+  if (mirrored_out) {
+    std::memcpy(final_params_.mapped(), &mirror_params, sizeof(mirror_params));
+    if (!final_params_.Flush(error_out) ||
+        !BindBuffersForSet(final_descriptor_set_, final_params_.buffer(),
+                           &final_bound_buffers_, vignette_out.buffer(),
+                           nullptr, nullptr, mirrored_out->buffer(), nullptr,
+                           nullptr, error_out)) {
+      return false;
+    }
+  }
+
+  if (!frame_batch_.Begin(error_out))
+    return false;
+  const auto fail_batch = [&]() {
+    frame_batch_.Abort();
+    return false;
+  };
+  const auto &vf = device_.f();
+  VkCommandBuffer command = frame_batch_.command_buffer();
+  if (!frame_batch_.RecordBufferBarrier(
+          src.buffer(), src.byte_size(), src.context_identity(),
+          VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          attenuation_factor.buffer(), attenuation_factor.byte_size(),
+          attenuation_factor.context_identity(),
+          VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      (resize_scratch &&
+       !frame_batch_.RecordBufferBarrier(
+           params_.buffer(), params_.size(), params_.context_identity(),
+           VulkanBufferAccess::host_write, VulkanBufferAccess::compute_read,
+           error_out)) ||
+      !frame_batch_.RecordBufferBarrier(
+          batch_params_.buffer(), batch_params_.size(),
+          batch_params_.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      (mirrored_out &&
+       !frame_batch_.RecordBufferBarrier(
+           final_params_.buffer(), final_params_.size(),
+           final_params_.context_identity(), VulkanBufferAccess::host_write,
+           VulkanBufferAccess::compute_read, error_out))) {
+    return fail_batch();
+  }
+
+  vf.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+  const auto dispatch = [&](VkDescriptorSet descriptor_set, Op op,
+                            std::uint32_t width, std::uint32_t height,
+                            const char *label) {
+    if (!frame_batch_.RecordStage(label, error_out))
+      return false;
+    vf.vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline_layout_, 0, 1, &descriptor_set, 0,
+                               nullptr);
+    const std::uint32_t op_u32 = static_cast<std::uint32_t>(op);
+    vf.vkCmdPushConstants(command, pipeline_layout_,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(op_u32),
+                          &op_u32);
+    vf.vkCmdDispatch(command, CeilDiv(width, kBlockX), CeilDiv(height, kBlockY),
+                     1);
+    return true;
+  };
+
+  if (resize_scratch) {
+    if (!dispatch(descriptor_set_, Op::crop_resize_u8x3, resize_params.dst_w,
+                  resize_params.dst_h, "output_resize") ||
+        !frame_batch_.RecordBufferBarrier(
+            resize_scratch->buffer(), resize_scratch->byte_size(),
+            resize_scratch->context_identity(),
+            VulkanBufferAccess::compute_write, VulkanBufferAccess::compute_read,
+            error_out)) {
+      return fail_batch();
+    }
+  }
+  if (!dispatch(batch_descriptor_set_, Op::composite_solid,
+                vignette_params.dst_w, vignette_params.dst_h,
+                "final_vignette")) {
+    return fail_batch();
+  }
+
+  const VulkanImage &final_image = mirrored_out ? *mirrored_out : vignette_out;
+  if (mirrored_out) {
+    if (!frame_batch_.RecordBufferBarrier(
+            vignette_out.buffer(), vignette_out.byte_size(),
+            vignette_out.context_identity(), VulkanBufferAccess::compute_write,
+            VulkanBufferAccess::compute_read, error_out) ||
+        !dispatch(final_descriptor_set_, Op::crop_resize_u8x3,
+                  mirror_params.dst_w, mirror_params.dst_h, "final_mirror")) {
+      return fail_batch();
+    }
+  }
+  if (!frame_batch_.RecordBufferBarrier(
+          final_image.buffer(), final_image.byte_size(),
+          final_image.context_identity(), VulkanBufferAccess::compute_write,
+          VulkanBufferAccess::host_read, error_out)) {
+    return fail_batch();
+  }
+
+  ++synchronous_submission_count_;
+  return frame_batch_.Complete(error_out);
 }
 
 bool IsUtilityKernelsAvailable(std::string *error_out) {

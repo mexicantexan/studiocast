@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1035,9 +1036,9 @@ bool TestCudaVignetteHonorsComputeBackendPreference() {
   available.vulkan_available = false;
   available.vulkan_unavailable_reason = "vulkan unavailable";
 
-  auto selected = ResolveComputeBackendSelection(
-      ComputeBackendPreference::cpu, available,
-      /*compute_work_requested=*/true);
+  auto selected =
+      ResolveComputeBackendSelection(ComputeBackendPreference::cpu, available,
+                                     /*compute_work_requested=*/true);
   if (selected.resolved != ComputeBackendKind::cpu ||
       ResolveActiveComputeBackendName(selected,
                                       /*compute_work_requested=*/true,
@@ -1065,9 +1066,9 @@ bool TestCudaVignetteHonorsComputeBackendPreference() {
     return false;
   }
 
-  selected = ResolveComputeBackendSelection(ComputeBackendPreference::cuda,
-                                            available,
-                                            /*compute_work_requested=*/true);
+  selected =
+      ResolveComputeBackendSelection(ComputeBackendPreference::cuda, available,
+                                     /*compute_work_requested=*/true);
   if (selected.resolved != ComputeBackendKind::cuda ||
       ResolveActiveComputeBackendName(selected,
                                       /*compute_work_requested=*/true,
@@ -1257,6 +1258,154 @@ bool TestMirrorCanonicalPlanAndBackendContractIsNoGpuSafe() {
   return true;
 }
 
+bool TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe() {
+  namespace effects = studiocast::video::effects;
+  using studiocast::video::ComputeBackendAvailability;
+  using studiocast::video::ComputeBackendKind;
+  using studiocast::video::ComputeBackendPreference;
+  using studiocast::video::ResolveComputeBackendSelection;
+
+  effects::BroadcastCameraEffects vignette_only;
+  if (vignette_only.vignette.intensity !=
+      effects::contract::kVignetteIntensityDefault) {
+    std::cerr << "canonical vignette default construction must reference the "
+                 "stable 35 percent contract\n";
+    return false;
+  }
+  vignette_only.vignette.enabled = true;
+  auto plan = effects::BuildBroadcastEffectsPlan(vignette_only);
+  if (plan.ordered_effect_ids.size() != 1 ||
+      plan.ordered_effect_ids.front() != effects::contract::kEffectIdVignette ||
+      !plan.vignette_attach_to_effect_id.empty() ||
+      !effects::BroadcastEffectsPlanRequestsCompute(plan)) {
+    std::cerr << "vignette-only plan must schedule standalone final compute "
+                 "work\n";
+    return false;
+  }
+
+  effects::BroadcastCameraEffects combined;
+  combined.auto_frame.enabled = true;
+  combined.vignette.enabled = true;
+  combined.mirror = true;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  const auto auto_frame =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdAutoFrame);
+  const auto vignette =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette);
+  const auto mirror =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdMirror);
+  if (auto_frame == plan.ordered_effect_ids.end() ||
+      vignette == plan.ordered_effect_ids.end() ||
+      mirror == plan.ordered_effect_ids.end() || !(auto_frame < vignette) ||
+      !(vignette < mirror) ||
+      plan.vignette_attach_to_effect_id == effects::contract::kEffectIdMirror) {
+    std::cerr << "canonical ordering must be framing -> vignette -> mirror\n";
+    return false;
+  }
+
+  const auto tracked_center_compatibility =
+      studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan);
+  const auto retained_auto_frame =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdAutoFrame);
+  const auto blocked_vignette =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette);
+  const auto retained_mirror =
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdMirror);
+  if (!tracked_center_compatibility.blocked ||
+      tracked_center_compatibility.reason_code !=
+          studiocast::video::
+              kOpenVulkanVignetteTrackedCenterNotSupportedReason ||
+      tracked_center_compatibility.detail !=
+          studiocast::video::
+              kOpenVulkanVignetteTrackedCenterNotSupportedDetail ||
+      retained_auto_frame == plan.ordered_effect_ids.end() ||
+      blocked_vignette != plan.ordered_effect_ids.end() ||
+      retained_mirror == plan.ordered_effect_ids.end() ||
+      !plan.vignette_attach_to_effect_id.empty() || plan.disabled.size() != 1 ||
+      plan.disabled.front().id != effects::contract::kEffectIdVignette ||
+      plan.disabled.front().reason.find(
+          "[vulkan_vignette_tracked_center_not_supported]") ==
+          std::string::npos) {
+    std::cerr << "explicit Vulkan tracked-center compatibility must visibly "
+                 "block only vignette while retaining Auto Frame and mirror\n";
+    return false;
+  }
+
+  combined.vignette.center_on_tracked_face = false;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  if (studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan)
+          .blocked ||
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette) ==
+          plan.ordered_effect_ids.end()) {
+    std::cerr << "explicit fixed-center Vulkan config must retain vignette\n";
+    return false;
+  }
+
+  combined.vignette.center_on_tracked_face = true;
+  plan = effects::BuildBroadcastEffectsPlan(combined);
+  plan.ordered_effect_ids.erase(
+      std::remove(plan.ordered_effect_ids.begin(),
+                  plan.ordered_effect_ids.end(),
+                  std::string(effects::contract::kEffectIdAutoFrame)),
+      plan.ordered_effect_ids.end());
+  if (studiocast::video::ApplyOpenVulkanVignettePlanCompatibility(combined,
+                                                                  &plan)
+          .blocked ||
+      std::find(plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+                effects::contract::kEffectIdVignette) ==
+          plan.ordered_effect_ids.end()) {
+    std::cerr << "vignette must remain when unavailable Auto Frame was removed "
+                 "before Vulkan compatibility evaluation\n";
+    return false;
+  }
+
+  ComputeBackendAvailability available;
+  available.vulkan_available = true;
+  const auto selected = ResolveComputeBackendSelection(
+      ComputeBackendPreference::vulkan, available,
+      effects::BroadcastEffectsPlanRequestsCompute(
+          effects::BuildBroadcastEffectsPlan(vignette_only)));
+  if (selected.resolved != ComputeBackendKind::vulkan || selected.degraded) {
+    std::cerr << "vignette-only explicit Vulkan must resolve Vulkan compute\n";
+    return false;
+  }
+
+  CameraPipelineStatus::OpenVulkanTransfers counters;
+  ++counters.active_frames;
+  ++counters.upload_calls;
+  ++counters.vignette_dispatch_calls;
+  ++counters.vignette_factor_allocation_calls;
+  ++counters.vignette_factor_generation_calls;
+  ++counters.vignette_factor_upload_calls;
+  ++counters.mirror_dispatch_calls;
+  ++counters.download_calls;
+  ++counters.final_download_calls;
+  ++counters.forced_sync_calls;
+  if (counters.active_frames != 1 || counters.upload_calls != 1 ||
+      counters.vignette_dispatch_calls != 1 ||
+      counters.vignette_factor_allocation_calls != 1 ||
+      counters.vignette_factor_generation_calls != 1 ||
+      counters.vignette_factor_upload_calls != 1 ||
+      counters.mirror_dispatch_calls != 1 || counters.download_calls != 1 ||
+      counters.final_download_calls != 1 || counters.forced_sync_calls != 1 ||
+      counters.cpu_continuation_download_calls != 0 ||
+      counters.cpu_tail_stage_calls != 0) {
+    std::cerr << "combined Vulkan vignette/mirror contract must be one "
+                 "resident section/completion without a CPU tail\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1301,6 +1450,8 @@ int main() {
        &TestComputeBackendSelectionPolicyIsNoGpuSafe},
       {"mirror canonical plan and backend contract is no-GPU safe",
        &TestMirrorCanonicalPlanAndBackendContractIsNoGpuSafe},
+      {"vignette canonical plan/default/backend contract is no-GPU safe",
+       &TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},

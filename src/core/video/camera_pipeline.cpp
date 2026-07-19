@@ -61,6 +61,7 @@
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
 #include "core/open_video/vulkan_matting_session.h"
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/resize_bilinear.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #endif
@@ -234,6 +235,41 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   active_this_frame = true;
   ++active_frames;
   return true;
+}
+
+OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
+    const effects::BroadcastCameraEffects &fx,
+    effects::BroadcastEffectsPlan *retained_plan) {
+  OpenVulkanVignettePlanCompatibility result;
+  if (!retained_plan || !fx.vignette.enabled ||
+      !fx.vignette.center_on_tracked_face) {
+    return result;
+  }
+
+  const auto contains = [&](std::string_view effect_id) {
+    return std::find(retained_plan->ordered_effect_ids.begin(),
+                     retained_plan->ordered_effect_ids.end(),
+                     effect_id) != retained_plan->ordered_effect_ids.end();
+  };
+  if (!contains(effects::contract::kEffectIdVignette) ||
+      !contains(effects::contract::kEffectIdAutoFrame)) {
+    return result;
+  }
+
+  const std::string vignette_id(effects::contract::kEffectIdVignette);
+  retained_plan->ordered_effect_ids.erase(
+      std::remove(retained_plan->ordered_effect_ids.begin(),
+                  retained_plan->ordered_effect_ids.end(), vignette_id),
+      retained_plan->ordered_effect_ids.end());
+  retained_plan->vignette_attach_to_effect_id.clear();
+  result.blocked = true;
+  result.reason_code = kOpenVulkanVignetteTrackedCenterNotSupportedReason;
+  result.detail = kOpenVulkanVignetteTrackedCenterNotSupportedDetail;
+  retained_plan->disabled.push_back(effects::DisabledEffectByRule{
+      .id = vignette_id,
+      .reason = "[" + std::string(result.reason_code) + "] " +
+                std::string(result.detail)});
+  return result;
 }
 
 namespace {
@@ -3536,6 +3572,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::vulkan::VulkanImage bg_rgb;         // rgb_u8, WxH
     studiocast::vulkan::VulkanImage bg_src_rgb;     // rgb_u8, source WxH
     studiocast::vulkan::VulkanImage auto_frame_rgb; // rgb_u8, WxH
+    studiocast::vulkan::VulkanImage vignette_rgb;   // rgb_u8, final output WxH
     studiocast::vulkan::VulkanImage mirror_rgb;     // rgb_u8, final output WxH
 
     std::filesystem::path cached_bg_src_path;
@@ -3624,6 +3661,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       bg_rgb.Free();
       bg_src_rgb.Free();
       auto_frame_rgb.Free();
+      vignette_rgb.Free();
       mirror_rgb.Free();
     }
 
@@ -4325,6 +4363,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
   } open_vulkan_vb;
 
+  OpenVulkanVignette open_vulkan_vignette;
+  OpenVulkanVignetteCounters open_vulkan_vignette_counters;
   OpenVulkanMirror open_vulkan_mirror;
 #endif
 
@@ -7702,6 +7742,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   bool want_open_vulkan_key_light = false;
   bool have_open_vulkan_key_light = false;
 
+  bool want_open_vulkan_vignette = false;
+  bool have_open_vulkan_vignette = false;
+
   bool want_open_vulkan_mirror = false;
   bool have_open_vulkan_mirror = false;
 
@@ -7873,6 +7916,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     want_open_vulkan_key_light = false;
     have_open_vulkan_key_light = false;
 
+    want_open_vulkan_vignette = false;
+    have_open_vulkan_vignette = false;
+
     want_open_vulkan_mirror = false;
     have_open_vulkan_mirror = false;
 
@@ -7916,6 +7962,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const auto has = [&](std::string_view id) {
       return planned.count(std::string(id)) != 0;
     };
+
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (!has(studiocast::video::effects::contract::kEffectIdVignette))
+      open_vulkan_vignette.Shutdown();
+#endif
 
     const bool engine_maxine =
         (fx.engine ==
@@ -7988,8 +8039,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
       remove_stage_from_plan(
           studiocast::video::effects::contract::kEffectIdEyeContact);
-      remove_stage_from_plan(
-          studiocast::video::effects::contract::kEffectIdVignette);
     };
 
     auto compute_selection = ResolveComputeBackendSelection(
@@ -7998,10 +8047,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
       remove_non_vulkan_vb_compute_stages_from_plan();
+      // Vulkan vignette is a final-output stage rather than an attached model
+      // stage. Tracked-center compatibility is evaluated after Auto Frame
+      // readiness is known, so no hidden analysis tail is introduced.
+      plan.vignette_attach_to_effect_id.clear();
       append_note("Open Vulkan: virtual background, virtual key light, and "
                   "auto frame are eligible for the Vulkan backend in this "
-                  "milestone; mirror is a production final-output Vulkan "
-                  "stage.");
+                  "milestone; vignette and mirror are production final-output "
+                  "Vulkan stages.");
     } else if (compute_work_requested &&
                compute_selection.resolved == ComputeBackendKind::cpu &&
                cfg.compute_backend == ComputeBackendPreference::cpu) {
@@ -8703,11 +8756,77 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
-    // Vignette-only stage.
-    // If no other GPU stage is active, run a minimal GPU upload -> vignette
-    // kernel -> download.
+    // The default-true tracked-center field has observable semantics on the
+    // Auto Frame-attached CUDA path. Apply this backend compatibility rule only
+    // after unavailable Auto Frame stages have been removed. Standalone
+    // vignette therefore remains fixed-center production behavior, while the
+    // combined tracked request fails closed without CPU tracking/mask work.
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+      const auto compatibility =
+          ApplyOpenVulkanVignettePlanCompatibility(fx, &plan);
+      if (compatibility.blocked) {
+        planned.erase(std::string(
+            studiocast::video::effects::contract::kEffectIdVignette));
+        want_open_vulkan_vignette = true;
+        open_vulkan_vignette.Shutdown();
+      }
+    }
+#endif
+
+    // Vignette final-output stage. Compatible explicit Vulkan requests run the
+    // fixed-center device-resident implementation after output geometry and
+    // before mirror. Other backends retain their existing attachment behavior.
     if (has(studiocast::video::effects::contract::kEffectIdVignette) &&
-        plan.vignette_attach_to_effect_id.empty()) {
+        cfg.compute_backend == ComputeBackendPreference::vulkan) {
+      const std::string stage_id =
+          std::string(studiocast::video::effects::contract::kEffectIdVignette);
+      want_open_vulkan_vignette = true;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      std::string vk_err;
+      bool vignette_ready = open_vulkan_vignette.EnsureInitialized(
+          &open_vulkan_vb.kernels, outA.width, outA.height,
+          fx.vignette.intensity, &open_vulkan_vignette_counters, &vk_err);
+      if (vignette_ready) {
+        vignette_ready =
+            open_vulkan_vb.EnsureImage(
+                &open_vulkan_vb.frame_rgb, capA.width, capA.height,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/true, "frame_rgb", &vk_err) &&
+            open_vulkan_vb.EnsureImage(
+                &open_vulkan_vb.out_rgb, capA.width, capA.height,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/true, "out_rgb", &vk_err) &&
+            open_vulkan_vb.EnsureImage(
+                &open_vulkan_vb.vignette_rgb, outA.width, outA.height,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/true, "vignette_rgb", &vk_err);
+      }
+      if (vignette_ready) {
+        have_open_vulkan_vignette = true;
+        compute_available.vulkan_available = true;
+        set_backend(stage_id, "open_vulkan");
+        append_note("Open Vulkan: Vignette (fixed center after framing; "
+                    "device-resident attenuation mask, no tracking CPU tail).");
+      } else {
+        if (vk_err.find("[vulkan_effect_initialization_failed]") ==
+            std::string::npos) {
+          vk_err = OpenVulkanVignetteInitializationFailure(vk_err);
+        }
+        append_note(vk_err);
+        compute_available.vulkan_unavailable_reason = vk_err;
+        remove_stage_from_plan(stage_id);
+      }
+#else
+      const std::string vk_err =
+          "[vulkan_effect_initialization_failed] Open Vulkan vignette "
+          "initialization failed: backend is disabled in this build.";
+      append_note(vk_err);
+      compute_available.vulkan_unavailable_reason = vk_err;
+      remove_stage_from_plan(stage_id);
+#endif
+    } else if (has(studiocast::video::effects::contract::kEffectIdVignette) &&
+               plan.vignette_attach_to_effect_id.empty()) {
       const bool have_any_maxine_gpu_stage =
           have_maxine_eye_contact || have_maxine_bg_blur ||
           have_maxine_relight || have_maxine_auto_frame;
@@ -8794,7 +8913,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           have_maxine_eye_contact || have_maxine_relight || have_maxine_denoise;
       const bool have_any_vulkan_compute =
           have_open_vulkan_vb || have_open_vulkan_auto_frame ||
-          have_open_vulkan_key_light || have_open_vulkan_mirror;
+          have_open_vulkan_key_light || have_open_vulkan_vignette ||
+          have_open_vulkan_mirror;
       const bool have_any_cuda_compute =
           have_any_maxine_compute || have_open_cuda_vb ||
           have_open_cuda_auto_frame || have_open_cuda_key_light ||
@@ -8819,8 +8939,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       const std::string compute_active_backend =
           ResolveActiveComputeBackendName(
-              compute_selection, compute_work_requested, have_any_maxine_compute,
-              compute_available.cuda_available,
+              compute_selection, compute_work_requested,
+              have_any_maxine_compute, compute_available.cuda_available,
               compute_available.vulkan_available);
 
       for (auto &breaker : optional_effect_breakers)
@@ -9302,6 +9422,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool have_deferred_gpu_out = false;
     bool open_cuda_gpu_frame_pending_cpu_readback = false;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
+    bool open_vulkan_vignette_attempt_this_frame = false;
     bool open_vulkan_gpu_frame_pending_cpu_readback = false;
     bool open_vulkan_mirror_attempt_this_frame = false;
 #endif
@@ -9586,6 +9707,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           has_stage(studiocast::video::effects::contract::kEffectIdVignette);
       const std::string &vig_attach = plan.vignette_attach_to_effect_id;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
+      open_vulkan_vignette_attempt_this_frame =
+          have_open_vulkan_vignette && vignette_requested &&
+          optional_breaker(OptionalEffectSlot::vignette)
+              .AllowsAttempt(f.sequence);
       open_vulkan_mirror_attempt_this_frame =
           have_open_vulkan_mirror &&
           has_stage(studiocast::video::effects::contract::kEffectIdMirror) &&
@@ -9603,6 +9728,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
            it != plan.ordered_effect_ids.rend(); ++it) {
         if (*it == studiocast::video::effects::contract::
                        kEffectIdVideoNoiseRemoval ||
+            *it == studiocast::video::effects::contract::kEffectIdVignette ||
             *it == studiocast::video::effects::contract::kEffectIdMirror)
           continue;
         last_stage_for_defer = *it;
@@ -9613,6 +9739,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const bool allow_defer_readback =
           ((scaling_needed && (gpu_backend != GpuResizeBackend::none)) ||
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
+           open_vulkan_vignette_attempt_this_frame ||
            open_vulkan_mirror_attempt_this_frame ||
 #endif
            false) &&
@@ -10882,13 +11009,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
-    // Mirror-only requests enter the same resident final-output block as
-    // combined Vulkan effects. Earlier Vulkan stages already publish a
-    // deferred image; otherwise upload the post-analysis CPU frame exactly
-    // once here. The mirror dispatch itself remains after output resize below.
-    if (open_vulkan_mirror_attempt_this_frame && !have_deferred_gpu_out) {
-      std::string mirror_err;
-      if (ensure_open_vulkan_current_from_cpu(&mirror_err)) {
+    // Final-output vignette/mirror requests enter the same resident block as
+    // earlier Vulkan stages. Otherwise upload the post-analysis CPU frame once
+    // here; resize, vignette, and mirror are batched below.
+    if ((open_vulkan_vignette_attempt_this_frame ||
+         open_vulkan_mirror_attempt_this_frame) &&
+        !have_deferred_gpu_out) {
+      std::string final_err;
+      if (ensure_open_vulkan_current_from_cpu(&final_err)) {
         deferred_gpu_out.kind = DeferredGpuKind::vulkan_rgb;
         deferred_gpu_out.nvcv_img = nullptr;
         deferred_gpu_out.nvcv = nullptr;
@@ -10902,11 +11030,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       } else {
         ++open_vulkan_fallback_frames;
         ++open_vulkan_runtime_failure_frames;
-        block_optional_effect(
-            OptionalEffectSlot::mirror,
-            studiocast::video::effects::contract::kEffectIdMirror,
-            "open_vulkan", OpenVulkanMirrorRuntimeFailure(mirror_err),
-            f.sequence);
+        if (open_vulkan_vignette_attempt_this_frame) {
+          block_optional_effect(
+              OptionalEffectSlot::vignette,
+              studiocast::video::effects::contract::kEffectIdVignette,
+              "open_vulkan", OpenVulkanVignetteRuntimeFailure(final_err),
+              f.sequence);
+        }
+        if (open_vulkan_mirror_attempt_this_frame) {
+          block_optional_effect(
+              OptionalEffectSlot::mirror,
+              studiocast::video::effects::contract::kEffectIdMirror,
+              "open_vulkan", OpenVulkanMirrorRuntimeFailure(final_err),
+              f.sequence);
+        }
+        open_vulkan_vignette_attempt_this_frame = false;
         open_vulkan_mirror_attempt_this_frame = false;
       }
     }
@@ -11084,20 +11222,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         download_img = &vulkan_rgb_scaled;
       }
 
-      // Without mirror, preserve the normal single-stage resident resize. If
-      // mirror is active, its production helper records resize -> barrier ->
-      // mirror under one completion below.
-      if (ok && vulkan_resize_needed &&
-          !open_vulkan_mirror_attempt_this_frame) {
-        if (!deferred_gpu_out.vulkan_kernels->ResizeBilinear(
-                *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
-          ok = false;
-        } else {
-          ++open_vulkan_forced_sync_calls;
-        }
-      }
-
-      if (ok && open_vulkan_mirror_attempt_this_frame) {
+      const auto apply_open_vulkan_mirror = [&]() {
         std::string mirror_err;
         bool mirror_ready = open_vulkan_mirror.EnsureInitialized(
             deferred_gpu_out.vulkan_kernels, outW, outH, &mirror_err);
@@ -11155,6 +11280,98 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           }
           // Same-size failures fail open by reading the original unmirrored
           // resident frame; unrelated stages and camera output remain active.
+        }
+      };
+
+      if (ok && open_vulkan_vignette_attempt_this_frame) {
+        std::string vignette_err;
+        bool vignette_ready = open_vulkan_vignette.EnsureInitialized(
+            deferred_gpu_out.vulkan_kernels, outW, outH,
+            appliedFx.vignette.intensity, &open_vulkan_vignette_counters,
+            &vignette_err);
+        if (vignette_ready) {
+          vignette_ready = open_vulkan_vb.EnsureImage(
+              &open_vulkan_vb.vignette_rgb, outW, outH,
+              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+              /*map_memory=*/true, "vignette_rgb", &vignette_err);
+        }
+        if (vignette_ready && open_vulkan_mirror_attempt_this_frame) {
+          vignette_ready = open_vulkan_vb.EnsureImage(
+              &open_vulkan_vb.mirror_rgb, outW, outH,
+              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+              /*map_memory=*/true, "mirror_rgb", &vignette_err);
+        }
+
+        bool vignette_applied = false;
+        if (vignette_ready) {
+          OpenVulkanVignetteFinalStageInput vignette_input;
+          vignette_input.src = deferred_gpu_out.vulkan_img;
+          vignette_input.resize_scratch =
+              vulkan_resize_needed ? &vulkan_rgb_scaled : nullptr;
+          vignette_input.dst = &open_vulkan_vb.vignette_rgb;
+          vignette_input.mirrored_dst = open_vulkan_mirror_attempt_this_frame
+                                            ? &open_vulkan_vb.mirror_rgb
+                                            : nullptr;
+          vignette_input.preceding_effects_complete = true;
+          vignette_input.intensity_percent = appliedFx.vignette.intensity;
+          vignette_applied = open_vulkan_vignette.ApplyFinal(
+              vignette_input, &open_vulkan_vignette_counters, &vignette_err);
+        }
+
+        if (vignette_applied) {
+          ++open_vulkan_forced_sync_calls;
+          open_vulkan_effect_ran_this_frame = true;
+          download_img = &open_vulkan_vb.vignette_rgb;
+          clear_optional_effect_on_success(
+              optional_breaker(OptionalEffectSlot::vignette), f.sequence);
+          if (open_vulkan_mirror_attempt_this_frame) {
+            // The combined production helper recorded the exact mirror as the
+            // third resident stage under the same completion.
+            ++open_vulkan_mirror_counters.dispatch_calls;
+            download_img = &open_vulkan_vb.mirror_rgb;
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::mirror), f.sequence);
+            open_vulkan_mirror_attempt_this_frame = false;
+          }
+        } else {
+          ++open_vulkan_fallback_frames;
+          if (!vignette_ready) {
+            ++open_vulkan_runtime_failure_frames;
+            if (vignette_err.find("[vulkan_effect_initialization_failed]") ==
+                std::string::npos) {
+              vignette_err =
+                  OpenVulkanVignetteInitializationFailure(vignette_err);
+            }
+          }
+          block_optional_effect(
+              OptionalEffectSlot::vignette,
+              studiocast::video::effects::contract::kEffectIdVignette,
+              "open_vulkan", vignette_err, f.sequence);
+          open_vulkan_vignette_attempt_this_frame = false;
+          download_img = deferred_gpu_out.vulkan_img;
+
+          // A vignette failure only trips vignette. Retry the independent
+          // mirror stage from the original resident source; a poisoned shared
+          // context will fail with its own nested reason instead of silently
+          // disabling mirror because another optional effect failed.
+          if (open_vulkan_mirror_attempt_this_frame) {
+            apply_open_vulkan_mirror();
+          } else if (vulkan_resize_needed) {
+            ok = false;
+            gerr =
+                "Open Vulkan combined resize/vignette failed: " + vignette_err;
+          }
+        }
+      } else if (ok && open_vulkan_mirror_attempt_this_frame) {
+        apply_open_vulkan_mirror();
+      } else if (ok && vulkan_resize_needed) {
+        // No final effect requested: preserve the existing one-stage resident
+        // resize and final readback.
+        if (!deferred_gpu_out.vulkan_kernels->ResizeBilinear(
+                *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
+          ok = false;
+        } else {
+          ++open_vulkan_forced_sync_calls;
         }
       }
 
@@ -12083,6 +12300,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_vb.key_light_dispatch_calls;
       open_vulkan_transfers_.crop_resize_dispatch_calls =
           open_vulkan_vb.crop_resize_dispatch_calls;
+      open_vulkan_transfers_.vignette_dispatch_calls =
+          open_vulkan_vignette_counters.dispatch_calls;
+      open_vulkan_transfers_.vignette_factor_allocation_calls =
+          open_vulkan_vignette_counters.factor_allocation_calls;
+      open_vulkan_transfers_.vignette_factor_generation_calls =
+          open_vulkan_vignette_counters.factor_generation_calls;
+      open_vulkan_transfers_.vignette_factor_upload_calls =
+          open_vulkan_vignette_counters.factor_upload_calls;
       open_vulkan_transfers_.mirror_dispatch_calls =
           open_vulkan_mirror_counters.dispatch_calls;
 #endif
@@ -12111,6 +12336,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       open_vulkan_transfers_.runtime_failure_frames =
           open_vulkan_runtime_failure_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
+      open_vulkan_transfers_.runtime_failure_frames +=
+          open_vulkan_vignette_counters.runtime_failure_frames;
       open_vulkan_transfers_.runtime_failure_frames +=
           open_vulkan_mirror_counters.runtime_failure_frames;
 #endif
