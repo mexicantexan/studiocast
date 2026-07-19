@@ -276,6 +276,13 @@ struct CameraPipelineStatus {
     std::uint64_t background_upload_calls = 0;
     std::uint64_t composite_dispatch_calls = 0;
     std::uint64_t key_light_dispatch_calls = 0;
+    std::uint64_t virtual_key_light_shared_matte_reuse_calls = 0;
+    std::uint64_t virtual_key_light_independent_matte_inference_calls = 0;
+    std::uint64_t virtual_key_light_passthrough_frames = 0;
+    std::uint64_t virtual_key_light_alpha_readback_calls = 0;
+    std::uint64_t virtual_key_light_cpu_fallback_calls = 0;
+    std::uint64_t virtual_key_light_runtime_failure_frames = 0;
+    std::uint64_t virtual_key_light_device_loss_frames = 0;
     std::uint64_t crop_resize_dispatch_calls = 0;
     std::uint64_t vignette_dispatch_calls = 0;
     std::uint64_t vignette_factor_allocation_calls = 0;

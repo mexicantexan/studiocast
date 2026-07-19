@@ -62,10 +62,11 @@
 #include "core/open_video/vulkan_matting_session.h"
 #include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_vignette.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
 #include "core/video/open_vulkan_virtual_background_remove.h"
 #include "core/video/open_vulkan_virtual_background_replace.h"
-#include "core/video/open_vulkan_vignette.h"
+#include "core/video/open_vulkan_virtual_key_light.h"
 #include "core/vulkan/kernels/resize_bilinear.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #endif
@@ -3568,6 +3569,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     OpenVulkanVirtualBackgroundRemoveCounters remove_effect_counters;
     OpenVulkanVirtualBackgroundReplace replace_effect;
     OpenVulkanVirtualBackgroundReplaceCounters replace_effect_counters;
+    OpenVulkanVirtualKeyLight key_light_effect;
+    OpenVulkanVirtualKeyLightCounters key_light_effect_counters;
 
     studiocast::open_video::FrameArtifactCache matte_artifacts;
     studiocast::open_video::FrameMatteArtifactKey vulkan_matte_artifact_key;
@@ -3603,7 +3606,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::uint64_t alpha_resize_completion_count = 0;
     std::uint64_t blur_dispatch_calls = 0;
     std::uint64_t composite_dispatch_calls = 0;
-    std::uint64_t key_light_dispatch_calls = 0;
     std::uint64_t crop_resize_dispatch_calls = 0;
     std::uint64_t forced_sync_calls = 0;
 
@@ -3615,6 +3617,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       blur_effect.Shutdown();
       remove_effect.Shutdown();
       replace_effect.Shutdown();
+      key_light_effect.Shutdown();
       model_pack.reset();
       ResetMattingSessionState();
       kernels.Shutdown();
@@ -3858,6 +3861,38 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       key.stream = queue_handle;
       vulkan_matte_artifact_key = key;
       vulkan_matte_artifact_key_valid = true;
+    }
+
+    bool HasCompatibleFrameAlpha(std::uint64_t capture_sequence, int frame_w,
+                                 int frame_h) const {
+      const auto *artifact =
+          capture_sequence != 0 && vulkan_matte_artifact_key_valid
+              ? matte_artifacts.FindMatte(capture_sequence,
+                                          vulkan_matte_artifact_key)
+              : nullptr;
+      if (!model_pack || !model_pack->matting || !kernels.device() ||
+          !vulkan_matte_artifact_key_valid || !cached_matte_valid ||
+          !cached_frame_alpha_valid ||
+          !detail::IsOpenVulkanVirtualKeyLightSameFrameArtifactCompatible(
+              capture_sequence, cached_matte_sequence,
+              cached_frame_alpha_sequence, vulkan_matte_artifact_key, artifact,
+              active_model_id, frame_w, frame_h,
+              model_pack->matting->output.width,
+              model_pack->matting->output.height,
+              reinterpret_cast<std::uintptr_t>(kernels.device()),
+              reinterpret_cast<std::uintptr_t>(kernels.device()->queue()),
+              reinterpret_cast<std::uintptr_t>(&alpha_model),
+              reinterpret_cast<std::uintptr_t>(alpha_model.buffer())) ||
+          !alpha_resized.Valid() ||
+          !alpha_resized.BelongsTo(*kernels.device()) ||
+          alpha_resized.context_identity() !=
+              kernels.device()->context_identity() ||
+          alpha_resized.width() != frame_w ||
+          alpha_resized.height() != frame_h || alpha_resized.mapped() ||
+          !alpha_resized.device_local()) {
+        return false;
+      }
+      return true;
     }
 
     bool EnsureInitialized(
@@ -5404,21 +5439,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
   struct OpenVulkanKeyLightContext {
-    bool initialized = false;
-    bool enabled = false;
     std::string last_error;
-    std::string active_model_id;
     OpenVulkanVirtualBackgroundContext *matte = nullptr;
-    int last_frame_w = 0;
-    int last_frame_h = 0;
 
     void Destroy() {
-      initialized = false;
-      enabled = false;
       last_error.clear();
-      active_model_id.clear();
-      last_frame_w = 0;
-      last_frame_h = 0;
+      if (matte)
+        matte->key_light_effect.Shutdown();
     }
 
     bool EnsureInitialized(
@@ -5428,13 +5455,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (error)
         error->clear();
       if (frame_w <= 0 || frame_h <= 0) {
-        last_error = "Open Vulkan Virtual Key Light: invalid frame size.";
+        last_error = OpenVulkanVirtualKeyLightInitializationFailure(
+            "invalid frame size");
         if (error)
           *error = last_error;
         return false;
       }
       if (!matte) {
-        last_error = "Open Vulkan Virtual Key Light: matte provider not set.";
+        last_error = OpenVulkanVirtualKeyLightInitializationFailure(
+            "matte provider not set");
         if (error)
           *error = last_error;
         return false;
@@ -5442,21 +5471,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::string matte_err;
       if (!matte->EnsureInitialized(frame_w, frame_h, fx, &matte_err,
                                     /*require_vb_buffers=*/false)) {
-        last_error = "Open Vulkan Virtual Key Light: " + matte_err;
+        last_error = OpenVulkanVirtualKeyLightInitializationFailure(matte_err);
         if (error)
           *error = last_error;
         return false;
       }
-      const std::string current_model_id = matte->active_model_id;
-      if (initialized && enabled && current_model_id == active_model_id &&
-          last_frame_w == frame_w && last_frame_h == frame_h) {
-        return true;
+      const auto matting_readiness = matte->matting_session->Readiness();
+      if (!matte->key_light_effect.EnsureInitialized(
+              &matte->kernels, frame_w, frame_h, fx.virtual_key_light.intensity,
+              fx.virtual_key_light.temperature_preset,
+              fx.virtual_key_light.direction_pan_degrees, matting_readiness,
+              &last_error)) {
+        if (error)
+          *error = last_error;
+        return false;
       }
-      active_model_id = current_model_id;
-      last_frame_w = frame_w;
-      last_frame_h = frame_h;
-      initialized = true;
-      enabled = true;
       last_error.clear();
       return true;
     }
@@ -5471,7 +5500,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         error->clear();
       if (!deferred_out) {
         if (error)
-          *error = "Open Vulkan Virtual Key Light: invalid GPU output.";
+          *error =
+              OpenVulkanVirtualKeyLightRuntimeFailure("invalid GPU output");
         return false;
       }
       const auto publish_passthrough = [&]() {
@@ -5488,22 +5518,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         publish_passthrough();
         return true;
       }
-      const float intensity01 =
-          Clamp01FromPercent(fx.virtual_key_light.intensity);
-      if (intensity01 <= 0.0001f) {
-        publish_passthrough();
-        return true;
-      }
       if (!matte || !out_rgb_img) {
         if (error)
-          *error = "Open Vulkan Virtual Key Light: invalid GPU stage state.";
+          *error = OpenVulkanVirtualKeyLightRuntimeFailure(
+              "invalid GPU stage state");
         return false;
       }
       if (!in_rgb.Valid() ||
           in_rgb.format() != studiocast::vulkan::VulkanPixelFormat::rgb_u8) {
         if (error)
-          *error =
-              "Open Vulkan Virtual Key Light: invalid input GPU RGB image.";
+          *error = OpenVulkanVirtualKeyLightRuntimeFailure(
+              "invalid input GPU RGB image");
         return false;
       }
       std::string init_err;
@@ -5512,39 +5537,51 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error = init_err;
         return false;
       }
-      if (!matte->EnsureFrameAlphaForFrameGpu(in_rgb, capture_sequence,
-                                              in_rgb.width(), in_rgb.height(),
-                                              fx, error)) {
-        if (error && !error->empty()) {
-          *error = "Open Vulkan Virtual Key Light: " + *error;
-        }
-        return false;
-      }
-      if (!matte->EnsureImage(out_rgb_img, in_rgb.width(), in_rgb.height(),
-                              studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                              /*map_memory=*/true, "key_light_out", error)) {
+      const bool passthrough =
+          matte->key_light_effect.parameters().passthrough();
+      const bool reuse_same_frame =
+          !passthrough &&
+          matte->HasCompatibleFrameAlpha(capture_sequence, in_rgb.width(),
+                                         in_rgb.height());
+      const auto readiness_before = matte->matting_session->Readiness();
+      const std::uint64_t inference_count_before =
+          readiness_before.runtime.inference_count;
+      const std::uint64_t resize_count_before =
+          matte->alpha_resize_completion_count;
+
+      if (!passthrough && !matte->EnsureFrameAlphaForFrameGpu(
+                              in_rgb, capture_sequence, in_rgb.width(),
+                              in_rgb.height(), fx, error)) {
+        if (error && !error->empty())
+          *error = OpenVulkanVirtualKeyLightRuntimeFailure(*error);
         return false;
       }
 
-      const float pan = std::clamp(
-          static_cast<float>(fx.virtual_key_light.direction_pan_degrees),
-          -90.0f, 90.0f);
-      const float dir = std::clamp(pan / 90.0f, -1.0f, 1.0f);
-
-      float target_r = 255.0f, target_g = 255.0f, target_b = 255.0f;
-      OpenCudaKeyLightContext::ResolveTargetColorFromTemperaturePreset(
-          fx.virtual_key_light.temperature_preset, &target_r, &target_g,
-          &target_b);
-
-      std::string kerr;
-      if (!matte->kernels.ApplyKeyLightU8x3(
-              in_rgb, matte->alpha_resized, target_r, target_g, target_b,
-              intensity01, dir, *out_rgb_img, &kerr)) {
-        if (error)
-          *error = "Open Vulkan Virtual Key Light: GPU blend failed: " + kerr;
+      const auto current_readiness = matte->matting_session->Readiness();
+      OpenVulkanVirtualKeyLightInput input;
+      input.foreground = &in_rgb;
+      input.alpha = &matte->alpha_resized;
+      input.output = out_rgb_img;
+      input.capture_sequence = capture_sequence;
+      input.resident_alpha_sequence = matte->cached_frame_alpha_sequence;
+      input.alpha_resize_completion_count_before = resize_count_before;
+      input.alpha_resize_completion_count_after =
+          matte->alpha_resize_completion_count;
+      input.matting_inference_count_before = inference_count_before;
+      input.matte_source =
+          reuse_same_frame
+              ? OpenVulkanVirtualKeyLightMatteSource::reused_same_frame
+              : OpenVulkanVirtualKeyLightMatteSource::independently_inferred;
+      input.matting_readiness = &current_readiness;
+      if (!matte->key_light_effect.Apply(
+              input, &matte->key_light_effect_counters, error)) {
         return false;
       }
-      ++matte->key_light_dispatch_calls;
+
+      if (passthrough) {
+        publish_passthrough();
+        return true;
+      }
       ++matte->forced_sync_calls;
 
       deferred_out->kind = DeferredGpuKind::vulkan_rgb;
@@ -8157,6 +8194,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     if (!has(studiocast::video::effects::contract::kEffectIdVignette))
       open_vulkan_vignette.Shutdown();
+    if (!has(studiocast::video::effects::contract::kEffectIdVirtualKeyLight))
+      open_vulkan_key_light.Destroy();
 #endif
 
     const bool engine_maxine =
@@ -8888,6 +8927,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   "foreground relight while the frame is Vulkan-resident).";
           detach_vignette_from_key_light();
         } else {
+          if (vk_err.find("[vulkan_virtual_key_light_initialization_failed]") ==
+              std::string::npos) {
+            vk_err = OpenVulkanVirtualKeyLightInitializationFailure(vk_err);
+          }
           if (!note.empty()) {
             note += "\n";
           }
@@ -8898,8 +8941,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
 #else
         const std::string vk_err =
-            "Open Vulkan: backend is disabled in this build. Rebuild with "
-            "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
+            "[vulkan_virtual_key_light_initialization_failed] Open Vulkan "
+            "virtual key light initialization failed: "
+            "[vulkan_backend_disabled_in_build] Open Vulkan support is "
+            "disabled in this build.";
         append_note(vk_err);
         compute_available.vulkan_unavailable_reason = vk_err;
         remove_stage_from_plan(stage_id);
@@ -10344,11 +10389,23 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
           if (have_open_vulkan_key_light) {
+            auto &key_light_breaker =
+                optional_breaker(OptionalEffectSlot::relight);
+            if (!key_light_breaker.AllowsAttempt(capture_sequence))
+              return;
             std::string vk_err;
             if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
               ++open_vulkan_runtime_failure_frames;
-              std::lock_guard<std::mutex> lock(mu_);
-              last_error_ = "Open Vulkan virtual key light failed: " + vk_err;
+              ++open_vulkan_vb.key_light_effect_counters.runtime_failure_frames;
+              if (open_vulkan_vb.kernels.device() &&
+                  open_vulkan_vb.kernels.device()->health().health ==
+                      studiocast::vulkan::VulkanContextHealth::device_lost) {
+                ++open_vulkan_vb.key_light_effect_counters.device_loss_frames;
+              }
+              block_optional_effect(
+                  OptionalEffectSlot::relight, stage_id, "open_vulkan",
+                  OpenVulkanVirtualKeyLightRuntimeFailure(vk_err),
+                  capture_sequence);
               return;
             }
 
@@ -10358,6 +10415,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                      : &open_vulkan_vb.frame_rgb;
             }
 
+            const std::uint64_t key_light_failures_before =
+                open_vulkan_vb.key_light_effect_counters.runtime_failure_frames;
+            const std::uint64_t key_light_device_losses_before =
+                open_vulkan_vb.key_light_effect_counters.device_loss_frames;
             if (open_vulkan_key_light.ApplyVulkanRgb(
                     *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
                     &vk_err, &deferred_gpu_out)) {
@@ -10378,24 +10439,50 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       studiocast::video::effects::contract::kEffectIdAutoFrame);
               if (defer_readback) {
                 have_deferred_gpu_out = true;
+                clear_optional_effect_on_success(key_light_breaker,
+                                                 capture_sequence);
                 return;
               }
               if (keep_gpu_for_auto_frame) {
+                clear_optional_effect_on_success(key_light_breaker,
+                                                 capture_sequence);
                 return;
               }
               std::string down_err;
               if (!download_open_vulkan_current_to_cpu(&down_err)) {
                 ++open_vulkan_runtime_failure_frames;
-                std::lock_guard<std::mutex> lock(mu_);
-                last_error_ =
-                    "Open Vulkan virtual key light failed: " + down_err;
+                ++open_vulkan_vb.key_light_effect_counters
+                      .runtime_failure_frames;
+                if (open_vulkan_vb.kernels.device() &&
+                    open_vulkan_vb.kernels.device()->health().health ==
+                        studiocast::vulkan::VulkanContextHealth::device_lost) {
+                  ++open_vulkan_vb.key_light_effect_counters.device_loss_frames;
+                }
+                block_optional_effect(
+                    OptionalEffectSlot::relight, stage_id, "open_vulkan",
+                    OpenVulkanVirtualKeyLightRuntimeFailure(down_err),
+                    capture_sequence);
+              } else {
+                clear_optional_effect_on_success(key_light_breaker,
+                                                 capture_sequence);
               }
               return;
             }
 
             ++open_vulkan_runtime_failure_frames;
-            std::lock_guard<std::mutex> lock(mu_);
-            last_error_ = "Open Vulkan virtual key light failed: " + vk_err;
+            if (open_vulkan_vb.key_light_effect_counters
+                    .runtime_failure_frames == key_light_failures_before) {
+              ++open_vulkan_vb.key_light_effect_counters.runtime_failure_frames;
+            }
+            if (open_vulkan_vb.kernels.device() &&
+                open_vulkan_vb.kernels.device()->health().health ==
+                    studiocast::vulkan::VulkanContextHealth::device_lost &&
+                open_vulkan_vb.key_light_effect_counters.device_loss_frames ==
+                    key_light_device_losses_before) {
+              ++open_vulkan_vb.key_light_effect_counters.device_loss_frames;
+            }
+            block_optional_effect(OptionalEffectSlot::relight, stage_id,
+                                  "open_vulkan", vk_err, capture_sequence);
             return;
           }
 #endif
@@ -12695,7 +12782,23 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       open_vulkan_transfers_.composite_dispatch_calls =
           open_vulkan_vb.composite_dispatch_calls;
       open_vulkan_transfers_.key_light_dispatch_calls =
-          open_vulkan_vb.key_light_dispatch_calls;
+          open_vulkan_vb.key_light_effect_counters.dispatch_calls;
+      open_vulkan_transfers_.virtual_key_light_shared_matte_reuse_calls =
+          open_vulkan_vb.key_light_effect_counters.shared_matte_reuse_calls;
+      open_vulkan_transfers_
+          .virtual_key_light_independent_matte_inference_calls =
+          open_vulkan_vb.key_light_effect_counters
+              .independent_matte_inference_calls;
+      open_vulkan_transfers_.virtual_key_light_passthrough_frames =
+          open_vulkan_vb.key_light_effect_counters.passthrough_frames;
+      open_vulkan_transfers_.virtual_key_light_alpha_readback_calls =
+          open_vulkan_vb.key_light_effect_counters.alpha_readback_calls;
+      open_vulkan_transfers_.virtual_key_light_cpu_fallback_calls =
+          open_vulkan_vb.key_light_effect_counters.cpu_fallback_calls;
+      open_vulkan_transfers_.virtual_key_light_runtime_failure_frames =
+          open_vulkan_vb.key_light_effect_counters.runtime_failure_frames;
+      open_vulkan_transfers_.virtual_key_light_device_loss_frames =
+          open_vulkan_vb.key_light_effect_counters.device_loss_frames;
       open_vulkan_transfers_.crop_resize_dispatch_calls =
           open_vulkan_vb.crop_resize_dispatch_calls;
       open_vulkan_transfers_.vignette_dispatch_calls =

@@ -859,6 +859,88 @@ bool TestVulkanVirtualBackgroundReplaceDebugCounters() {
                 "replace device loss counter should be published");
 }
 
+bool TestVulkanVirtualKeyLightDebugCounters() {
+  ScopedEnvironmentVariable debug("STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS",
+                                  "1");
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  auto &vk = videoStatus.pipeline.open_vulkan_transfers;
+  vk.key_light_dispatch_calls = 89;
+  vk.virtual_key_light_shared_matte_reuse_calls = 97;
+  vk.virtual_key_light_independent_matte_inference_calls = 101;
+  vk.virtual_key_light_passthrough_frames = 103;
+  vk.virtual_key_light_alpha_readback_calls = 107;
+  vk.virtual_key_light_cpu_fallback_calls = 109;
+  vk.virtual_key_light_runtime_failure_frames = 113;
+  vk.virtual_key_light_device_loss_frames = 127;
+
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(
+          StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                       std::filesystem::path("/tmp/studiocastd-test.sock"),
+                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                       /*loopbackJson=*/""),
+          &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *pipeline =
+      ObjectAt(*video, "pipeline", "video.pipeline should exist");
+  if (!pipeline)
+    return false;
+  const JsonObject *debugCounters =
+      ObjectAt(*pipeline, "open_vulkan_transfers",
+               "Open Vulkan debug transfer counters should exist");
+  if (!debugCounters)
+    return false;
+
+  return Expect(JsonNumberField(*debugCounters, "key_light_dispatch_calls",
+                                -1.0) == 89.0,
+                "key-light dispatch counter should be published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_shared_matte_reuse_calls",
+                                -1.0) == 97.0,
+                "key-light reuse counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_key_light_independent_matte_inference_calls",
+                    -1.0) == 101.0,
+                "key-light independent inference counter should be "
+                "published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_passthrough_frames",
+                                -1.0) == 103.0,
+                "key-light pass-through counter should be published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_alpha_readback_calls",
+                                -1.0) == 107.0,
+                "key-light alpha readback counter should be published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_cpu_fallback_calls",
+                                -1.0) == 109.0,
+                "key-light CPU fallback counter should be published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_runtime_failure_frames",
+                                -1.0) == 113.0,
+                "key-light runtime failure counter should be published") &&
+         Expect(JsonNumberField(*debugCounters,
+                                "virtual_key_light_device_loss_frames",
+                                -1.0) == 127.0,
+                "key-light device loss counter should be published");
+}
+
 bool TestVideoConfigMapsComputeBackendPreference() {
   studiocast::config::DaemonConfig daemonConfig;
   daemonConfig.video_compute_backend = "cuda";
@@ -1306,6 +1388,7 @@ int main() {
   ok = TestVulkanVirtualBackgroundBlurDebugCounters() && ok;
   ok = TestVulkanVirtualBackgroundRemoveDebugCounters() && ok;
   ok = TestVulkanVirtualBackgroundReplaceDebugCounters() && ok;
+  ok = TestVulkanVirtualKeyLightDebugCounters() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestPersistentVulkanAdapterConfigAndStatus() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;

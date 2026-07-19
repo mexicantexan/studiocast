@@ -683,6 +683,135 @@ bool TestVirtualBackgroundReplaceUsesTheCanonicalResidentWrapper() {
   return ok;
 }
 
+bool TestVirtualKeyLightUsesTheCanonicalResidentWrapper() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::string setup = Section(pipeline, "// Virtual Key Light.",
+                                    "// If key light couldn't be initialized");
+  const std::string live =
+      Section(pipeline, "if (have_open_vulkan_key_light) {",
+              "if (have_open_cuda_key_light)");
+  const std::string key_light_context = Section(
+      pipeline, "struct OpenVulkanKeyLightContext", "} open_vulkan_key_light;");
+  const std::string matting_context =
+      Section(pipeline, "struct OpenVulkanVirtualBackgroundContext",
+              "} open_vulkan_vb;");
+  const std::string reuse_check =
+      Section(matting_context, "bool HasCompatibleFrameAlpha(",
+              "bool EnsureInitialized(");
+  bool ok =
+      Require(!setup.empty() && !live.empty() && !key_light_context.empty() &&
+                  !matting_context.empty() && !reuse_check.empty(),
+              "Vulkan key-light setup/live resident sections are "
+              "missing");
+  ok &= Require(
+      Contains(setup, "open_vulkan_key_light.EnsureInitialized") &&
+          Contains(setup, "OpenVulkanVirtualKeyLightInitializationFailure") &&
+          Contains(setup, "remove_stage_from_plan(stage_id)") &&
+          Contains(setup, "set_backend(stage_id, \"open_vulkan\")"),
+      "key-light setup must publish the backend only after shared "
+      "matting/wrapper readiness and retain a stable outer failure");
+  ok &= Require(
+      Contains(key_light_context, "key_light_effect.EnsureInitialized") &&
+          Contains(key_light_context, "key_light_effect.Apply") &&
+          Contains(key_light_context, "HasCompatibleFrameAlpha") &&
+          Contains(key_light_context, "inference_count_before") &&
+          Contains(key_light_context, "resize_count_before") &&
+          Contains(key_light_context, "reused_same_frame") &&
+          Contains(key_light_context, "independently_inferred") &&
+          !Contains(key_light_context, ".ApplyKeyLightU8x3") &&
+          !Contains(key_light_context, "GetAlphaCpuForFrame") &&
+          !Contains(key_light_context, "ReadbackF32_1") &&
+          !Contains(key_light_context, "require_cpu_alpha_readback"),
+      "canonical live key light must route only through its wrapper, classify "
+      "exact same-frame reuse versus independent inference, and own no CPU "
+      "alpha path");
+  ok &= Require(
+      Contains(reuse_check,
+               "IsOpenVulkanVirtualKeyLightSameFrameArtifactCompatible") &&
+          Contains(reuse_check, "&alpha_model") &&
+          Contains(reuse_check, "alpha_model.buffer()") &&
+          Contains(reuse_check, "alpha_resized.context_identity()") &&
+          Contains(reuse_check, "alpha_resized.device_local()"),
+      "same-frame reuse must reject stale, foreign, incompatible, or tampered "
+      "artifact handles instead of trusting a cache-key hit alone");
+  ok &= Require(
+      Contains(live, "OptionalEffectSlot::relight") &&
+          Contains(live, "key_light_breaker.AllowsAttempt") &&
+          Contains(live, "key_light_failures_before") &&
+          Contains(live, "key_light_device_losses_before") &&
+          Contains(live, "VulkanContextHealth::device_lost") &&
+          Contains(live, "block_optional_effect(") &&
+          Contains(live, "clear_optional_effect_on_success") &&
+          Contains(live, "OpenVulkanVirtualKeyLightRuntimeFailure"),
+      "Vulkan key-light setup/transport/runtime failures must be isolated to "
+      "the relight breaker, classified by device health, and avoid counter "
+      "double-counting");
+
+  const std::string wrapper = ReadFile(root / "src" / "core" / "video" /
+                                       "open_vulkan_virtual_key_light.cpp");
+  const std::string wrapper_header = ReadFile(
+      root / "src" / "core" / "video" / "open_vulkan_virtual_key_light.h");
+  ok &= Require(
+      Contains(wrapper, "std::clamp(intensity_percent, 0, 100)") &&
+          Contains(wrapper, "std::clamp(direction_pan_degrees, -90, 90)") &&
+          Contains(wrapper, "target_g = 242.0f") &&
+          Contains(wrapper, "target_b = 228.0f") &&
+          Contains(wrapper, "target_r = 228.0f") &&
+          Contains(wrapper, "runtime.inference_count") &&
+          Contains(wrapper, "runtime.completion_count") &&
+          Contains(wrapper, "runtime.cpu_readback_count != 0") &&
+          Contains(wrapper, "artifact->key == key") &&
+          Contains(wrapper, "key.provider_id == \"open_vulkan\"") &&
+          Contains(wrapper, "key.model_id == active_model_id") &&
+          Contains(wrapper, "FrameMatteStorage::device_f32_alpha") &&
+          Contains(wrapper, "key.device_context == device_context") &&
+          Contains(wrapper, "key.stream == queue") &&
+          Contains(wrapper, "artifact->handle == expected_object_handle") &&
+          Contains(wrapper, "artifact->aux_handle == expected_buffer_handle") &&
+          Contains(wrapper, "non-mapped DEVICE_LOCAL") &&
+          Contains(wrapper, "parameters_.passthrough()") &&
+          Contains(wrapper, "ApplyKeyLightU8x3") &&
+          !Contains(wrapper, ".Invalidate(") &&
+          !Contains(wrapper, "ReadbackF32_1") &&
+          Contains(wrapper_header,
+                   "vulkan_virtual_key_light_initialization_failed") &&
+          Contains(wrapper_header, "vulkan_virtual_key_light_runtime_failed") &&
+          Contains(wrapper_header, "alpha_readback_calls = 0") &&
+          Contains(wrapper_header, "cpu_fallback_calls = 0"),
+      "key-light wrapper must enforce exact parity/current "
+      "matting/device-local "
+      "contracts, true zero-intensity pass-through, stable reasons, and zero "
+      "CPU/readback behavior");
+
+  const std::string ordering =
+      ReadFile(root / "src" / "core" / "video" / "effects" /
+               "broadcast_effect_rules.cpp");
+  const std::size_t vb = ordering.find("if (enable_virtual_background)");
+  const std::size_t key = ordering.find("if (enable_key_light)", vb);
+  const std::size_t frame = ordering.find("if (enable_auto_frame)", key);
+  ok &= Require(vb != std::string::npos && key != std::string::npos &&
+                    frame != std::string::npos && vb < key && key < frame,
+                "canonical ordering must remain virtual background, key "
+                "light, then Auto Frame for same-frame matte reuse");
+
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+  ok &= Require(
+      Contains(daemon, "virtual_key_light_shared_matte_reuse_calls") &&
+          Contains(daemon,
+                   "virtual_key_light_independent_matte_inference_calls") &&
+          Contains(daemon, "virtual_key_light_passthrough_frames") &&
+          Contains(daemon, "virtual_key_light_alpha_readback_calls") &&
+          Contains(daemon, "virtual_key_light_cpu_fallback_calls") &&
+          Contains(daemon, "virtual_key_light_runtime_failure_frames") &&
+          Contains(daemon, "virtual_key_light_device_loss_frames"),
+      "debug diagnostics must expose key-light reuse, independent inference, "
+      "pass-through, zero-host-tail, runtime, and device-loss counters");
+  return ok;
+}
+
 bool TestDefaultMattingDiagnosticsRemainFailClosed() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string diagnostics = ReadFile(root / "src" / "core" / "vulkan" /
@@ -832,6 +961,7 @@ int main() {
   ok = TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() && ok;
   ok = TestVirtualBackgroundRemoveUsesTheCanonicalResidentWrapper() && ok;
   ok = TestVirtualBackgroundReplaceUsesTheCanonicalResidentWrapper() && ok;
+  ok = TestVirtualKeyLightUsesTheCanonicalResidentWrapper() && ok;
   ok = TestDefaultMattingDiagnosticsRemainFailClosed() && ok;
   ok = TestAutoFrameDegradedPathRemainsExplicit() && ok;
   return ok ? 0 : 1;
