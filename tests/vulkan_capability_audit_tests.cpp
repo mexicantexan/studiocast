@@ -421,6 +421,125 @@ bool TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() {
   return ok;
 }
 
+bool TestVirtualBackgroundRemoveUsesTheCanonicalResidentWrapper() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::string setup = Section(pipeline, "// Background effects.",
+                                    "// Auto Frame.");
+  const std::string live = Section(
+      pipeline,
+      "if (stage_id == studiocast::video::effects::contract::\n"
+      "                            kEffectIdVirtualBackgroundBlur ||",
+      "if (have_maxine_bg_blur)");
+  const std::string vulkan_context = Section(
+      pipeline, "struct OpenVulkanVirtualBackgroundContext",
+      "} open_vulkan_vb;");
+  const std::string resident_remove = Section(
+      vulkan_context,
+      "else if (fx.virtual_background.mode == VirtualBackgroundMode::remove)",
+      "else if (fx.virtual_background.mode == VirtualBackgroundMode::replace)");
+  const std::string matting_setup =
+      Section(vulkan_context,
+              "bool EnsureInitialized(\n        int frame_w, int frame_h",
+              "bool EnsureReplaceBackgroundGpu");
+  bool ok = Require(!setup.empty() && !live.empty() &&
+                        !vulkan_context.empty() && !resident_remove.empty() &&
+                        !matting_setup.empty(),
+                    "Vulkan remove setup/live resident sections are missing");
+  ok &= Require(
+      Contains(setup, "open_vulkan_vb.EnsureInitialized") &&
+          Contains(
+              setup,
+              "OpenVulkanVirtualBackgroundRemoveInitializationFailure") &&
+          Contains(setup, "remove_stage_from_plan(*vb_effect_id)"),
+      "remove setup must retain the stage only after shared matting/wrapper "
+      "readiness and publish a stable outer failure");
+  ok &= Require(
+      Contains(resident_remove, "remove_effect.Apply") &&
+          Contains(resident_remove, "matting_session->Readiness()") &&
+          Contains(resident_remove, "cached_frame_alpha_sequence") &&
+          Contains(resident_remove, "alpha_resize_completion_count") &&
+          !Contains(resident_remove, "BoxBlurSeparableF32_1") &&
+          !Contains(resident_remove, "CompositeAlphaSolidU8x3") &&
+          !Contains(resident_remove, "ParseRgbHex") &&
+          !Contains(resident_remove, "Readback") &&
+          !Contains(resident_remove, "Cpu"),
+      "canonical live remove mode must route the complete resident chain only "
+      "through its effect wrapper with current matte evidence");
+  ok &= Require(
+      Contains(live, "is_vulkan_remove") &&
+          Contains(live, "is_wrapped_vulkan_vb") &&
+          Contains(live, "vulkan_vb_breaker.AllowsAttempt") &&
+          Contains(live, "block_optional_effect(") &&
+          Contains(live, "clear_optional_effect_on_success") &&
+          Contains(live, "OpenVulkanVirtualBackgroundRemoveRuntimeFailure"),
+      "Vulkan remove runtime failures must use the existing bounded breaker "
+      "and stable effect reason instead of retrying every frame");
+
+  const std::string readback_allocation = Section(
+      matting_setup, "if (require_cpu_alpha_readback)",
+      "if (require_vb_buffers)");
+  ok &= Require(
+      !readback_allocation.empty() &&
+          Contains(readback_allocation, "alpha_readback") &&
+          Contains(pipeline, "/*require_cpu_alpha_readback=*/true") &&
+          !Contains(resident_remove, "require_cpu_alpha_readback"),
+      "host alpha staging must remain explicit Auto Frame-only setup and must "
+      "not appear in remove");
+  const std::string resident_allocations = Section(
+      matting_setup, "if (!EnsureImage(&frame_rgb", "if (cached_bg_dst_w");
+  ok &= Require(!resident_allocations.empty() &&
+                    !Contains(resident_allocations, "LatchExternalFailure") &&
+                    !Contains(resident_allocations,
+                              "matting_failure_latched = true"),
+                "remove consumer/scratch allocation failures must not poison "
+                "shared matting consumers");
+
+  const std::string wrapper = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_virtual_background_remove.cpp");
+  const std::string wrapper_header = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_virtual_background_remove.h");
+  ok &= Require(
+      Contains(wrapper, "VulkanMattingReadiness") &&
+          Contains(wrapper, "runtime.inference_count == 0") &&
+          Contains(wrapper, "runtime.completion_count") &&
+          Contains(wrapper, "runtime.cpu_readback_count != 0") &&
+          Contains(wrapper, "VulkanPixelFormat::rgb_u8") &&
+          Contains(wrapper, "non-mapped DEVICE_LOCAL") &&
+          Contains(wrapper,
+                   "images[left]->buffer() == images[right]->buffer()") &&
+          Contains(wrapper, "BoxBlurSeparableF32_1") &&
+          Contains(wrapper, "CompositeAlphaSolidU8x3") &&
+          !Contains(wrapper, ".Invalidate(") &&
+          !Contains(wrapper, "ReadbackF32_1") &&
+          Contains(wrapper_header,
+                   "vulkan_virtual_background_remove_initialization_failed") &&
+          Contains(wrapper_header,
+                   "vulkan_virtual_background_remove_runtime_failed") &&
+          Contains(wrapper_header, "alpha_readback_calls = 0") &&
+          Contains(wrapper_header, "cpu_fallback_calls = 0"),
+      "remove wrapper must enforce current matting, exact RGB/device-local "
+      "scratch, alias, stable reason, and zero CPU/readback contracts");
+
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+  ok &= Require(
+      Contains(daemon, "virtual_background_remove_dispatch_calls") &&
+          Contains(daemon,
+                   "virtual_background_remove_alpha_readback_calls") &&
+          Contains(daemon, "virtual_background_remove_cpu_fallback_calls") &&
+          Contains(daemon,
+                   "virtual_background_remove_runtime_failure_frames") &&
+          Contains(daemon,
+                   "virtual_background_remove_device_loss_frames"),
+      "debug diagnostics must expose remove dispatch, zero-host-tail, runtime, "
+      "and device-loss counters");
+  return ok;
+}
+
 bool TestDefaultMattingDiagnosticsRemainFailClosed() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string diagnostics = ReadFile(root / "src" / "core" / "vulkan" /
@@ -568,6 +687,7 @@ int main() {
   ok = TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() && ok;
+  ok = TestVirtualBackgroundRemoveUsesTheCanonicalResidentWrapper() && ok;
   ok = TestDefaultMattingDiagnosticsRemainFailClosed() && ok;
   ok = TestAutoFrameDegradedPathRemainsExplicit() && ok;
   return ok ? 0 : 1;
