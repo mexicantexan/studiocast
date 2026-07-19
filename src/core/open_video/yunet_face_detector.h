@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/onnx/ort_session.h"
@@ -12,6 +13,32 @@
 #include "core/open_video/model_pack_registry.h"
 
 namespace studiocast::open_video {
+
+inline constexpr std::string_view kYunetTensorGeometryMismatchReason =
+    "vulkan_auto_frame_yunet_tensor_geometry_mismatch";
+inline constexpr std::string_view kYunetProviderPolicyViolationReason =
+    "vulkan_auto_frame_yunet_provider_policy_violation";
+inline constexpr std::string_view kYunetWarmupFailedReason =
+    "vulkan_auto_frame_yunet_warmup_failed";
+
+enum class YunetProviderPolicy {
+  // Existing Open Video/Open CUDA behavior: prefer CUDA EP and allow the
+  // canonical ORT wrapper to fall back to CPU.
+  prefer_cuda,
+  // Explicit Open Vulkan behavior: CPUExecutionProvider only. A Vulkan effect
+  // must never silently run analysis on CUDA/TensorRT or another GPU/device.
+  cpu_only,
+};
+
+const char *YunetProviderPolicyName(YunetProviderPolicy policy);
+studiocast::onnx::OrtSessionOptions
+YunetOrtSessionOptions(YunetProviderPolicy policy);
+
+// Validates the graph's first input against the manifest/runtime contract.
+// Fixed graph dimensions must match exactly; dynamic dimensions are accepted.
+bool ValidateYunetInputTensorContract(
+    const std::vector<int64_t> &graph_shape, bool manifest_nhwc,
+    int manifest_width, int manifest_height, std::string *error);
 
 struct FaceDetectionRuntimeStatus {
   bool uses_cpu_preprocess = true;
@@ -22,6 +49,10 @@ struct FaceDetectionRuntimeStatus {
   bool cuda_ep_active = false;
   bool cuda_ep_cpu_tensor_io_active = false;
   bool cpu_only_session_active = false;
+  bool warmup_complete = false;
+
+  std::string provider_policy;
+  std::string reason_code;
 
   std::string summary;
 };
@@ -50,8 +81,9 @@ public:
   // Loads a suitable YuNet model pack and creates an ORT session.
   // Safe to call multiple times. If requested_model_id is empty, the registry
   // default is used.
-  bool EnsureInitialized(const std::string &requested_model_id,
-                         std::string *error);
+  bool EnsureInitialized(
+      const std::string &requested_model_id, std::string *error,
+      YunetProviderPolicy provider_policy = YunetProviderPolicy::prefer_cuda);
 
   // Ensures cache->face_detections is populated for the given capture_sequence.
   //
@@ -62,7 +94,9 @@ public:
                                 std::size_t stride,
                                 const std::string &requested_model_id,
                                 std::uint64_t capture_sequence,
-                                FrameAnalysisCache *cache, std::string *error);
+                                FrameAnalysisCache *cache, std::string *error,
+                                YunetProviderPolicy provider_policy =
+                                    YunetProviderPolicy::prefer_cuda);
 
   bool available() const { return initialized_; }
   const std::string &active_model_id() const { return active_model_id_; }
@@ -72,6 +106,7 @@ private:
   struct Settings {
     int input_w = 320;
     int input_h = 320;
+    bool input_nhwc = false;
     float score_threshold = 0.9f;
     float nms_threshold = 0.3f;
     int top_k = 5000;
@@ -86,7 +121,11 @@ private:
   };
 
   bool initialized_ = false;
+  bool warmed_ = false;
   bool input_is_nhwc_ = false;
+  YunetProviderPolicy active_provider_policy_ =
+      YunetProviderPolicy::prefer_cuda;
+  std::string last_reason_code_;
 
   std::string active_model_id_;
   std::string active_requested_model_id_;
@@ -118,6 +157,7 @@ private:
   bool LoadSettingsFromManifest(const std::filesystem::path &manifest_path,
                                 std::string *error);
   bool BuildBindings(std::string *error);
+  bool Warmup(std::string *error);
 
   static Letterbox ComputeLetterbox(int src_w, int src_h, int dst_w, int dst_h);
   void FillInputTensorBgr(const std::uint8_t *rgb, int src_w, int src_h,

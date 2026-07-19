@@ -338,14 +338,75 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
   const std::string auto_frame =
       Section(pipeline, "// Auto Frame.", "// Virtual Key Light.");
   bool ok = Require(!auto_frame.empty(), "Auto Frame setup section missing");
-  ok &= Require(Contains(auto_frame, "CPU face tracking; Vulkan"),
-                "Vulkan Auto Frame CPU face-tracking tail changed; audit "
-                "required");
-  ok &=
-      Require(Contains(auto_frame, "CPU tracking tail and Vulkan"),
-              "Vulkan Auto Frame matte tracking tail changed; audit required");
+  ok &= Require(
+      Contains(auto_frame, "vulkan_auto_frame_cpu_face_tracking_tail") &&
+          Contains(auto_frame,
+                   "vulkan_auto_frame_cpu_crop_plan_smoothing_tail"),
+      "Vulkan Auto Frame CPU face/crop-plan tails changed; audit required");
+  ok &= Require(
+      Contains(auto_frame,
+               "vulkan_auto_frame_matte_alpha_readback_cpu_box_tail"),
+      "Vulkan Auto Frame matte readback/CPU-box tail changed; audit required");
+  ok &= Require(
+      Contains(auto_frame, "YunetProviderPolicy::cpu_only"),
+      "explicit Vulkan Auto Frame must force the CPU-only YuNet provider");
   ok &= Require(Contains(auto_frame, "set_backend(stage_id, \"open_vulkan\")"),
                 "Vulkan Auto Frame is no longer connected to the live backend");
+  const std::size_t setup_call =
+      auto_frame.find("open_vulkan_auto_frame.EnsureInitialized");
+  const std::size_t have_stage =
+      auto_frame.find("have_open_vulkan_auto_frame = true", setup_call);
+  const std::size_t set_backend =
+      auto_frame.find("set_backend(stage_id, \"open_vulkan\")", have_stage);
+  const std::size_t remove_stage =
+      auto_frame.find("remove_stage_from_plan(stage_id)", set_backend);
+  ok &= Require(setup_call != std::string::npos &&
+                    have_stage != std::string::npos &&
+                    set_backend != std::string::npos &&
+                    remove_stage != std::string::npos &&
+                    setup_call < have_stage && have_stage < set_backend &&
+                    set_backend < remove_stage,
+                "Vulkan Auto Frame must publish the backend only after setup "
+                "success and remove the stage on tracking+matting failure");
+  ok &= Require(
+      Contains(auto_frame, "OpenVulkanAutoFrameFaceProviderFailure(fd_err)") &&
+          Contains(auto_frame, "[vulkan_backend_disabled]"),
+      "Auto Frame setup failures must expose a stable outer effect reason and "
+      "nested provider/backend cause");
+
+  const std::string wrapper = ReadFile(
+      root / "src" / "core" / "video" / "open_vulkan_auto_frame.cpp");
+  ok &= Require(Contains(wrapper, "production_hardware_ready") &&
+                    Contains(wrapper, "CropResizeBilinear") &&
+                    Contains(wrapper, "vulkan_resource_foreign_context") &&
+                    Contains(wrapper, "vulkan_device_lost"),
+                "canonical Auto Frame wrapper must enforce production shared "
+                "context, crop dispatch, ownership, and device-loss evidence");
+
+  const std::string live_context =
+      Section(pipeline, "struct OpenVulkanAutoFrameContext",
+              "} open_vulkan_auto_frame;");
+  ok &= Require(
+      Contains(live_context, "OpenVulkanAutoFrameReuseKeyResetReason") &&
+          Contains(live_context, "production_crop.ApplyCrop") &&
+          !Contains(live_context, ".CropResizeBilinear"),
+      "the live Auto Frame context must use the reset/reuse contract and route "
+      "crop/resize only through the canonical production wrapper");
+
+  const std::size_t cache_begin =
+      pipeline.find("open_video_cache.BeginFrame(capture_sequence)");
+  const std::size_t preupload_face = pipeline.find(
+      "YunetProviderPolicy::cpu_only", cache_begin);
+  const std::size_t upload = pipeline.find(
+      "ensure_open_vulkan_current_from_cpu(&vk_err)", preupload_face);
+  const std::size_t canonical_crop = pipeline.find("production_crop.ApplyCrop");
+  ok &= Require(cache_begin != std::string::npos &&
+                    preupload_face != std::string::npos &&
+                    upload != std::string::npos &&
+                    canonical_crop != std::string::npos &&
+                    cache_begin < preupload_face && preupload_face < upload,
+                "Auto Frame must analyze the original host capture before "
+                "the one Vulkan upload and use the canonical crop wrapper");
   return ok;
 }
 

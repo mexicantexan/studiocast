@@ -15,6 +15,14 @@ namespace studiocast::open_video {
 
 namespace {
 
+std::string StableFailure(std::string_view code, std::string_view detail) {
+  std::string out = "[";
+  out += code;
+  out += "] ";
+  out += detail;
+  return out;
+}
+
 // Helper to pick a "best" model id from a list of candidates.
 // Our curated packs follow a *_fp32 / *_int8bq / *_int8 naming scheme.
 std::string PickPreferredModelId(const std::vector<std::string> &model_ids) {
@@ -62,11 +70,90 @@ JsonObject(const util::json::Value::Object &obj, const std::string &key) {
   return it->second.AsObject();
 }
 
+const util::json::Value::Array *
+JsonArray(const util::json::Value::Object &obj, const std::string &key) {
+  auto it = obj.find(key);
+  if (it == obj.end())
+    return nullptr;
+  return it->second.AsArray();
+}
+
+std::optional<std::string> JsonString(const util::json::Value::Object &obj,
+                                      const std::string &key) {
+  auto it = obj.find(key);
+  if (it == obj.end())
+    return std::nullopt;
+  if (const std::string *s = it->second.AsString())
+    return *s;
+  return std::nullopt;
+}
+
 } // namespace
+
+const char *YunetProviderPolicyName(YunetProviderPolicy policy) {
+  switch (policy) {
+  case YunetProviderPolicy::cpu_only:
+    return "cpu_only";
+  case YunetProviderPolicy::prefer_cuda:
+  default:
+    return "prefer_cuda";
+  }
+}
+
+studiocast::onnx::OrtSessionOptions
+YunetOrtSessionOptions(YunetProviderPolicy policy) {
+  studiocast::onnx::OrtSessionOptions opts;
+  opts.prefer_cuda = policy == YunetProviderPolicy::prefer_cuda;
+  opts.enable_tensorrt = false;
+  opts.cuda_device_id = 0;
+  return opts;
+}
+
+bool ValidateYunetInputTensorContract(
+    const std::vector<int64_t> &graph_shape, bool manifest_nhwc,
+    int manifest_width, int manifest_height, std::string *error) {
+  if (error)
+    error->clear();
+  auto fail = [&](std::string detail) {
+    if (error) {
+      *error = StableFailure(kYunetTensorGeometryMismatchReason, detail);
+    }
+    return false;
+  };
+  if (manifest_width <= 0 || manifest_height <= 0) {
+    return fail("YuNet manifest input geometry is missing or invalid");
+  }
+  if (graph_shape.size() != 4) {
+    return fail("YuNet graph input must have rank 4");
+  }
+  const std::size_t channel_index = manifest_nhwc ? 3u : 1u;
+  const std::size_t height_index = manifest_nhwc ? 1u : 2u;
+  const std::size_t width_index = manifest_nhwc ? 2u : 3u;
+  if (graph_shape[0] > 0 && graph_shape[0] != 1) {
+    return fail("YuNet graph batch dimension must be 1");
+  }
+  if (graph_shape[channel_index] > 0 && graph_shape[channel_index] != 3) {
+    return fail("YuNet graph channel dimension must be 3");
+  }
+  const int64_t graph_width = graph_shape[width_index];
+  const int64_t graph_height = graph_shape[height_index];
+  if ((graph_width > 0 && graph_width != manifest_width) ||
+      (graph_height > 0 && graph_height != manifest_height)) {
+    std::ostringstream oss;
+    oss << "YuNet graph input is fixed at " << graph_width << "x"
+        << graph_height << " but model.json declares " << manifest_width
+        << "x" << manifest_height;
+    return fail(oss.str());
+  }
+  return true;
+}
 
 void YunetFaceDetector::Reset() {
   initialized_ = false;
+  warmed_ = false;
   input_is_nhwc_ = false;
+  active_provider_policy_ = YunetProviderPolicy::prefer_cuda;
+  last_reason_code_.clear();
   settings_ = Settings{};
   active_model_id_.clear();
   active_requested_model_id_.clear();
@@ -87,6 +174,9 @@ FaceDetectionRuntimeStatus YunetFaceDetector::runtime_status() const {
   s.cuda_ep_active = session_ != nullptr && session_info_.using_cuda;
   s.cuda_ep_cpu_tensor_io_active = s.cuda_ep_active;
   s.cpu_only_session_active = session_ != nullptr && !session_info_.using_cuda;
+  s.warmup_complete = warmed_;
+  s.provider_policy = YunetProviderPolicyName(active_provider_policy_);
+  s.reason_code = last_reason_code_;
 
   if (s.cuda_ep_cpu_tensor_io_active) {
     s.summary =
@@ -139,6 +229,19 @@ bool YunetFaceDetector::LoadSettingsFromManifest(
   if (!onnx)
     return true;
 
+  if (const auto *inputs = JsonArray(*onnx, "inputs")) {
+    if (!inputs->empty()) {
+      if (const auto *input = (*inputs)[0].AsObject()) {
+        if (auto w = JsonNumber(*input, "width"))
+          settings_.input_w = static_cast<int>(*w);
+        if (auto h = JsonNumber(*input, "height"))
+          settings_.input_h = static_cast<int>(*h);
+        if (auto layout = JsonString(*input, "layout"))
+          settings_.input_nhwc = *layout == "nhwc";
+      }
+    }
+  }
+
   if (const auto *pre = JsonObject(*onnx, "preprocess")) {
     if (auto w = JsonNumber(*pre, "width"))
       settings_.input_w = static_cast<int>(*w);
@@ -180,8 +283,17 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
     return false;
   }
 
+  std::string geometry_error;
+  if (!ValidateYunetInputTensorContract(
+          session_info_.input_shapes[0], settings_.input_nhwc,
+          settings_.input_w, settings_.input_h, &geometry_error)) {
+    if (error)
+      *error = geometry_error;
+    return false;
+  }
+
   // Determine input layout.
-  input_is_nhwc_ = false;
+  input_is_nhwc_ = settings_.input_nhwc;
   const auto &ishape = session_info_.input_shapes[0];
   if (ishape.size() == 4) {
     if (ishape[3] == 3) {
@@ -260,7 +372,9 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
         nhwc = false;
     }
 
-    if (nhwc) {
+    if (declared_shape.size() == 3 && declared_shape[2] == channels) {
+      ob.shape = {1, static_cast<int64_t>(rows) * cols, channels};
+    } else if (nhwc) {
       ob.shape = {1, rows, cols, channels};
     } else {
       ob.shape = {1, channels, rows, cols};
@@ -315,13 +429,52 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
   return true;
 }
 
+bool YunetFaceDetector::Warmup(std::string *error) {
+  if (error)
+    error->clear();
+  if (!session_) {
+    if (error)
+      *error = StableFailure(kYunetWarmupFailedReason,
+                             "YuNet ORT session is not initialized");
+    return false;
+  }
+  studiocast::onnx::OrtSession::RunInput input;
+  input.name = session_info_.input_names[0].c_str();
+  input.data = input_tensor_.data();
+  input.num_floats = input_tensor_.size();
+  input.shape = input_shape_.data();
+  input.shape_rank = input_shape_.size();
+
+  std::vector<studiocast::onnx::OrtSession::RunOutput> outputs;
+  outputs.reserve(outputs_.size());
+  for (auto &binding : outputs_) {
+    outputs.push_back(studiocast::onnx::OrtSession::RunOutput{
+        binding.name.c_str(), binding.data.data(), binding.data.size(),
+        binding.shape.data(), binding.shape.size()});
+  }
+  session_->ReserveRunScratch(1, outputs.size());
+  std::string run_error;
+  if (!session_->RunCpu(&input, 1, outputs.data(), outputs.size(), &run_error)) {
+    if (error) {
+      *error = StableFailure(
+          kYunetWarmupFailedReason,
+          run_error.empty() ? "YuNet setup warm-up failed" : run_error);
+    }
+    return false;
+  }
+  warmed_ = true;
+  return true;
+}
+
 bool YunetFaceDetector::EnsureInitialized(const std::string &requested_model_id,
-                                          std::string *error) {
+                                          std::string *error,
+                                          YunetProviderPolicy provider_policy) {
   if (error)
     error->clear();
 
   if (initialized_ && session_ &&
-      requested_model_id == active_requested_model_id_) {
+      requested_model_id == active_requested_model_id_ &&
+      provider_policy == active_provider_policy_) {
     return true;
   }
 
@@ -340,7 +493,8 @@ bool YunetFaceDetector::EnsureInitialized(const std::string &requested_model_id,
   const std::string model_id = requested_model_id.empty()
                                    ? PickPreferredModelId(it->second)
                                    : requested_model_id;
-  if (initialized_ && model_id == active_model_id_) {
+  if (initialized_ && model_id == active_model_id_ &&
+      provider_policy == active_provider_policy_) {
     registry_ = std::move(reg);
     active_requested_model_id_ = requested_model_id;
     return true;
@@ -379,9 +533,8 @@ bool YunetFaceDetector::EnsureInitialized(const std::string &requested_model_id,
   std::string settings_err;
   (void)LoadSettingsFromManifest(pack->manifest_path, &settings_err);
 
-  studiocast::onnx::OrtSessionOptions opts;
-  opts.prefer_cuda = true;
-  opts.cuda_device_id = 0;
+  const studiocast::onnx::OrtSessionOptions opts =
+      YunetOrtSessionOptions(provider_policy);
   std::string ort_err;
   auto sess = studiocast::onnx::OrtSession::Create(model_path, opts,
                                                    &session_info_, &ort_err);
@@ -394,19 +547,55 @@ bool YunetFaceDetector::EnsureInitialized(const std::string &requested_model_id,
   }
 
   session_ = std::move(sess);
+  active_provider_policy_ = provider_policy;
   active_model_id_ = model_id;
   active_requested_model_id_ = requested_model_id;
   active_model_path_ = model_path;
 
   std::string bind_err;
   if (!BuildBindings(&bind_err)) {
+    const bool geometry_mismatch =
+        bind_err.find(std::string(kYunetTensorGeometryMismatchReason)) !=
+        std::string::npos;
     if (error)
       *error = bind_err;
     Reset();
+    active_provider_policy_ = provider_policy;
+    if (geometry_mismatch)
+      last_reason_code_ = std::string(kYunetTensorGeometryMismatchReason);
+    return false;
+  }
+
+  if (provider_policy == YunetProviderPolicy::cpu_only &&
+      (session_info_.using_cuda || session_info_.using_tensorrt ||
+       session_info_.active_provider != "cpu")) {
+    const std::string provider = session_info_.active_provider.empty()
+                                     ? "unknown"
+                                     : session_info_.active_provider;
+    if (error) {
+      *error = StableFailure(kYunetProviderPolicyViolationReason,
+                             "explicit Vulkan requested CPU-only YuNet but "
+                             "ORT activated provider '" +
+                                 provider + "'");
+    }
+    Reset();
+    active_provider_policy_ = provider_policy;
+    last_reason_code_ = std::string(kYunetProviderPolicyViolationReason);
+    return false;
+  }
+
+  std::string warmup_error;
+  if (!Warmup(&warmup_error)) {
+    if (error)
+      *error = warmup_error;
+    Reset();
+    active_provider_policy_ = provider_policy;
+    last_reason_code_ = std::string(kYunetWarmupFailedReason);
     return false;
   }
 
   initialized_ = true;
+  last_reason_code_.clear();
   return true;
 }
 
@@ -573,7 +762,8 @@ float YunetFaceDetector::IoU(const FaceDetection &a, const FaceDetection &b) {
 bool YunetFaceDetector::EnsureDetectionsForFrame(
     const std::uint8_t *rgb, int width, int height, std::size_t stride,
     const std::string &requested_model_id, std::uint64_t capture_sequence,
-    FrameAnalysisCache *cache, std::string *error) {
+    FrameAnalysisCache *cache, std::string *error,
+    YunetProviderPolicy provider_policy) {
   if (error)
     error->clear();
   if (!cache) {
@@ -588,7 +778,7 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
   }
 
   std::string init_err;
-  if (!EnsureInitialized(requested_model_id, &init_err)) {
+  if (!EnsureInitialized(requested_model_id, &init_err, provider_policy)) {
     if (error)
       *error = init_err;
     return false;
@@ -646,8 +836,12 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
     const auto &bbox = outputs_[static_cast<std::size_t>(bbox_idx_[s])];
     const auto &kps = outputs_[static_cast<std::size_t>(kps_idx_[s])];
 
-    const bool bbox_nhwc = (bbox.shape.size() == 4 && bbox.shape[3] == 4);
-    const bool kps_nhwc = (kps.shape.size() == 4 && kps.shape[3] == 10);
+    const bool bbox_nhwc =
+        (bbox.shape.size() == 4 && bbox.shape[3] == 4) ||
+        (bbox.shape.size() == 3 && bbox.shape[2] == 4);
+    const bool kps_nhwc =
+        (kps.shape.size() == 4 && kps.shape[3] == 10) ||
+        (kps.shape.size() == 3 && kps.shape[2] == 10);
 
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < cols; ++c) {
