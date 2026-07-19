@@ -17,9 +17,8 @@ bool Expect(bool condition, const std::string &message) {
 }
 
 bool TestFirstUseDoesSetupWork() {
-  const auto d =
-      DecideOpenVulkanMattingSetup(OpenVulkanMattingSetupSnapshot{}, 1280, 720,
-                                   "");
+  const auto d = DecideOpenVulkanMattingSetup(OpenVulkanMattingSetupSnapshot{},
+                                              1280, 720, "");
   return Expect(d.scan_model_registry, "first use should scan registry") &&
          Expect(d.recreate_session, "first use should create session") &&
          Expect(d.initialize_session, "first use should initialize session") &&
@@ -63,13 +62,14 @@ bool TestModelIdChangeTriggersSetupWork() {
       DecideOpenVulkanMattingSetup(state, 1280, 720, "birefnet_lite");
   return Expect(d.scan_model_registry,
                 "model id change should scan model registry") &&
-         Expect(d.recreate_session, "model id change should recreate session") &&
+         Expect(d.recreate_session,
+                "model id change should recreate session") &&
          Expect(d.initialize_session,
                 "model id change should initialize session") &&
          Expect(d.warmup_session, "model id change should warm session");
 }
 
-bool TestFrameSizeChangeOnlyRefreshesSession() {
+bool TestFrameSizeChangeDoesNotRepeatRuntimeSetup() {
   OpenVulkanMattingSetupSnapshot state;
   state.has_model_pack = true;
   state.has_matting_session = true;
@@ -85,9 +85,54 @@ bool TestFrameSizeChangeOnlyRefreshesSession() {
                 "frame size change should not scan model registry") &&
          Expect(!d.recreate_session,
                 "frame size change should not recreate session") &&
-         Expect(d.initialize_session,
-                "frame size change should initialize session") &&
-         Expect(d.warmup_session, "frame size change should warm session");
+         Expect(!d.initialize_session,
+                "frame size change should reuse fixed model tensors") &&
+         Expect(!d.warmup_session,
+                "frame size change should not repeat warmup");
+}
+
+bool TestContextGenerationChangeRecreatesWithoutRegistryScan() {
+  OpenVulkanMattingSetupSnapshot state;
+  state.has_model_pack = true;
+  state.has_matting_session = true;
+  state.session_initialized = true;
+  state.session_warmed = true;
+  state.active_model_id = "ncnn-matting";
+  state.active_requested_model_id = "";
+  state.session_context_id = 17;
+  state.session_context_generation = 2;
+  state.current_context_id = 17;
+  state.current_context_generation = 3;
+
+  const auto d = DecideOpenVulkanMattingSetup(state, 1280, 720, "");
+  return Expect(!d.scan_model_registry,
+                "context change should reuse validated model pack") &&
+         Expect(d.recreate_session,
+                "context generation change must recreate session") &&
+         Expect(d.initialize_session && d.warmup_session,
+                "new context must initialize and warm once");
+}
+
+bool TestLatchedFailureIsReusedUntilContractChanges() {
+  OpenVulkanMattingSetupSnapshot state;
+  state.failure_latched = true;
+  state.active_requested_model_id = "ncnn-matting";
+  state.session_context_id = 17;
+  state.session_context_generation = 2;
+  state.current_context_id = 17;
+  state.current_context_generation = 2;
+
+  const auto stable =
+      DecideOpenVulkanMattingSetup(state, 1280, 720, "ncnn-matting");
+  const auto changed =
+      DecideOpenVulkanMattingSetup(state, 1280, 720, "other-matting");
+  return Expect(stable.reuse_latched_failure,
+                "stable failure must be reused without frame-loop retry") &&
+         Expect(!stable.scan_model_registry && !stable.recreate_session &&
+                    !stable.initialize_session && !stable.warmup_session,
+                "latched failure reuse must do no setup work") &&
+         Expect(!changed.reuse_latched_failure && changed.scan_model_registry,
+                "model contract change may retry setup");
 }
 
 bool TestRepeatedFrameProcessingKeepsSetupCountersStable() {
@@ -164,11 +209,19 @@ bool TestOpenVulkanMattingModelIdChangeTriggersSetupWork() {
 }
 
 bool TestOpenVulkanMattingFrameSizeChangeOnlyRefreshesSession() {
-  return TestFrameSizeChangeOnlyRefreshesSession();
+  return TestFrameSizeChangeDoesNotRepeatRuntimeSetup();
 }
 
 bool TestOpenVulkanMattingRepeatedFrameProcessingKeepsSetupCountersStable() {
   return TestRepeatedFrameProcessingKeepsSetupCountersStable();
+}
+
+bool TestOpenVulkanMattingContextGenerationChangeRecreatesSession() {
+  return TestContextGenerationChangeRecreatesWithoutRegistryScan();
+}
+
+bool TestOpenVulkanMattingLatchedFailureIsReused() {
+  return TestLatchedFailureIsReusedUntilContractChanges();
 }
 
 } // namespace studiocast::tests

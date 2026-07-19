@@ -321,6 +321,36 @@ bool TestDefaultMattingDiagnosticsRemainFailClosed() {
       Require(Contains(default_diagnostics, "BlockOpenVulkanVirtualBackground"),
               "default diagnostics no longer block virtual background; "
               "audit required");
+  ok &= Require(
+      Contains(default_diagnostics, "ApplyOpenVulkanMattingReadiness") &&
+          Contains(diagnostics, "EvaluateVulkanMattingReadiness") &&
+          Contains(diagnostics, "matting_reason_code"),
+      "default diagnostics must consume the shared matting "
+      "readiness verdict and stable reason evidence");
+  ok &= Require(
+      !Contains(diagnostics, "ValidateProductionNcnnVulkanMattingPack") &&
+          Contains(diagnostics, "facts.contract_validated = false"),
+      "polled diagnostics must not hash artifacts or infer live contract "
+      "validation");
+  const std::string matting_session =
+      ReadFile(root / "src" / "core" / "open_video" /
+               "vulkan_matting_session.cpp");
+  const std::string camera_pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  ok &= Require(
+      Contains(matting_session, "ValidateProductionNcnnVulkanMattingPack") &&
+          !Contains(camera_pipeline,
+                    "ValidateProductionNcnnVulkanMattingPack"),
+      "artifact hashing must remain solely at memoized live-session "
+      "validation, not model selection");
+  ok &= Require(
+      Contains(default_diagnostics, "d.blocked_reason = d.fallback_reason") &&
+          Contains(default_diagnostics, "BlockOpenVulkanVirtualBackground(&d, "
+                                        "d.blocked_reason.c_str())") &&
+          Contains(default_diagnostics,
+                   "d.blocked_reason = d.matting_reason_code"),
+      "base Vulkan failures must retain blocker precedence while healthy "
+      "utility kernels defer to the shared matting blocker");
 
   const std::string blocker = Section(
       diagnostics, "void BlockOpenVulkanVirtualBackground", "} // namespace");
@@ -360,22 +390,21 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
       auto_frame.find("set_backend(stage_id, \"open_vulkan\")", have_stage);
   const std::size_t remove_stage =
       auto_frame.find("remove_stage_from_plan(stage_id)", set_backend);
-  ok &= Require(setup_call != std::string::npos &&
-                    have_stage != std::string::npos &&
-                    set_backend != std::string::npos &&
-                    remove_stage != std::string::npos &&
-                    setup_call < have_stage && have_stage < set_backend &&
-                    set_backend < remove_stage,
-                "Vulkan Auto Frame must publish the backend only after setup "
-                "success and remove the stage on tracking+matting failure");
+  ok &= Require(
+      setup_call != std::string::npos && have_stage != std::string::npos &&
+          set_backend != std::string::npos &&
+          remove_stage != std::string::npos && setup_call < have_stage &&
+          have_stage < set_backend && set_backend < remove_stage,
+      "Vulkan Auto Frame must publish the backend only after setup "
+      "success and remove the stage on tracking+matting failure");
   ok &= Require(
       Contains(auto_frame, "OpenVulkanAutoFrameFaceProviderFailure(fd_err)") &&
           Contains(auto_frame, "[vulkan_backend_disabled]"),
       "Auto Frame setup failures must expose a stable outer effect reason and "
       "nested provider/backend cause");
 
-  const std::string wrapper = ReadFile(
-      root / "src" / "core" / "video" / "open_vulkan_auto_frame.cpp");
+  const std::string wrapper =
+      ReadFile(root / "src" / "core" / "video" / "open_vulkan_auto_frame.cpp");
   ok &= Require(Contains(wrapper, "production_hardware_ready") &&
                     Contains(wrapper, "CropResizeBilinear") &&
                     Contains(wrapper, "vulkan_resource_foreign_context") &&
@@ -395,18 +424,17 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
 
   const std::size_t cache_begin =
       pipeline.find("open_video_cache.BeginFrame(capture_sequence)");
-  const std::size_t preupload_face = pipeline.find(
-      "YunetProviderPolicy::cpu_only", cache_begin);
+  const std::size_t preupload_face =
+      pipeline.find("YunetProviderPolicy::cpu_only", cache_begin);
   const std::size_t upload = pipeline.find(
       "ensure_open_vulkan_current_from_cpu(&vk_err)", preupload_face);
   const std::size_t canonical_crop = pipeline.find("production_crop.ApplyCrop");
-  ok &= Require(cache_begin != std::string::npos &&
-                    preupload_face != std::string::npos &&
-                    upload != std::string::npos &&
-                    canonical_crop != std::string::npos &&
-                    cache_begin < preupload_face && preupload_face < upload,
-                "Auto Frame must analyze the original host capture before "
-                "the one Vulkan upload and use the canonical crop wrapper");
+  ok &= Require(
+      cache_begin != std::string::npos && preupload_face != std::string::npos &&
+          upload != std::string::npos && canonical_crop != std::string::npos &&
+          cache_begin < preupload_face && preupload_face < upload,
+      "Auto Frame must analyze the original host capture before "
+      "the one Vulkan upload and use the canonical crop wrapper");
   return ok;
 }
 

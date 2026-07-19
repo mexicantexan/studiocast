@@ -16,7 +16,7 @@ option(STUDIOCAST_ENABLE_OPEN_VULKAN "Enable Open Vulkan backend (runtime-loaded
 option(STUDIOCAST_ENABLE_NCNN_SPIKE "Build experimental ncnn Vulkan matting spike tool" OFF)
 option(STUDIOCAST_REQUIRE_NCNN "Fail configure when the ncnn spike is enabled but ncnn is unavailable" OFF)
 option(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
-       "Enable production device-resident ncnn Vulkan matting (requires Open Vulkan and Vulkan-enabled ncnn)"
+       "Enable ncnn Vulkan matting build prerequisites (does not imply production readiness; requires Open Vulkan and Vulkan-enabled ncnn)"
        OFF)
 
 set(_studiocast_default_open_audio OFF)

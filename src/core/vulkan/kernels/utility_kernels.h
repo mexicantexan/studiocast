@@ -104,6 +104,14 @@ public:
   bool ResizeBilinearF32_1(const VulkanImage &src, const VulkanImage &dst,
                            std::string *error_out);
 
+  // Explicit degraded CPU-tail seam. Copies a device-local, non-mapped alpha
+  // image into one caller-owned reusable host-visible staging image, waits for
+  // completion, invalidates the staging memory, and copies exactly
+  // width*height floats into preallocated CPU storage.
+  bool ReadbackF32_1(const VulkanImage &src,
+                     const VulkanImage &readback_staging, float *dst,
+                     std::size_t dst_count, std::string *error_out);
+
   bool BoxBlurSeparableU8x3(const VulkanImage &src, const VulkanImage &tmp,
                             const VulkanImage &dst, int radius,
                             std::string *error_out);

@@ -794,9 +794,46 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   AppendJsonStringMap(&oss, blocked_effects);
   oss << ",";
   oss << "\"matting_runtime\":\"" << JsonEscape(matting_runtime) << "\",";
+  oss << "\"matting_build_enabled\":" << BoolJson(matting_build_enabled) << ",";
+  oss << "\"matting_adapter_available\":" << BoolJson(matting_adapter_available)
+      << ",";
+  oss << "\"matting_model_pack_selected\":"
+      << BoolJson(matting_model_pack_selected) << ",";
+  oss << "\"matting_model_contract_validated\":"
+      << BoolJson(matting_model_contract_validated) << ",";
+  oss << "\"matting_production_ready\":" << BoolJson(matting_production_ready)
+      << ",";
+  oss << "\"matting_reason_code\":\"" << JsonEscape(matting_reason_code)
+      << "\",";
+  oss << "\"matting_blocker_code\":\"" << JsonEscape(matting_blocker_code)
+      << "\",";
+  oss << "\"matting_detail\":\"" << JsonEscape(matting_detail) << "\",";
   oss << "\"matting_runtime_created\":" << BoolJson(matting_runtime_created)
       << ",";
   oss << "\"matting_graph_loaded\":" << BoolJson(matting_graph_loaded) << ",";
+  oss << "\"matting_warmup_complete\":" << BoolJson(matting_warmup_complete)
+      << ",";
+  oss << "\"matting_cpu_layers_used\":" << BoolJson(matting_cpu_layers_used)
+      << ",";
+  oss << "\"matting_shared_device_imported\":"
+      << BoolJson(matting_shared_device_imported) << ",";
+  oss << "\"matting_queue_ownership_explicit\":"
+      << BoolJson(matting_queue_ownership_explicit) << ",";
+  oss << "\"matting_synchronous_completion\":"
+      << BoolJson(matting_synchronous_completion) << ",";
+  oss << "\"matting_bounded_reusable_allocations\":"
+      << BoolJson(matting_bounded_reusable_allocations) << ",";
+  oss << "\"matting_persistent_allocation_count\":"
+      << matting_persistent_allocation_count << ",";
+  oss << "\"matting_dynamic_allocation_count\":"
+      << matting_dynamic_allocation_count << ",";
+  oss << "\"matting_cpu_readback_count\":" << matting_cpu_readback_count << ",";
+  oss << "\"matting_warmup_inference_count\":" << matting_warmup_inference_count
+      << ",";
+  oss << "\"matting_inference_count\":" << matting_inference_count << ",";
+  oss << "\"matting_completion_count\":" << matting_completion_count << ",";
+  oss << "\"matting_context_id\":" << matting_context_id << ",";
+  oss << "\"matting_context_generation\":" << matting_context_generation << ",";
   oss << "\"input_device_resident\":" << BoolJson(input_device_resident) << ",";
   oss << "\"alpha_device_resident\":" << BoolJson(alpha_device_resident) << ",";
   oss << "\"output_device_resident\":" << BoolJson(output_device_resident)

@@ -41,6 +41,12 @@ public:
   VkDeviceMemory memory() const { return memory_; }
   VkDeviceSize size() const { return size_; }
   void *mapped() const { return mapped_; }
+  bool device_local() const {
+    return (memory_property_flags_ & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+  }
+  bool host_visible() const {
+    return (memory_property_flags_ & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+  }
 
   bool Flush(std::string *error_out) const;
   bool Invalidate(std::string *error_out) const;
@@ -54,6 +60,7 @@ private:
   VkDeviceSize size_ = 0;
   VkDeviceSize allocation_size_ = 0;
   void *mapped_ = nullptr;
+  VkFlags memory_property_flags_ = 0;
 };
 
 class VulkanImage {
@@ -82,6 +89,8 @@ public:
   VkDeviceMemory memory() const { return storage_.memory(); }
   VkDeviceSize byte_size() const { return storage_.size(); }
   void *mapped() const { return storage_.mapped(); }
+  bool device_local() const { return storage_.device_local(); }
+  bool host_visible() const { return storage_.host_visible(); }
   int width() const { return width_; }
   int height() const { return height_; }
   VulkanPixelFormat format() const { return format_; }

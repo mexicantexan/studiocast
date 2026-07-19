@@ -68,11 +68,12 @@ bool VulkanTensor::AllocateNchwF32(VulkanDevice *device, int n_in, int c_in,
     return false;
 
   const VkFlags required_memory_flags =
-      map_memory ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : 0u;
+      map_memory ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
   const VkFlags preferred_memory_flags =
       map_memory ? (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                 : 0u;
   if (!storage_.Allocate(device, static_cast<VkDeviceSize>(size.bytes),
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |

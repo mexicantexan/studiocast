@@ -121,6 +121,8 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
   size_ = size;
   allocation_size_ = req.size;
   mapped_ = mapped;
+  memory_property_flags_ =
+      device->memory_properties().memoryTypes[memory_type].propertyFlags;
   return true;
 }
 
@@ -142,6 +144,7 @@ void VulkanBuffer::Free() noexcept {
   context->ReleaseAllocation(allocation_size_);
   size_ = 0;
   allocation_size_ = 0;
+  memory_property_flags_ = 0;
   device_ = nullptr;
   context_identity_ = {};
   context_.reset();
@@ -235,11 +238,12 @@ bool VulkanImage::Allocate(VulkanDevice *device, int width, int height,
   const std::size_t pixels = w * h;
   const VkDeviceSize bytes = static_cast<VkDeviceSize>(pixels * bpp);
   const VkFlags required_memory_flags =
-      map_memory ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : 0u;
+      map_memory ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
   const VkFlags preferred_memory_flags =
       map_memory ? (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                 : 0u;
   if (!storage_.Allocate(device, bytes,
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |

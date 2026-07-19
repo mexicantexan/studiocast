@@ -12,6 +12,7 @@ using studiocast::open_vulkan::VulkanMattingBufferBinding;
 using studiocast::open_vulkan::VulkanMattingDeviceContext;
 using studiocast::open_vulkan::VulkanMattingGraphDescriptor;
 using studiocast::open_vulkan::VulkanMattingPersistentResources;
+using studiocast::open_vulkan::VulkanMattingReadinessInput;
 using studiocast::open_vulkan::VulkanMattingRuntime;
 using studiocast::open_vulkan::VulkanMattingRuntimeEvidence;
 using studiocast::open_vulkan::VulkanMattingRuntimeFailure;
@@ -35,6 +36,11 @@ VulkanMattingDeviceContext Device() {
   device.device_id = 0x1234;
   device.selected_device_index = 1;
   device.stable_device_id = "v1:8086:1234:integrated:test";
+  device.context_id = 11;
+  device.context_generation = 3;
+  device.non_cpu_device_selected = true;
+  device.compute_queue_available = true;
+  device.context_healthy = true;
   return device;
 }
 
@@ -76,6 +82,11 @@ VulkanMattingBufferBinding InputBinding() {
   binding.h = 2;
   binding.w = 3;
   binding.device_resident = true;
+  binding.device_local_memory = true;
+  binding.context_id = Device().context_id;
+  binding.context_generation = Device().context_generation;
+  binding.access_synchronized = true;
+  binding.runtime_queue_ownership = true;
   return binding;
 }
 
@@ -90,6 +101,11 @@ VulkanMattingBufferBinding AlphaBinding() {
   binding.h = 2;
   binding.w = 3;
   binding.device_resident = true;
+  binding.device_local_memory = true;
+  binding.context_id = Device().context_id;
+  binding.context_generation = Device().context_generation;
+  binding.access_synchronized = true;
+  binding.runtime_queue_ownership = true;
   return binding;
 }
 
@@ -110,12 +126,30 @@ struct FakeState {
   bool cpu_layers_used = false;
   bool identity_matches = true;
   bool residency_proven = true;
+  bool shared_device_imported = true;
+  bool queue_ownership_explicit = true;
+  bool synchronous_completion = true;
+  bool bounded_reusable_allocations = true;
+  std::uint64_t persistent_allocation_count = 4;
+  std::uint64_t dynamic_allocation_count = 0;
+  std::uint64_t cpu_readback_count = 0;
+  bool mutate_allocations_on_run = false;
 };
 
 class FakeRuntime final : public VulkanMattingRuntime {
 public:
   explicit FakeRuntime(FakeState *state) : state_(state) {
     evidence_.runtime_name = "fake-ncnn-vulkan";
+    evidence_.adapter_available = true;
+    evidence_.production_adapter = true;
+    evidence_.shared_device_imported = state_->shared_device_imported;
+    evidence_.queue_ownership_explicit = state_->queue_ownership_explicit;
+    evidence_.synchronous_completion = state_->synchronous_completion;
+    evidence_.bounded_reusable_allocations =
+        state_->bounded_reusable_allocations;
+    evidence_.persistent_allocation_count = state_->persistent_allocation_count;
+    evidence_.dynamic_allocation_count = state_->dynamic_allocation_count;
+    evidence_.cpu_readback_count = state_->cpu_readback_count;
   }
 
   VulkanMattingRuntimeResult
@@ -158,15 +192,20 @@ public:
     if (state_->warmup_failure != VulkanMattingRuntimeFailure::none)
       return Failure(state_->warmup_failure);
     evidence_.warmup_complete = true;
+    ++evidence_.warmup_inference_count;
+    ++evidence_.completion_count;
     return VulkanMattingRuntimeResult::Success();
   }
 
-  VulkanMattingRuntimeResult
-  Run(const VulkanMattingBufferBinding &,
-      const VulkanMattingBufferBinding &) override {
+  VulkanMattingRuntimeResult Run(const VulkanMattingBufferBinding &,
+                                 const VulkanMattingBufferBinding &) override {
     ++state_->run_calls;
     if (state_->run_failure != VulkanMattingRuntimeFailure::none)
       return Failure(state_->run_failure);
+    ++evidence_.inference_count;
+    ++evidence_.completion_count;
+    if (state_->mutate_allocations_on_run)
+      ++evidence_.persistent_allocation_count;
     return VulkanMattingRuntimeResult::Success();
   }
 
@@ -193,7 +232,8 @@ bool TestLifecycleDoesSetupAndWarmupExactlyOnce() {
       std::make_unique<FakeRuntime>(&state));
   std::string error;
   if (!Expect(PrepareAndWarm(&lifecycle, &error), error) ||
-      !Expect(lifecycle.Prepare(Device(), Graph(), Resources(), &error), error) ||
+      !Expect(lifecycle.Prepare(Device(), Graph(), Resources(), &error),
+              error) ||
       !Expect(lifecycle.Warmup(&error), error)) {
     return false;
   }
@@ -207,7 +247,8 @@ bool TestLifecycleDoesSetupAndWarmupExactlyOnce() {
                 "persistent allocation must run once") &&
          Expect(state.warmup_calls == 1, "warmup must run once") &&
          Expect(state.run_calls == 5, "run count mismatch") &&
-         Expect(lifecycle.available(), "successful lifecycle must be available");
+         Expect(lifecycle.available(),
+                "successful lifecycle must be available");
 }
 
 bool TestCpuLayersAreRejected() {
@@ -251,6 +292,192 @@ bool TestResidencyMustBeProven() {
          Expect(lifecycle.latched_failure() ==
                     VulkanMattingRuntimeFailure::residency_check_failed,
                 "residency classification missing");
+}
+
+bool TestCpuReadbackIsRejected() {
+  FakeState state;
+  state.cpu_readback_count = 1;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  return Expect(!lifecycle.Prepare(Device(), Graph(), Resources(), &error),
+                "CPU readback evidence must fail setup") &&
+         Expect(lifecycle.latched_failure() ==
+                    VulkanMattingRuntimeFailure::cpu_readback_rejected,
+                "CPU readback rejection classification missing");
+}
+
+bool TestUnsynchronizedBindingIsRejected() {
+  FakeState state;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  if (!Expect(PrepareAndWarm(&lifecycle, &error), error))
+    return false;
+  auto input = InputBinding();
+  input.access_synchronized = false;
+  return Expect(!lifecycle.Run(input, AlphaBinding(), &error),
+                "unsynchronized binding must fail") &&
+         Expect(lifecycle.latched_failure() ==
+                    VulkanMattingRuntimeFailure::synchronization_failed,
+                "synchronization failure classification missing") &&
+         Expect(state.run_calls == 0,
+                "runtime must not receive unsynchronized bindings");
+}
+
+bool TestHostMappedBindingIsNotDeviceResidentEvidence() {
+  FakeState state;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  if (!Expect(PrepareAndWarm(&lifecycle, &error), error))
+    return false;
+  auto alpha = AlphaBinding();
+  alpha.host_mapped = true;
+  return Expect(!lifecycle.Run(InputBinding(), alpha, &error),
+                "host-mapped alpha must fail the device-residency gate") &&
+         Expect(lifecycle.latched_failure() ==
+                    VulkanMattingRuntimeFailure::residency_check_failed,
+                "host-mapped alpha must be classified as unproven "
+                "residency") &&
+         Expect(state.run_calls == 0,
+                "runtime must not receive a host-mapped alpha binding");
+}
+
+bool TestContextGenerationMismatchIsRejected() {
+  FakeState state;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  if (!Expect(PrepareAndWarm(&lifecycle, &error), error))
+    return false;
+  auto alpha = AlphaBinding();
+  ++alpha.context_generation;
+  return Expect(!lifecycle.Run(InputBinding(), alpha, &error),
+                "stale context generation must fail") &&
+         Expect(lifecycle.latched_failure() ==
+                    VulkanMattingRuntimeFailure::context_generation_mismatch,
+                "context generation mismatch classification missing") &&
+         Expect(state.run_calls == 0,
+                "runtime must not receive a stale context binding");
+}
+
+bool TestWarmupFailureLatchesWithoutRetry() {
+  FakeState state;
+  state.warmup_failure = VulkanMattingRuntimeFailure::execution_failed;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  if (!Expect(lifecycle.Prepare(Device(), Graph(), Resources(), &error), error))
+    return false;
+  std::string first_error;
+  if (!Expect(!lifecycle.Warmup(&first_error),
+              "injected warmup failure must fail")) {
+    return false;
+  }
+  std::string second_error;
+  return Expect(!lifecycle.Warmup(&second_error),
+                "latched warmup failure must reject retry") &&
+         Expect(state.warmup_calls == 1,
+                "latched warmup failure must not retry") &&
+         Expect(first_error == second_error,
+                "warmup failure text must remain stable");
+}
+
+bool TestPersistentAllocationMutationIsRejected() {
+  FakeState state;
+  state.mutate_allocations_on_run = true;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  return Expect(PrepareAndWarm(&lifecycle, &error), error) &&
+         Expect(!lifecycle.Run(InputBinding(), AlphaBinding(), &error),
+                "persistent allocation mutation must fail") &&
+         Expect(lifecycle.latched_failure() ==
+                    VulkanMattingRuntimeFailure::allocation_contract_failed,
+                "allocation mutation classification missing");
+}
+
+bool TestProductionReadinessRequiresAllEvidence() {
+  FakeState state;
+  VulkanMattingRuntimeLifecycle lifecycle(
+      std::make_unique<FakeRuntime>(&state));
+  std::string error;
+  if (!Expect(PrepareAndWarm(&lifecycle, &error), error))
+    return false;
+
+  VulkanMattingReadinessInput input;
+  input.production_build_enabled = true;
+  input.production_adapter_available = true;
+  input.model_pack_selected = true;
+  input.model_contract_validated = true;
+  input.non_cpu_device_selected = true;
+  input.compute_queue_available = true;
+  input.context_healthy = true;
+  input.session_initialized = true;
+  input.session_warmed = true;
+  input.runtime = lifecycle.Evidence();
+  auto readiness =
+      studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  if (!Expect(readiness.production_ready,
+              "complete affirmative evidence should be ready")) {
+    return false;
+  }
+  input.runtime.cpu_readback_count = 1;
+  readiness = studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  return Expect(!readiness.production_ready,
+                "CPU readback evidence must revoke readiness") &&
+         Expect(
+             readiness.blocker_code ==
+                 studiocast::open_vulkan::kOpenVulkanMattingCpuReadbackReason,
+             "readiness must expose stable CPU readback blocker");
+}
+
+bool TestDisabledProductionFactoryHasStableBlocker() {
+  VulkanMattingReadinessInput input;
+  input.model_pack_selected = true;
+  input.model_contract_validated = true;
+  input.production_build_enabled =
+      studiocast::open_vulkan::ProductionVulkanMattingBuildEnabled();
+  const auto readiness =
+      studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  const std::string expected_blocker =
+      input.production_build_enabled
+          ? studiocast::open_vulkan::kOpenVulkanMattingAdapterUnavailableReason
+          : studiocast::open_vulkan::kOpenVulkanMattingBuildDisabledReason;
+  return Expect(!readiness.production_ready,
+                "disabled build must remain blocked") &&
+         Expect(
+             readiness.reason_code ==
+                 studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason,
+             "outer matting blocker must remain stable") &&
+         Expect(readiness.blocker_code == expected_blocker,
+                "production factory blocker must be exact");
+}
+
+bool TestHardwareFactsDoNotOverrideMissingModelOrAdapter() {
+  VulkanMattingReadinessInput input;
+  input.production_build_enabled = true;
+  input.production_adapter_available = true;
+  input.non_cpu_device_selected = true;
+  input.compute_queue_available = true;
+  input.context_healthy = true;
+  auto readiness =
+      studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  if (!Expect(
+          readiness.blocker_code ==
+              studiocast::open_vulkan::kOpenVulkanMattingModelUnavailableReason,
+          "valid Vulkan hardware must not imply a matting model")) {
+    return false;
+  }
+  input.model_pack_selected = true;
+  input.model_contract_validated = true;
+  input.production_adapter_available = false;
+  readiness = studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  return Expect(
+      readiness.blocker_code ==
+          studiocast::open_vulkan::kOpenVulkanMattingAdapterUnavailableReason,
+      "valid Vulkan hardware must not imply a production adapter");
 }
 
 bool TestForeignAndInvalidBindingsFailBeforeRuntime() {
@@ -358,6 +585,15 @@ int main() {
   ok = TestCpuLayersAreRejected() && ok;
   ok = TestDeviceIdentityMismatchIsRejected() && ok;
   ok = TestResidencyMustBeProven() && ok;
+  ok = TestCpuReadbackIsRejected() && ok;
+  ok = TestUnsynchronizedBindingIsRejected() && ok;
+  ok = TestHostMappedBindingIsNotDeviceResidentEvidence() && ok;
+  ok = TestContextGenerationMismatchIsRejected() && ok;
+  ok = TestWarmupFailureLatchesWithoutRetry() && ok;
+  ok = TestPersistentAllocationMutationIsRejected() && ok;
+  ok = TestProductionReadinessRequiresAllEvidence() && ok;
+  ok = TestDisabledProductionFactoryHasStableBlocker() && ok;
+  ok = TestHardwareFactsDoNotOverrideMissingModelOrAdapter() && ok;
   ok = TestForeignAndInvalidBindingsFailBeforeRuntime() && ok;
   ok = TestNamedFatalFailuresLatchWithoutRetry() && ok;
   ok = TestInvalidPersistentAllocationShapeLatchesBeforeRuntime() && ok;

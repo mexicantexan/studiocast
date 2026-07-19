@@ -2665,7 +2665,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       cached_matte_valid = false;
       cached_alpha_cpu_sequence = 0;
       cached_alpha_cpu_valid = false;
-      alpha_cpu.clear();
       matte_artifacts.ClearArtifacts();
       ClearMatteArtifactKeys();
 
@@ -3552,6 +3551,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool matting_session_warmed = false;
     int matting_session_frame_w = 0;
     int matting_session_frame_h = 0;
+    bool matting_failure_latched = false;
+    std::uint64_t matting_session_context_id = 0;
+    std::uint64_t matting_session_context_generation = 0;
 
     studiocast::vulkan::kernels::UtilityKernels kernels;
     std::optional<studiocast::open_video::ModelPack> model_pack;
@@ -3565,6 +3567,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::vulkan::VulkanImage frame_rgb;      // rgb_u8, WxH
     studiocast::vulkan::VulkanImage out_rgb;        // rgb_u8, WxH
     studiocast::vulkan::VulkanImage alpha_model;    // f32_1, model WxH
+    studiocast::vulkan::VulkanImage alpha_readback; // mapped staging, model WxH
     studiocast::vulkan::VulkanImage alpha_resized;  // f32_1, frame WxH
     studiocast::vulkan::VulkanImage alpha_tmp;      // f32_1, frame WxH
     studiocast::vulkan::VulkanImage alpha_feather;  // f32_1, frame WxH
@@ -3648,12 +3651,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       matting_session_warmed = false;
       matting_session_frame_w = 0;
       matting_session_frame_h = 0;
+      matting_failure_latched = false;
+      matting_session_context_id = 0;
+      matting_session_context_generation = 0;
     }
 
     void FreeImages() {
       frame_rgb.Free();
       out_rgb.Free();
       alpha_model.Free();
+      alpha_readback.Free();
       alpha_resized.Free();
       alpha_tmp.Free();
       alpha_feather.Free();
@@ -3696,10 +3703,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       if (image->Valid() && image->width() == width &&
           image->height() == height && image->format() == format &&
-          (!map_memory || image->mapped() != nullptr)) {
+          (map_memory ? image->mapped() != nullptr
+                      : image->mapped() == nullptr) &&
+          (map_memory || image->device_local())) {
         return true;
       }
       std::string err;
+      kernels.InvalidateDescriptorBindingCacheForSetup();
       if (!image->Allocate(kernels.device(), width, height, format, map_memory,
                            &err)) {
         if (error_out)
@@ -3789,15 +3799,41 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         const std::string &requested_model_id) const {
       if (!requested_model_id.empty())
         return requested_model_id;
-      if (registry.Find("matting", "modnet-webnn-256-fp32"))
+
+      const auto is_production_candidate = [&](const std::string &id) {
+        const auto candidate = registry.Find("matting", id);
+        return candidate && candidate->ncnn_vulkan.has_value();
+      };
+      if (is_production_candidate("modnet-webnn-256-fp32"))
         return "modnet-webnn-256-fp32";
-      if (registry.Find("matting", "birefnet_lite"))
+      if (is_production_candidate("birefnet_lite"))
         return "birefnet_lite";
       for (const auto &m : registry.ListModels()) {
-        if (m.task == "matting")
+        if (m.task == "matting" && is_production_candidate(m.id))
           return m.id;
       }
       return {};
+    }
+
+    std::string MattingReadinessError(bool model_selected,
+                                      bool model_validated) const {
+      studiocast::open_vulkan::VulkanMattingReadinessInput input;
+      input.production_build_enabled =
+          studiocast::open_vulkan::ProductionVulkanMattingBuildEnabled();
+      input.production_adapter_available =
+          studiocast::open_vulkan::ProductionVulkanMattingAdapterAvailable();
+      input.model_pack_selected = model_selected;
+      input.model_contract_validated = model_validated;
+      if (kernels.device()) {
+        const auto diagnostics = kernels.device()->DiagnosticsSnapshot();
+        input.non_cpu_device_selected = diagnostics.non_cpu_device_selected;
+        input.compute_queue_available = diagnostics.compute_queue_available;
+        input.context_healthy = diagnostics.context_healthy;
+      }
+      return "Open Vulkan: " +
+             studiocast::open_vulkan::FormatVulkanMattingReadiness(
+                 studiocast::open_vulkan::EvaluateVulkanMattingReadiness(
+                     input));
     }
 
     void RefreshMatteArtifactKey(int frame_w, int frame_h) {
@@ -3805,8 +3841,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         ClearMatteArtifactKey();
         return;
       }
-      const int matte_w = model_pack->matting->input.width;
-      const int matte_h = model_pack->matting->input.height;
+      const int matte_w = model_pack->matting->output.width;
+      const int matte_h = model_pack->matting->output.height;
       const auto device_handle =
           reinterpret_cast<std::uintptr_t>(kernels.device());
       const auto queue_handle =
@@ -3868,10 +3904,23 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       setup_state.session_warmed = matting_session_warmed;
       setup_state.session_frame_w = matting_session_frame_w;
       setup_state.session_frame_h = matting_session_frame_h;
+      setup_state.failure_latched = matting_failure_latched;
+      const auto current_context = kernels.device()->context_identity();
+      setup_state.session_context_id = matting_session_context_id;
+      setup_state.session_context_generation =
+          matting_session_context_generation;
+      setup_state.current_context_id = current_context.context_id;
+      setup_state.current_context_generation = current_context.generation;
       setup_state.active_model_id = active_model_id;
       setup_state.active_requested_model_id = active_requested_model_id;
       const auto setup_decision = detail::DecideOpenVulkanMattingSetup(
           setup_state, frame_w, frame_h, requested_model_id);
+
+      if (setup_decision.reuse_latched_failure) {
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
 
       if (setup_decision.scan_model_registry) {
         const auto registry =
@@ -3879,7 +3928,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         const std::string model_id =
             ResolveMattingModelId(registry, requested_model_id);
         if (model_id.empty()) {
-          last_error = "Open Vulkan: no matting model pack is installed.";
+          last_error = MattingReadinessError(/*model_selected=*/false,
+                                             /*model_validated=*/false);
+          matting_failure_latched = true;
+          active_requested_model_id = requested_model_id;
           if (error_out)
             *error_out = last_error;
           return false;
@@ -3887,30 +3939,49 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
         auto resolved = registry.Find("matting", model_id);
         if (!resolved) {
-          last_error = "Open Vulkan: matting model pack '" + model_id +
-                       "' is not installed.";
+          const bool malformed_requested_pack =
+              registry.Problems().find(model_id) != registry.Problems().end();
+          last_error = MattingReadinessError(
+              /*model_selected=*/malformed_requested_pack,
+              /*model_validated=*/false);
+          matting_failure_latched = true;
+          active_requested_model_id = requested_model_id;
           if (error_out)
             *error_out = last_error;
           return false;
         }
 
-        matting_session.reset();
-        ResetMattingSessionState();
         model_pack = std::move(resolved);
         active_model_id = model_id;
         active_requested_model_id = requested_model_id;
         ClearMatteArtifactKey();
         InvalidateMatteCache();
+      }
 
+      if (setup_decision.recreate_session) {
+        matting_session.reset();
+        ResetMattingSessionState();
+        if (!model_pack || !model_pack->matting) {
+          last_error = MattingReadinessError(/*model_selected=*/false,
+                                             /*model_validated=*/false);
+          matting_failure_latched = true;
+          active_requested_model_id = requested_model_id;
+          if (error_out)
+            *error_out = last_error;
+          return false;
+        }
         studiocast::open_vulkan::OpenVulkanMattingSession::Options opts;
         opts.require_device_residency = true;
         matting_session =
             std::make_unique<studiocast::open_vulkan::OpenVulkanMattingSession>(
                 kernels.device(), &kernels, *model_pack, opts);
+        matting_session_context_id = current_context.context_id;
+        matting_session_context_generation = current_context.generation;
       }
 
       if (!matting_session) {
         last_error = "Open Vulkan: matting session is not available.";
+        matting_failure_latched = true;
         if (error_out)
           *error_out = last_error;
         return false;
@@ -3921,6 +3992,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           matting_session_initialized = false;
           matting_session_warmed = false;
           last_error = "Open Vulkan: " + e;
+          matting_failure_latched = true;
           if (error_out)
             *error_out = last_error;
           return false;
@@ -3934,6 +4006,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         if (!matting_session->Warmup(&e)) {
           matting_session_warmed = false;
           last_error = "Open Vulkan: " + e;
+          matting_failure_latched = true;
           if (error_out)
             *error_out = last_error;
           return false;
@@ -3941,10 +4014,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         matting_session_warmed = true;
       }
 
+      const auto readiness = matting_session->Readiness();
+      if (!readiness.production_ready) {
+        matting_failure_latched = true;
+        last_error =
+            "Open Vulkan: " +
+            studiocast::open_vulkan::FormatVulkanMattingReadiness(readiness);
+        if (error_out)
+          *error_out = last_error;
+        return false;
+      }
+
       RefreshMatteArtifactKey(frame_w, frame_h);
 
-      const int matte_w = model_pack->matting->input.width;
-      const int matte_h = model_pack->matting->input.height;
+      const int matte_w = model_pack->matting->output.width;
+      const int matte_h = model_pack->matting->output.height;
       if (!EnsureImage(&frame_rgb, frame_w, frame_h,
                        studiocast::vulkan::VulkanPixelFormat::rgb_u8,
                        /*map_memory=*/true, "frame_rgb", error_out) ||
@@ -3953,29 +4037,55 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                        /*map_memory=*/true, "out_rgb", error_out) ||
           !EnsureImage(&alpha_model, matte_w, matte_h,
                        studiocast::vulkan::VulkanPixelFormat::f32_1,
-                       /*map_memory=*/true, "alpha_model", error_out) ||
+                       /*map_memory=*/false, "alpha_model", error_out) ||
+          !EnsureImage(&alpha_readback, matte_w, matte_h,
+                       studiocast::vulkan::VulkanPixelFormat::f32_1,
+                       /*map_memory=*/true, "alpha_readback", error_out) ||
           !EnsureImage(&alpha_resized, frame_w, frame_h,
                        studiocast::vulkan::VulkanPixelFormat::f32_1,
-                       /*map_memory=*/true, "alpha_resized", error_out)) {
+                       /*map_memory=*/false, "alpha_resized", error_out)) {
         last_error = error_out ? *error_out : "Open Vulkan allocation failed.";
+        matting_failure_latched = true;
+        std::string stable_error;
+        (void)matting_session->LatchExternalFailure(
+            studiocast::open_vulkan::VulkanMattingRuntimeFailure::
+                allocation_contract_failed,
+            last_error, &stable_error);
+        last_error = "Open Vulkan: " + stable_error;
+        if (error_out)
+          *error_out = last_error;
         return false;
       }
+      const std::size_t alpha_count =
+          static_cast<std::size_t>(matte_w) *
+          static_cast<std::size_t>(matte_h);
+      if (alpha_cpu.size() != alpha_count)
+        alpha_cpu.resize(alpha_count);
 
       if (require_vb_buffers) {
         if (!EnsureImage(&alpha_tmp, frame_w, frame_h,
                          studiocast::vulkan::VulkanPixelFormat::f32_1,
-                         /*map_memory=*/true, "alpha_tmp", error_out) ||
+                         /*map_memory=*/false, "alpha_tmp", error_out) ||
             !EnsureImage(&alpha_feather, frame_w, frame_h,
                          studiocast::vulkan::VulkanPixelFormat::f32_1,
-                         /*map_memory=*/true, "alpha_feather", error_out) ||
+                         /*map_memory=*/false, "alpha_feather", error_out) ||
             !EnsureImage(&blur_tmp, frame_w, frame_h,
                          studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                         /*map_memory=*/true, "blur_tmp", error_out) ||
+                         /*map_memory=*/false, "blur_tmp", error_out) ||
             !EnsureImage(&blurred, frame_w, frame_h,
                          studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                         /*map_memory=*/true, "blurred", error_out)) {
+                         /*map_memory=*/false, "blurred", error_out)) {
           last_error =
               error_out ? *error_out : "Open Vulkan allocation failed.";
+          matting_failure_latched = true;
+          std::string stable_error;
+          (void)matting_session->LatchExternalFailure(
+              studiocast::open_vulkan::VulkanMattingRuntimeFailure::
+                  allocation_contract_failed,
+              last_error, &stable_error);
+          last_error = "Open Vulkan: " + stable_error;
+          if (error_out)
+            *error_out = last_error;
           return false;
         }
       }
@@ -4109,6 +4219,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       std::string matte_err;
       if (!matting_session->Run(in_rgb, &alpha_model, &matte_err)) {
+        matting_failure_latched = true;
+        last_error = matte_err;
         if (error_out)
           *error_out = matte_err;
         return false;
@@ -4176,8 +4288,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           *error_out = "Open Vulkan: matting model pack not initialized.";
         return false;
       }
-      const int matte_w = model_pack->matting->input.width;
-      const int matte_h = model_pack->matting->input.height;
+      const int matte_w = model_pack->matting->output.width;
+      const int matte_h = model_pack->matting->output.height;
       if (cached_alpha_cpu_valid &&
           cached_alpha_cpu_sequence == capture_sequence) {
         if (out_alpha)
@@ -4193,22 +4305,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                   error_out)) {
         return false;
       }
-      if (!alpha_model.mapped()) {
+      std::string readback_error;
+      if (!kernels.ReadbackF32_1(alpha_model, alpha_readback, alpha_cpu.data(),
+                                 alpha_cpu.size(), &readback_error)) {
         if (error_out)
-          *error_out = "Open Vulkan: alpha model image is not mapped.";
+          *error_out = "Open Vulkan: explicit degraded alpha readback failed: " +
+                       readback_error;
         return false;
       }
-      std::string ierr;
-      if (!alpha_model.Invalidate(&ierr)) {
-        if (error_out)
-          *error_out = "Open Vulkan: failed to invalidate alpha image: " + ierr;
-        return false;
-      }
-      const auto count =
-          static_cast<std::size_t>(matte_w) * static_cast<std::size_t>(matte_h);
-      const auto *src = static_cast<const float *>(alpha_model.mapped());
-      alpha_cpu.assign(src, src + count);
       ++alpha_download_calls;
+      ++forced_sync_calls;
       cached_alpha_cpu_valid = true;
       cached_alpha_cpu_sequence = capture_sequence;
       if (out_alpha)
