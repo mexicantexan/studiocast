@@ -19,10 +19,11 @@
 
 #include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_vignette.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
 #include "core/video/open_vulkan_virtual_background_remove.h"
 #include "core/video/open_vulkan_virtual_background_replace.h"
-#include "core/video/open_vulkan_vignette.h"
+#include "core/video/open_vulkan_virtual_key_light.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
@@ -1147,6 +1148,131 @@ int main() {
                   "blocker");
   }
   {
+    using studiocast::video::ResolveOpenVulkanVirtualKeyLightParameters;
+    const auto off = ResolveOpenVulkanVirtualKeyLightParameters(-5, 0, -180);
+    const auto neutral = ResolveOpenVulkanVirtualKeyLightParameters(70, 99, 0);
+    const auto warm = ResolveOpenVulkanVirtualKeyLightParameters(50, 1, -90);
+    const auto cool = ResolveOpenVulkanVirtualKeyLightParameters(150, 2, 180);
+    ok &= Require(
+        off.passthrough() && off.intensity == 0.0f && off.target_r == 255.0f &&
+            off.target_g == 255.0f && off.target_b == 255.0f &&
+            off.direction == -1.0f && neutral.intensity == 0.7f &&
+            neutral.target_r == 255.0f && neutral.target_g == 255.0f &&
+            neutral.target_b == 255.0f && neutral.direction == 0.0f &&
+            warm.intensity == 0.5f && warm.target_r == 255.0f &&
+            warm.target_g == 242.0f && warm.target_b == 228.0f &&
+            warm.direction == -1.0f && cool.intensity == 1.0f &&
+            cool.target_r == 228.0f && cool.target_g == 242.0f &&
+            cool.target_b == 255.0f && cool.direction == 1.0f,
+        "Vulkan key light must preserve Open CUDA intensity, preset, and "
+        "pan-saturation endpoint semantics");
+
+    studiocast::video::OpenVulkanVirtualKeyLight invalid_key_light;
+    studiocast::open_vulkan::VulkanMattingReadiness unavailable_matting;
+    unavailable_matting.reason_code =
+        studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason;
+    unavailable_matting.blocker_code =
+        studiocast::open_vulkan::kOpenVulkanMattingAdapterUnavailableReason;
+    unavailable_matting.detail = "reviewed shared-device adapter is absent";
+    ok &= Require(
+        !invalid_key_light.EnsureInitialized(nullptr, 1, 1, 70, 0, 0,
+                                             unavailable_matting, &error) &&
+            error.find("vulkan_virtual_key_light_initialization_failed") !=
+                std::string::npos,
+        "key-light initialization failures need an effect-specific stable "
+        "outer reason");
+
+    studiocast::vulkan::OpenVulkanDiagnostics fake_hardware;
+    fake_hardware.compiled_enabled = true;
+    fake_hardware.runtime_library_found = true;
+    fake_hardware.physical_device_found = true;
+    fake_hardware.non_cpu_device_selected = true;
+    fake_hardware.compute_queue_available = true;
+    fake_hardware.logical_device_created = true;
+    fake_hardware.context_created = true;
+    fake_hardware.context_healthy = true;
+    fake_hardware.production_hardware_ready = true;
+    fake_hardware.shader_pipeline_created = true;
+    fake_hardware.ok = true;
+    const auto blocked =
+        studiocast::video::EvaluateOpenVulkanVirtualKeyLightReadiness(
+            fake_hardware, unavailable_matting);
+    ok &= Require(
+        !blocked.production_ready &&
+            blocked.reason_code ==
+                studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason &&
+            blocked.detail.find("open_vulkan_matting_adapter_unavailable") !=
+                std::string::npos,
+        "utility/synthetic-alpha evidence alone must not make key light "
+        "available and must retain the exact matting blocker");
+
+    using studiocast::video::detail::
+        IsOpenVulkanVirtualKeyLightSameFrameArtifactCompatible;
+    studiocast::open_video::FrameMatteArtifactKey key;
+    key.provider_id = "open_vulkan";
+    key.model_id = "test-matting";
+    key.storage = studiocast::open_video::FrameMatteStorage::device_f32_alpha;
+    key.frame_width = 1280;
+    key.frame_height = 720;
+    key.matte_width = 256;
+    key.matte_height = 144;
+    key.device_context = 0xabc;
+    key.stream = 0xdef;
+    studiocast::open_video::FrameMatteArtifact artifact;
+    artifact.key = key;
+    artifact.handle = 0x123;
+    artifact.aux_handle = 0x456;
+    const auto compatible = [&](std::uint64_t capture_sequence = 41,
+                                std::uint64_t cached_matte_sequence = 41,
+                                std::uint64_t cached_alpha_sequence = 41,
+                                std::string_view active_model =
+                                    "test-matting") {
+      return IsOpenVulkanVirtualKeyLightSameFrameArtifactCompatible(
+          capture_sequence, cached_matte_sequence, cached_alpha_sequence, key,
+          &artifact, active_model, 1280, 720, 256, 144, 0xabc, 0xdef, 0x123,
+          0x456);
+    };
+    ok &= Require(compatible(),
+                  "exact same-frame key-light matte artifact should be "
+                  "accepted");
+    artifact.handle = 0x999;
+    ok &= Require(!compatible(),
+                  "tampered key-light matte object handle must be rejected");
+    artifact.handle = 0x123;
+    artifact.aux_handle = 0x999;
+    ok &= Require(!compatible(),
+                  "tampered key-light matte buffer handle must be rejected");
+    artifact.aux_handle = 0x456;
+    ok &= Require(!compatible(41, 40, 41) && !compatible(41, 41, 40),
+                  "stale matte or resized-alpha sequence must be rejected");
+    artifact.key.model_id = "tampered-key";
+    ok &= Require(!compatible(), "artifact/key mismatch must be rejected");
+    artifact.key = key;
+    key.device_context = 0xbeef;
+    artifact.key = key;
+    ok &= Require(!compatible(),
+                  "wrong key-light Vulkan device context must be rejected");
+    key.device_context = 0xabc;
+    key.stream = 0xbeef;
+    artifact.key = key;
+    ok &=
+        Require(!compatible(), "wrong key-light Vulkan queue must be rejected");
+    key.stream = 0xdef;
+    key.frame_width = 640;
+    artifact.key = key;
+    ok &= Require(!compatible(),
+                  "wrong key-light frame geometry must be rejected");
+    key.frame_width = 1280;
+    key.matte_height = 256;
+    artifact.key = key;
+    ok &= Require(!compatible(),
+                  "wrong key-light matte geometry must be rejected");
+    key.matte_height = 144;
+    artifact.key = key;
+    ok &= Require(!compatible(41, 41, 41, "other-model"),
+                  "wrong active key-light matting model must be rejected");
+  }
+  {
     studiocast::video::OpenVulkanAutoFrame invalid_auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
     ok &= Require(
@@ -1464,6 +1590,260 @@ int main() {
                           submitted_after_loss,
                   "poisoned replacement upload context must reject without "
                   "another driver submission");
+  }
+
+  {
+    using studiocast::video::OpenVulkanVirtualKeyLight;
+    using studiocast::video::OpenVulkanVirtualKeyLightCounters;
+    using studiocast::video::OpenVulkanVirtualKeyLightInput;
+    using studiocast::video::OpenVulkanVirtualKeyLightMatteSource;
+
+    UtilityKernels key_light_kernels;
+    if (!key_light_kernels.Initialize(&error))
+      return OptionalSkip("key-light Vulkan context unavailable: " + error);
+    constexpr int w = 4;
+    constexpr int h = 2;
+    const std::vector<std::uint8_t> foreground = {
+        10, 20, 30, 100, 110, 120, 200, 210, 220, 50, 60, 70,
+        90, 80, 70, 40,  50,  60,  130, 140, 150, 5,  15, 25,
+    };
+    const std::vector<float> alpha = {0.0f,  0.5f,  1.0f, 0.01f,
+                                      0.25f, 0.75f, 0.9f, 0.1f};
+    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    if (!AllocateU8(key_light_kernels, &gpu_foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(key_light_kernels, &gpu_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(key_light_kernels, &alpha_upload, w, h, &error) ||
+        !resident_alpha.Allocate(key_light_kernels.device(), w, h,
+                                 VulkanPixelFormat::f32_1,
+                                 /*map_memory=*/false, &error)) {
+      return OptionalSkip("production key-light allocation failed: " + error);
+    }
+    FillU8(gpu_foreground, foreground);
+    FillF32(alpha_upload, alpha);
+    if (!gpu_foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+        !key_light_kernels.ResizeBilinearF32_1(alpha_upload, resident_alpha,
+                                               &error)) {
+      return OptionalSkip("production key-light fixture setup failed: " +
+                          error);
+    }
+    ok &= Require(!resident_alpha.mapped() && resident_alpha.device_local() &&
+                      gpu_output.mapped(),
+                  "production key light must keep alpha non-mapped "
+                  "DEVICE_LOCAL and use only the mapped RGB transport");
+
+    auto setup_readiness =
+        SyntheticProductionMattingReadiness(key_light_kernels, false);
+    OpenVulkanVirtualKeyLight key_light;
+    ok &= Require(key_light.EnsureInitialized(&key_light_kernels, w, h, 50, 1,
+                                              90, setup_readiness, &error),
+                  "synthetic test-seam key-light initialization failed: " +
+                      error);
+
+    OpenVulkanVirtualKeyLightInput input;
+    input.foreground = &gpu_foreground;
+    input.alpha = &resident_alpha;
+    input.output = &gpu_output;
+    input.capture_sequence = 81;
+    input.resident_alpha_sequence = 81;
+    input.alpha_resize_completion_count_before = 0;
+    input.alpha_resize_completion_count_after = 1;
+    input.matting_inference_count_before = 0;
+    input.matte_source =
+        OpenVulkanVirtualKeyLightMatteSource::independently_inferred;
+    input.matting_readiness = &setup_readiness;
+    OpenVulkanVirtualKeyLightCounters missing_frame_evidence;
+    ok &= Require(!key_light.Apply(input, &missing_frame_evidence, &error) &&
+                      error.find("vulkan_virtual_key_light_runtime_failed") !=
+                          std::string::npos &&
+                      error.find("current-frame resident alpha") !=
+                          std::string::npos &&
+                      missing_frame_evidence.dispatch_calls == 0,
+                  "warmup/utility availability must not replace current-frame "
+                  "key-light matting evidence");
+
+    auto current_readiness =
+        SyntheticProductionMattingReadiness(key_light_kernels, true);
+    input.matting_readiness = &current_readiness;
+    OpenVulkanVirtualKeyLightCounters counters;
+    const auto allocations_before =
+        key_light_kernels.device()->allocation_stats().allocation_count;
+    const auto submissions_before =
+        key_light_kernels.synchronous_submission_count();
+    ok &= Require(key_light.Apply(input, &counters, &error) &&
+                      gpu_output.Invalidate(&error),
+                  "independent production key-light dispatch failed: " + error);
+    ok &= CompareU8Exact(ReadU8(gpu_output),
+                         KeyLightReference(foreground, alpha, w, h, 255.0f,
+                                           242.0f, 228.0f, 0.5f, 1.0f),
+                         "production Vulkan key-light Open CUDA parity");
+
+    input.capture_sequence = 82;
+    input.resident_alpha_sequence = 82;
+    input.alpha_resize_completion_count_before = 1;
+    input.alpha_resize_completion_count_after = 1;
+    input.matting_inference_count_before = 1;
+    input.matte_source =
+        OpenVulkanVirtualKeyLightMatteSource::reused_same_frame;
+    ok &= Require(key_light.Apply(input, &counters, &error),
+                  "same-frame matte reuse key-light dispatch failed: " + error);
+    ok &= Require(
+        counters.dispatch_calls == 2 &&
+            counters.independent_matte_inference_calls == 1 &&
+            counters.shared_matte_reuse_calls == 1 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0 &&
+            counters.runtime_failure_frames == 0 &&
+            key_light_kernels.synchronous_submission_count() ==
+                submissions_before + 2 &&
+            key_light_kernels.device()->allocation_stats().allocation_count ==
+                allocations_before,
+        "key-light inference/reuse accounting must be exact, allocation-free, "
+        "and prove zero readback/CPU fallback");
+
+    const auto before_bad_reuse =
+        key_light_kernels.synchronous_submission_count();
+    input.matting_inference_count_before = 0;
+    ok &= Require(
+        !key_light.Apply(input, &counters, &error) &&
+            error.find("reuse unexpectedly performed inference") !=
+                std::string::npos &&
+            key_light_kernels.synchronous_submission_count() ==
+                before_bad_reuse,
+        "key light must reject a false same-frame reuse classification before "
+        "dispatch");
+
+    ok &= Require(key_light.EnsureInitialized(&key_light_kernels, w, h, 0, 2,
+                                              -180, setup_readiness, &error),
+                  "zero-intensity key-light setup should retain production "
+                  "readiness: " +
+                      error);
+    input.capture_sequence = 0;
+    input.resident_alpha_sequence = 0;
+    input.matting_readiness = &setup_readiness;
+    const auto before_passthrough =
+        key_light_kernels.synchronous_submission_count();
+    ok &= Require(key_light.Apply(input, &counters, &error) &&
+                      counters.passthrough_frames == 1 &&
+                      counters.dispatch_calls == 2 &&
+                      key_light_kernels.synchronous_submission_count() ==
+                          before_passthrough,
+                  "zero-intensity key light must pass through without "
+                  "inference evidence or a Vulkan dispatch");
+
+    ok &= Require(key_light.EnsureInitialized(&key_light_kernels, w, h, 50, 1,
+                                              90, current_readiness, &error),
+                  "key-light reinitialization failed: " + error);
+    input.capture_sequence = 83;
+    input.resident_alpha_sequence = 83;
+    input.alpha_resize_completion_count_before = 1;
+    input.alpha_resize_completion_count_after = 1;
+    input.matting_inference_count_before = 1;
+    input.matte_source =
+        OpenVulkanVirtualKeyLightMatteSource::reused_same_frame;
+    input.matting_readiness = &current_readiness;
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error))
+      return OptionalSkip("foreign key-light context unavailable: " + error);
+    VulkanImage foreign_output;
+    if (!AllocateU8(foreign_kernels, &foreign_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("foreign key-light output allocation failed: " +
+                          error);
+    }
+    input.output = &foreign_output;
+    const auto before_foreign =
+        key_light_kernels.synchronous_submission_count();
+    ok &= Require(
+        !key_light.Apply(input, &counters, &error) &&
+            error.find("vulkan_virtual_key_light_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_foreign_context]") != std::string::npos &&
+            key_light_kernels.synchronous_submission_count() == before_foreign,
+        "key light must reject a foreign output before dispatch with nested "
+        "stable reasons");
+    foreign_kernels.Shutdown();
+    ok &= Require(
+        !key_light.Apply(input, &counters, &error) &&
+            key_light_kernels.synchronous_submission_count() == before_foreign,
+        "key light must reject a stale foreign output without a driver "
+        "submission");
+  }
+
+  {
+    using studiocast::video::OpenVulkanVirtualKeyLight;
+    using studiocast::video::OpenVulkanVirtualKeyLightCounters;
+    using studiocast::video::OpenVulkanVirtualKeyLightInput;
+    using studiocast::video::OpenVulkanVirtualKeyLightMatteSource;
+
+    UtilityKernels lost_key_light_kernels;
+    if (!lost_key_light_kernels.Initialize(&error))
+      return OptionalSkip("key-light device-loss context unavailable: " +
+                          error);
+    constexpr int w = 2;
+    constexpr int h = 2;
+    VulkanImage foreground, output, alpha_upload, alpha;
+    if (!AllocateU8(lost_key_light_kernels, &foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_key_light_kernels, &output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(lost_key_light_kernels, &alpha_upload, w, h, &error) ||
+        !alpha.Allocate(lost_key_light_kernels.device(), w, h,
+                        VulkanPixelFormat::f32_1, false, &error)) {
+      return OptionalSkip("key-light device-loss allocation failed: " + error);
+    }
+    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
+    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+        !lost_key_light_kernels.ResizeBilinearF32_1(alpha_upload, alpha,
+                                                    &error)) {
+      return OptionalSkip("key-light device-loss fixture setup failed: " +
+                          error);
+    }
+    auto readiness =
+        SyntheticProductionMattingReadiness(lost_key_light_kernels, true);
+    OpenVulkanVirtualKeyLight key_light;
+    ok &= Require(key_light.EnsureInitialized(&lost_key_light_kernels, w, h, 70,
+                                              2, -90, readiness, &error),
+                  "key-light device-loss wrapper initialization failed: " +
+                      error);
+    OpenVulkanVirtualKeyLightInput input;
+    input.foreground = &foreground;
+    input.alpha = &alpha;
+    input.output = &output;
+    input.capture_sequence = 901;
+    input.resident_alpha_sequence = 901;
+    input.alpha_resize_completion_count_before = 0;
+    input.alpha_resize_completion_count_after = 1;
+    input.matting_inference_count_before = 0;
+    input.matte_source =
+        OpenVulkanVirtualKeyLightMatteSource::independently_inferred;
+    input.matting_readiness = &readiness;
+    lost_key_light_kernels.device()->InjectNextSubmissionResultForTesting(
+        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
+        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
+    OpenVulkanVirtualKeyLightCounters counters;
+    ok &= Require(
+        !key_light.Apply(input, &counters, &error) &&
+            error.find("vulkan_virtual_key_light_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 0 &&
+            counters.runtime_failure_frames == 1 &&
+            counters.device_loss_frames == 1 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0,
+        "key-light device loss must retain nested reasons, count no successful "
+        "dispatch, and never substitute CPU/readback work");
+    const auto submitted_after_loss =
+        lost_key_light_kernels.device()->health().submitted_serial;
+    ok &= Require(
+        !key_light.Apply(input, &counters, &error) &&
+            lost_key_light_kernels.device()->health().submitted_serial ==
+                submitted_after_loss,
+        "poisoned key-light context must reject without another driver "
+        "submission");
   }
 
   {

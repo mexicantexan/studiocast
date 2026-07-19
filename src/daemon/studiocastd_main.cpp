@@ -2076,6 +2076,34 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers.composite_dispatch_calls << ",";
     oss << "\"key_light_dispatch_calls\":"
         << st.pipeline.open_vulkan_transfers.key_light_dispatch_calls << ",";
+    oss << "\"virtual_key_light_shared_matte_reuse_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_shared_matte_reuse_calls
+        << ",";
+    oss << "\"virtual_key_light_independent_matte_inference_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_independent_matte_inference_calls
+        << ",";
+    oss << "\"virtual_key_light_passthrough_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_passthrough_frames
+        << ",";
+    oss << "\"virtual_key_light_alpha_readback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_alpha_readback_calls
+        << ",";
+    oss << "\"virtual_key_light_cpu_fallback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_cpu_fallback_calls
+        << ",";
+    oss << "\"virtual_key_light_runtime_failure_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_runtime_failure_frames
+        << ",";
+    oss << "\"virtual_key_light_device_loss_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_key_light_device_loss_frames
+        << ",";
     oss << "\"crop_resize_dispatch_calls\":"
         << st.pipeline.open_vulkan_transfers.crop_resize_dispatch_calls << ",";
     oss << "\"standalone_scaler_upload_calls\":"
