@@ -12,6 +12,8 @@ using studiocast::vulkan::FrameDispatchRequest;
 using studiocast::vulkan::FrameExecutionPlan;
 using studiocast::vulkan::FrameExecutionRequest;
 using studiocast::vulkan::FrameExecutionStage;
+using studiocast::vulkan::FrameInitialResource;
+using studiocast::vulkan::FrameInitialResourceState;
 using studiocast::vulkan::ValidateFrameExecutionPlan;
 
 bool Require(bool condition, const std::string &message) {
@@ -193,6 +195,67 @@ bool TestMutatedPlanValidation() {
   return ok;
 }
 
+bool TestExplicitInitialStatesAndWriteReuse() {
+  FrameExecutionRequest request;
+  request.initial_resources = {
+      FrameInitialResource{"host_upload",
+                           FrameInitialResourceState::host_write},
+      FrameInitialResource{"transfer_upload",
+                           FrameInitialResourceState::transfer_write},
+  };
+  request.dispatches = {
+      {FrameExecutionStage::preprocess,
+       "consume_uploads",
+       {"host_upload", "transfer_upload"},
+       {"seed"}},
+      {FrameExecutionStage::alpha_resize, "first_write", {"seed"}, {"reused"}},
+      {FrameExecutionStage::alpha_feather, "overwrite", {"seed"}, {"reused"}},
+      {FrameExecutionStage::composite,
+       "consume_reused",
+       {"reused"},
+       {"output"}},
+  };
+  request.host_readbacks = {"output"};
+  request.parameter_slot_capacity = request.dispatches.size();
+  request.descriptor_slot_capacity = request.dispatches.size();
+  request.allow_resource_reuse = true;
+
+  FrameExecutionPlan plan;
+  std::string error;
+  bool ok = Require(BuildFrameExecutionPlan(request, &plan, &error),
+                    "explicit-state frame plan should build: " + error);
+  bool host_to_compute = false;
+  bool transfer_to_compute = false;
+  bool write_to_write = false;
+  bool reused_to_read = false;
+  bool final_host = false;
+  for (const auto &barrier : plan.barriers) {
+    host_to_compute |=
+        barrier.kind == FrameBarrierKind::host_write_to_compute_read &&
+        barrier.resource == "host_upload" && barrier.consumer_boundary == 0;
+    transfer_to_compute |=
+        barrier.kind == FrameBarrierKind::transfer_write_to_compute_read &&
+        barrier.resource == "transfer_upload" && barrier.consumer_boundary == 0;
+    write_to_write |=
+        barrier.kind == FrameBarrierKind::compute_write_to_compute_write &&
+        barrier.resource == "reused" && barrier.producer_dispatch == 1 &&
+        barrier.consumer_boundary == 2;
+    reused_to_read |=
+        barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
+        barrier.resource == "reused" && barrier.producer_dispatch == 2 &&
+        barrier.consumer_boundary == 3;
+    final_host |=
+        barrier.kind == FrameBarrierKind::compute_write_to_host_read &&
+        barrier.resource == "output" &&
+        barrier.consumer_boundary == plan.completion_boundary;
+  }
+  ok &= Require(host_to_compute && transfer_to_compute && write_to_write &&
+                    reused_to_read && final_host,
+                "planner should model host/transfer writes, compute "
+                "write-to-write/read, and final host visibility");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -200,5 +263,6 @@ int main() {
   ok &= TestFullFramePlan();
   ok &= TestInvalidRequests();
   ok &= TestMutatedPlanValidation();
+  ok &= TestExplicitInitialStatesAndWriteReuse();
   return ok ? 0 : 1;
 }

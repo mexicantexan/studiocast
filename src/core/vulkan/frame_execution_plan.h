@@ -30,15 +30,32 @@ struct FrameDispatchRequest {
   std::vector<std::string> writes;
 };
 
+enum class FrameInitialResourceState {
+  compute_read,
+  host_write,
+  transfer_write,
+};
+
+struct FrameInitialResource {
+  std::string resource;
+  FrameInitialResourceState state = FrameInitialResourceState::compute_read;
+};
+
 struct FrameExecutionRequest {
   // Resources already valid before command recording, such as the captured
   // frame. They are read-only within this plan.
   std::vector<std::string> external_resources;
+  // Explicit initial state for uploaded/staged resources. Names must not also
+  // appear in external_resources.
+  std::vector<FrameInitialResource> initial_resources;
   std::vector<FrameDispatchRequest> dispatches;
   // Resources made host-visible at the frame completion/readback boundary.
   std::vector<std::string> host_readbacks;
   std::size_t parameter_slot_capacity = 0;
   std::size_t descriptor_slot_capacity = 0;
+  // Reuse is opt-in. When enabled, a later dispatch may overwrite a resource
+  // and receives an explicit compute-write to compute-write barrier.
+  bool allow_resource_reuse = false;
 };
 
 struct PlannedFrameDispatch {
@@ -51,7 +68,10 @@ struct PlannedFrameDispatch {
 };
 
 enum class FrameBarrierKind {
+  host_write_to_compute_read,
+  transfer_write_to_compute_read,
   compute_write_to_compute_read,
+  compute_write_to_compute_write,
   compute_write_to_host_read,
 };
 

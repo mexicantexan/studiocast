@@ -27,14 +27,6 @@ struct ResizePushConstants {
   std::uint32_t dst_pitch_pixels = 0;
 };
 
-bool ResultOk(VkResult result, const char *what, std::string *error_out) {
-  if (result == VK_SUCCESS)
-    return true;
-  if (error_out)
-    *error_out = std::string(what) + " failed: " + VkResultName(result);
-  return false;
-}
-
 std::uint32_t CeilDiv(std::uint32_t x, std::uint32_t y) {
   return (x + y - 1u) / y;
 }
@@ -62,6 +54,7 @@ ResizeBilinear::~ResizeBilinear() { Shutdown(); }
 
 bool ResizeBilinear::EnsureInitialized(int src_w, int src_h, int dst_w,
                                        int dst_h, std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (initialized_ && src_w_ == src_w && src_h_ == src_h && dst_w_ == dst_w &&
@@ -99,6 +92,7 @@ bool ResizeBilinear::Resize(const std::uint8_t *src,
                             std::size_t src_stride_bytes, std::uint8_t *dst,
                             std::size_t dst_stride_bytes,
                             std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!initialized_) {
@@ -144,31 +138,32 @@ bool ResizeBilinear::Resize(const std::uint8_t *src,
 }
 
 void ResizeBilinear::Shutdown() noexcept {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   const bool have_device = device_.Initialized();
+  const bool destroy_children = have_device && device_.SafeToDestroyResources();
   const auto &vf = device_.f();
-  if (have_device && vf.vkDeviceWaitIdle)
-    (void)vf.vkDeviceWaitIdle(device_.device());
 
-  if (have_device && command_buffer_ && vf.vkFreeCommandBuffers) {
+  if (destroy_children && command_buffer_ && vf.vkFreeCommandBuffers) {
     vf.vkFreeCommandBuffers(device_.device(), device_.command_pool(), 1,
                             &command_buffer_);
   }
   command_buffer_ = nullptr;
 
-  if (have_device && pipeline_ && vf.vkDestroyPipeline)
+  if (destroy_children && pipeline_ && vf.vkDestroyPipeline)
     vf.vkDestroyPipeline(device_.device(), pipeline_, nullptr);
   pipeline_ = nullptr;
-  if (have_device && pipeline_layout_ && vf.vkDestroyPipelineLayout)
+  if (destroy_children && pipeline_layout_ && vf.vkDestroyPipelineLayout)
     vf.vkDestroyPipelineLayout(device_.device(), pipeline_layout_, nullptr);
   pipeline_layout_ = nullptr;
-  if (have_device && shader_module_ && vf.vkDestroyShaderModule)
+  if (destroy_children && shader_module_ && vf.vkDestroyShaderModule)
     vf.vkDestroyShaderModule(device_.device(), shader_module_, nullptr);
   shader_module_ = nullptr;
-  if (have_device && descriptor_pool_ && vf.vkDestroyDescriptorPool)
+  if (destroy_children && descriptor_pool_ && vf.vkDestroyDescriptorPool)
     vf.vkDestroyDescriptorPool(device_.device(), descriptor_pool_, nullptr);
   descriptor_pool_ = nullptr;
   descriptor_set_ = nullptr;
-  if (have_device && descriptor_set_layout_ && vf.vkDestroyDescriptorSetLayout)
+  if (destroy_children && descriptor_set_layout_ &&
+      vf.vkDestroyDescriptorSetLayout)
     vf.vkDestroyDescriptorSetLayout(device_.device(), descriptor_set_layout_,
                                     nullptr);
   descriptor_set_layout_ = nullptr;
@@ -185,7 +180,8 @@ void ResizeBilinear::Shutdown() noexcept {
 }
 
 OpenVulkanDiagnostics ResizeBilinear::Diagnostics() const {
-  OpenVulkanDiagnostics d = device_.diagnostics();
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  OpenVulkanDiagnostics d = device_.DiagnosticsSnapshot();
   d.shader_pipeline_created = pipeline_created_;
   d.ok = d.ok && pipeline_created_;
   if (!init_error_.empty() && d.error.empty())
@@ -224,7 +220,8 @@ bool ResizeBilinear::CreatePipeline(std::string *error_out) {
   shader.pCode = shaders::kResizeRgb24BilinearSpirv;
   VkResult result = vf.vkCreateShaderModule(device_.device(), &shader, nullptr,
                                             &shader_module_);
-  if (!ResultOk(result, "vkCreateShaderModule", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateShaderModule", false,
+                                 error_out))
     return false;
 
   VkDescriptorSetLayoutBinding bindings[2]{};
@@ -240,7 +237,8 @@ bool ResizeBilinear::CreatePipeline(std::string *error_out) {
   layout_info.pBindings = bindings;
   result = vf.vkCreateDescriptorSetLayout(device_.device(), &layout_info,
                                           nullptr, &descriptor_set_layout_);
-  if (!ResultOk(result, "vkCreateDescriptorSetLayout", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateDescriptorSetLayout", false,
+                                 error_out))
     return false;
 
   VkPushConstantRange push{};
@@ -255,7 +253,8 @@ bool ResizeBilinear::CreatePipeline(std::string *error_out) {
   pipeline_layout.pPushConstantRanges = &push;
   result = vf.vkCreatePipelineLayout(device_.device(), &pipeline_layout,
                                      nullptr, &pipeline_layout_);
-  if (!ResultOk(result, "vkCreatePipelineLayout", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreatePipelineLayout", false,
+                                 error_out))
     return false;
 
   VkComputePipelineCreateInfo compute{};
@@ -266,7 +265,8 @@ bool ResizeBilinear::CreatePipeline(std::string *error_out) {
   compute.layout = pipeline_layout_;
   result = vf.vkCreateComputePipelines(device_.device(), nullptr, 1, &compute,
                                        nullptr, &pipeline_);
-  if (!ResultOk(result, "vkCreateComputePipelines", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateComputePipelines", false,
+                                 error_out))
     return false;
 
   pipeline_created_ = true;
@@ -283,19 +283,20 @@ bool ResizeBilinear::CreateDescriptors(std::string *error_out) {
   pool.maxSets = 1;
   pool.poolSizeCount = 1;
   pool.pPoolSizes = &pool_size;
-  VkResult result =
-      vf.vkCreateDescriptorPool(device_.device(), &pool, nullptr,
-                                &descriptor_pool_);
-  if (!ResultOk(result, "vkCreateDescriptorPool", error_out))
+  VkResult result = vf.vkCreateDescriptorPool(device_.device(), &pool, nullptr,
+                                              &descriptor_pool_);
+  if (!device_.CheckDriverResult(result, "vkCreateDescriptorPool", false,
+                                 error_out))
     return false;
 
   VkDescriptorSetAllocateInfo alloc{};
   alloc.descriptorPool = descriptor_pool_;
   alloc.descriptorSetCount = 1;
   alloc.pSetLayouts = &descriptor_set_layout_;
-  result = vf.vkAllocateDescriptorSets(device_.device(), &alloc,
-                                       &descriptor_set_);
-  if (!ResultOk(result, "vkAllocateDescriptorSets", error_out))
+  result =
+      vf.vkAllocateDescriptorSets(device_.device(), &alloc, &descriptor_set_);
+  if (!device_.CheckDriverResult(result, "vkAllocateDescriptorSets", false,
+                                 error_out))
     return false;
 
   VkDescriptorBufferInfo infos[2]{};
@@ -329,37 +330,35 @@ bool ResizeBilinear::RecordCommandBuffer(std::string *error_out) {
   alloc.commandBufferCount = 1;
   VkResult result =
       vf.vkAllocateCommandBuffers(device_.device(), &alloc, &command_buffer_);
-  if (!ResultOk(result, "vkAllocateCommandBuffers", error_out))
+  if (!device_.CheckDriverResult(result, "vkAllocateCommandBuffers", false,
+                                 error_out))
     return false;
 
   VkCommandBufferBeginInfo begin{};
   begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
   result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
-  if (!ResultOk(result, "vkBeginCommandBuffer", error_out))
+  if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
+                                 error_out))
     return false;
 
-  VkBufferMemoryBarrier upload_barrier{};
-  upload_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-  upload_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-  upload_barrier.buffer = upload_.buffer();
-  upload_barrier.size = upload_.size();
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_HOST_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
-                          &upload_barrier, 0, nullptr);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, upload_.buffer(), upload_.size(),
+          upload_.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::transfer_read, error_out)) {
+    return false;
+  }
 
   VkBufferCopy src_copy{};
   src_copy.size = gpu_src_.byte_size();
   vf.vkCmdCopyBuffer(command_buffer_, upload_.buffer(), gpu_src_.buffer(), 1,
                      &src_copy);
 
-  VkBufferMemoryBarrier src_ready{};
-  src_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  src_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  src_ready.buffer = gpu_src_.buffer();
-  src_ready.size = gpu_src_.byte_size();
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                          1, &src_ready, 0, nullptr);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, gpu_src_.buffer(), gpu_src_.byte_size(),
+          gpu_src_.context_identity(), VulkanBufferAccess::transfer_write,
+          VulkanBufferAccess::compute_read, error_out)) {
+    return false;
+  }
 
   vf.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                        pipeline_);
@@ -380,32 +379,28 @@ bool ResizeBilinear::RecordCommandBuffer(std::string *error_out) {
                    CeilDiv(static_cast<std::uint32_t>(dst_w_), 16u),
                    CeilDiv(static_cast<std::uint32_t>(dst_h_), 16u), 1);
 
-  VkBufferMemoryBarrier dst_ready{};
-  dst_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  dst_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-  dst_ready.buffer = gpu_dst_.buffer();
-  dst_ready.size = gpu_dst_.byte_size();
-  vf.vkCmdPipelineBarrier(command_buffer_,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
-                          &dst_ready, 0, nullptr);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, gpu_dst_.buffer(), gpu_dst_.byte_size(),
+          gpu_dst_.context_identity(), VulkanBufferAccess::compute_write,
+          VulkanBufferAccess::transfer_read, error_out)) {
+    return false;
+  }
 
   VkBufferCopy dst_copy{};
   dst_copy.size = gpu_dst_.byte_size();
   vf.vkCmdCopyBuffer(command_buffer_, gpu_dst_.buffer(), readback_.buffer(), 1,
                      &dst_copy);
 
-  VkBufferMemoryBarrier readback_ready{};
-  readback_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  readback_ready.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  readback_ready.buffer = readback_.buffer();
-  readback_ready.size = readback_.size();
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
-                          &readback_ready, 0, nullptr);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, readback_.buffer(), readback_.size(),
+          readback_.context_identity(), VulkanBufferAccess::transfer_write,
+          VulkanBufferAccess::host_read, error_out)) {
+    return false;
+  }
 
   result = vf.vkEndCommandBuffer(command_buffer_);
-  return ResultOk(result, "vkEndCommandBuffer", error_out);
+  return device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
+                                   error_out);
 }
 
 bool IsResizeBilinearAvailable(std::string *error_out) {
@@ -492,11 +487,11 @@ void BlockOpenVulkanVirtualBackground(OpenVulkanDiagnostics *d,
                                       const char *reason_code) {
   if (!d)
     return;
-  d->blocked_effects[std::string(studiocast::video::effects::contract::
-                                     kEffectIdVirtualBackgroundBlur)] =
+  d->blocked_effects[std::string(
+      studiocast::video::effects::contract::kEffectIdVirtualBackgroundBlur)] =
       reason_code;
-  d->blocked_effects[std::string(studiocast::video::effects::contract::
-                                     kEffectIdVirtualBackgroundRemove)] =
+  d->blocked_effects[std::string(
+      studiocast::video::effects::contract::kEffectIdVirtualBackgroundRemove)] =
       reason_code;
   d->blocked_effects[std::string(studiocast::video::effects::contract::
                                      kEffectIdVirtualBackgroundReplace)] =

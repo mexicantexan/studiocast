@@ -10,7 +10,10 @@ namespace {
 struct ResourceState {
   bool external = false;
   bool written = false;
-  bool compute_read_visible = false;
+  FrameInitialResourceState initial_state =
+      FrameInitialResourceState::compute_read;
+  bool initial_state_consumed = true;
+  bool compute_write_visible = false;
   std::size_t writer = 0;
 };
 
@@ -85,7 +88,23 @@ bool BuildFrameExecutionPlan(const FrameExecutionRequest &request,
                               &external_seen, error_out)) {
       return false;
     }
-    resources.emplace(resource, ResourceState{true, false, true, 0});
+    ResourceState state;
+    state.external = true;
+    resources.emplace(resource, state);
+  }
+
+  std::unordered_set<std::string> initial_seen = external_seen;
+  for (const FrameInitialResource &initial : request.initial_resources) {
+    if (!InsertUniqueResource(initial.resource, "Frame initial resources",
+                              &initial_seen, error_out)) {
+      return false;
+    }
+    ResourceState state;
+    state.external = true;
+    state.initial_state = initial.state;
+    state.initial_state_consumed =
+        initial.state == FrameInitialResourceState::compute_read;
+    resources.emplace(initial.resource, state);
   }
 
   std::unordered_set<std::string> labels;
@@ -122,11 +141,18 @@ bool BuildFrameExecutionPlan(const FrameExecutionRequest &request,
                     error_out);
       }
       ResourceState &state = found->second;
-      if (state.written && !state.compute_read_visible) {
+      if (!state.initial_state_consumed) {
+        const FrameBarrierKind kind =
+            state.initial_state == FrameInitialResourceState::host_write
+                ? FrameBarrierKind::host_write_to_compute_read
+                : FrameBarrierKind::transfer_write_to_compute_read;
+        plan->barriers.push_back({kind, resource, 0, index});
+        state.initial_state_consumed = true;
+      } else if (state.written && !state.compute_write_visible) {
         plan->barriers.push_back(
             {FrameBarrierKind::compute_write_to_compute_read, resource,
              state.writer, index});
-        state.compute_read_visible = true;
+        state.compute_write_visible = true;
       }
     }
 
@@ -151,11 +177,16 @@ bool BuildFrameExecutionPlan(const FrameExecutionRequest &request,
                     error_out);
       }
       if (found != resources.end() && found->second.written) {
-        return Fail(
-            "Frame dispatch '" + label +
-                "' overwrites resource already written by this frame: '" +
-                resource + "'.",
-            error_out);
+        if (!request.allow_resource_reuse) {
+          return Fail(
+              "Frame dispatch '" + label +
+                  "' overwrites resource already written by this frame: '" +
+                  resource + "'.",
+              error_out);
+        }
+        plan->barriers.push_back(
+            {FrameBarrierKind::compute_write_to_compute_write, resource,
+             found->second.writer, index});
       }
     }
 
@@ -172,6 +203,7 @@ bool BuildFrameExecutionPlan(const FrameExecutionRequest &request,
       ResourceState state;
       state.written = true;
       state.writer = index;
+      state.compute_write_visible = false;
       resources[resource] = state;
     }
   }
@@ -240,9 +272,11 @@ bool ValidateFrameExecutionPlan(const FrameExecutionPlan &plan,
       return Fail("Frame execution barrier has an invalid producer.",
                   error_out);
     }
-    if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read) {
+    if (barrier.kind != FrameBarrierKind::compute_write_to_host_read) {
       if (barrier.consumer_boundary >= plan.dispatches.size() ||
-          barrier.consumer_boundary <= barrier.producer_dispatch) {
+          (barrier.kind != FrameBarrierKind::host_write_to_compute_read &&
+           barrier.kind != FrameBarrierKind::transfer_write_to_compute_read &&
+           barrier.consumer_boundary <= barrier.producer_dispatch)) {
         return Fail("Frame compute barrier has an invalid consumer boundary.",
                     error_out);
       }

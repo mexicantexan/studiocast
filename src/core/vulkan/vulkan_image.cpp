@@ -6,18 +6,6 @@
 
 namespace studiocast::vulkan {
 
-namespace {
-
-bool ResultOk(VkResult result, const char *what, std::string *error_out) {
-  if (result == VK_SUCCESS)
-    return true;
-  if (error_out)
-    *error_out = std::string(what) + " failed: " + VkResultName(result);
-  return false;
-}
-
-} // namespace
-
 std::size_t VulkanStorageBytesPerPixel(VulkanPixelFormat format) {
   switch (format) {
   case VulkanPixelFormat::rgba_u8:
@@ -40,7 +28,8 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
     error_out->clear();
   if (!device || !device->Initialized()) {
     if (error_out)
-      *error_out = "VulkanBuffer::Allocate called without an initialized device.";
+      *error_out =
+          "VulkanBuffer::Allocate called without an initialized device.";
     return false;
   }
   if (size == 0) {
@@ -49,23 +38,43 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
     return false;
   }
 
-  const auto &vf = device->f();
+  const auto context = device->context_handle();
+  if (!context || !context->Healthy()) {
+    if (error_out)
+      *error_out = "[vulkan_context_unhealthy] VulkanBuffer::Allocate called "
+                   "with an unhealthy context.";
+    return false;
+  }
+
+  const auto &vf = context->f();
   VkBufferCreateInfo create{};
   create.size = size;
   create.usage = usage;
   VkBuffer buffer = nullptr;
-  VkResult result = vf.vkCreateBuffer(device->device(), &create, nullptr,
-                                      &buffer);
-  if (!ResultOk(result, "vkCreateBuffer", error_out))
+  VkResult result =
+      vf.vkCreateBuffer(context->device, &create, nullptr, &buffer);
+  if (!context->RecordDriverFailure(result, "vkCreateBuffer",
+                                    /*submission_failure=*/false, error_out))
     return false;
 
   VkMemoryRequirements req{};
-  vf.vkGetBufferMemoryRequirements(device->device(), buffer, &req);
+  vf.vkGetBufferMemoryRequirements(context->device, buffer, &req);
+  if (req.size == 0) {
+    if (error_out)
+      *error_out = "[vulkan_allocation_size_invalid] Vulkan buffer reported "
+                   "zero memory requirements.";
+    vf.vkDestroyBuffer(context->device, buffer, nullptr);
+    return false;
+  }
   std::uint32_t memory_type = 0;
   if (!device->FindMemoryType(req.memoryTypeBits, required_memory_flags,
                               preferred_memory_flags, &memory_type,
                               error_out)) {
-    vf.vkDestroyBuffer(device->device(), buffer, nullptr);
+    vf.vkDestroyBuffer(context->device, buffer, nullptr);
+    return false;
+  }
+  if (!context->ReserveAllocation(req.size, error_out)) {
+    vf.vkDestroyBuffer(context->device, buffer, nullptr);
     return false;
   }
 
@@ -73,53 +82,78 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
   alloc.allocationSize = req.size;
   alloc.memoryTypeIndex = memory_type;
   VkDeviceMemory memory = nullptr;
-  result = vf.vkAllocateMemory(device->device(), &alloc, nullptr, &memory);
-  if (!ResultOk(result, "vkAllocateMemory", error_out)) {
-    vf.vkDestroyBuffer(device->device(), buffer, nullptr);
+  result = vf.vkAllocateMemory(context->device, &alloc, nullptr, &memory);
+  if (!context->RecordDriverFailure(result, "vkAllocateMemory",
+                                    /*submission_failure=*/false, error_out)) {
+    context->ReleaseAllocation(req.size);
+    vf.vkDestroyBuffer(context->device, buffer, nullptr);
     return false;
   }
 
-  result = vf.vkBindBufferMemory(device->device(), buffer, memory, 0);
-  if (!ResultOk(result, "vkBindBufferMemory", error_out)) {
-    vf.vkDestroyBuffer(device->device(), buffer, nullptr);
-    vf.vkFreeMemory(device->device(), memory, nullptr);
+  result = vf.vkBindBufferMemory(context->device, buffer, memory, 0);
+  if (!context->RecordDriverFailure(result, "vkBindBufferMemory",
+                                    /*submission_failure=*/false, error_out)) {
+    vf.vkDestroyBuffer(context->device, buffer, nullptr);
+    vf.vkFreeMemory(context->device, memory, nullptr);
+    context->ReleaseAllocation(req.size);
     return false;
   }
 
   void *mapped = nullptr;
   if (map_memory) {
-    result = vf.vkMapMemory(device->device(), memory, 0, VK_WHOLE_SIZE, 0,
-                            &mapped);
-    if (!ResultOk(result, "vkMapMemory", error_out)) {
-      vf.vkDestroyBuffer(device->device(), buffer, nullptr);
-      vf.vkFreeMemory(device->device(), memory, nullptr);
+    result =
+        vf.vkMapMemory(context->device, memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (!context->RecordDriverFailure(result, "vkMapMemory",
+                                      /*submission_failure=*/false,
+                                      error_out)) {
+      vf.vkDestroyBuffer(context->device, buffer, nullptr);
+      vf.vkFreeMemory(context->device, memory, nullptr);
+      context->ReleaseAllocation(req.size);
       return false;
     }
   }
 
+  context_ = context;
+  context_identity_ = context->identity;
   device_ = device;
   buffer_ = buffer;
   memory_ = memory;
   size_ = size;
+  allocation_size_ = req.size;
   mapped_ = mapped;
   return true;
 }
 
 void VulkanBuffer::Free() noexcept {
-  if (!device_)
+  if (!context_)
     return;
-  const auto &vf = device_->f();
-  if (mapped_ && vf.vkUnmapMemory)
-    vf.vkUnmapMemory(device_->device(), memory_);
+  const auto context = context_;
+  const auto &vf = context->f();
+  const bool safe_to_destroy = context->SafeToDestroyChildren();
+  if (safe_to_destroy && mapped_ && vf.vkUnmapMemory)
+    vf.vkUnmapMemory(context->device, memory_);
   mapped_ = nullptr;
-  if (buffer_ && vf.vkDestroyBuffer)
-    vf.vkDestroyBuffer(device_->device(), buffer_, nullptr);
+  if (safe_to_destroy && buffer_ && vf.vkDestroyBuffer)
+    vf.vkDestroyBuffer(context->device, buffer_, nullptr);
   buffer_ = nullptr;
-  if (memory_ && vf.vkFreeMemory)
-    vf.vkFreeMemory(device_->device(), memory_, nullptr);
+  if (safe_to_destroy && memory_ && vf.vkFreeMemory)
+    vf.vkFreeMemory(context->device, memory_, nullptr);
   memory_ = nullptr;
+  context->ReleaseAllocation(allocation_size_);
   size_ = 0;
+  allocation_size_ = 0;
   device_ = nullptr;
+  context_identity_ = {};
+  context_.reset();
+}
+
+bool VulkanBuffer::Valid() const {
+  return context_ && context_->Active() && context_identity_.Valid() &&
+         buffer_ && memory_ && size_ > 0 && allocation_size_ >= size_;
+}
+
+bool VulkanBuffer::BelongsTo(const VulkanDevice &device) const {
+  return Valid() && device.OwnsContext(context_identity_);
 }
 
 bool VulkanBuffer::Flush(std::string *error_out) const {
@@ -128,7 +162,20 @@ bool VulkanBuffer::Flush(std::string *error_out) const {
       *error_out = "Cannot flush an invalid Vulkan buffer.";
     return false;
   }
-  return device_->FlushMemory(memory_, 0, VK_WHOLE_SIZE, error_out);
+  if (!context_->Healthy()) {
+    const auto snapshot = context_->HealthSnapshot();
+    if (error_out)
+      *error_out = "[" + snapshot.reason_code +
+                   "] Cannot flush an unhealthy Vulkan buffer context.";
+    return false;
+  }
+  VkMappedMemoryRange range{};
+  range.memory = memory_;
+  range.size = VK_WHOLE_SIZE;
+  const VkResult result =
+      context_->f().vkFlushMappedMemoryRanges(context_->device, 1, &range);
+  return context_->RecordDriverFailure(result, "vkFlushMappedMemoryRanges",
+                                       /*submission_failure=*/false, error_out);
 }
 
 bool VulkanBuffer::Invalidate(std::string *error_out) const {
@@ -137,7 +184,20 @@ bool VulkanBuffer::Invalidate(std::string *error_out) const {
       *error_out = "Cannot invalidate an invalid Vulkan buffer.";
     return false;
   }
-  return device_->InvalidateMemory(memory_, 0, VK_WHOLE_SIZE, error_out);
+  if (!context_->Healthy()) {
+    const auto snapshot = context_->HealthSnapshot();
+    if (error_out)
+      *error_out = "[" + snapshot.reason_code +
+                   "] Cannot invalidate an unhealthy Vulkan buffer context.";
+    return false;
+  }
+  VkMappedMemoryRange range{};
+  range.memory = memory_;
+  range.size = VK_WHOLE_SIZE;
+  const VkResult result =
+      context_->f().vkInvalidateMappedMemoryRanges(context_->device, 1, &range);
+  return context_->RecordDriverFailure(result, "vkInvalidateMappedMemoryRanges",
+                                       /*submission_failure=*/false, error_out);
 }
 
 VulkanImage::~VulkanImage() { Free(); }
@@ -215,16 +275,15 @@ void PackRgb24ToRgba32(const std::uint8_t *src, std::size_t src_stride_bytes,
     std::uint32_t *out = dst + static_cast<std::size_t>(y) * dst_pitch_pixels;
     for (int x = 0; x < width; ++x) {
       const std::size_t i = static_cast<std::size_t>(x) * 3u;
-      out[x] = std::uint32_t(row[i]) |
-               (std::uint32_t(row[i + 1]) << 8u) |
+      out[x] = std::uint32_t(row[i]) | (std::uint32_t(row[i + 1]) << 8u) |
                (std::uint32_t(row[i + 2]) << 16u) | 0xff000000u;
     }
   }
 }
 
-void UnpackRgba32ToRgb24(const std::uint32_t *src,
-                         std::size_t src_pitch_pixels, int width, int height,
-                         std::uint8_t *dst, std::size_t dst_stride_bytes) {
+void UnpackRgba32ToRgb24(const std::uint32_t *src, std::size_t src_pitch_pixels,
+                         int width, int height, std::uint8_t *dst,
+                         std::size_t dst_stride_bytes) {
   if (!src || !dst || width <= 0 || height <= 0)
     return;
   for (int y = 0; y < height; ++y) {

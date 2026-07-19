@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "core/vulkan/vulkan_device.h"
@@ -57,7 +59,13 @@ public:
   const VulkanDevice *device() const { return &device_; }
   OpenVulkanDiagnostics Diagnostics() const;
   std::uint64_t synchronous_submission_count() const {
-    return synchronous_submission_count_;
+    return synchronous_submission_count_.load(std::memory_order_relaxed);
+  }
+  std::size_t last_frame_batch_stage_count() const {
+    return frame_batch_.recorded_stage_count();
+  }
+  std::uint64_t frame_batch_completion_count() const {
+    return frame_batch_.completion_count();
   }
 
   bool CropResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
@@ -151,13 +159,15 @@ private:
   VkPipelineLayout pipeline_layout_ = nullptr;
   VkPipeline pipeline_ = nullptr;
   VkCommandBuffer command_buffer_ = nullptr;
+  VulkanCommandBatch frame_batch_;
   std::array<VkBuffer, 7> bound_buffers_{};
   std::array<VkBuffer, 7> batch_bound_buffers_{};
 
   bool initialized_ = false;
   bool pipeline_created_ = false;
-  std::uint64_t synchronous_submission_count_ = 0;
+  std::atomic<std::uint64_t> synchronous_submission_count_{0};
   std::string init_error_;
+  mutable std::recursive_mutex execution_mutex_;
 };
 
 bool IsUtilityKernelsAvailable(std::string *error_out);
