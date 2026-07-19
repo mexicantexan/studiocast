@@ -26,6 +26,8 @@ bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared();
 bool TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed();
 bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared();
 bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed();
+bool TestOpenVulkanVideoNoiseRemovalCapabilityFactsAreFailClosed();
+bool TestOpenVulkanVideoNoiseRemovalTemporalReadinessGatesAreExact();
 bool TestFrameArtifactCacheReusesCompatibleMatteWithinFrame();
 bool TestFrameArtifactCacheReusesCompatibleMaxineMatteWithinFrame();
 bool TestFrameArtifactCacheSeparatesIncompatibleMatteKeys();
@@ -1479,6 +1481,98 @@ bool TestOpenVulkanEyeContactPlanCompatibilityIsIsolatedAndFailClosed() {
   return true;
 }
 
+bool TestOpenVulkanVideoNoiseRemovalPlanCompatibilityIsIsolatedAndFailClosed() {
+  namespace effects = studiocast::video::effects;
+
+  effects::BroadcastCameraEffects combined;
+  combined.video_noise_removal.enabled = true;
+  combined.eye_contact.enabled = true;
+  combined.virtual_background.mode = effects::VirtualBackgroundMode::blur;
+  combined.virtual_key_light.enabled = true;
+  combined.auto_frame.enabled = true;
+  combined.vignette.enabled = true;
+  combined.mirror = true;
+  auto plan = effects::BuildBroadcastEffectsPlan(combined);
+
+  const auto compatibility =
+      studiocast::video::ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+          &plan);
+  const auto contains = [&](std::string_view effect_id) {
+    return std::find(plan.ordered_effect_ids.begin(),
+                     plan.ordered_effect_ids.end(),
+                     effect_id) != plan.ordered_effect_ids.end();
+  };
+
+  if (!compatibility.blocked ||
+      compatibility.reason_code !=
+          studiocast::video::kOpenVulkanVideoNoiseRemovalUnavailableReason ||
+      compatibility.blocker_code !=
+          studiocast::video::
+              kOpenVulkanVideoNoiseRemovalRuntimeUnavailableReason ||
+      contains(effects::contract::kEffectIdVideoNoiseRemoval) ||
+      !contains(effects::contract::kEffectIdEyeContact) ||
+      !contains(effects::contract::kEffectIdVirtualBackgroundBlur) ||
+      !contains(effects::contract::kEffectIdVirtualKeyLight) ||
+      !contains(effects::contract::kEffectIdAutoFrame) ||
+      !contains(effects::contract::kEffectIdVignette) ||
+      !contains(effects::contract::kEffectIdMirror) ||
+      plan.vignette_attach_to_effect_id !=
+          effects::contract::kEffectIdAutoFrame ||
+      plan.disabled.size() != 1 ||
+      plan.disabled.front().id !=
+          effects::contract::kEffectIdVideoNoiseRemoval ||
+      plan.disabled.front().reason.find(
+          "[open_vulkan_video_noise_removal_unavailable] "
+          "[open_vulkan_video_noise_removal_runtime_unavailable]") ==
+          std::string::npos) {
+    std::cerr << "explicit Vulkan video-denoise compatibility must remove and "
+                 "diagnose only video noise removal\n";
+    return false;
+  }
+
+  const std::size_t disabled_count = plan.disabled.size();
+  if (studiocast::video::ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+          &plan)
+          .blocked ||
+      plan.disabled.size() != disabled_count) {
+    std::cerr << "video-denoise compatibility must be idempotent after "
+                 "removal\n";
+    return false;
+  }
+
+  effects::BroadcastCameraEffects mirror_only;
+  mirror_only.mirror = true;
+  auto mirror_plan = effects::BuildBroadcastEffectsPlan(mirror_only);
+  if (studiocast::video::ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+          &mirror_plan)
+          .blocked ||
+      mirror_plan.ordered_effect_ids.size() != 1 ||
+      mirror_plan.ordered_effect_ids.front() !=
+          effects::contract::kEffectIdMirror) {
+    std::cerr << "video-denoise compatibility must not alter unrelated plans\n";
+    return false;
+  }
+
+  effects::BroadcastCameraEffects denoise_and_vignette;
+  denoise_and_vignette.video_noise_removal.enabled = true;
+  denoise_and_vignette.vignette.enabled = true;
+  auto attached_plan = effects::BuildBroadcastEffectsPlan(denoise_and_vignette);
+  const bool vignette_was_standalone =
+      attached_plan.vignette_attach_to_effect_id.empty();
+  const auto attached_compatibility =
+      studiocast::video::ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+          &attached_plan);
+  if (!vignette_was_standalone || !attached_compatibility.blocked ||
+      !attached_plan.vignette_attach_to_effect_id.empty() ||
+      attached_plan.ordered_effect_ids.size() != 1 ||
+      attached_plan.ordered_effect_ids.front() !=
+          effects::contract::kEffectIdVignette) {
+    std::cerr << "removing video denoise must preserve standalone vignette\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1527,6 +1621,8 @@ int main() {
        &TestVignetteCanonicalPlanDefaultAndBackendContractIsNoGpuSafe},
       {"Open Vulkan eye contact plan compatibility is isolated/fail closed",
        &TestOpenVulkanEyeContactPlanCompatibilityIsIsolatedAndFailClosed},
+      {"Open Vulkan video denoise plan compatibility is isolated/fail closed",
+       &TestOpenVulkanVideoNoiseRemovalPlanCompatibilityIsIsolatedAndFailClosed},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},
@@ -1550,6 +1646,12 @@ int main() {
       {"Open Vulkan eye contact capability facts are fail closed",
        &studiocast::tests::
            TestOpenVulkanEyeContactCapabilityFactsAreFailClosed},
+      {"Open Vulkan video denoise capability facts are fail closed",
+       &studiocast::tests::
+           TestOpenVulkanVideoNoiseRemovalCapabilityFactsAreFailClosed},
+      {"Open Vulkan video denoise temporal readiness gates are exact",
+       &studiocast::tests::
+           TestOpenVulkanVideoNoiseRemovalTemporalReadinessGatesAreExact},
       {"frame artifact cache reuses compatible matte within frame",
        &studiocast::tests::
            TestFrameArtifactCacheReusesCompatibleMatteWithinFrame},

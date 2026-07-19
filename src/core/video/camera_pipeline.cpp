@@ -307,6 +307,36 @@ ApplyOpenVulkanEyeContactPlanCompatibility(
   return result;
 }
 
+OpenVulkanVideoNoiseRemovalPlanCompatibility
+ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan) {
+  OpenVulkanVideoNoiseRemovalPlanCompatibility result;
+  if (!retained_plan)
+    return result;
+
+  const std::string denoise_id(effects::contract::kEffectIdVideoNoiseRemoval);
+  const auto stage =
+      std::find(retained_plan->ordered_effect_ids.begin(),
+                retained_plan->ordered_effect_ids.end(), denoise_id);
+  if (stage == retained_plan->ordered_effect_ids.end())
+    return result;
+
+  retained_plan->ordered_effect_ids.erase(stage);
+  if (retained_plan->vignette_attach_to_effect_id == denoise_id)
+    retained_plan->vignette_attach_to_effect_id.clear();
+
+  result.blocked = true;
+  result.reason_code = kOpenVulkanVideoNoiseRemovalUnavailableReason;
+  result.blocker_code = kOpenVulkanVideoNoiseRemovalRuntimeUnavailableReason;
+  result.detail = kOpenVulkanVideoNoiseRemovalUnavailableDetail;
+  retained_plan->disabled.push_back(effects::DisabledEffectByRule{
+      .id = denoise_id,
+      .reason = "[" + std::string(result.reason_code) + "] [" +
+                std::string(result.blocker_code) + "] " +
+                std::string(result.detail)});
+  return result;
+}
+
 namespace {
 
 detail::PreparedReplaceBackgroundSource
@@ -8294,17 +8324,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::contract::kEffectIdMirror);
     };
 
-    const auto remove_unavailable_open_vulkan_denoise_from_plan = [&] {
-      remove_stage_from_plan(
-          studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
-    };
-
     auto compute_selection = ResolveComputeBackendSelection(
         cfg.compute_backend, compute_available, compute_work_requested);
 
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
-      remove_unavailable_open_vulkan_denoise_from_plan();
+      const auto denoise_compatibility =
+          ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(&plan);
+      if (denoise_compatibility.blocked) {
+        planned.erase(std::string(
+            studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval));
+        compute_available.vulkan_unavailable_reason =
+            "[" + std::string(denoise_compatibility.reason_code) + "] [" +
+            std::string(denoise_compatibility.blocker_code) + "] " +
+            std::string(denoise_compatibility.detail);
+      }
       const auto eye_contact_compatibility =
           ApplyOpenVulkanEyeContactPlanCompatibility(&plan);
       if (eye_contact_compatibility.blocked) {

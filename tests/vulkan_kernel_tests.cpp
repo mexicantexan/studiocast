@@ -908,6 +908,81 @@ int main() {
         "serialized eye-contact diagnostics must mirror hardware facts and "
         "expose the primary blocker with zero frame work");
   }
+  {
+    const auto diagnostics = studiocast::vulkan::DiagnoseOpenVulkanDefault();
+    const auto blocked =
+        diagnostics.blocked_effects.find("video_noise_removal");
+    const bool falsely_available =
+        std::find(diagnostics.available_effects.begin(),
+                  diagnostics.available_effects.end(),
+                  "video_noise_removal") != diagnostics.available_effects.end();
+    const std::string json = diagnostics.ToJson();
+    ok &= Require(
+        blocked != diagnostics.blocked_effects.end() &&
+            blocked->second == "open_vulkan_video_noise_removal_unavailable" &&
+            !falsely_available &&
+            !diagnostics.video_noise_removal_production_ready &&
+            diagnostics.video_noise_removal_backend_compiled &&
+            !diagnostics.video_noise_removal_live_stage_implemented &&
+            !diagnostics.video_noise_removal_production_adapter_available &&
+            !diagnostics
+                 .video_noise_removal_vulkan_inference_provider_available &&
+            diagnostics.video_noise_removal_non_cpu_device_selected ==
+                diagnostics.non_cpu_device_selected &&
+            diagnostics.video_noise_removal_compute_queue_available ==
+                diagnostics.compute_queue_available &&
+            diagnostics.video_noise_removal_context_healthy ==
+                diagnostics.context_healthy &&
+            !diagnostics.video_noise_removal_shared_device_imported &&
+            !diagnostics.video_noise_removal_queue_ownership_explicit &&
+            !diagnostics.video_noise_removal_model_pack_selected &&
+            !diagnostics.video_noise_removal_artifact_contract_validated &&
+            !diagnostics.video_noise_removal_fully_device_resident_tensor_io &&
+            !diagnostics.video_noise_removal_device_resident_preprocess &&
+            !diagnostics.video_noise_removal_device_resident_postprocess &&
+            !diagnostics.video_noise_removal_temporal_history_device_resident &&
+            !diagnostics.video_noise_removal_temporal_history_bounded &&
+            !diagnostics.video_noise_removal_history_reset_on_disable &&
+            !diagnostics.video_noise_removal_history_reset_on_reconfigure &&
+            !diagnostics
+                 .video_noise_removal_capture_sequence_discontinuity_reset &&
+            !diagnostics.video_noise_removal_selectable_cpu_fallback &&
+            diagnostics.video_noise_removal_dispatch_count == 0 &&
+            diagnostics.video_noise_removal_temporal_history_reset_count == 0 &&
+            diagnostics.video_noise_removal_cpu_readback_count == 0 &&
+            diagnostics.video_noise_removal_cpu_fallback_count == 0,
+        "default diagnostics must keep Vulkan video denoise unavailable with "
+        "separate hardware/runtime/artifact/temporal/fallback facts");
+    ok &= Require(
+        diagnostics.video_noise_removal_blocker_code ==
+                "open_vulkan_video_noise_removal_runtime_unavailable" &&
+            json.find("\"video_noise_removal_production_ready\":false") !=
+                std::string::npos &&
+            json.find(
+                std::string(
+                    "\"video_noise_removal_non_cpu_device_selected\":") +
+                (diagnostics.non_cpu_device_selected ? "true" : "false")) !=
+                std::string::npos &&
+            json.find(
+                std::string(
+                    "\"video_noise_removal_compute_queue_available\":") +
+                (diagnostics.compute_queue_available ? "true" : "false")) !=
+                std::string::npos &&
+            json.find(std::string("\"video_noise_removal_context_healthy\":") +
+                      (diagnostics.context_healthy ? "true" : "false")) !=
+                std::string::npos &&
+            json.find("\"video_noise_removal_dispatch_count\":0") !=
+                std::string::npos &&
+            json.find(
+                "\"video_noise_removal_temporal_history_reset_count\":0") !=
+                std::string::npos &&
+            json.find("\"video_noise_removal_cpu_readback_count\":0") !=
+                std::string::npos &&
+            json.find("\"video_noise_removal_cpu_fallback_count\":0") !=
+                std::string::npos,
+        "serialized video-denoise diagnostics must mirror hardware facts and "
+        "expose the primary blocker with zero frame/history work");
+  }
   ok &= Require(
       !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(0, 7) &&
           !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(7, 7) &&

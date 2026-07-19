@@ -843,6 +843,73 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << eye_contact_cpu_readback_count << ",";
   oss << "\"eye_contact_cpu_fallback_count\":"
       << eye_contact_cpu_fallback_count << ",";
+  oss << "\"video_noise_removal_production_ready\":"
+      << BoolJson(video_noise_removal_production_ready) << ",";
+  oss << "\"video_noise_removal_reason_code\":\""
+      << JsonEscape(video_noise_removal_reason_code) << "\",";
+  oss << "\"video_noise_removal_blocker_code\":\""
+      << JsonEscape(video_noise_removal_blocker_code) << "\",";
+  oss << "\"video_noise_removal_detail\":\""
+      << JsonEscape(video_noise_removal_detail) << "\",";
+  oss << "\"video_noise_removal_backend_compiled\":"
+      << BoolJson(video_noise_removal_backend_compiled) << ",";
+  oss << "\"video_noise_removal_live_stage_implemented\":"
+      << BoolJson(video_noise_removal_live_stage_implemented) << ",";
+  oss << "\"video_noise_removal_production_adapter_available\":"
+      << BoolJson(video_noise_removal_production_adapter_available) << ",";
+  oss << "\"video_noise_removal_vulkan_inference_provider_available\":"
+      << BoolJson(video_noise_removal_vulkan_inference_provider_available)
+      << ",";
+  oss << "\"video_noise_removal_non_cpu_device_selected\":"
+      << BoolJson(video_noise_removal_non_cpu_device_selected) << ",";
+  oss << "\"video_noise_removal_compute_queue_available\":"
+      << BoolJson(video_noise_removal_compute_queue_available) << ",";
+  oss << "\"video_noise_removal_context_healthy\":"
+      << BoolJson(video_noise_removal_context_healthy) << ",";
+  oss << "\"video_noise_removal_shared_device_imported\":"
+      << BoolJson(video_noise_removal_shared_device_imported) << ",";
+  oss << "\"video_noise_removal_queue_ownership_explicit\":"
+      << BoolJson(video_noise_removal_queue_ownership_explicit) << ",";
+  oss << "\"video_noise_removal_model_pack_selected\":"
+      << BoolJson(video_noise_removal_model_pack_selected) << ",";
+  oss << "\"video_noise_removal_artifact_contract_validated\":"
+      << BoolJson(video_noise_removal_artifact_contract_validated) << ",";
+  oss << "\"video_noise_removal_fully_device_resident_tensor_io\":"
+      << BoolJson(video_noise_removal_fully_device_resident_tensor_io) << ",";
+  oss << "\"video_noise_removal_device_resident_preprocess\":"
+      << BoolJson(video_noise_removal_device_resident_preprocess) << ",";
+  oss << "\"video_noise_removal_device_resident_postprocess\":"
+      << BoolJson(video_noise_removal_device_resident_postprocess) << ",";
+  oss << "\"video_noise_removal_warmup_complete\":"
+      << BoolJson(video_noise_removal_warmup_complete) << ",";
+  oss << "\"video_noise_removal_synchronization_contract_validated\":"
+      << BoolJson(video_noise_removal_synchronization_contract_validated)
+      << ",";
+  oss << "\"video_noise_removal_bounded_reusable_allocations\":"
+      << BoolJson(video_noise_removal_bounded_reusable_allocations) << ",";
+  oss << "\"video_noise_removal_temporal_history_device_resident\":"
+      << BoolJson(video_noise_removal_temporal_history_device_resident) << ",";
+  oss << "\"video_noise_removal_temporal_history_bounded\":"
+      << BoolJson(video_noise_removal_temporal_history_bounded) << ",";
+  oss << "\"video_noise_removal_history_reset_on_disable\":"
+      << BoolJson(video_noise_removal_history_reset_on_disable) << ",";
+  oss << "\"video_noise_removal_history_reset_on_reconfigure\":"
+      << BoolJson(video_noise_removal_history_reset_on_reconfigure) << ",";
+  oss << "\"video_noise_removal_capture_sequence_discontinuity_reset\":"
+      << BoolJson(video_noise_removal_capture_sequence_discontinuity_reset)
+      << ",";
+  oss << "\"video_noise_removal_parity_validated\":"
+      << BoolJson(video_noise_removal_parity_validated) << ",";
+  oss << "\"video_noise_removal_selectable_cpu_fallback\":"
+      << BoolJson(video_noise_removal_selectable_cpu_fallback) << ",";
+  oss << "\"video_noise_removal_dispatch_count\":"
+      << video_noise_removal_dispatch_count << ",";
+  oss << "\"video_noise_removal_temporal_history_reset_count\":"
+      << video_noise_removal_temporal_history_reset_count << ",";
+  oss << "\"video_noise_removal_cpu_readback_count\":"
+      << video_noise_removal_cpu_readback_count << ",";
+  oss << "\"video_noise_removal_cpu_fallback_count\":"
+      << video_noise_removal_cpu_fallback_count << ",";
   oss << "\"matting_runtime\":\"" << JsonEscape(matting_runtime) << "\",";
   oss << "\"matting_build_enabled\":" << BoolJson(matting_build_enabled) << ",";
   oss << "\"matting_adapter_available\":" << BoolJson(matting_adapter_available)

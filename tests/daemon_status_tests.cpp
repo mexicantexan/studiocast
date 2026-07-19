@@ -1362,6 +1362,264 @@ bool TestExplicitVulkanEyeContactReportsExactFailClosedFacts() {
                 "blocked eye contact must prove zero frame work");
 }
 
+bool TestExplicitVulkanVideoNoiseRemovalReportsExactFailClosedFacts() {
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.enabled = true;
+  videoConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  videoConfig.pipeline.effects.video_noise_removal.enabled = true;
+
+  const std::string openVulkanJson =
+      "{\"compiled_enabled\":true,\"ok\":true,"
+      "\"available_effects\":[\"mirror\"],"
+      "\"blocked_effects\":{\"video_noise_removal\":"
+      "\"open_vulkan_video_noise_removal_unavailable\"},"
+      "\"video_noise_removal_production_ready\":false,"
+      "\"video_noise_removal_reason_code\":"
+      "\"open_vulkan_video_noise_removal_unavailable\","
+      "\"video_noise_removal_blocker_code\":"
+      "\"open_vulkan_video_noise_removal_runtime_unavailable\","
+      "\"video_noise_removal_detail\":\"FastDVDnet has host temporal "
+      "history, CPU preprocessing/postprocessing, and ONNX-only artifacts\","
+      "\"video_noise_removal_backend_compiled\":true,"
+      "\"video_noise_removal_live_stage_implemented\":false,"
+      "\"video_noise_removal_production_adapter_available\":false,"
+      "\"video_noise_removal_vulkan_inference_provider_available\":false,"
+      "\"video_noise_removal_non_cpu_device_selected\":true,"
+      "\"video_noise_removal_compute_queue_available\":true,"
+      "\"video_noise_removal_context_healthy\":true,"
+      "\"video_noise_removal_shared_device_imported\":false,"
+      "\"video_noise_removal_queue_ownership_explicit\":false,"
+      "\"video_noise_removal_model_pack_selected\":false,"
+      "\"video_noise_removal_artifact_contract_validated\":false,"
+      "\"video_noise_removal_fully_device_resident_tensor_io\":false,"
+      "\"video_noise_removal_device_resident_preprocess\":false,"
+      "\"video_noise_removal_device_resident_postprocess\":false,"
+      "\"video_noise_removal_warmup_complete\":false,"
+      "\"video_noise_removal_synchronization_contract_validated\":false,"
+      "\"video_noise_removal_bounded_reusable_allocations\":false,"
+      "\"video_noise_removal_temporal_history_device_resident\":false,"
+      "\"video_noise_removal_temporal_history_bounded\":false,"
+      "\"video_noise_removal_history_reset_on_disable\":false,"
+      "\"video_noise_removal_history_reset_on_reconfigure\":false,"
+      "\"video_noise_removal_capture_sequence_discontinuity_reset\":false,"
+      "\"video_noise_removal_parity_validated\":false,"
+      "\"video_noise_removal_selectable_cpu_fallback\":false,"
+      "\"video_noise_removal_dispatch_count\":0,"
+      "\"video_noise_removal_temporal_history_reset_count\":0,"
+      "\"video_noise_removal_cpu_readback_count\":0,"
+      "\"video_noise_removal_cpu_fallback_count\":0}";
+
+  const std::string statusJson = StatusForVideoConfigWithDiagnostics(
+      videoConfig, /*maxineJson=*/"", /*openCudaJson=*/"", openVulkanJson);
+  const ReadinessFields entry =
+      ReadinessEntryFor(statusJson, "video_noise_removal");
+  if (!entry.present)
+    return false;
+
+  studiocast::util::json::Value diagnosticsValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(openVulkanJson, &diagnosticsValue,
+                                     &error)) {
+    std::cerr << "Open Vulkan fixture should parse: " << error << "\n";
+    return false;
+  }
+  const JsonObject *diagnostics = diagnosticsValue.AsObject();
+  if (!diagnostics)
+    return false;
+  const std::string *blocker =
+      StringAt(*diagnostics, "video_noise_removal_blocker_code",
+               "video-denoise runtime blocker should exist");
+  if (!blocker)
+    return false;
+
+  return Expect(
+             entry.backend == "open_vulkan",
+             "explicit Vulkan video denoise must keep backend attribution") &&
+         Expect(entry.state == "backend_unavailable",
+                "explicit Vulkan video denoise must fail closed") &&
+         Expect(entry.reason == "open_vulkan_video_noise_removal_unavailable",
+                "video denoise must expose the stable outer reason") &&
+         Expect(entry.detail.find(
+                    "[open_vulkan_video_noise_removal_unavailable] "
+                    "[open_vulkan_video_noise_removal_runtime_unavailable]") !=
+                        std::string::npos &&
+                    entry.detail.find("host temporal history") !=
+                        std::string::npos &&
+                    entry.detail.find("ONNX-only") != std::string::npos,
+                "video-denoise detail must expose nested runtime, temporal, "
+                "and artifact boundaries") &&
+         Expect(*blocker ==
+                    "open_vulkan_video_noise_removal_runtime_unavailable",
+                "video denoise diagnostics must expose the primary blocker") &&
+         Expect(JsonBoolField(*diagnostics,
+                              "video_noise_removal_backend_compiled", false),
+                "compiled backend must remain a separate true fact") &&
+         Expect(
+             !JsonBoolField(*diagnostics,
+                            "video_noise_removal_live_stage_implemented",
+                            true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_production_adapter_available",
+                     true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_vulkan_inference_provider_available",
+                     true),
+             "video denoise must not claim a live adapter/provider") &&
+         Expect(
+             JsonBoolField(*diagnostics,
+                           "video_noise_removal_non_cpu_device_selected",
+                           false) &&
+                 JsonBoolField(*diagnostics,
+                               "video_noise_removal_compute_queue_available",
+                               false) &&
+                 JsonBoolField(*diagnostics,
+                               "video_noise_removal_context_healthy", false),
+             "hardware facts must remain independent from effect readiness") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "video_noise_removal_shared_device_imported",
+                               true) &&
+                    !JsonBoolField(
+                        *diagnostics,
+                        "video_noise_removal_queue_ownership_explicit", true),
+                "video denoise must not claim shared device/queue ownership") &&
+         Expect(
+             !JsonBoolField(*diagnostics,
+                            "video_noise_removal_model_pack_selected", true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_artifact_contract_validated", true),
+             "ONNX-only packs must not claim a Vulkan artifact contract") &&
+         Expect(
+             !JsonBoolField(
+                 *diagnostics,
+                 "video_noise_removal_fully_device_resident_tensor_io", true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_device_resident_preprocess", true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_device_resident_postprocess", true),
+             "host pre/post and tensor I/O must remain explicit") &&
+         Expect(
+             !JsonBoolField(
+                 *diagnostics,
+                 "video_noise_removal_temporal_history_device_resident",
+                 true) &&
+                 !JsonBoolField(*diagnostics,
+                                "video_noise_removal_temporal_history_bounded",
+                                true) &&
+                 !JsonBoolField(*diagnostics,
+                                "video_noise_removal_history_reset_on_disable",
+                                true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_history_reset_on_reconfigure",
+                     true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_capture_sequence_discontinuity_reset",
+                     true),
+             "Vulkan temporal residency/reset facts must fail closed") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "video_noise_removal_selectable_cpu_fallback",
+                               true),
+                "internal CPU behavior is not a selectable fallback") &&
+         Expect(JsonNumberField(*diagnostics,
+                                "video_noise_removal_dispatch_count",
+                                1.0) == 0.0 &&
+                    JsonNumberField(
+                        *diagnostics,
+                        "video_noise_removal_temporal_history_reset_count",
+                        1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "video_noise_removal_cpu_readback_count",
+                                    1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "video_noise_removal_cpu_fallback_count",
+                                    1.0) == 0.0,
+                "blocked video denoise must prove zero frame/history work");
+}
+
+bool TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() {
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+  return true;
+#else
+  const DiagnosticsJsonSnapshot snapshot = ComputeDiagnosticsJsonSnapshot();
+  studiocast::util::json::Value value;
+  std::string error;
+  if (!studiocast::util::json::Parse(snapshot.open_vulkan, &value, &error)) {
+    std::cerr << "Vulkan-off diagnostics should parse: " << error << "\n";
+    return false;
+  }
+  const JsonObject *diagnostics = value.AsObject();
+  if (!diagnostics)
+    return false;
+  const JsonObject *blocked =
+      ObjectAt(*diagnostics, "blocked_effects",
+               "Vulkan-off blocked_effects should be present");
+  if (!blocked)
+    return false;
+  const std::string *blockedReason =
+      StringAt(*blocked, "video_noise_removal",
+               "Vulkan-off video-denoise blocker should be present");
+  const std::string *primaryBlocker =
+      StringAt(*diagnostics, "video_noise_removal_blocker_code",
+               "Vulkan-off video-denoise primary blocker should be present");
+  if (!blockedReason || !primaryBlocker)
+    return false;
+
+  return Expect(*blockedReason == "open_vulkan_video_noise_removal_unavailable",
+                "Vulkan-off schema must preserve the stable outer reason") &&
+         Expect(*primaryBlocker ==
+                    "open_vulkan_video_noise_removal_runtime_unavailable",
+                "Vulkan-off schema must preserve the stable primary blocker") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "video_noise_removal_backend_compiled", true) &&
+                    !JsonBoolField(
+                        *diagnostics,
+                        "video_noise_removal_non_cpu_device_selected", true) &&
+                    !JsonBoolField(
+                        *diagnostics,
+                        "video_noise_removal_compute_queue_available", true) &&
+                    !JsonBoolField(*diagnostics,
+                                   "video_noise_removal_context_healthy", true),
+                "Vulkan-off hardware/compiled facts must stay false") &&
+         Expect(
+             !JsonBoolField(*diagnostics,
+                            "video_noise_removal_temporal_history_bounded",
+                            true) &&
+                 !JsonBoolField(*diagnostics,
+                                "video_noise_removal_history_reset_on_disable",
+                                true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_history_reset_on_reconfigure",
+                     true) &&
+                 !JsonBoolField(
+                     *diagnostics,
+                     "video_noise_removal_capture_sequence_discontinuity_reset",
+                     true),
+             "Vulkan-off temporal contract facts must stay false") &&
+         Expect(JsonNumberField(*diagnostics,
+                                "video_noise_removal_dispatch_count",
+                                1.0) == 0.0 &&
+                    JsonNumberField(
+                        *diagnostics,
+                        "video_noise_removal_temporal_history_reset_count",
+                        1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "video_noise_removal_cpu_readback_count",
+                                    1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "video_noise_removal_cpu_fallback_count",
+                                    1.0) == 0.0,
+                "Vulkan-off video denoise must report zero work counters");
+#endif
+}
+
 bool TestBuiltinEffectReadyWithoutDiagnostics() {
   studiocast::video::effects::BroadcastCameraEffects effects;
   effects.engine =
@@ -1508,6 +1766,8 @@ int main() {
   ok = TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() && ok;
   ok = TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() && ok;
   ok = TestExplicitVulkanEyeContactReportsExactFailClosedFacts() && ok;
+  ok = TestExplicitVulkanVideoNoiseRemovalReportsExactFailClosedFacts() && ok;
+  ok = TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() && ok;
   ok = TestBuiltinEffectReadyWithoutDiagnostics() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;
