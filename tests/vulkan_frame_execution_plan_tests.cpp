@@ -24,7 +24,7 @@ bool Require(bool condition, const std::string &message) {
 
 FrameExecutionRequest FullFrameRequest() {
   FrameExecutionRequest request;
-  request.external_resources = {"captured_rgb"};
+  request.external_resources = {"captured_rgb", "vignette_attenuation_factor"};
   request.dispatches = {
       {FrameExecutionStage::preprocess,
        "preprocess",
@@ -58,9 +58,13 @@ FrameExecutionRequest FullFrameRequest() {
        "crop_resize",
        {"lit_rgb"},
        {"output_rgb"}},
+      {FrameExecutionStage::key_light,
+       "vignette",
+       {"output_rgb", "vignette_attenuation_factor"},
+       {"vignetted_output_rgb"}},
       {FrameExecutionStage::crop_resize,
        "mirror",
-       {"output_rgb"},
+       {"vignetted_output_rgb"},
        {"mirrored_output_rgb"}},
   };
   request.host_readbacks = {"mirrored_output_rgb"};
@@ -74,7 +78,7 @@ bool TestFullFramePlan() {
   std::string error;
   bool ok = Require(BuildFrameExecutionPlan(FullFrameRequest(), &plan, &error),
                     "full frame plan should build: " + error);
-  ok &= Require(plan.dispatches.size() == 9,
+  ok &= Require(plan.dispatches.size() == 10,
                 "full frame plan should represent all candidate stages");
   ok &= Require(plan.completion_boundary == plan.dispatches.size(),
                 "completion boundary should follow the final dispatch");
@@ -96,7 +100,8 @@ bool TestFullFramePlan() {
   bool alpha_ready = false;
   bool blur_ready = false;
   bool composite_ready = false;
-  bool final_resize_to_mirror_ready = false;
+  bool final_resize_to_vignette_ready = false;
+  bool vignette_to_mirror_ready = false;
   bool host_ready = false;
   for (const auto &barrier : plan.barriers) {
     if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
@@ -122,18 +127,23 @@ bool TestFullFramePlan() {
     if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
         barrier.resource == "output_rgb" && barrier.producer_dispatch == 7 &&
         barrier.consumer_boundary == 8) {
-      final_resize_to_mirror_ready = true;
+      final_resize_to_vignette_ready = true;
+    }
+    if (barrier.kind == FrameBarrierKind::compute_write_to_compute_read &&
+        barrier.resource == "vignetted_output_rgb" &&
+        barrier.producer_dispatch == 8 && barrier.consumer_boundary == 9) {
+      vignette_to_mirror_ready = true;
     }
     if (barrier.kind == FrameBarrierKind::compute_write_to_host_read &&
         barrier.resource == "mirrored_output_rgb" &&
-        barrier.producer_dispatch == 8 &&
+        barrier.producer_dispatch == 9 &&
         barrier.consumer_boundary == plan.completion_boundary) {
       host_ready = true;
     }
   }
   ok &=
       Require(tensor_ready && alpha_ready && blur_ready && composite_ready &&
-                  final_resize_to_mirror_ready,
+                  final_resize_to_vignette_ready && vignette_to_mirror_ready,
               "planner should insert explicit compute write-to-read barriers");
   ok &= Require(host_ready,
                 "planner should insert the final host readback barrier");

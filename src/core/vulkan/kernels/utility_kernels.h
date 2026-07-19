@@ -67,6 +67,17 @@ public:
   std::uint64_t frame_batch_completion_count() const {
     return frame_batch_.completion_count();
   }
+  std::uint64_t descriptor_binding_update_count() const {
+    return descriptor_binding_update_count_.load(std::memory_order_relaxed);
+  }
+
+  // Setup-time resource destruction followed by allocation may reuse the same
+  // opaque VkBuffer handle. Raw-handle descriptor caches cannot distinguish
+  // that new object from the destroyed object, so effect-owned resource
+  // reconfiguration must invalidate every utility descriptor tuple before its
+  // next dispatch. Stable frame resources still avoid descriptor updates on
+  // subsequent frames.
+  void InvalidateDescriptorBindingCacheForSetup() noexcept;
 
   bool CropResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                           float crop_x, float crop_y, float crop_w,
@@ -122,6 +133,18 @@ public:
                          float intensity01, float direction,
                          const VulkanImage &out, std::string *error_out);
 
+  // Applies the final fixed-center vignette from a device-resident attenuation
+  // factor mask. If resize_scratch is supplied, src is first resized to final
+  // output geometry. If mirrored_out is supplied, the vignetted result is then
+  // horizontally mirrored. Every requested stage is recorded into one command
+  // buffer and completed with one bounded queue submission/fence wait.
+  bool ApplyFinalVignetteU8x3(const VulkanImage &src,
+                              const VulkanImage *resize_scratch,
+                              const VulkanImage &attenuation_factor,
+                              const VulkanImage &vignette_out,
+                              const VulkanImage *mirrored_out,
+                              std::string *error_out);
+
 private:
   enum class Op : std::uint32_t {
     crop_resize_u8x3 = 1,
@@ -161,12 +184,14 @@ private:
   VulkanDevice device_;
   VulkanBuffer params_;
   VulkanBuffer batch_params_;
+  VulkanBuffer final_params_;
   VulkanBuffer dummy_;
 
   VkDescriptorSetLayout descriptor_set_layout_ = nullptr;
   VkDescriptorPool descriptor_pool_ = nullptr;
   VkDescriptorSet descriptor_set_ = nullptr;
   VkDescriptorSet batch_descriptor_set_ = nullptr;
+  VkDescriptorSet final_descriptor_set_ = nullptr;
   VkShaderModule shader_module_ = nullptr;
   VkPipelineLayout pipeline_layout_ = nullptr;
   VkPipeline pipeline_ = nullptr;
@@ -174,10 +199,12 @@ private:
   VulkanCommandBatch frame_batch_;
   std::array<VkBuffer, 7> bound_buffers_{};
   std::array<VkBuffer, 7> batch_bound_buffers_{};
+  std::array<VkBuffer, 7> final_bound_buffers_{};
 
   bool initialized_ = false;
   bool pipeline_created_ = false;
   std::atomic<std::uint64_t> synchronous_submission_count_{0};
+  std::atomic<std::uint64_t> descriptor_binding_update_count_{0};
   std::string init_error_;
   mutable std::recursive_mutex execution_mutex_;
 };

@@ -232,6 +232,10 @@ struct CameraPipelineStatus {
     std::uint64_t composite_dispatch_calls = 0;
     std::uint64_t key_light_dispatch_calls = 0;
     std::uint64_t crop_resize_dispatch_calls = 0;
+    std::uint64_t vignette_dispatch_calls = 0;
+    std::uint64_t vignette_factor_allocation_calls = 0;
+    std::uint64_t vignette_factor_generation_calls = 0;
+    std::uint64_t vignette_factor_upload_calls = 0;
     std::uint64_t mirror_dispatch_calls = 0;
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
