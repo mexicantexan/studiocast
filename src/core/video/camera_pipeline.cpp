@@ -64,6 +64,7 @@
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
 #include "core/video/open_vulkan_virtual_background_remove.h"
+#include "core/video/open_vulkan_virtual_background_replace.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/resize_bilinear.h"
 #include "core/vulkan/kernels/utility_kernels.h"
@@ -3565,6 +3566,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     OpenVulkanVirtualBackgroundBlurCounters blur_effect_counters;
     OpenVulkanVirtualBackgroundRemove remove_effect;
     OpenVulkanVirtualBackgroundRemoveCounters remove_effect_counters;
+    OpenVulkanVirtualBackgroundReplace replace_effect;
+    OpenVulkanVirtualBackgroundReplaceCounters replace_effect_counters;
 
     studiocast::open_video::FrameArtifactCache matte_artifacts;
     studiocast::open_video::FrameMatteArtifactKey vulkan_matte_artifact_key;
@@ -3579,24 +3582,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::vulkan::VulkanImage alpha_feather;  // f32_1, frame WxH
     studiocast::vulkan::VulkanImage blur_tmp;       // rgb_u8, WxH
     studiocast::vulkan::VulkanImage blurred;        // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage bg_rgb;         // rgb_u8, WxH
-    studiocast::vulkan::VulkanImage bg_src_rgb;     // rgb_u8, source WxH
     studiocast::vulkan::VulkanImage auto_frame_rgb; // rgb_u8, WxH
     studiocast::vulkan::VulkanImage vignette_rgb;   // rgb_u8, final output WxH
     studiocast::vulkan::VulkanImage mirror_rgb;     // rgb_u8, final output WxH
 
-    std::filesystem::path cached_bg_src_path;
-    std::filesystem::file_time_type cached_bg_src_mtime{};
-    int cached_bg_src_w = 0;
-    int cached_bg_src_h = 0;
-    bool cached_bg_src_valid = false;
-    std::uint64_t cached_bg_src_gen = 0;
-    int cached_bg_dst_w = 0;
-    int cached_bg_dst_h = 0;
-    bool cached_bg_dst_valid = false;
-    std::uint64_t cached_bg_dst_src_gen = 0;
     detail::PreparedReplaceBackgroundSource prepared_bg_src;
-    std::vector<std::uint8_t> tmp_replace_rgb_src;
 
     std::uint64_t cached_matte_sequence = 0;
     bool cached_matte_valid = false;
@@ -3612,7 +3602,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::uint64_t alpha_resize_dispatch_calls = 0;
     std::uint64_t alpha_resize_completion_count = 0;
     std::uint64_t blur_dispatch_calls = 0;
-    std::uint64_t background_upload_calls = 0;
     std::uint64_t composite_dispatch_calls = 0;
     std::uint64_t key_light_dispatch_calls = 0;
     std::uint64_t crop_resize_dispatch_calls = 0;
@@ -3625,6 +3614,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       matting_session.reset();
       blur_effect.Shutdown();
       remove_effect.Shutdown();
+      replace_effect.Shutdown();
       model_pack.reset();
       ResetMattingSessionState();
       kernels.Shutdown();
@@ -3636,18 +3626,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       ClearMatteArtifactKey();
       InvalidateMatteCache();
 
-      cached_bg_src_path.clear();
-      cached_bg_src_mtime = {};
-      cached_bg_src_w = 0;
-      cached_bg_src_h = 0;
-      cached_bg_src_valid = false;
-      cached_bg_src_gen = 0;
-      cached_bg_dst_w = 0;
-      cached_bg_dst_h = 0;
-      cached_bg_dst_valid = false;
-      cached_bg_dst_src_gen = 0;
       prepared_bg_src = {};
-      tmp_replace_rgb_src.clear();
     }
 
     void ConfigureReplaceBackgroundSource(
@@ -3675,8 +3654,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       alpha_feather.Free();
       blur_tmp.Free();
       blurred.Free();
-      bg_rgb.Free();
-      bg_src_rgb.Free();
       auto_frame_rgb.Free();
       vignette_rgb.Free();
       mirror_rgb.Free();
@@ -4081,13 +4058,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                          /*map_memory=*/false, "alpha_tmp", error_out) ||
             !EnsureImage(&alpha_feather, frame_w, frame_h,
                          studiocast::vulkan::VulkanPixelFormat::f32_1,
-                         /*map_memory=*/false, "alpha_feather", error_out) ||
-            !EnsureImage(&blur_tmp, frame_w, frame_h,
-                         studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                         /*map_memory=*/false, "blur_tmp", error_out) ||
-            !EnsureImage(&blurred, frame_w, frame_h,
-                         studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                         /*map_memory=*/false, "blurred", error_out)) {
+                         /*map_memory=*/false, "alpha_feather", error_out)) {
           last_error =
               error_out ? *error_out : "Open Vulkan allocation failed.";
           if (error_out)
@@ -4096,6 +4067,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
         if (fx.virtual_background.mode ==
             studiocast::video::effects::VirtualBackgroundMode::blur) {
+          if (!EnsureImage(&blur_tmp, frame_w, frame_h,
+                           studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                           /*map_memory=*/false, "blur_tmp", error_out) ||
+              !EnsureImage(&blurred, frame_w, frame_h,
+                           studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                           /*map_memory=*/false, "blurred", error_out)) {
+            last_error =
+                error_out ? *error_out : "Open Vulkan allocation failed.";
+            if (error_out)
+              *error_out = last_error;
+            return false;
+          }
           const auto matting_readiness = matting_session->Readiness();
           std::string blur_error;
           if (!blur_effect.EnsureInitialized(&kernels, frame_w, frame_h,
@@ -4119,107 +4102,40 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               *error_out = last_error;
             return false;
           }
+        } else if (fx.virtual_background.mode ==
+                   studiocast::video::effects::VirtualBackgroundMode::replace) {
+          const auto matting_readiness = matting_session->Readiness();
+          std::string replace_error;
+          if (prepared_bg_src.path != fx.virtual_background.replace_path) {
+            replace_error = OpenVulkanVirtualBackgroundReplaceAssetInvalidFailure(
+                "prepared replacement path does not match the active "
+                "configuration");
+          } else if (!replace_effect.EnsureInitialized(
+                         &kernels, frame_w, frame_h,
+                         fx.virtual_background.strength, prepared_bg_src,
+                         matting_readiness, &replace_effect_counters,
+                         &replace_error)) {
+            // The wrapper already supplied the effect-specific outer reason.
+          }
+          if (!replace_error.empty()) {
+            if (replace_error.find(
+                    "[vulkan_virtual_background_replace_initialization_failed]") ==
+                std::string::npos) {
+              replace_error =
+                  OpenVulkanVirtualBackgroundReplaceInitializationFailure(
+                      replace_error);
+            }
+            last_error = replace_error;
+            if (error_out)
+              *error_out = last_error;
+            return false;
+          }
         }
-      }
-
-      if (cached_bg_dst_w != frame_w || cached_bg_dst_h != frame_h) {
-        cached_bg_dst_valid = false;
-        cached_bg_dst_w = frame_w;
-        cached_bg_dst_h = frame_h;
       }
 
       initialized = true;
       enabled = true;
       last_error.clear();
-      return true;
-    }
-
-    bool EnsureReplaceBackgroundGpu(int width, int height,
-                                    const std::filesystem::path &path,
-                                    std::string *error_out) {
-      if (error_out)
-        error_out->clear();
-      if (!initialized) {
-        if (error_out)
-          *error_out = "Open Vulkan: not initialized.";
-        return false;
-      }
-      if (path.empty()) {
-        if (error_out)
-          *error_out = "Open Vulkan: virtual_background.replace_path not set.";
-        return false;
-      }
-      if (!prepared_bg_src.valid || prepared_bg_src.path != path) {
-        if (error_out)
-          *error_out = prepared_bg_src.error.empty()
-                           ? "Open Vulkan: replace image was not prepared."
-                           : "Open Vulkan: " + prepared_bg_src.error;
-        return false;
-      }
-
-      const detail::ReplaceBackgroundSourceCacheSnapshot source_cache{
-          cached_bg_src_path, cached_bg_src_mtime,
-          cached_bg_src_valid && bg_src_rgb.Valid(), cached_bg_src_gen};
-      const detail::ReplaceBackgroundResizeCacheSnapshot resize_cache{
-          cached_bg_dst_w, cached_bg_dst_h,
-          cached_bg_dst_valid && bg_rgb.Valid(), cached_bg_dst_src_gen};
-      const auto cache_decision = detail::DecideReplaceBackgroundFrameCache(
-          prepared_bg_src, source_cache, resize_cache, width, height);
-
-      if (cache_decision.refresh_source) {
-        int iw = 0;
-        int ih = 0;
-        std::string img_err;
-        if (!studiocast::video::LoadImageRgb24(prepared_bg_src.path, &iw, &ih,
-                                               &tmp_replace_rgb_src,
-                                               &img_err)) {
-          if (error_out)
-            *error_out =
-                "Open Vulkan: failed to load replace image: " + img_err;
-          return false;
-        }
-        if (!UploadRgbToImage(tmp_replace_rgb_src.data(),
-                              static_cast<std::size_t>(iw) * 3u, iw, ih,
-                              &bg_src_rgb, error_out)) {
-          if (error_out && !error_out->empty()) {
-            *error_out =
-                "Open Vulkan: failed to upload replace image: " + *error_out;
-          }
-          return false;
-        }
-        ++background_upload_calls;
-
-        cached_bg_src_path = prepared_bg_src.path;
-        cached_bg_src_mtime = prepared_bg_src.mtime;
-        cached_bg_src_w = iw;
-        cached_bg_src_h = ih;
-        cached_bg_src_valid = true;
-        cached_bg_src_gen = cache_decision.source_generation_after_refresh;
-        cached_bg_dst_valid = false;
-      }
-
-      if (!cache_decision.refresh_resized_destination) {
-        return true;
-      }
-
-      if (!EnsureImage(&bg_rgb, width, height,
-                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                       /*map_memory=*/true, "bg_rgb", error_out)) {
-        return false;
-      }
-      std::string kerr;
-      if (!kernels.ResizeBilinear(bg_src_rgb, bg_rgb, &kerr)) {
-        if (error_out)
-          *error_out =
-              "Open Vulkan: failed to resize replace image on GPU: " + kerr;
-        return false;
-      }
-      ++forced_sync_calls;
-
-      cached_bg_dst_w = width;
-      cached_bg_dst_h = height;
-      cached_bg_dst_src_gen = cached_bg_src_gen;
-      cached_bg_dst_valid = true;
       return true;
     }
 
@@ -4459,38 +4375,28 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         forced_sync_calls +=
             1u + (parameters.alpha_feather_radius > 0 ? 1u : 0u);
       } else if (fx.virtual_background.mode == VirtualBackgroundMode::replace) {
-        const int strength = std::max(
-            studiocast::video::effects::contract::kVbStrengthMin,
-            std::min(studiocast::video::effects::contract::kVbStrengthMax,
-                     fx.virtual_background.strength));
-        const int feather_radius = std::min(4, strength / 16);
-        const studiocast::vulkan::VulkanImage *alpha_use = &alpha_resized;
-        if (feather_radius > 0) {
-          std::string kerr;
-          if (!kernels.BoxBlurSeparableF32_1(alpha_resized, alpha_tmp,
-                                             alpha_feather, feather_radius,
-                                             &kerr)) {
-            if (error_out)
-              *error_out = "Open Vulkan: alpha feather blur failed: " + kerr;
-            return false;
-          }
-          ++blur_dispatch_calls;
-          ++forced_sync_calls;
-          alpha_use = &alpha_feather;
-        }
-        if (!EnsureReplaceBackgroundGpu(
-                width, height, fx.virtual_background.replace_path, error_out)) {
+        OpenVulkanVirtualBackgroundReplaceInput replace_input;
+        replace_input.foreground = &in_rgb;
+        replace_input.alpha = &alpha_resized;
+        replace_input.alpha_tmp = &alpha_tmp;
+        replace_input.alpha_feathered = &alpha_feather;
+        replace_input.output = out_rgb_img;
+        replace_input.capture_sequence = capture_sequence;
+        replace_input.resident_alpha_sequence = cached_frame_alpha_sequence;
+        replace_input.alpha_resize_completion_count =
+            alpha_resize_completion_count;
+        const auto matting_readiness = matting_session->Readiness();
+        replace_input.matting_readiness = &matting_readiness;
+        if (!replace_effect.Apply(replace_input, &replace_effect_counters,
+                                  error_out)) {
           return false;
         }
-        std::string kerr;
-        if (!kernels.CompositeAlphaU8x3(in_rgb, bg_rgb, *alpha_use,
-                                        *out_rgb_img, &kerr)) {
-          if (error_out)
-            *error_out = "Open Vulkan: composite(replace) failed: " + kerr;
-          return false;
-        }
+        const auto &parameters = replace_effect.parameters();
+        blur_dispatch_calls +=
+            parameters.alpha_feather_radius > 0 ? 1u : 0u;
         ++composite_dispatch_calls;
-        ++forced_sync_calls;
+        forced_sync_calls +=
+            1u + (parameters.alpha_feather_radius > 0 ? 1u : 0u);
       }
       return true;
     }
@@ -8611,6 +8517,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   std::string::npos) {
             vk_err = OpenVulkanVirtualBackgroundRemoveInitializationFailure(
                 vk_err);
+          } else if (
+              vb_mode ==
+                  studiocast::video::effects::VirtualBackgroundMode::replace &&
+              vk_err.find("[vulkan_virtual_background_replace_") ==
+                  std::string::npos) {
+            vk_err = OpenVulkanVirtualBackgroundReplaceInitializationFailure(
+                vk_err);
           }
 #endif
           if (!vk_err.empty()) {
@@ -10610,8 +10523,24 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             const bool is_vulkan_remove =
                 stage_id == studiocast::video::effects::contract::
                                 kEffectIdVirtualBackgroundRemove;
+            const bool is_vulkan_replace =
+                stage_id == studiocast::video::effects::contract::
+                                kEffectIdVirtualBackgroundReplace;
             const bool is_wrapped_vulkan_vb =
-                is_vulkan_blur || is_vulkan_remove;
+                is_vulkan_blur || is_vulkan_remove || is_vulkan_replace;
+            const auto wrap_vulkan_vb_runtime_failure =
+                [&](std::string_view detail) {
+                  if (is_vulkan_blur) {
+                    return OpenVulkanVirtualBackgroundBlurRuntimeFailure(
+                        detail);
+                  }
+                  if (is_vulkan_remove) {
+                    return OpenVulkanVirtualBackgroundRemoveRuntimeFailure(
+                        detail);
+                  }
+                  return OpenVulkanVirtualBackgroundReplaceRuntimeFailure(
+                      detail);
+                };
             auto &vulkan_vb_breaker =
                 optional_breaker(OptionalEffectSlot::virtual_background);
             if (is_wrapped_vulkan_vb &&
@@ -10622,14 +10551,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
               ++open_vulkan_runtime_failure_frames;
               if (is_wrapped_vulkan_vb) {
-                const auto reason = is_vulkan_blur
-                                        ? OpenVulkanVirtualBackgroundBlurRuntimeFailure(
-                                              vk_err)
-                                        : OpenVulkanVirtualBackgroundRemoveRuntimeFailure(
-                                              vk_err);
                 block_optional_effect(
                     OptionalEffectSlot::virtual_background, stage_id,
-                    "open_vulkan", reason, capture_sequence);
+                    "open_vulkan", wrap_vulkan_vb_runtime_failure(vk_err),
+                    capture_sequence);
               } else {
                 std::lock_guard<std::mutex> lock(mu_);
                 last_error_ =
@@ -10692,14 +10617,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             if (!download_open_vulkan_current_to_cpu(&down_err)) {
               ++open_vulkan_runtime_failure_frames;
               if (is_wrapped_vulkan_vb) {
-                const auto reason = is_vulkan_blur
-                                        ? OpenVulkanVirtualBackgroundBlurRuntimeFailure(
-                                              down_err)
-                                        : OpenVulkanVirtualBackgroundRemoveRuntimeFailure(
-                                              down_err);
                 block_optional_effect(
                     OptionalEffectSlot::virtual_background, stage_id,
-                    "open_vulkan", reason, capture_sequence);
+                    "open_vulkan", wrap_vulkan_vb_runtime_failure(down_err),
+                    capture_sequence);
               } else {
                 std::lock_guard<std::mutex> lock(mu_);
                 last_error_ =
@@ -12703,7 +12624,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       open_vulkan_transfers_.active_frames = open_vulkan_active_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       open_vulkan_transfers_.upload_calls =
-          open_vulkan_upload_calls + open_vulkan_vb.background_upload_calls;
+          open_vulkan_upload_calls +
+          open_vulkan_vb.replace_effect_counters.asset_upload_calls;
       open_vulkan_transfers_.download_calls =
           open_vulkan_download_calls + open_vulkan_vb.alpha_download_calls;
 #else
@@ -12745,8 +12667,31 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_vb.remove_effect_counters.runtime_failure_frames;
       open_vulkan_transfers_.virtual_background_remove_device_loss_frames =
           open_vulkan_vb.remove_effect_counters.device_loss_frames;
+      open_vulkan_transfers_
+          .virtual_background_replace_asset_allocation_calls =
+          open_vulkan_vb.replace_effect_counters.asset_allocation_calls;
+      open_vulkan_transfers_.virtual_background_replace_asset_decode_calls =
+          open_vulkan_vb.replace_effect_counters.asset_decode_calls;
+      open_vulkan_transfers_.virtual_background_replace_asset_upload_calls =
+          open_vulkan_vb.replace_effect_counters.asset_upload_calls;
+      open_vulkan_transfers_
+          .virtual_background_replace_asset_resize_dispatch_calls =
+          open_vulkan_vb.replace_effect_counters.asset_resize_dispatch_calls;
+      open_vulkan_transfers_.virtual_background_replace_dispatch_calls =
+          open_vulkan_vb.replace_effect_counters
+              .replacement_composite_dispatch_calls;
+      open_vulkan_transfers_
+          .virtual_background_replace_alpha_readback_calls =
+          open_vulkan_vb.replace_effect_counters.alpha_readback_calls;
+      open_vulkan_transfers_.virtual_background_replace_cpu_fallback_calls =
+          open_vulkan_vb.replace_effect_counters.cpu_fallback_calls;
+      open_vulkan_transfers_
+          .virtual_background_replace_runtime_failure_frames =
+          open_vulkan_vb.replace_effect_counters.runtime_failure_frames;
+      open_vulkan_transfers_.virtual_background_replace_device_loss_frames =
+          open_vulkan_vb.replace_effect_counters.device_loss_frames;
       open_vulkan_transfers_.background_upload_calls =
-          open_vulkan_vb.background_upload_calls;
+          open_vulkan_vb.replace_effect_counters.asset_upload_calls;
       open_vulkan_transfers_.composite_dispatch_calls =
           open_vulkan_vb.composite_dispatch_calls;
       open_vulkan_transfers_.key_light_dispatch_calls =
@@ -12770,7 +12715,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_standalone_scaler_download_calls;
       open_vulkan_transfers_.forced_sync_calls =
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
-          open_vulkan_forced_sync_calls + open_vulkan_vb.forced_sync_calls;
+          open_vulkan_forced_sync_calls + open_vulkan_vb.forced_sync_calls +
+          open_vulkan_vb.replace_effect_counters.asset_upload_calls +
+          open_vulkan_vb.replace_effect_counters.asset_resize_dispatch_calls;
 #else
           open_vulkan_forced_sync_calls;
 #endif

@@ -764,6 +764,101 @@ bool TestVulkanVirtualBackgroundRemoveDebugCounters() {
                 "remove device loss counter should be published");
 }
 
+bool TestVulkanVirtualBackgroundReplaceDebugCounters() {
+  ScopedEnvironmentVariable debug("STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS",
+                                  "1");
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  auto &vk = videoStatus.pipeline.open_vulkan_transfers;
+  vk.virtual_background_replace_asset_allocation_calls = 47;
+  vk.virtual_background_replace_asset_decode_calls = 53;
+  vk.virtual_background_replace_asset_upload_calls = 59;
+  vk.virtual_background_replace_asset_resize_dispatch_calls = 61;
+  vk.virtual_background_replace_dispatch_calls = 67;
+  vk.virtual_background_replace_alpha_readback_calls = 71;
+  vk.virtual_background_replace_cpu_fallback_calls = 73;
+  vk.virtual_background_replace_runtime_failure_frames = 79;
+  vk.virtual_background_replace_device_loss_frames = 83;
+
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(
+          StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                       std::filesystem::path("/tmp/studiocastd-test.sock"),
+                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                       /*loopbackJson=*/""),
+          &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *pipeline =
+      ObjectAt(*video, "pipeline", "video.pipeline should exist");
+  if (!pipeline)
+    return false;
+  const JsonObject *debugCounters =
+      ObjectAt(*pipeline, "open_vulkan_transfers",
+               "Open Vulkan debug transfer counters should exist");
+  if (!debugCounters)
+    return false;
+
+  return Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_asset_allocation_calls",
+                    -1.0) == 47.0,
+                "replace asset allocation counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_asset_decode_calls", -1.0) ==
+                    53.0,
+                "replace asset decode counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_asset_upload_calls", -1.0) ==
+                    59.0,
+                "replace asset upload counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_asset_resize_dispatch_calls",
+                    -1.0) == 61.0,
+                "replace setup resize counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_dispatch_calls", -1.0) ==
+                    67.0,
+                "replace dispatch counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_alpha_readback_calls", -1.0) ==
+                    71.0,
+                "replace alpha readback counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_cpu_fallback_calls", -1.0) ==
+                    73.0,
+                "replace CPU fallback counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_runtime_failure_frames",
+                    -1.0) == 79.0,
+                "replace runtime failure counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_replace_device_loss_frames", -1.0) ==
+                    83.0,
+                "replace device loss counter should be published");
+}
+
 bool TestVideoConfigMapsComputeBackendPreference() {
   studiocast::config::DaemonConfig daemonConfig;
   daemonConfig.video_compute_backend = "cuda";
@@ -1210,6 +1305,7 @@ int main() {
   ok = TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() && ok;
   ok = TestVulkanVirtualBackgroundBlurDebugCounters() && ok;
   ok = TestVulkanVirtualBackgroundRemoveDebugCounters() && ok;
+  ok = TestVulkanVirtualBackgroundReplaceDebugCounters() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestPersistentVulkanAdapterConfigAndStatus() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;

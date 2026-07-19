@@ -905,6 +905,92 @@ bool UtilityKernels::ResizeBilinearF32_1(const VulkanImage &src,
   return Dispatch(p, Op::resize_f32_1, p.dst_w, p.dst_h, error_out);
 }
 
+bool UtilityKernels::UploadRgb24ToDeviceLocal(
+    const std::uint8_t *src, std::size_t src_stride,
+    const VulkanImage &upload_staging, const VulkanImage &device_dst,
+    std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!ValidateRgbOrBgrImage(upload_staging,
+                             "UploadRgb24ToDeviceLocal(staging)",
+                             error_out) ||
+      !ValidateRgbOrBgrImage(device_dst,
+                             "UploadRgb24ToDeviceLocal(dst)", error_out)) {
+    return false;
+  }
+  if (!Initialize(error_out))
+    return false;
+  if (!ValidateContext(device_, upload_staging,
+                       "UploadRgb24ToDeviceLocal(staging)", error_out) ||
+      !ValidateContext(device_, device_dst,
+                       "UploadRgb24ToDeviceLocal(dst)", error_out)) {
+    return false;
+  }
+  const std::size_t minimum_stride =
+      static_cast<std::size_t>(upload_staging.width()) * 3u;
+  if (!src || src_stride < minimum_stride ||
+      !SameDimensions(upload_staging, device_dst) ||
+      upload_staging.format() != VulkanPixelFormat::rgb_u8 ||
+      device_dst.format() != VulkanPixelFormat::rgb_u8 ||
+      upload_staging.byte_size() != device_dst.byte_size() ||
+      upload_staging.buffer() == device_dst.buffer() ||
+      !upload_staging.host_visible() || !upload_staging.mapped() ||
+      device_dst.mapped() || !device_dst.device_local()) {
+    if (error_out) {
+      *error_out =
+          "UploadRgb24ToDeviceLocal requires tight-or-padded RGB24 input, "
+          "an exact-shape/byte-size rgb_u8 mapped host-visible staging "
+          "image, and a distinct non-mapped DEVICE_LOCAL rgb_u8 "
+          "destination.";
+    }
+    return false;
+  }
+
+  PackRgb24ToRgba32(
+      src, src_stride, upload_staging.width(), upload_staging.height(),
+      static_cast<std::uint32_t *>(upload_staging.mapped()),
+      upload_staging.pitch_pixels());
+  if (!upload_staging.Flush(error_out))
+    return false;
+
+  const auto &vf = device_.f();
+  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
+  if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
+                                 error_out)) {
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{};
+  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
+  if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
+                                 error_out)) {
+    return false;
+  }
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, upload_staging.buffer(),
+          upload_staging.byte_size(), upload_staging.context_identity(),
+          VulkanBufferAccess::host_write, VulkanBufferAccess::transfer_read,
+          error_out)) {
+    return false;
+  }
+  VkBufferCopy copy{};
+  copy.size = device_dst.byte_size();
+  vf.vkCmdCopyBuffer(command_buffer_, upload_staging.buffer(),
+                     device_dst.buffer(), 1, &copy);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, device_dst.buffer(), device_dst.byte_size(),
+          device_dst.context_identity(), VulkanBufferAccess::transfer_write,
+          VulkanBufferAccess::compute_read, error_out)) {
+    return false;
+  }
+  result = vf.vkEndCommandBuffer(command_buffer_);
+  if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
+                                 error_out)) {
+    return false;
+  }
+  return SubmitRecorded(error_out);
+}
+
 bool UtilityKernels::ReadbackF32_1(const VulkanImage &src,
                                    const VulkanImage &readback_staging,
                                    float *dst, std::size_t dst_count,

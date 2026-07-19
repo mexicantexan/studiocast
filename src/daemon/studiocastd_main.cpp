@@ -2034,6 +2034,42 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers
                .virtual_background_remove_device_loss_frames
         << ",";
+    oss << "\"virtual_background_replace_asset_allocation_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_asset_allocation_calls
+        << ",";
+    oss << "\"virtual_background_replace_asset_decode_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_asset_decode_calls
+        << ",";
+    oss << "\"virtual_background_replace_asset_upload_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_asset_upload_calls
+        << ",";
+    oss << "\"virtual_background_replace_asset_resize_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_asset_resize_dispatch_calls
+        << ",";
+    oss << "\"virtual_background_replace_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_dispatch_calls
+        << ",";
+    oss << "\"virtual_background_replace_alpha_readback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_alpha_readback_calls
+        << ",";
+    oss << "\"virtual_background_replace_cpu_fallback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_cpu_fallback_calls
+        << ",";
+    oss << "\"virtual_background_replace_runtime_failure_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_runtime_failure_frames
+        << ",";
+    oss << "\"virtual_background_replace_device_loss_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_replace_device_loss_frames
+        << ",";
     oss << "\"background_upload_calls\":"
         << st.pipeline.open_vulkan_transfers.background_upload_calls << ",";
     oss << "\"composite_dispatch_calls\":"
