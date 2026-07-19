@@ -272,6 +272,14 @@ struct CameraPipelineStatus {
     std::uint64_t cpu_tail_auto_frame_face_tracking_calls = 0;
     std::uint64_t cpu_tail_auto_frame_matte_tracking_calls = 0;
     std::uint64_t cpu_tail_auto_frame_cpu_crop_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_matte_alpha_readback_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_matte_cpu_box_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_cpu_crop_plan_smoothing_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_cpu_resize_fallback_calls = 0;
+    std::uint64_t auto_frame_initialization_failures = 0;
+    std::uint64_t auto_frame_runtime_failure_frames = 0;
+    std::uint64_t auto_frame_device_loss_frames = 0;
+    std::uint64_t auto_frame_temporal_reset_calls = 0;
     std::uint64_t fallback_frames = 0;
     std::uint64_t runtime_failure_frames = 0;
   } open_vulkan_transfers{};

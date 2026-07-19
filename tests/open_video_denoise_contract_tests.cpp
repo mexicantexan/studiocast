@@ -101,6 +101,40 @@ bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared() {
   return ok;
 }
 
+bool TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed() {
+  using studiocast::open_video::ValidateYunetInputTensorContract;
+  using studiocast::open_video::YunetOrtSessionOptions;
+  using studiocast::open_video::YunetProviderPolicy;
+
+  const auto vulkan_policy =
+      YunetOrtSessionOptions(YunetProviderPolicy::cpu_only);
+  const auto cuda_policy =
+      YunetOrtSessionOptions(YunetProviderPolicy::prefer_cuda);
+  std::string error;
+  bool ok = Require(!vulkan_policy.prefer_cuda,
+                    "explicit Vulkan YuNet policy must be CPU-only") &&
+            Require(!vulkan_policy.enable_tensorrt,
+                    "explicit Vulkan YuNet policy must not append TensorRT") &&
+            Require(cuda_policy.prefer_cuda,
+                    "existing Open CUDA YuNet policy should remain compatible");
+  ok &= Require(ValidateYunetInputTensorContract({1, 3, 320, 320}, false,
+                                                 320, 320, &error),
+                "matching fixed YuNet geometry should validate: " + error);
+  ok &= Require(ValidateYunetInputTensorContract({1, 3, -1, -1}, false,
+                                                 320, 320, &error),
+                "dynamic YuNet geometry should accept the manifest runtime "
+                "shape: " + error);
+  ok &= Require(
+      !ValidateYunetInputTensorContract({1, 3, 640, 640}, false, 320, 320,
+                                        &error) &&
+          error.find("[vulkan_auto_frame_yunet_tensor_geometry_mismatch]") !=
+              std::string::npos &&
+          error.find("640x640") != std::string::npos &&
+          error.find("320x320") != std::string::npos,
+      "fixed installed-graph/manifest mismatch must fail with exact evidence");
+  return ok;
+}
+
 bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared() {
   studiocast::open_video::GazeCorrectionEyeContact eye_contact;
   const auto status = eye_contact.runtime_status();

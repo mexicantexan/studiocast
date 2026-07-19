@@ -60,6 +60,7 @@
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
 #include "core/open_video/vulkan_matting_session.h"
+#include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/resize_bilinear.h"
@@ -5495,6 +5496,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     OpenVulkanVirtualBackgroundContext *matte = nullptr;
     int last_frame_w = 0;
     int last_frame_h = 0;
+    std::uint64_t last_capture_sequence = 0;
+    studiocast::vulkan::VulkanContextIdentity last_context_identity{};
+    OpenVulkanAutoFrameReuseKey reuse_key{};
+
+    OpenVulkanAutoFrame production_crop;
+    OpenVulkanAutoFrameCounters counters;
 
     std::uint64_t last_matte_query_sequence = 0;
     bool have_last_matte_box = false;
@@ -5505,72 +5512,140 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool last_had_detection = false;
     TrackingSource last_tracking_source = TrackingSource::kNone;
 
+    void ResetTrackingState(OpenVulkanAutoFrameResetReason reason) {
+      production_crop.ResetTemporal(reason, &counters);
+      last_capture_sequence = 0;
+      last_context_identity = {};
+      last_matte_query_sequence = 0;
+      have_last_matte_box = false;
+      last_matte_box_px = {};
+      have_smoothed_crop = false;
+      crop_smoothed_px = {};
+      last_had_detection = false;
+      last_tracking_source = TrackingSource::kNone;
+      if (matte)
+        matte->InvalidateMatteCache();
+    }
+
     void Destroy() {
+      ResetTrackingState(OpenVulkanAutoFrameResetReason::pipeline_restart);
+      production_crop.Shutdown();
       initialized = false;
       enabled = false;
       last_error.clear();
       active_model_id.clear();
       last_frame_w = 0;
       last_frame_h = 0;
-      last_matte_query_sequence = 0;
-      have_last_matte_box = false;
-      last_matte_box_px = {};
-      have_smoothed_crop = false;
-      last_had_detection = false;
-      last_tracking_source = TrackingSource::kNone;
+      reuse_key = {};
+    }
+
+    void ObserveEnablementAndGeneration(bool current_enabled,
+                                        std::uint64_t effects_generation) {
+      OpenVulkanAutoFrameReuseKey next = reuse_key;
+      next.enabled = current_enabled;
+      next.effects_generation = effects_generation;
+      const auto reason =
+          OpenVulkanAutoFrameReuseKeyResetReason(reuse_key, next);
+      if (reason != OpenVulkanAutoFrameResetReason::none)
+        ResetTrackingState(reason);
+      reuse_key = std::move(next);
+    }
+
+    void PrepareFrame(std::uint64_t capture_sequence) {
+      if (!matte || !matte->kernels.device())
+        return;
+      const auto context_identity =
+          matte->kernels.device()->context_identity();
+      OpenVulkanAutoFrameResetReason reason =
+          OpenVulkanAutoFrameResetReason::none;
+      if (last_context_identity.Valid() &&
+          last_context_identity != context_identity) {
+        reason = OpenVulkanAutoFrameResetReason::
+            vulkan_context_generation_change;
+      } else if (OpenVulkanAutoFrameSequenceNeedsReset(last_capture_sequence,
+                                                       capture_sequence)) {
+        reason =
+            OpenVulkanAutoFrameResetReason::capture_sequence_discontinuity;
+      }
+      if (reason != OpenVulkanAutoFrameResetReason::none)
+        ResetTrackingState(reason);
+      last_context_identity = context_identity;
+      last_capture_sequence = capture_sequence;
+      if (reuse_key.observed)
+        reuse_key.context_identity = context_identity;
     }
 
     bool EnsureInitialized(
         int frame_w, int frame_h,
         const studiocast::video::effects::BroadcastCameraEffects &fx,
-        bool require_matte_tracking, std::string *error) {
+        bool require_matte_tracking, std::uint64_t effects_generation,
+        std::string_view face_model_id, std::string *error) {
       if (error)
         error->clear();
-      if (frame_w <= 0 || frame_h <= 0) {
-        last_error = "Open Vulkan Auto Frame: invalid frame size.";
+      auto fail = [&](std::string detail) {
+        last_error = OpenVulkanAutoFrameInitializationFailure(detail);
         if (error)
           *error = last_error;
         return false;
+      };
+      if (frame_w <= 0 || frame_h <= 0) {
+        return fail("invalid frame size");
       }
 
       std::string current_model_id;
+      std::string current_provider_id;
       if (!matte) {
-        last_error = "Open Vulkan Auto Frame: matte provider not set.";
-        if (error)
-          *error = last_error;
-        return false;
+        return fail("matte/shared utility provider is not set");
       }
       if (require_matte_tracking) {
         std::string matte_err;
         if (!matte->EnsureInitialized(frame_w, frame_h, fx, &matte_err,
                                       /*require_vb_buffers=*/false)) {
-          last_error = "Open Vulkan Auto Frame: " + matte_err;
-          if (error)
-            *error = last_error;
-          return false;
+          return fail(matte_err);
         }
         current_model_id = matte->active_model_id;
+        current_provider_id = "ncnn_vulkan";
       } else if (!matte->kernels.Initialized()) {
         std::string vk_err;
         if (!matte->kernels.Initialize(&vk_err)) {
-          last_error =
-              "Open Vulkan Auto Frame: utility kernels unavailable: " + vk_err;
-          if (error)
-            *error = last_error;
-          return false;
+          return fail("utility kernels unavailable: " + vk_err);
         }
+        current_model_id = std::string(face_model_id);
+        current_provider_id = "onnxruntime_cpu";
+      } else {
+        current_model_id = std::string(face_model_id);
+        current_provider_id = "onnxruntime_cpu";
       }
 
-      if (initialized && enabled && current_model_id == active_model_id &&
-          last_frame_w == frame_w && last_frame_h == frame_h) {
+      std::string crop_init_error;
+      if (!production_crop.EnsureInitialized(&matte->kernels, frame_w, frame_h,
+                                             &counters,
+                                             &crop_init_error)) {
+        last_error = crop_init_error;
+        if (error)
+          *error = last_error;
+        return false;
+      }
+
+      OpenVulkanAutoFrameReuseKey next_key;
+      next_key.observed = true;
+      next_key.enabled = fx.auto_frame.enabled;
+      next_key.effects_generation = effects_generation;
+      next_key.frame_width = frame_w;
+      next_key.frame_height = frame_h;
+      next_key.model_id = current_model_id;
+      next_key.provider_id = current_provider_id;
+      next_key.context_identity = matte->kernels.device()->context_identity();
+      const auto reset_reason =
+          OpenVulkanAutoFrameReuseKeyResetReason(reuse_key, next_key);
+      if (initialized && enabled &&
+          reset_reason == OpenVulkanAutoFrameResetReason::none) {
+        reuse_key = std::move(next_key);
         return true;
       }
-      have_smoothed_crop = false;
-      last_had_detection = false;
-      last_tracking_source = TrackingSource::kNone;
-      last_matte_query_sequence = 0;
-      have_last_matte_box = false;
-      last_matte_box_px = {};
+      if (reset_reason != OpenVulkanAutoFrameResetReason::none)
+        ResetTrackingState(reset_reason);
+      reuse_key = std::move(next_key);
       active_model_id = current_model_id;
       last_frame_w = frame_w;
       last_frame_h = frame_h;
@@ -5612,7 +5687,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                     /*require_vb_buffers=*/false)) {
         if (error && !matte_err.empty())
           *error = "Open Vulkan Auto Frame: " + matte_err;
-        return true;
+        return false;
       }
 
       const std::vector<float> *alpha_cpu = nullptr;
@@ -5620,10 +5695,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       int alpha_h = 0;
       std::string alpha_err;
       studiocast::maxine::effects::RectF box_px;
+      const std::uint64_t alpha_downloads_before =
+          matte->alpha_download_calls;
       if (matte->GetAlphaCpuForFrame(in_rgb, capture_sequence, width, height,
                                      fx, &alpha_cpu, &alpha_w, &alpha_h,
                                      &alpha_err) &&
           alpha_cpu) {
+        counters.matte_alpha_readback_calls +=
+            matte->alpha_download_calls - alpha_downloads_before;
+        ++counters.matte_cpu_box_calls;
         const bool found = OpenCudaAutoFrameContext::ComputeMatteBoxPxFromAlpha(
             *alpha_cpu, alpha_w, alpha_h, width, height, &box_px);
 
@@ -5638,8 +5718,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           have_last_matte_box = false;
           last_matte_box_px = {};
         }
-      } else if (error && !alpha_err.empty()) {
-        *error = "Open Vulkan Auto Frame: " + alpha_err;
+      } else {
+        if (error) {
+          *error = alpha_err.empty()
+                       ? "Open Vulkan Auto Frame: matte alpha readback failed."
+                       : "Open Vulkan Auto Frame: " + alpha_err;
+        }
+        return false;
       }
       return true;
     }
@@ -5663,11 +5748,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::string init_err;
       if (!EnsureInitialized(width, height, fx,
                              /*require_matte_tracking=*/!tracking_provider_ran,
+                             reuse_key.effects_generation,
+                             reuse_key.model_id,
                              &init_err)) {
         if (error && !init_err.empty())
           *error = init_err;
-        return true;
+        return false;
       }
+
+      PrepareFrame(capture_sequence);
+      ++counters.cpu_crop_plan_smoothing_calls;
 
       TrackingBox resolved_box;
       bool found = false;
@@ -5687,6 +5777,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const TrackingSource source =
           found ? resolved_box.source : TrackingSource::kNone;
       if (source != last_tracking_source) {
+        production_crop.ResetTemporal(
+            OpenVulkanAutoFrameResetReason::
+                geometry_model_or_provider_change,
+            &counters);
         have_smoothed_crop = false;
         last_tracking_source = source;
       }
@@ -5799,12 +5893,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                               /*map_memory=*/true, "auto_frame_out", error)) {
         return false;
       }
+      OpenVulkanAutoFrameCropInput crop_input;
+      crop_input.src = &in_rgb;
+      crop_input.dst = out_rgb;
+      crop_input.crop_x = plan.crop_px.x;
+      crop_input.crop_y = plan.crop_px.y;
+      crop_input.crop_w = plan.crop_px.w;
+      crop_input.crop_h = plan.crop_px.h;
+      crop_input.host_analysis_complete = true;
+      crop_input.cpu_crop_plan_complete = true;
       std::string kerr;
-      if (!matte->kernels.CropResizeBilinear(in_rgb, *out_rgb, plan.crop_px.x,
-                                             plan.crop_px.y, plan.crop_px.w,
-                                             plan.crop_px.h, &kerr)) {
+      if (!production_crop.ApplyCrop(crop_input, &counters, &kerr)) {
+        ResetTrackingState(
+            OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
         if (error)
-          *error = "Open Vulkan Auto Frame: GPU crop/resize failed: " + kerr;
+          *error = kerr;
         return false;
       }
       ++matte->crop_resize_dispatch_calls;
@@ -7831,6 +7934,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                               &replace_source,
                           std::uint64_t effects_generation) {
     chain.Clear();
+    // An effects generation is a hard temporal boundary. Recreate the YuNet
+    // provider session so provider/model policy cannot leak across explicit
+    // backend changes, and discard all tracking/smoothing/matte state before
+    // the rebuilt plan becomes live.
+    open_video_yunet.Reset();
+    open_video_cache.Clear();
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+    open_vulkan_auto_frame.ObserveEnablementAndGeneration(
+        fx.auto_frame.enabled, effects_generation);
+    open_vulkan_vb.InvalidateMatteCache();
+#endif
     open_cuda_vb.ConfigureReplaceBackgroundSource(replace_source);
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     open_vulkan_vb.ConfigureReplaceBackgroundSource(replace_source);
@@ -8436,16 +8550,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
         bool have_open_video_face_detection = false;
         std::string fd_err;
-        if (open_video_yunet.EnsureInitialized(fx.auto_frame.model_id,
-                                               &fd_err)) {
+        if (open_video_yunet.EnsureInitialized(
+                fx.auto_frame.model_id, &fd_err,
+                studiocast::open_video::YunetProviderPolicy::cpu_only)) {
           have_open_video_face_detection = true;
         }
 
         std::string vk_err;
         const bool require_matte_tracking = !have_open_video_face_detection;
+        const std::uint64_t auto_frame_init_failures_before =
+            open_vulkan_auto_frame.counters.initialization_failures;
         if (open_vulkan_auto_frame.EnsureInitialized(
                 capA.width, capA.height, fx,
-                /*require_matte_tracking=*/require_matte_tracking, &vk_err)) {
+                /*require_matte_tracking=*/require_matte_tracking,
+                effects_generation, open_video_yunet.active_model_id(),
+                &vk_err)) {
           have_open_vulkan_auto_frame = true;
           compute_available.vulkan_available = true;
           set_backend(stage_id, "open_vulkan");
@@ -8453,21 +8572,39 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             note += "\n";
           }
           if (have_open_video_face_detection) {
-            note += "Open Vulkan: Auto Frame (CPU face tracking; Vulkan "
-                    "crop/scale while the frame is Vulkan-resident).";
+            note += "[vulkan_effect_cpu_tail] Open Vulkan Auto Frame is "
+                    "usable with degraded behavior: "
+                    "[vulkan_auto_frame_cpu_face_tracking_tail] CPU-only "
+                    "YuNet tracking on the original host capture; "
+                    "[vulkan_auto_frame_cpu_crop_plan_smoothing_tail] CPU "
+                    "crop planning/smoothing; Vulkan crop/scale remains on "
+                    "the shared resident frame.";
             append_open_video_face_detection_note();
           } else {
-            note += "Open Vulkan: Auto Frame (foreground matte tracking; "
-                    "shared Vulkan matte with CPU tracking tail and Vulkan "
-                    "crop/scale).";
+            note += "[vulkan_effect_cpu_tail] Open Vulkan Auto Frame is "
+                    "usable with degraded behavior: "
+                    "[vulkan_auto_frame_matte_alpha_readback_cpu_box_tail] "
+                    "resident matte with explicit periodic alpha readback and "
+                    "CPU box extraction; "
+                    "[vulkan_auto_frame_cpu_crop_plan_smoothing_tail] CPU "
+                    "crop planning/smoothing; Vulkan crop/scale.";
+            if (!fd_err.empty()) {
+              note += "\n";
+              note += OpenVulkanAutoFrameFaceProviderFailure(fd_err);
+            }
           }
           detach_vignette_from_auto_frame();
         } else {
+          if (open_vulkan_auto_frame.counters.initialization_failures ==
+              auto_frame_init_failures_before) {
+            ++open_vulkan_auto_frame.counters.initialization_failures;
+          }
           if (!note.empty()) {
             note += "\n";
           }
           if (!fd_err.empty() && !have_open_video_face_detection) {
-            note += fd_err;
+            note += OpenVulkanAutoFrameInitializationFailure(
+                OpenVulkanAutoFrameFaceProviderFailure(fd_err));
             note += "\n";
           }
           note += vk_err;
@@ -8477,7 +8614,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
 #else
         const std::string vk_err =
-            "Open Vulkan: backend is disabled in this build. Rebuild with "
+            "[vulkan_effect_initialization_failed] Open Vulkan Auto Frame "
+            "initialization failed: [vulkan_backend_disabled] backend is "
+            "disabled in this build; rebuild with "
             "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON.";
         append_note(vk_err);
         compute_available.vulkan_unavailable_reason = vk_err;
@@ -9815,6 +9954,42 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       // share ML outputs without re-running inference multiple times per frame.
       open_video_cache.BeginFrame(capture_sequence);
 
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      // Explicit Vulkan Auto Frame consumes CPU analysis from the original
+      // host capture before the pipeline's one upload. This prevents a GPU
+      // readback for face tracking and guarantees that the CPU-only provider
+      // policy is rechecked at the actual inference boundary.
+      if (open_vulkan_auto_frame_stage_enabled) {
+        // Reset discontinuous temporal state before any Vulkan stage can
+        // publish a current-frame matte, so reset cannot discard and rerun
+        // shared inference later in this frame.
+        open_vulkan_auto_frame.PrepareFrame(capture_sequence);
+      }
+      if (open_vulkan_auto_frame_stage_enabled &&
+          open_video_yunet.available() &&
+          optional_breaker(OptionalEffectSlot::auto_frame)
+              .AllowsAttempt(capture_sequence)) {
+        std::string face_error;
+        if (open_video_yunet.EnsureDetectionsForFrame(
+                rgb.data(), capA.width, capA.height, rgbStride,
+                fx.auto_frame.model_id, capture_sequence, &open_video_cache,
+                &face_error,
+                studiocast::open_video::YunetProviderPolicy::cpu_only)) {
+          ++open_vulkan_auto_frame.counters.cpu_face_tracking_calls;
+        } else {
+          ++open_vulkan_auto_frame.counters.runtime_failure_frames;
+          open_vulkan_auto_frame.ResetTrackingState(
+              OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
+          block_optional_effect(
+              OptionalEffectSlot::auto_frame,
+              studiocast::video::effects::contract::kEffectIdAutoFrame,
+              "open_vulkan",
+              OpenVulkanAutoFrameRuntimeFailure(face_error),
+              capture_sequence);
+        }
+      }
+#endif
+
       // Open CUDA optimization: keep the CUDA RGB frame live across adjacent
       // Open CUDA stages so key light can consume the VB matte without a
       // CPU-side alpha download/relight tail.
@@ -10645,6 +10820,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             studiocast::video::effects::contract::kEffectIdAutoFrame) {
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
           if (have_open_vulkan_auto_frame) {
+            auto &breaker = optional_breaker(OptionalEffectSlot::auto_frame);
+            if (!breaker.AllowsAttempt(capture_sequence))
+              return;
             OpenCudaAutoFrameContext::TrackingBox tracking_box;
             const OpenCudaAutoFrameContext::TrackingBox *tracking_box_ptr =
                 nullptr;
@@ -10666,26 +10844,20 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
             if (open_video_cache.face_detections) {
               adopt_face_detections(*open_video_cache.face_detections);
-            } else if (open_video_yunet.available()) {
-              std::string fd_err;
-              if (open_video_yunet.EnsureDetectionsForFrame(
-                      rgb.data(), capA.width, capA.height, rgbStride,
-                      fx.auto_frame.model_id, capture_sequence,
-                      &open_video_cache, &fd_err)) {
-                if (open_video_cache.face_detections) {
-                  adopt_face_detections(*open_video_cache.face_detections);
-                }
-              } else if (!fd_err.empty()) {
-                std::lock_guard<std::mutex> lock(mu_);
-                last_error_ = "Open Video face detection failed: " + fd_err;
-              }
             }
 
             std::string vk_err;
             if (!ensure_open_vulkan_current_from_cpu(&vk_err)) {
               ++open_vulkan_runtime_failure_frames;
-              std::lock_guard<std::mutex> lock(mu_);
-              last_error_ = "Open Vulkan auto frame failed: " + vk_err;
+              ++open_vulkan_auto_frame.counters.runtime_failure_frames;
+              if (vk_err.find("[vulkan_device_lost]") != std::string::npos)
+                ++open_vulkan_auto_frame.counters.device_loss_frames;
+              open_vulkan_auto_frame.ResetTrackingState(
+                  OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
+              block_optional_effect(
+                  OptionalEffectSlot::auto_frame, stage_id, "open_vulkan",
+                  OpenVulkanAutoFrameRuntimeFailure(vk_err),
+                  capture_sequence);
               return;
             }
             if (!open_vulkan_next) {
@@ -10695,6 +10867,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             }
 
             DeferredGpuOut auto_frame_gpu_out{};
+            const std::uint64_t auto_frame_failures_before =
+                open_vulkan_auto_frame.counters.runtime_failure_frames;
+            const std::uint64_t auto_frame_device_losses_before =
+                open_vulkan_auto_frame.counters.device_loss_frames;
             if (open_vulkan_auto_frame.ApplyVulkanRgb(
                     capture_sequence, *open_vulkan_curr, open_vulkan_next, fx,
                     tracking_box_ptr, tracking_provider_ran,
@@ -10718,22 +10894,41 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 std::string down_err;
                 if (!download_open_vulkan_current_to_cpu(&down_err)) {
                   ++open_vulkan_runtime_failure_frames;
-                  std::lock_guard<std::mutex> lock(mu_);
-                  last_error_ =
-                      "Open Vulkan auto frame failed after GPU crop/resize: " +
-                      down_err;
+                  ++open_vulkan_auto_frame.counters.runtime_failure_frames;
+                  if (down_err.find("[vulkan_device_lost]") !=
+                      std::string::npos) {
+                    ++open_vulkan_auto_frame.counters.device_loss_frames;
+                  }
+                  open_vulkan_auto_frame.ResetTrackingState(
+                      OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
+                  block_optional_effect(
+                      OptionalEffectSlot::auto_frame, stage_id, "open_vulkan",
+                      OpenVulkanAutoFrameRuntimeFailure(down_err),
+                      capture_sequence);
                   return;
                 }
                 have_deferred_gpu_out = false;
               }
               mark_open_vulkan_auto_frame_cpu_tail(tracking_tail_source,
                                                    /*cpu_crop_resize=*/false);
+              clear_optional_effect_on_success(breaker, capture_sequence);
               return;
             }
 
             ++open_vulkan_runtime_failure_frames;
-            std::lock_guard<std::mutex> lock(mu_);
-            last_error_ = "Open Vulkan auto frame failed: " + vk_err;
+            if (open_vulkan_auto_frame.counters.runtime_failure_frames ==
+                auto_frame_failures_before) {
+              ++open_vulkan_auto_frame.counters.runtime_failure_frames;
+            }
+            if (vk_err.find("[vulkan_device_lost]") != std::string::npos &&
+                open_vulkan_auto_frame.counters.device_loss_frames ==
+                    auto_frame_device_losses_before) {
+              ++open_vulkan_auto_frame.counters.device_loss_frames;
+            }
+            open_vulkan_auto_frame.ResetTrackingState(
+                OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
+            block_optional_effect(OptionalEffectSlot::auto_frame, stage_id,
+                                  "open_vulkan", vk_err, capture_sequence);
             return;
           }
 #endif
@@ -12333,6 +12528,27 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_cpu_tail_auto_frame_matte_tracking_calls;
       open_vulkan_transfers_.cpu_tail_auto_frame_cpu_crop_calls =
           open_vulkan_cpu_tail_auto_frame_cpu_crop_calls;
+#if STUDIOCAST_ENABLE_OPEN_VULKAN
+      open_vulkan_transfers_
+          .cpu_tail_auto_frame_matte_alpha_readback_calls =
+          open_vulkan_auto_frame.counters.matte_alpha_readback_calls;
+      open_vulkan_transfers_.cpu_tail_auto_frame_matte_cpu_box_calls =
+          open_vulkan_auto_frame.counters.matte_cpu_box_calls;
+      open_vulkan_transfers_
+          .cpu_tail_auto_frame_cpu_crop_plan_smoothing_calls =
+          open_vulkan_auto_frame.counters.cpu_crop_plan_smoothing_calls;
+      open_vulkan_transfers_
+          .cpu_tail_auto_frame_cpu_resize_fallback_calls =
+          open_vulkan_auto_frame.counters.cpu_resize_fallback_calls;
+      open_vulkan_transfers_.auto_frame_initialization_failures =
+          open_vulkan_auto_frame.counters.initialization_failures;
+      open_vulkan_transfers_.auto_frame_runtime_failure_frames =
+          open_vulkan_auto_frame.counters.runtime_failure_frames;
+      open_vulkan_transfers_.auto_frame_device_loss_frames =
+          open_vulkan_auto_frame.counters.device_loss_frames;
+      open_vulkan_transfers_.auto_frame_temporal_reset_calls =
+          open_vulkan_auto_frame.counters.temporal_reset_calls;
+#endif
       open_vulkan_transfers_.runtime_failure_frames =
           open_vulkan_runtime_failure_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN

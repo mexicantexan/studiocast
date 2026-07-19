@@ -23,6 +23,7 @@ bool TestLatestFrameWinsGenerationRejectsStaleResults();
 bool TestLatestFrameWinsStatsCountersAndLastError();
 bool TestFastDvdnetDenoiseTensorContractIsDeclared();
 bool TestYunetFaceDetectionCpuTensorTailContractIsDeclared();
+bool TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed();
 bool TestOpenVideoEyeContactCpuTensorTailContractIsDeclared();
 bool TestFrameArtifactCacheReusesCompatibleMatteWithinFrame();
 bool TestFrameArtifactCacheReusesCompatibleMaxineMatteWithinFrame();
@@ -1466,6 +1467,9 @@ int main() {
       {"YuNet face detection CPU tensor tail contract is declared",
        &studiocast::tests::
            TestYunetFaceDetectionCpuTensorTailContractIsDeclared},
+      {"YuNet explicit Vulkan provider and tensor policy is fail closed",
+       &studiocast::tests::
+           TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed},
       {"Open Video eye contact CPU tensor tail contract is declared",
        &studiocast::tests::
            TestOpenVideoEyeContactCpuTensorTailContractIsDeclared},

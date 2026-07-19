@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/utility_kernels.h"
@@ -674,6 +675,68 @@ int main() {
   std::string error;
 
   ok &= TestVulkanDeviceSelectionPolicy();
+  ok &= Require(
+      !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(0, 7) &&
+          !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(7, 7) &&
+          !studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(7, 8) &&
+          studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(7, 9) &&
+          studiocast::video::OpenVulkanAutoFrameSequenceNeedsReset(9, 8),
+      "Auto Frame temporal state must reset deterministically on forward gaps "
+      "and sequence restarts, but not first/consecutive/duplicate frames");
+  {
+    using ReuseKey = studiocast::video::OpenVulkanAutoFrameReuseKey;
+    using ResetReason = studiocast::video::OpenVulkanAutoFrameResetReason;
+    const auto reset_reason =
+        studiocast::video::OpenVulkanAutoFrameReuseKeyResetReason;
+    const ReuseKey unobserved{};
+    const ReuseKey base{/*observed=*/true,
+                        /*enabled=*/true,
+                        /*effects_generation=*/41,
+                        /*frame_width=*/1280,
+                        /*frame_height=*/720,
+                        /*model_id=*/"yunet-320x320",
+                        /*provider_id=*/"onnxruntime-cpu",
+                        /*context_identity=*/{17, 3}};
+    ok &= Require(reset_reason(unobserved, base) == ResetReason::none &&
+                      reset_reason(base, base) == ResetReason::none,
+                  "Auto Frame must initialize or reuse an identical temporal "
+                  "configuration without a spurious reset");
+
+    ReuseKey changed = base;
+    changed.provider_id = "ncnn-vulkan";
+    ok &= Require(reset_reason(base, changed) ==
+                      ResetReason::geometry_model_or_provider_change,
+                  "Auto Frame provider transitions must reset temporal state");
+    changed = base;
+    changed.model_id = "yunet-fixed-640x640";
+    ok &= Require(reset_reason(base, changed) ==
+                      ResetReason::geometry_model_or_provider_change,
+                  "Auto Frame model transitions must reset temporal state");
+    changed = base;
+    changed.frame_width = 1920;
+    ok &= Require(reset_reason(base, changed) ==
+                      ResetReason::geometry_model_or_provider_change,
+                  "Auto Frame geometry transitions must reset temporal state");
+    changed = base;
+    changed.effects_generation = 42;
+    ok &= Require(reset_reason(base, changed) ==
+                      ResetReason::enablement_or_effect_generation,
+                  "Auto Frame effect generations must reset temporal state");
+    changed = base;
+    changed.context_identity.generation = 4;
+    ok &= Require(reset_reason(base, changed) ==
+                      ResetReason::vulkan_context_generation_change,
+                  "Auto Frame context generation transitions must reset "
+                  "temporal state");
+    changed = base;
+    changed.enabled = false;
+    ok &= Require(reset_reason(base, changed) ==
+                          ResetReason::enablement_or_effect_generation &&
+                      reset_reason(changed, base) ==
+                          ResetReason::enablement_or_effect_generation,
+                  "Auto Frame enable and disable transitions must explicitly "
+                  "reset temporal state");
+  }
 
   UtilityKernels validation_only;
   VulkanImage invalid;
@@ -692,6 +755,25 @@ int main() {
                       error.find("vulkan_effect_initialization_failed") !=
                           std::string::npos,
                   "mirror initialization failures need a stable reason code");
+  }
+  {
+    studiocast::video::OpenVulkanAutoFrame invalid_auto_frame;
+    studiocast::video::OpenVulkanAutoFrameCounters counters;
+    ok &= Require(
+        !invalid_auto_frame.EnsureInitialized(nullptr, 1, 1, &counters,
+                                              &error) &&
+            error.find("vulkan_effect_initialization_failed") !=
+                std::string::npos &&
+            counters.initialization_failures == 1,
+        "Auto Frame initialization failures need a stable reason and counter");
+    invalid_auto_frame.ResetTemporal(
+        studiocast::video::OpenVulkanAutoFrameResetReason::
+            enablement_or_effect_generation,
+        &counters);
+    ok &= Require(counters.temporal_reset_calls == 1 &&
+                      counters.cpu_resize_fallback_calls == 0,
+                  "Auto Frame reset accounting must not invent a CPU resize "
+                  "fallback");
   }
   {
     studiocast::video::OpenVulkanVignette invalid_vignette;
@@ -1536,6 +1618,67 @@ int main() {
     using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
     using studiocast::vulkan::VulkanSubmissionPhase;
 
+    UtilityKernels lost_auto_frame_kernels;
+    if (!lost_auto_frame_kernels.Initialize(&error)) {
+      return OptionalSkip("Auto Frame device-loss context init failed: " +
+                          error);
+    }
+    VulkanImage src, dst;
+    if (!AllocateU8(lost_auto_frame_kernels, &src, 2, 2,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_auto_frame_kernels, &dst, 2, 2,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("Auto Frame device-loss allocation failed: " +
+                          error);
+    }
+    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    if (!src.Flush(&error)) {
+      return OptionalSkip("Auto Frame device-loss source flush failed: " +
+                          error);
+    }
+
+    studiocast::video::OpenVulkanAutoFrame auto_frame;
+    studiocast::video::OpenVulkanAutoFrameCounters counters;
+    ok &= Require(auto_frame.EnsureInitialized(&lost_auto_frame_kernels, 2, 2,
+                                               &counters, &error),
+                  "Auto Frame device-loss wrapper should initialize: " +
+                      error);
+    lost_auto_frame_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanAutoFrameCropInput input;
+    input.src = &src;
+    input.dst = &dst;
+    input.crop_x = 0.0f;
+    input.crop_y = 0.0f;
+    input.crop_w = 2.0f;
+    input.crop_h = 2.0f;
+    input.host_analysis_complete = true;
+    input.cpu_crop_plan_complete = true;
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.crop_resize_dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1 &&
+            counters.device_loss_frames == 1 &&
+            counters.cpu_resize_fallback_calls == 0,
+        "Auto Frame device loss must retain nested reasons, count the failed "
+        "dispatch, and never substitute CPU crop/resize");
+    const std::uint64_t submissions_after_loss =
+        lost_auto_frame_kernels.synchronous_submission_count();
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &counters, &error) &&
+            lost_auto_frame_kernels.synchronous_submission_count() ==
+                submissions_after_loss,
+        "poisoned Auto Frame shared context must reject without another "
+        "submission");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
     UtilityKernels lost_batch_kernels;
     if (!lost_batch_kernels.Initialize(&error)) {
       return OptionalSkip("mirror batch device-loss context init failed: " +
@@ -1684,6 +1827,103 @@ int main() {
         ReadU8(gpu_dst),
         ResizeU8Reference(src, sw, sh, dw, dh, 0.0f, 0.0f, 3.0f, 2.0f),
         "Vulkan crop-resize");
+  }
+
+  {
+    const int w = 3, h = 2;
+    const std::vector<std::uint8_t> src = {
+        10,  20,  30,  40,  50,  60,  70,  80,  90,
+        110, 120, 130, 140, 150, 160, 170, 180, 190,
+    };
+    VulkanImage gpu_src, gpu_dst;
+    if (!AllocateU8(kernels, &gpu_src, w, h, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(kernels, &gpu_dst, w, h, VulkanPixelFormat::rgb_u8,
+                    &error)) {
+      return OptionalSkip("Auto Frame crop allocation failed: " + error);
+    }
+    FillU8(gpu_src, src);
+    flush(gpu_src);
+
+    studiocast::video::OpenVulkanAutoFrame auto_frame;
+    studiocast::video::OpenVulkanAutoFrameCounters counters;
+    ok &= Require(auto_frame.EnsureInitialized(&kernels, w, h, &counters,
+                                               &error),
+                  "canonical Auto Frame crop should initialize on the shared "
+                  "production context: " + error);
+    studiocast::video::OpenVulkanAutoFrameCropInput input;
+    input.src = &gpu_src;
+    input.dst = &gpu_dst;
+    input.crop_x = 0.5f;
+    input.crop_y = 0.0f;
+    input.crop_w = 2.0f;
+    input.crop_h = 2.0f;
+
+    studiocast::video::OpenVulkanAutoFrameCounters rejection_counters;
+    const std::uint64_t submissions_before_rejections =
+        kernels.synchronous_submission_count();
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+            error.find("host-analysis/crop-plan ordering boundary") !=
+                std::string::npos &&
+            kernels.synchronous_submission_count() ==
+                submissions_before_rejections &&
+            rejection_counters.crop_resize_dispatch_calls == 0,
+        "Auto Frame must reject crop dispatch before host analysis and CPU "
+        "crop planning without a Vulkan submission");
+
+    input.host_analysis_complete = true;
+    input.cpu_crop_plan_complete = true;
+    input.dst = &gpu_src;
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+            error.find("must be out of place") != std::string::npos &&
+            kernels.synchronous_submission_count() ==
+                submissions_before_rejections &&
+            rejection_counters.crop_resize_dispatch_calls == 0,
+        "Auto Frame must reject in-place crop/resize without a Vulkan "
+        "submission");
+
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error)) {
+      return OptionalSkip("Auto Frame foreign-context init failed: " + error);
+    }
+    VulkanImage foreign_src;
+    if (!AllocateU8(foreign_kernels, &foreign_src, w, h,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("Auto Frame foreign-context allocation failed: " +
+                          error);
+    }
+    const std::uint64_t foreign_submissions_before =
+        foreign_kernels.synchronous_submission_count();
+    input.src = &foreign_src;
+    input.dst = &gpu_dst;
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+            error.find("[vulkan_resource_foreign_context]") !=
+                std::string::npos &&
+            kernels.synchronous_submission_count() ==
+                submissions_before_rejections &&
+            foreign_kernels.synchronous_submission_count() ==
+                foreign_submissions_before &&
+            rejection_counters.crop_resize_dispatch_calls == 0,
+        "Auto Frame must reject foreign-context resources with a stable "
+        "reason and zero submissions on either context");
+
+    input.src = &gpu_src;
+    input.dst = &gpu_dst;
+    ok &= Require(auto_frame.ApplyCrop(input, &counters, &error),
+                  "canonical Auto Frame crop should dispatch: " + error);
+    invalidate(gpu_dst);
+    ok &= CompareU8(ReadU8(gpu_dst),
+                    ResizeU8Reference(src, w, h, w, h, 0.5f, 0.0f, 2.0f,
+                                      2.0f),
+                    "canonical Vulkan Auto Frame crop parity");
+    ok &= Require(counters.crop_resize_dispatch_calls == 1 &&
+                      counters.runtime_failure_frames == 0 &&
+                      counters.cpu_resize_fallback_calls == 0,
+                  "successful Vulkan Auto Frame must count one real dispatch "
+                  "and no CPU resize substitute");
   }
 
   {
