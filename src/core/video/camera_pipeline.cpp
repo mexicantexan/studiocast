@@ -277,6 +277,36 @@ OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
   return result;
 }
 
+OpenVulkanEyeContactPlanCompatibility
+ApplyOpenVulkanEyeContactPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan) {
+  OpenVulkanEyeContactPlanCompatibility result;
+  if (!retained_plan)
+    return result;
+
+  const std::string eye_contact_id(effects::contract::kEffectIdEyeContact);
+  const auto stage = std::find(retained_plan->ordered_effect_ids.begin(),
+                               retained_plan->ordered_effect_ids.end(),
+                               eye_contact_id);
+  if (stage == retained_plan->ordered_effect_ids.end())
+    return result;
+
+  retained_plan->ordered_effect_ids.erase(stage);
+  if (retained_plan->vignette_attach_to_effect_id == eye_contact_id)
+    retained_plan->vignette_attach_to_effect_id.clear();
+
+  result.blocked = true;
+  result.reason_code = kOpenVulkanEyeContactUnavailableReason;
+  result.blocker_code = kOpenVulkanEyeContactRuntimeUnavailableReason;
+  result.detail = kOpenVulkanEyeContactUnavailableDetail;
+  retained_plan->disabled.push_back(effects::DisabledEffectByRule{
+      .id = eye_contact_id,
+      .reason = "[" + std::string(result.reason_code) + "] [" +
+                std::string(result.blocker_code) + "] " +
+                std::string(result.detail)});
+  return result;
+}
+
 namespace {
 
 detail::PreparedReplaceBackgroundSource
@@ -8264,11 +8294,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::contract::kEffectIdMirror);
     };
 
-    const auto remove_non_vulkan_vb_compute_stages_from_plan = [&] {
+    const auto remove_unavailable_open_vulkan_denoise_from_plan = [&] {
       remove_stage_from_plan(
           studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval);
-      remove_stage_from_plan(
-          studiocast::video::effects::contract::kEffectIdEyeContact);
     };
 
     auto compute_selection = ResolveComputeBackendSelection(
@@ -8276,7 +8304,17 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     if (compute_work_requested &&
         cfg.compute_backend == ComputeBackendPreference::vulkan) {
-      remove_non_vulkan_vb_compute_stages_from_plan();
+      remove_unavailable_open_vulkan_denoise_from_plan();
+      const auto eye_contact_compatibility =
+          ApplyOpenVulkanEyeContactPlanCompatibility(&plan);
+      if (eye_contact_compatibility.blocked) {
+        planned.erase(std::string(
+            studiocast::video::effects::contract::kEffectIdEyeContact));
+        compute_available.vulkan_unavailable_reason =
+            "[" + std::string(eye_contact_compatibility.reason_code) +
+            "] [" + std::string(eye_contact_compatibility.blocker_code) +
+            "] " + std::string(eye_contact_compatibility.detail);
+      }
       // Vulkan vignette is a final-output stage rather than an attached model
       // stage. Tracked-center compatibility is evaluated after Auto Frame
       // readiness is known, so no hidden analysis tail is introduced.

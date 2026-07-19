@@ -372,7 +372,38 @@ DiagnosticsJsonSnapshot ComputeDiagnosticsJsonSnapshot() {
       "\"missing_models\":{},\"available_effects\":[],"
       "\"blocked_effects\":{\"virtual_background.blur\":\"disabled_in_build\","
       "\"virtual_background.remove\":\"disabled_in_build\","
-      "\"virtual_background.replace\":\"disabled_in_build\"},"
+      "\"virtual_background.replace\":\"disabled_in_build\","
+      "\"eye_contact\":\"open_vulkan_eye_contact_unavailable\"},"
+      "\"eye_contact_production_ready\":false,"
+      "\"eye_contact_reason_code\":\"open_vulkan_eye_contact_unavailable\","
+      "\"eye_contact_blocker_code\":"
+      "\"open_vulkan_eye_contact_runtime_unavailable\","
+      "\"eye_contact_detail\":\"no production eye-contact runtime can "
+      "import StudioCast's exact Vulkan device, compute queue, and resident "
+      "buffers; the current ONNX/dlib path uses CPU analysis, CPU tensors, "
+      "and CPU postprocess, and its manifests do not declare a complete "
+      "Vulkan artifact, gaze, or look-away contract\","
+      "\"eye_contact_backend_compiled\":false,"
+      "\"eye_contact_live_stage_implemented\":false,"
+      "\"eye_contact_production_adapter_available\":false,"
+      "\"eye_contact_vulkan_inference_provider_available\":false,"
+      "\"eye_contact_non_cpu_device_selected\":false,"
+      "\"eye_contact_compute_queue_available\":false,"
+      "\"eye_contact_context_healthy\":false,"
+      "\"eye_contact_shared_device_imported\":false,"
+      "\"eye_contact_queue_ownership_explicit\":false,"
+      "\"eye_contact_model_pack_selected\":false,"
+      "\"eye_contact_artifact_contract_validated\":false,"
+      "\"eye_contact_device_resident_analysis\":false,"
+      "\"eye_contact_device_resident_tensor_io\":false,"
+      "\"eye_contact_warmup_complete\":false,"
+      "\"eye_contact_bounded_reusable_allocations\":false,"
+      "\"eye_contact_synchronization_contract_validated\":false,"
+      "\"eye_contact_parity_validated\":false,"
+      "\"eye_contact_selectable_cpu_fallback\":false,"
+      "\"eye_contact_dispatch_count\":0,"
+      "\"eye_contact_cpu_readback_count\":0,"
+      "\"eye_contact_cpu_fallback_count\":0,"
       "\"matting_runtime\":\"none\",\"matting_runtime_created\":false,"
       "\"matting_graph_loaded\":false,\"input_device_resident\":false,"
       "\"alpha_device_resident\":false,\"output_device_resident\":false,"
@@ -562,6 +593,8 @@ struct EngineDiagnosticsSummary {
   std::string device_name;
   std::string matting_runtime;
   std::string device_residency_mode;
+  std::string eye_contact_blocker_code;
+  std::string eye_contact_detail;
   bool input_device_resident = false;
   bool alpha_device_resident = false;
   bool output_device_resident = false;
@@ -635,6 +668,11 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
     out.matting_runtime = *s;
   if (const std::string *s = JsonStringField(*obj, "device_residency_mode"))
     out.device_residency_mode = *s;
+  if (const std::string *s =
+          JsonStringField(*obj, "eye_contact_blocker_code"))
+    out.eye_contact_blocker_code = *s;
+  if (const std::string *s = JsonStringField(*obj, "eye_contact_detail"))
+    out.eye_contact_detail = *s;
   out.input_device_resident =
       JsonBoolField(*obj, "input_device_resident", false);
   out.alpha_device_resident =
@@ -1068,6 +1106,14 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
                       ? label + " model is missing."
                       : label + " is blocked by the selected backend.";
     out.detail = blockedIt->second;
+    if (id == studiocast::video::effects::contract::kEffectIdEyeContact &&
+        out.backend == "open_vulkan" &&
+        !diag->eye_contact_blocker_code.empty()) {
+      out.detail = "[" + blockedIt->second + "] [" +
+                   diag->eye_contact_blocker_code + "]";
+      if (!diag->eye_contact_detail.empty())
+        out.detail += " " + diag->eye_contact_detail;
+    }
     out.reason = blockedIt->second;
     return out;
   }

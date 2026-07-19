@@ -88,6 +88,7 @@ struct ReadinessFields {
   std::string state;
   std::string reason;
   std::string backend;
+  std::string detail;
   bool present = false;
 };
 
@@ -125,12 +126,15 @@ ReadinessFields ReadinessEntryFor(const std::string &statusJson,
       StringAt(*entry, "reason", "readiness reason should exist");
   const std::string *backend =
       StringAt(*entry, "backend", "readiness backend should exist");
-  if (!state || !reason || !backend)
+  const std::string *detail =
+      StringAt(*entry, "detail", "readiness detail should exist");
+  if (!state || !reason || !backend || !detail)
     return out;
 
   out.state = *state;
   out.reason = *reason;
   out.backend = *backend;
+  out.detail = *detail;
   out.present = true;
   return out;
 }
@@ -1250,6 +1254,114 @@ bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
                 "blocked explicit Vulkan must not report a CUDA provider");
 }
 
+bool TestExplicitVulkanEyeContactReportsExactFailClosedFacts() {
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  videoConfig.enabled = true;
+  videoConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  videoConfig.pipeline.effects.eye_contact.enabled = true;
+
+  const std::string openVulkanJson =
+      "{\"compiled_enabled\":true,\"ok\":true,"
+      "\"available_effects\":[\"mirror\"],"
+      "\"blocked_effects\":{\"eye_contact\":"
+      "\"open_vulkan_eye_contact_unavailable\"},"
+      "\"eye_contact_production_ready\":false,"
+      "\"eye_contact_reason_code\":\"open_vulkan_eye_contact_unavailable\","
+      "\"eye_contact_blocker_code\":"
+      "\"open_vulkan_eye_contact_runtime_unavailable\","
+      "\"eye_contact_detail\":\"current ONNX/dlib path uses CPU tensors\","
+      "\"eye_contact_backend_compiled\":true,"
+      "\"eye_contact_live_stage_implemented\":false,"
+      "\"eye_contact_production_adapter_available\":false,"
+      "\"eye_contact_vulkan_inference_provider_available\":false,"
+      "\"eye_contact_shared_device_imported\":false,"
+      "\"eye_contact_queue_ownership_explicit\":false,"
+      "\"eye_contact_model_pack_selected\":false,"
+      "\"eye_contact_artifact_contract_validated\":false,"
+      "\"eye_contact_selectable_cpu_fallback\":false,"
+      "\"eye_contact_dispatch_count\":0,"
+      "\"eye_contact_cpu_readback_count\":0,"
+      "\"eye_contact_cpu_fallback_count\":0}";
+
+  const std::string statusJson = StatusForVideoConfigWithDiagnostics(
+      videoConfig, /*maxineJson=*/"", /*openCudaJson=*/"", openVulkanJson);
+  const ReadinessFields entry = ReadinessEntryFor(statusJson, "eye_contact");
+  if (!entry.present)
+    return false;
+
+  studiocast::util::json::Value diagnosticsValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(openVulkanJson, &diagnosticsValue,
+                                     &error)) {
+    std::cerr << "Open Vulkan fixture should parse: " << error << "\n";
+    return false;
+  }
+  const JsonObject *diagnostics = diagnosticsValue.AsObject();
+  if (!diagnostics)
+    return false;
+  const std::string *blocker = StringAt(
+      *diagnostics, "eye_contact_blocker_code",
+      "eye-contact runtime blocker should exist");
+  if (!blocker)
+    return false;
+
+  return Expect(entry.backend == "open_vulkan",
+                "explicit Vulkan eye contact must keep backend attribution") &&
+         Expect(entry.state == "backend_unavailable",
+                "explicit Vulkan eye contact must fail closed") &&
+         Expect(entry.reason == "open_vulkan_eye_contact_unavailable",
+                "eye contact readiness must expose the stable outer reason") &&
+         Expect(entry.detail.find(
+                    "[open_vulkan_eye_contact_unavailable] "
+                    "[open_vulkan_eye_contact_runtime_unavailable]") !=
+                    std::string::npos &&
+                    entry.detail.find("CPU tensors") != std::string::npos,
+                "eye-contact readiness detail must expose the nested runtime "
+                "and CPU boundary") &&
+         Expect(*blocker == "open_vulkan_eye_contact_runtime_unavailable",
+                "eye contact diagnostics must expose the primary blocker") &&
+         Expect(JsonBoolField(*diagnostics, "eye_contact_backend_compiled",
+                              false),
+                "compiled backend must remain a separate true fact") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_live_stage_implemented", true),
+                "eye contact must not claim a live implementation") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_production_adapter_available",
+                               true),
+                "eye contact must not claim a production adapter") &&
+         Expect(!JsonBoolField(
+                    *diagnostics,
+                    "eye_contact_vulkan_inference_provider_available", true),
+                "eye contact must not claim a Vulkan inference provider") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_shared_device_imported", true) &&
+                    !JsonBoolField(
+                        *diagnostics,
+                        "eye_contact_queue_ownership_explicit", true),
+                "eye contact must not claim shared device/queue ownership") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_model_pack_selected", true),
+                "eye contact must not select an ONNX-only pack as Vulkan") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_artifact_contract_validated",
+                               true),
+                "eye contact must not claim a Vulkan artifact contract") &&
+         Expect(!JsonBoolField(*diagnostics,
+                               "eye_contact_selectable_cpu_fallback", true),
+                "eye contact must not expose an internal CPU tail as fallback") &&
+         Expect(JsonNumberField(*diagnostics, "eye_contact_dispatch_count",
+                                1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "eye_contact_cpu_readback_count",
+                                    1.0) == 0.0 &&
+                    JsonNumberField(*diagnostics,
+                                    "eye_contact_cpu_fallback_count",
+                                    1.0) == 0.0,
+                "blocked eye contact must prove zero frame work");
+}
+
 bool TestBuiltinEffectReadyWithoutDiagnostics() {
   studiocast::video::effects::BroadcastCameraEffects effects;
   effects.engine =
@@ -1395,6 +1507,7 @@ int main() {
   ok = TestVideoStatusReportsConfiguredDevicesWhenPipelineIdle() && ok;
   ok = TestExplicitOpenCudaEffectUnknownWithoutDiagnostics() && ok;
   ok = TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() && ok;
+  ok = TestExplicitVulkanEyeContactReportsExactFailClosedFacts() && ok;
   ok = TestBuiltinEffectReadyWithoutDiagnostics() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;

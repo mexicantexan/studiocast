@@ -102,14 +102,20 @@ bool TestExplicitVulkanFilteringMatchesAudit() {
   const std::string pipeline =
       ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
   const std::string filtering =
-      Section(pipeline, "remove_non_vulkan_vb_compute_stages_from_plan",
+      Section(pipeline, "remove_unavailable_open_vulkan_denoise_from_plan",
               "const bool vb_requested");
   bool ok = Require(!filtering.empty(),
                     "explicit Vulkan filtering section not found");
   ok &= Require(Contains(filtering, "kEffectIdVideoNoiseRemoval"),
                 "explicit Vulkan must continue removing video denoise");
-  ok &= Require(Contains(filtering, "kEffectIdEyeContact"),
-                "explicit Vulkan must continue removing eye contact");
+  ok &= Require(
+      Contains(filtering,
+               "ApplyOpenVulkanEyeContactPlanCompatibility(&plan)") &&
+          Contains(filtering, "kEffectIdEyeContact") &&
+          Contains(filtering,
+                   "eye_contact_compatibility.blocker_code"),
+      "explicit Vulkan must remove eye contact through its exact fail-closed "
+      "contract");
   ok &= Require(!Contains(filtering, "kEffectIdVignette"),
                 "explicit Vulkan must retain production vignette in the "
                 "canonical plan");
@@ -124,6 +130,110 @@ bool TestExplicitVulkanFilteringMatchesAudit() {
   ok &= Require(Contains(rules, "kEffectIdMirror") &&
                     Contains(rules, "Mirror is the final visual transform"),
                 "mirror must be scheduled as the canonical final transform");
+  return ok;
+}
+
+bool TestEyeContactDiagnosticsOnlyContractIsFailClosed() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string header = ReadFile(
+      root / "src" / "core" / "video" / "open_vulkan_eye_contact.h");
+  const std::string implementation = ReadFile(
+      root / "src" / "core" / "video" / "open_vulkan_eye_contact.cpp");
+  const std::string device_header =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.h");
+  const std::string device =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.cpp");
+  const std::string diagnostics =
+      ReadFile(root / "src" / "core" / "vulkan" / "kernels" /
+               "resize_bilinear.cpp");
+  const std::string pipeline_header =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.h");
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+
+  bool ok = Require(!header.empty() && !implementation.empty(),
+                    "Vulkan eye-contact diagnostics contract is missing");
+  ok &= Require(
+      Contains(header, "open_vulkan_eye_contact_unavailable") &&
+          Contains(header,
+                   "open_vulkan_eye_contact_runtime_unavailable") &&
+          Contains(header, "live_stage_implemented = false") &&
+          Contains(header, "production_adapter_available = false") &&
+          Contains(header,
+                   "vulkan_inference_provider_available = false") &&
+          Contains(header, "shared_device_imported = false") &&
+          Contains(header, "queue_ownership_explicit = false") &&
+          Contains(header, "artifact_contract_validated = false") &&
+          Contains(header, "selectable_cpu_fallback = false") &&
+          Contains(header, "dispatch_count = 0") &&
+          Contains(header, "cpu_readback_count = 0") &&
+          Contains(header, "cpu_fallback_count = 0") &&
+          !Contains(header, " Apply(") && !Contains(header, "VulkanImage"),
+      "eye contact must expose separate fail-closed facts without a callable "
+      "effect stub");
+  ok &= Require(
+      Contains(implementation, "CurrentOpenVulkanEyeContactFacts") &&
+          Contains(implementation,
+                   "EvaluateOpenVulkanEyeContactReadiness") &&
+          Contains(implementation, "facts.live_stage_implemented") &&
+          Contains(implementation, "facts.dispatch_count > 0") &&
+          Contains(implementation, "facts.cpu_readback_count == 0") &&
+          Contains(implementation, "facts.cpu_fallback_count == 0"),
+      "compiled Vulkan presence must not bypass live/runtime/zero-tail gates");
+  ok &= Require(
+      Contains(diagnostics, "ApplyOpenVulkanEyeContactReadiness") &&
+          Contains(diagnostics,
+                   "current_facts.non_cpu_device_selected = "
+                   "d->non_cpu_device_selected") &&
+          Contains(diagnostics,
+                   "current_facts.compute_queue_available = "
+                   "d->compute_queue_available") &&
+          Contains(diagnostics,
+                   "current_facts.context_healthy = d->context_healthy") &&
+          Contains(diagnostics, "d->blocked_effects[effect_id]") &&
+          Contains(diagnostics, "d->available_effects.erase") &&
+          Contains(device_header, "eye_contact_production_ready = false") &&
+          Contains(device_header,
+                   "eye_contact_live_stage_implemented = false") &&
+          Contains(device_header,
+                   "eye_contact_non_cpu_device_selected = false") &&
+          Contains(device_header,
+                   "eye_contact_compute_queue_available = false") &&
+          Contains(device_header,
+                   "eye_contact_context_healthy = false") &&
+          Contains(device_header,
+                   "eye_contact_selectable_cpu_fallback = false") &&
+          Contains(device, "eye_contact_dispatch_count") &&
+          Contains(device, "eye_contact_cpu_readback_count") &&
+          Contains(device, "eye_contact_cpu_fallback_count"),
+      "default diagnostics must block eye contact and expose zero-work facts");
+  ok &= Require(
+      Contains(pipeline_header,
+               "ApplyOpenVulkanEyeContactPlanCompatibility") &&
+          Contains(pipeline,
+                   "ApplyOpenVulkanEyeContactPlanCompatibility(&plan)") &&
+          Contains(pipeline,
+                   "eye_contact_compatibility.reason_code") &&
+          Contains(pipeline,
+                   "eye_contact_compatibility.blocker_code"),
+      "canonical explicit-Vulkan plan must publish the nested eye-contact "
+      "blocker");
+  ok &= Require(
+      Contains(daemon, "open_vulkan_eye_contact_unavailable") &&
+          Contains(daemon, "eye_contact_blocker_code") &&
+          Contains(daemon, "diag->eye_contact_blocker_code") &&
+          Contains(daemon, "diag->eye_contact_detail") &&
+          Contains(daemon,
+                   "\\\"eye_contact_non_cpu_device_selected\\\":false") &&
+          Contains(daemon,
+                   "\\\"eye_contact_compute_queue_available\\\":false") &&
+          Contains(daemon,
+                   "\\\"eye_contact_context_healthy\\\":false") &&
+          Contains(daemon, "eye_contact_selectable_cpu_fallback") &&
+          Contains(daemon, "eye_contact_dispatch_count"),
+      "Vulkan-off status must preserve the same exact per-effect contract");
   return ok;
 }
 
@@ -956,6 +1066,7 @@ int main() {
   bool ok = true;
   ok = TestAuditCoversCanonicalEffects() && ok;
   ok = TestExplicitVulkanFilteringMatchesAudit() && ok;
+  ok = TestEyeContactDiagnosticsOnlyContractIsFailClosed() && ok;
   ok = TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() && ok;

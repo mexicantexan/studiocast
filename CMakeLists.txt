@@ -388,6 +388,8 @@ add_library(studiocast_core
         src/core/video/camera_pipeline.cpp
         src/core/video/open_vulkan_matting_setup_policy.h
         src/core/video/open_vulkan_matting_setup_policy.cpp
+        src/core/video/open_vulkan_eye_contact.h
+        src/core/video/open_vulkan_eye_contact.cpp
         src/core/video/replace_background_cache_policy.h
         src/core/video/replace_background_cache_policy.cpp
         src/core/video/camera_effects_json.h

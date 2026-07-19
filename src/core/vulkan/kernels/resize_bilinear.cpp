@@ -12,6 +12,7 @@
 #include "core/open_video/vulkan_matting_runtime.h"
 #include "core/util/xdg.h"
 #include "core/video/effects/broadcast_effect_contract.h"
+#include "core/video/open_vulkan_eye_contact.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 
@@ -566,6 +567,57 @@ void BlockOpenVulkanVirtualBackground(OpenVulkanDiagnostics *d,
       reason_code;
 }
 
+void ApplyOpenVulkanEyeContactReadiness(OpenVulkanDiagnostics *d) {
+  if (!d)
+    return;
+
+  auto current_facts = studiocast::video::CurrentOpenVulkanEyeContactFacts();
+  current_facts.non_cpu_device_selected = d->non_cpu_device_selected;
+  current_facts.compute_queue_available = d->compute_queue_available;
+  current_facts.context_healthy = d->context_healthy;
+  const auto readiness =
+      studiocast::video::EvaluateOpenVulkanEyeContactReadiness(current_facts);
+  const auto &facts = readiness.facts;
+  d->eye_contact_production_ready = readiness.production_ready;
+  d->eye_contact_reason_code = readiness.reason_code;
+  d->eye_contact_blocker_code = readiness.blocker_code;
+  d->eye_contact_detail = readiness.detail;
+  d->eye_contact_backend_compiled = facts.backend_compiled;
+  d->eye_contact_live_stage_implemented = facts.live_stage_implemented;
+  d->eye_contact_production_adapter_available =
+      facts.production_adapter_available;
+  d->eye_contact_vulkan_inference_provider_available =
+      facts.vulkan_inference_provider_available;
+  d->eye_contact_non_cpu_device_selected = facts.non_cpu_device_selected;
+  d->eye_contact_compute_queue_available = facts.compute_queue_available;
+  d->eye_contact_context_healthy = facts.context_healthy;
+  d->eye_contact_shared_device_imported = facts.shared_device_imported;
+  d->eye_contact_queue_ownership_explicit = facts.queue_ownership_explicit;
+  d->eye_contact_model_pack_selected = facts.model_pack_selected;
+  d->eye_contact_artifact_contract_validated =
+      facts.artifact_contract_validated;
+  d->eye_contact_device_resident_analysis = facts.device_resident_analysis;
+  d->eye_contact_device_resident_tensor_io = facts.device_resident_tensor_io;
+  d->eye_contact_warmup_complete = facts.warmup_complete;
+  d->eye_contact_bounded_reusable_allocations =
+      facts.bounded_reusable_allocations;
+  d->eye_contact_synchronization_contract_validated =
+      facts.synchronization_contract_validated;
+  d->eye_contact_parity_validated = facts.parity_validated;
+  d->eye_contact_selectable_cpu_fallback = facts.selectable_cpu_fallback;
+  d->eye_contact_dispatch_count = facts.dispatch_count;
+  d->eye_contact_cpu_readback_count = facts.cpu_readback_count;
+  d->eye_contact_cpu_fallback_count = facts.cpu_fallback_count;
+
+  const std::string effect_id(
+      studiocast::video::effects::contract::kEffectIdEyeContact);
+  d->available_effects.erase(
+      std::remove(d->available_effects.begin(), d->available_effects.end(),
+                  effect_id),
+      d->available_effects.end());
+  d->blocked_effects[effect_id] = readiness.reason_code;
+}
+
 } // namespace
 
 OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
@@ -584,6 +636,7 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
     BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
+    ApplyOpenVulkanEyeContactReadiness(&d);
     return d;
   }
   kernels::UtilityKernels utility;
@@ -600,6 +653,7 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
     BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
+    ApplyOpenVulkanEyeContactReadiness(&d);
     return d;
   }
   OpenVulkanDiagnostics d = resize.Diagnostics();
@@ -624,6 +678,7 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
       "The milestone-4 ncnn Vulkan spike used CPU Mat input/output; it is not "
       "used for production Open Vulkan virtual background.");
   BlockOpenVulkanVirtualBackground(&d, d.matting_reason_code.c_str());
+  ApplyOpenVulkanEyeContactReadiness(&d);
   return d;
 }
 
