@@ -11070,8 +11070,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const std::size_t tightStride = static_cast<std::size_t>(outW) * 3u;
       const std::size_t tightBytes =
           tightStride * static_cast<std::size_t>(outH);
+      const bool vulkan_resize_needed = frameW != outW || frameH != outH;
 
-      if (ok && (frameW != outW || frameH != outH)) {
+      if (ok && vulkan_resize_needed) {
         if (!open_vulkan_vb.EnsureImage(
                 &vulkan_rgb_scaled, outW, outH,
                 studiocast::vulkan::VulkanPixelFormat::rgb_u8,
@@ -11080,13 +11081,20 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         } else {
           vulkan_rgb_scaled_allocated = true;
         }
-        if (ok && !deferred_gpu_out.vulkan_kernels->ResizeBilinear(
-                      *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
+        download_img = &vulkan_rgb_scaled;
+      }
+
+      // Without mirror, preserve the normal single-stage resident resize. If
+      // mirror is active, its production helper records resize -> barrier ->
+      // mirror under one completion below.
+      if (ok && vulkan_resize_needed &&
+          !open_vulkan_mirror_attempt_this_frame) {
+        if (!deferred_gpu_out.vulkan_kernels->ResizeBilinear(
+                *deferred_gpu_out.vulkan_img, vulkan_rgb_scaled, &gerr)) {
           ok = false;
-        } else if (ok) {
+        } else {
           ++open_vulkan_forced_sync_calls;
         }
-        download_img = &vulkan_rgb_scaled;
       }
 
       if (ok && open_vulkan_mirror_attempt_this_frame) {
@@ -11100,14 +11108,25 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               /*map_memory=*/true, "mirror_rgb", &mirror_err);
         }
 
-        OpenVulkanMirrorFinalStageInput mirror_input;
-        mirror_input.src = download_img;
-        mirror_input.dst = &open_vulkan_vb.mirror_rgb;
-        mirror_input.unmirrored_analysis_complete = true;
-        mirror_input.output_geometry_ready = true;
-        if (mirror_ready &&
-            open_vulkan_mirror.ApplyFinal(
-                mirror_input, &open_vulkan_mirror_counters, &mirror_err)) {
+        bool mirror_applied = false;
+        if (mirror_ready && vulkan_resize_needed) {
+          OpenVulkanMirrorResizeFinalStageInput mirror_input;
+          mirror_input.src = deferred_gpu_out.vulkan_img;
+          mirror_input.resized = &vulkan_rgb_scaled;
+          mirror_input.dst = &open_vulkan_vb.mirror_rgb;
+          mirror_input.unmirrored_analysis_complete = true;
+          mirror_applied = open_vulkan_mirror.ApplyResizeFinal(
+              mirror_input, &open_vulkan_mirror_counters, &mirror_err);
+        } else if (mirror_ready) {
+          OpenVulkanMirrorFinalStageInput mirror_input;
+          mirror_input.src = download_img;
+          mirror_input.dst = &open_vulkan_vb.mirror_rgb;
+          mirror_input.unmirrored_analysis_complete = true;
+          mirror_input.output_geometry_ready = true;
+          mirror_applied = open_vulkan_mirror.ApplyFinal(
+              mirror_input, &open_vulkan_mirror_counters, &mirror_err);
+        }
+        if (mirror_applied) {
           ++open_vulkan_forced_sync_calls;
           open_vulkan_effect_ran_this_frame = true;
           download_img = &open_vulkan_vb.mirror_rgb;
@@ -11126,8 +11145,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               studiocast::video::effects::contract::kEffectIdMirror,
               "open_vulkan", mirror_err, f.sequence);
           open_vulkan_mirror_attempt_this_frame = false;
-          // Fail open: read back the unmirrored final-geometry image so this
-          // optional effect cannot disable unrelated stages or camera output.
+          if (vulkan_resize_needed) {
+            // A failed combined submission cannot prove that the resize
+            // intermediate is complete. Enter the existing best-effort source
+            // readback/CPU output scaling path instead of reading partial GPU
+            // output.
+            ok = false;
+            gerr = "Open Vulkan combined resize/mirror failed: " + mirror_err;
+          }
+          // Same-size failures fail open by reading the original unmirrored
+          // resident frame; unrelated stages and camera output remain active.
         }
       }
 

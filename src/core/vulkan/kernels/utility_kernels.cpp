@@ -645,6 +645,153 @@ bool UtilityKernels::MirrorHorizontalU8x3(const VulkanImage &src,
   return Dispatch(p, Op::crop_resize_u8x3, p.dst_w, p.dst_h, error_out);
 }
 
+bool UtilityKernels::ResizeMirrorHorizontalU8x3(const VulkanImage &src,
+                                                const VulkanImage &scratch,
+                                                const VulkanImage &dst,
+                                                std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!ValidateRgbOrBgrImage(src, "ResizeMirrorHorizontalU8x3(src)",
+                             error_out) ||
+      !ValidateRgbOrBgrImage(scratch, "ResizeMirrorHorizontalU8x3(scratch)",
+                             error_out) ||
+      !ValidateRgbOrBgrImage(dst, "ResizeMirrorHorizontalU8x3(dst)",
+                             error_out)) {
+    return false;
+  }
+  if (!SameDimensions(scratch, dst)) {
+    if (error_out) {
+      *error_out =
+          "ResizeMirrorHorizontalU8x3: scratch/dst dimension mismatch.";
+    }
+    return false;
+  }
+  if (!SameU8Format(src, scratch) || !SameU8Format(src, dst)) {
+    if (error_out) {
+      *error_out =
+          "ResizeMirrorHorizontalU8x3: src/scratch/dst formats must match.";
+    }
+    return false;
+  }
+  if (src.buffer() == scratch.buffer() || src.buffer() == dst.buffer() ||
+      scratch.buffer() == dst.buffer()) {
+    if (error_out) {
+      *error_out = "ResizeMirrorHorizontalU8x3: src/scratch/dst must be "
+                   "distinct images.";
+    }
+    return false;
+  }
+  if (!Initialize(error_out))
+    return false;
+  if (!ValidateContext(device_, src, "ResizeMirrorHorizontalU8x3(src)",
+                       error_out) ||
+      !ValidateContext(device_, scratch, "ResizeMirrorHorizontalU8x3(scratch)",
+                       error_out) ||
+      !ValidateContext(device_, dst, "ResizeMirrorHorizontalU8x3(dst)",
+                       error_out)) {
+    return false;
+  }
+
+  Params resize_params{};
+  resize_params.src_w = static_cast<std::uint32_t>(src.width());
+  resize_params.src_h = static_cast<std::uint32_t>(src.height());
+  resize_params.src_pitch = static_cast<std::uint32_t>(src.pitch_pixels());
+  resize_params.dst_w = static_cast<std::uint32_t>(scratch.width());
+  resize_params.dst_h = static_cast<std::uint32_t>(scratch.height());
+  resize_params.dst_pitch = static_cast<std::uint32_t>(scratch.pitch_pixels());
+  resize_params.crop_x = 0.0f;
+  resize_params.crop_y = 0.0f;
+  resize_params.crop_w = static_cast<float>(src.width());
+  resize_params.crop_h = static_cast<float>(src.height());
+
+  Params mirror_params{};
+  mirror_params.src_w = resize_params.dst_w;
+  mirror_params.src_h = resize_params.dst_h;
+  mirror_params.src_pitch = static_cast<std::uint32_t>(scratch.pitch_pixels());
+  mirror_params.dst_w = resize_params.dst_w;
+  mirror_params.dst_h = resize_params.dst_h;
+  mirror_params.dst_pitch = static_cast<std::uint32_t>(dst.pitch_pixels());
+  mirror_params.crop_x = static_cast<float>(scratch.width());
+  mirror_params.crop_y = 0.0f;
+  mirror_params.crop_w = -static_cast<float>(scratch.width());
+  mirror_params.crop_h = static_cast<float>(scratch.height());
+
+  std::memcpy(params_.mapped(), &resize_params, sizeof(resize_params));
+  std::memcpy(batch_params_.mapped(), &mirror_params, sizeof(mirror_params));
+  if (!params_.Flush(error_out) || !batch_params_.Flush(error_out))
+    return false;
+  if (!BindBuffers(src.buffer(), nullptr, nullptr, scratch.buffer(), nullptr,
+                   nullptr, error_out) ||
+      !BindBuffersForSet(batch_descriptor_set_, batch_params_.buffer(),
+                         &batch_bound_buffers_, scratch.buffer(), nullptr,
+                         nullptr, dst.buffer(), nullptr, nullptr, error_out)) {
+    return false;
+  }
+
+  if (!frame_batch_.Begin(error_out))
+    return false;
+  VkCommandBuffer batch_command = frame_batch_.command_buffer();
+  const auto fail_batch = [&]() {
+    frame_batch_.Abort();
+    return false;
+  };
+  if (!frame_batch_.RecordBufferBarrier(
+          src.buffer(), src.byte_size(), src.context_identity(),
+          VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          params_.buffer(), params_.size(), params_.context_identity(),
+          VulkanBufferAccess::host_write, VulkanBufferAccess::compute_read,
+          error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          batch_params_.buffer(), batch_params_.size(),
+          batch_params_.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::compute_read, error_out)) {
+    return fail_batch();
+  }
+
+  const auto &vf = device_.f();
+  vf.vkCmdBindPipeline(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                       pipeline_);
+  vf.vkCmdBindDescriptorSets(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             pipeline_layout_, 0, 1, &descriptor_set_, 0,
+                             nullptr);
+  const std::uint32_t op = static_cast<std::uint32_t>(Op::crop_resize_u8x3);
+  if (!frame_batch_.RecordStage("output_resize", error_out))
+    return fail_batch();
+  vf.vkCmdPushConstants(batch_command, pipeline_layout_,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(op), &op);
+  vf.vkCmdDispatch(batch_command, CeilDiv(resize_params.dst_w, kBlockX),
+                   CeilDiv(resize_params.dst_h, kBlockY), 1);
+
+  if (!frame_batch_.RecordBufferBarrier(
+          scratch.buffer(), scratch.byte_size(), scratch.context_identity(),
+          VulkanBufferAccess::compute_write, VulkanBufferAccess::compute_read,
+          error_out)) {
+    return fail_batch();
+  }
+  vf.vkCmdBindDescriptorSets(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             pipeline_layout_, 0, 1, &batch_descriptor_set_, 0,
+                             nullptr);
+  if (!frame_batch_.RecordStage("final_mirror", error_out))
+    return fail_batch();
+  vf.vkCmdPushConstants(batch_command, pipeline_layout_,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(op), &op);
+  vf.vkCmdDispatch(batch_command, CeilDiv(mirror_params.dst_w, kBlockX),
+                   CeilDiv(mirror_params.dst_h, kBlockY), 1);
+
+  if (!frame_batch_.RecordBufferBarrier(
+          dst.buffer(), dst.byte_size(), dst.context_identity(),
+          VulkanBufferAccess::compute_write, VulkanBufferAccess::host_read,
+          error_out)) {
+    return fail_batch();
+  }
+
+  ++synchronous_submission_count_;
+  return frame_batch_.Complete(error_out);
+}
+
 bool UtilityKernels::PreprocessToTensor(const VulkanImage &src,
                                         const VulkanTensor &dst,
                                         const ModelPreprocessSpec &spec,

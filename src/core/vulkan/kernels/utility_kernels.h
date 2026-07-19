@@ -76,6 +76,13 @@ public:
   // interpolate, change channel order, or permit src/dst aliasing.
   bool MirrorHorizontalU8x3(const VulkanImage &src, const VulkanImage &dst,
                             std::string *error_out);
+  // Resizes src into scratch, then horizontally reverses scratch into dst in
+  // one command buffer and one synchronous completion. scratch/dst have final
+  // output geometry and all three images remain device resident.
+  bool ResizeMirrorHorizontalU8x3(const VulkanImage &src,
+                                  const VulkanImage &scratch,
+                                  const VulkanImage &dst,
+                                  std::string *error_out);
   bool ResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                       std::string *error_out);
 
