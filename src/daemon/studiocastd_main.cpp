@@ -373,7 +373,9 @@ DiagnosticsJsonSnapshot ComputeDiagnosticsJsonSnapshot() {
       "\"blocked_effects\":{\"virtual_background.blur\":\"disabled_in_build\","
       "\"virtual_background.remove\":\"disabled_in_build\","
       "\"virtual_background.replace\":\"disabled_in_build\","
-      "\"eye_contact\":\"open_vulkan_eye_contact_unavailable\"},"
+      "\"eye_contact\":\"open_vulkan_eye_contact_unavailable\","
+      "\"video_noise_removal\":"
+      "\"open_vulkan_video_noise_removal_unavailable\"},"
       "\"eye_contact_production_ready\":false,"
       "\"eye_contact_reason_code\":\"open_vulkan_eye_contact_unavailable\","
       "\"eye_contact_blocker_code\":"
@@ -404,6 +406,46 @@ DiagnosticsJsonSnapshot ComputeDiagnosticsJsonSnapshot() {
       "\"eye_contact_dispatch_count\":0,"
       "\"eye_contact_cpu_readback_count\":0,"
       "\"eye_contact_cpu_fallback_count\":0,"
+      "\"video_noise_removal_production_ready\":false,"
+      "\"video_noise_removal_reason_code\":"
+      "\"open_vulkan_video_noise_removal_unavailable\","
+      "\"video_noise_removal_blocker_code\":"
+      "\"open_vulkan_video_noise_removal_runtime_unavailable\","
+      "\"video_noise_removal_detail\":\"no production video-denoise runtime "
+      "can import StudioCast's exact Vulkan device, compute queue, and "
+      "resident "
+      "buffers; the current FastDVDnet ONNX path supports only CUDA/CPU "
+      "providers with host temporal history and CPU "
+      "preprocessing/postprocessing, "
+      "while the available model packs declare ONNX-only artifacts\","
+      "\"video_noise_removal_backend_compiled\":false,"
+      "\"video_noise_removal_live_stage_implemented\":false,"
+      "\"video_noise_removal_production_adapter_available\":false,"
+      "\"video_noise_removal_vulkan_inference_provider_available\":false,"
+      "\"video_noise_removal_non_cpu_device_selected\":false,"
+      "\"video_noise_removal_compute_queue_available\":false,"
+      "\"video_noise_removal_context_healthy\":false,"
+      "\"video_noise_removal_shared_device_imported\":false,"
+      "\"video_noise_removal_queue_ownership_explicit\":false,"
+      "\"video_noise_removal_model_pack_selected\":false,"
+      "\"video_noise_removal_artifact_contract_validated\":false,"
+      "\"video_noise_removal_fully_device_resident_tensor_io\":false,"
+      "\"video_noise_removal_device_resident_preprocess\":false,"
+      "\"video_noise_removal_device_resident_postprocess\":false,"
+      "\"video_noise_removal_warmup_complete\":false,"
+      "\"video_noise_removal_synchronization_contract_validated\":false,"
+      "\"video_noise_removal_bounded_reusable_allocations\":false,"
+      "\"video_noise_removal_temporal_history_device_resident\":false,"
+      "\"video_noise_removal_temporal_history_bounded\":false,"
+      "\"video_noise_removal_history_reset_on_disable\":false,"
+      "\"video_noise_removal_history_reset_on_reconfigure\":false,"
+      "\"video_noise_removal_capture_sequence_discontinuity_reset\":false,"
+      "\"video_noise_removal_parity_validated\":false,"
+      "\"video_noise_removal_selectable_cpu_fallback\":false,"
+      "\"video_noise_removal_dispatch_count\":0,"
+      "\"video_noise_removal_temporal_history_reset_count\":0,"
+      "\"video_noise_removal_cpu_readback_count\":0,"
+      "\"video_noise_removal_cpu_fallback_count\":0,"
       "\"matting_runtime\":\"none\",\"matting_runtime_created\":false,"
       "\"matting_graph_loaded\":false,\"input_device_resident\":false,"
       "\"alpha_device_resident\":false,\"output_device_resident\":false,"
@@ -595,6 +637,8 @@ struct EngineDiagnosticsSummary {
   std::string device_residency_mode;
   std::string eye_contact_blocker_code;
   std::string eye_contact_detail;
+  std::string video_noise_removal_blocker_code;
+  std::string video_noise_removal_detail;
   bool input_device_resident = false;
   bool alpha_device_resident = false;
   bool output_device_resident = false;
@@ -673,6 +717,12 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
     out.eye_contact_blocker_code = *s;
   if (const std::string *s = JsonStringField(*obj, "eye_contact_detail"))
     out.eye_contact_detail = *s;
+  if (const std::string *s =
+          JsonStringField(*obj, "video_noise_removal_blocker_code"))
+    out.video_noise_removal_blocker_code = *s;
+  if (const std::string *s =
+          JsonStringField(*obj, "video_noise_removal_detail"))
+    out.video_noise_removal_detail = *s;
   out.input_device_resident =
       JsonBoolField(*obj, "input_device_resident", false);
   out.alpha_device_resident =
@@ -1113,6 +1163,15 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
                    diag->eye_contact_blocker_code + "]";
       if (!diag->eye_contact_detail.empty())
         out.detail += " " + diag->eye_contact_detail;
+    }
+    if (id ==
+            studiocast::video::effects::contract::kEffectIdVideoNoiseRemoval &&
+        out.backend == "open_vulkan" &&
+        !diag->video_noise_removal_blocker_code.empty()) {
+      out.detail = "[" + blockedIt->second + "] [" +
+                   diag->video_noise_removal_blocker_code + "]";
+      if (!diag->video_noise_removal_detail.empty())
+        out.detail += " " + diag->video_noise_removal_detail;
     }
     out.reason = blockedIt->second;
     return out;

@@ -101,13 +101,16 @@ bool TestExplicitVulkanFilteringMatchesAudit() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string pipeline =
       ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
-  const std::string filtering =
-      Section(pipeline, "remove_unavailable_open_vulkan_denoise_from_plan",
-              "const bool vb_requested");
+  const std::string filtering = Section(
+      pipeline, "const auto denoise_compatibility", "const bool vb_requested");
   bool ok = Require(!filtering.empty(),
                     "explicit Vulkan filtering section not found");
-  ok &= Require(Contains(filtering, "kEffectIdVideoNoiseRemoval"),
-                "explicit Vulkan must continue removing video denoise");
+  ok &= Require(Contains(filtering,
+                         "ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility") &&
+                    Contains(filtering, "kEffectIdVideoNoiseRemoval") &&
+                    Contains(filtering, "denoise_compatibility.blocker_code"),
+                "explicit Vulkan must remove video denoise through its exact "
+                "fail-closed contract");
   ok &= Require(
       Contains(filtering,
                "ApplyOpenVulkanEyeContactPlanCompatibility(&plan)") &&
@@ -234,6 +237,151 @@ bool TestEyeContactDiagnosticsOnlyContractIsFailClosed() {
           Contains(daemon, "eye_contact_selectable_cpu_fallback") &&
           Contains(daemon, "eye_contact_dispatch_count"),
       "Vulkan-off status must preserve the same exact per-effect contract");
+  return ok;
+}
+
+bool TestVideoNoiseRemovalDiagnosticsOnlyContractIsFailClosed() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string header = ReadFile(root / "src" / "core" / "video" /
+                                      "open_vulkan_video_noise_removal.h");
+  const std::string implementation = ReadFile(
+      root / "src" / "core" / "video" / "open_vulkan_video_noise_removal.cpp");
+  const std::string denoiser = ReadFile(root / "src" / "core" / "open_video" /
+                                        "fastdvdnet_denoiser.cpp");
+  const std::string denoiser_header =
+      ReadFile(root / "src" / "core" / "open_video" / "fastdvdnet_denoiser.h");
+  const std::string ort =
+      ReadFile(root / "src" / "core" / "onnx" / "ort_session.cpp");
+  const std::string device_header =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.h");
+  const std::string device =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.cpp");
+  const std::string diagnostics = ReadFile(root / "src" / "core" / "vulkan" /
+                                           "kernels" / "resize_bilinear.cpp");
+  const std::string pipeline_header =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.h");
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+
+  bool ok = Require(!header.empty() && !implementation.empty(),
+                    "Vulkan video-denoise diagnostics contract is missing");
+  ok &= Require(
+      Contains(header, "open_vulkan_video_noise_removal_unavailable") &&
+          Contains(header,
+                   "open_vulkan_video_noise_removal_runtime_unavailable") &&
+          Contains(header, "live_stage_implemented = false") &&
+          Contains(header, "production_adapter_available = false") &&
+          Contains(header, "vulkan_inference_provider_available = false") &&
+          Contains(header, "shared_device_imported = false") &&
+          Contains(header, "queue_ownership_explicit = false") &&
+          Contains(header, "artifact_contract_validated = false") &&
+          Contains(header, "fully_device_resident_tensor_io = false") &&
+          Contains(header, "device_resident_preprocess = false") &&
+          Contains(header, "device_resident_postprocess = false") &&
+          Contains(header, "temporal_history_device_resident = false") &&
+          Contains(header, "temporal_history_bounded = false") &&
+          Contains(header, "history_reset_on_disable = false") &&
+          Contains(header, "history_reset_on_reconfigure = false") &&
+          Contains(header, "capture_sequence_discontinuity_reset = false") &&
+          Contains(header, "selectable_cpu_fallback = false") &&
+          Contains(header, "dispatch_count = 0") &&
+          Contains(header, "temporal_history_reset_count = 0") &&
+          Contains(header, "cpu_readback_count = 0") &&
+          Contains(header, "cpu_fallback_count = 0") &&
+          !Contains(header, " Apply(") && !Contains(header, "VulkanImage"),
+      "video denoise must expose separate fail-closed temporal/runtime facts "
+      "without a callable effect stub");
+  ok &= Require(
+      Contains(implementation, "CurrentOpenVulkanVideoNoiseRemovalFacts") &&
+          Contains(implementation,
+                   "EvaluateOpenVulkanVideoNoiseRemovalReadiness") &&
+          Contains(implementation, "facts.live_stage_implemented") &&
+          Contains(implementation, "facts.temporal_history_bounded") &&
+          Contains(implementation, "facts.history_reset_on_disable") &&
+          Contains(implementation, "facts.history_reset_on_reconfigure") &&
+          Contains(implementation,
+                   "facts.capture_sequence_discontinuity_reset") &&
+          Contains(implementation, "facts.dispatch_count > 0") &&
+          Contains(implementation, "facts.cpu_readback_count == 0") &&
+          Contains(implementation, "facts.cpu_fallback_count == 0"),
+      "compiled Vulkan presence must not bypass live/runtime/temporal gates");
+  ok &= Require(
+      Contains(denoiser, "kFastDvdnetWindowFrames = 5") &&
+          Contains(denoiser, "kFastDvdnetHistoryFrames = 3") &&
+          Contains(denoiser, "f_tp1 = f_t0") &&
+          Contains(denoiser, "f_tp2 = f_t0") &&
+          Contains(denoiser_header,
+                   "std::vector<std::vector<float>> history_") &&
+          Contains(denoiser,
+                   "capture_sequence != last_capture_sequence_ + 1") &&
+          Contains(denoiser, "if (s <= 0)") &&
+          Contains(denoiser, "history_.clear()") &&
+          Contains(denoiser, "active_requested_model_id_") &&
+          Contains(denoiser, "ResetTemporalState()") &&
+          Contains(denoiser, "PreprocessRgbToChwPadded") &&
+          Contains(denoiser, "PostprocessToRgbInPlace") &&
+          Contains(denoiser, "UploadFromCpuF32") &&
+          Contains(denoiser, "DownloadToCpuF32") &&
+          Contains(denoiser, "switched to CPU fallback") &&
+          !Contains(ort, "VulkanExecutionProvider"),
+      "existing FastDVDnet/ORT evidence must remain explicitly host/CUDA/CPU, "
+      "not Vulkan-native");
+  ok &= Require(
+      Contains(diagnostics, "ApplyOpenVulkanVideoNoiseRemovalReadiness") &&
+          Contains(diagnostics, "current_facts.non_cpu_device_selected = "
+                                "d->non_cpu_device_selected") &&
+          Contains(diagnostics, "current_facts.compute_queue_available = "
+                                "d->compute_queue_available") &&
+          Contains(diagnostics,
+                   "current_facts.context_healthy = d->context_healthy") &&
+          Contains(diagnostics, "d->blocked_effects[effect_id]") &&
+          Contains(diagnostics, "d->available_effects.erase") &&
+          Contains(device_header,
+                   "video_noise_removal_production_ready = false") &&
+          Contains(device_header,
+                   "video_noise_removal_non_cpu_device_selected = false") &&
+          Contains(device_header,
+                   "video_noise_removal_compute_queue_available = false") &&
+          Contains(device_header,
+                   "video_noise_removal_context_healthy = false") &&
+          Contains(device_header,
+                   "video_noise_removal_temporal_history_bounded = false") &&
+          Contains(device_header,
+                   "video_noise_removal_selectable_cpu_fallback = false") &&
+          Contains(device, "video_noise_removal_dispatch_count") &&
+          Contains(device,
+                   "video_noise_removal_temporal_history_reset_count") &&
+          Contains(device, "video_noise_removal_cpu_readback_count") &&
+          Contains(device, "video_noise_removal_cpu_fallback_count"),
+      "default diagnostics must block video denoise and expose zero-work "
+      "temporal facts");
+  ok &= Require(
+      Contains(pipeline_header,
+               "ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility") &&
+          Contains(pipeline,
+                   "ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(") &&
+          Contains(pipeline, "denoise_compatibility.reason_code") &&
+          Contains(pipeline, "denoise_compatibility.blocker_code"),
+      "canonical explicit-Vulkan plan must publish the nested video-denoise "
+      "blocker");
+  ok &= Require(
+      Contains(daemon, "open_vulkan_video_noise_removal_unavailable") &&
+          Contains(daemon, "video_noise_removal_blocker_code") &&
+          Contains(daemon, "diag->video_noise_removal_blocker_code") &&
+          Contains(daemon, "diag->video_noise_removal_detail") &&
+          Contains(daemon,
+                   "\\\"video_noise_removal_non_cpu_device_selected\\\":"
+                   "false") &&
+          Contains(daemon,
+                   "\\\"video_noise_removal_compute_queue_available\\\":"
+                   "false") &&
+          Contains(daemon,
+                   "\\\"video_noise_removal_context_healthy\\\":false") &&
+          Contains(daemon, "video_noise_removal_selectable_cpu_fallback") &&
+          Contains(daemon, "video_noise_removal_temporal_history_reset_count"),
+      "Vulkan-off status must preserve the exact per-effect temporal contract");
   return ok;
 }
 
@@ -1067,6 +1215,7 @@ int main() {
   ok = TestAuditCoversCanonicalEffects() && ok;
   ok = TestExplicitVulkanFilteringMatchesAudit() && ok;
   ok = TestEyeContactDiagnosticsOnlyContractIsFailClosed() && ok;
+  ok = TestVideoNoiseRemovalDiagnosticsOnlyContractIsFailClosed() && ok;
   ok = TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() && ok;

@@ -279,6 +279,41 @@ struct OpenVulkanDiagnostics {
   std::uint64_t eye_contact_cpu_readback_count = 0;
   std::uint64_t eye_contact_cpu_fallback_count = 0;
 
+  bool video_noise_removal_production_ready = false;
+  std::string video_noise_removal_reason_code =
+      "open_vulkan_video_noise_removal_unavailable";
+  std::string video_noise_removal_blocker_code =
+      "open_vulkan_video_noise_removal_runtime_unavailable";
+  std::string video_noise_removal_detail;
+  bool video_noise_removal_backend_compiled = false;
+  bool video_noise_removal_live_stage_implemented = false;
+  bool video_noise_removal_production_adapter_available = false;
+  bool video_noise_removal_vulkan_inference_provider_available = false;
+  bool video_noise_removal_non_cpu_device_selected = false;
+  bool video_noise_removal_compute_queue_available = false;
+  bool video_noise_removal_context_healthy = false;
+  bool video_noise_removal_shared_device_imported = false;
+  bool video_noise_removal_queue_ownership_explicit = false;
+  bool video_noise_removal_model_pack_selected = false;
+  bool video_noise_removal_artifact_contract_validated = false;
+  bool video_noise_removal_fully_device_resident_tensor_io = false;
+  bool video_noise_removal_device_resident_preprocess = false;
+  bool video_noise_removal_device_resident_postprocess = false;
+  bool video_noise_removal_warmup_complete = false;
+  bool video_noise_removal_synchronization_contract_validated = false;
+  bool video_noise_removal_bounded_reusable_allocations = false;
+  bool video_noise_removal_temporal_history_device_resident = false;
+  bool video_noise_removal_temporal_history_bounded = false;
+  bool video_noise_removal_history_reset_on_disable = false;
+  bool video_noise_removal_history_reset_on_reconfigure = false;
+  bool video_noise_removal_capture_sequence_discontinuity_reset = false;
+  bool video_noise_removal_parity_validated = false;
+  bool video_noise_removal_selectable_cpu_fallback = false;
+  std::uint64_t video_noise_removal_dispatch_count = 0;
+  std::uint64_t video_noise_removal_temporal_history_reset_count = 0;
+  std::uint64_t video_noise_removal_cpu_readback_count = 0;
+  std::uint64_t video_noise_removal_cpu_fallback_count = 0;
+
   std::string matting_runtime;
   bool matting_build_enabled = false;
   bool matting_adapter_available = false;
