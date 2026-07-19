@@ -470,6 +470,8 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
             src/core/video/open_vulkan_mirror.cpp
             src/core/video/open_vulkan_auto_frame.h
             src/core/video/open_vulkan_auto_frame.cpp
+            src/core/video/open_vulkan_virtual_background_blur.h
+            src/core/video/open_vulkan_virtual_background_blur.cpp
             src/core/video/open_vulkan_vignette.h
             src/core/video/open_vulkan_vignette.cpp
     )

@@ -300,6 +300,127 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
   return ok;
 }
 
+bool TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  const std::string setup = Section(pipeline, "// Background effects.",
+                                    "// Auto Frame.");
+  const std::string live = Section(
+      pipeline,
+      "if (stage_id == studiocast::video::effects::contract::\n"
+      "                            kEffectIdVirtualBackgroundBlur ||",
+      "if (have_maxine_bg_blur)");
+  const std::string vulkan_context = Section(
+      pipeline, "struct OpenVulkanVirtualBackgroundContext",
+      "} open_vulkan_vb;");
+  const std::string resident_blur = Section(
+      vulkan_context,
+      "if (fx.virtual_background.mode == VirtualBackgroundMode::blur)",
+      "else if (fx.virtual_background.mode == VirtualBackgroundMode::remove)");
+  const std::string matting_setup =
+      Section(vulkan_context,
+              "bool EnsureInitialized(\n        int frame_w, int frame_h",
+              "bool EnsureReplaceBackgroundGpu");
+  bool ok = Require(!setup.empty() && !live.empty() &&
+                        !vulkan_context.empty() && !resident_blur.empty() &&
+                        !matting_setup.empty(),
+                    "Vulkan blur setup/live resident sections are missing");
+  ok &= Require(
+      Contains(setup, "open_vulkan_vb.EnsureInitialized") &&
+          Contains(setup,
+                   "OpenVulkanVirtualBackgroundBlurInitializationFailure") &&
+          Contains(setup, "remove_stage_from_plan(*vb_effect_id)"),
+      "blur setup must retain the stage only after shared matting/wrapper "
+      "readiness and publish a stable outer failure");
+  ok &= Require(
+      Contains(resident_blur, "blur_effect.Apply") &&
+          Contains(resident_blur, "matting_session->Readiness()") &&
+          Contains(resident_blur, "cached_frame_alpha_sequence") &&
+          Contains(resident_blur, "alpha_resize_completion_count") &&
+          !Contains(resident_blur, "BoxBlurSeparableF32_1") &&
+          !Contains(resident_blur, "BoxBlurCompositeAlphaU8x3") &&
+          !Contains(resident_blur, "Readback") &&
+          !Contains(resident_blur, "Cpu"),
+      "canonical live blur mode must route the complete resident chain only "
+      "through its effect wrapper with current matte evidence");
+  ok &= Require(
+      Contains(live, "OptionalEffectSlot::virtual_background") &&
+          Contains(live, "vulkan_vb_breaker.AllowsAttempt") &&
+          Contains(live, "block_optional_effect(") &&
+          Contains(live, "clear_optional_effect_on_success") &&
+          Contains(live, "OpenVulkanVirtualBackgroundBlurRuntimeFailure"),
+      "Vulkan blur runtime failures must use the existing bounded breaker and "
+      "stable effect reason instead of retrying every frame");
+
+  const std::string readback_allocation = Section(
+      matting_setup, "if (require_cpu_alpha_readback)",
+      "if (require_vb_buffers)");
+  ok &= Require(
+      !readback_allocation.empty() &&
+          Contains(readback_allocation, "alpha_readback") &&
+          Contains(readback_allocation, "alpha_cpu.resize") &&
+          Contains(readback_allocation,
+                   "vulkan_auto_frame_alpha_readback_setup_failed") &&
+          !Contains(readback_allocation, "LatchExternalFailure") &&
+          !Contains(readback_allocation, "matting_failure_latched = true") &&
+          Contains(pipeline, "/*require_cpu_alpha_readback=*/true") &&
+          Contains(pipeline,
+                   "Open Vulkan Auto Frame: matte alpha readback failed") &&
+          !Contains(resident_blur, "require_cpu_alpha_readback"),
+      "host alpha staging must be explicit Auto Frame-only setup and must not "
+      "poison shared matting or appear in blur");
+  const std::string resident_allocations = Section(
+      matting_setup, "if (!EnsureImage(&frame_rgb", "if (cached_bg_dst_w");
+  ok &= Require(!resident_allocations.empty() &&
+                    !Contains(resident_allocations, "LatchExternalFailure") &&
+                    !Contains(resident_allocations,
+                              "matting_failure_latched = true"),
+                "consumer/transport/scratch allocation failures must not "
+                "poison shared matting consumers");
+
+  const std::string wrapper = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_virtual_background_blur.cpp");
+  const std::string wrapper_header = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_virtual_background_blur.h");
+  ok &= Require(
+      Contains(wrapper, "VulkanMattingReadiness") &&
+          Contains(wrapper, "runtime.inference_count == 0") &&
+          Contains(wrapper, "runtime.completion_count") &&
+          Contains(wrapper, "runtime.cpu_readback_count != 0") &&
+          Contains(wrapper, "VulkanPixelFormat::rgb_u8") &&
+          Contains(wrapper, "non-mapped DEVICE_LOCAL") &&
+          Contains(wrapper, "left->buffer() == right->buffer()") &&
+          Contains(wrapper, "BoxBlurSeparableF32_1") &&
+          Contains(wrapper, "BoxBlurCompositeAlphaU8x3") &&
+          !Contains(wrapper, ".Invalidate(") &&
+          !Contains(wrapper, "ReadbackF32_1") &&
+          Contains(wrapper_header,
+                   "vulkan_virtual_background_blur_initialization_failed") &&
+          Contains(wrapper_header,
+                   "vulkan_virtual_background_blur_runtime_failed") &&
+          Contains(wrapper_header, "alpha_readback_calls = 0") &&
+          Contains(wrapper_header, "cpu_fallback_calls = 0"),
+      "blur wrapper must enforce current matting, exact RGB/device-local "
+      "scratch, alias, stable reason, and zero CPU/readback contracts");
+
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+  ok &= Require(
+      Contains(daemon, "virtual_background_blur_dispatch_calls") &&
+          Contains(daemon,
+                   "virtual_background_blur_alpha_readback_calls") &&
+          Contains(daemon, "virtual_background_blur_cpu_fallback_calls") &&
+          Contains(daemon,
+                   "virtual_background_blur_runtime_failure_frames") &&
+          Contains(daemon, "virtual_background_blur_device_loss_frames"),
+      "debug diagnostics must expose blur dispatch, zero-host-tail, runtime, "
+      "and device-loss counters");
+  return ok;
+}
+
 bool TestDefaultMattingDiagnosticsRemainFailClosed() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string diagnostics = ReadFile(root / "src" / "core" / "vulkan" /
@@ -446,6 +567,7 @@ int main() {
   ok = TestExplicitVulkanFilteringMatchesAudit() && ok;
   ok = TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
   ok = TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() && ok;
+  ok = TestVirtualBackgroundBlurUsesTheCanonicalResidentWrapper() && ok;
   ok = TestDefaultMattingDiagnosticsRemainFailClosed() && ok;
   ok = TestAutoFrameDegradedPathRemainsExplicit() && ok;
   return ok ? 0 : 1;
