@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -55,6 +56,33 @@ bool ArrayContainsString(const JsonArray *array, const std::string &needle) {
   }
   return false;
 }
+
+class ScopedEnvironmentVariable {
+public:
+  ScopedEnvironmentVariable(const char *name, const char *value) : name_(name) {
+    if (const char *previous = std::getenv(name)) {
+      had_previous_ = true;
+      previous_ = previous;
+    }
+    setenv(name, value, 1);
+  }
+
+  ~ScopedEnvironmentVariable() {
+    if (had_previous_)
+      setenv(name_.c_str(), previous_.c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable &) = delete;
+  ScopedEnvironmentVariable &
+  operator=(const ScopedEnvironmentVariable &) = delete;
+
+private:
+  std::string name_;
+  std::string previous_;
+  bool had_previous_ = false;
+};
 
 struct ReadinessFields {
   std::string state;
@@ -596,6 +624,76 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
                 "Maxine scaler download subcounter should remain available");
 }
 
+bool TestVulkanVirtualBackgroundBlurDebugCounters() {
+  ScopedEnvironmentVariable debug("STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS",
+                                  "1");
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  auto &vk = videoStatus.pipeline.open_vulkan_transfers;
+  vk.virtual_background_blur_dispatch_calls = 11;
+  vk.virtual_background_blur_alpha_readback_calls = 13;
+  vk.virtual_background_blur_cpu_fallback_calls = 17;
+  vk.virtual_background_blur_runtime_failure_frames = 19;
+  vk.virtual_background_blur_device_loss_frames = 23;
+
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(
+          StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                       std::filesystem::path("/tmp/studiocastd-test.sock"),
+                       /*maxineJson=*/"", /*openCudaJson=*/"",
+                       /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                       /*loopbackJson=*/""),
+          &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return false;
+  }
+
+  const JsonObject *root = rootValue.AsObject();
+  if (!root)
+    return false;
+  const JsonObject *video = ObjectAt(*root, "video", "video should exist");
+  if (!video)
+    return false;
+  const JsonObject *pipeline =
+      ObjectAt(*video, "pipeline", "video.pipeline should exist");
+  if (!pipeline)
+    return false;
+  const JsonObject *debugCounters =
+      ObjectAt(*pipeline, "open_vulkan_transfers",
+               "Open Vulkan debug transfer counters should exist");
+  if (!debugCounters)
+    return false;
+
+  return Expect(JsonNumberField(*debugCounters,
+                                "virtual_background_blur_dispatch_calls",
+                                -1.0) == 11.0,
+                "blur dispatch counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_blur_alpha_readback_calls", -1.0) ==
+                    13.0,
+                "blur alpha readback counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_blur_cpu_fallback_calls", -1.0) ==
+                    17.0,
+                "blur CPU fallback counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_blur_runtime_failure_frames", -1.0) ==
+                    19.0,
+                "blur runtime failure counter should be published") &&
+         Expect(JsonNumberField(
+                    *debugCounters,
+                    "virtual_background_blur_device_loss_frames", -1.0) ==
+                    23.0,
+                "blur device loss counter should be published");
+}
+
 bool TestVideoConfigMapsComputeBackendPreference() {
   studiocast::config::DaemonConfig daemonConfig;
   daemonConfig.video_compute_backend = "cuda";
@@ -1040,6 +1138,7 @@ int main() {
   ok = TestVideoStatusReportsComputeBackend() && ok;
   ok = TestVideoComputeStatusReportsCachedCountersAndProvider() && ok;
   ok = TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() && ok;
+  ok = TestVulkanVirtualBackgroundBlurDebugCounters() && ok;
   ok = TestVideoConfigMapsComputeBackendPreference() && ok;
   ok = TestPersistentVulkanAdapterConfigAndStatus() && ok;
   ok = TestVideoStatusReportsCaptureFallbackState() && ok;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
@@ -12,6 +13,7 @@
 
 #include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_virtual_background_blur.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
@@ -458,6 +460,48 @@ bool AllocateF32(studiocast::vulkan::kernels::UtilityKernels &kernels,
                          /*map_memory=*/true, error);
 }
 
+studiocast::open_vulkan::VulkanMattingReadiness
+SyntheticProductionMattingReadiness(
+    studiocast::vulkan::kernels::UtilityKernels &kernels,
+    bool current_frame_inference) {
+  studiocast::open_vulkan::VulkanMattingReadiness readiness;
+  readiness.production_ready = true;
+  readiness.reason_code =
+      studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason;
+  auto &runtime = readiness.runtime;
+  runtime.runtime_name = "synthetic-test-seam";
+  runtime.adapter_available = true;
+  runtime.production_adapter = true;
+  runtime.runtime_created = true;
+  runtime.graph_loaded = true;
+  runtime.persistent_resources_allocated = true;
+  runtime.warmup_complete = true;
+  runtime.device_identity_matches = true;
+  runtime.input_device_resident = true;
+  runtime.alpha_device_resident = true;
+  runtime.output_device_resident = true;
+  runtime.shared_device_imported = true;
+  runtime.queue_ownership_explicit = true;
+  runtime.synchronous_completion = true;
+  runtime.bounded_reusable_allocations = true;
+  runtime.persistent_allocation_count = 2;
+  runtime.warmup_inference_count = 1;
+  runtime.inference_count = current_frame_inference ? 1 : 0;
+  runtime.completion_count = current_frame_inference ? 2 : 1;
+  runtime.active_device.ownership_domain = kernels.device();
+  runtime.active_device.logical_device =
+      reinterpret_cast<std::uintptr_t>(kernels.device()->device());
+  runtime.active_device.queue =
+      reinterpret_cast<std::uintptr_t>(kernels.device()->queue());
+  const auto identity = kernels.device()->context_identity();
+  runtime.active_device.context_id = identity.context_id;
+  runtime.active_device.context_generation = identity.generation;
+  runtime.active_device.non_cpu_device_selected = true;
+  runtime.active_device.compute_queue_available = true;
+  runtime.active_device.context_healthy = true;
+  return readiness;
+}
+
 studiocast::vulkan::VulkanDeviceCandidateInfo
 DeviceCandidate(std::uint32_t index, std::uint32_t type, int score,
                 int compute_queue, const char *name) {
@@ -757,6 +801,82 @@ int main() {
                   "mirror initialization failures need a stable reason code");
   }
   {
+    using studiocast::video::ResolveOpenVulkanVirtualBackgroundBlurParameters;
+    const auto below =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(-10);
+    const auto one = ResolveOpenVulkanVirtualBackgroundBlurParameters(1);
+    const auto default_strength =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(8);
+    const auto fifteen =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(15);
+    const auto sixteen =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(16);
+    const auto sixty_three =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(63);
+    const auto sixty_four =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(64);
+    const auto above =
+        ResolveOpenVulkanVirtualBackgroundBlurParameters(100);
+    ok &= Require(
+        below.background_radius == 1 && below.alpha_feather_radius == 0 &&
+            one.background_radius == 1 && one.alpha_feather_radius == 0 &&
+            default_strength.background_radius == 8 &&
+            default_strength.alpha_feather_radius == 0 &&
+            fifteen.background_radius == 15 &&
+            fifteen.alpha_feather_radius == 0 &&
+            sixteen.background_radius == 16 &&
+            sixteen.alpha_feather_radius == 1 &&
+            sixty_three.background_radius == 63 &&
+            sixty_three.alpha_feather_radius == 3 &&
+            sixty_four.background_radius == 64 &&
+            sixty_four.alpha_feather_radius == 4 &&
+            above.background_radius == 64 &&
+            above.alpha_feather_radius == 4,
+        "Vulkan blur strength and feather mapping must match canonical Open "
+        "CUDA endpoint/default semantics");
+
+    studiocast::video::OpenVulkanVirtualBackgroundBlur invalid_blur;
+    studiocast::open_vulkan::VulkanMattingReadiness unavailable_matting;
+    unavailable_matting.reason_code =
+        studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason;
+    unavailable_matting.blocker_code =
+        studiocast::open_vulkan::kOpenVulkanMattingAdapterUnavailableReason;
+    unavailable_matting.detail = "reviewed shared-device adapter is absent";
+    ok &= Require(
+        !invalid_blur.EnsureInitialized(nullptr, 1, 1, unavailable_matting,
+                                        &error) &&
+            error.find(
+                "vulkan_virtual_background_blur_initialization_failed") !=
+                std::string::npos,
+        "blur initialization failures need an effect-specific stable outer "
+        "reason");
+
+    studiocast::vulkan::OpenVulkanDiagnostics fake_hardware;
+    fake_hardware.compiled_enabled = true;
+    fake_hardware.runtime_library_found = true;
+    fake_hardware.physical_device_found = true;
+    fake_hardware.non_cpu_device_selected = true;
+    fake_hardware.compute_queue_available = true;
+    fake_hardware.logical_device_created = true;
+    fake_hardware.context_created = true;
+    fake_hardware.context_healthy = true;
+    fake_hardware.production_hardware_ready = true;
+    fake_hardware.shader_pipeline_created = true;
+    fake_hardware.ok = true;
+    const auto blocked = studiocast::video::
+        EvaluateOpenVulkanVirtualBackgroundBlurReadiness(fake_hardware,
+                                                         unavailable_matting);
+    ok &= Require(!blocked.production_ready &&
+                      blocked.reason_code ==
+                          studiocast::open_vulkan::
+                              kOpenVulkanMattingUnavailableReason &&
+                      blocked.detail.find(
+                          "open_vulkan_matting_adapter_unavailable") !=
+                          std::string::npos,
+                  "utility/synthetic-alpha evidence alone must not make blur "
+                  "available and must retain the exact matting blocker");
+  }
+  {
     studiocast::video::OpenVulkanAutoFrame invalid_auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
     ok &= Require(
@@ -953,6 +1073,268 @@ int main() {
   }
 
   {
+    using studiocast::video::OpenVulkanVirtualBackgroundBlur;
+    using studiocast::video::OpenVulkanVirtualBackgroundBlurCounters;
+    using studiocast::video::OpenVulkanVirtualBackgroundBlurInput;
+    using studiocast::video::ResolveOpenVulkanVirtualBackgroundBlurParameters;
+
+    UtilityKernels blur_kernels;
+    if (!blur_kernels.Initialize(&error))
+      return OptionalSkip("blur Vulkan context unavailable: " + error);
+    constexpr int w = 5;
+    constexpr int h = 3;
+    std::vector<std::uint8_t> foreground(
+        static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    for (std::size_t i = 0; i < foreground.size(); ++i)
+      foreground[i] = static_cast<std::uint8_t>((i * 47u + 13u) & 0xffu);
+    const std::vector<float> alpha = {
+        0.0f,  0.1f, 0.25f, 0.5f,  1.0f,  0.75f, 0.6f, 0.4f,
+        0.2f,  0.0f, 1.0f,  0.85f, 0.5f, 0.15f, 0.0f,
+    };
+
+    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    VulkanImage alpha_tmp, alpha_feathered, blur_tmp, blurred;
+    if (!AllocateU8(blur_kernels, &gpu_foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(blur_kernels, &gpu_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(blur_kernels, &alpha_upload, w, h, &error) ||
+        !resident_alpha.Allocate(blur_kernels.device(), w, h,
+                                 VulkanPixelFormat::f32_1,
+                                 /*map_memory=*/false, &error) ||
+        !alpha_tmp.Allocate(blur_kernels.device(), w, h,
+                            VulkanPixelFormat::f32_1,
+                            /*map_memory=*/false, &error) ||
+        !alpha_feathered.Allocate(blur_kernels.device(), w, h,
+                                  VulkanPixelFormat::f32_1,
+                                  /*map_memory=*/false, &error) ||
+        !blur_tmp.Allocate(blur_kernels.device(), w, h,
+                           VulkanPixelFormat::rgb_u8,
+                           /*map_memory=*/false, &error) ||
+        !blurred.Allocate(blur_kernels.device(), w, h,
+                          VulkanPixelFormat::rgb_u8,
+                          /*map_memory=*/false, &error)) {
+      return OptionalSkip("production blur resource allocation failed: " +
+                          error);
+    }
+    FillU8(gpu_foreground, foreground);
+    FillF32(alpha_upload, alpha);
+    ok &= Require(gpu_foreground.Flush(&error) && alpha_upload.Flush(&error),
+                  "production blur fixture flush failed: " + error);
+    blur_kernels.InvalidateDescriptorBindingCacheForSetup();
+    ok &= Require(blur_kernels.ResizeBilinearF32_1(alpha_upload,
+                                                   resident_alpha, &error),
+                  "production blur resident alpha setup failed: " + error);
+    ok &= Require(
+        !resident_alpha.mapped() && resident_alpha.device_local() &&
+            !alpha_tmp.mapped() && alpha_tmp.device_local() &&
+            !alpha_feathered.mapped() && alpha_feathered.device_local() &&
+            !blur_tmp.mapped() && blur_tmp.device_local() &&
+            !blurred.mapped() && blurred.device_local() &&
+            gpu_output.mapped(),
+        "production blur must keep alpha/RGB scratch non-mapped DEVICE_LOCAL "
+        "and use only the mapped final-frame output transport");
+
+    auto setup_readiness =
+        SyntheticProductionMattingReadiness(blur_kernels, false);
+    OpenVulkanVirtualBackgroundBlur blur;
+    ok &= Require(blur.EnsureInitialized(&blur_kernels, w, h, setup_readiness,
+                                         &error),
+                  "synthetic test-seam blur wrapper initialization failed: " +
+                      error);
+
+    OpenVulkanVirtualBackgroundBlurInput input;
+    input.foreground = &gpu_foreground;
+    input.alpha = &resident_alpha;
+    input.alpha_tmp = &alpha_tmp;
+    input.alpha_feathered = &alpha_feathered;
+    input.blur_tmp = &blur_tmp;
+    input.blurred = &blurred;
+    input.output = &gpu_output;
+    input.capture_sequence = 91;
+    input.resident_alpha_sequence = 91;
+    input.alpha_resize_completion_count = 1;
+    input.matting_readiness = &setup_readiness;
+
+    OpenVulkanVirtualBackgroundBlurCounters missing_frame_evidence;
+    input.strength = 8;
+    ok &= Require(
+        !blur.Apply(input, &missing_frame_evidence, &error) &&
+            error.find("vulkan_virtual_background_blur_runtime_failed") !=
+                std::string::npos &&
+            error.find("current-frame resident alpha") != std::string::npos &&
+            missing_frame_evidence.blur_composite_dispatch_calls == 0,
+        "warmup/synthetic kernel availability must not replace current-frame "
+        "matting inference evidence");
+
+    auto current_readiness =
+        SyntheticProductionMattingReadiness(blur_kernels, true);
+    input.matting_readiness = &current_readiness;
+    OpenVulkanVirtualBackgroundBlurCounters counters;
+    const auto allocations_before =
+        blur_kernels.device()->allocation_stats().allocation_count;
+    const auto submissions_before =
+        blur_kernels.synchronous_submission_count();
+    const int strengths[] = {1, 8, 16, 64};
+    std::uint64_t expected_feather_dispatches = 0;
+    for (int strength : strengths) {
+      input.strength = strength;
+      const auto parameters =
+          ResolveOpenVulkanVirtualBackgroundBlurParameters(strength);
+      ok &= Require(blur.Apply(input, &counters, &error),
+                    "production blur wrapper dispatch failed at strength " +
+                        std::to_string(strength) + ": " + error);
+      ok &= Require(gpu_output.Invalidate(&error),
+                    "production blur final transport invalidate failed: " +
+                        error);
+      std::vector<float> alpha_reference = alpha;
+      if (parameters.alpha_feather_radius > 0) {
+        alpha_reference = BlurF32Reference(
+            alpha, w, h, parameters.alpha_feather_radius);
+        ++expected_feather_dispatches;
+      }
+      ok &= CompareU8(
+          ReadU8(gpu_output),
+          CompositeReference(
+              foreground,
+              BlurU8Reference(foreground, w, h,
+                              parameters.background_radius),
+              alpha_reference),
+          "production Vulkan virtual background blur strength " +
+              std::to_string(strength));
+    }
+    ok &= Require(
+        counters.blur_composite_dispatch_calls == std::size(strengths) &&
+            counters.alpha_feather_dispatch_calls ==
+                expected_feather_dispatches &&
+            counters.runtime_failure_frames == 0 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0 &&
+            blur_kernels.synchronous_submission_count() ==
+                submissions_before + std::size(strengths) +
+                                         expected_feather_dispatches &&
+            blur_kernels.device()->allocation_stats().allocation_count ==
+                allocations_before,
+        "repeated production blur must reuse bounded resources, account only "
+        "successful submissions, and prove zero alpha readback/CPU fallback");
+
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error))
+      return OptionalSkip("foreign blur Vulkan context unavailable: " + error);
+    VulkanImage foreign_output;
+    if (!AllocateU8(foreign_kernels, &foreign_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("foreign blur output allocation failed: " + error);
+    }
+    const auto submissions_before_foreign =
+        blur_kernels.synchronous_submission_count();
+    input.output = &foreign_output;
+    input.strength = 8;
+    OpenVulkanVirtualBackgroundBlurCounters foreign_counters;
+    ok &= Require(
+        !blur.Apply(input, &foreign_counters, &error) &&
+            error.find("vulkan_virtual_background_blur_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_foreign_context]") != std::string::npos &&
+            foreign_counters.blur_composite_dispatch_calls == 0 &&
+            blur_kernels.synchronous_submission_count() ==
+                submissions_before_foreign,
+        "blur must reject foreign output before dispatch with nested stable "
+        "effect/context reasons");
+    foreign_kernels.Shutdown();
+    const auto submissions_before_stale =
+        blur_kernels.synchronous_submission_count();
+    ok &= Require(
+        !blur.Apply(input, &foreign_counters, &error) &&
+            error.find("vulkan_virtual_background_blur_runtime_failed") !=
+                std::string::npos &&
+            foreign_counters.blur_composite_dispatch_calls == 0 &&
+            blur_kernels.synchronous_submission_count() ==
+                submissions_before_stale,
+        "blur must reject a stale foreign output without a driver "
+        "submission");
+  }
+
+  {
+    using studiocast::video::OpenVulkanVirtualBackgroundBlur;
+    using studiocast::video::OpenVulkanVirtualBackgroundBlurCounters;
+    using studiocast::video::OpenVulkanVirtualBackgroundBlurInput;
+
+    UtilityKernels lost_blur_kernels;
+    if (!lost_blur_kernels.Initialize(&error))
+      return OptionalSkip("blur device-loss context unavailable: " + error);
+    constexpr int w = 2;
+    constexpr int h = 2;
+    VulkanImage foreground, output, alpha_upload, alpha, alpha_tmp;
+    VulkanImage alpha_feathered, blur_tmp, blurred;
+    if (!AllocateU8(lost_blur_kernels, &foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_blur_kernels, &output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(lost_blur_kernels, &alpha_upload, w, h, &error) ||
+        !alpha.Allocate(lost_blur_kernels.device(), w, h,
+                        VulkanPixelFormat::f32_1, false, &error) ||
+        !alpha_tmp.Allocate(lost_blur_kernels.device(), w, h,
+                            VulkanPixelFormat::f32_1, false, &error) ||
+        !alpha_feathered.Allocate(lost_blur_kernels.device(), w, h,
+                                  VulkanPixelFormat::f32_1, false, &error) ||
+        !blur_tmp.Allocate(lost_blur_kernels.device(), w, h,
+                           VulkanPixelFormat::rgb_u8, false, &error) ||
+        !blurred.Allocate(lost_blur_kernels.device(), w, h,
+                          VulkanPixelFormat::rgb_u8, false, &error)) {
+      return OptionalSkip("blur device-loss allocation failed: " + error);
+    }
+    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
+    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+        !lost_blur_kernels.ResizeBilinearF32_1(alpha_upload, alpha, &error)) {
+      return OptionalSkip("blur device-loss fixture setup failed: " + error);
+    }
+    auto readiness =
+        SyntheticProductionMattingReadiness(lost_blur_kernels, true);
+    OpenVulkanVirtualBackgroundBlur blur;
+    ok &= Require(blur.EnsureInitialized(&lost_blur_kernels, w, h, readiness,
+                                         &error),
+                  "blur device-loss wrapper initialization failed: " + error);
+    OpenVulkanVirtualBackgroundBlurInput input;
+    input.foreground = &foreground;
+    input.alpha = &alpha;
+    input.alpha_tmp = &alpha_tmp;
+    input.alpha_feathered = &alpha_feathered;
+    input.blur_tmp = &blur_tmp;
+    input.blurred = &blurred;
+    input.output = &output;
+    input.strength = 1;
+    input.capture_sequence = 7;
+    input.resident_alpha_sequence = 7;
+    input.alpha_resize_completion_count = 1;
+    input.matting_readiness = &readiness;
+    lost_blur_kernels.device()->InjectNextSubmissionResultForTesting(
+        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
+        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
+    OpenVulkanVirtualBackgroundBlurCounters counters;
+    ok &= Require(
+        !blur.Apply(input, &counters, &error) &&
+            error.find("vulkan_virtual_background_blur_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.blur_composite_dispatch_calls == 0 &&
+            counters.runtime_failure_frames == 1 &&
+            counters.device_loss_frames == 1 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0,
+        "blur device loss must retain nested reasons, count only successful "
+        "dispatches, and never substitute CPU/readback work");
+    const auto submitted_after_loss =
+        lost_blur_kernels.device()->health().submitted_serial;
+    ok &= Require(
+        !blur.Apply(input, &counters, &error) &&
+            lost_blur_kernels.device()->health().submitted_serial ==
+                submitted_after_loss,
+        "poisoned blur context must reject without another driver submission");
+  }
+
+  {
     using studiocast::video::OpenVulkanMirror;
     using studiocast::video::OpenVulkanMirrorCounters;
     using studiocast::video::OpenVulkanMirrorFinalStageInput;
@@ -971,6 +1353,10 @@ int main() {
     };
 
     for (const auto &tc : cases) {
+      // Each case destroys its images at the end of the iteration. Prevent a
+      // recycled raw VkBuffer handle from making the utility descriptor cache
+      // look current when the next fixture allocates replacement images.
+      kernels.InvalidateDescriptorBindingCacheForSetup();
       std::vector<std::uint8_t> source(static_cast<std::size_t>(tc.width) *
                                        static_cast<std::size_t>(tc.height) *
                                        3u);
