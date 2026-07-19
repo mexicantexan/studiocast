@@ -2014,6 +2014,26 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.open_vulkan_transfers
                .virtual_background_blur_device_loss_frames
         << ",";
+    oss << "\"virtual_background_remove_dispatch_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_remove_dispatch_calls
+        << ",";
+    oss << "\"virtual_background_remove_alpha_readback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_remove_alpha_readback_calls
+        << ",";
+    oss << "\"virtual_background_remove_cpu_fallback_calls\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_remove_cpu_fallback_calls
+        << ",";
+    oss << "\"virtual_background_remove_runtime_failure_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_remove_runtime_failure_frames
+        << ",";
+    oss << "\"virtual_background_remove_device_loss_frames\":"
+        << st.pipeline.open_vulkan_transfers
+               .virtual_background_remove_device_loss_frames
+        << ",";
     oss << "\"background_upload_calls\":"
         << st.pipeline.open_vulkan_transfers.background_upload_calls << ",";
     oss << "\"composite_dispatch_calls\":"

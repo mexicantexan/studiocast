@@ -14,6 +14,7 @@
 #include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
+#include "core/video/open_vulkan_virtual_background_remove.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/vulkan_image.h"
@@ -877,6 +878,81 @@ int main() {
                   "available and must retain the exact matting blocker");
   }
   {
+    using studiocast::video::
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters;
+    const auto below =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(-10, "#12aBcD");
+    const auto fifteen =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(15, "0X112233");
+    const auto sixteen =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(16, "a1B2c3");
+    const auto sixty_four =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(64, "#ffffff");
+    const auto above =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(100, "0x010203");
+    const auto malformed =
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters(8, "#xyzxyz");
+    ok &= Require(
+        below.alpha_feather_radius == 0 && below.background_r == 0x12 &&
+            below.background_g == 0xab && below.background_b == 0xcd &&
+            fifteen.alpha_feather_radius == 0 &&
+            fifteen.background_r == 0x11 && fifteen.background_g == 0x22 &&
+            fifteen.background_b == 0x33 &&
+            sixteen.alpha_feather_radius == 1 &&
+            sixteen.background_r == 0xa1 && sixteen.background_g == 0xb2 &&
+            sixteen.background_b == 0xc3 &&
+            sixty_four.alpha_feather_radius == 4 &&
+            above.alpha_feather_radius == 4 && above.background_r == 1 &&
+            above.background_g == 2 && above.background_b == 3 &&
+            malformed.background_r == 0 && malformed.background_g == 0 &&
+            malformed.background_b == 0,
+        "Vulkan remove must preserve strength-as-feather-only endpoints, "
+        "compatible hex forms, semantic RGB order, and invalid-color black "
+        "fallback");
+
+    studiocast::video::OpenVulkanVirtualBackgroundRemove invalid_remove;
+    studiocast::open_vulkan::VulkanMattingReadiness unavailable_matting;
+    unavailable_matting.reason_code =
+        studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason;
+    unavailable_matting.blocker_code =
+        studiocast::open_vulkan::kOpenVulkanMattingAdapterUnavailableReason;
+    unavailable_matting.detail = "reviewed shared-device adapter is absent";
+    ok &= Require(
+        !invalid_remove.EnsureInitialized(nullptr, 1, 1, 8, "#000000",
+                                          unavailable_matting, &error) &&
+            error.find(
+                "vulkan_virtual_background_remove_initialization_failed") !=
+                std::string::npos,
+        "remove initialization failures need an effect-specific stable outer "
+        "reason");
+
+    studiocast::vulkan::OpenVulkanDiagnostics fake_hardware;
+    fake_hardware.compiled_enabled = true;
+    fake_hardware.runtime_library_found = true;
+    fake_hardware.physical_device_found = true;
+    fake_hardware.non_cpu_device_selected = true;
+    fake_hardware.compute_queue_available = true;
+    fake_hardware.logical_device_created = true;
+    fake_hardware.context_created = true;
+    fake_hardware.context_healthy = true;
+    fake_hardware.production_hardware_ready = true;
+    fake_hardware.shader_pipeline_created = true;
+    fake_hardware.ok = true;
+    const auto blocked = studiocast::video::
+        EvaluateOpenVulkanVirtualBackgroundRemoveReadiness(fake_hardware,
+                                                           unavailable_matting);
+    ok &= Require(!blocked.production_ready &&
+                      blocked.reason_code ==
+                          studiocast::open_vulkan::
+                              kOpenVulkanMattingUnavailableReason &&
+                      blocked.detail.find(
+                          "open_vulkan_matting_adapter_unavailable") !=
+                          std::string::npos,
+                  "utility/synthetic-alpha evidence alone must not make "
+                  "remove available and must retain the exact matting "
+                  "blocker");
+  }
+  {
     studiocast::video::OpenVulkanAutoFrame invalid_auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
     ok &= Require(
@@ -1252,6 +1328,267 @@ int main() {
             blur_kernels.synchronous_submission_count() ==
                 submissions_before_stale,
         "blur must reject a stale foreign output without a driver "
+        "submission");
+  }
+
+  {
+    using studiocast::video::OpenVulkanVirtualBackgroundRemove;
+    using studiocast::video::OpenVulkanVirtualBackgroundRemoveCounters;
+    using studiocast::video::OpenVulkanVirtualBackgroundRemoveInput;
+    using studiocast::video::
+        ResolveOpenVulkanVirtualBackgroundRemoveParameters;
+
+    UtilityKernels remove_kernels;
+    if (!remove_kernels.Initialize(&error))
+      return OptionalSkip("remove Vulkan context unavailable: " + error);
+    constexpr int w = 5;
+    constexpr int h = 3;
+    std::vector<std::uint8_t> foreground(
+        static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    for (std::size_t i = 0; i < foreground.size(); ++i)
+      foreground[i] = static_cast<std::uint8_t>((i * 29u + 7u) & 0xffu);
+    // A binary-exact constant matte keeps the wrapper's byte parity assertion
+    // exact across vendors while still exercising both feather dispatches.
+    // Spatial f32 blur behavior is covered independently below.
+    const std::vector<float> alpha(static_cast<std::size_t>(w) *
+                                       static_cast<std::size_t>(h),
+                                   0.5f);
+
+    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    VulkanImage alpha_tmp, alpha_feathered;
+    if (!AllocateU8(remove_kernels, &gpu_foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(remove_kernels, &gpu_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(remove_kernels, &alpha_upload, w, h, &error) ||
+        !resident_alpha.Allocate(remove_kernels.device(), w, h,
+                                 VulkanPixelFormat::f32_1,
+                                 /*map_memory=*/false, &error) ||
+        !alpha_tmp.Allocate(remove_kernels.device(), w, h,
+                            VulkanPixelFormat::f32_1,
+                            /*map_memory=*/false, &error) ||
+        !alpha_feathered.Allocate(remove_kernels.device(), w, h,
+                                  VulkanPixelFormat::f32_1,
+                                  /*map_memory=*/false, &error)) {
+      return OptionalSkip("production remove resource allocation failed: " +
+                          error);
+    }
+    FillU8(gpu_foreground, foreground);
+    FillF32(alpha_upload, alpha);
+    ok &= Require(gpu_foreground.Flush(&error) && alpha_upload.Flush(&error),
+                  "production remove fixture flush failed: " + error);
+    remove_kernels.InvalidateDescriptorBindingCacheForSetup();
+    ok &= Require(remove_kernels.ResizeBilinearF32_1(
+                      alpha_upload, resident_alpha, &error),
+                  "production remove resident alpha setup failed: " + error);
+    ok &= Require(
+        !resident_alpha.mapped() && resident_alpha.device_local() &&
+            !alpha_tmp.mapped() && alpha_tmp.device_local() &&
+            !alpha_feathered.mapped() && alpha_feathered.device_local() &&
+            gpu_output.mapped(),
+        "production remove must keep alpha scratch non-mapped DEVICE_LOCAL "
+        "and use only the mapped final-frame output transport");
+
+    auto setup_readiness =
+        SyntheticProductionMattingReadiness(remove_kernels, false);
+    OpenVulkanVirtualBackgroundRemove remove;
+    ok &= Require(remove.EnsureInitialized(
+                      &remove_kernels, w, h, 8, "#123456", setup_readiness,
+                      &error),
+                  "synthetic test-seam remove wrapper initialization failed: " +
+                      error);
+
+    OpenVulkanVirtualBackgroundRemoveInput input;
+    input.foreground = &gpu_foreground;
+    input.alpha = &resident_alpha;
+    input.alpha_tmp = &alpha_tmp;
+    input.alpha_feathered = &alpha_feathered;
+    input.output = &gpu_output;
+    input.capture_sequence = 101;
+    input.resident_alpha_sequence = 101;
+    input.alpha_resize_completion_count = 1;
+    input.matting_readiness = &setup_readiness;
+
+    OpenVulkanVirtualBackgroundRemoveCounters missing_frame_evidence;
+    ok &= Require(
+        !remove.Apply(input, &missing_frame_evidence, &error) &&
+            error.find("vulkan_virtual_background_remove_runtime_failed") !=
+                std::string::npos &&
+            error.find("current-frame resident alpha") != std::string::npos &&
+            missing_frame_evidence.solid_composite_dispatch_calls == 0,
+        "warmup/synthetic kernel availability must not replace current-frame "
+        "remove matting inference evidence");
+
+    auto current_readiness =
+        SyntheticProductionMattingReadiness(remove_kernels, true);
+    input.matting_readiness = &current_readiness;
+    OpenVulkanVirtualBackgroundRemoveCounters counters;
+    const auto allocations_before =
+        remove_kernels.device()->allocation_stats().allocation_count;
+    const auto submissions_before =
+        remove_kernels.synchronous_submission_count();
+    const struct RemoveCase {
+      int strength;
+      const char *remove_color;
+      std::array<std::uint8_t, 3> rgb;
+    } cases[] = {
+        {1, "#123456", {0x12, 0x34, 0x56}},
+        {8, "0xABCDEF", {0xab, 0xcd, 0xef}},
+        {16, "010203", {1, 2, 3}},
+        {64, "invalid", {0, 0, 0}},
+    };
+    std::uint64_t expected_feather_dispatches = 0;
+    for (const auto &tc : cases) {
+      ok &= Require(remove.EnsureInitialized(
+                        &remove_kernels, w, h, tc.strength, tc.remove_color,
+                        current_readiness, &error),
+                    "production remove reconfiguration failed: " + error);
+      const auto parameters =
+          ResolveOpenVulkanVirtualBackgroundRemoveParameters(
+              tc.strength, tc.remove_color);
+      ok &= Require(remove.Apply(input, &counters, &error),
+                    "production remove wrapper dispatch failed at strength " +
+                        std::to_string(tc.strength) + ": " + error);
+      ok &= Require(gpu_output.Invalidate(&error),
+                    "production remove final transport invalidate failed: " +
+                        error);
+      std::vector<float> alpha_reference = alpha;
+      if (parameters.alpha_feather_radius > 0) {
+        alpha_reference = BlurF32Reference(
+            alpha, w, h, parameters.alpha_feather_radius);
+        ++expected_feather_dispatches;
+      }
+      ok &= CompareU8Exact(
+          ReadU8(gpu_output),
+          CompositeSolidReference(foreground, alpha_reference, tc.rgb),
+          "production Vulkan virtual background remove strength/color parity " +
+              std::to_string(tc.strength));
+    }
+    ok &= Require(
+        counters.solid_composite_dispatch_calls == std::size(cases) &&
+            counters.alpha_feather_dispatch_calls ==
+                expected_feather_dispatches &&
+            counters.runtime_failure_frames == 0 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0 &&
+            remove_kernels.synchronous_submission_count() ==
+                submissions_before + std::size(cases) +
+                                         expected_feather_dispatches &&
+            remove_kernels.device()->allocation_stats().allocation_count ==
+                allocations_before,
+        "repeated production remove must reuse bounded resources, account "
+        "only successful submissions, and prove zero alpha readback/CPU "
+        "fallback");
+
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error))
+      return OptionalSkip("foreign remove Vulkan context unavailable: " +
+                          error);
+    VulkanImage foreign_output;
+    if (!AllocateU8(foreign_kernels, &foreign_output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("foreign remove output allocation failed: " + error);
+    }
+    const auto submissions_before_foreign =
+        remove_kernels.synchronous_submission_count();
+    input.output = &foreign_output;
+    OpenVulkanVirtualBackgroundRemoveCounters foreign_counters;
+    ok &= Require(
+        !remove.Apply(input, &foreign_counters, &error) &&
+            error.find("vulkan_virtual_background_remove_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_foreign_context]") != std::string::npos &&
+            foreign_counters.solid_composite_dispatch_calls == 0 &&
+            remove_kernels.synchronous_submission_count() ==
+                submissions_before_foreign,
+        "remove must reject foreign output before dispatch with nested stable "
+        "effect/context reasons");
+    foreign_kernels.Shutdown();
+    const auto submissions_before_stale =
+        remove_kernels.synchronous_submission_count();
+    ok &= Require(
+        !remove.Apply(input, &foreign_counters, &error) &&
+            error.find("vulkan_virtual_background_remove_runtime_failed") !=
+                std::string::npos &&
+            foreign_counters.solid_composite_dispatch_calls == 0 &&
+            remove_kernels.synchronous_submission_count() ==
+                submissions_before_stale,
+        "remove must reject a stale foreign output without a driver "
+        "submission");
+  }
+
+  {
+    using studiocast::video::OpenVulkanVirtualBackgroundRemove;
+    using studiocast::video::OpenVulkanVirtualBackgroundRemoveCounters;
+    using studiocast::video::OpenVulkanVirtualBackgroundRemoveInput;
+
+    UtilityKernels lost_remove_kernels;
+    if (!lost_remove_kernels.Initialize(&error))
+      return OptionalSkip("remove device-loss context unavailable: " + error);
+    constexpr int w = 2;
+    constexpr int h = 2;
+    VulkanImage foreground, output, alpha_upload, alpha, alpha_tmp;
+    VulkanImage alpha_feathered;
+    if (!AllocateU8(lost_remove_kernels, &foreground, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(lost_remove_kernels, &output, w, h,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateF32(lost_remove_kernels, &alpha_upload, w, h, &error) ||
+        !alpha.Allocate(lost_remove_kernels.device(), w, h,
+                        VulkanPixelFormat::f32_1, false, &error) ||
+        !alpha_tmp.Allocate(lost_remove_kernels.device(), w, h,
+                            VulkanPixelFormat::f32_1, false, &error) ||
+        !alpha_feathered.Allocate(lost_remove_kernels.device(), w, h,
+                                  VulkanPixelFormat::f32_1, false, &error)) {
+      return OptionalSkip("remove device-loss allocation failed: " + error);
+    }
+    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
+    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+        !lost_remove_kernels.ResizeBilinearF32_1(alpha_upload, alpha, &error)) {
+      return OptionalSkip("remove device-loss fixture setup failed: " + error);
+    }
+    auto readiness =
+        SyntheticProductionMattingReadiness(lost_remove_kernels, true);
+    OpenVulkanVirtualBackgroundRemove remove;
+    ok &= Require(remove.EnsureInitialized(
+                      &lost_remove_kernels, w, h, 1, "#102030", readiness,
+                      &error),
+                  "remove device-loss wrapper initialization failed: " +
+                      error);
+    OpenVulkanVirtualBackgroundRemoveInput input;
+    input.foreground = &foreground;
+    input.alpha = &alpha;
+    input.alpha_tmp = &alpha_tmp;
+    input.alpha_feathered = &alpha_feathered;
+    input.output = &output;
+    input.capture_sequence = 17;
+    input.resident_alpha_sequence = 17;
+    input.alpha_resize_completion_count = 1;
+    input.matting_readiness = &readiness;
+    lost_remove_kernels.device()->InjectNextSubmissionResultForTesting(
+        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
+        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
+    OpenVulkanVirtualBackgroundRemoveCounters counters;
+    ok &= Require(
+        !remove.Apply(input, &counters, &error) &&
+            error.find("vulkan_virtual_background_remove_runtime_failed") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.solid_composite_dispatch_calls == 0 &&
+            counters.runtime_failure_frames == 1 &&
+            counters.device_loss_frames == 1 &&
+            counters.alpha_readback_calls == 0 &&
+            counters.cpu_fallback_calls == 0,
+        "remove device loss must retain nested reasons, count only successful "
+        "dispatches, and never substitute CPU/readback work");
+    const auto submitted_after_loss =
+        lost_remove_kernels.device()->health().submitted_serial;
+    ok &= Require(
+        !remove.Apply(input, &counters, &error) &&
+            lost_remove_kernels.device()->health().submitted_serial ==
+                submitted_after_loss,
+        "poisoned remove context must reject without another driver "
         "submission");
   }
 
