@@ -472,6 +472,8 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
             src/core/vulkan/kernels/shaders/utility_kernels_spv.h
             src/core/video/open_vulkan_mirror.h
             src/core/video/open_vulkan_mirror.cpp
+            src/core/video/open_vulkan_final_resident_stage.h
+            src/core/video/open_vulkan_final_resident_stage.cpp
             src/core/video/open_vulkan_auto_frame.h
             src/core/video/open_vulkan_auto_frame.cpp
             src/core/video/open_vulkan_virtual_background_blur.h
@@ -1468,6 +1470,31 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-kernel-tests
                 COMMAND studiocast-vulkan-kernel-tests)
+
+        add_executable(studiocast-vulkan-final-stage-integration-tests
+                tests/vulkan_final_resident_stage_integration_tests.cpp
+        )
+
+        target_link_libraries(studiocast-vulkan-final-stage-integration-tests PRIVATE
+                studiocast_core
+        )
+
+        target_include_directories(studiocast-vulkan-final-stage-integration-tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${STUDIOCAST_GENERATED_DIR}"
+        )
+
+        studiocast_set_project_warnings(studiocast-vulkan-final-stage-integration-tests)
+        studiocast_enable_sanitizers(studiocast-vulkan-final-stage-integration-tests)
+
+        set_target_properties(studiocast-vulkan-final-stage-integration-tests PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF
+        )
+
+        add_test(NAME studiocast-vulkan-final-stage-integration-tests
+                COMMAND studiocast-vulkan-final-stage-integration-tests)
 
         add_executable(studiocast-vulkan-matting-runtime-tests
                 tests/vulkan_matting_runtime_tests.cpp

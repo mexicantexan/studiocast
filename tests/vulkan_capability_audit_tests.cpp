@@ -454,18 +454,20 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string pipeline =
       ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
-  const std::size_t input =
-      pipeline.find("OpenVulkanVignetteFinalStageInput vignette_input");
-  const std::size_t resize_binding =
-      pipeline.find("vignette_input.resize_scratch", input);
-  const std::size_t output_binding =
-      pipeline.find("vignette_input.dst", resize_binding);
-  const std::size_t mirror_binding =
-      pipeline.find("vignette_input.mirrored_dst", output_binding);
+  const std::string orchestration = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_final_resident_stage.cpp");
+  const std::string executable_test = ReadFile(
+      root / "tests" / "vulkan_final_resident_stage_integration_tests.cpp");
+  const std::string cmake = ReadFile(root / "CMakeLists.txt");
+  const std::size_t input = pipeline.find(
+      "OpenVulkanFinalResidentStageInput final_input");
+  const std::size_t vignette_request = pipeline.find(
+      "final_input.request_fixed_center_vignette", input);
   const std::size_t ordering_boundary = pipeline.find(
-      "vignette_input.preceding_effects_complete = true", mirror_binding);
-  const std::size_t apply =
-      pipeline.find("open_vulkan_vignette.ApplyFinal", ordering_boundary);
+      "final_input.preceding_effects_complete = true", vignette_request);
+  const std::size_t apply = pipeline.find(
+      "ExecuteOpenVulkanFinalResidentStage(", ordering_boundary);
   const std::size_t download =
       pipeline.find("DownloadImageToRgb(*download_img", apply);
   const std::size_t auto_frame_setup = pipeline.find("// Auto Frame.");
@@ -478,9 +480,7 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
   const std::size_t compatibility_status_publish =
       pipeline.find("append_rule_notes();", compatibility_call);
   bool ok = Require(
-      input != std::string::npos && resize_binding != std::string::npos &&
-          output_binding != std::string::npos &&
-          mirror_binding != std::string::npos &&
+      input != std::string::npos && vignette_request != std::string::npos &&
           ordering_boundary != std::string::npos &&
           apply != std::string::npos && download != std::string::npos &&
           auto_frame_setup != std::string::npos &&
@@ -490,9 +490,8 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
           compatibility_status_publish != std::string::npos,
       "vignette live final-output helper call is incomplete");
   ok &= Require(
-      input < resize_binding && resize_binding < output_binding &&
-          output_binding < mirror_binding &&
-          mirror_binding < ordering_boundary && ordering_boundary < apply &&
+      input < vignette_request && vignette_request < ordering_boundary &&
+          ordering_boundary < apply &&
           apply < download && auto_frame_setup < auto_frame_resolution &&
           auto_frame_resolution < compatibility_call &&
           compatibility_call < vignette_setup &&
@@ -500,6 +499,18 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
       "live path must batch output resize, vignette, optional mirror, "
       "then perform the final readback, with compatibility evaluated "
       "after Auto Frame setup and its stable block published to status");
+  ok &= Require(
+      Contains(orchestration, "OpenVulkanVignetteFinalStageInput stage") &&
+          Contains(orchestration, "stage.resize_scratch") &&
+          Contains(orchestration, "stage.mirrored_dst") &&
+          Contains(orchestration, "resources.vignette->ApplyFinal") &&
+          Contains(executable_test, "RunProductionCases") &&
+          Contains(executable_test, "RunOrderingAndIsolationCases") &&
+          Contains(executable_test, "STUDIOCAST_REQUIRE_VULKAN_RUNTIME") &&
+          Contains(cmake,
+                   "studiocast-vulkan-final-stage-integration-tests"),
+      "vignette production evidence requires the executable test of the exact "
+      "CameraPipeline final resident helper");
   ok &= Require(
       Contains(pipeline, "have_open_vulkan_vignette") &&
           Contains(pipeline,
@@ -567,38 +578,48 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
   const std::string pipeline =
       ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
-  const std::size_t combined_input =
-      pipeline.find("OpenVulkanMirrorResizeFinalStageInput mirror_input");
+  const std::string orchestration = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_final_resident_stage.cpp");
+  const std::string executable_test = ReadFile(
+      root / "tests" / "vulkan_final_resident_stage_integration_tests.cpp");
+  const std::string cmake = ReadFile(root / "CMakeLists.txt");
+  const std::size_t combined_input = pipeline.find(
+      "OpenVulkanFinalResidentStageInput final_input");
   const std::size_t analysis_boundary = pipeline.find(
-      "mirror_input.unmirrored_analysis_complete = true", combined_input);
-  const std::size_t combined_apply =
-      pipeline.find("open_vulkan_mirror.ApplyResizeFinal", analysis_boundary);
-  const std::size_t geometry_boundary = pipeline.find(
-      "mirror_input.output_geometry_ready = true", combined_apply);
-  const std::size_t apply =
-      pipeline.find("open_vulkan_mirror.ApplyFinal", geometry_boundary);
+      "final_input.unmirrored_analysis_complete = true", combined_input);
+  const std::size_t apply = pipeline.find(
+      "ExecuteOpenVulkanFinalResidentStage(", analysis_boundary);
   const std::size_t download =
       pipeline.find("DownloadImageToRgb(*download_img", apply);
   bool ok =
       Require(combined_input != std::string::npos &&
                   analysis_boundary != std::string::npos &&
-                  combined_apply != std::string::npos &&
-                  geometry_boundary != std::string::npos &&
                   apply != std::string::npos && download != std::string::npos,
               "mirror live final-output helper call is incomplete");
   ok &= Require(combined_input < analysis_boundary &&
-                    analysis_boundary < combined_apply &&
-                    combined_apply < geometry_boundary &&
-                    geometry_boundary < apply && apply < download,
-                "live path must use the combined resize/mirror helper, retain "
-                "the same-size final helper, and mirror before readback");
+                    analysis_boundary < apply && apply < download,
+                "live path must call the canonical final resident helper and "
+                "mirror before readback");
   ok &= Require(
       Contains(pipeline, "have_open_vulkan_mirror") &&
-          Contains(pipeline, "open_vulkan_mirror.ApplyFinal") &&
-          Contains(pipeline, "open_vulkan_mirror.ApplyResizeFinal") &&
+          Contains(pipeline, "final_input.request_mirror") &&
+          Contains(pipeline, "final_result.mirror_applied") &&
           Contains(pipeline, "set_backend(stage_id, \"open_vulkan\")") &&
           Contains(pipeline, "open_vulkan_mirror_counters.dispatch_calls"),
       "mirror batching, applied-backend, or counter evidence is missing");
+  ok &= Require(
+      Contains(orchestration, "OpenVulkanMirrorResizeFinalStageInput stage") &&
+          Contains(orchestration, "OpenVulkanMirrorFinalStageInput stage") &&
+          Contains(orchestration, "resources.mirror->ApplyResizeFinal") &&
+          Contains(orchestration, "resources.mirror->ApplyFinal") &&
+          Contains(executable_test, "mirror RGB no resize") &&
+          Contains(executable_test, "mirror BGR resize") &&
+          Contains(executable_test, "STUDIOCAST_REQUIRE_VULKAN_RUNTIME") &&
+          Contains(cmake,
+                   "studiocast-vulkan-final-stage-integration-tests"),
+      "mirror production evidence requires the executable test of the exact "
+      "CameraPipeline final resident helper");
 
   const std::string helper =
       ReadFile(root / "src" / "core" / "video" / "open_vulkan_mirror.cpp");
