@@ -104,6 +104,16 @@ public:
   bool ResizeBilinearF32_1(const VulkanImage &src, const VulkanImage &dst,
                            std::string *error_out);
 
+  // Setup/reconfiguration-only RGB upload seam. Packs tightly packed RGB24
+  // into one caller-owned mapped staging image, copies it into an exact-shape
+  // non-mapped DEVICE_LOCAL image, and completes the transfer before return.
+  // Neither allocation nor filesystem/image decoding belongs here.
+  bool UploadRgb24ToDeviceLocal(const std::uint8_t *src,
+                                std::size_t src_stride,
+                                const VulkanImage &upload_staging,
+                                const VulkanImage &device_dst,
+                                std::string *error_out);
+
   // Explicit degraded CPU-tail seam. Copies a device-local, non-mapped alpha
   // image into one caller-owned reusable host-visible staging image, waits for
   // completion, invalidates the staging memory, and copies exactly

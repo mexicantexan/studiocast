@@ -474,6 +474,8 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
             src/core/video/open_vulkan_virtual_background_blur.cpp
             src/core/video/open_vulkan_virtual_background_remove.h
             src/core/video/open_vulkan_virtual_background_remove.cpp
+            src/core/video/open_vulkan_virtual_background_replace.h
+            src/core/video/open_vulkan_virtual_background_replace.cpp
             src/core/video/open_vulkan_vignette.h
             src/core/video/open_vulkan_vignette.cpp
     )

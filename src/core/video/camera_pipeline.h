@@ -264,6 +264,15 @@ struct CameraPipelineStatus {
     std::uint64_t virtual_background_remove_cpu_fallback_calls = 0;
     std::uint64_t virtual_background_remove_runtime_failure_frames = 0;
     std::uint64_t virtual_background_remove_device_loss_frames = 0;
+    std::uint64_t virtual_background_replace_asset_allocation_calls = 0;
+    std::uint64_t virtual_background_replace_asset_decode_calls = 0;
+    std::uint64_t virtual_background_replace_asset_upload_calls = 0;
+    std::uint64_t virtual_background_replace_asset_resize_dispatch_calls = 0;
+    std::uint64_t virtual_background_replace_dispatch_calls = 0;
+    std::uint64_t virtual_background_replace_alpha_readback_calls = 0;
+    std::uint64_t virtual_background_replace_cpu_fallback_calls = 0;
+    std::uint64_t virtual_background_replace_runtime_failure_frames = 0;
+    std::uint64_t virtual_background_replace_device_loss_frames = 0;
     std::uint64_t background_upload_calls = 0;
     std::uint64_t composite_dispatch_calls = 0;
     std::uint64_t key_light_dispatch_calls = 0;
