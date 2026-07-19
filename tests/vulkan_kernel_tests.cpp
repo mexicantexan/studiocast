@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/vulkan/kernels/utility_kernels.h"
@@ -46,8 +47,8 @@ float ClampAlpha(float v) {
 
 std::uint8_t BlendByte(std::uint8_t fg, std::uint8_t bg, float alpha) {
   const float a = ClampAlpha(alpha);
-  const float v = static_cast<float>(fg) * a +
-                  static_cast<float>(bg) * (1.0f - a);
+  const float v =
+      static_cast<float>(fg) * a + static_cast<float>(bg) * (1.0f - a);
   return RoundClampByte(v);
 }
 
@@ -69,29 +70,25 @@ std::size_t ChannelIndex(int x, int y, int w, int c) {
 AxisSample U8Sample(int src_len, int dst_len, int dst_i, float crop_pos,
                     float crop_len) {
   const float scale = crop_len / static_cast<float>(dst_len);
-  const float src = crop_pos + (static_cast<float>(dst_i) + 0.5f) * scale -
-                    0.5f;
+  const float src =
+      crop_pos + (static_cast<float>(dst_i) + 0.5f) * scale - 0.5f;
   const int i0 = std::clamp(static_cast<int>(src), 0, src_len - 1);
-  return {i0, std::clamp(i0 + 1, 0, src_len - 1),
-          src - static_cast<float>(i0)};
+  return {i0, std::clamp(i0 + 1, 0, src_len - 1), src - static_cast<float>(i0)};
 }
 
 AxisSample F32ReplicateSample(int src_len, int dst_len, int dst_i) {
-  const float scale =
-      static_cast<float>(src_len) / static_cast<float>(dst_len);
-  const float src = std::clamp((static_cast<float>(dst_i) + 0.5f) * scale -
-                                   0.5f,
-                               0.0f, static_cast<float>(src_len - 1));
+  const float scale = static_cast<float>(src_len) / static_cast<float>(dst_len);
+  const float src =
+      std::clamp((static_cast<float>(dst_i) + 0.5f) * scale - 0.5f, 0.0f,
+                 static_cast<float>(src_len - 1));
   const int i0 = static_cast<int>(std::floor(src));
-  return {i0, std::clamp(i0 + 1, 0, src_len - 1),
-          src - static_cast<float>(i0)};
+  return {i0, std::clamp(i0 + 1, 0, src_len - 1), src - static_cast<float>(i0)};
 }
 
-std::vector<std::uint8_t> ResizeU8Reference(const std::vector<std::uint8_t> &src,
-                                            int src_w, int src_h, int dst_w,
-                                            int dst_h, float crop_x,
-                                            float crop_y, float crop_w,
-                                            float crop_h) {
+std::vector<std::uint8_t>
+ResizeU8Reference(const std::vector<std::uint8_t> &src, int src_w, int src_h,
+                  int dst_w, int dst_h, float crop_x, float crop_y,
+                  float crop_w, float crop_h) {
   std::vector<std::uint8_t> dst(static_cast<std::size_t>(dst_w) *
                                 static_cast<std::size_t>(dst_h) * 3u);
   for (int y = 0; y < dst_h; ++y) {
@@ -102,10 +99,10 @@ std::vector<std::uint8_t> ResizeU8Reference(const std::vector<std::uint8_t> &src
         const auto at = [&](int sx, int sy) {
           return static_cast<float>(src[ChannelIndex(sx, sy, src_w, c)]);
         };
-        const float v0 = at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) -
-                                                    at(xs.i0, ys.i0));
-        const float v1 = at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) -
-                                                    at(xs.i0, ys.i1));
+        const float v0 =
+            at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) - at(xs.i0, ys.i0));
+        const float v1 =
+            at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) - at(xs.i0, ys.i1));
         dst[ChannelIndex(x, y, dst_w, c)] =
             RoundClampByte(v0 + ys.t * (v1 - v0));
       }
@@ -125,28 +122,27 @@ std::vector<float> ResizeF32Reference(const std::vector<float> &src, int src_w,
       const auto at = [&](int sx, int sy) {
         return src[PixelIndex(sx, sy, src_w)];
       };
-      const float v0 = at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) -
-                                                  at(xs.i0, ys.i0));
-      const float v1 = at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) -
-                                                  at(xs.i0, ys.i1));
+      const float v0 =
+          at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) - at(xs.i0, ys.i0));
+      const float v1 =
+          at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) - at(xs.i0, ys.i1));
       dst[PixelIndex(x, y, dst_w)] = v0 + ys.t * (v1 - v0);
     }
   }
   return dst;
 }
 
-std::vector<float> PreprocessReference(const std::vector<std::uint8_t> &src,
-                                       int src_w, int src_h, bool src_bgr,
-                                       const studiocast::vulkan::kernels::
-                                           ModelPreprocessSpec &spec) {
+std::vector<float> PreprocessReference(
+    const std::vector<std::uint8_t> &src, int src_w, int src_h, bool src_bgr,
+    const studiocast::vulkan::kernels::ModelPreprocessSpec &spec) {
   std::vector<float> out(3u * static_cast<std::size_t>(spec.dst_w) *
                          static_cast<std::size_t>(spec.dst_h));
   for (int y = 0; y < spec.dst_h; ++y) {
-    const AxisSample ys = U8Sample(src_h, spec.dst_h, y, 0.0f,
-                                  static_cast<float>(src_h));
+    const AxisSample ys =
+        U8Sample(src_h, spec.dst_h, y, 0.0f, static_cast<float>(src_h));
     for (int x = 0; x < spec.dst_w; ++x) {
-      const AxisSample xs = U8Sample(src_w, spec.dst_w, x, 0.0f,
-                                    static_cast<float>(src_w));
+      const AxisSample xs =
+          U8Sample(src_w, spec.dst_w, x, 0.0f, static_cast<float>(src_w));
       float rgb[3] = {};
       for (int semantic = 0; semantic < 3; ++semantic) {
         const int mem_c =
@@ -154,10 +150,10 @@ std::vector<float> PreprocessReference(const std::vector<std::uint8_t> &src,
         const auto at = [&](int sx, int sy) {
           return static_cast<float>(src[ChannelIndex(sx, sy, src_w, mem_c)]);
         };
-        const float v0 = at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) -
-                                                    at(xs.i0, ys.i0));
-        const float v1 = at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) -
-                                                    at(xs.i0, ys.i1));
+        const float v0 =
+            at(xs.i0, ys.i0) + xs.t * (at(xs.i1, ys.i0) - at(xs.i0, ys.i0));
+        const float v1 =
+            at(xs.i0, ys.i1) + xs.t * (at(xs.i1, ys.i1) - at(xs.i0, ys.i1));
         rgb[semantic] = (v0 + ys.t * (v1 - v0)) / 255.0f;
       }
       const float ordered[3] = {
@@ -170,9 +166,8 @@ std::vector<float> PreprocessReference(const std::vector<std::uint8_t> &src,
               : rgb[2],
       };
       const std::size_t base = PixelIndex(x, y, spec.dst_w);
-      const std::size_t hw =
-          static_cast<std::size_t>(spec.dst_w) *
-          static_cast<std::size_t>(spec.dst_h);
+      const std::size_t hw = static_cast<std::size_t>(spec.dst_w) *
+                             static_cast<std::size_t>(spec.dst_h);
       for (int c = 0; c < 3; ++c)
         out[static_cast<std::size_t>(c) * hw + base] =
             (ordered[c] - spec.mean[c]) / spec.std[c];
@@ -241,9 +236,10 @@ std::vector<float> BlurF32Reference(const std::vector<float> &src, int w, int h,
   return dst;
 }
 
-std::vector<std::uint8_t> CompositeReference(
-    const std::vector<std::uint8_t> &fg, const std::vector<std::uint8_t> &bg,
-    const std::vector<float> &alpha) {
+std::vector<std::uint8_t>
+CompositeReference(const std::vector<std::uint8_t> &fg,
+                   const std::vector<std::uint8_t> &bg,
+                   const std::vector<float> &alpha) {
   std::vector<std::uint8_t> out(fg.size());
   for (std::size_t i = 0; i < alpha.size(); ++i) {
     for (int c = 0; c < 3; ++c)
@@ -268,10 +264,11 @@ CompositeSolidReference(const std::vector<std::uint8_t> &fg,
   return out;
 }
 
-std::vector<std::uint8_t> KeyLightReference(
-    const std::vector<std::uint8_t> &src, const std::vector<float> &alpha,
-    int w, int h, float target_r, float target_g, float target_b,
-    float intensity, float direction) {
+std::vector<std::uint8_t>
+KeyLightReference(const std::vector<std::uint8_t> &src,
+                  const std::vector<float> &alpha, int w, int h, float target_r,
+                  float target_g, float target_b, float intensity,
+                  float direction) {
   std::vector<std::uint8_t> out(src.size());
   target_r = std::clamp(target_r, 0.0f, 255.0f);
   target_g = std::clamp(target_g, 0.0f, 255.0f);
@@ -332,7 +329,7 @@ void FillF32(studiocast::vulkan::VulkanImage &image,
 std::vector<float> ReadF32(studiocast::vulkan::VulkanImage &image) {
   const auto *ptr = static_cast<const float *>(image.mapped());
   return {ptr, ptr + static_cast<std::size_t>(image.width()) *
-                    static_cast<std::size_t>(image.height())};
+                         static_cast<std::size_t>(image.height())};
 }
 
 std::vector<float> ReadTensor(studiocast::vulkan::VulkanTensor &tensor) {
@@ -350,8 +347,8 @@ bool CompareU8(const std::vector<std::uint8_t> &actual,
   bool ok = true;
   ok &= Require(actual.size() == expected.size(), what + ": size mismatch");
   for (std::size_t i = 0; i < actual.size() && i < expected.size(); ++i) {
-    const int diff = std::abs(static_cast<int>(actual[i]) -
-                              static_cast<int>(expected[i]));
+    const int diff =
+        std::abs(static_cast<int>(actual[i]) - static_cast<int>(expected[i]));
     if (diff > 1) {
       std::cerr << what << ": byte mismatch at " << i << " got "
                 << static_cast<int>(actual[i]) << " expected "
@@ -460,6 +457,32 @@ bool TestVulkanDeviceSelectionPolicy() {
                     candidates[3].rejection_reason == "no_compute_queue",
                 "Vulkan candidates should diagnose missing compute queues");
 
+  std::vector<VulkanDeviceCandidateInfo> no_candidates;
+  auto failed = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &no_candidates, VulkanDeviceSelection{});
+  ok &= Require(!failed.ok &&
+                    failed.failure_reason == "vulkan_no_physical_device",
+                "empty Vulkan enumeration must retain its stable reason code");
+
+  auto no_compute_candidates =
+      std::vector<VulkanDeviceCandidateInfo>{DeviceCandidate(
+          0, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, -1, "No compute GPU")};
+  failed = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &no_compute_candidates, VulkanDeviceSelection{});
+  ok &=
+      Require(!failed.ok && failed.failure_reason == "vulkan_no_compute_queue",
+              "no-compute Vulkan selection must retain its stable reason "
+              "code");
+  VulkanDeviceSelection requested_no_compute;
+  requested_no_compute.requested_index = 0;
+  failed = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
+      &no_compute_candidates, requested_no_compute);
+  ok &= Require(
+      !failed.ok &&
+          failed.failure_reason == "vulkan_requested_device_no_compute_queue",
+      "explicit no-compute Vulkan selection must retain its stable reason "
+      "code");
+
   selection.requested_index = 0;
   selection.request = "index:0";
   selection.source = "STUDIOCAST_VULKAN_DEVICE_INDEX";
@@ -504,16 +527,15 @@ bool TestVulkanDeviceSelectionPolicy() {
       studiocast::vulkan::detail::MakeVulkanDeviceStableId(
           0x8086, 0x1234, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
           "Intel Arc Integrated");
-  ok &= Require(
-      intelStableId == "v1:8086:1234:1:intel-arc-integrated" &&
-          studiocast::vulkan::detail::IsValidVulkanDeviceStableId(
-              intelStableId),
-      "stable Vulkan identity should be deterministic and config-safe");
-  candidates = {
-      DeviceCandidate(7, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, 0,
-                      "AMD GPU"),
-      DeviceCandidate(2, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
-                      "Intel Arc Integrated")};
+  ok &=
+      Require(intelStableId == "v1:8086:1234:1:intel-arc-integrated" &&
+                  studiocast::vulkan::detail::IsValidVulkanDeviceStableId(
+                      intelStableId),
+              "stable Vulkan identity should be deterministic and config-safe");
+  candidates = {DeviceCandidate(7, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 400, 0,
+                                "AMD GPU"),
+                DeviceCandidate(2, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300,
+                                0, "Intel Arc Integrated")};
   candidates[1].vendor_id = 0x8086;
   candidates[1].device_id = 0x1234;
   selection = VulkanDeviceSelection{};
@@ -530,25 +552,22 @@ bool TestVulkanDeviceSelectionPolicy() {
   selection.requested_stable_id = "v1:1002:ffff:2:missing-amd";
   selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
       &candidates, selection);
-  ok &= Require(!selected.ok &&
-                    selected.failure_reason ==
-                        "vulkan_requested_device_not_found",
+  ok &= Require(!selected.ok && selected.failure_reason ==
+                                    "vulkan_requested_device_not_found",
                 "a missing saved Vulkan identity must fail closed");
 
-  candidates = {
-      DeviceCandidate(0, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
-                      "Identical GPU"),
-      DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
-                      "Identical GPU")};
+  candidates = {DeviceCandidate(0, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300,
+                                0, "Identical GPU"),
+                DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300,
+                                0, "Identical GPU")};
   const std::string ambiguousId =
       studiocast::vulkan::detail::MakeVulkanDeviceStableId(
           0, 0, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, "Identical GPU");
   selection.requested_stable_id = ambiguousId;
   selected = studiocast::vulkan::detail::SelectVulkanDeviceCandidate(
       &candidates, selection);
-  ok &= Require(!selected.ok &&
-                    selected.failure_reason ==
-                        "vulkan_requested_device_ambiguous",
+  ok &= Require(!selected.ok && selected.failure_reason ==
+                                    "vulkan_requested_device_ambiguous",
                 "indistinguishable saved Vulkan identities must fail closed");
 
   studiocast::vulkan::OpenVulkanDiagnostics diagnostics;
@@ -556,9 +575,8 @@ bool TestVulkanDeviceSelectionPolicy() {
   diagnostics.device_selection_request = "index:1";
   diagnostics.selected_device_index = 1;
   diagnostics.selected_device_stable_id = intelStableId;
-  diagnostics.device_candidates = {
-      DeviceCandidate(1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0,
-                      "Intel GPU")};
+  diagnostics.device_candidates = {DeviceCandidate(
+      1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0, "Intel GPU")};
   diagnostics.device_candidates[0].stable_id = intelStableId;
   diagnostics.device_candidates[0].selected = true;
   const std::string json = diagnostics.ToJson();
@@ -596,29 +614,231 @@ int main() {
                 "runtime init");
   ok &= Require(error.find("invalid Vulkan image") != std::string::npos,
                 "Vulkan invalid image error should be clear");
-  ok &= Require(studiocast::vulkan::kernels::detail::
-                    CheckBoxBlurRadiusForKernel(64, "test", &error),
-                "Vulkan box blur should accept radius 64");
-  ok &= Require(!studiocast::vulkan::kernels::detail::
-                    CheckBoxBlurRadiusForKernel(65, "test", &error),
-                "Vulkan box blur should reject radius above 64");
+  ok &=
+      Require(studiocast::vulkan::kernels::detail::CheckBoxBlurRadiusForKernel(
+                  64, "test", &error),
+              "Vulkan box blur should accept radius 64");
+  ok &=
+      Require(!studiocast::vulkan::kernels::detail::CheckBoxBlurRadiusForKernel(
+                  65, "test", &error),
+              "Vulkan box blur should reject radius above 64");
   ok &= Require(error.find("maximum supported radius 64") != std::string::npos,
                 "Vulkan radius error should name the limit");
   studiocast::vulkan::VulkanTensorSize size;
-  ok &= Require(studiocast::vulkan::CheckedNchwF32Size(1, 3, 2, 2, &size,
-                                                       &error),
-                "Vulkan tensor valid shape should pass");
+  ok &=
+      Require(studiocast::vulkan::CheckedNchwF32Size(1, 3, 2, 2, &size, &error),
+              "Vulkan tensor valid shape should pass");
   ok &= Require(size.elements == 12 && size.bytes == 12 * sizeof(float),
                 "Vulkan tensor size should be contiguous NCHW f32");
-  ok &= Require(!studiocast::vulkan::CheckedNchwF32Size(1, 0, 2, 2, &size,
-                                                        &error),
-                "Vulkan tensor invalid shape should fail");
+  ok &= Require(
+      !studiocast::vulkan::CheckedNchwF32Size(1, 0, 2, 2, &size, &error),
+      "Vulkan tensor invalid shape should fail");
   if (!ok)
     return 1;
 
   UtilityKernels kernels;
   if (!kernels.Initialize(&error))
     return OptionalSkip(error);
+
+  {
+    const auto diagnostics = kernels.Diagnostics();
+    ok &=
+        Require(diagnostics.runtime_library_found &&
+                    diagnostics.physical_device_found &&
+                    diagnostics.compute_queue_available &&
+                    diagnostics.logical_device_created &&
+                    diagnostics.context_created && diagnostics.context_healthy,
+                "Vulkan capability facts should distinguish a healthy "
+                "logical context from loader presence");
+    ok &= Require(diagnostics.production_hardware_ready ==
+                      !diagnostics.cpu_device_selected,
+                  "CPU Vulkan devices must never count as production hardware "
+                  "readiness");
+    ok &= Require(kernels.device()->context_identity().Valid(),
+                  "initialized Vulkan device should expose context/generation "
+                  "identity");
+  }
+
+  {
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error))
+      return OptionalSkip("second Vulkan context init failed: " + error);
+    VulkanImage same_src, same_dst, foreign_dst;
+    if (!AllocateU8(kernels, &same_src, 2, 2, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(kernels, &same_dst, 2, 2, VulkanPixelFormat::rgb_u8,
+                    &error) ||
+        !AllocateU8(foreign_kernels, &foreign_dst, 2, 2,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("context identity allocation failed: " + error);
+    }
+    ok &= Require(same_src.BelongsTo(*kernels.device()) &&
+                      same_dst.BelongsTo(*kernels.device()),
+                  "same-context Vulkan resources should be accepted");
+    ok &= Require(!foreign_dst.BelongsTo(*kernels.device()),
+                  "foreign Vulkan resource should carry a different context "
+                  "generation");
+    ok &=
+        Require(!kernels.ResizeBilinear(same_src, foreign_dst, &error) &&
+                    error.find("[vulkan_foreign_context]") != std::string::npos,
+                "utility descriptor binding must reject a foreign context "
+                "before dispatch");
+  }
+
+  {
+    studiocast::vulkan::VulkanCommandBatch bounded_batch;
+    ok &= Require(bounded_batch.Initialize(kernels.device(), 1, &error) &&
+                      bounded_batch.Begin(&error) &&
+                      bounded_batch.RecordStage("only_stage", &error),
+                  "fixed-capacity Vulkan batch should begin and accept its "
+                  "declared slot: " +
+                      error);
+    ok &= Require(!bounded_batch.RecordStage("overflow", &error) &&
+                      error.find("vulkan_batch_capacity_exceeded") !=
+                          std::string::npos,
+                  "Vulkan batch must enforce bounded stage/slot lifetime");
+    bool foreign_thread_accepted = true;
+    std::thread foreign_thread([&] {
+      std::string thread_error;
+      foreign_thread_accepted =
+          bounded_batch.RecordStage("foreign_thread", &thread_error);
+    });
+    foreign_thread.join();
+    ok &= Require(!foreign_thread_accepted,
+                  "Vulkan batch recording must enforce its serial owner");
+    bounded_batch.Abort();
+  }
+
+  {
+    using studiocast::vulkan::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    using studiocast::vulkan::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    using studiocast::vulkan::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    using studiocast::vulkan::VulkanBuffer;
+    using studiocast::vulkan::VulkanDevice;
+    using studiocast::vulkan::VulkanDeviceConfig;
+    using studiocast::vulkan::VulkanDeviceSelection;
+
+    VulkanDevice budget_device;
+    VulkanDeviceConfig config;
+    config.allocation_budget_bytes = 4096;
+    if (!budget_device.Initialize(VulkanDeviceSelection{}, config, &error))
+      return OptionalSkip("budgeted Vulkan context init failed: " + error);
+    const auto initial = budget_device.allocation_stats();
+    ok &=
+        Require(initial.budget_bytes > 0 && initial.budget_bytes <= 4096 &&
+                    initial.current_bytes == 0 && initial.allocation_count == 0,
+                "Vulkan context should expose its derived/explicit empty "
+                "allocation budget");
+
+    VulkanBuffer tracked;
+    ok &= Require(tracked.Allocate(&budget_device, 1024,
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   /*map_memory=*/true, &error),
+                  "tracked Vulkan allocation should fit the explicit budget: " +
+                      error);
+    const auto allocated = budget_device.allocation_stats();
+    ok &= Require(allocated.current_bytes >= 1024 &&
+                      allocated.high_water_bytes == allocated.current_bytes &&
+                      allocated.allocation_count == 1,
+                  "Vulkan allocation counters should account actual memory "
+                  "requirements");
+    tracked.Free();
+    const auto released = budget_device.allocation_stats();
+    ok &= Require(released.current_bytes == 0 &&
+                      released.high_water_bytes == allocated.high_water_bytes &&
+                      released.allocation_count == 0,
+                  "Vulkan allocation release should preserve only high-water "
+                  "history");
+
+    VulkanBuffer over_budget;
+    ok &=
+        Require(!over_budget.Allocate(&budget_device, released.budget_bytes + 1,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      /*map_memory=*/true, &error) &&
+                    error.find("vulkan_allocation_budget_exceeded") !=
+                        std::string::npos,
+                "Vulkan allocation must fail before device memory allocation "
+                "when its context budget is exceeded");
+    studiocast::vulkan::VulkanTensorSize overflow_size;
+    ok &= Require(
+        !studiocast::vulkan::CheckedNchwF32Size(
+            std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+            std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+            &overflow_size, &error) &&
+            error.find("overflow") != std::string::npos,
+        "Vulkan tensor size arithmetic must fail closed on "
+        "overflow");
+
+    VulkanBuffer retained_across_shutdown;
+    ok &= Require(retained_across_shutdown.Allocate(
+                      &budget_device, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      /*map_memory=*/true, &error),
+                  "resource lifetime test allocation should succeed: " + error);
+    const auto first_identity = budget_device.context_identity();
+    budget_device.Shutdown();
+    ok &= Require(!retained_across_shutdown.Valid(),
+                  "resource should become unusable when its facade shuts down");
+    ok &= Require(
+        budget_device.Initialize(VulkanDeviceSelection{}, config, &error),
+        "Vulkan device facade should support a new generation: " + error);
+    ok &= Require(budget_device.context_identity().context_id ==
+                          first_identity.context_id &&
+                      budget_device.context_identity().generation >
+                          first_identity.generation &&
+                      !retained_across_shutdown.BelongsTo(budget_device),
+                  "reinitialized facade must reject resources from its prior "
+                  "context generation");
+    retained_across_shutdown.Free();
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VK_TIMEOUT;
+    using studiocast::vulkan::VulkanContextHealth;
+    using studiocast::vulkan::VulkanDevice;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    VulkanDevice lost_device;
+    if (!lost_device.Initialize(&error))
+      return OptionalSkip("device-loss test context init failed: " + error);
+    const auto fake_command =
+        reinterpret_cast<studiocast::vulkan::VkCommandBuffer>(
+            std::uintptr_t{1});
+    lost_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
+                      error.find("[vulkan_device_lost]") != std::string::npos,
+                  "injected Vulkan device loss should produce a stable reason");
+    const auto lost = lost_device.health();
+    ok &= Require(lost.health == VulkanContextHealth::device_lost &&
+                      lost.poisoned && lost.reason_code == "vulkan_device_lost",
+                  "Vulkan device loss should poison and latch the context");
+    const std::uint64_t submitted_after_loss = lost.submitted_serial;
+    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
+                      lost_device.health().submitted_serial ==
+                          submitted_after_loss,
+                  "poisoned Vulkan context must reject later frames without "
+                  "retrying submission");
+
+    VulkanDevice timeout_device;
+    if (!timeout_device.Initialize(&error))
+      return OptionalSkip("timeout test context init failed: " + error);
+    timeout_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::wait_for_fence, VK_TIMEOUT);
+    ok &= Require(!timeout_device.SubmitAndWait(fake_command, &error) &&
+                      timeout_device.health().health ==
+                          VulkanContextHealth::unsafe_timeout &&
+                      timeout_device.health().reason_code ==
+                          "vulkan_submission_timeout",
+                  "unsafe Vulkan timeout should poison and latch with a stable "
+                  "reason");
+  }
 
   auto flush = [&](auto &resource) {
     if (!resource.Flush(&error)) {
@@ -636,7 +856,7 @@ int main() {
   {
     const int sw = 3, sh = 2, dw = 2, dh = 3;
     const std::vector<std::uint8_t> src = {
-        10, 20, 30, 40, 50, 60, 70, 80, 90,
+        10,  20,  30,  40,  50,  60,  70,  80,  90,
         110, 120, 130, 140, 150, 160, 170, 180, 190,
     };
     VulkanImage gpu_src, gpu_dst;
@@ -648,21 +868,20 @@ int main() {
     }
     FillU8(gpu_src, src);
     flush(gpu_src);
-    ok &= Require(kernels.CropResizeBilinear(gpu_src, gpu_dst, 0.0f, 0.0f,
-                                             3.0f, 2.0f, &error),
+    ok &= Require(kernels.CropResizeBilinear(gpu_src, gpu_dst, 0.0f, 0.0f, 3.0f,
+                                             2.0f, &error),
                   "Vulkan crop-resize should dispatch: " + error);
     invalidate(gpu_dst);
-    ok &= CompareU8(ReadU8(gpu_dst),
-                    ResizeU8Reference(src, sw, sh, dw, dh, 0.0f, 0.0f, 3.0f,
-                                      2.0f),
-                    "Vulkan crop-resize");
+    ok &= CompareU8(
+        ReadU8(gpu_dst),
+        ResizeU8Reference(src, sw, sh, dw, dh, 0.0f, 0.0f, 3.0f, 2.0f),
+        "Vulkan crop-resize");
   }
 
   {
     const int sw = 2, sh = 2;
     const std::vector<std::uint8_t> rgb = {
-        10, 20, 30, 110, 120, 130,
-        210, 220, 230, 30, 40, 50,
+        10, 20, 30, 110, 120, 130, 210, 220, 230, 30, 40, 50,
     };
     VulkanImage gpu_src;
     VulkanTensor tensor;
@@ -705,15 +924,15 @@ int main() {
     ok &= Require(kernels.ResizeBilinearF32_1(gpu_src, gpu_dst, &error),
                   "Vulkan f32 resize should dispatch: " + error);
     invalidate(gpu_dst);
-    ok &= CompareF32(ReadF32(gpu_dst),
-                     ResizeF32Reference(alpha, sw, sh, dw, dh),
-                     "Vulkan alpha resize");
+    ok &=
+        CompareF32(ReadF32(gpu_dst), ResizeF32Reference(alpha, sw, sh, dw, dh),
+                   "Vulkan alpha resize");
   }
 
   {
     const int w = 3, h = 2, radius = 1;
     const std::vector<std::uint8_t> rgb = {
-        0, 10, 20, 30, 40, 50, 60, 70, 80,
+        0,  10,  20,  30,  40,  50,  60,  70,  80,
         90, 100, 110, 120, 130, 140, 150, 160, 170,
     };
     VulkanImage src, tmp, dst;
@@ -765,6 +984,10 @@ int main() {
                       submissions_before + 1,
                   "Vulkan batched blur/composite should use one synchronous "
                   "submission");
+    ok &= Require(kernels.last_frame_batch_stage_count() == 3 &&
+                      kernels.frame_batch_completion_count() > 0,
+                  "real Vulkan frame batch should record three utility stages "
+                  "under one completion boundary");
     invalidate(gpu_out);
     ok &= CompareU8(
         ReadU8(gpu_out),
@@ -773,15 +996,18 @@ int main() {
 
     const std::uint64_t zero_radius_submissions_before =
         kernels.synchronous_submission_count();
-    ok &= Require(kernels.BoxBlurCompositeAlphaU8x3(
-                      gpu_fg, gpu_tmp, gpu_blurred, gpu_alpha, gpu_out,
-                      /*radius=*/0, &error),
-                  "Vulkan zero-radius batched blur/composite should dispatch: " +
-                      error);
+    ok &= Require(
+        kernels.BoxBlurCompositeAlphaU8x3(gpu_fg, gpu_tmp, gpu_blurred,
+                                          gpu_alpha, gpu_out,
+                                          /*radius=*/0, &error),
+        "Vulkan zero-radius batched blur/composite should dispatch: " + error);
     ok &= Require(kernels.synchronous_submission_count() ==
                       zero_radius_submissions_before + 1,
                   "Vulkan zero-radius batched blur/composite should use one "
                   "synchronous submission");
+    ok &= Require(kernels.last_frame_batch_stage_count() == 2,
+                  "zero-radius real Vulkan batch should record copy and "
+                  "composite stages");
     invalidate(gpu_out);
     ok &= CompareU8(ReadU8(gpu_out), fg,
                     "Vulkan zero-radius batched blur/composite");
@@ -808,15 +1034,13 @@ int main() {
   {
     const int w = 2, h = 2;
     const std::vector<std::uint8_t> fg = {
-        10, 20, 30, 100, 110, 120,
-        200, 210, 220, 250, 5, 15,
+        10, 20, 30, 100, 110, 120, 200, 210, 220, 250, 5, 15,
     };
     const std::vector<std::uint8_t> bg = {
-        1, 2, 3, 50, 60, 70,
-        80, 90, 100, 200, 210, 220,
+        1, 2, 3, 50, 60, 70, 80, 90, 100, 200, 210, 220,
     };
-    const std::vector<float> alpha = {
-        0.0f, 0.5f, 1.0f, std::numeric_limits<float>::quiet_NaN()};
+    const std::vector<float> alpha = {0.0f, 0.5f, 1.0f,
+                                      std::numeric_limits<float>::quiet_NaN()};
     VulkanImage gpu_fg, gpu_bg, gpu_alpha, gpu_out;
     if (!AllocateU8(kernels, &gpu_fg, w, h, VulkanPixelFormat::rgb_u8,
                     &error) ||
@@ -833,9 +1057,9 @@ int main() {
     flush(gpu_fg);
     flush(gpu_bg);
     flush(gpu_alpha);
-    ok &= Require(kernels.CompositeAlphaU8x3(gpu_fg, gpu_bg, gpu_alpha,
-                                             gpu_out, &error),
-                  "Vulkan composite background should dispatch: " + error);
+    ok &= Require(
+        kernels.CompositeAlphaU8x3(gpu_fg, gpu_bg, gpu_alpha, gpu_out, &error),
+        "Vulkan composite background should dispatch: " + error);
     invalidate(gpu_out);
     ok &= CompareU8(ReadU8(gpu_out), CompositeReference(fg, bg, alpha),
                     "Vulkan composite background");
@@ -851,11 +1075,10 @@ int main() {
   {
     const int w = 4, h = 1;
     const std::vector<std::uint8_t> src = {
-        10, 20, 30, 100, 110, 120,
-        200, 210, 220, 50, 60, 70,
+        10, 20, 30, 100, 110, 120, 200, 210, 220, 50, 60, 70,
     };
-    const std::vector<float> alpha = {
-        0.0f, 0.5f, 1.0f, std::numeric_limits<float>::quiet_NaN()};
+    const std::vector<float> alpha = {0.0f, 0.5f, 1.0f,
+                                      std::numeric_limits<float>::quiet_NaN()};
     VulkanImage gpu_src, gpu_alpha, gpu_out;
     if (!AllocateU8(kernels, &gpu_src, w, h, VulkanPixelFormat::rgb_u8,
                     &error) ||
@@ -868,15 +1091,15 @@ int main() {
     FillF32(gpu_alpha, alpha);
     flush(gpu_src);
     flush(gpu_alpha);
-    ok &= Require(kernels.ApplyKeyLightU8x3(gpu_src, gpu_alpha, 255.0f,
-                                            242.0f, 228.0f, 0.5f, 1.0f,
-                                            gpu_out, &error),
-                  "Vulkan key-light should dispatch: " + error);
+    ok &=
+        Require(kernels.ApplyKeyLightU8x3(gpu_src, gpu_alpha, 255.0f, 242.0f,
+                                          228.0f, 0.5f, 1.0f, gpu_out, &error),
+                "Vulkan key-light should dispatch: " + error);
     invalidate(gpu_out);
-    ok &= CompareU8(ReadU8(gpu_out),
-                    KeyLightReference(src, alpha, w, h, 255.0f, 242.0f,
-                                      228.0f, 0.5f, 1.0f),
-                    "Vulkan key-light");
+    ok &= CompareU8(
+        ReadU8(gpu_out),
+        KeyLightReference(src, alpha, w, h, 255.0f, 242.0f, 228.0f, 0.5f, 1.0f),
+        "Vulkan key-light");
   }
 
   return ok ? 0 : 1;

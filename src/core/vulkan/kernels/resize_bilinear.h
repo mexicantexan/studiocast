@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "core/vulkan/vulkan_device.h"
@@ -14,8 +15,8 @@ namespace studiocast::vulkan::kernels {
 // The public boundary is RGB24, while the GPU image storage is pitched RGBA8 in
 // storage buffers. Pipeline/descriptors/command buffers are created for stable
 // dimensions during setup/reconfiguration; Resize() only updates mapped staging
-// memory, submits the pre-recorded command buffer, waits for final readback, and
-// unpacks RGB24.
+// memory, submits the pre-recorded command buffer, waits for final readback,
+// and unpacks RGB24.
 class ResizeBilinear {
 public:
   ResizeBilinear() = default;
@@ -65,6 +66,7 @@ private:
   bool initialized_ = false;
   bool pipeline_created_ = false;
   std::string init_error_;
+  mutable std::recursive_mutex execution_mutex_;
 };
 
 bool IsResizeBilinearAvailable(std::string *error_out);

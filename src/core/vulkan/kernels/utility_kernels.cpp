@@ -18,14 +18,6 @@ std::uint32_t CeilDiv(std::uint32_t x, std::uint32_t y) {
   return (x + y - 1u) / y;
 }
 
-bool ResultOk(VkResult result, const char *what, std::string *error_out) {
-  if (result == VK_SUCCESS)
-    return true;
-  if (error_out)
-    *error_out = std::string(what) + " failed: " + VkResultName(result);
-  return false;
-}
-
 bool IsRgbOrBgrFormat(VulkanPixelFormat format) {
   return format == VulkanPixelFormat::rgb_u8 ||
          format == VulkanPixelFormat::bgr_u8;
@@ -40,8 +32,7 @@ bool ValidateRgbOrBgrImage(const VulkanImage &image, const char *what,
   }
   if (!IsRgbOrBgrFormat(image.format())) {
     if (error_out)
-      *error_out =
-          std::string(what) + ": expected rgb_u8 or bgr_u8 image.";
+      *error_out = std::string(what) + ": expected rgb_u8 or bgr_u8 image.";
     return false;
   }
   return true;
@@ -60,6 +51,30 @@ bool ValidateF32Image(const VulkanImage &image, const char *what,
     return false;
   }
   return true;
+}
+
+bool ValidateContext(const VulkanDevice &device, const VulkanImage &image,
+                     const char *what, std::string *error_out) {
+  if (image.BelongsTo(device))
+    return true;
+  if (error_out) {
+    *error_out = std::string("[vulkan_foreign_context] ") + what +
+                 ": resource belongs to a foreign Vulkan "
+                 "context/generation.";
+  }
+  return false;
+}
+
+bool ValidateContext(const VulkanDevice &device, const VulkanTensor &tensor,
+                     const char *what, std::string *error_out) {
+  if (tensor.BelongsTo(device))
+    return true;
+  if (error_out) {
+    *error_out = std::string("[vulkan_foreign_context] ") + what +
+                 ": resource belongs to a foreign Vulkan "
+                 "context/generation.";
+  }
+  return false;
 }
 
 bool SameDimensions(const VulkanImage &a, const VulkanImage &b) {
@@ -142,6 +157,7 @@ detail::SolidBackgroundMemoryChannels(VulkanPixelFormat format,
 UtilityKernels::~UtilityKernels() { Shutdown(); }
 
 bool UtilityKernels::Initialize(std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (initialized_)
@@ -170,6 +186,13 @@ bool UtilityKernels::Initialize(std::string *error_out) {
     Shutdown();
     return false;
   }
+  if (!frame_batch_.Initialize(&device_, /*stage_capacity=*/3, &e)) {
+    init_error_ = e;
+    if (error_out)
+      *error_out = e;
+    Shutdown();
+    return false;
+  }
 
   initialized_ = true;
   init_error_.clear();
@@ -177,31 +200,34 @@ bool UtilityKernels::Initialize(std::string *error_out) {
 }
 
 void UtilityKernels::Shutdown() noexcept {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   const bool have_device = device_.Initialized();
+  const bool destroy_children = have_device && device_.SafeToDestroyResources();
   const auto &vf = device_.f();
-  if (have_device && vf.vkDeviceWaitIdle)
-    (void)vf.vkDeviceWaitIdle(device_.device());
 
-  if (have_device && command_buffer_ && vf.vkFreeCommandBuffers) {
+  frame_batch_.Shutdown();
+
+  if (destroy_children && command_buffer_ && vf.vkFreeCommandBuffers) {
     vf.vkFreeCommandBuffers(device_.device(), device_.command_pool(), 1,
                             &command_buffer_);
   }
   command_buffer_ = nullptr;
-  if (have_device && pipeline_ && vf.vkDestroyPipeline)
+  if (destroy_children && pipeline_ && vf.vkDestroyPipeline)
     vf.vkDestroyPipeline(device_.device(), pipeline_, nullptr);
   pipeline_ = nullptr;
-  if (have_device && pipeline_layout_ && vf.vkDestroyPipelineLayout)
+  if (destroy_children && pipeline_layout_ && vf.vkDestroyPipelineLayout)
     vf.vkDestroyPipelineLayout(device_.device(), pipeline_layout_, nullptr);
   pipeline_layout_ = nullptr;
-  if (have_device && shader_module_ && vf.vkDestroyShaderModule)
+  if (destroy_children && shader_module_ && vf.vkDestroyShaderModule)
     vf.vkDestroyShaderModule(device_.device(), shader_module_, nullptr);
   shader_module_ = nullptr;
-  if (have_device && descriptor_pool_ && vf.vkDestroyDescriptorPool)
+  if (destroy_children && descriptor_pool_ && vf.vkDestroyDescriptorPool)
     vf.vkDestroyDescriptorPool(device_.device(), descriptor_pool_, nullptr);
   descriptor_pool_ = nullptr;
   descriptor_set_ = nullptr;
   batch_descriptor_set_ = nullptr;
-  if (have_device && descriptor_set_layout_ && vf.vkDestroyDescriptorSetLayout)
+  if (destroy_children && descriptor_set_layout_ &&
+      vf.vkDestroyDescriptorSetLayout)
     vf.vkDestroyDescriptorSetLayout(device_.device(), descriptor_set_layout_,
                                     nullptr);
   descriptor_set_layout_ = nullptr;
@@ -218,7 +244,8 @@ void UtilityKernels::Shutdown() noexcept {
 }
 
 OpenVulkanDiagnostics UtilityKernels::Diagnostics() const {
-  OpenVulkanDiagnostics d = device_.diagnostics();
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  OpenVulkanDiagnostics d = device_.DiagnosticsSnapshot();
   d.shader_pipeline_created = pipeline_created_;
   d.ok = d.ok && pipeline_created_;
   if (!init_error_.empty() && d.error.empty())
@@ -236,7 +263,8 @@ bool UtilityKernels::EnsurePipeline(std::string *error_out) {
   shader.pCode = shaders::kUtilityKernelsSpirv;
   VkResult result = vf.vkCreateShaderModule(device_.device(), &shader, nullptr,
                                             &shader_module_);
-  if (!ResultOk(result, "vkCreateShaderModule", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateShaderModule", false,
+                                 error_out))
     return false;
 
   std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
@@ -252,7 +280,8 @@ bool UtilityKernels::EnsurePipeline(std::string *error_out) {
   layout_info.pBindings = bindings.data();
   result = vf.vkCreateDescriptorSetLayout(device_.device(), &layout_info,
                                           nullptr, &descriptor_set_layout_);
-  if (!ResultOk(result, "vkCreateDescriptorSetLayout", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateDescriptorSetLayout", false,
+                                 error_out))
     return false;
 
   VkPushConstantRange push{};
@@ -267,7 +296,8 @@ bool UtilityKernels::EnsurePipeline(std::string *error_out) {
   pipeline_layout.pPushConstantRanges = &push;
   result = vf.vkCreatePipelineLayout(device_.device(), &pipeline_layout,
                                      nullptr, &pipeline_layout_);
-  if (!ResultOk(result, "vkCreatePipelineLayout", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreatePipelineLayout", false,
+                                 error_out))
     return false;
 
   VkComputePipelineCreateInfo compute{};
@@ -278,7 +308,8 @@ bool UtilityKernels::EnsurePipeline(std::string *error_out) {
   compute.layout = pipeline_layout_;
   result = vf.vkCreateComputePipelines(device_.device(), nullptr, 1, &compute,
                                        nullptr, &pipeline_);
-  if (!ResultOk(result, "vkCreateComputePipelines", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateComputePipelines", false,
+                                 error_out))
     return false;
 
   pipeline_created_ = true;
@@ -299,7 +330,8 @@ bool UtilityKernels::EnsureDescriptors(std::string *error_out) {
   pool.pPoolSizes = &pool_size;
   VkResult result = vf.vkCreateDescriptorPool(device_.device(), &pool, nullptr,
                                               &descriptor_pool_);
-  if (!ResultOk(result, "vkCreateDescriptorPool", error_out))
+  if (!device_.CheckDriverResult(result, "vkCreateDescriptorPool", false,
+                                 error_out))
     return false;
 
   VkDescriptorSetAllocateInfo alloc{};
@@ -311,7 +343,8 @@ bool UtilityKernels::EnsureDescriptors(std::string *error_out) {
   alloc.pSetLayouts = layouts.data();
   result = vf.vkAllocateDescriptorSets(device_.device(), &alloc,
                                        descriptor_sets.data());
-  if (!ResultOk(result, "vkAllocateDescriptorSets", error_out))
+  if (!device_.CheckDriverResult(result, "vkAllocateDescriptorSets", false,
+                                 error_out))
     return false;
   descriptor_set_ = descriptor_sets[0];
   batch_descriptor_set_ = descriptor_sets[1];
@@ -334,7 +367,8 @@ bool UtilityKernels::EnsureCommandBuffer(std::string *error_out) {
   alloc.commandBufferCount = 1;
   const VkResult result = device_.f().vkAllocateCommandBuffers(
       device_.device(), &alloc, &command_buffer_);
-  return ResultOk(result, "vkAllocateCommandBuffers", error_out);
+  return device_.CheckDriverResult(result, "vkAllocateCommandBuffers", false,
+                                   error_out);
 }
 
 bool UtilityKernels::BindBuffersForSet(VkDescriptorSet descriptor_set,
@@ -418,12 +452,14 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
 
   const auto &vf = device_.f();
   VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
-  if (!ResultOk(result, "vkResetCommandBuffer", error_out))
+  if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
+                                 error_out))
     return false;
 
   VkCommandBufferBeginInfo begin{};
   result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
-  if (!ResultOk(result, "vkBeginCommandBuffer", error_out))
+  if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
+                                 error_out))
     return false;
 
   std::array<VkBufferMemoryBarrier, 4> read_barriers{};
@@ -464,8 +500,8 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
     scratch_ready.size = VK_WHOLE_SIZE;
     vf.vkCmdPipelineBarrier(command_buffer_,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                            nullptr, 1, &scratch_ready, 0, nullptr);
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                            1, &scratch_ready, 0, nullptr);
     dispatch_op(second);
   }
 
@@ -476,14 +512,13 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
     host_barriers[i].buffer = bound_buffers_[3 + i];
     host_barriers[i].size = VK_WHOLE_SIZE;
   }
-  vf.vkCmdPipelineBarrier(command_buffer_,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr,
                           static_cast<std::uint32_t>(host_barriers.size()),
                           host_barriers.data(), 0, nullptr);
 
   result = vf.vkEndCommandBuffer(command_buffer_);
-  if (!ResultOk(result, "vkEndCommandBuffer", error_out))
+  if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true, error_out))
     return false;
 
   return SubmitRecorded(error_out);
@@ -497,8 +532,8 @@ bool UtilityKernels::SubmitRecorded(std::string *error_out) {
 bool UtilityKernels::CropResizeBilinear(const VulkanImage &src,
                                         const VulkanImage &dst, float crop_x,
                                         float crop_y, float crop_w,
-                                        float crop_h,
-                                        std::string *error_out) {
+                                        float crop_h, std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(src, "CropResizeBilinear(src)", error_out) ||
@@ -518,6 +553,10 @@ bool UtilityKernels::CropResizeBilinear(const VulkanImage &src,
   }
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "CropResizeBilinear(src)", error_out) ||
+      !ValidateContext(device_, dst, "CropResizeBilinear(dst)", error_out)) {
+    return false;
+  }
 
   crop_w = std::clamp(crop_w, 1.0f, static_cast<float>(src.width()));
   crop_h = std::clamp(crop_h, 1.0f, static_cast<float>(src.height()));
@@ -554,6 +593,7 @@ bool UtilityKernels::PreprocessToTensor(const VulkanImage &src,
                                         const VulkanTensor &dst,
                                         const ModelPreprocessSpec &spec,
                                         std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(src, "PreprocessToTensor(src)", error_out))
@@ -582,6 +622,10 @@ bool UtilityKernels::PreprocessToTensor(const VulkanImage &src,
   }
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "PreprocessToTensor(src)", error_out) ||
+      !ValidateContext(device_, dst, "PreprocessToTensor(dst)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(src.width());
@@ -607,6 +651,7 @@ bool UtilityKernels::PreprocessToTensor(const VulkanImage &src,
 bool UtilityKernels::ResizeBilinearF32_1(const VulkanImage &src,
                                          const VulkanImage &dst,
                                          std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateF32Image(src, "ResizeBilinearF32_1(src)", error_out) ||
@@ -614,6 +659,10 @@ bool UtilityKernels::ResizeBilinearF32_1(const VulkanImage &src,
     return false;
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "ResizeBilinearF32_1(src)", error_out) ||
+      !ValidateContext(device_, dst, "ResizeBilinearF32_1(dst)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(src.width());
@@ -633,6 +682,7 @@ bool UtilityKernels::BoxBlurSeparableU8x3(const VulkanImage &src,
                                           const VulkanImage &tmp,
                                           const VulkanImage &dst, int radius,
                                           std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(src, "BoxBlurSeparableU8x3(src)", error_out) ||
@@ -655,6 +705,11 @@ bool UtilityKernels::BoxBlurSeparableU8x3(const VulkanImage &src,
   radius = detail::NormalizeBoxBlurRadius(radius);
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "BoxBlurSeparableU8x3(src)", error_out) ||
+      !ValidateContext(device_, tmp, "BoxBlurSeparableU8x3(tmp)", error_out) ||
+      !ValidateContext(device_, dst, "BoxBlurSeparableU8x3(dst)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(src.width());
@@ -671,14 +726,15 @@ bool UtilityKernels::BoxBlurSeparableU8x3(const VulkanImage &src,
     return false;
   if (radius == 0)
     return Dispatch(p, Op::copy_u8x3, p.dst_w, p.dst_h, error_out);
-  return DispatchTwoPass(p, Op::blur_h_u8x3, Op::blur_v_u8x3, p.dst_w,
-                         p.dst_h, error_out);
+  return DispatchTwoPass(p, Op::blur_h_u8x3, Op::blur_v_u8x3, p.dst_w, p.dst_h,
+                         error_out);
 }
 
 bool UtilityKernels::BoxBlurSeparableF32_1(const VulkanImage &src,
                                            const VulkanImage &tmp,
                                            const VulkanImage &dst, int radius,
                                            std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateF32Image(src, "BoxBlurSeparableF32_1(src)", error_out) ||
@@ -696,6 +752,11 @@ bool UtilityKernels::BoxBlurSeparableF32_1(const VulkanImage &src,
   radius = detail::NormalizeBoxBlurRadius(radius);
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "BoxBlurSeparableF32_1(src)", error_out) ||
+      !ValidateContext(device_, tmp, "BoxBlurSeparableF32_1(tmp)", error_out) ||
+      !ValidateContext(device_, dst, "BoxBlurSeparableF32_1(dst)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(src.width());
@@ -721,6 +782,7 @@ bool UtilityKernels::CompositeAlphaU8x3(const VulkanImage &fg,
                                         const VulkanImage &alpha,
                                         const VulkanImage &out,
                                         std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(fg, "CompositeAlphaU8x3(fg)", error_out) ||
@@ -741,6 +803,13 @@ bool UtilityKernels::CompositeAlphaU8x3(const VulkanImage &fg,
   }
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, fg, "CompositeAlphaU8x3(fg)", error_out) ||
+      !ValidateContext(device_, bg, "CompositeAlphaU8x3(bg)", error_out) ||
+      !ValidateContext(device_, alpha, "CompositeAlphaU8x3(alpha)",
+                       error_out) ||
+      !ValidateContext(device_, out, "CompositeAlphaU8x3(out)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(fg.width());
@@ -762,6 +831,7 @@ bool UtilityKernels::BoxBlurCompositeAlphaU8x3(
     const VulkanImage &fg, const VulkanImage &blur_tmp,
     const VulkanImage &blurred, const VulkanImage &alpha,
     const VulkanImage &out, int radius, std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(fg, "BoxBlurCompositeAlphaU8x3(fg)", error_out) ||
@@ -796,6 +866,18 @@ bool UtilityKernels::BoxBlurCompositeAlphaU8x3(
   radius = detail::NormalizeBoxBlurRadius(radius);
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, fg, "BoxBlurCompositeAlphaU8x3(fg)",
+                       error_out) ||
+      !ValidateContext(device_, blur_tmp, "BoxBlurCompositeAlphaU8x3(blur_tmp)",
+                       error_out) ||
+      !ValidateContext(device_, blurred, "BoxBlurCompositeAlphaU8x3(blurred)",
+                       error_out) ||
+      !ValidateContext(device_, alpha, "BoxBlurCompositeAlphaU8x3(alpha)",
+                       error_out) ||
+      !ValidateContext(device_, out, "BoxBlurCompositeAlphaU8x3(out)",
+                       error_out)) {
+    return false;
+  }
 
   Params blur_params{};
   blur_params.src_w = static_cast<std::uint32_t>(fg.width());
@@ -834,95 +916,96 @@ bool UtilityKernels::BoxBlurCompositeAlphaU8x3(
     return false;
   }
 
+  if (!frame_batch_.Begin(error_out))
+    return false;
+  VkCommandBuffer batch_command = frame_batch_.command_buffer();
+  const auto fail_batch = [&]() {
+    frame_batch_.Abort();
+    return false;
+  };
   const auto &vf = device_.f();
-  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
-  if (!ResultOk(result, "vkResetCommandBuffer", error_out))
-    return false;
-  VkCommandBufferBeginInfo begin{};
-  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
-  if (!ResultOk(result, "vkBeginCommandBuffer", error_out))
-    return false;
 
-  const VkBuffer inputs[] = {fg.buffer(), alpha.buffer(), params_.buffer(),
-                             batch_params_.buffer()};
-  std::array<VkBufferMemoryBarrier, 4> inputs_ready{};
-  for (std::size_t i = 0; i < inputs_ready.size(); ++i) {
-    inputs_ready[i].srcAccessMask =
-        VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    inputs_ready[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    inputs_ready[i].buffer = inputs[i];
-    inputs_ready[i].size = VK_WHOLE_SIZE;
+  if (!frame_batch_.RecordBufferBarrier(
+          fg.buffer(), fg.byte_size(), fg.context_identity(),
+          VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          alpha.buffer(), alpha.byte_size(), alpha.context_identity(),
+          VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::compute_read, error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          params_.buffer(), params_.size(), params_.context_identity(),
+          VulkanBufferAccess::host_write, VulkanBufferAccess::compute_read,
+          error_out) ||
+      !frame_batch_.RecordBufferBarrier(
+          batch_params_.buffer(), batch_params_.size(),
+          batch_params_.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::compute_read, error_out)) {
+    return fail_batch();
   }
-  vf.vkCmdPipelineBarrier(command_buffer_,
-                          VK_PIPELINE_STAGE_HOST_BIT |
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                          static_cast<std::uint32_t>(inputs_ready.size()),
-                          inputs_ready.data(), 0, nullptr);
 
-  vf.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+  vf.vkCmdBindPipeline(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
                        pipeline_);
-  vf.vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+  vf.vkCmdBindDescriptorSets(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
                              pipeline_layout_, 0, 1, &descriptor_set_, 0,
                              nullptr);
-  auto dispatch_op = [&](Op op) {
+  auto dispatch_op = [&](Op op, const char *label) {
+    if (!frame_batch_.RecordStage(label, error_out))
+      return false;
     const std::uint32_t op_u32 = static_cast<std::uint32_t>(op);
-    vf.vkCmdPushConstants(command_buffer_, pipeline_layout_,
+    vf.vkCmdPushConstants(batch_command, pipeline_layout_,
                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(op_u32),
                           &op_u32);
-    vf.vkCmdDispatch(command_buffer_, CeilDiv(blur_params.dst_w, kBlockX),
+    vf.vkCmdDispatch(batch_command, CeilDiv(blur_params.dst_w, kBlockX),
                      CeilDiv(blur_params.dst_h, kBlockY), 1);
+    return true;
   };
 
   if (radius == 0) {
-    dispatch_op(Op::copy_u8x3);
+    if (!dispatch_op(Op::copy_u8x3, "background_copy"))
+      return fail_batch();
   } else {
-    dispatch_op(Op::blur_h_u8x3);
-    VkBufferMemoryBarrier scratch_ready{};
-    scratch_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    scratch_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    scratch_ready.buffer = blur_tmp.buffer();
-    scratch_ready.size = VK_WHOLE_SIZE;
-    vf.vkCmdPipelineBarrier(command_buffer_,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                            1, &scratch_ready, 0, nullptr);
-    dispatch_op(Op::blur_v_u8x3);
+    if (!dispatch_op(Op::blur_h_u8x3, "background_blur_horizontal") ||
+        !frame_batch_.RecordBufferBarrier(
+            blur_tmp.buffer(), blur_tmp.byte_size(),
+            blur_tmp.context_identity(), VulkanBufferAccess::compute_write,
+            VulkanBufferAccess::compute_read, error_out) ||
+        !dispatch_op(Op::blur_v_u8x3, "background_blur_vertical")) {
+      return fail_batch();
+    }
   }
 
-  VkBufferMemoryBarrier blurred_ready{};
-  blurred_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  blurred_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  blurred_ready.buffer = blurred.buffer();
-  blurred_ready.size = VK_WHOLE_SIZE;
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                          1, &blurred_ready, 0, nullptr);
+  if (!frame_batch_.RecordBufferBarrier(
+          blurred.buffer(), blurred.byte_size(), blurred.context_identity(),
+          VulkanBufferAccess::compute_write, VulkanBufferAccess::compute_read,
+          error_out)) {
+    return fail_batch();
+  }
 
-  vf.vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+  vf.vkCmdBindDescriptorSets(batch_command, VK_PIPELINE_BIND_POINT_COMPUTE,
                              pipeline_layout_, 0, 1, &batch_descriptor_set_, 0,
                              nullptr);
-  dispatch_op(Op::composite_bg);
+  if (!dispatch_op(Op::composite_bg, "alpha_composite"))
+    return fail_batch();
 
-  VkBufferMemoryBarrier out_ready{};
-  out_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  out_ready.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  out_ready.buffer = out.buffer();
-  out_ready.size = VK_WHOLE_SIZE;
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
-                          &out_ready, 0, nullptr);
+  if (!frame_batch_.RecordBufferBarrier(
+          out.buffer(), out.byte_size(), out.context_identity(),
+          VulkanBufferAccess::compute_write, VulkanBufferAccess::host_read,
+          error_out)) {
+    return fail_batch();
+  }
 
-  result = vf.vkEndCommandBuffer(command_buffer_);
-  if (!ResultOk(result, "vkEndCommandBuffer", error_out))
+  if (!frame_batch_.Complete(error_out))
     return false;
-  return SubmitRecorded(error_out);
+  ++synchronous_submission_count_;
+  return true;
 }
 
 bool UtilityKernels::CompositeAlphaSolidU8x3(
     const VulkanImage &fg, const VulkanImage &alpha, std::uint8_t bg_r,
     std::uint8_t bg_g, std::uint8_t bg_b, const VulkanImage &out,
     std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(fg, "CompositeAlphaSolidU8x3(fg)", error_out) ||
@@ -941,6 +1024,13 @@ bool UtilityKernels::CompositeAlphaSolidU8x3(
   }
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, fg, "CompositeAlphaSolidU8x3(fg)", error_out) ||
+      !ValidateContext(device_, alpha, "CompositeAlphaSolidU8x3(alpha)",
+                       error_out) ||
+      !ValidateContext(device_, out, "CompositeAlphaSolidU8x3(out)",
+                       error_out)) {
+    return false;
+  }
 
   const auto bg =
       detail::SolidBackgroundMemoryChannels(fg.format(), bg_r, bg_g, bg_b);
@@ -963,12 +1053,12 @@ bool UtilityKernels::CompositeAlphaSolidU8x3(
 }
 
 bool UtilityKernels::ApplyKeyLightU8x3(const VulkanImage &src,
-                                       const VulkanImage &alpha,
-                                       float target_r, float target_g,
-                                       float target_b, float intensity01,
-                                       float direction,
+                                       const VulkanImage &alpha, float target_r,
+                                       float target_g, float target_b,
+                                       float intensity01, float direction,
                                        const VulkanImage &out,
                                        std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(src, "ApplyKeyLightU8x3(src)", error_out) ||
@@ -988,6 +1078,11 @@ bool UtilityKernels::ApplyKeyLightU8x3(const VulkanImage &src,
   }
   if (!Initialize(error_out))
     return false;
+  if (!ValidateContext(device_, src, "ApplyKeyLightU8x3(src)", error_out) ||
+      !ValidateContext(device_, alpha, "ApplyKeyLightU8x3(alpha)", error_out) ||
+      !ValidateContext(device_, out, "ApplyKeyLightU8x3(out)", error_out)) {
+    return false;
+  }
 
   Params p{};
   p.src_w = static_cast<std::uint32_t>(src.width());
@@ -1003,8 +1098,8 @@ bool UtilityKernels::ApplyKeyLightU8x3(const VulkanImage &src,
   p.intensity = std::clamp(intensity01, 0.0f, 1.0f);
   p.direction = std::clamp(direction, -1.0f, 1.0f);
 
-  if (!BindBuffers(src.buffer(), nullptr, alpha.buffer(), out.buffer(),
-                   nullptr, nullptr, error_out))
+  if (!BindBuffers(src.buffer(), nullptr, alpha.buffer(), out.buffer(), nullptr,
+                   nullptr, error_out))
     return false;
   return Dispatch(p, Op::key_light, p.dst_w, p.dst_h, error_out);
 }

@@ -29,8 +29,14 @@ public:
                 bool map_memory, std::string *error_out);
   void Free() noexcept;
 
-  bool Valid() const { return device_ && buffer_ && memory_ && size_ > 0; }
+  bool Valid() const;
+  // Compatibility observation only. Resource lifetime and destruction are
+  // owned by the shared context handle, not by this raw facade pointer.
   VulkanDevice *device() const { return device_; }
+  bool BelongsTo(const VulkanDevice &device) const;
+  const VulkanContextIdentity &context_identity() const {
+    return context_identity_;
+  }
   VkBuffer buffer() const { return buffer_; }
   VkDeviceMemory memory() const { return memory_; }
   VkDeviceSize size() const { return size_; }
@@ -40,10 +46,13 @@ public:
   bool Invalidate(std::string *error_out) const;
 
 private:
+  std::shared_ptr<detail::VulkanContextState> context_;
+  VulkanContextIdentity context_identity_{};
   VulkanDevice *device_ = nullptr;
   VkBuffer buffer_ = nullptr;
   VkDeviceMemory memory_ = nullptr;
   VkDeviceSize size_ = 0;
+  VkDeviceSize allocation_size_ = 0;
   void *mapped_ = nullptr;
 };
 
@@ -63,6 +72,12 @@ public:
 
   bool Valid() const { return storage_.Valid(); }
   VulkanDevice *device() const { return storage_.device(); }
+  bool BelongsTo(const VulkanDevice &device) const {
+    return storage_.BelongsTo(device);
+  }
+  const VulkanContextIdentity &context_identity() const {
+    return storage_.context_identity();
+  }
   VkBuffer buffer() const { return storage_.buffer(); }
   VkDeviceMemory memory() const { return storage_.memory(); }
   VkDeviceSize byte_size() const { return storage_.size(); }
@@ -97,8 +112,8 @@ void PackRgb24ToRgba32(const std::uint8_t *src, std::size_t src_stride_bytes,
                        int width, int height, std::uint32_t *dst,
                        std::size_t dst_pitch_pixels);
 
-void UnpackRgba32ToRgb24(const std::uint32_t *src,
-                         std::size_t src_pitch_pixels, int width, int height,
-                         std::uint8_t *dst, std::size_t dst_stride_bytes);
+void UnpackRgba32ToRgb24(const std::uint32_t *src, std::size_t src_pitch_pixels,
+                         int width, int height, std::uint8_t *dst,
+                         std::size_t dst_stride_bytes);
 
 } // namespace studiocast::vulkan

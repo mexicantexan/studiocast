@@ -12,8 +12,7 @@ struct VulkanTensorSize {
   std::size_t bytes = 0;
 };
 
-bool CheckedNchwF32Size(int n, int c, int h, int w,
-                        VulkanTensorSize *size_out,
+bool CheckedNchwF32Size(int n, int c, int h, int w, VulkanTensorSize *size_out,
                         std::string *error_out);
 
 class VulkanTensor {
@@ -34,6 +33,12 @@ public:
   VkDeviceMemory memory() const { return storage_.memory(); }
   VkDeviceSize byte_size() const { return storage_.size(); }
   void *mapped() const { return storage_.mapped(); }
+  bool BelongsTo(const VulkanDevice &device) const {
+    return storage_.BelongsTo(device);
+  }
+  const VulkanContextIdentity &context_identity() const {
+    return storage_.context_identity();
+  }
 
   int n() const { return n_; }
   int c() const { return c_; }

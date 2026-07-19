@@ -1,11 +1,13 @@
 #include "core/vulkan/vulkan_device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -17,6 +19,11 @@
 namespace studiocast::vulkan {
 
 namespace {
+
+std::atomic<std::uint64_t> &NextContextId() {
+  static std::atomic<std::uint64_t> next{1};
+  return next;
+}
 
 std::mutex &ProcessSelectionMutex() {
   static std::mutex mutex;
@@ -228,7 +235,258 @@ bool ResultOk(VkResult result, const char *what, std::string *error_out) {
   return false;
 }
 
+VkDeviceSize DerivedAllocationBudget(
+    const VkPhysicalDeviceMemoryProperties &memory_properties) {
+  VkDeviceSize total = 0;
+  for (std::uint32_t i = 0; i < memory_properties.memoryHeapCount; ++i) {
+    const VkDeviceSize heap_size = memory_properties.memoryHeaps[i].size;
+    if (heap_size > std::numeric_limits<VkDeviceSize>::max() - total)
+      return std::numeric_limits<VkDeviceSize>::max();
+    total += heap_size;
+  }
+  return total;
+}
+
+void QuarantineUnsafeTimeoutLoader(std::shared_ptr<VulkanLoader> loader) {
+  // A fence timeout means command buffers/resources may still be in use.
+  // Calling child destruction or vkDestroyDevice can violate Vulkan lifetime
+  // rules or block indefinitely. Retain the loader until process teardown and
+  // let the OS reclaim the abandoned poisoned context.
+  static auto *mutex = new std::mutex();
+  static auto *loaders = new std::vector<std::shared_ptr<VulkanLoader>>();
+  std::lock_guard<std::mutex> lock(*mutex);
+  loaders->push_back(std::move(loader));
+}
+
 } // namespace
+
+const char *VulkanContextHealthName(VulkanContextHealth health) {
+  switch (health) {
+  case VulkanContextHealth::uninitialized:
+    return "uninitialized";
+  case VulkanContextHealth::healthy:
+    return "healthy";
+  case VulkanContextHealth::device_lost:
+    return "device_lost";
+  case VulkanContextHealth::unsafe_timeout:
+    return "unsafe_timeout";
+  case VulkanContextHealth::fatal_submission_error:
+    return "fatal_submission_error";
+  case VulkanContextHealth::shutdown:
+    return "shutdown";
+  }
+  return "unknown";
+}
+
+VulkanBufferBarrierSpec VulkanBufferBarrier(VulkanBufferAccess source,
+                                            VulkanBufferAccess destination) {
+  auto access_and_stage = [](VulkanBufferAccess access) {
+    struct AccessStage {
+      VkFlags access = 0;
+      VkFlags stage = 0;
+    };
+    switch (access) {
+    case VulkanBufferAccess::host_write:
+      return AccessStage{VK_ACCESS_HOST_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT};
+    case VulkanBufferAccess::host_or_compute_write:
+      return AccessStage{VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    case VulkanBufferAccess::transfer_write:
+      return AccessStage{VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT};
+    case VulkanBufferAccess::compute_read:
+      return AccessStage{VK_ACCESS_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    case VulkanBufferAccess::compute_write:
+      return AccessStage{VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    case VulkanBufferAccess::transfer_read:
+      return AccessStage{VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT};
+    case VulkanBufferAccess::host_read:
+      return AccessStage{VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT};
+    }
+    return AccessStage{};
+  };
+  const auto src = access_and_stage(source);
+  const auto dst = access_and_stage(destination);
+  return {src.access, dst.access, src.stage, dst.stage};
+}
+
+namespace detail {
+
+VulkanContextState::~VulkanContextState() {
+  if (!loader)
+    return;
+  if (!SafeToDestroyChildren()) {
+    QuarantineUnsafeTimeoutLoader(std::move(loader));
+    return;
+  }
+  const auto &vf = loader->f();
+  if (device) {
+    if (fence && vf.vkDestroyFence)
+      vf.vkDestroyFence(device, fence, nullptr);
+    fence = nullptr;
+    if (command_pool && vf.vkDestroyCommandPool)
+      vf.vkDestroyCommandPool(device, command_pool, nullptr);
+    command_pool = nullptr;
+    if (vf.vkDestroyDevice)
+      vf.vkDestroyDevice(device, nullptr);
+    device = nullptr;
+  }
+  queue = nullptr;
+  physical_device = nullptr;
+  if (instance && vf.vkDestroyInstance)
+    vf.vkDestroyInstance(instance, nullptr);
+  instance = nullptr;
+}
+
+bool VulkanContextState::Active() const {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return health.health != VulkanContextHealth::uninitialized &&
+         health.health != VulkanContextHealth::shutdown;
+}
+
+bool VulkanContextState::Healthy() const {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return health.health == VulkanContextHealth::healthy && !health.poisoned;
+}
+
+bool VulkanContextState::SafeToDestroyChildren() const {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return health.health != VulkanContextHealth::unsafe_timeout;
+}
+
+VulkanHealthSnapshot VulkanContextState::HealthSnapshot() const {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return health;
+}
+
+VulkanAllocationStats VulkanContextState::AllocationStats() const {
+  std::lock_guard<std::mutex> lock(allocation_mutex);
+  return allocation_stats;
+}
+
+bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
+                                           std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (!Healthy()) {
+    const auto snapshot = HealthSnapshot();
+    if (error_out) {
+      *error_out = "[" + snapshot.reason_code +
+                   "] Vulkan context is not healthy for allocation.";
+    }
+    return false;
+  }
+  if (bytes == 0) {
+    if (error_out)
+      *error_out = "[vulkan_allocation_size_invalid] Vulkan allocation size "
+                   "must be non-zero.";
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(allocation_mutex);
+  const VkDeviceSize current = allocation_stats.current_bytes;
+  if (bytes > std::numeric_limits<VkDeviceSize>::max() - current) {
+    if (error_out) {
+      *error_out = "[vulkan_allocation_size_overflow] Vulkan allocation "
+                   "accounting overflow.";
+    }
+    return false;
+  }
+  const VkDeviceSize next = current + bytes;
+  if (next > allocation_stats.budget_bytes) {
+    if (error_out) {
+      *error_out =
+          "[vulkan_allocation_budget_exceeded] Vulkan context "
+          "allocation budget exceeded (requested=" +
+          std::to_string(bytes) + ", current=" + std::to_string(current) +
+          ", budget=" + std::to_string(allocation_stats.budget_bytes) + ").";
+    }
+    return false;
+  }
+  allocation_stats.current_bytes = next;
+  allocation_stats.high_water_bytes =
+      std::max(allocation_stats.high_water_bytes, next);
+  ++allocation_stats.allocation_count;
+  return true;
+}
+
+void VulkanContextState::ReleaseAllocation(VkDeviceSize bytes) noexcept {
+  if (bytes == 0)
+    return;
+  std::lock_guard<std::mutex> lock(allocation_mutex);
+  if (bytes <= allocation_stats.current_bytes)
+    allocation_stats.current_bytes -= bytes;
+  else
+    allocation_stats.current_bytes = 0;
+  if (allocation_stats.allocation_count > 0)
+    --allocation_stats.allocation_count;
+}
+
+bool VulkanContextState::RecordDriverFailure(VkResult result,
+                                             std::string_view operation,
+                                             bool submission_failure,
+                                             std::string *error_out) {
+  if (result == VK_SUCCESS)
+    return true;
+
+  std::string reason = "vulkan_driver_error";
+  VulkanContextHealth next_health = VulkanContextHealth::healthy;
+  bool poison = false;
+  if (result == VK_ERROR_DEVICE_LOST) {
+    reason = "vulkan_device_lost";
+    next_health = VulkanContextHealth::device_lost;
+    poison = true;
+  } else if (result == VK_TIMEOUT) {
+    reason = "vulkan_submission_timeout";
+    next_health = VulkanContextHealth::unsafe_timeout;
+    poison = true;
+  } else if (submission_failure) {
+    reason = "vulkan_submission_failed";
+    next_health = VulkanContextHealth::fatal_submission_error;
+    poison = true;
+  } else if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+    reason = "vulkan_out_of_device_memory";
+  } else if (result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+    reason = "vulkan_out_of_host_memory";
+  } else if (result == VK_ERROR_MEMORY_MAP_FAILED) {
+    reason = "vulkan_memory_map_failed";
+  } else if (result == VK_ERROR_INITIALIZATION_FAILED) {
+    reason = "vulkan_initialization_failed";
+  }
+
+  const std::string message = "[" + reason + "] " + std::string(operation) +
+                              " failed: " + VkResultName(result) + ".";
+  if (poison) {
+    std::lock_guard<std::mutex> lock(health_mutex);
+    if (!health.poisoned) {
+      health.health = next_health;
+      health.poisoned = true;
+      health.reason_code = reason;
+      health.last_result = result;
+      health.operation = operation;
+      health.message = message;
+    }
+  }
+  if (error_out)
+    *error_out = message;
+  return false;
+}
+
+void VulkanContextState::MarkShutdown() noexcept {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  if (!health.poisoned) {
+    health.health = VulkanContextHealth::shutdown;
+    health.reason_code = "vulkan_context_shutdown";
+    health.operation = "shutdown";
+    health.message = "Vulkan context was shut down.";
+  }
+}
+
+} // namespace detail
 
 namespace detail {
 
@@ -468,19 +726,29 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "{";
   oss << "\"compiled_enabled\":" << BoolJson(compiled_enabled) << ",";
   oss << "\"ok\":" << BoolJson(ok) << ",";
-  oss << "\"runtime_library_found\":" << BoolJson(runtime_library_found)
-      << ",";
+  oss << "\"runtime_library_found\":" << BoolJson(runtime_library_found) << ",";
   oss << "\"runtime_library_path\":\"" << JsonEscape(runtime_library_path)
       << "\",";
   oss << "\"instance_created\":" << BoolJson(instance_created) << ",";
-  oss << "\"physical_device_found\":" << BoolJson(physical_device_found)
+  oss << "\"physical_device_found\":" << BoolJson(physical_device_found) << ",";
+  oss << "\"non_cpu_device_selected\":" << BoolJson(non_cpu_device_selected)
       << ",";
   oss << "\"compute_queue_available\":" << BoolJson(compute_queue_available)
       << ",";
   oss << "\"logical_device_created\":" << BoolJson(logical_device_created)
       << ",";
-  oss << "\"shader_pipeline_created\":"
-      << BoolJson(shader_pipeline_created) << ",";
+  oss << "\"context_created\":" << BoolJson(context_created) << ",";
+  oss << "\"context_healthy\":" << BoolJson(context_healthy) << ",";
+  oss << "\"production_hardware_ready\":" << BoolJson(production_hardware_ready)
+      << ",";
+  oss << "\"context_health\":\"" << JsonEscape(context_health) << "\",";
+  oss << "\"context_failure_reason\":\"" << JsonEscape(context_failure_reason)
+      << "\",";
+  oss << "\"context_id\":" << context_id << ",";
+  oss << "\"context_generation\":" << context_generation << ",";
+  oss << "\"allocation_budget_bytes\":" << allocation_budget_bytes << ",";
+  oss << "\"shader_pipeline_created\":" << BoolJson(shader_pipeline_created)
+      << ",";
   oss << "\"api_version\":" << api_version << ",";
   oss << "\"driver_version\":" << driver_version << ",";
   oss << "\"vendor_id\":" << vendor_id << ",";
@@ -488,8 +756,7 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "\"device_type\":" << device_type << ",";
   oss << "\"vendor_name\":\"" << JsonEscape(vendor_name) << "\",";
   oss << "\"device_name\":\"" << JsonEscape(device_name) << "\",";
-  oss << "\"compute_queue_family_index\":" << compute_queue_family_index
-      << ",";
+  oss << "\"compute_queue_family_index\":" << compute_queue_family_index << ",";
   oss << "\"device_selection_source\":\"" << JsonEscape(device_selection_source)
       << "\",";
   oss << "\"device_selection_request\":\""
@@ -527,18 +794,15 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   AppendJsonStringMap(&oss, blocked_effects);
   oss << ",";
   oss << "\"matting_runtime\":\"" << JsonEscape(matting_runtime) << "\",";
-  oss << "\"matting_runtime_created\":"
-      << BoolJson(matting_runtime_created) << ",";
-  oss << "\"matting_graph_loaded\":" << BoolJson(matting_graph_loaded)
+  oss << "\"matting_runtime_created\":" << BoolJson(matting_runtime_created)
       << ",";
-  oss << "\"input_device_resident\":" << BoolJson(input_device_resident)
-      << ",";
-  oss << "\"alpha_device_resident\":" << BoolJson(alpha_device_resident)
-      << ",";
+  oss << "\"matting_graph_loaded\":" << BoolJson(matting_graph_loaded) << ",";
+  oss << "\"input_device_resident\":" << BoolJson(input_device_resident) << ",";
+  oss << "\"alpha_device_resident\":" << BoolJson(alpha_device_resident) << ",";
   oss << "\"output_device_resident\":" << BoolJson(output_device_resident)
       << ",";
-  oss << "\"device_residency_mode\":\""
-      << JsonEscape(device_residency_mode) << "\",";
+  oss << "\"device_residency_mode\":\"" << JsonEscape(device_residency_mode)
+      << "\",";
   oss << "\"warnings\":";
   AppendJsonStringArray(&oss, warnings);
   oss << ",";
@@ -554,6 +818,10 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "}";
   return oss.str();
 }
+
+VulkanDevice::VulkanDevice()
+    : loader_(std::make_shared<VulkanLoader>()),
+      context_id_(NextContextId().fetch_add(1, std::memory_order_relaxed)) {}
 
 VulkanDevice::~VulkanDevice() { Shutdown(); }
 
@@ -580,6 +848,12 @@ bool VulkanDevice::Initialize(std::string *error_out) {
 
 bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
                               std::string *error_out) {
+  return Initialize(selection, VulkanDeviceConfig{}, error_out);
+}
+
+bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
+                              const VulkanDeviceConfig &config,
+                              std::string *error_out) {
   if (error_out)
     error_out->clear();
   if (initialized_)
@@ -589,10 +863,20 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
   identity_ = VulkanDeviceIdentity{};
   std::string e;
   selection_ = selection;
+  config_ = config;
   diagnostics_.device_selection_source = selection_.source;
   diagnostics_.device_selection_request = selection_.request;
 
-  if (!loader_.Load(&e)) {
+  if (config_.fence_timeout_ns == 0) {
+    e = "Vulkan fence timeout must be non-zero.";
+    diagnostics_.error = e;
+    diagnostics_.fallback_reason = "vulkan_context_config_invalid";
+    if (error_out)
+      *error_out = e;
+    return false;
+  }
+
+  if (!loader_->Load(&e)) {
     diagnostics_.error = e;
     diagnostics_.fallback_reason = "vulkan_runtime_not_found";
     if (error_out)
@@ -600,9 +884,9 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
     return false;
   }
   diagnostics_.runtime_library_found = true;
-  diagnostics_.runtime_library_path = loader_.LibraryPath().string();
+  diagnostics_.runtime_library_path = loader_->LibraryPath().string();
 
-  const VulkanFunctions &lf = loader_.f();
+  const VulkanFunctions &lf = loader_->f();
   VkApplicationInfo app{};
   app.pApplicationName = "StudioCast";
   app.applicationVersion = 1;
@@ -631,9 +915,56 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
       diagnostics_.fallback_reason = "vulkan_device_init_failed";
     if (error_out)
       *error_out = e;
-    Shutdown();
+    DestroyUnownedHandles();
     return false;
   }
+
+  const VkDeviceSize derived_budget =
+      DerivedAllocationBudget(memory_properties_);
+  if (derived_budget == 0) {
+    e = "Selected Vulkan device reported no allocatable memory heaps.";
+    diagnostics_.error = e;
+    diagnostics_.fallback_reason = "vulkan_memory_budget_unavailable";
+    if (error_out)
+      *error_out = e;
+    DestroyUnownedHandles();
+    return false;
+  }
+
+  const VkDeviceSize budget =
+      config_.allocation_budget_bytes == 0
+          ? derived_budget
+          : std::min(config_.allocation_budget_bytes, derived_budget);
+  context_identity_ = {context_id_, ++next_generation_};
+  context_ = std::make_shared<detail::VulkanContextState>();
+  context_->loader = loader_;
+  context_->identity = context_identity_;
+  context_->instance = instance_;
+  context_->physical_device = physical_device_;
+  context_->device = device_;
+  context_->queue = queue_;
+  context_->command_pool = command_pool_;
+  context_->fence = fence_;
+  context_->memory_properties = memory_properties_;
+  context_->allocation_budget_bytes = budget;
+  context_->fence_timeout_ns = config_.fence_timeout_ns;
+  context_->health.health = VulkanContextHealth::healthy;
+  context_->health.reason_code = "vulkan_context_healthy";
+  context_->allocation_stats.budget_bytes = budget;
+
+  diagnostics_.context_created = true;
+  diagnostics_.context_healthy = true;
+  diagnostics_.context_health = "healthy";
+  diagnostics_.context_failure_reason.clear();
+  diagnostics_.context_id = context_identity_.context_id;
+  diagnostics_.context_generation = context_identity_.generation;
+  diagnostics_.allocation_budget_bytes = budget;
+  diagnostics_.production_hardware_ready =
+      diagnostics_.runtime_library_found &&
+      diagnostics_.physical_device_found &&
+      diagnostics_.non_cpu_device_selected &&
+      diagnostics_.compute_queue_available &&
+      diagnostics_.logical_device_created && diagnostics_.context_healthy;
 
   initialized_ = true;
   diagnostics_.ok = true;
@@ -641,10 +972,26 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
 }
 
 void VulkanDevice::Shutdown() noexcept {
-  const auto &vf = loader_.f();
+  if (context_) {
+    std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
+    context_->MarkShutdown();
+    context_.reset();
+  } else {
+    DestroyUnownedHandles();
+  }
+  fence_ = nullptr;
+  command_pool_ = nullptr;
+  device_ = nullptr;
+  queue_ = nullptr;
+  physical_device_ = nullptr;
+  instance_ = nullptr;
+  context_identity_ = {};
+  initialized_ = false;
+}
+
+void VulkanDevice::DestroyUnownedHandles() noexcept {
+  const auto &vf = loader_->f();
   if (device_) {
-    if (vf.vkDeviceWaitIdle)
-      (void)vf.vkDeviceWaitIdle(device_);
     if (fence_ && vf.vkDestroyFence)
       vf.vkDestroyFence(device_, fence_, nullptr);
     fence_ = nullptr;
@@ -657,36 +1004,32 @@ void VulkanDevice::Shutdown() noexcept {
   }
   queue_ = nullptr;
   physical_device_ = nullptr;
-  if (instance_ && vf.vkDestroyInstance) {
+  if (instance_ && vf.vkDestroyInstance)
     vf.vkDestroyInstance(instance_, nullptr);
-  }
   instance_ = nullptr;
-  initialized_ = false;
 }
 
 bool VulkanDevice::LoadInstanceFunctions(std::string *error_out) {
-  VulkanFunctions &vf = loader_.f();
+  VulkanFunctions &vf = loader_->f();
   return LoadInstanceProc(vf, instance_, "vkDestroyInstance",
                           &vf.vkDestroyInstance, error_out) &&
          LoadInstanceProc(vf, instance_, "vkEnumeratePhysicalDevices",
                           &vf.vkEnumeratePhysicalDevices, error_out) &&
          LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceProperties",
                           &vf.vkGetPhysicalDeviceProperties, error_out) &&
-         LoadInstanceProc(vf, instance_,
-                          "vkGetPhysicalDeviceQueueFamilyProperties",
-                          &vf.vkGetPhysicalDeviceQueueFamilyProperties,
-                          error_out) &&
+         LoadInstanceProc(
+             vf, instance_, "vkGetPhysicalDeviceQueueFamilyProperties",
+             &vf.vkGetPhysicalDeviceQueueFamilyProperties, error_out) &&
          LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceMemoryProperties",
-                          &vf.vkGetPhysicalDeviceMemoryProperties,
+                          &vf.vkGetPhysicalDeviceMemoryProperties, error_out) &&
+         LoadInstanceProc(vf, instance_, "vkCreateDevice", &vf.vkCreateDevice,
                           error_out) &&
-         LoadInstanceProc(vf, instance_, "vkCreateDevice",
-                          &vf.vkCreateDevice, error_out) &&
          LoadInstanceProc(vf, instance_, "vkGetDeviceProcAddr",
                           &vf.vkGetDeviceProcAddr, error_out);
 }
 
 bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
-  const auto &vf = loader_.f();
+  const auto &vf = loader_->f();
   std::uint32_t count = 0;
   VkResult result = vf.vkEnumeratePhysicalDevices(instance_, &count, nullptr);
   if (!ResultOk(result, "vkEnumeratePhysicalDevices(count)", error_out))
@@ -774,6 +1117,7 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
   identity_.device_name = best.device_name;
   diagnostics_.cpu_device_selected =
       best.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+  diagnostics_.non_cpu_device_selected = !diagnostics_.cpu_device_selected;
   if (diagnostics_.cpu_device_selected) {
     diagnostics_.warnings.push_back(
         "A CPU Vulkan device was selected; this is a software fallback, not "
@@ -783,7 +1127,7 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
 }
 
 bool VulkanDevice::CreateLogicalDevice(std::string *error_out) {
-  const auto &vf = loader_.f();
+  const auto &vf = loader_->f();
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue{};
   queue.queueFamilyIndex = queue_family_index_;
@@ -805,13 +1149,13 @@ bool VulkanDevice::CreateLogicalDevice(std::string *error_out) {
 }
 
 bool VulkanDevice::LoadDeviceFunctions(std::string *error_out) {
-  VulkanFunctions &vf = loader_.f();
+  VulkanFunctions &vf = loader_->f();
   return LoadDeviceProc(vf, device_, "vkDestroyDevice", &vf.vkDestroyDevice,
                         error_out) &&
          LoadDeviceProc(vf, device_, "vkGetDeviceQueue", &vf.vkGetDeviceQueue,
                         error_out) &&
-         LoadDeviceProc(vf, device_, "vkDeviceWaitIdle",
-                        &vf.vkDeviceWaitIdle, error_out) &&
+         LoadDeviceProc(vf, device_, "vkDeviceWaitIdle", &vf.vkDeviceWaitIdle,
+                        error_out) &&
          LoadDeviceProc(vf, device_, "vkCreateCommandPool",
                         &vf.vkCreateCommandPool, error_out) &&
          LoadDeviceProc(vf, device_, "vkDestroyCommandPool",
@@ -836,8 +1180,8 @@ bool VulkanDevice::LoadDeviceFunctions(std::string *error_out) {
                         error_out) &&
          LoadDeviceProc(vf, device_, "vkGetBufferMemoryRequirements",
                         &vf.vkGetBufferMemoryRequirements, error_out) &&
-         LoadDeviceProc(vf, device_, "vkAllocateMemory",
-                        &vf.vkAllocateMemory, error_out) &&
+         LoadDeviceProc(vf, device_, "vkAllocateMemory", &vf.vkAllocateMemory,
+                        error_out) &&
          LoadDeviceProc(vf, device_, "vkFreeMemory", &vf.vkFreeMemory,
                         error_out) &&
          LoadDeviceProc(vf, device_, "vkBindBufferMemory",
@@ -872,16 +1216,16 @@ bool VulkanDevice::LoadDeviceFunctions(std::string *error_out) {
                         &vf.vkDestroyShaderModule, error_out) &&
          LoadDeviceProc(vf, device_, "vkCreateComputePipelines",
                         &vf.vkCreateComputePipelines, error_out) &&
-         LoadDeviceProc(vf, device_, "vkDestroyPipeline",
-                        &vf.vkDestroyPipeline, error_out) &&
+         LoadDeviceProc(vf, device_, "vkDestroyPipeline", &vf.vkDestroyPipeline,
+                        error_out) &&
          LoadDeviceProc(vf, device_, "vkBeginCommandBuffer",
                         &vf.vkBeginCommandBuffer, error_out) &&
          LoadDeviceProc(vf, device_, "vkEndCommandBuffer",
                         &vf.vkEndCommandBuffer, error_out) &&
          LoadDeviceProc(vf, device_, "vkResetCommandBuffer",
                         &vf.vkResetCommandBuffer, error_out) &&
-         LoadDeviceProc(vf, device_, "vkCmdBindPipeline",
-                        &vf.vkCmdBindPipeline, error_out) &&
+         LoadDeviceProc(vf, device_, "vkCmdBindPipeline", &vf.vkCmdBindPipeline,
+                        error_out) &&
          LoadDeviceProc(vf, device_, "vkCmdBindDescriptorSets",
                         &vf.vkCmdBindDescriptorSets, error_out) &&
          LoadDeviceProc(vf, device_, "vkCmdPushConstants",
@@ -895,7 +1239,7 @@ bool VulkanDevice::LoadDeviceFunctions(std::string *error_out) {
 }
 
 bool VulkanDevice::CreateCommandInfrastructure(std::string *error_out) {
-  const auto &vf = loader_.f();
+  const auto &vf = loader_->f();
   vf.vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
   if (!queue_) {
     if (error_out)
@@ -948,8 +1292,8 @@ bool VulkanDevice::FindMemoryType(std::uint32_t type_bits,
 
   if (error_out) {
     std::ostringstream oss;
-    oss << "No Vulkan memory type matched type_bits=0x" << std::hex
-        << type_bits << " required=0x" << required_flags << " preferred=0x"
+    oss << "No Vulkan memory type matched type_bits=0x" << std::hex << type_bits
+        << " required=0x" << required_flags << " preferred=0x"
         << preferred_flags << ".";
     *error_out = oss.str();
   }
@@ -958,54 +1302,549 @@ bool VulkanDevice::FindMemoryType(std::uint32_t type_bits,
 
 bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
                                  std::string *error_out) {
-  if (!initialized_) {
+  if (error_out)
+    error_out->clear();
+  if (!initialized_ || !context_) {
     if (error_out)
-      *error_out = "Vulkan device is not initialized.";
+      *error_out = "[vulkan_context_uninitialized] Vulkan device is not "
+                   "initialized.";
     return false;
   }
-  const auto &vf = loader_.f();
-  VkResult result = vf.vkResetFences(device_, 1, &fence_);
-  if (!ResultOk(result, "vkResetFences", error_out))
+  if (!command_buffer) {
+    if (error_out)
+      *error_out = "[vulkan_command_buffer_invalid] Cannot submit a null "
+                   "Vulkan command buffer.";
     return false;
+  }
+
+  std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
+  const auto before = context_->HealthSnapshot();
+  if (before.poisoned || before.health != VulkanContextHealth::healthy) {
+    if (error_out) {
+      *error_out = "[" + before.reason_code +
+                   "] Vulkan submission rejected because the context is "
+                   "latched unhealthy.";
+    }
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    ++context_->health.submitted_serial;
+  }
+
+  if (context_->injected_submission_result) {
+    const auto injected = *context_->injected_submission_result;
+    context_->injected_submission_result.reset();
+    const char *operation = "injected Vulkan submission";
+    switch (injected.first) {
+    case VulkanSubmissionPhase::reset_fence:
+      operation = "vkResetFences";
+      break;
+    case VulkanSubmissionPhase::queue_submit:
+      operation = "vkQueueSubmit";
+      break;
+    case VulkanSubmissionPhase::wait_for_fence:
+      operation = "vkWaitForFences";
+      break;
+    }
+    if (!context_->RecordDriverFailure(injected.second, operation,
+                                       /*submission_failure=*/true,
+                                       error_out)) {
+      diagnostics_ = DiagnosticsSnapshot();
+      return false;
+    }
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    context_->health.completed_serial = context_->health.submitted_serial;
+    return true;
+  }
+
+  const auto &vf = loader_->f();
+  VkResult result = vf.vkResetFences(device_, 1, &fence_);
+  if (!context_->RecordDriverFailure(result, "vkResetFences",
+                                     /*submission_failure=*/true, error_out)) {
+    diagnostics_ = DiagnosticsSnapshot();
+    return false;
+  }
 
   VkSubmitInfo submit{};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command_buffer;
   result = vf.vkQueueSubmit(queue_, 1, &submit, fence_);
-  if (!ResultOk(result, "vkQueueSubmit", error_out))
-    return false;
-
-  result = vf.vkWaitForFences(device_, 1, &fence_, 1,
-                              VK_DEFAULT_FENCE_TIMEOUT_NS);
-  if (result == VK_TIMEOUT) {
-    if (error_out)
-      *error_out = "vkWaitForFences timed out after 10 seconds.";
+  if (!context_->RecordDriverFailure(result, "vkQueueSubmit",
+                                     /*submission_failure=*/true, error_out)) {
+    diagnostics_ = DiagnosticsSnapshot();
     return false;
   }
-  return ResultOk(result, "vkWaitForFences", error_out);
+
+  result =
+      vf.vkWaitForFences(device_, 1, &fence_, 1, context_->fence_timeout_ns);
+  if (!context_->RecordDriverFailure(result, "vkWaitForFences",
+                                     /*submission_failure=*/true, error_out)) {
+    diagnostics_ = DiagnosticsSnapshot();
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    context_->health.completed_serial = context_->health.submitted_serial;
+  }
+  return true;
+}
+
+bool VulkanDevice::CheckDriverResult(VkResult result,
+                                     std::string_view operation,
+                                     bool poison_on_failure,
+                                     std::string *error_out) const {
+  if (!context_) {
+    if (error_out)
+      *error_out = "[vulkan_context_uninitialized] Cannot classify a driver "
+                   "result without a Vulkan context.";
+    return false;
+  }
+  return context_->RecordDriverFailure(result, operation, poison_on_failure,
+                                       error_out);
+}
+
+bool VulkanDevice::RecordBufferBarrier(
+    VkCommandBuffer command_buffer, VkBuffer buffer, VkDeviceSize size,
+    const VulkanContextIdentity &resource_context, VulkanBufferAccess source,
+    VulkanBufferAccess destination, std::string *error_out) const {
+  if (error_out)
+    error_out->clear();
+  if (!initialized_ || !context_ || !command_buffer || !buffer || size == 0) {
+    if (error_out)
+      *error_out = "[vulkan_barrier_invalid] Vulkan buffer barrier has an "
+                   "invalid context, command buffer, buffer, or size.";
+    return false;
+  }
+  if (!OwnsContext(resource_context)) {
+    if (error_out)
+      *error_out = "[vulkan_foreign_context] Vulkan buffer barrier rejected "
+                   "a resource from a foreign context/generation.";
+    return false;
+  }
+  const auto snapshot = context_->HealthSnapshot();
+  if (!context_->Healthy()) {
+    if (error_out)
+      *error_out = "[" + snapshot.reason_code +
+                   "] Vulkan buffer barrier rejected an unhealthy context.";
+    return false;
+  }
+
+  const VulkanBufferBarrierSpec spec = VulkanBufferBarrier(source, destination);
+  VkBufferMemoryBarrier barrier{};
+  barrier.srcAccessMask = spec.src_access_mask;
+  barrier.dstAccessMask = spec.dst_access_mask;
+  barrier.buffer = buffer;
+  barrier.size = size;
+  loader_->f().vkCmdPipelineBarrier(command_buffer, spec.src_stage_mask,
+                                    spec.dst_stage_mask, 0, 0, nullptr, 1,
+                                    &barrier, 0, nullptr);
+  return true;
 }
 
 bool VulkanDevice::FlushMemory(VkDeviceMemory memory, VkDeviceSize offset,
                                VkDeviceSize size,
                                std::string *error_out) const {
+  if (!context_ || !context_->Healthy()) {
+    const auto snapshot = health();
+    if (error_out)
+      *error_out = "[" + snapshot.reason_code +
+                   "] Cannot flush memory for an unhealthy Vulkan context.";
+    return false;
+  }
   VkMappedMemoryRange range{};
   range.memory = memory;
   range.offset = offset;
   range.size = size;
-  return ResultOk(loader_.f().vkFlushMappedMemoryRanges(device_, 1, &range),
-                  "vkFlushMappedMemoryRanges", error_out);
+  const VkResult result =
+      loader_->f().vkFlushMappedMemoryRanges(device_, 1, &range);
+  return context_->RecordDriverFailure(result, "vkFlushMappedMemoryRanges",
+                                       /*submission_failure=*/false, error_out);
 }
 
 bool VulkanDevice::InvalidateMemory(VkDeviceMemory memory, VkDeviceSize offset,
                                     VkDeviceSize size,
                                     std::string *error_out) const {
+  if (!context_ || !context_->Healthy()) {
+    const auto snapshot = health();
+    if (error_out)
+      *error_out = "[" + snapshot.reason_code +
+                   "] Cannot invalidate memory for an unhealthy Vulkan "
+                   "context.";
+    return false;
+  }
   VkMappedMemoryRange range{};
   range.memory = memory;
   range.offset = offset;
   range.size = size;
-  return ResultOk(
-      loader_.f().vkInvalidateMappedMemoryRanges(device_, 1, &range),
-      "vkInvalidateMappedMemoryRanges", error_out);
+  const VkResult result =
+      loader_->f().vkInvalidateMappedMemoryRanges(device_, 1, &range);
+  return context_->RecordDriverFailure(result, "vkInvalidateMappedMemoryRanges",
+                                       /*submission_failure=*/false, error_out);
+}
+
+bool VulkanDevice::OwnsContext(const VulkanContextIdentity &identity) const {
+  return initialized_ && context_ && identity.Valid() &&
+         identity == context_identity_;
+}
+
+VulkanHealthSnapshot VulkanDevice::health() const {
+  if (!context_)
+    return {};
+  return context_->HealthSnapshot();
+}
+
+VulkanAllocationStats VulkanDevice::allocation_stats() const {
+  if (!context_)
+    return {};
+  return context_->AllocationStats();
+}
+
+bool VulkanDevice::SafeToDestroyResources() const {
+  return context_ && context_->SafeToDestroyChildren();
+}
+
+OpenVulkanDiagnostics VulkanDevice::DiagnosticsSnapshot() const {
+  OpenVulkanDiagnostics snapshot = diagnostics_;
+  if (!context_)
+    return snapshot;
+  const auto health_snapshot = context_->HealthSnapshot();
+  const auto allocations = context_->AllocationStats();
+  snapshot.context_created = true;
+  snapshot.context_healthy =
+      health_snapshot.health == VulkanContextHealth::healthy &&
+      !health_snapshot.poisoned;
+  snapshot.context_health = VulkanContextHealthName(health_snapshot.health);
+  snapshot.context_failure_reason = health_snapshot.reason_code;
+  snapshot.context_id = context_->identity.context_id;
+  snapshot.context_generation = context_->identity.generation;
+  snapshot.allocation_budget_bytes = allocations.budget_bytes;
+  snapshot.production_hardware_ready =
+      snapshot.runtime_library_found && snapshot.physical_device_found &&
+      snapshot.non_cpu_device_selected && snapshot.compute_queue_available &&
+      snapshot.logical_device_created && snapshot.context_healthy;
+  snapshot.ok = snapshot.ok && snapshot.context_healthy;
+  if (health_snapshot.poisoned && snapshot.error.empty())
+    snapshot.error = health_snapshot.message;
+  return snapshot;
+}
+
+void VulkanDevice::InjectNextSubmissionResultForTesting(
+    VulkanSubmissionPhase phase, VkResult result) {
+  if (!context_)
+    return;
+  std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
+  context_->injected_submission_result = std::make_pair(phase, result);
+}
+
+VulkanCommandBatch::~VulkanCommandBatch() { Shutdown(); }
+
+bool VulkanCommandBatch::Initialize(VulkanDevice *device,
+                                    std::size_t stage_capacity,
+                                    std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (context_ && command_buffer_ && stage_capacity_ == stage_capacity)
+    return true;
+  if (context_) {
+    if (error_out)
+      *error_out = "[vulkan_batch_reconfigure_required] Shut down the Vulkan "
+                   "command batch before changing its capacity.";
+    return false;
+  }
+  if (!device || !device->Initialized() || !device->context_ ||
+      stage_capacity == 0) {
+    if (error_out)
+      *error_out = "[vulkan_batch_config_invalid] Vulkan command batch "
+                   "requires an initialized device and non-zero capacity.";
+    return false;
+  }
+
+  const auto context = device->context_;
+  if (!context->Healthy()) {
+    if (error_out)
+      *error_out = "[vulkan_context_unhealthy] Cannot initialize a command "
+                   "batch on an unhealthy context.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo allocate{};
+  allocate.commandPool = context->command_pool;
+  allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  allocate.commandBufferCount = 1;
+  VkCommandBuffer command_buffer = nullptr;
+  VkResult result = VK_SUCCESS;
+  {
+    std::lock_guard<std::mutex> pool_lock(context->command_pool_mutex);
+    result = context->f().vkAllocateCommandBuffers(context->device, &allocate,
+                                                   &command_buffer);
+  }
+  if (!context->RecordDriverFailure(result, "vkAllocateCommandBuffers",
+                                    /*submission_failure=*/true, error_out)) {
+    return false;
+  }
+  context_ = context;
+  context_identity_ = context->identity;
+  command_buffer_ = command_buffer;
+  stage_capacity_ = stage_capacity;
+  return true;
+}
+
+void VulkanCommandBatch::Shutdown() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (context_ && context_->SafeToDestroyChildren() && command_buffer_ &&
+      context_->f().vkFreeCommandBuffers) {
+    std::lock_guard<std::mutex> pool_lock(context_->command_pool_mutex);
+    context_->f().vkFreeCommandBuffers(context_->device, context_->command_pool,
+                                       1, &command_buffer_);
+  }
+  command_buffer_ = nullptr;
+  context_.reset();
+  context_identity_ = {};
+  stage_capacity_ = 0;
+  recorded_stage_count_ = 0;
+  recording_ = false;
+  recording_owner_ = {};
+}
+
+bool VulkanCommandBatch::Begin(std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!context_ || !command_buffer_ || stage_capacity_ == 0) {
+    if (error_out)
+      *error_out = "[vulkan_batch_uninitialized] Vulkan command batch is not "
+                   "initialized.";
+    return false;
+  }
+  if (recording_) {
+    if (error_out)
+      *error_out = "[vulkan_batch_already_recording] Vulkan command batch is "
+                   "already in use.";
+    return false;
+  }
+  const auto health = context_->HealthSnapshot();
+  if (!context_->Healthy()) {
+    if (error_out)
+      *error_out = "[" + health.reason_code +
+                   "] Vulkan command batch rejected an unhealthy context.";
+    return false;
+  }
+
+  VkResult result = context_->f().vkResetCommandBuffer(command_buffer_, 0);
+  if (!context_->RecordDriverFailure(result, "vkResetCommandBuffer",
+                                     /*submission_failure=*/true, error_out)) {
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{};
+  result = context_->f().vkBeginCommandBuffer(command_buffer_, &begin);
+  if (!context_->RecordDriverFailure(result, "vkBeginCommandBuffer",
+                                     /*submission_failure=*/true, error_out)) {
+    return false;
+  }
+  recorded_stage_count_ = 0;
+  recording_owner_ = std::this_thread::get_id();
+  recording_ = true;
+  return true;
+}
+
+bool VulkanCommandBatch::CheckRecordingOwner(std::string *error_out) const {
+  if (!recording_) {
+    if (error_out)
+      *error_out = "[vulkan_batch_not_recording] Vulkan command batch has no "
+                   "active recording scope.";
+    return false;
+  }
+  if (recording_owner_ != std::this_thread::get_id()) {
+    if (error_out)
+      *error_out = "[vulkan_batch_wrong_thread] Vulkan command batch must be "
+                   "recorded and completed by its beginning thread.";
+    return false;
+  }
+  return true;
+}
+
+bool VulkanCommandBatch::RecordStage(std::string_view label,
+                                     std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!CheckRecordingOwner(error_out))
+    return false;
+  if (label.empty()) {
+    if (error_out)
+      *error_out = "[vulkan_batch_stage_invalid] Vulkan batch stage label is "
+                   "empty.";
+    return false;
+  }
+  if (recorded_stage_count_ >= stage_capacity_) {
+    if (error_out)
+      *error_out = "[vulkan_batch_capacity_exceeded] Vulkan batch stage "
+                   "capacity exceeded.";
+    return false;
+  }
+  ++recorded_stage_count_;
+  return true;
+}
+
+bool VulkanCommandBatch::RecordBufferBarrier(
+    VkBuffer buffer, VkDeviceSize size,
+    const VulkanContextIdentity &resource_context, VulkanBufferAccess source,
+    VulkanBufferAccess destination, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!CheckRecordingOwner(error_out))
+    return false;
+  const auto health = context_->HealthSnapshot();
+  if (!context_->Healthy()) {
+    if (error_out)
+      *error_out = "[" + health.reason_code +
+                   "] Vulkan batch barrier rejected an unhealthy context.";
+    return false;
+  }
+  if (!buffer || size == 0 || resource_context != context_identity_) {
+    if (error_out)
+      *error_out = "[vulkan_foreign_context] Vulkan command batch barrier "
+                   "rejected an invalid or foreign-context resource.";
+    return false;
+  }
+  const VulkanBufferBarrierSpec spec = VulkanBufferBarrier(source, destination);
+  VkBufferMemoryBarrier barrier{};
+  barrier.srcAccessMask = spec.src_access_mask;
+  barrier.dstAccessMask = spec.dst_access_mask;
+  barrier.buffer = buffer;
+  barrier.size = size;
+  context_->f().vkCmdPipelineBarrier(command_buffer_, spec.src_stage_mask,
+                                     spec.dst_stage_mask, 0, 0, nullptr, 1,
+                                     &barrier, 0, nullptr);
+  return true;
+}
+
+bool VulkanCommandBatch::Complete(std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!CheckRecordingOwner(error_out))
+    return false;
+  if (recorded_stage_count_ == 0) {
+    if (error_out)
+      *error_out = "[vulkan_batch_empty] Vulkan command batch contains no "
+                   "recorded stages.";
+    return false;
+  }
+
+  VkResult result = context_->f().vkEndCommandBuffer(command_buffer_);
+  if (!context_->RecordDriverFailure(result, "vkEndCommandBuffer",
+                                     /*submission_failure=*/true, error_out)) {
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
+  }
+
+  std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
+  const auto before = context_->HealthSnapshot();
+  if (!context_->Healthy()) {
+    if (error_out)
+      *error_out = "[" + before.reason_code +
+                   "] Vulkan batch completion rejected an unhealthy context.";
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    ++context_->health.submitted_serial;
+  }
+
+  if (context_->injected_submission_result) {
+    const auto injected = *context_->injected_submission_result;
+    context_->injected_submission_result.reset();
+    const char *operation =
+        injected.first == VulkanSubmissionPhase::reset_fence ? "vkResetFences"
+        : injected.first == VulkanSubmissionPhase::queue_submit
+            ? "vkQueueSubmit"
+            : "vkWaitForFences";
+    result = injected.second;
+    if (!context_->RecordDriverFailure(result, operation,
+                                       /*submission_failure=*/true,
+                                       error_out)) {
+      recording_ = false;
+      recording_owner_ = {};
+      return false;
+    }
+  } else {
+    result = context_->f().vkResetFences(context_->device, 1, &context_->fence);
+    if (!context_->RecordDriverFailure(result, "vkResetFences",
+                                       /*submission_failure=*/true,
+                                       error_out)) {
+      recording_ = false;
+      recording_owner_ = {};
+      return false;
+    }
+    VkSubmitInfo submit{};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command_buffer_;
+    result = context_->f().vkQueueSubmit(context_->queue, 1, &submit,
+                                         context_->fence);
+    if (!context_->RecordDriverFailure(result, "vkQueueSubmit",
+                                       /*submission_failure=*/true,
+                                       error_out)) {
+      recording_ = false;
+      recording_owner_ = {};
+      return false;
+    }
+    result = context_->f().vkWaitForFences(
+        context_->device, 1, &context_->fence, 1, context_->fence_timeout_ns);
+    if (!context_->RecordDriverFailure(result, "vkWaitForFences",
+                                       /*submission_failure=*/true,
+                                       error_out)) {
+      recording_ = false;
+      recording_owner_ = {};
+      return false;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    context_->health.completed_serial = context_->health.submitted_serial;
+  }
+  ++completion_count_;
+  recording_ = false;
+  recording_owner_ = {};
+  return true;
+}
+
+void VulkanCommandBatch::Abort() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (recording_ && recording_owner_ == std::this_thread::get_id()) {
+    recording_ = false;
+    recording_owner_ = {};
+    recorded_stage_count_ = 0;
+  }
+}
+
+VkCommandBuffer VulkanCommandBatch::command_buffer() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!recording_ || recording_owner_ != std::this_thread::get_id())
+    return nullptr;
+  return command_buffer_;
+}
+
+bool VulkanCommandBatch::recording() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return recording_;
+}
+
+std::size_t VulkanCommandBatch::recorded_stage_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return recorded_stage_count_;
+}
+
+std::uint64_t VulkanCommandBatch::completion_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return completion_count_;
 }
 
 void SetProcessVulkanDeviceSelection(const VulkanDeviceSelection &selection) {
