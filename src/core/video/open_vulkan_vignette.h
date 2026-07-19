@@ -13,6 +13,11 @@ inline constexpr std::string_view
         "vulkan_effect_initialization_failed";
 inline constexpr std::string_view kOpenVulkanVignetteRuntimeFailureReason =
     "vulkan_effect_runtime_failed";
+inline constexpr std::string_view
+    kOpenVulkanVignetteFixedCenterProductionReadyReason =
+        "open_vulkan_vignette_fixed_center_production_ready";
+inline constexpr std::string_view kOpenVulkanVignetteParameterContract =
+    "fixed_center";
 
 std::string OpenVulkanVignetteInitializationFailure(std::string_view detail);
 std::string OpenVulkanVignetteRuntimeFailure(std::string_view detail);

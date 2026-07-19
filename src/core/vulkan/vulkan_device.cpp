@@ -793,6 +793,34 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "\"blocked_effects\":";
   AppendJsonStringMap(&oss, blocked_effects);
   oss << ",";
+  oss << "\"mirror_production_ready\":"
+      << BoolJson(mirror_production_ready) << ",";
+  oss << "\"mirror_readiness_code\":\""
+      << JsonEscape(mirror_readiness_code) << "\",";
+  oss << "\"mirror_blocker_code\":\"" << JsonEscape(mirror_blocker_code)
+      << "\",";
+  oss << "\"vignette_fixed_center_production_ready\":"
+      << BoolJson(vignette_fixed_center_production_ready) << ",";
+  oss << "\"vignette_readiness_code\":\""
+      << JsonEscape(vignette_readiness_code) << "\",";
+  oss << "\"vignette_blocker_code\":\""
+      << JsonEscape(vignette_blocker_code) << "\",";
+  oss << "\"vignette_parameter_contract\":\""
+      << JsonEscape(vignette_parameter_contract) << "\",";
+  oss << "\"auto_frame_crop_stage_implemented\":"
+      << BoolJson(auto_frame_crop_stage_implemented) << ",";
+  oss << "\"auto_frame_production_ready\":"
+      << BoolJson(auto_frame_production_ready) << ",";
+  oss << "\"auto_frame_readiness_code\":\""
+      << JsonEscape(auto_frame_readiness_code) << "\",";
+  oss << "\"auto_frame_blocker_code\":\""
+      << JsonEscape(auto_frame_blocker_code) << "\",";
+  oss << "\"auto_frame_cpu_tail\":" << BoolJson(auto_frame_cpu_tail)
+      << ",";
+  oss << "\"auto_frame_degraded_reason_code\":\""
+      << JsonEscape(auto_frame_degraded_reason_code) << "\",";
+  oss << "\"auto_frame_selectable_cpu_fallback\":"
+      << BoolJson(auto_frame_selectable_cpu_fallback) << ",";
   oss << "\"eye_contact_production_ready\":"
       << BoolJson(eye_contact_production_ready) << ",";
   oss << "\"eye_contact_reason_code\":\""

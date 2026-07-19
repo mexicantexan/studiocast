@@ -25,21 +25,25 @@ struct CapabilityRow {
 };
 
 constexpr std::array<CapabilityRow, 9> kExpectedCapabilities{{
-    {kEffectIdMirror, "stub/unavailable", "vulkan_effect_not_implemented"},
+    {kEffectIdMirror, "production usable",
+     "open_vulkan_mirror_production_ready"},
     {kEffectIdVirtualBackgroundBlur, "experimental",
      "open_vulkan_matting_unavailable"},
     {kEffectIdVirtualBackgroundRemove, "experimental",
      "open_vulkan_matting_unavailable"},
     {kEffectIdVirtualBackgroundReplace, "experimental",
      "open_vulkan_matting_unavailable"},
-    {kEffectIdAutoFrame, "usable with degraded behavior",
-     "vulkan_effect_cpu_tail"},
-    {kEffectIdEyeContact, "stub/unavailable", "vulkan_effect_not_implemented"},
-    {kEffectIdVideoNoiseRemoval, "stub/unavailable",
-     "vulkan_effect_not_implemented"},
+    {kEffectIdAutoFrame,
+     "usable with degraded behavior; unavailable on the analyzed machine",
+     "vulkan_auto_frame_yunet_unavailable"},
+    {kEffectIdEyeContact, "diagnostics-only / stub-unavailable",
+     "open_vulkan_eye_contact_unavailable"},
+    {kEffectIdVideoNoiseRemoval, "diagnostics-only / stub-unavailable",
+     "open_vulkan_video_noise_removal_unavailable"},
     {kEffectIdVirtualKeyLight, "experimental",
      "open_vulkan_matting_unavailable"},
-    {kEffectIdVignette, "stub/unavailable", "vulkan_effect_not_implemented"},
+    {kEffectIdVignette, "production usable (fixed center only)",
+     "open_vulkan_vignette_fixed_center_production_ready"},
 }};
 
 std::string ReadFile(const fs::path &path) {
@@ -91,9 +95,70 @@ bool TestAuditCoversCanonicalEffects() {
   }
   ok &= Require(ids.size() == kExpectedCapabilities.size(),
                 "capability matrix must cover exactly nine canonical effects");
-  ok &= Require(Contains(audit, "No canonical effect is currently in the "
-                                "**production usable** Vulkan category."),
-                "audit must retain the conservative recommendation gate");
+  ok &= Require(
+      Contains(audit,
+               "Mirror and fixed-center vignette are the only canonical "
+               "effects currently") &&
+          Contains(audit, "`effect.<id>.cpu.no_selectable_production_path`") &&
+          Contains(audit, "`available_effects` is useful live-stage evidence "
+                          "but is never sufficient"),
+      "audit must state the exact per-effect recommendation and CPU gates");
+  return ok;
+}
+
+bool TestInstallerRecommendationConsumesExactPerEffectEvidence() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string backend = ReadFile(
+      root / "installer" / "backend" / "studiocast-installer-backend");
+  const std::string diagnostics =
+      ReadFile(root / "src" / "core" / "vulkan" / "kernels" /
+               "resize_bilinear.cpp");
+  const std::string device_header =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.h");
+  const std::string daemon =
+      ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
+  bool ok = Require(!backend.empty() && !diagnostics.empty() &&
+                        !device_header.empty() && !daemon.empty(),
+                    "installer/Vulkan capability sources are missing");
+  ok &= Require(
+      Contains(backend, "def common_vulkan_effect_evidence") &&
+          Contains(backend, "runtime_diagnostics_available") &&
+          Contains(backend, "non_cpu_device_selected") &&
+          Contains(backend, "compute_queue_available") &&
+          Contains(backend, "context_healthy") &&
+          Contains(backend, "utility_kernels_ready") &&
+          Contains(backend, "def engine_capability_usable") &&
+          Contains(backend,
+                   "all(evidence.get(key) is True for key in common_keys)") &&
+          Contains(backend, "expected_success in successes.get") &&
+          !Contains(backend,
+                    "v0.2.9 Vulkan has no production-recommendable canonical "
+                    "effect"),
+      "recommendation must require common and exact per-effect Vulkan proof");
+  ok &= Require(
+      Contains(backend, "mirror_production_ready") &&
+          Contains(backend, "mirror_readiness_code") &&
+          Contains(backend, "vignette_fixed_center_production_ready") &&
+          Contains(backend, "vignette_parameter_contract") &&
+          Contains(backend, "auto_frame_production_ready") &&
+          Contains(backend, "auto_frame_cpu_tail") &&
+          Contains(backend, "success_reason_codes") &&
+          Contains(backend, "blocker_reason_codes") &&
+          Contains(backend, "selectable_production_path") &&
+          Contains(backend, "effect.{effect}.cpu.no_selectable_production_path"),
+      "per-effect success/blocker/evidence/CPU facts are incomplete");
+  ok &= Require(
+      Contains(diagnostics, "ApplyOpenVulkanPixelEffectReadiness") &&
+          Contains(diagnostics, "ApplyOpenVulkanAutoFrameReleaseReadiness") &&
+          Contains(diagnostics, "kOpenVulkanMirrorProductionReadyReason") &&
+          Contains(diagnostics,
+                   "kOpenVulkanVignetteFixedCenterProductionReadyReason") &&
+          Contains(device_header, "mirror_production_ready") &&
+          Contains(device_header,
+                   "vignette_fixed_center_production_ready") &&
+          Contains(device_header, "auto_frame_crop_stage_implemented") &&
+          Contains(daemon, "vulkan_backend_disabled_in_build"),
+      "daemon ON/OFF per-effect readiness schema is incomplete");
   return ok;
 }
 
@@ -1126,8 +1191,10 @@ bool TestDefaultMattingDiagnosticsRemainFailClosed() {
       diagnostics, "void BlockOpenVulkanVirtualBackground", "} // namespace");
   ok &= Require(Contains(blocker, "kEffectIdVirtualBackgroundBlur") &&
                     Contains(blocker, "kEffectIdVirtualBackgroundRemove") &&
-                    Contains(blocker, "kEffectIdVirtualBackgroundReplace"),
-                "matting blocker must cover all virtual-background modes");
+                    Contains(blocker, "kEffectIdVirtualBackgroundReplace") &&
+                    Contains(blocker, "kEffectIdVirtualKeyLight"),
+                "matting blocker must cover all virtual-background modes and "
+                "virtual key light");
   return ok;
 }
 
@@ -1213,6 +1280,7 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
 int main() {
   bool ok = true;
   ok = TestAuditCoversCanonicalEffects() && ok;
+  ok = TestInstallerRecommendationConsumesExactPerEffectEvidence() && ok;
   ok = TestExplicitVulkanFilteringMatchesAudit() && ok;
   ok = TestEyeContactDiagnosticsOnlyContractIsFailClosed() && ok;
   ok = TestVideoNoiseRemovalDiagnosticsOnlyContractIsFailClosed() && ok;

@@ -87,6 +87,148 @@ def base_facts(**installation):
     }
 
 
+def canonical_capabilities(vulkan_profile="unavailable", blocker="vulkan_no_physical_device"):
+    capabilities = {}
+    for effect in (
+        "mirror", "virtual_background.blur", "virtual_background.remove",
+        "virtual_background.replace", "auto_frame", "eye_contact",
+        "video_noise_removal", "virtual_key_light", "vignette",
+    ):
+        ready = vulkan_profile == "valid" and effect in {"mirror", "vignette"}
+        parameter_contract = "fixed_center" if effect == "vignette" else None
+        specific_blocker = blocker
+        if vulkan_profile == "valid":
+            specific_blocker = {
+                "auto_frame": "vulkan_auto_frame_yunet_unavailable",
+                "virtual_background.blur": "open_vulkan_matting_unavailable",
+                "virtual_background.remove": "open_vulkan_matting_unavailable",
+                "virtual_background.replace": "open_vulkan_matting_unavailable",
+                "virtual_key_light": "open_vulkan_matting_unavailable",
+                "eye_contact": "open_vulkan_eye_contact_unavailable",
+                "video_noise_removal": "open_vulkan_video_noise_removal_unavailable",
+            }.get(effect, blocker)
+        capabilities[effect] = {
+            "maxine": "unavailable", "cuda": "unavailable",
+            "vulkan": ("production_usable" if ready else
+                       "experimental" if effect in {
+                           "virtual_background.blur", "virtual_background.remove",
+                           "virtual_background.replace", "virtual_key_light"}
+                       else "unavailable"),
+            "cpu": "unavailable",
+            "success_reason_codes": {
+                "maxine": [], "cuda": [],
+                "vulkan": (["open_vulkan_mirror_production_ready"] if ready and effect == "mirror"
+                            else ["open_vulkan_vignette_fixed_center_production_ready"]
+                            if ready else []),
+                "cpu": [],
+            },
+            "blocker_reason_codes": {
+                "maxine": ["maxine.effect.unavailable"],
+                "cuda": ["open_cuda_effect_unavailable"],
+                "vulkan": [] if ready else [specific_blocker],
+                "cpu": [f"effect.{effect}.cpu.no_selectable_production_path"],
+            },
+            "cpu_evidence": {
+                "selectable_production_path": False,
+                "reason_code": f"effect.{effect}.cpu.no_selectable_production_path",
+            },
+            "vulkan_evidence": {
+                "runtime_diagnostics_available": vulkan_profile != "unavailable",
+                "backend_compiled": vulkan_profile != "unavailable",
+                "runtime_library_found": vulkan_profile not in {"unavailable", "no_gpu"},
+                "instance_created": vulkan_profile == "valid",
+                "physical_device_found": vulkan_profile == "valid",
+                "non_cpu_device_selected": vulkan_profile == "valid",
+                "compute_queue_available": vulkan_profile == "valid",
+                "logical_device_created": vulkan_profile == "valid",
+                "context_created": vulkan_profile == "valid",
+                "context_healthy": vulkan_profile == "valid",
+                "production_hardware_ready": vulkan_profile == "valid",
+                "utility_kernels_ready": vulkan_profile == "valid",
+                "common_ready": vulkan_profile == "valid",
+                "live_stage_implemented": effect not in {
+                    "eye_contact", "video_noise_removal"},
+                "daemon_production_ready": ready,
+                "effect_production_ready_attested": ready,
+                "production_ready": ready,
+                "runtime_ready": ready,
+                "model_artifact_ready": ready,
+                "warmup_complete": ready,
+                "exact_device_and_queue": ready,
+                "device_resident": ready,
+                "synchronization_contract_validated": ready,
+                "bounded_reusable_allocations": ready,
+                "parity_validated": ready,
+                "no_cpu_layers": ready,
+                "no_dynamic_allocations": ready,
+                "no_cpu_readback": ready,
+                "no_cpu_fallback": ready,
+                "temporal_history_device_resident": False,
+                "temporal_history_bounded": False,
+                "history_reset_on_disable": False,
+                "history_reset_on_reconfigure": False,
+                "capture_sequence_discontinuity_reset": False,
+                "parameter_contract": parameter_contract,
+                "selectable_cpu_fallback": False,
+            },
+        }
+    return capabilities
+
+
+def promote_production_looking_vulkan(facts, effect):
+    matrix = facts["effects"]["capabilities"][effect]
+    matrix["vulkan"] = "production_usable"
+    matrix["blocker_reason_codes"]["vulkan"] = []
+    matrix["success_reason_codes"]["vulkan"] = [{
+        "virtual_background.blur": "open_vulkan_matting_production_ready",
+        "eye_contact": "open_vulkan_eye_contact_production_ready",
+        "video_noise_removal": "open_vulkan_video_noise_removal_production_ready",
+    }[effect]]
+    evidence = matrix["vulkan_evidence"]
+    for key in (
+        "live_stage_implemented", "daemon_production_ready",
+        "effect_production_ready_attested", "production_ready",
+        "runtime_ready", "model_artifact_ready", "warmup_complete",
+        "exact_device_and_queue", "device_resident",
+        "synchronization_contract_validated", "bounded_reusable_allocations",
+        "parity_validated", "no_cpu_readback", "no_cpu_fallback",
+    ):
+        evidence[key] = True
+    if effect == "virtual_background.blur":
+        evidence["no_cpu_layers"] = True
+        evidence["no_dynamic_allocations"] = True
+    if effect == "video_noise_removal":
+        for key in (
+            "temporal_history_device_resident", "temporal_history_bounded",
+            "history_reset_on_disable", "history_reset_on_reconfigure",
+            "capture_sequence_discontinuity_reset",
+        ):
+            evidence[key] = True
+    return matrix
+
+
+def machine_recommendation_facts(vendor, vulkan_profile="valid",
+                                 blocker="vulkan_no_physical_device"):
+    facts = base_facts()
+    facts["effects"]["capabilities"] = canonical_capabilities(
+        vulkan_profile, blocker)
+    if vendor == "hybrid":
+        facts["gpus"]["devices"] = [
+            {"id": "integrated", "vendor": "intel"},
+            {"id": "discrete", "vendor": "nvidia"},
+        ]
+    elif vendor != "none":
+        facts["gpus"]["devices"] = [{"id": "gpu0", "vendor": vendor}]
+    facts["gpus"]["vulkan"] = {
+        "loader_present": vulkan_profile != "no_gpu",
+        "physical_devices": facts["gpus"]["devices"],
+        "compute_device_usable": vulkan_profile == "valid",
+        "reason_codes": [blocker] if vulkan_profile != "valid" else
+                        ["vulkan_compute_device_usable"],
+    }
+    return facts
+
+
 class Sandbox:
     def __init__(self):
         self.temp = tempfile.TemporaryDirectory(prefix="studiocast-installer-core-")
@@ -198,17 +340,164 @@ class InstallerBackendCoreTests(unittest.TestCase):
             "studiocast-source": {"verified": True, "state": "cached_verified"}}
         self.assertEqual(self.recommendation(facts)["route"], "recommended")
 
-    def test_recommendation_is_deterministic_models_exact_and_vulkan_not_promoted(self):
+    def test_recommendation_is_deterministic_models_exact_and_legacy_vulkan_fails_closed(self):
         one = self.recommendation(); two = self.recommendation()
         self.assertEqual(one, two)
         self.assertEqual(one["selections"]["model_pack_ids"], DEFAULT_PACKS)
         self.assertEqual(one["selections"]["effects"]["virtual_background"]["selected"], "cuda")
         facts = base_facts(); facts["effects"]["capabilities"]["virtual_background"]["cuda"] = "unavailable"
+        # A legacy string or forged aggregate availability has no exact
+        # per-effect production evidence and therefore cannot select Vulkan.
         self.assertEqual(self.recommendation(facts)["selections"]["effects"]["virtual_background"]["selected"], "unavailable")
         facts["maxine"] = {"components": {"video_fx": {"usable": True}}, "effects": {}, "reason_codes": []}
         facts["effects"]["capabilities"]["virtual_background"]["maxine"] = "production_usable"
         self.assertEqual(self.recommendation(facts)["selections"]["effects"]["virtual_background"]["selected"], "maxine")
         self.assertEqual(self.recommendation(facts)["selections"]["model_pack_ids"], DEFAULT_PACKS)
+
+    def test_per_effect_recommendation_fixtures_cover_gpu_topologies_and_failures(self):
+        valid_cases = (("nvidia", "valid"), ("amd", "valid"),
+                       ("intel", "valid"), ("hybrid", "valid"))
+        for vendor, profile in valid_cases:
+            with self.subTest(vendor=vendor, profile=profile):
+                rec = self.recommendation(machine_recommendation_facts(vendor, profile))
+                selected = rec["selections"]["effects"]
+                self.assertEqual(selected["mirror"]["selected"], "vulkan")
+                self.assertEqual(selected["vignette"]["selected"], "vulkan")
+                self.assertEqual(
+                    selected["vignette"]["selected_reason_codes"],
+                    ["open_vulkan_vignette_fixed_center_production_ready"])
+                self.assertEqual(
+                    machine_recommendation_facts(vendor, profile)["effects"]
+                    ["capabilities"]["vignette"]["vulkan_evidence"]
+                    ["parameter_contract"], "fixed_center")
+                self.assertTrue(rec["selections"]["features"]["open_vulkan"])
+                for effect in (
+                    "virtual_background.blur", "virtual_background.remove",
+                    "virtual_background.replace", "auto_frame", "eye_contact",
+                    "video_noise_removal", "virtual_key_light",
+                ):
+                    self.assertNotEqual(selected[effect]["selected"], "vulkan")
+                self.assertTrue(all(item["selected"] != "cpu"
+                                    for item in selected.values()))
+
+        failure_cases = (
+            ("none", "no_gpu", "vulkan_no_physical_device"),
+            ("none", "loader_only", "vulkan_no_physical_device"),
+            ("none", "cpu_only", "vulkan_only_cpu_devices_available"),
+            ("amd", "no_compute", "vulkan_no_compute_queue"),
+            ("nvidia", "device_lost", "vulkan_device_lost"),
+        )
+        for vendor, profile, blocker in failure_cases:
+            with self.subTest(vendor=vendor, profile=profile):
+                rec = self.recommendation(
+                    machine_recommendation_facts(vendor, profile, blocker))
+                selected = rec["selections"]["effects"]
+                self.assertTrue(all(item["selected"] != "vulkan"
+                                    for item in selected.values()))
+                self.assertIn(
+                    blocker,
+                    selected["mirror"]["capability_blocker_reason_codes"]
+                    ["vulkan"])
+                self.assertTrue(all(item["selected"] != "cpu"
+                                    for item in selected.values()))
+
+    def test_effect_precedence_isolation_fixed_center_and_cpu_contract(self):
+        facts = machine_recommendation_facts("amd")
+        mirror = facts["effects"]["capabilities"]["mirror"]
+        mirror["cuda"] = "production_usable"
+        mirror["success_reason_codes"]["cuda"] = ["open_cuda_effect_available"]
+        self.assertEqual(self.recommendation(facts)["selections"]["effects"]
+                         ["mirror"]["selected"], "cuda")
+        mirror["maxine"] = "production_usable"
+        mirror["success_reason_codes"]["maxine"] = ["maxine.effect.usable"]
+        self.assertEqual(self.recommendation(facts)["selections"]["effects"]
+                         ["mirror"]["selected"], "maxine")
+
+        isolated = machine_recommendation_facts("intel")
+        isolated_mirror = isolated["effects"]["capabilities"]["mirror"]
+        isolated_mirror["vulkan"] = "unavailable"
+        isolated_mirror["vulkan_evidence"]["production_ready"] = False
+        isolated_mirror["success_reason_codes"]["vulkan"] = []
+        isolated_mirror["blocker_reason_codes"]["vulkan"] = ["vulkan_device_lost"]
+        rec = self.recommendation(isolated)
+        self.assertEqual(rec["selections"]["effects"]["mirror"]["selected"],
+                         "unavailable")
+        self.assertEqual(rec["selections"]["effects"]["vignette"]["selected"],
+                         "vulkan")
+
+        tracked = machine_recommendation_facts("nvidia")
+        vignette = tracked["effects"]["capabilities"]["vignette"]
+        vignette["vulkan"] = "unavailable"
+        vignette["vulkan_evidence"].update(
+            production_ready=False, parameter_contract="tracked_center")
+        vignette["success_reason_codes"]["vulkan"] = []
+        vignette["blocker_reason_codes"]["vulkan"] = [
+            "vulkan_vignette_tracked_center_not_supported"]
+        tracked_rec = self.recommendation(tracked)
+        self.assertNotEqual(tracked_rec["selections"]["effects"]["vignette"]
+                            ["selected"], "vulkan")
+        self.assertIn(
+            "vulkan_vignette_tracked_center_not_supported",
+            tracked_rec["selections"]["effects"]["vignette"]
+            ["selected_reason_codes"])
+
+        auto = tracked["effects"]["capabilities"]["auto_frame"]
+        auto["vulkan"] = "production_usable"
+        auto["vulkan_evidence"]["production_ready"] = False
+        self.assertNotEqual(self.recommendation(tracked)["selections"]["effects"]
+                            ["auto_frame"]["selected"], "vulkan")
+        mirror = tracked["effects"]["capabilities"]["mirror"]
+        mirror["maxine"] = "unavailable"
+        mirror["cuda"] = "unavailable"
+        mirror["vulkan"] = "unavailable"
+        mirror["cpu"] = "production_usable"
+        self.assertEqual(self.recommendation(tracked)["selections"]["effects"]
+                         ["mirror"]["selected"], "unavailable")
+        for effect, matrix in tracked["effects"]["capabilities"].items():
+            if effect != "mirror":
+                self.assertEqual(matrix["cpu"], "unavailable")
+            self.assertFalse(matrix["cpu_evidence"]["selectable_production_path"])
+            self.assertEqual(
+                matrix["blocker_reason_codes"]["cpu"],
+                [f"effect.{effect}.cpu.no_selectable_production_path"])
+
+    def test_effect_specific_vulkan_evidence_cannot_be_forged_by_composites(self):
+        adversarial_cases = (
+            ("virtual_background.blur", "runtime_ready", "clear"),
+            ("virtual_background.blur", "no_cpu_layers", "omit"),
+            ("virtual_background.blur", "no_cpu_readback", "clear"),
+            ("virtual_background.blur", "no_dynamic_allocations", "omit"),
+            ("eye_contact", "model_artifact_ready", "omit"),
+            ("eye_contact", "synchronization_contract_validated", "clear"),
+            ("eye_contact", "bounded_reusable_allocations", "omit"),
+            ("eye_contact", "parity_validated", "clear"),
+            ("eye_contact", "no_cpu_fallback", "omit"),
+            ("video_noise_removal", "device_resident", "clear"),
+            ("video_noise_removal", "no_cpu_readback", "omit"),
+            ("video_noise_removal", "temporal_history_bounded", "clear"),
+            ("video_noise_removal", "history_reset_on_reconfigure", "omit"),
+            ("video_noise_removal", "capture_sequence_discontinuity_reset", "clear"),
+        )
+        proven_effects = {effect for effect, _, _ in adversarial_cases}
+        for effect in proven_effects:
+            with self.subTest(effect=effect, proof="complete"):
+                facts = machine_recommendation_facts("amd")
+                promote_production_looking_vulkan(facts, effect)
+                self.assertEqual(
+                    self.recommendation(facts)["selections"]["effects"][effect]
+                    ["selected"], "vulkan")
+
+        for effect, key, mutation in adversarial_cases:
+            with self.subTest(effect=effect, evidence=key, mutation=mutation):
+                facts = machine_recommendation_facts("amd")
+                matrix = promote_production_looking_vulkan(facts, effect)
+                if mutation == "omit":
+                    matrix["vulkan_evidence"].pop(key)
+                else:
+                    matrix["vulkan_evidence"][key] = False
+                self.assertNotEqual(
+                    self.recommendation(facts)["selections"]["effects"][effect]
+                    ["selected"], "vulkan")
 
     def test_plan_has_exact_explicit_flags_digest_and_v4l_only_typed_ops(self):
         plan = self.plan("--no-open-backends", "--no-open-vulkan")
@@ -536,7 +825,47 @@ class InstallerBackendCoreTests(unittest.TestCase):
                           "onnxruntime_cuda_provider_present": True,
                           "onnxruntime_cpu_provider_present": True, "cuda_context_available": True,
                           "available_effects": ["virtual_background.blur"]},
-            "open_audio": {}, "open_vulkan": {"available_effects": ["auto_frame"]}}}
+            "open_audio": {}, "open_vulkan": {
+                "compiled_enabled": True, "ok": True,
+                "runtime_library_found": True, "instance_created": True,
+                "physical_device_found": True, "non_cpu_device_selected": True,
+                "compute_queue_available": True, "logical_device_created": True,
+                "context_created": True, "context_healthy": True,
+                "production_hardware_ready": True, "shader_pipeline_created": True,
+                "available_effects": ["mirror", "auto_frame", "vignette"],
+                "blocked_effects": {
+                    "virtual_background.blur": "open_vulkan_matting_unavailable",
+                    "virtual_background.remove": "open_vulkan_matting_unavailable",
+                    "virtual_background.replace": "open_vulkan_matting_unavailable",
+                    "virtual_key_light": "open_vulkan_matting_unavailable",
+                    "eye_contact": "open_vulkan_eye_contact_unavailable",
+                    "video_noise_removal": "open_vulkan_video_noise_removal_unavailable",
+                },
+                "mirror_production_ready": True,
+                "mirror_readiness_code": "open_vulkan_mirror_production_ready",
+                "vignette_fixed_center_production_ready": True,
+                "vignette_readiness_code":
+                    "open_vulkan_vignette_fixed_center_production_ready",
+                "vignette_parameter_contract": "fixed_center",
+                "auto_frame_crop_stage_implemented": True,
+                "auto_frame_production_ready": False,
+                "auto_frame_blocker_code": "vulkan_auto_frame_yunet_unavailable",
+                "auto_frame_cpu_tail": True,
+                "auto_frame_degraded_reason_code": "vulkan_effect_cpu_tail",
+                "auto_frame_selectable_cpu_fallback": False,
+                "matting_production_ready": False,
+                "matting_reason_code": "open_vulkan_matting_unavailable",
+                "matting_blocker_code": "open_vulkan_matting_adapter_unavailable",
+                "eye_contact_production_ready": False,
+                "eye_contact_reason_code": "open_vulkan_eye_contact_unavailable",
+                "eye_contact_blocker_code":
+                    "open_vulkan_eye_contact_runtime_unavailable",
+                "video_noise_removal_production_ready": False,
+                "video_noise_removal_reason_code":
+                    "open_vulkan_video_noise_removal_unavailable",
+                "video_noise_removal_blocker_code":
+                    "open_vulkan_video_noise_removal_runtime_unavailable",
+            }}}
         ctl = current_bin / "studiocastctl"
         ctl.write_text("#!/bin/sh\nprintf '%s\\n' " + repr(json.dumps(diagnostics)) + "\n")
         ctl.chmod(0o755)
@@ -567,6 +896,18 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         self.assertEqual(facts["effects"]["capabilities"]["auto_frame"]["maxine"], "production_usable")
         self.assertEqual(facts["effects"]["capabilities"]["auto_frame"]["vulkan"],
                          "usable_with_degraded_behavior")
+        self.assertEqual(facts["effects"]["capabilities"]["mirror"]["vulkan"],
+                         "production_usable")
+        self.assertTrue(facts["effects"]["capabilities"]["mirror"]
+                        ["vulkan_evidence"]["production_ready"])
+        self.assertEqual(facts["effects"]["capabilities"]["vignette"]
+                         ["vulkan_evidence"]["parameter_contract"], "fixed_center")
+        self.assertFalse(facts["effects"]["capabilities"]["auto_frame"]
+                         ["vulkan_evidence"]["production_ready"])
+        self.assertIn("open_vulkan_matting_adapter_unavailable",
+                      facts["effects"]["capabilities"]
+                      ["virtual_background.blur"]["blocker_reason_codes"]
+                      ["vulkan"])
 
     def test_unsupported_override_is_advanced_only_and_rewires_removed_privilege(self):
         facts = base_facts(); facts["os"]["supported"] = False

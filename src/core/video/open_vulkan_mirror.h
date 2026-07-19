@@ -12,6 +12,8 @@ inline constexpr std::string_view kOpenVulkanMirrorInitializationFailureReason =
     "vulkan_effect_initialization_failed";
 inline constexpr std::string_view kOpenVulkanMirrorRuntimeFailureReason =
     "vulkan_effect_runtime_failed";
+inline constexpr std::string_view kOpenVulkanMirrorProductionReadyReason =
+    "open_vulkan_mirror_production_ready";
 
 std::string OpenVulkanMirrorInitializationFailure(std::string_view detail);
 std::string OpenVulkanMirrorRuntimeFailure(std::string_view detail);

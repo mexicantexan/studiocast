@@ -754,21 +754,418 @@ def maxine_facts(diagnostics: dict[str, Any] | None, data_root: Path) -> dict[st
                                                        else "maxine.sdk.absent"]}
 
 
+def common_vulkan_effect_evidence(engine: Any) -> tuple[dict[str, Any], str | None]:
+    diagnostics_available = isinstance(engine, dict) and bool(engine)
+    value = engine if diagnostics_available else {}
+    evidence = {
+        "runtime_diagnostics_available": diagnostics_available,
+        "backend_compiled": value.get("compiled_enabled") is True,
+        "runtime_library_found": value.get("runtime_library_found") is True,
+        "instance_created": value.get("instance_created") is True,
+        "physical_device_found": value.get("physical_device_found") is True,
+        "non_cpu_device_selected": value.get("non_cpu_device_selected") is True,
+        "compute_queue_available": value.get("compute_queue_available") is True,
+        "logical_device_created": value.get("logical_device_created") is True,
+        "context_created": value.get("context_created") is True,
+        "context_healthy": value.get("context_healthy") is True,
+        "production_hardware_ready": value.get("production_hardware_ready") is True,
+        "utility_kernels_ready": (value.get("shader_pipeline_created") is True and
+                                  value.get("ok") is True),
+    }
+    evidence["common_ready"] = all(evidence.values())
+    if not diagnostics_available:
+        return evidence, "open_vulkan_runtime_diagnostics_unavailable"
+    if not evidence["backend_compiled"]:
+        return evidence, "vulkan_backend_disabled_in_build"
+    if not evidence["runtime_library_found"]:
+        return evidence, "vulkan_runtime_not_found"
+    if not evidence["instance_created"]:
+        return evidence, str(value.get("fallback_reason") or
+                             "vulkan_instance_create_failed")
+    if not evidence["physical_device_found"]:
+        reason = str(value.get("fallback_reason") or "vulkan_no_physical_device")
+        return evidence, reason
+    if value.get("cpu_device_selected") is True or not evidence["non_cpu_device_selected"]:
+        return evidence, "vulkan_only_cpu_devices_available"
+    if not evidence["compute_queue_available"]:
+        reason = str(value.get("fallback_reason") or "vulkan_no_compute_queue")
+        return evidence, reason
+    if not evidence["logical_device_created"]:
+        return evidence, "vulkan_device_create_failed"
+    if not evidence["context_created"] or not evidence["context_healthy"]:
+        return evidence, str(value.get("context_failure_reason") or
+                             "vulkan_context_uninitialized")
+    if not evidence["production_hardware_ready"]:
+        return evidence, "vulkan_production_hardware_not_ready"
+    if not evidence["utility_kernels_ready"]:
+        return evidence, "open_vulkan_utility_kernels_unavailable"
+    return evidence, None
+
+
 def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, Any]) -> dict[str, Any]:
     engines = diagnostics.get("engines", {}) if diagnostics else {}
-    cuda_available = set(engines.get("open_cuda", {}).get("available_effects", []))
-    vulkan_available = set(engines.get("open_vulkan", {}).get("available_effects", []))
+    open_cuda = engines.get("open_cuda", {})
+    open_cuda = open_cuda if isinstance(open_cuda, dict) else {}
+    open_vulkan = engines.get("open_vulkan", {})
+    open_vulkan = open_vulkan if isinstance(open_vulkan, dict) else {}
+    cuda_available = set(open_cuda.get("available_effects", []))
+    cuda_blocked = open_cuda.get("blocked_effects", {})
+    cuda_blocked = cuda_blocked if isinstance(cuda_blocked, dict) else {}
+    vulkan_available = set(open_vulkan.get("available_effects", []))
+    vulkan_common, vulkan_common_blocker = common_vulkan_effect_evidence(open_vulkan)
+
     out: dict[str, Any] = {}
     for effect in CANONICAL_EFFECTS:
-        vulkan = "unavailable"
-        if effect == "auto_frame" and effect in vulkan_available:
-            vulkan = "usable_with_degraded_behavior"
+        maxine_effect = maxine.get("effects", {}).get(effect, {})
+        maxine_usable = isinstance(maxine_effect, dict) and maxine_effect.get("usable") is True
+        cuda_usable = effect in cuda_available
+        success_codes: dict[str, list[str]] = {"maxine": [], "cuda": [], "vulkan": [], "cpu": []}
+        blocker_codes: dict[str, list[str]] = {"maxine": [], "cuda": [], "vulkan": [], "cpu": []}
+        if maxine_usable:
+            success_codes["maxine"] = [str(maxine_effect.get("reason_code") or
+                                             "maxine.effect.usable")]
+        else:
+            blocker_codes["maxine"] = [str(maxine_effect.get("reason_code") or
+                                             "maxine.effect.unavailable")]
+        if cuda_usable:
+            success_codes["cuda"] = ["open_cuda_effect_available"]
+        else:
+            blocker_codes["cuda"] = [str(cuda_blocked.get(effect) or
+                                           "open_cuda_effect_unavailable")]
+        blocker_codes["cpu"] = [f"effect.{effect}.cpu.no_selectable_production_path"]
+
+        evidence = copy.deepcopy(vulkan_common)
+        evidence.update({
+            "live_stage_implemented": False,
+            "runtime_ready": False,
+            "model_artifact_ready": False,
+            "warmup_complete": False,
+            "exact_device_and_queue": False,
+            "device_resident": False,
+            "synchronization_contract_validated": False,
+            "bounded_reusable_allocations": False,
+            "parity_validated": False,
+            "no_cpu_layers": False,
+            "no_dynamic_allocations": False,
+            "no_cpu_readback": False,
+            "no_cpu_fallback": False,
+            "temporal_history_device_resident": False,
+            "temporal_history_bounded": False,
+            "history_reset_on_disable": False,
+            "history_reset_on_reconfigure": False,
+            "capture_sequence_discontinuity_reset": False,
+            "cpu_tail": False,
+            "selectable_cpu_fallback": False,
+            "parameter_contract": None,
+            "daemon_production_ready": False,
+            "effect_production_ready_attested": False,
+            "production_ready": False,
+            "degraded_reason_codes": [],
+        })
+        vulkan_status = "unavailable"
+        specific_blocker: str | None = None
+
+        if effect == "mirror":
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("mirror_production_ready") is True)
+            evidence["live_stage_implemented"] = True
+            evidence["runtime_ready"] = True
+            evidence["model_artifact_ready"] = True
+            evidence["warmup_complete"] = True
+            evidence["exact_device_and_queue"] = evidence["common_ready"]
+            evidence["device_resident"] = True
+            evidence["synchronization_contract_validated"] = True
+            evidence["bounded_reusable_allocations"] = True
+            evidence["parity_validated"] = True
+            evidence["no_cpu_layers"] = True
+            evidence["no_dynamic_allocations"] = True
+            evidence["no_cpu_readback"] = True
+            evidence["no_cpu_fallback"] = True
+            exact_ready = (open_vulkan.get("mirror_production_ready") is True and
+                           open_vulkan.get("mirror_readiness_code") ==
+                           "open_vulkan_mirror_production_ready")
+            evidence["effect_production_ready_attested"] = exact_ready
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and exact_ready and effect in vulkan_available)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = ["open_vulkan_mirror_production_ready"]
+            elif vulkan_common_blocker:
+                specific_blocker = vulkan_common_blocker
+            elif "mirror_production_ready" not in open_vulkan:
+                specific_blocker = "open_vulkan_mirror_production_evidence_missing"
+            elif open_vulkan.get("mirror_production_ready") is not True:
+                specific_blocker = str(open_vulkan.get("mirror_blocker_code") or
+                                       "open_vulkan_mirror_unavailable")
+            else:
+                specific_blocker = "open_vulkan_mirror_live_stage_unavailable"
+        elif effect == "vignette":
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("vignette_fixed_center_production_ready") is True)
+            evidence["live_stage_implemented"] = True
+            evidence["runtime_ready"] = True
+            evidence["model_artifact_ready"] = True
+            evidence["warmup_complete"] = True
+            evidence["exact_device_and_queue"] = evidence["common_ready"]
+            evidence["device_resident"] = True
+            evidence["synchronization_contract_validated"] = True
+            evidence["bounded_reusable_allocations"] = True
+            evidence["parity_validated"] = True
+            evidence["no_cpu_layers"] = True
+            evidence["no_dynamic_allocations"] = True
+            evidence["no_cpu_readback"] = True
+            evidence["no_cpu_fallback"] = True
+            evidence["parameter_contract"] = open_vulkan.get("vignette_parameter_contract")
+            exact_ready = (
+                open_vulkan.get("vignette_fixed_center_production_ready") is True and
+                open_vulkan.get("vignette_readiness_code") ==
+                "open_vulkan_vignette_fixed_center_production_ready" and
+                evidence["parameter_contract"] == "fixed_center")
+            evidence["effect_production_ready_attested"] = exact_ready
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and exact_ready and effect in vulkan_available)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = [
+                    "open_vulkan_vignette_fixed_center_production_ready"]
+            elif vulkan_common_blocker:
+                specific_blocker = vulkan_common_blocker
+            elif evidence["parameter_contract"] != "fixed_center":
+                specific_blocker = "vulkan_vignette_tracked_center_not_supported"
+            elif "vignette_fixed_center_production_ready" not in open_vulkan:
+                specific_blocker = "open_vulkan_vignette_production_evidence_missing"
+            elif open_vulkan.get("vignette_fixed_center_production_ready") is not True:
+                specific_blocker = str(open_vulkan.get("vignette_blocker_code") or
+                                       "open_vulkan_vignette_unavailable")
+            else:
+                specific_blocker = "open_vulkan_vignette_live_stage_unavailable"
+        elif effect == "auto_frame":
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("auto_frame_production_ready") is True)
+            evidence["live_stage_implemented"] = (
+                open_vulkan.get("auto_frame_crop_stage_implemented") is True)
+            evidence["cpu_tail"] = open_vulkan.get("auto_frame_cpu_tail") is True
+            evidence["degraded_reason_codes"] = [str(
+                open_vulkan.get("auto_frame_degraded_reason_code") or
+                "vulkan_effect_cpu_tail")]
+            evidence["selectable_cpu_fallback"] = (
+                open_vulkan.get("auto_frame_selectable_cpu_fallback") is True)
+            # The real crop stage and its CPU tracking tail are implementation
+            # facts, not production-ready or selectable CPU-engine evidence.
+            evidence["production_ready"] = False
+            if (effect in vulkan_available and evidence["live_stage_implemented"] and
+                    evidence["cpu_tail"]):
+                vulkan_status = "usable_with_degraded_behavior"
+            specific_blocker = (vulkan_common_blocker or str(
+                open_vulkan.get("auto_frame_blocker_code") or
+                "vulkan_auto_frame_yunet_unavailable"))
         elif effect in {"virtual_background.blur", "virtual_background.remove",
-                        "virtual_background.replace", "virtual_key_light"} and effect in vulkan_available:
-            vulkan = "experimental"
-        out[effect] = {"maxine": "production_usable" if maxine.get("effects", {}).get(effect, {}).get("usable") else "unavailable",
-                       "cuda": "production_usable" if effect in cuda_available else "unavailable",
-                       "vulkan": vulkan, "cpu": "unavailable"}
+                        "virtual_background.replace", "virtual_key_light"}:
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("matting_production_ready") is True)
+            evidence["live_stage_implemented"] = True
+            evidence["runtime_ready"] = (open_vulkan.get("matting_runtime_created") is True and
+                                         open_vulkan.get("matting_graph_loaded") is True)
+            evidence["model_artifact_ready"] = (
+                open_vulkan.get("matting_model_pack_selected") is True and
+                open_vulkan.get("matting_model_contract_validated") is True)
+            evidence["warmup_complete"] = open_vulkan.get("matting_warmup_complete") is True
+            evidence["exact_device_and_queue"] = (
+                open_vulkan.get("matting_shared_device_imported") is True and
+                open_vulkan.get("matting_queue_ownership_explicit") is True)
+            evidence["device_resident"] = (
+                open_vulkan.get("input_device_resident") is True and
+                open_vulkan.get("alpha_device_resident") is True and
+                open_vulkan.get("output_device_resident") is True and
+                open_vulkan.get("device_residency_mode") == "device_resident" and
+                open_vulkan.get("matting_cpu_layers_used") is False and
+                open_vulkan.get("matting_cpu_readback_count") == 0)
+            evidence["synchronization_contract_validated"] = (
+                open_vulkan.get("matting_synchronous_completion") is True)
+            evidence["bounded_reusable_allocations"] = (
+                open_vulkan.get("matting_bounded_reusable_allocations") is True)
+            evidence["parity_validated"] = (
+                open_vulkan.get("matting_parity_validated") is True)
+            evidence["no_cpu_layers"] = (
+                open_vulkan.get("matting_cpu_layers_used") is False)
+            evidence["no_dynamic_allocations"] = (
+                open_vulkan.get("matting_dynamic_allocation_count") == 0)
+            evidence["no_cpu_readback"] = (
+                open_vulkan.get("matting_cpu_readback_count") == 0)
+            evidence["no_cpu_fallback"] = (
+                open_vulkan.get("matting_cpu_fallback_count") == 0)
+            matting_ready = (
+                open_vulkan.get("matting_production_ready") is True and
+                open_vulkan.get("matting_build_enabled") is True and
+                open_vulkan.get("matting_adapter_available") is True and
+                evidence["runtime_ready"] and evidence["model_artifact_ready"] and
+                evidence["warmup_complete"] and evidence["exact_device_and_queue"] and
+                evidence["device_resident"] and
+                evidence["synchronization_contract_validated"] and
+                evidence["bounded_reusable_allocations"] and
+                evidence["parity_validated"] and evidence["no_cpu_layers"] and
+                evidence["no_dynamic_allocations"] and
+                evidence["no_cpu_readback"] and evidence["no_cpu_fallback"])
+            evidence["effect_production_ready_attested"] = matting_ready
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and matting_ready and effect in vulkan_available)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = ["open_vulkan_matting_production_ready"]
+            else:
+                vulkan_status = "experimental"
+                specific_blocker = (vulkan_common_blocker or str(
+                    open_vulkan.get("matting_reason_code") or
+                    "open_vulkan_matting_unavailable"))
+                nested = open_vulkan.get("matting_blocker_code")
+                if nested and nested != specific_blocker:
+                    blocker_codes["vulkan"].append(str(nested))
+        elif effect == "eye_contact":
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("eye_contact_production_ready") is True)
+            evidence["live_stage_implemented"] = (
+                open_vulkan.get("eye_contact_live_stage_implemented") is True)
+            evidence["runtime_ready"] = (
+                open_vulkan.get("eye_contact_production_adapter_available") is True and
+                open_vulkan.get("eye_contact_vulkan_inference_provider_available") is True)
+            evidence["model_artifact_ready"] = (
+                open_vulkan.get("eye_contact_model_pack_selected") is True and
+                open_vulkan.get("eye_contact_artifact_contract_validated") is True)
+            evidence["warmup_complete"] = open_vulkan.get("eye_contact_warmup_complete") is True
+            evidence["exact_device_and_queue"] = (
+                open_vulkan.get("eye_contact_shared_device_imported") is True and
+                open_vulkan.get("eye_contact_queue_ownership_explicit") is True)
+            evidence["device_resident"] = (
+                open_vulkan.get("eye_contact_device_resident_analysis") is True and
+                open_vulkan.get("eye_contact_device_resident_tensor_io") is True)
+            evidence["selectable_cpu_fallback"] = (
+                open_vulkan.get("eye_contact_selectable_cpu_fallback") is True)
+            evidence["synchronization_contract_validated"] = (
+                open_vulkan.get("eye_contact_synchronization_contract_validated") is True)
+            evidence["bounded_reusable_allocations"] = (
+                open_vulkan.get("eye_contact_bounded_reusable_allocations") is True)
+            evidence["parity_validated"] = (
+                open_vulkan.get("eye_contact_parity_validated") is True)
+            evidence["no_cpu_readback"] = (
+                open_vulkan.get("eye_contact_cpu_readback_count") == 0)
+            evidence["no_cpu_fallback"] = (
+                open_vulkan.get("eye_contact_cpu_fallback_count") == 0)
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and
+                open_vulkan.get("eye_contact_production_ready") is True and
+                evidence["live_stage_implemented"] and evidence["runtime_ready"] and
+                evidence["model_artifact_ready"] and evidence["warmup_complete"] and
+                evidence["exact_device_and_queue"] and evidence["device_resident"] and
+                evidence["bounded_reusable_allocations"] and
+                evidence["synchronization_contract_validated"] and
+                evidence["parity_validated"] and evidence["no_cpu_readback"] and
+                evidence["no_cpu_fallback"] and
+                effect in vulkan_available)
+            evidence["effect_production_ready_attested"] = bool(
+                open_vulkan.get("eye_contact_production_ready") is True)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = ["open_vulkan_eye_contact_production_ready"]
+            else:
+                specific_blocker = (vulkan_common_blocker or str(
+                    open_vulkan.get("eye_contact_reason_code") or
+                    "open_vulkan_eye_contact_unavailable"))
+                nested = open_vulkan.get("eye_contact_blocker_code")
+                if nested and nested != specific_blocker:
+                    blocker_codes["vulkan"].append(str(nested))
+        elif effect == "video_noise_removal":
+            evidence["daemon_production_ready"] = (
+                open_vulkan.get("video_noise_removal_production_ready") is True)
+            evidence["live_stage_implemented"] = (
+                open_vulkan.get("video_noise_removal_live_stage_implemented") is True)
+            evidence["runtime_ready"] = (
+                open_vulkan.get("video_noise_removal_production_adapter_available") is True and
+                open_vulkan.get("video_noise_removal_vulkan_inference_provider_available") is True)
+            evidence["model_artifact_ready"] = (
+                open_vulkan.get("video_noise_removal_model_pack_selected") is True and
+                open_vulkan.get("video_noise_removal_artifact_contract_validated") is True)
+            evidence["warmup_complete"] = (
+                open_vulkan.get("video_noise_removal_warmup_complete") is True)
+            evidence["exact_device_and_queue"] = (
+                open_vulkan.get("video_noise_removal_shared_device_imported") is True and
+                open_vulkan.get("video_noise_removal_queue_ownership_explicit") is True)
+            evidence["device_resident"] = (
+                open_vulkan.get("video_noise_removal_fully_device_resident_tensor_io") is True and
+                open_vulkan.get("video_noise_removal_device_resident_preprocess") is True and
+                open_vulkan.get("video_noise_removal_device_resident_postprocess") is True and
+                open_vulkan.get("video_noise_removal_temporal_history_device_resident") is True)
+            evidence["selectable_cpu_fallback"] = (
+                open_vulkan.get("video_noise_removal_selectable_cpu_fallback") is True)
+            evidence["synchronization_contract_validated"] = (
+                open_vulkan.get(
+                    "video_noise_removal_synchronization_contract_validated") is True)
+            evidence["bounded_reusable_allocations"] = (
+                open_vulkan.get(
+                    "video_noise_removal_bounded_reusable_allocations") is True)
+            evidence["parity_validated"] = (
+                open_vulkan.get("video_noise_removal_parity_validated") is True)
+            evidence["no_cpu_readback"] = (
+                open_vulkan.get("video_noise_removal_cpu_readback_count") == 0)
+            evidence["no_cpu_fallback"] = (
+                open_vulkan.get("video_noise_removal_cpu_fallback_count") == 0)
+            evidence["temporal_history_device_resident"] = (
+                open_vulkan.get(
+                    "video_noise_removal_temporal_history_device_resident") is True)
+            evidence["temporal_history_bounded"] = (
+                open_vulkan.get("video_noise_removal_temporal_history_bounded") is True)
+            evidence["history_reset_on_disable"] = (
+                open_vulkan.get("video_noise_removal_history_reset_on_disable") is True)
+            evidence["history_reset_on_reconfigure"] = (
+                open_vulkan.get(
+                    "video_noise_removal_history_reset_on_reconfigure") is True)
+            evidence["capture_sequence_discontinuity_reset"] = (
+                open_vulkan.get(
+                    "video_noise_removal_capture_sequence_discontinuity_reset") is True)
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and
+                open_vulkan.get("video_noise_removal_production_ready") is True and
+                evidence["live_stage_implemented"] and evidence["runtime_ready"] and
+                evidence["model_artifact_ready"] and evidence["warmup_complete"] and
+                evidence["exact_device_and_queue"] and evidence["device_resident"] and
+                evidence["synchronization_contract_validated"] and
+                evidence["bounded_reusable_allocations"] and
+                evidence["temporal_history_device_resident"] and
+                evidence["temporal_history_bounded"] and
+                evidence["history_reset_on_disable"] and
+                evidence["history_reset_on_reconfigure"] and
+                evidence["capture_sequence_discontinuity_reset"] and
+                evidence["parity_validated"] and evidence["no_cpu_readback"] and
+                evidence["no_cpu_fallback"] and
+                effect in vulkan_available)
+            evidence["effect_production_ready_attested"] = bool(
+                open_vulkan.get("video_noise_removal_production_ready") is True)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = [
+                    "open_vulkan_video_noise_removal_production_ready"]
+            else:
+                specific_blocker = (vulkan_common_blocker or str(
+                    open_vulkan.get("video_noise_removal_reason_code") or
+                    "open_vulkan_video_noise_removal_unavailable"))
+                nested = open_vulkan.get("video_noise_removal_blocker_code")
+                if nested and nested != specific_blocker:
+                    blocker_codes["vulkan"].append(str(nested))
+
+        if specific_blocker:
+            blocker_codes["vulkan"].insert(0, specific_blocker)
+        out[effect] = {
+            "maxine": "production_usable" if maxine_usable else "unavailable",
+            "cuda": "production_usable" if cuda_usable else "unavailable",
+            "vulkan": vulkan_status,
+            "cpu": "unavailable",
+            "success_reason_codes": success_codes,
+            "blocker_reason_codes": blocker_codes,
+            "vulkan_evidence": evidence,
+            "cpu_evidence": {
+                "selectable_production_path": False,
+                "reason_code": f"effect.{effect}.cpu.no_selectable_production_path",
+            },
+        }
     return out
 
 
@@ -1016,6 +1413,109 @@ def capability_usable(value: Any) -> bool:
     return value is True or value in {"usable", "production_usable"}
 
 
+def engine_capability_usable(effect: str, matrix: dict[str, Any], engine: str) -> bool:
+    if not capability_usable(matrix.get(engine)):
+        return False
+    if engine == "cpu":
+        cpu_evidence = matrix.get("cpu_evidence")
+        return (isinstance(cpu_evidence, dict) and
+                cpu_evidence.get("selectable_production_path") is True)
+    if engine != "vulkan":
+        return True
+    evidence = matrix.get("vulkan_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    common_keys = (
+        "runtime_diagnostics_available", "backend_compiled",
+        "runtime_library_found", "instance_created", "physical_device_found",
+        "non_cpu_device_selected", "compute_queue_available",
+        "logical_device_created", "context_created", "context_healthy",
+        "production_hardware_ready", "utility_kernels_ready", "common_ready",
+        "live_stage_implemented", "daemon_production_ready",
+        "effect_production_ready_attested",
+        "production_ready",
+    )
+    if not all(evidence.get(key) is True for key in common_keys):
+        return False
+    required_effect_keys = {
+        "mirror": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "vignette": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "virtual_background.blur": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "virtual_background.remove": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "virtual_background.replace": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "virtual_key_light": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
+            "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "eye_contact": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_readback", "no_cpu_fallback",
+        ),
+        "video_noise_removal": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident",
+            "synchronization_contract_validated", "bounded_reusable_allocations",
+            "parity_validated", "no_cpu_readback", "no_cpu_fallback",
+            "temporal_history_device_resident", "temporal_history_bounded",
+            "history_reset_on_disable", "history_reset_on_reconfigure",
+            "capture_sequence_discontinuity_reset",
+        ),
+    }.get(effect)
+    if (required_effect_keys is None or not all(
+            evidence.get(key) is True for key in required_effect_keys)):
+        return False
+    if effect == "vignette" and evidence.get("parameter_contract") != "fixed_center":
+        return False
+    expected_success = {
+        "mirror": "open_vulkan_mirror_production_ready",
+        "vignette": "open_vulkan_vignette_fixed_center_production_ready",
+        "virtual_background.blur": "open_vulkan_matting_production_ready",
+        "virtual_background.remove": "open_vulkan_matting_production_ready",
+        "virtual_background.replace": "open_vulkan_matting_production_ready",
+        "virtual_key_light": "open_vulkan_matting_production_ready",
+        "eye_contact": "open_vulkan_eye_contact_production_ready",
+        "video_noise_removal": "open_vulkan_video_noise_removal_production_ready",
+    }.get(effect)
+    successes = matrix.get("success_reason_codes", {})
+    return (expected_success is not None and isinstance(successes, dict) and
+            expected_success in successes.get("vulkan", []))
+
+
 def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
               policy_version: str = POLICY_VERSION, route: str = "recommended") -> dict[str, Any]:
     if facts.get("schema_version") != 1 or facts.get("facts_version") != FACTS_VERSION:
@@ -1055,13 +1555,26 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
     for effect, matrix in sorted(facts.get("effects", {}).get("capabilities", {}).items()):
         selected = "unavailable"
         for engine in ("maxine", "cuda", "vulkan", "cpu"):
-            # v0.2.9 Vulkan has no production-recommendable canonical effect.
-            if engine == "vulkan" and route == "recommended":
-                continue
-            if capability_usable(matrix.get(engine)):
+            if engine_capability_usable(effect, matrix, engine):
                 selected = engine
                 break
-        selections["effects"][effect] = {"engine_precedence": ["maxine", "cuda", "vulkan", "cpu"], "selected": selected}
+        successes = matrix.get("success_reason_codes", {})
+        blockers_by_engine = matrix.get("blocker_reason_codes", {})
+        successes = successes if isinstance(successes, dict) else {}
+        blockers_by_engine = blockers_by_engine if isinstance(blockers_by_engine, dict) else {}
+        selected_codes = list(successes.get(selected, [])) if selected != "unavailable" else [
+            code for engine in ("maxine", "cuda", "vulkan", "cpu")
+            for code in blockers_by_engine.get(engine, [])]
+        selections["effects"][effect] = {
+            "engine_precedence": ["maxine", "cuda", "vulkan", "cpu"],
+            "selected": selected,
+            "selected_reason_codes": selected_codes,
+            "capability_success_reason_codes": copy.deepcopy(successes),
+            "capability_blocker_reason_codes": copy.deepcopy(blockers_by_engine),
+        }
+    if route == "recommended" and any(
+            item.get("selected") == "vulkan" for item in selections["effects"].values()):
+        selections["features"]["open_vulkan"] = True
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if not facts.get("os", {}).get("supported", False):
