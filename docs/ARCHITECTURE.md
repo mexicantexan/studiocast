@@ -104,6 +104,41 @@ Required top-level fields:
 - `output`: `{ name, kind, dtype }` where `kind` is `"alpha"`
 - `preprocess`: `{ mean[3], std[3], color, range }` where `color` is `"rgb"` and `range` is `"0..1"`
 
+### Production Vulkan matting schema-v2 extension
+
+A Vulkan matting candidate must use schema v2, declare distinct
+`ncnn_param`/`ncnn_bin` files with `role: "vulkan_matting"` and installed
+SHA-256 digests, and provide an `ncnn_vulkan` object. Its top-level tensor
+contract is exact rather than inferred from the graph:
+
+```json
+{
+  "schema_version": 2,
+  "task": "matting",
+  "input": {
+    "name": "input", "layout": "nchw", "dtype": "float32",
+    "width": 256, "height": 256, "channels": 3
+  },
+  "output": {
+    "name": "alpha", "kind": "alpha", "layout": "nchw",
+    "dtype": "float32", "width": 160, "height": 144, "channels": 1
+  },
+  "ncnn_vulkan": {
+    "param_file": "model.ncnn.param",
+    "bin_file": "model.ncnn.bin",
+    "input_blob": "input",
+    "output_blob": "alpha",
+    "converter": { "name": "pnnx", "version": "20250503" },
+    "precision": "fp16"
+  }
+}
+```
+
+`precision` describes the offline ncnn artifact/weights (`fp32` or `fp16`);
+StudioCast's external resident input and alpha bindings remain float32. The
+output dimensions may differ from the input dimensions and govern alpha
+allocation, artifact identity, resize, and element counts.
+
 ## No CPU fallback (product rule)
 
 Effects are GPU-only (Maxine + small CUDA post-process where needed). If Maxine, drivers, supported GPU, or feature

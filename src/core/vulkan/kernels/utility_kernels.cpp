@@ -905,6 +905,85 @@ bool UtilityKernels::ResizeBilinearF32_1(const VulkanImage &src,
   return Dispatch(p, Op::resize_f32_1, p.dst_w, p.dst_h, error_out);
 }
 
+bool UtilityKernels::ReadbackF32_1(const VulkanImage &src,
+                                   const VulkanImage &readback_staging,
+                                   float *dst, std::size_t dst_count,
+                                   std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!initialized_) {
+    if (error_out)
+      *error_out = "Vulkan utility kernels are not initialized.";
+    return false;
+  }
+  if (!ValidateF32Image(src, "ReadbackF32_1(src)", error_out) ||
+      !ValidateF32Image(readback_staging, "ReadbackF32_1(staging)",
+                        error_out)) {
+    return false;
+  }
+  if (!ValidateContext(device_, src, "ReadbackF32_1(src)", error_out) ||
+      !ValidateContext(device_, readback_staging,
+                       "ReadbackF32_1(staging)", error_out)) {
+    return false;
+  }
+  const std::size_t expected_count =
+      static_cast<std::size_t>(src.width()) *
+      static_cast<std::size_t>(src.height());
+  if (src.width() != readback_staging.width() ||
+      src.height() != readback_staging.height() || !src.device_local() ||
+      src.mapped() != nullptr || !readback_staging.host_visible() ||
+      readback_staging.mapped() == nullptr || !dst ||
+      dst_count != expected_count) {
+    if (error_out) {
+      *error_out =
+          "ReadbackF32_1 requires a non-mapped device-local source, an "
+          "exact-shape mapped host-visible staging image, and exact "
+          "preallocated destination storage.";
+    }
+    return false;
+  }
+
+  const auto &vf = device_.f();
+  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
+  if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
+                                 error_out)) {
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{};
+  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
+  if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
+                                 error_out)) {
+    return false;
+  }
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, src.buffer(), src.byte_size(),
+          src.context_identity(), VulkanBufferAccess::host_or_compute_write,
+          VulkanBufferAccess::transfer_read, error_out)) {
+    return false;
+  }
+  VkBufferCopy copy{};
+  copy.size = src.byte_size();
+  vf.vkCmdCopyBuffer(command_buffer_, src.buffer(), readback_staging.buffer(),
+                     1, &copy);
+  if (!device_.RecordBufferBarrier(
+          command_buffer_, readback_staging.buffer(),
+          readback_staging.byte_size(), readback_staging.context_identity(),
+          VulkanBufferAccess::transfer_write, VulkanBufferAccess::host_read,
+          error_out)) {
+    return false;
+  }
+  result = vf.vkEndCommandBuffer(command_buffer_);
+  if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
+                                 error_out) ||
+      !SubmitRecorded(error_out) ||
+      !readback_staging.Invalidate(error_out)) {
+    return false;
+  }
+  std::memcpy(dst, readback_staging.mapped(), expected_count * sizeof(float));
+  return true;
+}
+
 bool UtilityKernels::BoxBlurSeparableU8x3(const VulkanImage &src,
                                           const VulkanImage &tmp,
                                           const VulkanImage &dst, int radius,

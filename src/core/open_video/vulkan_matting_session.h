@@ -54,9 +54,12 @@ public:
            std::string *error_out);
 
   bool DeviceResidentInferenceAvailable() const;
+  VulkanMattingReadiness Readiness() const;
   VulkanMattingRuntimeEvidence RuntimeEvidence() const;
   VulkanMattingRuntimeFailure LatchedRuntimeFailure() const;
   const std::string &LatchedRuntimeError() const;
+  bool LatchExternalFailure(VulkanMattingRuntimeFailure failure,
+                            std::string detail, std::string *error_out);
 
   const studiocast::open_video::ModelPack &pack() const;
   const Options &options() const;

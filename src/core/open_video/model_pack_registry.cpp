@@ -140,9 +140,8 @@ private:
   std::array<std::uint8_t, 64> data_{};
   std::size_t datalen_ = 0;
   std::uint64_t bitlen_ = 0;
-  std::array<std::uint32_t, 8> state_{0x6a09e667u, 0xbb67ae85u,
-                                      0x3c6ef372u, 0xa54ff53au,
-                                      0x510e527fu, 0x9b05688cu,
+  std::array<std::uint32_t, 8> state_{0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
+                                      0xa54ff53au, 0x510e527fu, 0x9b05688cu,
                                       0x1f83d9abu, 0x5be0cd19u};
 };
 
@@ -305,6 +304,17 @@ bool GetIntOptional(const util::json::Value::Object &o, const char *key,
   return true;
 }
 
+bool GetPositiveIntOptional(const util::json::Value::Object &o, const char *key,
+                            int *out, std::string *error) {
+  if (!GetIntOptional(o, key, out, error))
+    return false;
+  if (Get(o, key) && *out <= 0) {
+    return Fail(error, std::string("model.json: field '") + key +
+                           "' must be positive");
+  }
+  return true;
+}
+
 bool GetIntRequired(const util::json::Value::Object &o, const char *key,
                     int *out, std::string *error) {
   const auto *v = Get(o, key);
@@ -457,6 +467,14 @@ bool ParseMattingSpecFromV1Fields(const util::json::Value::Object &root,
     return false;
   if (!GetStringRequired(*outputObj, "dtype", &out->output.dtype, error))
     return false;
+  if (!GetStringOptional(*outputObj, "layout", &out->output.layout, error) ||
+      !GetPositiveIntOptional(*outputObj, "width", &out->output.width, error) ||
+      !GetPositiveIntOptional(*outputObj, "height", &out->output.height,
+                              error) ||
+      !GetPositiveIntOptional(*outputObj, "channels", &out->output.channels,
+                              error)) {
+    return false;
+  }
 
   if (!IsOneOf(out->output.kind, {"alpha"})) {
     return Fail(error, "model.json: output.kind must be 'alpha'");
@@ -464,6 +482,9 @@ bool ParseMattingSpecFromV1Fields(const util::json::Value::Object &root,
   if (!IsOneOf(out->output.dtype, {"float32", "float16"})) {
     return Fail(error,
                 "model.json: output.dtype must be one of: float32, float16");
+  }
+  if (!out->output.layout.empty() && out->output.layout != "nchw") {
+    return Fail(error, "model.json: output.layout must be 'nchw' when present");
   }
 
   const auto *ppV = Get(root, "preprocess");
@@ -517,6 +538,11 @@ const ModelFile *FindUniqueModelFile(const ModelPack &pack,
                     "' must use files[].kind='" + kind + "'");
     return nullptr;
   }
+  if (found->role != "vulkan_matting") {
+    Fail(error, "model.json: ncnn_vulkan artifact '" + name +
+                    "' must use files[].role='vulkan_matting'");
+    return nullptr;
+  }
   if (!studiocast::model_integrity_internal::IsSha256Hex(found->sha256)) {
     Fail(error, "model.json: ncnn_vulkan artifact '" + name +
                     "' requires a 64-character files[].sha256 digest");
@@ -546,8 +572,7 @@ bool ParseNcnnVulkanMattingSpec(const util::json::Value::Object &root,
   NcnnVulkanMattingSpec spec;
   if (!GetStringRequired(*spec_object, "param_file", &param_file, error) ||
       !GetStringRequired(*spec_object, "bin_file", &bin_file, error) ||
-      !GetStringRequired(*spec_object, "input_blob", &spec.input_blob,
-                         error) ||
+      !GetStringRequired(*spec_object, "input_blob", &spec.input_blob, error) ||
       !GetStringRequired(*spec_object, "output_blob", &spec.output_blob,
                          error) ||
       !GetStringRequired(*spec_object, "precision", &spec.precision, error)) {
@@ -568,13 +593,37 @@ bool ParseNcnnVulkanMattingSpec(const util::json::Value::Object &root,
                 "model.json: ncnn_vulkan.precision must be one of: fp32, fp16");
   }
 
+  if (!pack->matting) {
+    return Fail(error,
+                "model.json: ncnn_vulkan requires exact matting metadata");
+  }
+  const auto &matting = *pack->matting;
+  if (matting.input.name != spec.input_blob ||
+      matting.output.name != spec.output_blob) {
+    return Fail(error,
+                "model.json: ncnn_vulkan blob names must exactly match the "
+                "declared matting input/output names");
+  }
+  if (matting.input.layout != "nchw" || matting.input.width <= 0 ||
+      matting.input.height <= 0 || matting.input.channels != 3 ||
+      matting.output.layout != "nchw" || matting.output.width <= 0 ||
+      matting.output.height <= 0 || matting.output.channels != 1) {
+    return Fail(error,
+                "model.json: ncnn_vulkan requires exact NCHW input/output "
+                "geometry with 3 input channels and 1 alpha channel");
+  }
+  if (matting.input.dtype != "float32" || matting.output.dtype != "float32") {
+    return Fail(error, "model.json: ncnn_vulkan requires float32 StudioCast "
+                       "input/output bindings");
+  }
+
   const auto *converter_value = Get(*spec_object, "converter");
   if (!converter_value) {
     return Fail(error,
                 "model.json: ncnn_vulkan missing required field 'converter'");
   }
-  const auto *converter = AsObject(*converter_value, error,
-                                   "'ncnn_vulkan.converter'");
+  const auto *converter =
+      AsObject(*converter_value, error, "'ncnn_vulkan.converter'");
   if (!converter ||
       !GetStringRequired(*converter, "name", &spec.converter_name, error) ||
       !GetStringRequired(*converter, "version", &spec.converter_version,
@@ -586,11 +635,14 @@ bool ParseNcnnVulkanMattingSpec(const util::json::Value::Object &root,
       FindUniqueModelFile(*pack, param_file, "ncnn_param", error);
   if (!param)
     return false;
-  const ModelFile *bin = FindUniqueModelFile(*pack, bin_file, "ncnn_bin", error);
+  const ModelFile *bin =
+      FindUniqueModelFile(*pack, bin_file, "ncnn_bin", error);
   if (!bin)
     return false;
 
   std::error_code ec;
+  spec.param_file = param_file;
+  spec.bin_file = bin_file;
   spec.param_path = fs::absolute(param->path, ec).lexically_normal();
   if (ec)
     return Fail(error, "model.json: failed to resolve ncnn_vulkan param_file");
@@ -838,8 +890,8 @@ ModelFileVerification VerifyFile(const ModelPack &pack, const ModelFile &f) {
   }
   if (!fs::is_regular_file(f.path, ec) || ec) {
     out.status = "missing";
-    out.message =
-        std::string("model file is not a regular file: ") + PathForError(f.path);
+    out.message = std::string("model file is not a regular file: ") +
+                  PathForError(f.path);
     out.ok = false;
     return out;
   }
@@ -850,8 +902,7 @@ ModelFileVerification VerifyFile(const ModelPack &pack, const ModelFile &f) {
     out.ok = true;
     return out;
   }
-  if (!studiocast::model_integrity_internal::IsSha256Hex(
-          out.expected_sha256)) {
+  if (!studiocast::model_integrity_internal::IsSha256Hex(out.expected_sha256)) {
     out.status = "invalid_manifest";
     out.message = "model.json: files[].sha256 must be a 64-character hex "
                   "SHA-256 digest";
@@ -901,8 +952,8 @@ ModelPackVerification VerifyParsedPack(const ModelPack &pack) {
 
   if (IsPlaceholderModelId(pack.id)) {
     out.status = "placeholder";
-    out.message =
-        "placeholder: model id contains 'placeholder' and is skipped by default";
+    out.message = "placeholder: model id contains 'placeholder' and is skipped "
+                  "by default";
     out.ok = false;
     return out;
   }
@@ -952,18 +1003,76 @@ bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
                                              std::string *error) {
   if (error)
     error->clear();
+  if (pack.schema_version != 2)
+    return Fail(error, "production ncnn Vulkan requires schema_version=2");
   if (pack.task != "matting")
     return Fail(error, "production ncnn Vulkan requires task=matting");
+  if (!pack.matting) {
+    return Fail(error,
+                "production ncnn Vulkan requires exact matting metadata");
+  }
   if (!pack.ncnn_vulkan) {
     return Fail(error,
                 "model.json: missing required production ncnn_vulkan metadata");
   }
 
   const auto &spec = *pack.ncnn_vulkan;
+  const auto &matting = *pack.matting;
+  if (!IsSafeRelativePath(spec.param_file) ||
+      !IsSafeRelativePath(spec.bin_file) || spec.param_file == spec.bin_file) {
+    return Fail(error,
+                "model.json: ncnn_vulkan artifacts must be distinct safe "
+                "relative paths");
+  }
+  if (spec.input_blob != matting.input.name ||
+      spec.output_blob != matting.output.name ||
+      matting.input.layout != "nchw" || matting.input.channels != 3 ||
+      matting.input.width <= 0 || matting.input.height <= 0 ||
+      matting.output.layout != "nchw" || matting.output.channels != 1 ||
+      matting.output.width <= 0 || matting.output.height <= 0) {
+    return Fail(error,
+                "model.json: ncnn_vulkan input/output metadata is not exact "
+                "and compatible");
+  }
+  if ((spec.precision != "fp32" && spec.precision != "fp16") ||
+      matting.input.dtype != "float32" || matting.output.dtype != "float32") {
+    return Fail(error,
+                "model.json: ncnn_vulkan requires fp32/fp16 artifacts and "
+                "float32 StudioCast input/output bindings");
+  }
+  std::string declaration_error;
+  const ModelFile *param = FindUniqueModelFile(
+      pack, spec.param_file, "ncnn_param", &declaration_error);
+  if (!param)
+    return Fail(error, declaration_error);
+  const ModelFile *bin =
+      FindUniqueModelFile(pack, spec.bin_file, "ncnn_bin", &declaration_error);
+  if (!bin)
+    return Fail(error, declaration_error);
   std::error_code ec;
+  const fs::path declared_param_path =
+      fs::absolute(param->path, ec).lexically_normal();
+  if (ec)
+    return Fail(error, "failed to resolve declared ncnn param artifact");
+  const fs::path declared_bin_path =
+      fs::absolute(bin->path, ec).lexically_normal();
+  if (ec)
+    return Fail(error, "failed to resolve declared ncnn bin artifact");
+  if (declared_param_path != spec.param_path ||
+      declared_bin_path != spec.bin_path ||
+      studiocast::model_integrity_internal::NormalizeSha256Hex(param->sha256) !=
+          spec.param_sha256 ||
+      studiocast::model_integrity_internal::NormalizeSha256Hex(bin->sha256) !=
+          spec.bin_sha256) {
+    return Fail(error,
+                "model.json: ncnn_vulkan resolved artifact evidence does not "
+                "match files[]");
+  }
   const fs::path canonical_root = fs::weakly_canonical(pack.root_dir, ec);
   if (ec)
     return Fail(error, "failed to resolve model pack root");
+  if (!fs::is_directory(canonical_root, ec) || ec)
+    return Fail(error, "model pack root is missing or is not a directory");
 
   const auto validate_artifact = [&](const fs::path &path,
                                      const std::string &expected_sha256,
@@ -989,9 +1098,10 @@ bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
     std::string hash_error;
     if (!studiocast::model_integrity_internal::ComputeSha256File(
             canonical_path, &actual_sha256, &hash_error)) {
-      return Fail(error, hash_error.empty()
-                             ? std::string("failed to hash ncnn_vulkan ") + label
-                             : hash_error);
+      return Fail(error,
+                  hash_error.empty()
+                      ? std::string("failed to hash ncnn_vulkan ") + label
+                      : hash_error);
     }
     if (actual_sha256 != expected_sha256) {
       return Fail(error, std::string("ncnn_vulkan ") + label +
@@ -1053,8 +1163,9 @@ ModelPackRegistry::Scan(const std::filesystem::path &open_video_models_dir) {
     if (!ok) {
       const std::string dirKey = PackDirKey(open_video_models_dir, pack_dir);
       const std::string key = pack.id.empty() ? dirKey : pack.id;
-      const std::string status =
-          IsPlaceholderModelId(pack.id) ? "placeholder" : ClassifyLoadError(err);
+      const std::string status = IsPlaceholderModelId(pack.id)
+                                     ? "placeholder"
+                                     : ClassifyLoadError(err);
       const std::string msg =
           IsPlaceholderModelId(pack.id)
               ? "model id contains 'placeholder' and is skipped by default"
@@ -1154,8 +1265,9 @@ ModelPackRegistry::Verify(const std::filesystem::path &open_video_models_dir) {
     r.id = open_video_models_dir.filename().string();
     r.root_dir = open_video_models_dir;
     r.status = "invalid_manifest";
-    r.message = "invalid_manifest: open_video models path is not a directory: " +
-                PathForError(open_video_models_dir);
+    r.message =
+        "invalid_manifest: open_video models path is not a directory: " +
+        PathForError(open_video_models_dir);
     r.ok = false;
     out.push_back(std::move(r));
     return out;
@@ -1190,8 +1302,8 @@ ModelPackRegistry::Verify(const std::filesystem::path &open_video_models_dir) {
     const bool ok = schema == 2 ? ParseModelJsonV2(pack_dir, &pack, &err)
                                 : ParseModelJsonV1(pack_dir, &pack, &err);
     if (!ok) {
-      out.push_back(
-          FailedVerification(open_video_models_dir, pack_dir, manifest, pack, err));
+      out.push_back(FailedVerification(open_video_models_dir, pack_dir,
+                                       manifest, pack, err));
       continue;
     }
 
@@ -1199,8 +1311,7 @@ ModelPackRegistry::Verify(const std::filesystem::path &open_video_models_dir) {
   }
 
   std::sort(out.begin(), out.end(),
-            [](const ModelPackVerification &a,
-               const ModelPackVerification &b) {
+            [](const ModelPackVerification &a, const ModelPackVerification &b) {
               if (a.task != b.task)
                 return a.task < b.task;
               return a.id < b.id;

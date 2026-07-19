@@ -33,6 +33,8 @@ public:
   VkDeviceMemory memory() const { return storage_.memory(); }
   VkDeviceSize byte_size() const { return storage_.size(); }
   void *mapped() const { return storage_.mapped(); }
+  bool device_local() const { return storage_.device_local(); }
+  bool host_visible() const { return storage_.host_visible(); }
   bool BelongsTo(const VulkanDevice &device) const {
     return storage_.BelongsTo(device);
   }

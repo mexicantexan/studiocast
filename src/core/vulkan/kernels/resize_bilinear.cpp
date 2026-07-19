@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "core/open_video/model_pack_registry.h"
+#include "core/open_video/vulkan_matting_runtime.h"
 #include "core/util/xdg.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
@@ -414,26 +415,23 @@ namespace studiocast::vulkan {
 
 namespace {
 
-constexpr const char *kOpenVulkanMattingUnavailable =
-    "open_vulkan_matting_unavailable";
+struct OpenVulkanMattingModelFacts {
+  bool selected = false;
+  bool contract_validated = false;
+};
 
-void PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
+OpenVulkanMattingModelFacts
+PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
+  OpenVulkanMattingModelFacts facts;
   if (!d)
-    return;
+    return facts;
 
   const auto reg = studiocast::open_video::ModelPackRegistry::ScanDefault();
   std::set<std::string> installed_model_ids;
-  d->default_model_id = [&reg]() -> std::string {
-    if (reg.Find("matting", "modnet-webnn-256-fp32"))
-      return "modnet-webnn-256-fp32";
-    if (reg.Find("matting", "birefnet_lite"))
-      return "birefnet_lite";
-    for (const auto &m : reg.ListModels()) {
-      if (m.task == "matting")
-        return m.id;
-    }
-    return {};
-  }();
+  const auto is_production_candidate = [&](const std::string &id) {
+    const auto candidate = reg.Find("matting", id);
+    return candidate && candidate->ncnn_vulkan.has_value();
+  };
 
   for (const auto &m : reg.ListModels()) {
     if (m.task != "matting")
@@ -450,6 +448,23 @@ void PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
     }
     d->models.push_back(std::move(mi));
   }
+
+  if (is_production_candidate("modnet-webnn-256-fp32")) {
+    d->default_model_id = "modnet-webnn-256-fp32";
+  } else if (is_production_candidate("birefnet_lite")) {
+    d->default_model_id = "birefnet_lite";
+  } else {
+    for (const auto &m : reg.ListModels()) {
+      if (m.task == "matting" && is_production_candidate(m.id)) {
+        d->default_model_id = m.id;
+        break;
+      }
+    }
+  }
+  facts.selected = !d->default_model_id.empty();
+  // Diagnostics polling never hashes artifacts. Only a live session may
+  // publish cached validation attestation; this cold diagnostic has none.
+  facts.contract_validated = false;
 
   for (const auto &[id, reason] : reg.Problems()) {
     const std::string lower_reason = [&] {
@@ -481,6 +496,59 @@ void PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
   d->install_hints.push_back(
       "Device-resident Vulkan virtual background requires a production Vulkan "
       "matting runtime; the ncnn spike CPU Mat path is not used here.");
+  return facts;
+}
+
+void ApplyOpenVulkanMattingReadiness(
+    OpenVulkanDiagnostics *d, const OpenVulkanMattingModelFacts &model_facts) {
+  if (!d)
+    return;
+  studiocast::open_vulkan::VulkanMattingReadinessInput input;
+  input.production_build_enabled =
+      studiocast::open_vulkan::ProductionVulkanMattingBuildEnabled();
+  input.production_adapter_available =
+      studiocast::open_vulkan::ProductionVulkanMattingAdapterAvailable();
+  input.model_pack_selected = model_facts.selected;
+  input.model_contract_validated = model_facts.contract_validated;
+  input.non_cpu_device_selected = d->non_cpu_device_selected;
+  input.compute_queue_available = d->compute_queue_available;
+  input.context_healthy = d->context_healthy;
+  const auto readiness =
+      studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+  const auto &runtime = readiness.runtime;
+
+  d->matting_build_enabled = input.production_build_enabled;
+  d->matting_adapter_available = input.production_adapter_available;
+  d->matting_model_pack_selected = input.model_pack_selected;
+  d->matting_model_contract_validated = input.model_contract_validated;
+  d->matting_production_ready = readiness.production_ready;
+  d->matting_reason_code = readiness.reason_code;
+  d->matting_blocker_code = readiness.blocker_code;
+  d->matting_detail = readiness.detail;
+  d->matting_runtime =
+      runtime.runtime_name.empty() ? "none" : runtime.runtime_name;
+  d->matting_runtime_created = runtime.runtime_created;
+  d->matting_graph_loaded = runtime.graph_loaded;
+  d->matting_warmup_complete = runtime.warmup_complete;
+  d->matting_cpu_layers_used = runtime.cpu_layers_used;
+  d->matting_shared_device_imported = runtime.shared_device_imported;
+  d->matting_queue_ownership_explicit = runtime.queue_ownership_explicit;
+  d->matting_synchronous_completion = runtime.synchronous_completion;
+  d->matting_bounded_reusable_allocations =
+      runtime.bounded_reusable_allocations;
+  d->matting_persistent_allocation_count = runtime.persistent_allocation_count;
+  d->matting_dynamic_allocation_count = runtime.dynamic_allocation_count;
+  d->matting_cpu_readback_count = runtime.cpu_readback_count;
+  d->matting_warmup_inference_count = runtime.warmup_inference_count;
+  d->matting_inference_count = runtime.inference_count;
+  d->matting_completion_count = runtime.completion_count;
+  d->matting_context_id = runtime.active_device.context_id;
+  d->matting_context_generation = runtime.active_device.context_generation;
+  d->input_device_resident = runtime.input_device_resident;
+  d->alpha_device_resident = runtime.alpha_device_resident;
+  d->output_device_resident = runtime.output_device_resident;
+  d->device_residency_mode =
+      readiness.production_ready ? "device_resident" : "unavailable";
 }
 
 void BlockOpenVulkanVirtualBackground(OpenVulkanDiagnostics *d,
@@ -505,53 +573,57 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   std::string e;
   if (!resize.EnsureInitialized(4, 4, 4, 4, &e)) {
     OpenVulkanDiagnostics d = resize.Diagnostics();
-    PopulateOpenVulkanModelDiagnostics(&d);
+    const auto model_facts = PopulateOpenVulkanModelDiagnostics(&d);
     d.matting_runtime = "none";
     d.device_residency_mode = "unavailable";
-    BlockOpenVulkanVirtualBackground(&d, "open_vulkan_runtime_unavailable");
+    ApplyOpenVulkanMattingReadiness(&d, model_facts);
     if (d.error.empty())
       d.error = e;
     if (d.fallback_reason.empty())
       d.fallback_reason = "open_vulkan_resize_unavailable";
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
+    BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
     return d;
   }
   kernels::UtilityKernels utility;
   if (!utility.Initialize(&e)) {
     OpenVulkanDiagnostics d = utility.Diagnostics();
-    PopulateOpenVulkanModelDiagnostics(&d);
+    const auto model_facts = PopulateOpenVulkanModelDiagnostics(&d);
     d.matting_runtime = "none";
     d.device_residency_mode = "unavailable";
-    BlockOpenVulkanVirtualBackground(&d,
-                                     "open_vulkan_utility_kernels_unavailable");
+    ApplyOpenVulkanMattingReadiness(&d, model_facts);
     if (d.error.empty())
       d.error = e;
     if (d.fallback_reason.empty())
       d.fallback_reason = "open_vulkan_utility_kernels_unavailable";
     if (d.blocked_reason.empty())
       d.blocked_reason = d.fallback_reason;
+    BlockOpenVulkanVirtualBackground(&d, d.blocked_reason.c_str());
     return d;
   }
   OpenVulkanDiagnostics d = resize.Diagnostics();
   d.ok = true;
   d.shader_pipeline_created = true;
-  PopulateOpenVulkanModelDiagnostics(&d);
+  const auto model_facts = PopulateOpenVulkanModelDiagnostics(&d);
   d.matting_runtime = "none";
   d.device_residency_mode = "unavailable";
   d.matting_runtime_created = false;
   d.matting_graph_loaded = false;
-  d.input_device_resident = true;
+  d.input_device_resident = false;
   d.alpha_device_resident = false;
-  d.output_device_resident = true;
-  d.blocked_reason = kOpenVulkanMattingUnavailable;
-  d.degraded_reason =
-      "Open Vulkan runtime is available, but no production device-resident "
-      "matting inference runtime is available.";
+  d.output_device_resident = false;
+  ApplyOpenVulkanMattingReadiness(&d, model_facts);
+  d.blocked_reason = d.matting_reason_code;
+  d.degraded_reason = "[" + d.matting_reason_code + "]";
+  if (!d.matting_blocker_code.empty())
+    d.degraded_reason += " [" + d.matting_blocker_code + "]";
+  if (!d.matting_detail.empty())
+    d.degraded_reason += " " + d.matting_detail;
   d.warnings.push_back(
       "The milestone-4 ncnn Vulkan spike used CPU Mat input/output; it is not "
       "used for production Open Vulkan virtual background.");
-  BlockOpenVulkanVirtualBackground(&d, kOpenVulkanMattingUnavailable);
+  BlockOpenVulkanVirtualBackground(&d, d.matting_reason_code.c_str());
   return d;
 }
 

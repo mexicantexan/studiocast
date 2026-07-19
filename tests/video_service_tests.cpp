@@ -45,6 +45,8 @@ bool TestOpenVulkanMattingRepeatedFramesDoNotRepeatSetupWork();
 bool TestOpenVulkanMattingModelIdChangeTriggersSetupWork();
 bool TestOpenVulkanMattingFrameSizeChangeOnlyRefreshesSession();
 bool TestOpenVulkanMattingRepeatedFrameProcessingKeepsSetupCountersStable();
+bool TestOpenVulkanMattingContextGenerationChangeRecreatesSession();
+bool TestOpenVulkanMattingLatchedFailureIsReused();
 bool TestReplaceBackgroundRepeatedFramePathDoesNotStatImage();
 bool TestReplaceBackgroundSamePathExplicitRefreshUsesPreparedMtime();
 bool TestReplaceBackgroundFrameSizeChangeOnlyRefreshesResizedBackground();
@@ -1524,6 +1526,11 @@ int main() {
       {"Open Vulkan matting repeated frame processing keeps setup stable",
        &studiocast::tests::
            TestOpenVulkanMattingRepeatedFrameProcessingKeepsSetupCountersStable},
+      {"Open Vulkan matting context generation recreates session",
+       &studiocast::tests::
+           TestOpenVulkanMattingContextGenerationChangeRecreatesSession},
+      {"Open Vulkan matting latched failure is reused",
+       &studiocast::tests::TestOpenVulkanMattingLatchedFailureIsReused},
       {"replace background repeated frames do not stat image",
        &studiocast::tests::
            TestReplaceBackgroundRepeatedFramePathDoesNotStatImage},

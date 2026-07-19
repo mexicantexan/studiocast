@@ -42,6 +42,13 @@ struct ModelOutputSpec {
   std::string name;
   std::string kind;  // e.g. "alpha"
   std::string dtype; // e.g. "float32"
+  // Exact output geometry is optional for legacy/ONNX-only packs. A
+  // production ncnn Vulkan declaration requires all four fields so the
+  // runtime never infers alpha layout or shape from a filename/graph.
+  std::string layout; // e.g. "nchw"
+  int width = 0;
+  int height = 0;
+  int channels = 0;
 };
 
 struct ModelPreprocessSpec {
@@ -62,6 +69,8 @@ struct MattingSpec {
 // so existing ONNX-only packs remain valid for Open CUDA, but every field is
 // mandatory when the section is present.
 struct NcnnVulkanMattingSpec {
+  std::string param_file;
+  std::string bin_file;
   std::filesystem::path param_path;
   std::filesystem::path bin_path;
   std::string param_sha256;

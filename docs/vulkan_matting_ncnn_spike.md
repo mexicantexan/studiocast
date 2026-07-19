@@ -124,6 +124,14 @@ SHA-256 values remain in the common `files` array:
 {
   "schema_version": 2,
   "task": "matting",
+  "input": {
+    "name": "input", "layout": "nchw", "dtype": "float32",
+    "width": 256, "height": 256, "channels": 3
+  },
+  "output": {
+    "name": "alpha", "kind": "alpha", "layout": "nchw",
+    "dtype": "float32", "width": 160, "height": 144, "channels": 1
+  },
   "files": [
     {
       "name": "model.ncnn.param",
@@ -155,7 +163,10 @@ SHA-256 values remain in the common `files` array:
 `param_file` and `bin_file` must be safe relative paths, must refer to unique
 `files` entries of the matching kind, and must carry valid SHA-256 values.
 Input/output blob names, converter name/version, and precision (`fp32` or
-`fp16`) are mandatory. At one-time production session creation StudioCast
+`fp16`) are mandatory. Precision describes the offline artifacts; both
+variants use StudioCast's float32 resident input/output binding contract.
+Exact NCHW output layout/width/height/channels are mandatory and may differ
+from the input geometry. At one-time production session creation StudioCast
 resolves both paths inside the pack and recomputes both checksums. Missing
 metadata, path escape, missing files, and checksum mismatch all fail closed.
 Manifest parsing and hashing are forbidden in the frame loop.
@@ -163,3 +174,10 @@ Manifest parsing and hashing are forbidden in the frame loop.
 Current curated packs remain ONNX-only until reviewed ncnn conversions and
 their real checksums are produced. Consequently, this contract alone does not
 make production Vulkan matting available or device-resident.
+
+Current upstream ncnn owns/selects its Vulkan device and does not provide the
+reviewed external-device import needed for StudioCast's already-selected
+`VkPhysicalDevice`/`VkDevice`/`VkQueue` and buffers. The production factory
+therefore remains fail-closed with
+`open_vulkan_matting_adapter_unavailable` even when the build option and ncnn
+dependency are present.

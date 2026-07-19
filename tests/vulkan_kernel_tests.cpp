@@ -1978,6 +1978,115 @@ int main() {
   }
 
   {
+    const int sw = 2, sh = 2, dw = 3, dh = 3;
+    const std::vector<float> alpha = {0.0f, 1.0f, 0.25f, 0.75f};
+    VulkanImage upload, resident, readback;
+    if (!AllocateF32(kernels, &upload, sw, sh, &error) ||
+        !resident.Allocate(kernels.device(), dw, dh, VulkanPixelFormat::f32_1,
+                           /*map_memory=*/false, &error) ||
+        !readback.Allocate(kernels.device(), dw, dh, VulkanPixelFormat::f32_1,
+                           /*map_memory=*/true, &error)) {
+      return OptionalSkip("Vulkan alpha readback staging allocation failed: " +
+                          error);
+    }
+    FillF32(upload, alpha);
+    flush(upload);
+    kernels.InvalidateDescriptorBindingCacheForSetup();
+    ok &= Require(resident.device_local() && resident.mapped() == nullptr,
+                  "production alpha must be non-mapped device-local memory");
+    ok &= Require(kernels.ResizeBilinearF32_1(upload, resident, &error),
+                  "Vulkan resident alpha setup should dispatch: " + error);
+    const auto expected = ResizeF32Reference(alpha, sw, sh, dw, dh);
+    std::vector<float> cpu(expected.size());
+    const auto allocations_before =
+        kernels.device()->allocation_stats().allocation_count;
+    ok &= Require(kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                       cpu.size(), &error),
+                  "explicit staged alpha readback should succeed: " + error);
+    ok &= CompareF32(cpu, expected, "Vulkan staged alpha readback");
+    ok &= Require(kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                       cpu.size(), &error) &&
+                      kernels.device()->allocation_stats().allocation_count ==
+                          allocations_before,
+                  "repeated alpha readback must reuse bounded staging");
+    ok &= Require(!kernels.ReadbackF32_1(upload, readback, cpu.data(),
+                                        cpu.size(), &error),
+                  "host-mapped inference alpha must not pass resident "
+                  "readback source validation");
+
+    UtilityKernels foreign_kernels;
+    if (!foreign_kernels.Initialize(&error))
+      return OptionalSkip("foreign Vulkan readback context unavailable: " +
+                          error);
+    VulkanImage foreign_staging;
+    if (!foreign_staging.Allocate(foreign_kernels.device(), dw, dh,
+                                  VulkanPixelFormat::f32_1,
+                                  /*map_memory=*/true, &error)) {
+      return OptionalSkip("foreign Vulkan staging allocation failed: " +
+                          error);
+    }
+    const auto submissions_before_foreign =
+        kernels.synchronous_submission_count();
+    ok &= Require(!kernels.ReadbackF32_1(resident, foreign_staging, cpu.data(),
+                                        cpu.size(), &error) &&
+                      error.find("[vulkan_foreign_context]") !=
+                          std::string::npos &&
+                      kernels.synchronous_submission_count() ==
+                          submissions_before_foreign,
+                  "foreign readback staging must fail before submission");
+    foreign_kernels.Shutdown();
+    ok &= Require(!kernels.ReadbackF32_1(resident, foreign_staging, cpu.data(),
+                                        cpu.size(), &error) &&
+                      kernels.synchronous_submission_count() ==
+                          submissions_before_foreign,
+                  "stale readback staging must fail before submission");
+  }
+
+  {
+    UtilityKernels loss_kernels;
+    if (!loss_kernels.Initialize(&error))
+      return OptionalSkip("device-loss readback context unavailable: " +
+                          error);
+    constexpr int w = 2;
+    constexpr int h = 2;
+    VulkanImage upload, resident, readback;
+    if (!AllocateF32(loss_kernels, &upload, w, h, &error) ||
+        !resident.Allocate(loss_kernels.device(), w, h,
+                           VulkanPixelFormat::f32_1,
+                           /*map_memory=*/false, &error) ||
+        !readback.Allocate(loss_kernels.device(), w, h,
+                           VulkanPixelFormat::f32_1,
+                           /*map_memory=*/true, &error)) {
+      return OptionalSkip("device-loss readback allocation failed: " + error);
+    }
+    const std::vector<float> alpha = {0.0f, 1.0f, 0.25f, 0.75f};
+    FillF32(upload, alpha);
+    flush(upload);
+    loss_kernels.InvalidateDescriptorBindingCacheForSetup();
+    ok &= Require(loss_kernels.ResizeBilinearF32_1(upload, resident, &error),
+                  "device-loss readback setup should dispatch: " + error);
+    std::vector<float> cpu(alpha.size());
+    loss_kernels.device()->InjectNextSubmissionResultForTesting(
+        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
+        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
+    ok &= Require(!loss_kernels.ReadbackF32_1(
+                      resident, readback, cpu.data(), cpu.size(), &error),
+                  "device loss during staged readback must fail");
+    const auto poisoned = loss_kernels.device()->health();
+    ok &= Require(poisoned.poisoned &&
+                      poisoned.health ==
+                          studiocast::vulkan::VulkanContextHealth::device_lost,
+                  "staged readback device loss must poison the context");
+    const auto submitted_after_loss = poisoned.submitted_serial;
+    ok &= Require(!loss_kernels.ReadbackF32_1(
+                      resident, readback, cpu.data(), cpu.size(), &error) &&
+                      loss_kernels.device()->health().submitted_serial ==
+                          submitted_after_loss,
+                  "poisoned readback context must reject retries before a "
+                  "new driver submission");
+  }
+
+  {
     const int w = 3, h = 2, radius = 1;
     const std::vector<std::uint8_t> rgb = {
         0,  10,  20,  30,  40,  50,  60,  70,  80,

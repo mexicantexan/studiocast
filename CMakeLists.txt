@@ -173,8 +173,8 @@ if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
                 "Set ncnn_DIR or NCNN_ROOT, or disable the production matting option.")
     endif()
     message(STATUS
-            "Production ncnn Vulkan matting build enabled (${_studiocast_ncnn_target}); "
-            "runtime availability remains gated by model artifacts, shared-device identity, warmup, and residency checks.")
+            "ncnn Vulkan matting build prerequisites enabled (${_studiocast_ncnn_target}); "
+            "this does not imply production readiness. Runtime remains blocked until a reviewed adapter imports StudioCast's exact shared device/queue/buffers and proves model integrity, warmup, synchronization, no CPU layers/readback, residency, and bounded allocation reuse.")
 else()
     message(STATUS "Production ncnn Vulkan matting build disabled.")
 endif()

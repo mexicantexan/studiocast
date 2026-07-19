@@ -11,21 +11,6 @@ namespace studiocast::open_vulkan {
 
 namespace {
 
-const char *DefaultUnavailableReason() {
-#if defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) &&                       \
-    STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
-  return "OpenVulkanMattingSession: production ncnn Vulkan dependencies are "
-         "enabled, but the shared-device runtime adapter is not implemented "
-         "in this milestone. The spike's CPU Mat bridge is intentionally not "
-         "used by production.";
-#else
-  return "OpenVulkanMattingSession: production ncnn Vulkan matting build "
-         "option is disabled (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=OFF). "
-         "The spike's CPU Mat bridge is intentionally not used by "
-         "production.";
-#endif
-}
-
 bool IsFinite3(const std::array<double, 3> &v) {
   return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
@@ -52,6 +37,7 @@ struct OpenVulkanMattingSession::Impl {
   bool buffers_ready = false;
   int last_frame_w = 0;
   int last_frame_h = 0;
+  studiocast::vulkan::VulkanContextIdentity bound_context{};
 
   studiocast::vulkan::kernels::ModelPreprocessSpec preprocess{};
   studiocast::vulkan::VulkanTensor input_tensor;
@@ -63,6 +49,52 @@ struct OpenVulkanMattingSession::Impl {
     pack_validation_error = std::move(message);
     if (error_out)
       *error_out = pack_validation_error;
+    return false;
+  }
+
+  VulkanMattingReadiness Readiness() const {
+    VulkanMattingReadinessInput input;
+    input.production_build_enabled = ProductionVulkanMattingBuildEnabled();
+    input.production_adapter_available =
+        ProductionVulkanMattingAdapterAvailable();
+    input.model_pack_selected = !pack.id.empty();
+    input.model_contract_validated = validated_pack;
+    if (device) {
+      const auto diagnostics = device->DiagnosticsSnapshot();
+      input.non_cpu_device_selected = diagnostics.non_cpu_device_selected;
+      input.compute_queue_available = diagnostics.compute_queue_available;
+      input.context_healthy = diagnostics.context_healthy;
+    }
+    input.session_initialized =
+        buffers_ready && runtime_lifecycle && runtime_lifecycle->prepared();
+    input.session_warmed = runtime_lifecycle && runtime_lifecycle->warmed();
+    if (runtime_lifecycle) {
+      input.failure_latched = runtime_lifecycle->failure_latched();
+      input.failure = runtime_lifecycle->latched_failure();
+      input.failure_detail = runtime_lifecycle->latched_error();
+      input.runtime = runtime_lifecycle->Evidence();
+    }
+    return EvaluateVulkanMattingReadiness(input);
+  }
+
+  bool Latch(VulkanMattingRuntimeFailure failure, std::string detail,
+             std::string *error_out) {
+    if (!runtime_lifecycle) {
+      if (error_out)
+        *error_out = FormatVulkanMattingReadiness(Readiness());
+      return false;
+    }
+    std::string ignored;
+    (void)runtime_lifecycle->LatchExternalFailure(failure, std::move(detail),
+                                                  &ignored);
+    if (error_out)
+      *error_out = FormatVulkanMattingReadiness(Readiness());
+    return false;
+  }
+
+  bool ReportReadiness(std::string *error_out) const {
+    if (error_out)
+      *error_out = FormatVulkanMattingReadiness(Readiness());
     return false;
   }
 
@@ -168,8 +200,8 @@ struct OpenVulkanMattingSession::Impl {
     graph.input_w = spec.input.width;
     graph.output_n = 1;
     graph.output_c = 1;
-    graph.output_h = spec.input.height;
-    graph.output_w = spec.input.width;
+    graph.output_h = spec.output.height;
+    graph.output_w = spec.output.width;
 
     preprocess.dst_w = spec.input.width;
     preprocess.dst_h = spec.input.height;
@@ -202,11 +234,8 @@ OpenVulkanMattingSession::OpenVulkanMattingSession(
     studiocast::vulkan::VulkanDevice *device,
     studiocast::vulkan::kernels::UtilityKernels *kernels,
     studiocast::open_video::ModelPack pack, Options opts)
-    : OpenVulkanMattingSession(
-          device, kernels, std::move(pack), opts,
-          CreateUnavailableVulkanMattingRuntime(
-              DefaultUnavailableReason())) {
-}
+    : OpenVulkanMattingSession(device, kernels, std::move(pack), opts,
+                               CreateProductionVulkanMattingRuntime()) {}
 
 OpenVulkanMattingSession::OpenVulkanMattingSession(
     studiocast::vulkan::VulkanDevice *device,
@@ -227,26 +256,34 @@ OpenVulkanMattingSession::options() const {
 }
 
 bool OpenVulkanMattingSession::DeviceResidentInferenceAvailable() const {
-  return impl_->runtime_lifecycle && impl_->runtime_lifecycle->available();
+  return Readiness().production_ready;
 }
 
-VulkanMattingRuntimeEvidence
-OpenVulkanMattingSession::RuntimeEvidence() const {
+VulkanMattingReadiness OpenVulkanMattingSession::Readiness() const {
+  return impl_->Readiness();
+}
+
+VulkanMattingRuntimeEvidence OpenVulkanMattingSession::RuntimeEvidence() const {
   return impl_->runtime_lifecycle ? impl_->runtime_lifecycle->Evidence()
                                   : VulkanMattingRuntimeEvidence{};
 }
 
 VulkanMattingRuntimeFailure
 OpenVulkanMattingSession::LatchedRuntimeFailure() const {
-  return impl_->runtime_lifecycle
-             ? impl_->runtime_lifecycle->latched_failure()
-             : VulkanMattingRuntimeFailure::unavailable;
+  return impl_->runtime_lifecycle ? impl_->runtime_lifecycle->latched_failure()
+                                  : VulkanMattingRuntimeFailure::unavailable;
 }
 
 const std::string &OpenVulkanMattingSession::LatchedRuntimeError() const {
   static const std::string empty;
   return impl_->runtime_lifecycle ? impl_->runtime_lifecycle->latched_error()
                                   : empty;
+}
+
+bool OpenVulkanMattingSession::LatchExternalFailure(
+    VulkanMattingRuntimeFailure failure, std::string detail,
+    std::string *error_out) {
+  return impl_->Latch(failure, std::move(detail), error_out);
 }
 
 bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
@@ -258,53 +295,90 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
   impl_->last_frame_h = frame_h;
 
   if (!impl_->device || !impl_->device->Initialized()) {
-    if (error_out)
-      *error_out =
-          "OpenVulkanMattingSession: Vulkan device is not initialized.";
-    return false;
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::device_identity_mismatch,
+        "OpenVulkanMattingSession: Vulkan device is not initialized.",
+        error_out);
   }
   if (!impl_->kernels || !impl_->kernels->Initialized()) {
-    if (error_out)
-      *error_out =
-          "OpenVulkanMattingSession: Vulkan utility kernels are not "
-          "initialized.";
-    return false;
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::synchronization_failed,
+        "OpenVulkanMattingSession: Vulkan utility kernels are not "
+        "initialized.",
+        error_out);
   }
   if (frame_w <= 0 || frame_h <= 0) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession: invalid frame size.";
-    return false;
+    return impl_->Latch(VulkanMattingRuntimeFailure::invalid_shape,
+                        "OpenVulkanMattingSession: invalid frame size.",
+                        error_out);
   }
-  if (!impl_->ValidatePack(error_out))
-    return false;
+  std::string validation_error;
+  if (!impl_->ValidatePack(&validation_error)) {
+    return impl_->Latch(VulkanMattingRuntimeFailure::invalid_graph,
+                        std::move(validation_error), error_out);
+  }
+
+  // Contract/hash validation is one-time and precedes readiness. An absent
+  // shared-device adapter is then rejected before any Vulkan tensor/resource
+  // allocation.
+  if (!ProductionVulkanMattingBuildEnabled() ||
+      !ProductionVulkanMattingAdapterAvailable()) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::unavailable,
+        "No production shared-device ncnn Vulkan adapter is available.",
+        error_out);
+  }
+
+  const auto diagnostics = impl_->device->DiagnosticsSnapshot();
+  const auto current_context = impl_->device->context_identity();
+  if (!diagnostics.production_hardware_ready || !current_context.Valid()) {
+    return impl_->Latch(
+        diagnostics.context_health == "device_lost"
+            ? VulkanMattingRuntimeFailure::device_lost
+            : VulkanMattingRuntimeFailure::device_identity_mismatch,
+        "OpenVulkanMattingSession: a healthy non-CPU Vulkan context and "
+        "compute queue are required.",
+        error_out);
+  }
+  if (impl_->bound_context.Valid() &&
+      !(impl_->bound_context == current_context)) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::context_generation_mismatch,
+        "OpenVulkanMattingSession: Vulkan context identity/generation "
+        "changed; recreate the matting session.",
+        error_out);
+  }
 
   std::string alloc_err;
   if (!impl_->input_tensor.Valid() || impl_->input_tensor.n() != 1 ||
       impl_->input_tensor.c() != 3 ||
       impl_->input_tensor.h() != impl_->pack.matting->input.height ||
-      impl_->input_tensor.w() != impl_->pack.matting->input.width) {
+      impl_->input_tensor.w() != impl_->pack.matting->input.width ||
+      !impl_->input_tensor.device_local() ||
+      impl_->input_tensor.mapped() != nullptr) {
     if (!impl_->input_tensor.AllocateNchwF32(
             impl_->device, /*n_in=*/1, /*c_in=*/3,
             /*h_in=*/impl_->pack.matting->input.height,
             /*w_in=*/impl_->pack.matting->input.width,
             /*map_memory=*/false, &alloc_err)) {
-      if (error_out)
-        *error_out =
-            "OpenVulkanMattingSession: failed to allocate input tensor: " +
-            alloc_err;
-      return false;
+      return impl_->Latch(
+          VulkanMattingRuntimeFailure::allocation_contract_failed,
+          "OpenVulkanMattingSession: failed to allocate input tensor: " +
+              alloc_err,
+          error_out);
     }
   }
 
   studiocast::vulkan::VulkanTensorSize alpha_size;
   std::string size_error;
   if (!studiocast::vulkan::CheckedNchwF32Size(
-          1, 1, impl_->pack.matting->input.height,
-          impl_->pack.matting->input.width, &alpha_size, &size_error)) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession: invalid alpha allocation size: " +
-                   size_error;
-    return false;
+          1, 1, impl_->pack.matting->output.height,
+          impl_->pack.matting->output.width, &alpha_size, &size_error)) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::invalid_shape,
+        "OpenVulkanMattingSession: invalid alpha allocation size: " +
+            size_error,
+        error_out);
   }
   impl_->resources.input_bytes = impl_->input_tensor.bytes();
   impl_->resources.alpha_bytes = alpha_size.bytes;
@@ -323,11 +397,17 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
   context.selected_device_index =
       impl_->device->diagnostics().selected_device_index;
   context.stable_device_id = impl_->device->identity().stable_id;
+  context.context_id = current_context.context_id;
+  context.context_generation = current_context.generation;
+  context.non_cpu_device_selected = diagnostics.non_cpu_device_selected;
+  context.compute_queue_available = diagnostics.compute_queue_available;
+  context.context_healthy = diagnostics.context_healthy;
   if (!impl_->runtime_lifecycle ||
       !impl_->runtime_lifecycle->Prepare(context, impl_->graph,
                                          impl_->resources, error_out)) {
-    return false;
+    return impl_->ReportReadiness(error_out);
   }
+  impl_->bound_context = current_context;
   impl_->buffers_ready = true;
   return true;
 }
@@ -335,82 +415,91 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
 bool OpenVulkanMattingSession::Warmup(std::string *error_out) {
   if (error_out)
     error_out->clear();
-  if (!impl_->buffers_ready) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession: warmup requires initialized "
-                   "buffers.";
-    return false;
-  }
+  if (!impl_->buffers_ready)
+    return impl_->ReportReadiness(error_out);
   if (!impl_->runtime_lifecycle ||
       !impl_->runtime_lifecycle->Warmup(error_out)) {
-    return false;
+    return impl_->ReportReadiness(error_out);
   }
   return true;
 }
 
 bool OpenVulkanMattingSession::Run(
     const studiocast::vulkan::VulkanImage &input_rgb_gpu,
-    studiocast::vulkan::VulkanImage *output_alpha_gpu,
-    std::string *error_out) {
+    studiocast::vulkan::VulkanImage *output_alpha_gpu, std::string *error_out) {
   if (error_out)
     error_out->clear();
   if (!output_alpha_gpu) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession::Run: output_alpha_gpu is null.";
-    return false;
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::invalid_shape,
+        "OpenVulkanMattingSession::Run: output_alpha_gpu is null.", error_out);
   }
-  if (!impl_->buffers_ready || impl_->last_frame_w != input_rgb_gpu.width() ||
-      impl_->last_frame_h != input_rgb_gpu.height()) {
+  if (!impl_->buffers_ready) {
     if (!EnsureInitialized(input_rgb_gpu.width(), input_rgb_gpu.height(),
                            error_out)) {
       return false;
     }
   }
   if (!input_rgb_gpu.Valid()) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession::Run: invalid input image.";
-    return false;
+    return impl_->Latch(VulkanMattingRuntimeFailure::residency_check_failed,
+                        "OpenVulkanMattingSession::Run: invalid input image.",
+                        error_out);
   }
-  if (input_rgb_gpu.device() != impl_->device) {
-    if (error_out)
-      *error_out = "OpenVulkanMattingSession::Run: input image belongs to a "
-                   "different Vulkan device ownership domain.";
-    return false;
+  const auto current_context = impl_->device->context_identity();
+  if (!impl_->bound_context.Valid() || !current_context.Valid() ||
+      !(impl_->bound_context == current_context)) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::context_generation_mismatch,
+        "OpenVulkanMattingSession::Run: Vulkan context identity/generation "
+        "changed; recreate the matting session.",
+        error_out);
   }
-  if (!DeviceResidentInferenceAvailable()) {
+  if (!input_rgb_gpu.BelongsTo(*impl_->device)) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::device_identity_mismatch,
+        "OpenVulkanMattingSession::Run: input image belongs to a different "
+        "Vulkan context identity/generation.",
+        error_out);
+  }
+  if (!impl_->runtime_lifecycle || !impl_->runtime_lifecycle->available()) {
     if (error_out)
-      *error_out = DefaultUnavailableReason();
+      *error_out = FormatVulkanMattingReadiness(Readiness());
     return false;
   }
   if (!output_alpha_gpu->Valid() ||
       output_alpha_gpu->format() !=
           studiocast::vulkan::VulkanPixelFormat::f32_1 ||
-      output_alpha_gpu->width() != impl_->pack.matting->input.width ||
-      output_alpha_gpu->height() != impl_->pack.matting->input.height) {
+      output_alpha_gpu->width() != impl_->pack.matting->output.width ||
+      output_alpha_gpu->height() != impl_->pack.matting->output.height) {
     if (error_out) {
-      *error_out =
-          "OpenVulkanMattingSession::Run: output alpha image shape mismatch "
-          "(expected f32_1 " +
-          std::to_string(impl_->pack.matting->input.width) + "x" +
-          std::to_string(impl_->pack.matting->input.height) + ")";
+      error_out->clear();
     }
-    return false;
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::invalid_shape,
+        "OpenVulkanMattingSession::Run: output alpha image shape mismatch "
+        "(expected f32_1 " +
+            std::to_string(impl_->pack.matting->output.width) + "x" +
+            std::to_string(impl_->pack.matting->output.height) + ")",
+        error_out);
   }
-  if (output_alpha_gpu->device() != impl_->device) {
-    if (error_out)
-      *error_out =
-          "OpenVulkanMattingSession::Run: output alpha image belongs to a "
-          "different Vulkan device ownership domain.";
-    return false;
+  if (!output_alpha_gpu->BelongsTo(*impl_->device)) {
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::device_identity_mismatch,
+        "OpenVulkanMattingSession::Run: output alpha image belongs to a "
+        "different Vulkan context identity/generation.",
+        error_out);
   }
 
   std::string pp_err;
   if (!impl_->kernels->PreprocessToTensor(input_rgb_gpu, impl_->input_tensor,
                                           impl_->preprocess, &pp_err)) {
-    if (error_out)
-      *error_out =
-          "OpenVulkanMattingSession::Run: preprocess failed: " + pp_err;
-    return false;
+    const auto health = impl_->device->health();
+    return impl_->Latch(
+        health.health == studiocast::vulkan::VulkanContextHealth::device_lost
+            ? VulkanMattingRuntimeFailure::device_lost
+            : VulkanMattingRuntimeFailure::execution_failed,
+        "OpenVulkanMattingSession::Run: preprocess failed: " + pp_err,
+        error_out);
   }
 
   VulkanMattingBufferBinding input_binding;
@@ -423,21 +512,37 @@ bool OpenVulkanMattingSession::Run(
   input_binding.h = impl_->input_tensor.h();
   input_binding.w = impl_->input_tensor.w();
   input_binding.device_resident = impl_->input_tensor.Valid();
+  input_binding.device_local_memory = impl_->input_tensor.device_local();
+  input_binding.host_mapped = impl_->input_tensor.mapped() != nullptr;
+  input_binding.context_id = impl_->bound_context.context_id;
+  input_binding.context_generation = impl_->bound_context.generation;
+  // PreprocessToTensor records the producer barrier and completes through the
+  // device's serialized SubmitAndWait queue contract. A production adapter
+  // must run synchronously on that same queue before returning.
+  input_binding.access_synchronized = true;
+  input_binding.runtime_queue_ownership = true;
 
   VulkanMattingBufferBinding alpha_binding;
   alpha_binding.ownership_domain = impl_->device;
   alpha_binding.logical_device = OpaqueHandle(impl_->device->device());
   alpha_binding.buffer = OpaqueHandle(output_alpha_gpu->buffer());
-  alpha_binding.byte_size = static_cast<std::size_t>(
-      output_alpha_gpu->byte_size());
+  alpha_binding.byte_size =
+      static_cast<std::size_t>(output_alpha_gpu->byte_size());
   alpha_binding.n = 1;
   alpha_binding.c = 1;
   alpha_binding.h = output_alpha_gpu->height();
   alpha_binding.w = output_alpha_gpu->width();
   alpha_binding.device_resident = output_alpha_gpu->Valid();
+  alpha_binding.device_local_memory = output_alpha_gpu->device_local();
+  alpha_binding.host_mapped = output_alpha_gpu->mapped() != nullptr;
+  alpha_binding.context_id = impl_->bound_context.context_id;
+  alpha_binding.context_generation = impl_->bound_context.generation;
+  alpha_binding.access_synchronized = true;
+  alpha_binding.runtime_queue_ownership = true;
 
-  return impl_->runtime_lifecycle->Run(input_binding, alpha_binding,
-                                       error_out);
+  if (!impl_->runtime_lifecycle->Run(input_binding, alpha_binding, error_out))
+    return impl_->ReportReadiness(error_out);
+  return true;
 }
 
 } // namespace studiocast::open_vulkan
