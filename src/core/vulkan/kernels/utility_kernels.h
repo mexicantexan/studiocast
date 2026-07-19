@@ -71,6 +71,11 @@ public:
   bool CropResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                           float crop_x, float crop_y, float crop_w,
                           float crop_h, std::string *error_out);
+  // Exact out-of-place horizontal reversal. This intentionally reuses the
+  // existing crop/resize opcode with integer sample coordinates; it does not
+  // interpolate, change channel order, or permit src/dst aliasing.
+  bool MirrorHorizontalU8x3(const VulkanImage &src, const VulkanImage &dst,
+                            std::string *error_out);
   bool ResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                       std::string *error_out);
 

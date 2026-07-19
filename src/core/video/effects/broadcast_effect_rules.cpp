@@ -78,14 +78,6 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
     vb_id.clear();
   }
 
-  // 2) Mirror is intentionally not implemented in the pipeline.
-  // Keep it in the schema/UI for backward compatibility, but never schedule it.
-  if (enable_mirror) {
-    plan.disabled.push_back(DisabledEffectByRule{
-        .id = std::string(contract::kEffectIdMirror),
-        .reason = "Disabled: mirror is not supported (ignored)."});
-  }
-
   // ---- Ordering rules ----
   // Rationale (high-level):
   //  - Noise removal early improves subsequent stages.
@@ -126,6 +118,13 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
     plan.ordered_effect_ids.push_back(std::string(contract::kEffectIdVignette));
   }
 
+  // Mirror is the final visual transform. Face/subject analysis and every
+  // other effect must consume the unmirrored frame, and the live Vulkan path
+  // applies this stage after any output resize.
+  if (enable_mirror) {
+    plan.ordered_effect_ids.push_back(std::string(contract::kEffectIdMirror));
+  }
+
   // Decide vignette attachment.
   if (enable_vignette) {
     // Attach to the last enabled GPU stage (excluding vignette itself).
@@ -142,6 +141,20 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
   }
 
   return plan;
+}
+
+bool BroadcastEffectsPlanRequestsCompute(const BroadcastEffectsPlan &plan) {
+  using namespace contract;
+  for (const std::string &id : plan.ordered_effect_ids) {
+    if (id == kEffectIdMirror || id == kEffectIdVideoNoiseRemoval ||
+        id == kEffectIdEyeContact || id == kEffectIdVirtualBackgroundBlur ||
+        id == kEffectIdVirtualBackgroundRemove ||
+        id == kEffectIdVirtualBackgroundReplace || id == kEffectIdAutoFrame ||
+        id == kEffectIdVirtualKeyLight || id == kEffectIdVignette) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace studiocast::video::effects

@@ -589,6 +589,62 @@ bool UtilityKernels::ResizeBilinear(const VulkanImage &src,
                             static_cast<float>(src.height()), error_out);
 }
 
+bool UtilityKernels::MirrorHorizontalU8x3(const VulkanImage &src,
+                                          const VulkanImage &dst,
+                                          std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!ValidateRgbOrBgrImage(src, "MirrorHorizontalU8x3(src)", error_out) ||
+      !ValidateRgbOrBgrImage(dst, "MirrorHorizontalU8x3(dst)", error_out)) {
+    return false;
+  }
+  if (!SameDimensions(src, dst)) {
+    if (error_out)
+      *error_out = "MirrorHorizontalU8x3: dimension mismatch.";
+    return false;
+  }
+  if (!SameU8Format(src, dst)) {
+    if (error_out)
+      *error_out = "MirrorHorizontalU8x3: src/dst formats must match.";
+    return false;
+  }
+  if (src.buffer() == dst.buffer()) {
+    if (error_out)
+      *error_out = "MirrorHorizontalU8x3: src/dst must be distinct images.";
+    return false;
+  }
+  if (!Initialize(error_out))
+    return false;
+  if (!ValidateContext(device_, src, "MirrorHorizontalU8x3(src)", error_out) ||
+      !ValidateContext(device_, dst, "MirrorHorizontalU8x3(dst)", error_out)) {
+    return false;
+  }
+
+  Params p{};
+  p.src_w = static_cast<std::uint32_t>(src.width());
+  p.src_h = static_cast<std::uint32_t>(src.height());
+  p.src_pitch = static_cast<std::uint32_t>(src.pitch_pixels());
+  p.dst_w = static_cast<std::uint32_t>(dst.width());
+  p.dst_h = static_cast<std::uint32_t>(dst.height());
+  p.dst_pitch = static_cast<std::uint32_t>(dst.pitch_pixels());
+
+  // For equal source/destination widths the crop opcode computes:
+  //   src_x = W + (x + 0.5) * (-W / W) - 0.5 = W - 1 - x.
+  // Both axes therefore land on exact integer coordinates and the existing
+  // bilinear opcode returns the original three channel bytes bit-for-bit.
+  p.crop_x = static_cast<float>(src.width());
+  p.crop_y = 0.0f;
+  p.crop_w = -static_cast<float>(src.width());
+  p.crop_h = static_cast<float>(src.height());
+
+  if (!BindBuffers(src.buffer(), nullptr, nullptr, dst.buffer(), nullptr,
+                   nullptr, error_out)) {
+    return false;
+  }
+  return Dispatch(p, Op::crop_resize_u8x3, p.dst_w, p.dst_h, error_out);
+}
+
 bool UtilityKernels::PreprocessToTensor(const VulkanImage &src,
                                         const VulkanTensor &dst,
                                         const ModelPreprocessSpec &spec,

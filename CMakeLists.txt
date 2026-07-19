@@ -466,6 +466,8 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
             src/core/vulkan/kernels/utility_kernels.cpp
             src/core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h
             src/core/vulkan/kernels/shaders/utility_kernels_spv.h
+            src/core/video/open_vulkan_mirror.h
+            src/core/video/open_vulkan_mirror.cpp
     )
 endif()
 
