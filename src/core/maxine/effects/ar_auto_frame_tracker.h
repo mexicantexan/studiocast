@@ -42,6 +42,9 @@ public:
   // `input_bgr_gpu` must remain valid for the lifetime of the initialized
   // tracker.
   bool EnsureInitialized(NvCVImage *input_bgr_gpu, std::string *error_out);
+  bool SetExternalCudaStream(studiocast::maxine::CUstream stream,
+                             std::string *error_out);
+  void InvalidateBindings() noexcept;
   void Reset();
 
   void SetKnobs(const AutoFrameKnobs &knobs) { knobs_ = knobs; }
@@ -72,12 +75,24 @@ private:
   bool RunAndExtractBestBox(NvAR_FeatureHandle handle, int frame_w, int frame_h,
                             RectF *out_best_box_px, bool *out_found,
                             std::string *error_out);
+  bool BindStream(NvAR_FeatureHandle handle, bool *bound,
+                  std::string *error_out);
 
   studiocast::maxine::ar::ArApi *ar_ = nullptr; // non-owning
   NvCVImage *input_bgr_gpu_ = nullptr;          // non-owning
+  unsigned input_width_ = 0;
+  unsigned input_height_ = 0;
+  bool face_input_bound_ = false;
+  bool body_input_configured_ = false;
 
   NvAR_FeatureHandle face_handle_ = nullptr;
   NvAR_FeatureHandle body_handle_ = nullptr; // optional
+  studiocast::maxine::CUstream external_stream_ = nullptr;
+  bool external_stream_selected_ = false;
+  bool face_stream_bound_ = false;
+  bool body_stream_bound_ = false;
+  bool face_outputs_configured_ = false;
+  bool body_outputs_configured_ = false;
 
   // Output binding (best-effort). Some AR builds may require SetF32Array.
   std::string boxes_param_name_;

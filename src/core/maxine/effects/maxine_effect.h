@@ -43,6 +43,15 @@ public:
   virtual NvCV_Status Process(studiocast::video::GpuFrame &frame,
                               std::string *error) = 0;
 
+  // Select a pipeline-owned CUDA stream. The effect binds but never destroys
+  // this stream. Repeating the same selection is idempotent.
+  virtual bool SetExternalCudaStream(maxine::CUstream stream,
+                                     std::string *error) = 0;
+
+  // Runtime failures invalidate pointer/stream bindings without discarding
+  // stable user configuration or ownership telemetry.
+  virtual void InvalidateBindings() noexcept = 0;
+
   virtual const char *Backend() const { return "maxine"; }
 };
 
