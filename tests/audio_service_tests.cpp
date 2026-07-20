@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "core/audio/audio_backend_resolver.h"
+#include "core/audio/audio_consumer_detector.h"
 #include "core/audio/audio_device_safety.h"
 #include "core/audio/audio_pipeline.h"
 #include "core/audio/audio_processor.h"
@@ -62,6 +63,24 @@ public:
 
   ScopedPactlExecHook(const ScopedPactlExecHook &) = delete;
   ScopedPactlExecHook &operator=(const ScopedPactlExecHook &) = delete;
+};
+
+class ScopedPactlStopAwareExecHook final {
+public:
+  explicit ScopedPactlStopAwareExecHook(
+      studiocast::audio::pulse::PactlExecCaptureStopAwareHook hook) {
+    studiocast::audio::pulse::SetPactlExecCaptureStopAwareHookForTesting(
+        std::move(hook));
+  }
+
+  ~ScopedPactlStopAwareExecHook() {
+    studiocast::audio::pulse::SetPactlExecCaptureStopAwareHookForTesting(
+        nullptr);
+  }
+
+  ScopedPactlStopAwareExecHook(const ScopedPactlStopAwareExecHook &) = delete;
+  ScopedPactlStopAwareExecHook &
+  operator=(const ScopedPactlStopAwareExecHook &) = delete;
 };
 
 class EnvGuard final {
@@ -169,6 +188,134 @@ AudioConsumerSnapshot ConsumerSnapshot(bool present, int count = 1) {
   out.present = present;
   out.count = present ? count : 0;
   return out;
+}
+
+struct FakePactlSubscriptionState {
+  std::atomic<bool> event_pending{false};
+  std::atomic<bool> disconnect_pending{false};
+  std::atomic<int> starts{0};
+  std::atomic<int> stops{0};
+};
+
+class FakePactlSubscriptionMonitor final
+    : public studiocast::audio::PactlSubscriptionMonitor {
+public:
+  explicit FakePactlSubscriptionMonitor(
+      std::shared_ptr<FakePactlSubscriptionState> state)
+      : state_(std::move(state)) {}
+
+  ~FakePactlSubscriptionMonitor() override { Stop(); }
+
+  studiocast::audio::PactlSubscriptionPollResult Poll() override {
+    studiocast::audio::PactlSubscriptionPollResult out;
+    out.event_received =
+        state_->event_pending.exchange(false, std::memory_order_acq_rel);
+    out.disconnected =
+        state_->disconnect_pending.exchange(false, std::memory_order_acq_rel);
+    if (out.disconnected)
+      out.error = "synthetic pactl subscription disconnect";
+    return out;
+  }
+
+  void Stop() override {
+    if (!stopped_.exchange(true, std::memory_order_acq_rel))
+      state_->stops.fetch_add(1, std::memory_order_relaxed);
+  }
+
+private:
+  std::shared_ptr<FakePactlSubscriptionState> state_;
+  std::atomic<bool> stopped_{false};
+};
+
+studiocast::audio::PactlSubscriptionMonitorFactory FakePactlMonitorFactory(
+    const std::shared_ptr<FakePactlSubscriptionState> &state) {
+  return [state](std::string *error) {
+    if (error)
+      error->clear();
+    state->starts.fetch_add(1, std::memory_order_relaxed);
+    return std::make_unique<FakePactlSubscriptionMonitor>(state);
+  };
+}
+
+struct BlockingPactlSubscriptionState {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool blocked = false;
+  bool stop_requested = false;
+  int stop_calls = 0;
+};
+
+class BlockingPactlSubscriptionMonitor final
+    : public studiocast::audio::PactlSubscriptionMonitor {
+public:
+  explicit BlockingPactlSubscriptionMonitor(
+      std::shared_ptr<BlockingPactlSubscriptionState> state)
+      : state_(std::move(state)), worker_([state = state_] {
+          std::unique_lock<std::mutex> lock(state->mu);
+          state->blocked = true;
+          state->cv.notify_all();
+          state->cv.wait(lock, [&] { return state->stop_requested; });
+        }) {}
+
+  ~BlockingPactlSubscriptionMonitor() override { Stop(); }
+
+  studiocast::audio::PactlSubscriptionPollResult Poll() override { return {}; }
+
+  void Stop() override {
+    if (stopped_.exchange(true, std::memory_order_acq_rel))
+      return;
+    {
+      std::lock_guard<std::mutex> lock(state_->mu);
+      ++state_->stop_calls;
+      state_->stop_requested = true;
+    }
+    state_->cv.notify_all();
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+private:
+  std::shared_ptr<BlockingPactlSubscriptionState> state_;
+  std::thread worker_;
+  std::atomic<bool> stopped_{false};
+};
+
+struct FakePactlSnapshotState {
+  std::atomic<int> helper_calls{0};
+  std::atomic<bool> source_present{true};
+  std::atomic<bool> sink_present{true};
+  std::atomic<bool> source_consumer{true};
+  std::atomic<bool> sink_consumer{true};
+  std::atomic<bool> fail_sources{false};
+};
+
+studiocast::audio::pulse::PactlExecCaptureHook
+FakePactlSnapshotHook(const std::shared_ptr<FakePactlSnapshotState> &state) {
+  return [state](const std::string &command) {
+    state->helper_calls.fetch_add(1, std::memory_order_relaxed);
+    if (command == "pactl list short sources 2>&1") {
+      if (state->fail_sources.load(std::memory_order_relaxed))
+        return ExecResult(1, "synthetic source snapshot failure\n");
+      return state->source_present.load(std::memory_order_relaxed)
+                 ? ExecResult(0, "1\tstudiocast_mic\tmodule-remap-source.c\n")
+                 : ExecResult(0);
+    }
+    if (command == "pactl list short sinks 2>&1")
+      return state->sink_present.load(std::memory_order_relaxed)
+                 ? ExecResult(0, "2\tstudiocast_speakers\tmodule-null-sink.c\n")
+                 : ExecResult(0);
+    if (command == "pactl list short source-outputs 2>&1") {
+      return state->source_consumer.load(std::memory_order_relaxed)
+                 ? ExecResult(0, "7\t1\t51\tprotocol-native.c\n")
+                 : ExecResult(0);
+    }
+    if (command == "pactl list short sink-inputs 2>&1") {
+      return state->sink_consumer.load(std::memory_order_relaxed)
+                 ? ExecResult(0, "8\t2\t52\tprotocol-native.c\n")
+                 : ExecResult(0);
+    }
+    return ExecResult(99, "unexpected command: " + command);
+  };
 }
 
 studiocast::audio::pulse::PactlExecCaptureHook SafeMicrophoneSourcePactlHook() {
@@ -1134,6 +1281,280 @@ bool TestPactlConsumerListsParseSourceOutputsAndSinkInputs() {
     for (const auto &command : commands)
       std::cerr << "  " << command << "\n";
     return false;
+  }
+
+  return true;
+}
+
+bool TestPactlSubscriptionCacheRefreshesOnlyOnEvents() {
+  auto monitor_state = std::make_shared<FakePactlSubscriptionState>();
+  auto snapshot_state = std::make_shared<FakePactlSnapshotState>();
+  ScopedPactlExecHook hook(FakePactlSnapshotHook(snapshot_state));
+  std::atomic_bool stop{false};
+  auto detector =
+      studiocast::audio::CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+          FakePactlMonitorFactory(monitor_state), &stop, 5s);
+
+  auto mic = detector->DetectSourceConsumersByName("studiocast_mic");
+  auto speakers = detector->DetectSinkConsumersByName("studiocast_speakers");
+  if (!mic.present || mic.count != 1 || !mic.error.empty() ||
+      !speakers.present || speakers.count != 1 || !speakers.error.empty() ||
+      monitor_state->starts.load(std::memory_order_relaxed) != 1 ||
+      snapshot_state->helper_calls.load(std::memory_order_relaxed) != 4) {
+    std::cerr << "initial cached pactl snapshot was not prepared exactly once; "
+              << "starts=" << monitor_state->starts.load()
+              << " helpers=" << snapshot_state->helper_calls.load()
+              << " mic_error='" << mic.error << "' speaker_error='"
+              << speakers.error << "'\n";
+    return false;
+  }
+
+  for (int i = 0; i < 200; ++i) {
+    (void)detector->DetectSourceConsumersByName("studiocast_mic");
+    (void)detector->DetectSinkConsumersByName("studiocast_speakers");
+  }
+  if (snapshot_state->helper_calls.load(std::memory_order_relaxed) != 4 ||
+      monitor_state->starts.load(std::memory_order_relaxed) != 1) {
+    std::cerr << "stable polling relaunched pactl helpers; starts="
+              << monitor_state->starts.load()
+              << " helpers=" << snapshot_state->helper_calls.load() << "\n";
+    return false;
+  }
+
+  snapshot_state->source_consumer.store(false, std::memory_order_relaxed);
+  snapshot_state->sink_consumer.store(false, std::memory_order_relaxed);
+  monitor_state->event_pending.store(true, std::memory_order_release);
+  mic = detector->DetectSourceConsumersByName("studiocast_mic");
+  speakers = detector->DetectSinkConsumersByName("studiocast_speakers");
+  if (mic.present || speakers.present ||
+      snapshot_state->helper_calls.load(std::memory_order_relaxed) != 8) {
+    std::cerr << "subscription event did not cause exactly one refresh; "
+              << "helpers=" << snapshot_state->helper_calls.load() << "\n";
+    return false;
+  }
+
+  // A burst is represented by one dirty bit rather than an application queue.
+  for (int i = 0; i < 1000; ++i)
+    monitor_state->event_pending.store(true, std::memory_order_release);
+  (void)detector->DetectSourceConsumersByName("studiocast_mic");
+  (void)detector->DetectSinkConsumersByName("studiocast_speakers");
+  if (snapshot_state->helper_calls.load(std::memory_order_relaxed) != 12) {
+    std::cerr << "subscription event burst was not coalesced; helpers="
+              << snapshot_state->helper_calls.load() << "\n";
+    return false;
+  }
+
+  snapshot_state->source_present.store(false, std::memory_order_relaxed);
+  monitor_state->event_pending.store(true, std::memory_order_release);
+  mic = detector->DetectSourceConsumersByName("studiocast_mic");
+  if (mic.error.find("not present") == std::string::npos || mic.present ||
+      snapshot_state->helper_calls.load(std::memory_order_relaxed) != 16) {
+    std::cerr << "missing configured source was not preserved in status; "
+              << "error='" << mic.error
+              << "' helpers=" << snapshot_state->helper_calls.load() << "\n";
+    return false;
+  }
+  for (int i = 0; i < 100; ++i)
+    mic = detector->DetectSourceConsumersByName("studiocast_mic");
+  if (mic.error.find("not present") == std::string::npos ||
+      snapshot_state->helper_calls.load(std::memory_order_relaxed) != 16) {
+    std::cerr << "stable missing source polling relaunched helpers; error='"
+              << mic.error
+              << "' helpers=" << snapshot_state->helper_calls.load() << "\n";
+    return false;
+  }
+
+  return true;
+}
+
+bool TestPactlSubscriptionReconnectAndStickyRefreshFailure() {
+  {
+    std::atomic<int> starts{0};
+    std::atomic_bool stop{false};
+    auto detector =
+        studiocast::audio::
+            CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+                [&starts](std::string *error)
+                    -> std::unique_ptr<
+                        studiocast::audio::PactlSubscriptionMonitor> {
+                  starts.fetch_add(1, std::memory_order_relaxed);
+                  if (error)
+                    *error = "synthetic subscription start failure";
+                  return nullptr;
+                },
+                &stop, 1h);
+    AudioConsumerSnapshot result;
+    for (int i = 0; i < 200; ++i)
+      result = detector->DetectSourceConsumersByName("studiocast_mic");
+    if (starts.load(std::memory_order_relaxed) != 1 ||
+        result.error.find("synthetic subscription start failure") ==
+            std::string::npos) {
+      std::cerr << "failed subscription start did not remain in bounded "
+                   "backoff; starts="
+                << starts.load() << " error='" << result.error << "'\n";
+      return false;
+    }
+  }
+
+  {
+    auto monitor_state = std::make_shared<FakePactlSubscriptionState>();
+    auto snapshot_state = std::make_shared<FakePactlSnapshotState>();
+    ScopedPactlExecHook hook(FakePactlSnapshotHook(snapshot_state));
+    std::atomic_bool stop{false};
+    auto detector = studiocast::audio::
+        CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+            FakePactlMonitorFactory(monitor_state), &stop, 0ms);
+
+    (void)detector->DetectSourceConsumersByName("studiocast_mic");
+    monitor_state->disconnect_pending.store(true, std::memory_order_release);
+    const auto disconnected =
+        detector->DetectSourceConsumersByName("studiocast_mic");
+    if (disconnected.error.find("synthetic pactl subscription disconnect") ==
+            std::string::npos ||
+        disconnected.present ||
+        snapshot_state->helper_calls.load(std::memory_order_relaxed) != 4) {
+      std::cerr << "subscription disconnect was not surfaced without a "
+                   "snapshot relaunch; error='"
+                << disconnected.error
+                << "' helpers=" << snapshot_state->helper_calls.load() << "\n";
+      return false;
+    }
+
+    const auto recovered =
+        detector->DetectSourceConsumersByName("studiocast_mic");
+    if (!recovered.present || !recovered.error.empty() ||
+        monitor_state->starts.load(std::memory_order_relaxed) != 2 ||
+        snapshot_state->helper_calls.load(std::memory_order_relaxed) != 8) {
+      std::cerr << "subscription reconnect did not perform one fresh snapshot; "
+                << "starts=" << monitor_state->starts.load()
+                << " helpers=" << snapshot_state->helper_calls.load()
+                << " error='" << recovered.error << "'\n";
+      return false;
+    }
+  }
+
+  {
+    auto monitor_state = std::make_shared<FakePactlSubscriptionState>();
+    auto snapshot_state = std::make_shared<FakePactlSnapshotState>();
+    ScopedPactlExecHook hook(FakePactlSnapshotHook(snapshot_state));
+    std::atomic_bool stop{false};
+    auto detector = studiocast::audio::
+        CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+            FakePactlMonitorFactory(monitor_state), &stop, 1h);
+
+    (void)detector->DetectSourceConsumersByName("studiocast_mic");
+    snapshot_state->fail_sources.store(true, std::memory_order_relaxed);
+    monitor_state->event_pending.store(true, std::memory_order_release);
+    const auto failed = detector->DetectSourceConsumersByName("studiocast_mic");
+    if (failed.error.find("synthetic source snapshot failure") ==
+            std::string::npos ||
+        snapshot_state->helper_calls.load(std::memory_order_relaxed) != 5) {
+      std::cerr << "snapshot refresh failure was not surfaced; error='"
+                << failed.error
+                << "' helpers=" << snapshot_state->helper_calls.load() << "\n";
+      return false;
+    }
+
+    for (int i = 0; i < 200; ++i)
+      (void)detector->DetectSourceConsumersByName("studiocast_mic");
+    if (snapshot_state->helper_calls.load(std::memory_order_relaxed) != 5 ||
+        monitor_state->starts.load(std::memory_order_relaxed) != 1) {
+      std::cerr << "failed snapshot retried during stable backoff; starts="
+                << monitor_state->starts.load()
+                << " helpers=" << snapshot_state->helper_calls.load() << "\n";
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool TestPactlSubscriptionAndSnapshotStopAreBounded() {
+  {
+    auto monitor_state = std::make_shared<BlockingPactlSubscriptionState>();
+    auto snapshot_state = std::make_shared<FakePactlSnapshotState>();
+    ScopedPactlExecHook hook(FakePactlSnapshotHook(snapshot_state));
+    std::atomic_bool stop{false};
+    auto detector = studiocast::audio::
+        CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+            [monitor_state](std::string *error) {
+              if (error)
+                error->clear();
+              return std::make_unique<BlockingPactlSubscriptionMonitor>(
+                  monitor_state);
+            },
+            &stop, 5s);
+    (void)detector->DetectSourceConsumersByName("studiocast_mic");
+
+    {
+      std::unique_lock<std::mutex> lock(monitor_state->mu);
+      if (!monitor_state->cv.wait_for(lock, 250ms,
+                                      [&] { return monitor_state->blocked; })) {
+        std::cerr << "synthetic subscription did not enter blocked wait\n";
+        return false;
+      }
+    }
+
+    auto destroy =
+        std::async(std::launch::async, [&detector] { detector.reset(); });
+    if (destroy.wait_for(50ms) != std::future_status::ready) {
+      std::cerr << "detector destruction did not stop blocked subscription\n";
+      (void)destroy.wait_for(250ms);
+      return false;
+    }
+    destroy.get();
+    std::lock_guard<std::mutex> lock(monitor_state->mu);
+    if (monitor_state->stop_calls != 1) {
+      std::cerr << "blocked subscription stop count was "
+                << monitor_state->stop_calls << " instead of 1\n";
+      return false;
+    }
+  }
+
+  {
+    auto monitor_state = std::make_shared<FakePactlSubscriptionState>();
+    std::atomic_bool stop{false};
+    std::atomic_bool helper_entered{false};
+    ScopedPactlStopAwareExecHook hook(
+        [&](const std::string &command,
+            const std::atomic_bool *stop_requested) {
+          if (command != "pactl list short sources 2>&1")
+            return ExecResult(99, "unexpected command: " + command);
+          helper_entered.store(true, std::memory_order_release);
+          while (stop_requested &&
+                 !stop_requested->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(1ms);
+          }
+          auto result = ExecResult(-1);
+          result.cancelled = true;
+          return result;
+        });
+    auto detector = studiocast::audio::
+        CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+            FakePactlMonitorFactory(monitor_state), &stop, 5s);
+    auto detection = std::async(std::launch::async, [&] {
+      return detector->DetectSourceConsumersByName("studiocast_mic");
+    });
+    if (!WaitUntil(
+            [&] { return helper_entered.load(std::memory_order_acquire); },
+            250ms)) {
+      std::cerr << "snapshot helper did not enter blocked wait\n";
+      stop.store(true, std::memory_order_release);
+      (void)detection.get();
+      return false;
+    }
+
+    stop.store(true, std::memory_order_release);
+    if (detection.wait_for(50ms) != std::future_status::ready) {
+      std::cerr << "stop token did not interrupt blocked snapshot helper\n";
+      return false;
+    }
+    const auto result = detection.get();
+    if (result.error.find("cancelled") == std::string::npos) {
+      std::cerr << "cancelled snapshot helper error was not visible; error='"
+                << result.error << "'\n";
+      return false;
+    }
   }
 
   return true;
@@ -5089,6 +5510,12 @@ int main() {
        &TestPactlProplistCommandsQuoteArgumentsAndDetectFailures},
       {"pactl consumer lists parse source outputs and sink inputs",
        &TestPactlConsumerListsParseSourceOutputsAndSinkInputs},
+      {"pactl subscription cache refreshes only on events",
+       &TestPactlSubscriptionCacheRefreshesOnlyOnEvents},
+      {"pactl subscription reconnect and sticky refresh failure",
+       &TestPactlSubscriptionReconnectAndStickyRefreshFailure},
+      {"pactl subscription and snapshot stop are bounded",
+       &TestPactlSubscriptionAndSnapshotStopAreBounded},
       {"audio source safety rejects virtual and monitor sources",
        &TestAudioSourceSafetyRejectsVirtualAndMonitorSources},
       {"audio source auto falls back from unsafe default source",

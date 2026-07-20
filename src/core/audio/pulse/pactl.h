@@ -58,8 +58,13 @@ bool PactlAvailable(std::string *details);
 
 using PactlExecCaptureHook =
     std::function<studiocast::util::ExecResult(const std::string &)>;
+using PactlExecCaptureStopAwareHook =
+    std::function<studiocast::util::ExecResult(const std::string &,
+                                               const std::atomic_bool *)>;
 
 void SetPactlExecCaptureHookForTesting(PactlExecCaptureHook hook);
+void SetPactlExecCaptureStopAwareHookForTesting(
+    PactlExecCaptureStopAwareHook hook);
 
 std::optional<int> LoadModule(const std::string &module,
                               const std::string &args, std::string *error);
@@ -75,8 +80,12 @@ ListSources(std::string *error,
 std::vector<PactlSink>
 ListSinks(std::string *error,
           const std::atomic_bool *stop_requested = nullptr);
-std::vector<PactlSourceOutput> ListSourceOutputs(std::string *error);
-std::vector<PactlSinkInput> ListSinkInputs(std::string *error);
+std::vector<PactlSourceOutput>
+ListSourceOutputs(std::string *error,
+                  const std::atomic_bool *stop_requested = nullptr);
+std::vector<PactlSinkInput>
+ListSinkInputs(std::string *error,
+               const std::atomic_bool *stop_requested = nullptr);
 
 std::optional<std::string>
 GetDefaultSourceName(std::string *error,
