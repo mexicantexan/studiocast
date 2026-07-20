@@ -21,6 +21,30 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
+MODEL_PACK_SIZE_ROWS = [
+    ("fastenhancer_s_vd_v1", 1, 832775),
+    ("fastenhancer_m_vd_v1", 1, 2033628),
+    ("modnet-webnn-256-fp32", 1, 25888640),
+    ("yunet_opencv_zoo_2023mar_fp32", 1, 232589),
+    ("dlib_68_ibug_300w", 1, 99693937),
+    ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
+    ("fastdvdnet_sigma15", 1, 416788),
+]
+
+
+def catalog_size_summary() -> dict:
+    return {
+        "schema_version": 1, "catalog_version": "2026-07-19",
+        "catalog_sha256": "sha256:130ac3b35680c4adbd6cd0471770150b7d813ad0e11b226dbc216f689ba8058c",
+        "trusted": True,
+        "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
+        "pack_count": 7, "artifact_count": 8, "download_bytes": 131224287,
+        "packs": [
+            {"id": pack_id, "artifact_count": artifact_count,
+             "download_bytes": download_bytes, "size_status": "known"}
+            for pack_id, artifact_count, download_bytes in MODEL_PACK_SIZE_ROWS
+        ],
+    }
 
 
 def facts() -> dict:
@@ -45,7 +69,9 @@ def facts() -> dict:
         "gpus": {"devices": [], "nvidia": {"driver_usable": False, "cuda_usable": False},
                  "vulkan": {"loader_present": False, "physical_devices": [], "compute_device_usable": False}},
         "maxine": {"components": {}, "effects": {}, "reason_codes": []},
-        "effects": {"capabilities": {}}, "models": {"packs": {}, "default_pack_ids": []},
+        "effects": {"capabilities": {}},
+        "models": {"packs": {}, "default_pack_ids": list(DEFAULT_PACKS),
+                   "catalog_size_summary": catalog_size_summary()},
         "cache": {"release_artifacts": {}, "model_artifacts": {}},
         "connectivity": {"release_source": {"state": "online", "reason_codes": []},
                          "model_source": {"state": "online", "reason_codes": []}}, "reason_codes": [],

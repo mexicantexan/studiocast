@@ -24,6 +24,16 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
+MODEL_CATALOG_SHA256 = "sha256:130ac3b35680c4adbd6cd0471770150b7d813ad0e11b226dbc216f689ba8058c"
+MODEL_PACK_SIZE_ROWS = [
+    ("fastenhancer_s_vd_v1", 1, 832775),
+    ("fastenhancer_m_vd_v1", 1, 2033628),
+    ("modnet-webnn-256-fp32", 1, 25888640),
+    ("yunet_opencv_zoo_2023mar_fp32", 1, 232589),
+    ("dlib_68_ibug_300w", 1, 99693937),
+    ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
+    ("fastdvdnet_sigma15", 1, 416788),
+]
 CANONICAL_EFFECTS = [
     "mirror", "virtual_background.blur", "virtual_background.remove",
     "virtual_background.replace", "auto_frame", "eye_contact",
@@ -37,6 +47,24 @@ def terminal_result(text: str) -> dict:
     if value.get("result_version") != "installer-result/v1":
         raise AssertionError("terminal installer result is missing")
     return value
+
+
+def catalog_size_summary() -> dict:
+    return {
+        "schema_version": 1,
+        "catalog_version": "2026-07-19",
+        "catalog_sha256": MODEL_CATALOG_SHA256,
+        "trusted": True,
+        "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
+        "pack_count": len(MODEL_PACK_SIZE_ROWS),
+        "artifact_count": sum(row[1] for row in MODEL_PACK_SIZE_ROWS),
+        "download_bytes": sum(row[2] for row in MODEL_PACK_SIZE_ROWS),
+        "packs": [
+            {"id": pack_id, "artifact_count": artifact_count,
+             "download_bytes": download_bytes, "size_status": "known"}
+            for pack_id, artifact_count, download_bytes in MODEL_PACK_SIZE_ROWS
+        ],
+    }
 
 
 def progress_events(text: str) -> list[dict]:
@@ -84,7 +112,8 @@ def base_facts(**installation):
         "effects": {"capabilities": {
             "virtual_background": {"maxine": "unavailable", "cuda": "production_usable",
                                    "vulkan": "production_usable", "cpu": "unavailable"}}},
-        "models": {"packs": {}, "default_pack_ids": DEFAULT_PACKS},
+        "models": {"packs": {}, "default_pack_ids": list(DEFAULT_PACKS),
+                   "catalog_size_summary": catalog_size_summary()},
         "cache": {"release_artifacts": {}, "model_artifacts": {}},
         "connectivity": {"release_source": {"state": "online", "reason_codes": []},
                          "model_source": {"state": "online", "reason_codes": []}},
@@ -363,6 +392,82 @@ class InstallerBackendCoreTests(unittest.TestCase):
         facts["effects"]["capabilities"]["virtual_background"]["maxine"] = "production_usable"
         self.assertEqual(self.recommendation(facts)["selections"]["effects"]["virtual_background"]["selected"], "maxine")
         self.assertEqual(self.recommendation(facts)["selections"]["model_pack_ids"], DEFAULT_PACKS)
+
+    def test_recommendation_never_reads_replaced_packaged_catalog(self):
+        component = self.s.root / "pure-recommend-component"
+        installer_root = component / "installer"
+        staged_backend = installer_root / "studiocast-installer-backend"
+        installer_root.mkdir(parents=True)
+        shutil.copy2(BACKEND, staged_backend)
+        staged_backend.chmod(0o755)
+        model_dir = installer_root / "models"
+        model_dir.mkdir()
+        for name in ("__init__.py", "model_transactions.py"):
+            shutil.copy2(SOURCE / "installer/models" / name, model_dir / name)
+        catalog_path = component / "packaging/models/curated-model-catalog-v1.json"
+        catalog_path.parent.mkdir(parents=True)
+        shutil.copy2(SOURCE / "packaging/models/curated-model-catalog-v1.json", catalog_path)
+        facts_path = self.s.root / "pure-recommend-facts.json"
+        facts_path.write_text(json.dumps(base_facts()), encoding="utf-8")
+
+        def invoke() -> bytes:
+            result = subprocess.run(
+                [str(staged_backend), "recommend", "--facts", str(facts_path),
+                 "--intent", "install"], env=self.s.env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout
+
+        before = invoke()
+        changed = json.loads(catalog_path.read_text(encoding="utf-8"))
+        changed["packs"][0]["artifacts"][0]["size_bytes"] += 1
+        catalog_path.write_text(json.dumps(changed), encoding="utf-8")
+        after = invoke()
+        self.assertEqual(before, after)
+        plan = subprocess.run(
+            [str(staged_backend), "plan", "install", "--facts", str(facts_path),
+             "--no-v4l2loopback", "--no-service", "--models"], env=self.s.env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        self.assertIn("artifact_sizes_untrusted",
+                      {item["code"] for item in json.loads(plan.stdout)["blockers"]})
+
+    def test_recommendation_rejects_incomplete_or_inconsistent_size_facts(self):
+        cases = {}
+        missing = base_facts()
+        del missing["models"]["catalog_size_summary"]
+        cases["missing_summary"] = missing
+        wrong_bool = base_facts()
+        wrong_bool["models"]["catalog_size_summary"]["download_bytes"] = True
+        cases["boolean_total"] = wrong_bool
+        nonpositive = base_facts()
+        nonpositive["models"]["catalog_size_summary"]["packs"][0]["download_bytes"] = 0
+        cases["nonpositive_pack_total"] = nonpositive
+        wrong_status = base_facts()
+        wrong_status["models"]["catalog_size_summary"]["packs"][0]["size_status"] = "unknown"
+        cases["status_inconsistent"] = wrong_status
+        duplicate = base_facts()
+        duplicate["models"]["catalog_size_summary"]["packs"][-1]["id"] = DEFAULT_PACKS[0]
+        cases["duplicate_pack_id"] = duplicate
+        missing_pack = base_facts()
+        missing_pack["models"]["catalog_size_summary"]["packs"].pop()
+        cases["missing_pack_id"] = missing_pack
+        inconsistent = base_facts()
+        inconsistent["models"]["catalog_size_summary"]["download_bytes"] += 1
+        cases["inconsistent_total"] = inconsistent
+        duplicate_defaults = base_facts()
+        duplicate_defaults["models"]["default_pack_ids"][-1] = DEFAULT_PACKS[0]
+        cases["duplicate_default_id"] = duplicate_defaults
+        untrusted = base_facts()
+        untrusted["models"]["catalog_size_summary"]["trusted"] = False
+        cases["untrusted"] = untrusted
+
+        for name, facts in cases.items():
+            with self.subTest(name=name):
+                rec = self.recommendation(facts)
+                self.assertIn("artifact_sizes_untrusted",
+                              {item["code"] for item in rec["blockers"]})
+                self.assertEqual(rec["disk"]["download_bytes"], 0)
 
     def test_recommended_open_vulkan_feature_exactly_tracks_selected_effects(self):
         zero = base_facts(desired_configuration={

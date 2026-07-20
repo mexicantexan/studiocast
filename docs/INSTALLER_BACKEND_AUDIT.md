@@ -357,7 +357,33 @@ document and never probes the host.
       "dlib_68_ibug_300w",
       "gaze_correction_cam_flx_v0_1_1",
       "fastdvdnet_sigma15"
-    ]
+    ],
+    "catalog_size_summary": {
+      "schema_version": 1,
+      "catalog_version": "2026-07-19",
+      "catalog_sha256": "sha256:<packaged-catalog-bytes>",
+      "trusted": true,
+      "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
+      "pack_count": 7,
+      "artifact_count": 8,
+      "download_bytes": 131224287,
+      "packs": [
+        {"id": "fastenhancer_s_vd_v1", "artifact_count": 1,
+         "download_bytes": 832775, "size_status": "known"},
+        {"id": "fastenhancer_m_vd_v1", "artifact_count": 1,
+         "download_bytes": 2033628, "size_status": "known"},
+        {"id": "modnet-webnn-256-fp32", "artifact_count": 1,
+         "download_bytes": 25888640, "size_status": "known"},
+        {"id": "yunet_opencv_zoo_2023mar_fp32", "artifact_count": 1,
+         "download_bytes": 232589, "size_status": "known"},
+        {"id": "dlib_68_ibug_300w", "artifact_count": 1,
+         "download_bytes": 99693937, "size_status": "known"},
+        {"id": "gaze_correction_cam_flx_v0_1_1", "artifact_count": 2,
+         "download_bytes": 2125930, "size_status": "known"},
+        {"id": "fastdvdnet_sigma15", "artifact_count": 1,
+         "download_bytes": 416788, "size_status": "known"}
+      ]
+    }
   },
   "cache": {
     "release_artifacts": {},
@@ -378,6 +404,16 @@ usability. Vulkan physical devices include vendor/device IDs, type, compute
 queue support, API/driver version, software-device signal, and stable identity.
 Maxine usability is recorded per component and per effect after loading/smoke
 validation, not from directory checks.
+
+Real-host analysis strictly loads the packaged curated-model catalog once and
+records this bounded canonical size summary for the seven defaults. Facts
+contain all seven ordered rows, whose counts and totals must match the summary.
+Fixture analysis performs no catalog or host probe and uses only the supplied
+summary. Recommendation validates the exact
+summary shape, types, trust reason, unique IDs, known statuses, positive totals,
+and internal counts, then derives model bytes solely from facts. Plan creation
+still reloads the packaged catalog and rejects a version/digest/summary mismatch
+before execution; Apply retains its independent catalog and hash revalidation.
 
 Stable reason-code families include:
 
