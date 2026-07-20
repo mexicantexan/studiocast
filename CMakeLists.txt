@@ -259,6 +259,8 @@ add_library(studiocast_core
         src/core/maxine/maxine_manager.h
         src/core/maxine/maxine_manager.cpp
         src/core/maxine/nvcv_types.h
+        src/core/maxine/resident_frame_section.h
+        src/core/maxine/resident_frame_section.cpp
         src/core/maxine/nvcv_api.h
         src/core/maxine/nvcv_api.cpp
         src/core/maxine/vfx_api.h
@@ -862,6 +864,29 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
             AUTOUIC OFF
             AUTORCC OFF
     )
+
+    add_executable(studiocast-maxine-resident-fake-bench
+            src/tools/studiocast_maxine_resident_fake_bench_main.cpp
+            src/core/maxine/testing/fake_resident_frame_executor.cpp
+    )
+
+    target_link_libraries(studiocast-maxine-resident-fake-bench PRIVATE
+            studiocast_core
+    )
+
+    target_include_directories(studiocast-maxine-resident-fake-bench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-maxine-resident-fake-bench)
+    studiocast_enable_sanitizers(studiocast-maxine-resident-fake-bench)
+
+    set_target_properties(studiocast-maxine-resident-fake-bench PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
 endif()
 
 
@@ -1086,6 +1111,32 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-nvcv-validation-tests
             COMMAND studiocast-nvcv-validation-tests)
+
+    add_executable(studiocast-maxine-resident-frame-tests
+            tests/maxine_resident_frame_section_tests.cpp
+            src/core/maxine/testing/fake_resident_frame_executor.cpp
+    )
+
+    target_link_libraries(studiocast-maxine-resident-frame-tests PRIVATE
+            studiocast_core
+    )
+
+    target_include_directories(studiocast-maxine-resident-frame-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-maxine-resident-frame-tests)
+    studiocast_enable_sanitizers(studiocast-maxine-resident-frame-tests)
+
+    set_target_properties(studiocast-maxine-resident-frame-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-maxine-resident-frame-tests
+            COMMAND studiocast-maxine-resident-frame-tests)
 
     add_executable(studiocast-model-registry-tests
             tests/model_pack_registry_tests.cpp
