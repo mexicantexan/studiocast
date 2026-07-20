@@ -253,6 +253,28 @@ bool EffectsPlanRequiresRebuild(
          applied_generation != current_generation;
 }
 
+bool EffectsFramePreparationCounters::ObservePublishedGeneration(
+    std::uint64_t published_generation,
+    std::uint64_t applied_generation) noexcept {
+  ++generation_loads;
+  if (published_generation == 0) {
+    ++transition_sentinel_loads;
+    return false;
+  }
+  if (published_generation == applied_generation)
+    return false;
+  ++snapshot_requests;
+  return true;
+}
+
+void EffectsFramePreparationCounters::RecordConfigSnapshot(
+    bool rebuilt) noexcept {
+  ++config_lock_acquisitions;
+  ++config_copies;
+  if (rebuilt)
+    ++rebuilds;
+}
+
 void LiveEffectBackendAttribution::BeginFrame() { pending_.fill(0); }
 
 void LiveEffectBackendAttribution::MarkEffectSucceeded(
@@ -1974,7 +1996,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   studiocast::video::effects::EffectChain chain;
   studiocast::video::effects::BroadcastCameraEffects appliedFx{};
   studiocast::video::effects::BroadcastEffectsPlan appliedPlan{};
+  studiocast::video::effects::PreparedBroadcastEffectsFramePlan
+      appliedFramePlan{};
   std::uint64_t appliedEffectsGeneration = 0;
+  EffectsFramePreparationCounters effects_preparation_counters{};
   RawYuyvPassthroughPlan raw_yuyv_plan{};
   YuyvFramePathCounters yuyv_frame_path_counters{};
 
@@ -9609,6 +9634,19 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
+    auto prepared_frame_plan =
+        studiocast::video::effects::CompileBroadcastEffectsFramePlan(plan);
+    if (!prepared_frame_plan.valid) {
+      if (!note.empty())
+        note += "\n";
+      note += "Internal effect-plan compilation failed; optional effects "
+              "were disabled for safety.";
+      plan.ordered_effect_ids.clear();
+      plan.vignette_attach_to_effect_id.clear();
+      prepared_frame_plan =
+          studiocast::video::effects::CompileBroadcastEffectsFramePlan(plan);
+    }
+
     {
       append_rule_notes();
 
@@ -9675,6 +9713,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 
     appliedPlan = plan;
+    appliedFramePlan = prepared_frame_plan;
     appliedFx = fx;
     appliedEffectsGeneration = effects_generation;
     raw_yuyv_plan = PrepareRawYuyvPassthroughPlan(capA, outA, appliedFx);
@@ -9692,6 +9731,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       effects_generation = effects_generation_;
     }
     rebuildChain(fx, replace_source, effects_generation);
+    effects_preparation_counters.RecordConfigSnapshot(/*rebuilt=*/true);
   }
 
   struct Ema {
@@ -9988,6 +10028,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     return true;
   };
 
+  // Reused only for exceptional zero-timeout drain failures. The expected
+  // no-frame result does not touch or format this string.
+  std::string capture_drain_error;
   while (!stop_.load()) {
     CapturedFrameView f{};
     std::string ferr;
@@ -10015,14 +10058,20 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     // frames and keep only the most recent, dropping older frames to avoid
     // "living in the past".
     int dropped_this_frame = 0;
+    bool capture_drain_failed = false;
     for (;;) {
       if (stop_.load())
         break;
 
       CapturedFrameView newer{};
-      std::string nerr;
-      if (!cap.AcquireFrame(&newer, 0, &nerr)) {
+      const CaptureAcquireResult acquire_result =
+          cap.AcquireFrameDetailed(&newer, 0, &capture_drain_error);
+      if (acquire_result == CaptureAcquireResult::no_frame) {
         // No additional frame ready.
+        break;
+      }
+      if (acquire_result == CaptureAcquireResult::failure) {
+        capture_drain_failed = true;
         break;
       }
 
@@ -10034,6 +10083,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
     if (dropped_this_frame > 0) {
       dropped_capture_frames_total += dropped_this_frame;
+    }
+    if (capture_drain_failed) {
+      std::string rerr;
+      (void)cap.ReleaseFrame(f, &rerr);
+      std::lock_guard<std::mutex> lock(mu_);
+      last_error_ = "Capture drain failed";
+      if (!capture_drain_error.empty())
+        last_error_ += ": " + capture_drain_error;
+      break;
     }
     last_capture_sequence = f.sequence;
 
@@ -10443,19 +10501,29 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const auto t_effects_start = Clock::now();
     bool fx_failed = false;
     {
-      studiocast::video::effects::BroadcastCameraEffects fx;
-      detail::PreparedReplaceBackgroundSource replace_source;
-      std::uint64_t effects_generation = 0;
-      {
-        std::lock_guard<std::mutex> fxLock(effects_mu_);
-        fx = effects_;
-        replace_source = replace_background_source_;
-        effects_generation = effects_generation_;
+      const std::uint64_t published_effects_generation =
+          effects_generation_published_.load(std::memory_order_acquire);
+      if (effects_preparation_counters.ObservePublishedGeneration(
+              published_effects_generation, appliedEffectsGeneration)) {
+        studiocast::video::effects::BroadcastCameraEffects next_effects;
+        detail::PreparedReplaceBackgroundSource next_replace_source;
+        std::uint64_t next_effects_generation = 0;
+        {
+          std::lock_guard<std::mutex> fxLock(effects_mu_);
+          next_effects = effects_;
+          next_replace_source = replace_background_source_;
+          next_effects_generation = effects_generation_;
+        }
+        const bool rebuild =
+            next_effects_generation != appliedEffectsGeneration;
+        effects_preparation_counters.RecordConfigSnapshot(rebuild);
+        if (rebuild) {
+          rebuildChain(next_effects, next_replace_source,
+                       next_effects_generation);
+        }
       }
-      if (EffectsPlanRequiresRebuild(appliedFx, appliedEffectsGeneration, fx,
-                                     effects_generation)) {
-        rebuildChain(fx, replace_source, effects_generation);
-      }
+
+      const auto &fx = appliedFx;
 
       studiocast::video::effects::Rgb24FrameView view;
       view.data = rgb.data();
@@ -10466,28 +10534,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const float vignette_center_x_px = static_cast<float>(capA.width) * 0.5f;
       const float vignette_center_y_px = static_cast<float>(capA.height) * 0.5f;
 
-      const auto &plan = appliedPlan;
-
-      const auto has_stage = [&](std::string_view id) {
-        return std::find(plan.ordered_effect_ids.begin(),
-                         plan.ordered_effect_ids.end(),
-                         std::string(id)) != plan.ordered_effect_ids.end();
-      };
-
-      const auto stage_appears_after = [&](const std::string &stage_id,
-                                           std::string_view later_id) {
-        const auto current = std::find(plan.ordered_effect_ids.begin(),
-                                       plan.ordered_effect_ids.end(), stage_id);
-        if (current == plan.ordered_effect_ids.end())
-          return false;
-        return std::find(std::next(current), plan.ordered_effect_ids.end(),
-                         std::string(later_id)) !=
-               plan.ordered_effect_ids.end();
-      };
+      using EffectStage =
+          studiocast::video::effects::BroadcastEffectStage;
+      const auto &frame_plan = appliedFramePlan;
 
       const bool vignette_requested =
-          has_stage(studiocast::video::effects::contract::kEffectIdVignette);
-      const std::string &vig_attach = plan.vignette_attach_to_effect_id;
+          frame_plan.Contains(EffectStage::vignette);
+      const EffectStage vig_attach = frame_plan.vignette_attachment;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       open_vulkan_vignette_attempt_this_frame =
           have_open_vulkan_vignette && vignette_requested &&
@@ -10495,7 +10548,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               .AllowsAttempt(f.sequence);
       open_vulkan_mirror_attempt_this_frame =
           have_open_vulkan_mirror &&
-          has_stage(studiocast::video::effects::contract::kEffectIdMirror) &&
+          frame_plan.Contains(EffectStage::mirror) &&
           optional_breaker(OptionalEffectSlot::mirror)
               .AllowsAttempt(f.sequence);
 #endif
@@ -10505,17 +10558,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       // - no CPU tail effects are active
       // This allows us to resize on GPU and perform a single GPU->CPU transfer
       // for output.
-      std::string last_stage_for_defer;
-      for (auto it = plan.ordered_effect_ids.rbegin();
-           it != plan.ordered_effect_ids.rend(); ++it) {
-        if (*it == studiocast::video::effects::contract::
-                       kEffectIdVideoNoiseRemoval ||
-            *it == studiocast::video::effects::contract::kEffectIdVignette ||
-            *it == studiocast::video::effects::contract::kEffectIdMirror)
-          continue;
-        last_stage_for_defer = *it;
-        break;
-      }
+      const EffectStage last_stage_for_defer =
+          frame_plan.last_deferred_stage;
       const bool scaling_needed =
           (capA.width != outA.width || capA.height != outA.height);
       const bool allow_defer_readback =
@@ -10525,7 +10569,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
            open_vulkan_mirror_attempt_this_frame ||
 #endif
            false) &&
-          !last_stage_for_defer.empty();
+          last_stage_for_defer != EffectStage::none;
 
       // Define whether any Open CUDA stage is enabled for this frame.
       // Open CUDA stages can optionally use the deferred strategy (no internal
@@ -10533,35 +10577,28 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       // scaling/output without CPU-side continuation.
       const bool open_cuda_any_stage_enabled =
           have_open_cuda_vb &&
-          (has_stage(studiocast::video::effects::contract::
-                         kEffectIdVirtualBackgroundBlur) ||
-           has_stage(studiocast::video::effects::contract::
-                         kEffectIdVirtualBackgroundRemove) ||
-           has_stage(studiocast::video::effects::contract::
-                         kEffectIdVirtualBackgroundReplace));
+          (frame_plan.Contains(EffectStage::virtual_background_blur) ||
+           frame_plan.Contains(EffectStage::virtual_background_remove) ||
+           frame_plan.Contains(EffectStage::virtual_background_replace));
       const bool open_cuda_auto_frame_stage_enabled =
           have_open_cuda_auto_frame &&
-          has_stage(studiocast::video::effects::contract::kEffectIdAutoFrame);
+          frame_plan.Contains(EffectStage::auto_frame);
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       const bool open_vulkan_key_light_stage_enabled =
           have_open_vulkan_key_light &&
-          has_stage(
-              studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
+          frame_plan.Contains(EffectStage::virtual_key_light);
       const bool open_vulkan_auto_frame_stage_enabled =
           have_open_vulkan_auto_frame &&
-          has_stage(studiocast::video::effects::contract::kEffectIdAutoFrame);
+          frame_plan.Contains(EffectStage::auto_frame);
 #endif
 
-      const auto is_open_cuda_stage_id = [&](const std::string &stage_id) {
+      const auto is_open_cuda_stage = [&](EffectStage stage) {
         if (!open_cuda_any_stage_enabled)
           return false;
-        return stage_id == studiocast::video::effects::contract::
-                               kEffectIdVirtualBackgroundBlur ||
-               stage_id == studiocast::video::effects::contract::
-                               kEffectIdVirtualBackgroundRemove ||
-               stage_id == studiocast::video::effects::contract::
-                               kEffectIdVirtualBackgroundReplace;
+        return stage == EffectStage::virtual_background_blur ||
+               stage == EffectStage::virtual_background_remove ||
+               stage == EffectStage::virtual_background_replace;
       };
 
       const std::uint64_t capture_sequence = f.sequence;
@@ -10574,24 +10611,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               .AllowsAttempt(capture_sequence);
       const bool apply_vignette_on_eye_contact =
           vignette_requested && maxine_vignette_allowed &&
-          (vig_attach ==
-           studiocast::video::effects::contract::kEffectIdEyeContact);
+          vig_attach == EffectStage::eye_contact;
       const bool apply_vignette_on_relight =
           vignette_requested && maxine_vignette_allowed &&
-          (vig_attach ==
-           studiocast::video::effects::contract::kEffectIdVirtualKeyLight);
+          vig_attach == EffectStage::virtual_key_light;
       const bool apply_vignette_on_bg =
           vignette_requested && maxine_vignette_allowed &&
-          (vig_attach == studiocast::video::effects::contract::
-                             kEffectIdVirtualBackgroundBlur ||
-           vig_attach == studiocast::video::effects::contract::
-                             kEffectIdVirtualBackgroundRemove ||
-           vig_attach == studiocast::video::effects::contract::
-                             kEffectIdVirtualBackgroundReplace);
+          (vig_attach == EffectStage::virtual_background_blur ||
+           vig_attach == EffectStage::virtual_background_remove ||
+           vig_attach == EffectStage::virtual_background_replace);
       const bool apply_vignette_on_auto_frame =
           vignette_requested && maxine_vignette_allowed &&
-          (vig_attach ==
-           studiocast::video::effects::contract::kEffectIdAutoFrame);
+          vig_attach == EffectStage::auto_frame;
 
       // Reset per-frame analysis cache (Open Video). This allows effects to
       // share ML outputs without re-running inference multiple times per frame.
@@ -10669,10 +10700,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return true;
       };
 
-      auto apply_stage = [&](const std::string &stage_id) {
+      auto apply_stage = [&](EffectStage stage) {
+        const std::string_view stage_id =
+            studiocast::video::effects::BroadcastEffectStageId(stage);
         bool defer_readback =
-            allow_defer_readback && (stage_id == last_stage_for_defer);
-        if (is_open_cuda_stage_id(stage_id) && pending_open_cuda_key_light) {
+            allow_defer_readback && (stage == last_stage_for_defer);
+        if (is_open_cuda_stage(stage) && pending_open_cuda_key_light) {
           // Force immediate readback when we know a CPU stage (key light) must
           // run after this Open CUDA stage.
           defer_readback = false;
@@ -10946,9 +10979,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
               const bool keep_gpu_for_auto_frame =
                   open_vulkan_auto_frame_stage_enabled &&
-                  stage_appears_after(
-                      stage_id,
-                      studiocast::video::effects::contract::kEffectIdAutoFrame);
+                  frame_plan.AppearsAfter(stage, EffectStage::auto_frame);
               if (defer_readback) {
                 have_deferred_gpu_out = true;
                 clear_optional_effect_on_success(key_light_breaker,
@@ -11194,14 +11225,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
             const bool keep_gpu_frame_for_key_light =
                 open_vulkan_key_light_stage_enabled &&
-                stage_appears_after(stage_id,
-                                    studiocast::video::effects::contract::
-                                        kEffectIdVirtualKeyLight);
+                frame_plan.AppearsAfter(stage,
+                                        EffectStage::virtual_key_light);
             const bool keep_gpu_frame_for_auto_frame =
                 open_vulkan_auto_frame_stage_enabled &&
-                stage_appears_after(
-                    stage_id,
-                    studiocast::video::effects::contract::kEffectIdAutoFrame);
+                frame_plan.AppearsAfter(stage, EffectStage::auto_frame);
             if (defer_readback || keep_gpu_frame_for_key_light ||
                 keep_gpu_frame_for_auto_frame) {
               if (is_wrapped_vulkan_vb) {
@@ -11365,12 +11393,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
                   const bool keep_gpu_for_auto_frame =
                       open_cuda_auto_frame_stage_enabled &&
-                      stage_appears_after(stage_id,
-                                          studiocast::video::effects::contract::
-                                              kEffectIdAutoFrame);
+                      frame_plan.AppearsAfter(stage,
+                                              EffectStage::auto_frame);
                   const bool keep_gpu_for_final =
                       allow_defer_readback &&
-                      (stage_id == last_stage_for_defer);
+                      (stage == last_stage_for_defer);
                   if (keep_gpu_for_auto_frame || keep_gpu_for_final) {
                     have_deferred_gpu_out = true;
                     mark_live_effect_success(
@@ -11454,9 +11481,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
             const bool defer_for_open_cuda_auto_frame =
                 open_cuda_auto_frame_stage_enabled &&
-                stage_appears_after(
-                    stage_id,
-                    studiocast::video::effects::contract::kEffectIdAutoFrame) &&
+                frame_plan.AppearsAfter(stage, EffectStage::auto_frame) &&
                 !pending_open_cuda_key_light;
             if (defer_for_open_cuda_auto_frame) {
               defer_readback = true;
@@ -11555,9 +11580,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             const bool keep_gpu_frame_for_key_light =
                 have_open_cuda_key_light && fx.virtual_key_light.enabled &&
                 fx.virtual_key_light.intensity > 0 &&
-                stage_appears_after(stage_id,
-                                    studiocast::video::effects::contract::
-                                        kEffectIdVirtualKeyLight);
+                frame_plan.AppearsAfter(stage,
+                                        EffectStage::virtual_key_light);
             if (defer_readback) {
               have_deferred_gpu_out = true;
               open_cuda_gpu_frame_pending_cpu_readback = true;
@@ -11671,7 +11695,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               open_vulkan_gpu_frame_pending_cpu_readback = true;
 
               const bool keep_deferred_after_auto_frame =
-                  allow_defer_readback && (stage_id == last_stage_for_defer);
+                  allow_defer_readback && (stage == last_stage_for_defer);
               if (keep_deferred_after_auto_frame) {
                 have_deferred_gpu_out = true;
               } else {
@@ -11829,7 +11853,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 }
 
                 const bool keep_deferred_after_auto_frame =
-                    allow_defer_readback && (stage_id == last_stage_for_defer);
+                    allow_defer_readback && (stage == last_stage_for_defer);
                 bool auto_frame_output_visible = keep_deferred_after_auto_frame;
                 if (!keep_deferred_after_auto_frame && have_deferred_gpu_out &&
                     deferred_gpu_out.cuda_img && deferred_gpu_out.cuda) {
@@ -11936,8 +11960,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
-      for (const auto &stage_id : plan.ordered_effect_ids) {
-        apply_stage(stage_id);
+      for (std::size_t i = 0; i < frame_plan.size; ++i) {
+        apply_stage(frame_plan.StageAt(i));
         if (fx_failed)
           break;
       }
@@ -13200,6 +13224,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           yuyv_frame_path_counters.raw_passthrough_frames;
       debug_.raw_yuyv_passthrough_bytes =
           yuyv_frame_path_counters.raw_passthrough_bytes;
+      debug_.effects_preparation = effects_preparation_counters;
 
       debug_.pace_sleep_ms = ema_pace_sleep.ValueOrZero();
       debug_.pace_late_ms = ema_pace_late.ValueOrZero();

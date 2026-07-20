@@ -619,6 +619,14 @@ bool ParseChosenCaptureFmt(const v4l2_format &f, bool mplane, int fps,
 
 } // namespace
 
+CaptureAcquireResult ClassifyCapturePollResult(int poll_result) noexcept {
+  if (poll_result > 0)
+    return CaptureAcquireResult::frame;
+  if (poll_result == 0)
+    return CaptureAcquireResult::no_frame;
+  return CaptureAcquireResult::failure;
+}
+
 bool ShouldPreferMjpegForResolution(int width, int height) {
   // Heuristic: uncompressed YUYV at 720p+ tends to be unsupported, unstable,
   // or bandwidth-limited on many UVC webcams, while MJPEG often supports HD+.
@@ -1224,12 +1232,21 @@ bool V4l2Capture::StreamOff(std::string *error) {
 
 bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
                                std::string *error) {
+  const CaptureAcquireResult result =
+      AcquireFrameDetailed(out, timeout_ms, error);
+  if (result == CaptureAcquireResult::no_frame && error)
+    *error = "Timed out waiting for camera frame.";
+  return result == CaptureAcquireResult::frame;
+}
+
+CaptureAcquireResult V4l2Capture::AcquireFrameDetailed(
+    CapturedFrameView *out, int timeout_ms, std::string *error) {
   if (!out)
-    return false;
+    return CaptureAcquireResult::failure;
   if (fd_ < 0) {
     if (error)
       *error = "Capture not open.";
-    return false;
+    return CaptureAcquireResult::failure;
   }
 
   pollfd pfd{};
@@ -1246,16 +1263,14 @@ bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
     break;
   }
 
-  if (pr < 0) {
+  const CaptureAcquireResult poll_result = ClassifyCapturePollResult(pr);
+  if (poll_result == CaptureAcquireResult::failure) {
     if (error)
       *error = "poll failed: " + std::string(std::strerror(errno));
-    return false;
+    return CaptureAcquireResult::failure;
   }
-  if (pr == 0) {
-    if (error)
-      *error = "Timed out waiting for camera frame.";
-    return false;
-  }
+  if (poll_result == CaptureAcquireResult::no_frame)
+    return CaptureAcquireResult::no_frame;
 
   if (!mplane_) {
     v4l2_buffer b{};
@@ -1263,16 +1278,18 @@ bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
     b.memory = V4L2_MEMORY_MMAP;
 
     if (IoctlRetry(fd_, VIDIOC_DQBUF, &b) != 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return CaptureAcquireResult::no_frame;
       if (error)
         *error = "VIDIOC_DQBUF failed: " + std::string(std::strerror(errno));
-      return false;
+      return CaptureAcquireResult::failure;
     }
 
     const std::size_t idx = static_cast<std::size_t>(b.index);
     if (idx >= buffers_.size()) {
       if (error)
         *error = "Driver returned invalid buffer index.";
-      return false;
+      return CaptureAcquireResult::failure;
     }
 
     out->index = static_cast<int>(b.index);
@@ -1284,7 +1301,7 @@ bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
         (b.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) != 0;
     out->bytes = static_cast<std::size_t>(b.bytesused);
     out->data = static_cast<const std::uint8_t *>(buffers_[idx].start);
-    return true;
+    return CaptureAcquireResult::frame;
   }
 
 #ifdef V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
@@ -1296,17 +1313,19 @@ bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
   b.length = 1;
 
   if (IoctlRetry(fd_, VIDIOC_DQBUF, &b) != 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return CaptureAcquireResult::no_frame;
     if (error)
       *error =
           "VIDIOC_DQBUF (mplane) failed: " + std::string(std::strerror(errno));
-    return false;
+    return CaptureAcquireResult::failure;
   }
 
   const std::size_t idx = static_cast<std::size_t>(b.index);
   if (idx >= buffers_.size()) {
     if (error)
       *error = "Driver returned invalid buffer index (mplane).";
-    return false;
+    return CaptureAcquireResult::failure;
   }
 
   out->index = static_cast<int>(b.index);
@@ -1317,11 +1336,11 @@ bool V4l2Capture::AcquireFrame(CapturedFrameView *out, int timeout_ms,
   out->timestamp_monotonic = (b.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) != 0;
   out->bytes = static_cast<std::size_t>(planes[0].bytesused);
   out->data = static_cast<const std::uint8_t *>(buffers_[idx].start);
-  return true;
+  return CaptureAcquireResult::frame;
 #else
   if (error)
     *error = "mplane capture not supported by headers";
-  return false;
+  return CaptureAcquireResult::failure;
 #endif
 }
 
