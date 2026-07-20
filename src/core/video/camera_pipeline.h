@@ -282,6 +282,12 @@ struct CameraPipelineStatus {
     int output_refresh_failures = 0;
     int output_write_recoveries = 0;
 
+    // Actual YUYV frame-path call-site counters.
+    std::uint64_t yuyv_capture_to_rgb_calls = 0;
+    std::uint64_t yuyv_output_from_rgb_calls = 0;
+    std::uint64_t raw_yuyv_passthrough_frames = 0;
+    std::uint64_t raw_yuyv_passthrough_bytes = 0;
+
     // Output pacing/jitter diagnostics (useful for browser/WebRTC capture).
     double pace_sleep_ms = 0.0;
     double pace_late_ms = 0.0;
@@ -578,6 +584,11 @@ private:
   studiocast::video::effects::BroadcastCameraEffects effects_{};
   detail::PreparedReplaceBackgroundSource replace_background_source_{};
   std::uint64_t effects_generation_ = 0;
+  // Zero is a conservative transition sentinel. Effect mutations publish zero
+  // before changing canonical state, then release-publish the committed
+  // generation. The frame loop acquire-loads this value before taking the raw
+  // passthrough path, so a live change cannot leak one stale raw frame.
+  std::atomic<std::uint64_t> effects_generation_published_{0};
   std::uint64_t effects_set_requests_ = 0;
   std::uint64_t effects_ignored_updates_ = 0;
   std::uint64_t effects_applied_updates_ = 0;
