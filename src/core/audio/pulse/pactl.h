@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <string>
@@ -68,13 +69,21 @@ std::optional<int> LoadModule(const std::string &module,
 bool UnloadModule(int id, std::string *error);
 
 std::vector<PactlModule> ListModules(std::string *error);
-std::vector<PactlSource> ListSources(std::string *error);
-std::vector<PactlSink> ListSinks(std::string *error);
+std::vector<PactlSource>
+ListSources(std::string *error,
+            const std::atomic_bool *stop_requested = nullptr);
+std::vector<PactlSink>
+ListSinks(std::string *error,
+          const std::atomic_bool *stop_requested = nullptr);
 std::vector<PactlSourceOutput> ListSourceOutputs(std::string *error);
 std::vector<PactlSinkInput> ListSinkInputs(std::string *error);
 
-std::optional<std::string> GetDefaultSourceName(std::string *error);
-std::optional<std::string> GetDefaultSinkName(std::string *error);
+std::optional<std::string>
+GetDefaultSourceName(std::string *error,
+                     const std::atomic_bool *stop_requested = nullptr);
+std::optional<std::string>
+GetDefaultSinkName(std::string *error,
+                   const std::atomic_bool *stop_requested = nullptr);
 
 // Deterministic parsing helper (used for `pactl info` fallbacks and self-test).
 // Example keys: "Default Source:", "Default Sink:".

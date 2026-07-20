@@ -14,7 +14,9 @@ namespace {
 std::mutex g_exec_hook_mu;
 PactlExecCaptureHook g_exec_hook;
 
-util::ExecResult RunPactlCommand(const std::string &command) {
+util::ExecResult RunPactlCommand(
+    const std::string &command,
+    const std::atomic_bool *stop_requested = nullptr) {
   PactlExecCaptureHook hook;
   {
     std::lock_guard<std::mutex> lock(g_exec_hook_mu);
@@ -24,6 +26,7 @@ util::ExecResult RunPactlCommand(const std::string &command) {
     return hook(command);
   util::ExecCaptureOptions options;
   options.timeout_ms = 2500;
+  options.stop_requested = stop_requested;
   return util::ExecCapture(command, options);
 }
 
@@ -226,8 +229,10 @@ std::vector<PactlModule> ListModules(std::string *error) {
   return out;
 }
 
-std::vector<PactlSource> ListSources(std::string *error) {
-  auto res = RunPactlCommand("pactl list short sources 2>&1");
+std::vector<PactlSource>
+ListSources(std::string *error, const std::atomic_bool *stop_requested) {
+  auto res =
+      RunPactlCommand("pactl list short sources 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
       *error = util::TrimCopy(res.stdout_str);
@@ -253,8 +258,9 @@ std::vector<PactlSource> ListSources(std::string *error) {
   return out;
 }
 
-std::vector<PactlSink> ListSinks(std::string *error) {
-  auto res = RunPactlCommand("pactl list short sinks 2>&1");
+std::vector<PactlSink>
+ListSinks(std::string *error, const std::atomic_bool *stop_requested) {
+  auto res = RunPactlCommand("pactl list short sinks 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
       *error = util::TrimCopy(res.stdout_str);
@@ -452,9 +458,12 @@ bool SetSourcePort(const std::string &source_name, const std::string &port_name,
   return true;
 }
 
-std::optional<std::string> GetDefaultSourceName(std::string *error) {
+std::optional<std::string>
+GetDefaultSourceName(std::string *error,
+                     const std::atomic_bool *stop_requested) {
   // Newer pactl
-  auto res = RunPactlCommand("pactl get-default-source 2>&1");
+  auto res =
+      RunPactlCommand("pactl get-default-source 2>&1", stop_requested);
   if (res.exit_code == 0) {
     const auto line = util::TrimCopy(FirstLineOrEmpty(res.stdout_str));
     if (!line.empty())
@@ -462,7 +471,7 @@ std::optional<std::string> GetDefaultSourceName(std::string *error) {
   }
 
   // Fallback: parse `pactl info`
-  res = RunPactlCommand("pactl info 2>&1");
+  res = RunPactlCommand("pactl info 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
       *error = util::TrimCopy(res.stdout_str);
@@ -478,9 +487,11 @@ std::optional<std::string> GetDefaultSourceName(std::string *error) {
   return std::nullopt;
 }
 
-std::optional<std::string> GetDefaultSinkName(std::string *error) {
+std::optional<std::string>
+GetDefaultSinkName(std::string *error,
+                   const std::atomic_bool *stop_requested) {
   // Newer pactl
-  auto res = RunPactlCommand("pactl get-default-sink 2>&1");
+  auto res = RunPactlCommand("pactl get-default-sink 2>&1", stop_requested);
   if (res.exit_code == 0) {
     const auto line = util::TrimCopy(FirstLineOrEmpty(res.stdout_str));
     if (!line.empty())
@@ -488,7 +499,7 @@ std::optional<std::string> GetDefaultSinkName(std::string *error) {
   }
 
   // Fallback: parse `pactl info`
-  res = RunPactlCommand("pactl info 2>&1");
+  res = RunPactlCommand("pactl info 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
       *error = util::TrimCopy(res.stdout_str);

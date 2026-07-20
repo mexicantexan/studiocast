@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -190,6 +191,11 @@ struct VirtualAudioServiceHooks {
       probe_speaker_backend_availability;
   std::function<AudioConsumerSnapshot()> detect_microphone_consumers;
   std::function<AudioConsumerSnapshot()> detect_speaker_consumers;
+  // Test/measurement seam for setup-only discovery. Called immediately before
+  // the named operation. A hook may wait while observing stop_requested to
+  // exercise bounded shutdown without launching a real provider helper.
+  std::function<void(std::string_view, const std::atomic_bool &)>
+      before_preparation_probe;
 };
 
 // Minimal daemon-friendly owner of StudioCast virtual audio devices and
@@ -215,6 +221,11 @@ public:
   void Stop();
 
   void UpdateConfig(const VirtualAudioServiceConfig &cfg);
+
+  // Explicitly invalidates cached provider/model/device discovery. Normal
+  // status polling never performs rediscovery; callers use this after model
+  // installation/removal, settings refresh, or an external device transition.
+  void RefreshPreparation();
 
   VirtualAudioServiceConfig Config() const;
   VirtualAudioServiceStatus Status() const;
@@ -242,6 +253,9 @@ private:
   mutable std::mutex mu_;
   std::thread th_;
   std::atomic_bool stop_{false};
+  std::atomic<std::uint64_t> mic_backend_generation_{1};
+  std::atomic<std::uint64_t> speaker_backend_generation_{1};
+  std::atomic<std::uint64_t> device_generation_{1};
 
   bool running_ = false;
   bool mic_created_ = false;

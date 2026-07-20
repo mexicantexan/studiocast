@@ -142,7 +142,17 @@ ExecResult ExecCapture(const std::string &command,
       }
     }
 
-    if (Clock::now() >= deadline && (!childExited || pipeOpen)) {
+    if (options.stop_requested &&
+        options.stop_requested->load(std::memory_order_acquire) &&
+        (!childExited || pipeOpen)) {
+      result.cancelled = true;
+      TerminateProcessGroup(pid, &status);
+      childExited = true;
+      if (pipeOpen) {
+        ReadAvailable(pipeFds[0], &result, outputCap, &pipeOpen);
+        pipeOpen = false;
+      }
+    } else if (Clock::now() >= deadline && (!childExited || pipeOpen)) {
       result.timed_out = true;
       TerminateProcessGroup(pid, &status);
       childExited = true;
@@ -166,7 +176,8 @@ ExecResult ExecCapture(const std::string &command,
         pollTimeoutMs =
             remaining.count() <= 0
                 ? 0
-                : static_cast<int>(std::min<long long>(remaining.count(), 100));
+                : static_cast<int>(std::min<long long>(
+                      remaining.count(), options.stop_requested ? 25 : 100));
       }
 
       const int pr = ::poll(&pfd, 1, pollTimeoutMs);
@@ -183,7 +194,7 @@ ExecResult ExecCapture(const std::string &command,
 
   ::close(pipeFds[0]);
 
-  if (result.timed_out) {
+  if (result.timed_out || result.cancelled) {
     result.exit_code = -1;
   } else if (WIFEXITED(status)) {
     result.exit_code = WEXITSTATUS(status);

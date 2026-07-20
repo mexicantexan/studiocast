@@ -196,8 +196,7 @@ void ApplyOpenAudioRuntimeWarning(OpenAudioRuntimeStatus *status,
   if (!status || pipeline_error.find("Open Audio") == std::string::npos)
     return;
 
-  const std::string warning =
-      StripAudioProcessorWarningPrefix(pipeline_error);
+  const std::string warning = StripAudioProcessorWarningPrefix(pipeline_error);
   status->last_runtime_warning = warning;
 
   if (warning.find("switched to CPU fallback") != std::string::npos) {
@@ -217,20 +216,22 @@ void ApplyOpenAudioRuntimeWarning(OpenAudioRuntimeStatus *status,
 
 std::optional<std::string>
 ChooseSpeakerTargetSinkName(const std::string &configured_target,
-                            std::string *error) {
-  return ChooseSafeSpeakerTargetSinkName(configured_target, error);
+                            std::string *error,
+                            const std::atomic_bool *stop_requested) {
+  return ChooseSafeSpeakerTargetSinkName(configured_target, error,
+                                         stop_requested);
 }
 
 bool PulseSourceListContains(const std::vector<pulse::PactlSource> &sources,
                              const std::string &name) {
-  return std::any_of(sources.begin(), sources.end(), [&](const auto &source) {
-    return source.name == name;
-  });
+  return std::any_of(sources.begin(), sources.end(),
+                     [&](const auto &source) { return source.name == name; });
 }
 
 MicrophoneSourceStatus
 ResolveMicrophoneSourceStatus(const VirtualAudioServiceConfig &cfg,
-                              bool resolve_auto) {
+                              bool resolve_auto,
+                              const std::atomic_bool *stop_requested) {
   MicrophoneSourceStatus out;
 
   std::string configured = cfg.source_name;
@@ -248,7 +249,7 @@ ResolveMicrophoneSourceStatus(const VirtualAudioServiceConfig &cfg,
     }
 
     std::string listErr;
-    const auto sources = pulse::ListSources(&listErr);
+    const auto sources = pulse::ListSources(&listErr, stop_requested);
     if (!listErr.empty()) {
       out.warnings.push_back(
           "Pulse source list could not confirm configured source "
@@ -273,7 +274,8 @@ ResolveMicrophoneSourceStatus(const VirtualAudioServiceConfig &cfg,
   if (!resolve_auto)
     return out;
 
-  const auto resolved = ResolveSafeInputSourceName(cfg.source_name);
+  const auto resolved =
+      ResolveSafeInputSourceName(cfg.source_name, stop_requested);
   out.warnings = resolved.warnings;
   if (!resolved.ok) {
     out.availability = "unavailable";
@@ -288,7 +290,16 @@ ResolveMicrophoneSourceStatus(const VirtualAudioServiceConfig &cfg,
   return out;
 }
 
-void FillMaxineAvailability(AudioBackendAvailability *out) {
+void BeforePreparationProbe(const VirtualAudioServiceHooks *hooks,
+                            std::string_view name,
+                            const std::atomic_bool *stop_requested) {
+  if (hooks && hooks->before_preparation_probe && stop_requested)
+    hooks->before_preparation_probe(name, *stop_requested);
+}
+
+void FillMaxineAvailability(AudioBackendAvailability *out,
+                            const VirtualAudioServiceHooks *hooks,
+                            const std::atomic_bool *stop_requested) {
   if (!out)
     return;
 
@@ -299,58 +310,47 @@ void FillMaxineAvailability(AudioBackendAvailability *out) {
     return;
   }
 
-  const auto settings = studiocast::config::LoadSettings();
-  const auto sel = studiocast::maxine::SelectGpu(settings.gpu);
-  if (!sel.selected || !sel.selected->compute_capability) {
-    out->maxine_ok = false;
-    out->maxine_reason = "Failed to select a supported NVIDIA GPU.";
-    if (!sel.error.empty())
-      out->maxine_reason += " " + sel.error;
-    return;
-  }
-
-  const auto paths = studiocast::maxine::ResolveMaxinePaths();
-  if (!paths.afx.ok) {
-    out->maxine_ok = false;
-    out->maxine_reason = "AFX SDK not available";
-    if (!paths.afx.problems.empty()) {
-      out->maxine_reason += ": ";
-      out->maxine_reason += paths.afx.problems.front();
-    }
-    return;
-  }
-
+  // Detailed GPU and SDK discovery is performed once by the preparation that
+  // will consume it. Repeating it here would duplicate settings reads,
+  // nvidia-smi execution, and SDK scans before every restart.
+  (void)hooks;
+  (void)stop_requested;
   out->maxine_ok = true;
   out->maxine_reason.clear();
 }
 
 AudioBackendAvailability ProbeAudioBackendAvailabilityForMicrophone(
-    const VirtualAudioServiceConfig &cfg) {
+    const VirtualAudioServiceConfig &cfg, const VirtualAudioServiceHooks *hooks,
+    const std::atomic_bool *stop_requested) {
   AudioBackendAvailability out;
 
 #if !STUDIOCAST_HAVE_ONNXRUNTIME
   (void)cfg;
 #endif
 
-  FillMaxineAvailability(&out);
+  using Pref = AudioEffectsEnginePreference;
+  const bool probeMaxine =
+      cfg.effects.engine == Pref::kAuto || cfg.effects.engine == Pref::kMaxine;
+  const bool probeOpenAudio = cfg.effects.engine == Pref::kAuto ||
+                              cfg.effects.engine == Pref::kOpenSource;
+  if (probeMaxine)
+    FillMaxineAvailability(&out, hooks, stop_requested);
+  else
+    out.maxine_reason = "Maxine was not selected for this preparation.";
 
 #if !STUDIOCAST_ENABLE_OPEN_AUDIO
+  (void)probeOpenAudio;
   out.open_source_ok = false;
   out.open_source_reason = "Open Audio backend is disabled in this build.";
 #elif STUDIOCAST_HAVE_ONNXRUNTIME
-  // Open Audio backend availability probe: validate that a model can be
-  // resolved.
-  {
-    std::string oerr;
-    if (studiocast::open_audio::ResolveOpenAudioModelForMicrophone(
-            cfg.effects, nullptr, &oerr)) {
-      out.open_source_ok = true;
-      out.open_source_reason.clear();
-    } else {
-      out.open_source_ok = false;
-      out.open_source_reason =
-          oerr.empty() ? "Open Audio backend unavailable." : oerr;
-    }
+  if (probeOpenAudio) {
+    // Model resolution is part of the single processor preparation pass.
+    out.open_source_ok = true;
+    out.open_source_reason.clear();
+  } else {
+    out.open_source_ok = false;
+    out.open_source_reason =
+        "Open Audio was not selected for this preparation.";
   }
 #else
   out.open_source_ok = false;
@@ -361,31 +361,37 @@ AudioBackendAvailability ProbeAudioBackendAvailabilityForMicrophone(
   return out;
 }
 
-AudioBackendAvailability
-ProbeAudioBackendAvailabilityForSpeaker(const VirtualAudioServiceConfig &cfg) {
+AudioBackendAvailability ProbeAudioBackendAvailabilityForSpeaker(
+    const VirtualAudioServiceConfig &cfg, const VirtualAudioServiceHooks *hooks,
+    const std::atomic_bool *stop_requested) {
   AudioBackendAvailability out;
 
 #if !STUDIOCAST_HAVE_ONNXRUNTIME
   (void)cfg;
 #endif
 
-  FillMaxineAvailability(&out);
+  using Pref = AudioEffectsEnginePreference;
+  const bool probeMaxine =
+      cfg.effects.engine == Pref::kAuto || cfg.effects.engine == Pref::kMaxine;
+  const bool probeOpenAudio = cfg.effects.engine == Pref::kAuto ||
+                              cfg.effects.engine == Pref::kOpenSource;
+  if (probeMaxine)
+    FillMaxineAvailability(&out, hooks, stop_requested);
+  else
+    out.maxine_reason = "Maxine was not selected for this preparation.";
 
 #if !STUDIOCAST_ENABLE_OPEN_AUDIO
+  (void)probeOpenAudio;
   out.open_source_ok = false;
   out.open_source_reason = "Open Audio backend is disabled in this build.";
 #elif STUDIOCAST_HAVE_ONNXRUNTIME
-  {
-    std::string oerr;
-    if (studiocast::open_audio::ResolveOpenAudioModelForSpeaker(
-            cfg.effects, nullptr, &oerr)) {
-      out.open_source_ok = true;
-      out.open_source_reason.clear();
-    } else {
-      out.open_source_ok = false;
-      out.open_source_reason =
-          oerr.empty() ? "Open Audio backend unavailable." : oerr;
-    }
+  if (probeOpenAudio) {
+    out.open_source_ok = true;
+    out.open_source_reason.clear();
+  } else {
+    out.open_source_ok = false;
+    out.open_source_reason =
+        "Open Audio was not selected for this preparation.";
   }
 #else
   out.open_source_ok = false;
@@ -526,6 +532,12 @@ void VirtualAudioService::UpdateConfig(const VirtualAudioServiceConfig &cfg) {
   cfg_ = cfg;
 }
 
+void VirtualAudioService::RefreshPreparation() {
+  mic_backend_generation_.fetch_add(1, std::memory_order_acq_rel);
+  speaker_backend_generation_.fetch_add(1, std::memory_order_acq_rel);
+  device_generation_.fetch_add(1, std::memory_order_acq_rel);
+}
+
 VirtualAudioServiceConfig VirtualAudioService::Config() const {
   std::lock_guard<std::mutex> lock(mu_);
   return cfg_;
@@ -602,7 +614,7 @@ VirtualAudioService::ProbeMicrophoneBackendAvailability(
   if (hooks_.probe_microphone_backend_availability) {
     return hooks_.probe_microphone_backend_availability(cfg);
   }
-  return ProbeAudioBackendAvailabilityForMicrophone(cfg);
+  return ProbeAudioBackendAvailabilityForMicrophone(cfg, &hooks_, &stop_);
 }
 
 AudioBackendAvailability VirtualAudioService::ProbeSpeakerBackendAvailability(
@@ -610,7 +622,7 @@ AudioBackendAvailability VirtualAudioService::ProbeSpeakerBackendAvailability(
   if (hooks_.probe_speaker_backend_availability) {
     return hooks_.probe_speaker_backend_availability(cfg);
   }
-  return ProbeAudioBackendAvailabilityForSpeaker(cfg);
+  return ProbeAudioBackendAvailabilityForSpeaker(cfg, &hooks_, &stop_);
 }
 
 AudioConsumerSnapshot VirtualAudioService::DetectMicrophoneConsumers() const {
@@ -668,17 +680,21 @@ void VirtualAudioService::ThreadMain() {
   steady_clock::time_point lastMicConsumerSeen{};
   steady_clock::time_point lastSpeakerConsumerSeen{};
 
-  constexpr auto availabilityProbeTtl = seconds(2);
   std::optional<CachedMicrophoneSourceStatus> cachedMicSourceStatus;
-  steady_clock::time_point nextMicSourceStatusProbe{};
+  std::uint64_t cachedMicSourceGeneration = 0;
 
   std::optional<AudioBackendAvailability> cachedMicAvailability;
   std::optional<MicrophoneAvailabilityCacheKey> cachedMicAvailabilityKey;
-  steady_clock::time_point nextMicAvailabilityProbe{};
+  std::uint64_t cachedMicBackendGeneration = 0;
 
   std::optional<AudioBackendAvailability> cachedSpeakerAvailability;
   std::optional<SpeakerAvailabilityCacheKey> cachedSpeakerAvailabilityKey;
-  steady_clock::time_point nextSpeakerAvailabilityProbe{};
+  std::uint64_t cachedSpeakerBackendGeneration = 0;
+
+  std::string cachedSpeakerSinkConfigured;
+  std::optional<std::string> cachedSpeakerSink;
+  std::string cachedSpeakerSinkError;
+  std::uint64_t cachedSpeakerSinkGeneration = 0;
 
 #if STUDIOCAST_HAVE_PULSE_SIMPLE
   std::unique_ptr<studiocast::maxine::afx::AfxApi> api;
@@ -697,12 +713,14 @@ void VirtualAudioService::ThreadMain() {
   std::optional<studiocast::audio::effects::BroadcastAudioEffects> lastFx;
   std::string lastSource;
   std::filesystem::path lastAfxLib;
+  std::uint64_t lastMicPreparedGeneration = 0;
 
   std::string lastSpeakerBackend;
   std::optional<studiocast::audio::effects::BroadcastSpeakerEffects>
       lastSpeakerFx;
   std::string lastSpeakerTargetSink;
   std::filesystem::path lastSpeakerAfxLib;
+  std::uint64_t lastSpeakerPreparedGeneration = 0;
 
   bool micRestartingAfterTerminalFailure = false;
   bool speakerRestartingAfterTerminalFailure = false;
@@ -742,27 +760,47 @@ void VirtualAudioService::ThreadMain() {
     }
 
     const int pollMs = std::max(25, cfg.poll_ms);
+    const auto deviceGeneration =
+        device_generation_.load(std::memory_order_acquire);
+    const auto micBackendGeneration =
+        mic_backend_generation_.load(std::memory_order_acquire);
+    const auto speakerBackendGeneration =
+        speaker_backend_generation_.load(std::memory_order_acquire);
+    if (cachedMicBackendGeneration != 0 &&
+        cachedMicBackendGeneration != micBackendGeneration) {
+      openAudioCooldownUntil = {};
+      openAudioCooldownReason.clear();
+      maxineCooldownUntil = {};
+      maxineCooldownReason.clear();
+    }
+    if (cachedSpeakerBackendGeneration != 0 &&
+        cachedSpeakerBackendGeneration != speakerBackendGeneration) {
+      speakerOpenAudioCooldownUntil = {};
+      speakerOpenAudioCooldownReason.clear();
+    }
 
     const bool resolveAutoMicSource = cfg.enabled;
     const bool shouldProbeMicSource = cfg.enabled || !cfg.source_name.empty();
     MicrophoneSourceStatus micSourceStatus;
     if (shouldProbeMicSource) {
-      const auto sourceNow = steady_clock::now();
       const bool sourceStatusExpired =
           !cachedMicSourceStatus ||
           cachedMicSourceStatus->configured_source != cfg.source_name ||
           cachedMicSourceStatus->resolve_auto != resolveAutoMicSource ||
-          sourceNow >= nextMicSourceStatusProbe;
+          cachedMicSourceGeneration != deviceGeneration;
       if (sourceStatusExpired) {
+        BeforePreparationProbe(&hooks_, "source", &stop_);
+        if (stop_.load(std::memory_order_acquire))
+          break;
         cachedMicSourceStatus = CachedMicrophoneSourceStatus{
             cfg.source_name, resolveAutoMicSource,
-            ResolveMicrophoneSourceStatus(cfg, resolveAutoMicSource)};
-        nextMicSourceStatusProbe = sourceNow + availabilityProbeTtl;
+            ResolveMicrophoneSourceStatus(cfg, resolveAutoMicSource, &stop_)};
+        cachedMicSourceGeneration = deviceGeneration;
       }
       micSourceStatus = cachedMicSourceStatus->status;
     } else {
       cachedMicSourceStatus.reset();
-      nextMicSourceStatusProbe = steady_clock::time_point{};
+      cachedMicSourceGeneration = 0;
     }
 
     {
@@ -1286,11 +1324,11 @@ void VirtualAudioService::ThreadMain() {
             !cachedSpeakerAvailability ||
             !cachedSpeakerAvailabilityKey.has_value() ||
             *cachedSpeakerAvailabilityKey != speakerAvailabilityKey ||
-            now >= nextSpeakerAvailabilityProbe;
+            cachedSpeakerBackendGeneration != speakerBackendGeneration;
         if (speakerAvailabilityExpired) {
           cachedSpeakerAvailability = ProbeSpeakerBackendAvailability(cfg);
           cachedSpeakerAvailabilityKey = speakerAvailabilityKey;
-          nextSpeakerAvailabilityProbe = now + availabilityProbeTtl;
+          cachedSpeakerBackendGeneration = speakerBackendGeneration;
         }
         AudioBackendAvailability speakerAvail = *cachedSpeakerAvailability;
         bool speakerOpenAudioCooldownActive = false;
@@ -1331,14 +1369,28 @@ void VirtualAudioService::ThreadMain() {
 
         // Choose target sink. If misconfigured (virtual sink), fall back to a
         // safe physical sink.
-        std::string sinkErr;
-        auto sinkOpt =
-            ChooseSpeakerTargetSinkName(cfg.speaker_target_sink, &sinkErr);
-        if (!sinkOpt) {
-          std::string sinkErr2;
-          sinkOpt =
-              ChooseSpeakerTargetSinkName(/*configured_target=*/"", &sinkErr2);
+        const bool sinkPreparationChanged =
+            cachedSpeakerSinkGeneration != deviceGeneration ||
+            cachedSpeakerSinkConfigured != cfg.speaker_target_sink;
+        if (sinkPreparationChanged) {
+          BeforePreparationProbe(&hooks_, "sink", &stop_);
+          if (stop_.load(std::memory_order_acquire))
+            break;
+          cachedSpeakerSinkConfigured = cfg.speaker_target_sink;
+          cachedSpeakerSinkError.clear();
+          cachedSpeakerSink = ChooseSpeakerTargetSinkName(
+              cfg.speaker_target_sink, &cachedSpeakerSinkError, &stop_);
+          if (!cachedSpeakerSink) {
+            std::string fallbackError;
+            cachedSpeakerSink = ChooseSpeakerTargetSinkName(
+                /*configured_target=*/"", &fallbackError, &stop_);
+            if (!cachedSpeakerSink && cachedSpeakerSinkError.empty())
+              cachedSpeakerSinkError = std::move(fallbackError);
+          }
+          cachedSpeakerSinkGeneration = deviceGeneration;
         }
+        const auto sinkOpt = cachedSpeakerSink;
+        const std::string &sinkErr = cachedSpeakerSinkError;
 
         if (!sinkOpt) {
           // Can't route speakers anywhere.
@@ -1402,6 +1454,7 @@ void VirtualAudioService::ThreadMain() {
           }
           const bool needSpkRestart =
               (!spk_pipeline) || spkPipelineDead ||
+              (lastSpeakerPreparedGeneration != speakerBackendGeneration) ||
               (lastSpeakerBackend != desiredSpkBackend) ||
               (lastSpeakerTargetSink != sinkName) ||
               ((wantSpkMaxine || wantSpkOpenAudio) && speakerEffectsChanged);
@@ -1478,6 +1531,9 @@ void VirtualAudioService::ThreadMain() {
             // Build the processor (Maxine/Open Audio/Passthrough), with
             // graceful fallback.
             if (wantSpkOpenAudio) {
+              BeforePreparationProbe(&hooks_, "model_registry", &stop_);
+              if (stop_.load(std::memory_order_acquire))
+                break;
               studiocast::open_audio::ResolvedOpenAudioModel selected;
               std::string oerr;
               auto oa = studiocast::open_audio::OpenAudioAudioProcessor::
@@ -1494,9 +1550,9 @@ void VirtualAudioService::ThreadMain() {
                   st_.speakers_open_audio_runtime = {};
                   SetOpenAudioRuntimeModel(&st_.speakers_open_audio_runtime,
                                            selected);
-                  MarkOpenAudioRuntimeDisabled(
-                      &st_.speakers_open_audio_runtime,
-                      "Open Audio init failed: " + oerr);
+                  MarkOpenAudioRuntimeDisabled(&st_.speakers_open_audio_runtime,
+                                               "Open Audio init failed: " +
+                                                   oerr);
                   st_.speakers_backend_active = "passthrough";
                   st_.speakers_effects_note =
                       "Open-source speaker backend failed to initialize; using "
@@ -1515,8 +1571,15 @@ void VirtualAudioService::ThreadMain() {
               }
             } else if (wantSpkMaxine) {
               // Resolve GPU selection (settings.conf) and AFX SDK paths.
+              BeforePreparationProbe(&hooks_, "settings", &stop_);
+              if (stop_.load(std::memory_order_acquire))
+                break;
               const auto settings = studiocast::config::LoadSettings();
-              const auto sel = studiocast::maxine::SelectGpu(settings.gpu);
+              BeforePreparationProbe(&hooks_, "gpu_selection", &stop_);
+              if (stop_.load(std::memory_order_acquire))
+                break;
+              const auto sel =
+                  studiocast::maxine::SelectGpu(settings.gpu, &stop_);
               if (!sel.selected || !sel.selected->compute_capability) {
                 desiredSpkBackend = "passthrough";
                 spk_processor = std::make_unique<PassthroughAudioProcessor>();
@@ -1531,6 +1594,9 @@ void VirtualAudioService::ThreadMain() {
                       "GPU selection failed: " + sel.error;
                 }
               } else {
+                BeforePreparationProbe(&hooks_, "sdk_paths", &stop_);
+                if (stop_.load(std::memory_order_acquire))
+                  break;
                 const auto paths = studiocast::maxine::ResolveMaxinePaths();
                 if (!paths.afx.ok) {
                   std::string msg = "AFX SDK not available";
@@ -1647,6 +1713,7 @@ void VirtualAudioService::ThreadMain() {
                 lastSpeakerBackend = desiredSpkBackend;
                 lastSpeakerTargetSink = sinkName;
                 lastSpeakerFx = cfg.effects.speaker;
+                lastSpeakerPreparedGeneration = speakerBackendGeneration;
 
                 {
                   std::lock_guard<std::mutex> lock(mu_);
@@ -1876,11 +1943,11 @@ void VirtualAudioService::ThreadMain() {
       const bool micAvailabilityExpired =
           !cachedMicAvailability || !cachedMicAvailabilityKey.has_value() ||
           *cachedMicAvailabilityKey != micAvailabilityKey ||
-          now2 >= nextMicAvailabilityProbe;
+          cachedMicBackendGeneration != micBackendGeneration;
       if (micAvailabilityExpired) {
         cachedMicAvailability = ProbeMicrophoneBackendAvailability(cfg);
         cachedMicAvailabilityKey = micAvailabilityKey;
-        nextMicAvailabilityProbe = now2 + availabilityProbeTtl;
+        cachedMicBackendGeneration = micBackendGeneration;
       }
       avail = *cachedMicAvailability;
       if (now2 < openAudioCooldownUntil) {
@@ -2037,9 +2104,11 @@ void VirtualAudioService::ThreadMain() {
     }
 
     const std::string micPipelineSource = micSourceStatus.selected_source;
-    const bool needRestart = (!pipeline) || (lastBackend != desiredBackend) ||
-                             (lastSource != micPipelineSource) ||
-                             ((wantMaxine || wantOpenAudio) && effectsChanged);
+    const bool needRestart =
+        (!pipeline) || (lastBackend != desiredBackend) ||
+        (lastSource != micPipelineSource) ||
+        (lastMicPreparedGeneration != micBackendGeneration) ||
+        ((wantMaxine || wantOpenAudio) && effectsChanged);
 
     if (needRestart) {
       if (pipeline) {
@@ -2129,6 +2198,7 @@ void VirtualAudioService::ThreadMain() {
       lastBackend = "passthrough";
       lastSource = micPipelineSource;
       lastFx = cfg.effects;
+      lastMicPreparedGeneration = micBackendGeneration;
       {
         std::lock_guard<std::mutex> lock(mu_);
         st_.pipeline_starting = false;
@@ -2158,6 +2228,9 @@ void VirtualAudioService::ThreadMain() {
           st_.gpu_compute_cap.clear();
         }
 
+        BeforePreparationProbe(&hooks_, "model_registry", &stop_);
+        if (stop_.load(std::memory_order_acquire))
+          break;
         studiocast::open_audio::ResolvedOpenAudioModel selected;
         std::string oerr;
         auto oa = studiocast::open_audio::OpenAudioAudioProcessor::
@@ -2231,6 +2304,7 @@ void VirtualAudioService::ThreadMain() {
         lastBackend = desiredBackend;
         lastSource = micPipelineSource;
         lastFx = cfg.effects;
+        lastMicPreparedGeneration = micBackendGeneration;
 
         {
           std::lock_guard<std::mutex> lock(mu_);
@@ -2333,6 +2407,7 @@ void VirtualAudioService::ThreadMain() {
 
         lastBackend = desiredBackend;
         lastSource = micPipelineSource;
+        lastMicPreparedGeneration = micBackendGeneration;
 
         {
           std::lock_guard<std::mutex> lock(mu_);
@@ -2376,67 +2451,78 @@ void VirtualAudioService::ThreadMain() {
       continue;
     }
 
-    // Resolve GPU selection (settings.conf) and AFX SDK paths.
-    const auto settings = studiocast::config::LoadSettings();
-    const auto sel = studiocast::maxine::SelectGpu(settings.gpu);
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      st_.gpu_index = sel.selected ? sel.selected->index : -1;
-      st_.gpu_name = sel.selected ? sel.selected->name : std::string();
-      st_.gpu_compute_cap = (sel.selected && sel.selected->compute_capability)
-                                ? sel.selected->ComputeCapString()
-                                : std::string();
-    }
-    if (!sel.selected || !sel.selected->compute_capability) {
-      const std::string reason =
-          "Failed to select a supported NVIDIA GPU: " + sel.error;
-      (void)startMicPassthroughFallback(
-          "Failed to select a supported NVIDIA GPU for microphone effects; "
-          "using pass-through.\n" +
-              sel.error,
-          reason);
-      SleepFor(milliseconds(pollMs));
-      continue;
-    }
-
-    const auto paths = studiocast::maxine::ResolveMaxinePaths();
-    if (!paths.afx.ok) {
-      std::string msg = "AFX SDK not available";
-      if (!paths.afx.problems.empty()) {
-        msg += ": ";
-        msg += paths.afx.problems.front();
+    if (needRestart) {
+      // Resolve GPU selection (settings.conf) and AFX SDK paths only while
+      // preparing a new pipeline generation. Stable active audio must not
+      // rediscover provider configuration on supervisor polls.
+      BeforePreparationProbe(&hooks_, "settings", &stop_);
+      if (stop_.load(std::memory_order_acquire))
+        break;
+      const auto settings = studiocast::config::LoadSettings();
+      BeforePreparationProbe(&hooks_, "gpu_selection", &stop_);
+      if (stop_.load(std::memory_order_acquire))
+        break;
+      const auto sel = studiocast::maxine::SelectGpu(settings.gpu, &stop_);
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        st_.gpu_index = sel.selected ? sel.selected->index : -1;
+        st_.gpu_name = sel.selected ? sel.selected->name : std::string();
+        st_.gpu_compute_cap = (sel.selected && sel.selected->compute_capability)
+                                  ? sel.selected->ComputeCapString()
+                                  : std::string();
       }
-      (void)startMicPassthroughFallback(
-          "AFX SDK not available for microphone effects; using "
-          "pass-through.\n" +
-              msg,
-          msg);
-      SleepFor(milliseconds(pollMs));
-      continue;
-    }
-
-    if (!api || paths.afx.library != lastAfxLib) {
-      api = std::make_unique<studiocast::maxine::afx::AfxApi>();
-      std::string aerr;
-      if (!api->InitializeFromLibraryPath(paths.afx.library, &aerr)) {
+      if (!sel.selected || !sel.selected->compute_capability) {
+        const std::string reason =
+            "Failed to select a supported NVIDIA GPU: " + sel.error;
         (void)startMicPassthroughFallback(
-            "Failed to initialize AFX runtime for microphone effects; using "
-            "pass-through.\n" +
-                aerr,
-            "Failed to initialize AFX runtime: " + aerr);
+            "Failed to select a supported NVIDIA GPU for microphone effects; "
+            "using pass-through.\n" +
+                sel.error,
+            reason);
         SleepFor(milliseconds(pollMs));
         continue;
       }
-      lastAfxLib = paths.afx.library;
-    }
 
-    if (!fx) {
-      fx = std::make_unique<studiocast::maxine::afx::AfxEffect>(api.get());
-    } else {
-      fx->SetApi(api.get());
-    }
+      BeforePreparationProbe(&hooks_, "sdk_paths", &stop_);
+      if (stop_.load(std::memory_order_acquire))
+        break;
+      const auto paths = studiocast::maxine::ResolveMaxinePaths();
+      if (!paths.afx.ok) {
+        std::string msg = "AFX SDK not available";
+        if (!paths.afx.problems.empty()) {
+          msg += ": ";
+          msg += paths.afx.problems.front();
+        }
+        (void)startMicPassthroughFallback(
+            "AFX SDK not available for microphone effects; using "
+            "pass-through.\n" +
+                msg,
+            msg);
+        SleepFor(milliseconds(pollMs));
+        continue;
+      }
 
-    if (needRestart) {
+      if (!api || paths.afx.library != lastAfxLib) {
+        api = std::make_unique<studiocast::maxine::afx::AfxApi>();
+        std::string aerr;
+        if (!api->InitializeFromLibraryPath(paths.afx.library, &aerr)) {
+          (void)startMicPassthroughFallback(
+              "Failed to initialize AFX runtime for microphone effects; using "
+              "pass-through.\n" +
+                  aerr,
+              "Failed to initialize AFX runtime: " + aerr);
+          SleepFor(milliseconds(pollMs));
+          continue;
+        }
+        lastAfxLib = paths.afx.library;
+      }
+
+      if (!fx) {
+        fx = std::make_unique<studiocast::maxine::afx::AfxEffect>(api.get());
+      } else {
+        fx->SetApi(api.get());
+      }
+
       studiocast::maxine::afx::AfxEffectConfig e;
       e.effect_selector = plan.effect_selector;
       e.feature_id = plan.feature_id;
@@ -2512,6 +2598,7 @@ void VirtualAudioService::ThreadMain() {
       lastFx = cfg.effects;
       lastSource = micPipelineSource;
       lastBackend = desiredBackend;
+      lastMicPreparedGeneration = micBackendGeneration;
       {
         std::lock_guard<std::mutex> lock(mu_);
         st_.pipeline_starting = false;
