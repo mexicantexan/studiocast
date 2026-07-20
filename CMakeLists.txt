@@ -827,6 +827,26 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
             AUTORCC OFF
     )
 
+    add_executable(studiocast-v4l2-writer-bench
+            src/tools/studiocast_v4l2_writer_bench_main.cpp
+    )
+
+    target_link_libraries(studiocast-v4l2-writer-bench PRIVATE studiocast_core)
+
+    target_include_directories(studiocast-v4l2-writer-bench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-v4l2-writer-bench)
+    studiocast_enable_sanitizers(studiocast-v4l2-writer-bench)
+
+    set_target_properties(studiocast-v4l2-writer-bench PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
     add_executable(studiocast-cuda-transfer-bench
             src/tools/studiocast_cuda_transfer_bench_main.cpp
     )
@@ -1604,6 +1624,31 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-video-tests COMMAND studiocast-video-tests)
+
+    add_executable(studiocast-v4l2-writer-transport-tests
+            tests/v4l2_writer_transport_tests.cpp
+    )
+
+    target_link_libraries(studiocast-v4l2-writer-transport-tests PRIVATE
+            studiocast_core
+    )
+
+    target_include_directories(studiocast-v4l2-writer-transport-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-v4l2-writer-transport-tests)
+    studiocast_enable_sanitizers(studiocast-v4l2-writer-transport-tests)
+
+    set_target_properties(studiocast-v4l2-writer-transport-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-v4l2-writer-transport-tests
+            COMMAND studiocast-v4l2-writer-transport-tests)
 
     add_executable(studiocast-open-video-scratch-tests
             tests/open_video_scratch_reuse_tests.cpp

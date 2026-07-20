@@ -1566,9 +1566,16 @@ bool CameraPipeline::EnsureOutputOpen(const CameraPipelineConfig &cfg,
       keepalive_format_ = outA;
     }
 
-    std::string werr;
-    if (!writer_.WriteFrame(keepalive_frame_.data(), keepalive_frame_.size(),
-                            &werr)) {
+    const FrameWriteResult write_result = writer_.WriteFrameDetailed(
+        keepalive_frame_.data(), keepalive_frame_.size());
+    if (write_result.status == FrameWriteStatus::would_block_dropped) {
+      // Keepalive has no queue. A later supervisor tick supplies the newest
+      // frame without treating output backpressure as device failure.
+      last_keepalive_frame_at_ = now;
+      return true;
+    }
+    if (!write_result.FrameCommitted()) {
+      const std::string werr = DescribeFrameWriteResult(write_result);
       const std::string msg = "Failed to write keepalive frame: " + werr;
       writer_.Close();
       writer_device_.clear();
@@ -10270,6 +10277,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   int output_write_recoveries = 0;
   bool raw_capture_fallback_attempted = false;
 
+  // Caller holds mu_. The writer counters are updated only by this thread.
+  const auto PublishWriterCountersLocked = [&] {
+    const FrameWriteCounters &writes = writer_.WriteCounters();
+    debug_.output_write_syscalls = writes.write_syscalls;
+    debug_.output_frames_committed = writes.frames_written;
+    debug_.output_would_block_drops = writes.would_block_drops;
+    debug_.output_stopped_writes = writes.stopped_writes;
+    debug_.output_eintr_retries = writes.eintr_retries;
+    debug_.output_partial_frame_failures = writes.partial_frame_failures;
+    debug_.output_fatal_failures = writes.fatal_failures;
+  };
+
   auto ActualFormatToString = [](const ActualFormat &a) {
     std::ostringstream oss;
     oss << a.width << "x" << a.height << "@" << a.fps << " ";
@@ -10283,9 +10302,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
            a.pixfmt_fourcc == b.pixfmt_fourcc &&
            a.bytes_per_line == b.bytes_per_line && a.size_image == b.size_image;
   };
-
-  constexpr int kOutputRefreshEveryFrames = 30;
-  int frames_until_output_refresh = kOutputRefreshEveryFrames;
 
   auto TryRawCaptureFallbackAfterMjpegFailure =
       [&](const std::string &reason, std::string *error) -> bool {
@@ -10343,17 +10359,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     return true;
   };
 
-  auto RefreshOutputActual = [&](const char *reason, bool force) -> bool {
+  auto RefreshOutputActual = [&](const char *reason) -> bool {
     if (!writer_.IsOpen())
       return false;
-
-    if (!force) {
-      if (--frames_until_output_refresh > 0)
-        return false;
-      frames_until_output_refresh = kOutputRefreshEveryFrames;
-    } else {
-      frames_until_output_refresh = kOutputRefreshEveryFrames;
-    }
 
     const ActualFormat prev = outA;
     std::string rerr;
@@ -10590,17 +10598,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     const auto t_capture_end = Clock::now();
     const double capture_ms = ToMs(t_capture_end - t_capture_start);
-
-    // Periodically refresh the v4l2loopback negotiated format so
-    // consumer-driven VIDIOC_S_FMT changes (common in Zoom/Teams) do not force
-    // pipeline restarts.
-    const bool output_changed =
-        RefreshOutputActual("periodic", /*force=*/false);
-    if (raw_yuyv_passthrough_frame && output_changed) {
-      // The bounded copy was prepared for the previous negotiated layout.
-      // Drop it and use the newly prepared plan on the next captured frame.
-      continue;
-    }
 
     live_effect_attribution.BeginFrame();
     const auto mark_live_effect_success = [&](std::string_view effect_id,
@@ -13636,23 +13633,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       continue;
     }
 
+    const std::uint8_t *output_data = nullptr;
+    std::size_t output_bytes = 0;
     if (outA.format == PixelFormat::rgb24) {
       const std::size_t wantRow = static_cast<std::size_t>(outW) * 3u;
 
       if (outA.bytes_per_line == wantRow && outA.size_image == rgbOutBytes) {
-        std::string werr;
-        if (!writer_.WriteFrame(rgbOut, rgbOutBytes, &werr)) {
-          // Best-effort recovery: consumers may renegotiate global loopback
-          // caps via VIDIOC_S_FMT (common in Zoom/Teams). Refresh and drop this
-          // frame instead of tearing down the whole pipeline.
-          if (RefreshOutputActual("write_fail", /*force=*/true)) {
-            ++output_write_recoveries;
-            continue;
-          }
-          std::lock_guard<std::mutex> lock(mu_);
-          last_error_ = "Write failed: " + werr;
-          break;
-        }
+        output_data = rgbOut;
+        output_bytes = rgbOutBytes;
       } else {
         // Copy into padded output buffer.
         for (int y = 0; y < outH; ++y) {
@@ -13665,18 +13653,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             dstRow[i] = srcRow[i];
         }
 
-        std::string werr;
-        if (!writer_.WriteFrame(outBuf.data(), outBuf.size(), &werr)) {
-          // See note above: allow consumer-driven renegotiation without
-          // restart.
-          if (RefreshOutputActual("write_fail", /*force=*/true)) {
-            ++output_write_recoveries;
-            continue;
-          }
-          std::lock_guard<std::mutex> lock(mu_);
-          last_error_ = "Write failed: " + werr;
-          break;
-        }
+        output_data = outBuf.data();
+        output_bytes = outBuf.size();
       }
     } else {
       if (!raw_yuyv_passthrough_frame) {
@@ -13689,17 +13667,43 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             yuyvConversionScratch.size(), &yuyv_frame_path_counters);
       }
 
-      std::string werr;
-      if (!writer_.WriteFrame(outBuf.data(), outBuf.size(), &werr)) {
-        // See note above: allow consumer-driven renegotiation without restart.
-        if (RefreshOutputActual("write_fail", /*force=*/true)) {
-          ++output_write_recoveries;
-          continue;
-        }
+      output_data = outBuf.data();
+      output_bytes = outBuf.size();
+    }
+
+    const FrameWriteResult write_result =
+        writer_.WriteFrameDetailed(output_data, output_bytes, &stop_);
+    if (write_result.status == FrameWriteStatus::stopped) {
+      live_effect_attribution.DiscardFrame();
+      std::lock_guard<std::mutex> lock(mu_);
+      PublishWriterCountersLocked();
+      break;
+    }
+    if (write_result.status == FrameWriteStatus::would_block_dropped) {
+      // Zero-queue latest-frame policy: this frame is discarded and the next
+      // capture replaces it. Do not probe or format an error on this path.
+      live_effect_attribution.DiscardFrame();
+      {
         std::lock_guard<std::mutex> lock(mu_);
-        last_error_ = "Write failed: " + werr;
-        break;
+        PublishWriterCountersLocked();
       }
+      continue;
+    }
+    if (!write_result.FrameCommitted()) {
+      // A consumer-driven format change is the sole write failure that may
+      // trigger an in-place refresh. Transport/disconnect and partial-frame
+      // failures remain fatal and visible.
+      if (write_result.ShouldRefreshFormat() &&
+          RefreshOutputActual("write_format_mismatch")) {
+        ++output_write_recoveries;
+        live_effect_attribution.DiscardFrame();
+        continue;
+      }
+      const std::string werr = DescribeFrameWriteResult(write_result);
+      std::lock_guard<std::mutex> lock(mu_);
+      PublishWriterCountersLocked();
+      last_error_ = "Write failed: " + werr;
+      break;
     }
 
     if (live_effect_attribution.CommitSuccessfulFrame(
@@ -13824,6 +13828,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       debug_.output_format_changes = output_format_changes;
       debug_.output_refresh_failures = output_refresh_failures;
       debug_.output_write_recoveries = output_write_recoveries;
+      PublishWriterCountersLocked();
       debug_.yuyv_capture_to_rgb_calls =
           yuyv_frame_path_counters.capture_to_rgb_calls;
       debug_.yuyv_output_from_rgb_calls =

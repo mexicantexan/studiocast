@@ -2813,6 +2813,22 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << st.pipeline.debug.output_refresh_failures << ",";
     oss << "\"output_write_recoveries\":"
         << st.pipeline.debug.output_write_recoveries;
+    oss << ",\"output_write_syscalls\":"
+        << st.pipeline.debug.output_write_syscalls;
+    oss << ",\"output_frames_committed\":"
+        << st.pipeline.debug.output_frames_committed;
+    oss << ",\"output_would_block_drops\":"
+        << st.pipeline.debug.output_would_block_drops;
+    oss << ",\"output_stopped_writes\":"
+        << st.pipeline.debug.output_stopped_writes;
+    oss << ",\"output_eintr_retries\":"
+        << st.pipeline.debug.output_eintr_retries;
+    oss << ",\"output_partial_frame_failures\":"
+        << st.pipeline.debug.output_partial_frame_failures;
+    oss << ",\"output_fatal_failures\":"
+        << st.pipeline.debug.output_fatal_failures;
+    oss << ",\"output_queue_capacity\":"
+        << st.pipeline.debug.output_queue_capacity;
     oss << ",\"yuyv_capture_to_rgb_calls\":"
         << st.pipeline.debug.yuyv_capture_to_rgb_calls;
     oss << ",\"yuyv_output_from_rgb_calls\":"
