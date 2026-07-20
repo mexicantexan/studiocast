@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -84,6 +85,43 @@ std::string ResolveActiveComputeBackendName(
     bool vulkan_compute_available);
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
+
+// Tracks effect/backend attribution at the same boundary as a successfully
+// written output frame. Setup-time selection and an attempted effect are not
+// live evidence: callers begin a pending frame, record only completed effect
+// stages, and commit only after the writer accepts that frame.
+// Per-frame tracking is fixed-size and allocation-free; the public string is
+// rebuilt only when the committed attribution changes.
+class LiveEffectBackendAttribution {
+public:
+  void BeginFrame();
+  void MarkEffectSucceeded(std::string_view effect_id,
+                           std::string_view backend);
+  bool RemoveEffect(std::string_view effect_id);
+  void DiscardFrame();
+  bool CommitSuccessfulFrame(const std::vector<std::string> &canonical_order);
+  void Clear();
+
+  const std::string &active_backends() const { return active_backends_; }
+
+private:
+  static constexpr std::size_t kEffectCount = 9;
+  using BackendSlots = std::array<std::uint8_t, kEffectCount>;
+  using EffectOrder = std::array<std::uint8_t, kEffectCount>;
+
+  static std::size_t EffectSlot(std::string_view effect_id);
+  static std::uint8_t BackendCode(std::string_view backend);
+  static std::string_view EffectId(std::size_t slot);
+  static std::string_view BackendId(std::uint8_t code);
+  void RememberOrder(const std::vector<std::string> &canonical_order);
+  void SerializeActive();
+
+  BackendSlots pending_{};
+  BackendSlots active_{};
+  EffectOrder active_order_{};
+  std::size_t active_order_size_ = 0;
+  std::string active_backends_;
+};
 
 inline constexpr std::string_view
     kOpenVulkanVignetteTrackedCenterNotSupportedReason =

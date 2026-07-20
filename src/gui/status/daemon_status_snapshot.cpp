@@ -1206,10 +1206,41 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
       ObjectValue(audio, QStringLiteral("audio_effects"))
           .value(QStringLiteral("engine"))
           .toString();
+  const QJsonObject videoPipeline =
+      ObjectValue(video, QStringLiteral("pipeline"));
+  out.videoPipelineRunning =
+      videoPipeline.value(QStringLiteral("running")).toBool(false);
+  out.videoPipelineStarting =
+      videoPipeline.value(QStringLiteral("starting")).toBool(false);
+  out.videoPipelineState =
+      videoPipeline.value(QStringLiteral("state")).toString().trimmed();
+  const QString activeCompute =
+      out.videoComputeActiveBackend.trimmed().toLower();
+  const bool nonCpuActiveCompute =
+      !activeCompute.isEmpty() && activeCompute != QStringLiteral("cpu");
+  const auto hasActiveEngine = [&](const QString &engine) {
+    return out.videoComputeActiveEngines.contains(engine);
+  };
+  const bool matchingActiveEngine =
+      (activeCompute == QStringLiteral("vulkan") &&
+       hasActiveEngine(QStringLiteral("open_vulkan"))) ||
+      (activeCompute == QStringLiteral("cuda") &&
+       (hasActiveEngine(QStringLiteral("open_cuda")) ||
+        hasActiveEngine(QStringLiteral("maxine")))) ||
+      (activeCompute == QStringLiteral("maxine") &&
+       hasActiveEngine(QStringLiteral("maxine"))) ||
+      (activeCompute != QStringLiteral("vulkan") &&
+       activeCompute != QStringLiteral("cuda") &&
+       activeCompute != QStringLiteral("maxine") &&
+       hasActiveEngine(activeCompute));
+  const bool authoritativeRunningEffects =
+      out.videoPipelineRunning && !out.videoPipelineStarting &&
+      out.videoPipelineState == QStringLiteral("running") &&
+      nonCpuActiveCompute && matchingActiveEngine;
   out.videoEffectsActiveBackends =
-      ObjectValue(video, QStringLiteral("pipeline"))
-          .value(QStringLiteral("effects_backends"))
-          .toString();
+      authoritativeRunningEffects
+          ? videoPipeline.value(QStringLiteral("effects_backends")).toString()
+          : QString();
   out.microphoneActiveBackend =
       ObjectValue(audio, QStringLiteral("pipeline"))
           .value(QStringLiteral("backend_active"))

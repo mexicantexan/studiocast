@@ -157,6 +157,9 @@ struct DaemonStatusSnapshot {
   QString rawAudioEffectsJson;
   VideoEffectPlan videoEffectPlan;
   QMap<QString, EffectReadiness> videoEffectReadiness;
+  bool videoPipelineRunning = false;
+  bool videoPipelineStarting = false;
+  QString videoPipelineState;
   QString videoEffectsActiveBackends;
   QString microphoneActiveBackend;
   QString speakersActiveBackend;
