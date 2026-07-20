@@ -689,14 +689,32 @@ def runtime_diagnostics(data_root: Path) -> dict[str, Any] | None:
     ctl = data_root / "current/bin/studiocastctl"
     if not ctl.is_file() or ctl.is_symlink() or not os.access(ctl, os.X_OK):
         return None
+
+    # GET_STATUS is deliberately cache-only.  A newly started daemon has not
+    # populated its expensive provider/device diagnostics yet, so refresh them
+    # through the installed public CLI before consuming status.  The CLI owns
+    # the daemon protocol and bounds the IPC call at 30 seconds; this outer
+    # timeout also bounds process startup/teardown.  Older CLIs/daemons fail
+    # this additive command without preventing the compatibility status read,
+    # but their unrefreshed evidence is never eligible for recommendation.
+    refresh_code, refresh_text = readonly_command(
+        [str(ctl), "diagnostics", "refresh"], timeout=35)
     code, text = readonly_command([str(ctl), "status"], timeout=4)
     if code != 0:
         return None
     try:
         value = json.loads(text, object_pairs_hook=reject_duplicates)
+        refreshed = json.loads(refresh_text, object_pairs_hook=reject_duplicates)
     except (json.JSONDecodeError, BackendError):
         return None
-    return value if isinstance(value, dict) else None
+    refresh_engines = refreshed.get("engines") if isinstance(refreshed, dict) else None
+    refresh_open_vulkan = (refresh_engines.get("open_vulkan")
+                           if isinstance(refresh_engines, dict) else None)
+    if (refresh_code != 0 or not isinstance(refresh_engines, dict) or
+            not isinstance(refresh_open_vulkan, dict) or not refresh_open_vulkan or
+            not isinstance(value, dict)):
+        return None
+    return value
 
 
 def ort_facts(diagnostics: dict[str, Any] | None) -> dict[str, Any]:

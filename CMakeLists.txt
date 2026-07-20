@@ -1275,7 +1275,11 @@ if (BUILD_TESTING)
 
     target_compile_definitions(studiocast-installer-backend-tests PRIVATE
             STUDIOCAST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            STUDIOCAST_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+            STUDIOCAST_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
     )
+
+    add_dependencies(studiocast-installer-backend-tests studiocastd studiocastctl)
 
     studiocast_set_project_warnings(studiocast-installer-backend-tests)
     studiocast_enable_sanitizers(studiocast-installer-backend-tests)

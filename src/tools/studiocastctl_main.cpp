@@ -730,6 +730,7 @@ void Usage(const char *argv0) {
       << "studiocastctl - control StudioCast daemon (studiocastd)\n\n"
       << "Usage:\n"
       << "  " << argv0 << " status [--pretty]\n"
+      << "  " << argv0 << " diagnostics refresh\n"
       << "  " << argv0 << " debug-report [--out <path>]\n"
       << "  " << argv0 << " config\n"
       << "  " << argv0 << " effects get\n"
@@ -762,6 +763,7 @@ void Usage(const char *argv0) {
       << "Examples:\n"
       << "  " << argv0 << " status\n"
       << "  " << argv0 << " status --pretty\n"
+      << "  " << argv0 << " diagnostics refresh\n"
       << "  " << argv0 << " debug-report --out studiocast-debug-report.txt\n"
       << "  " << argv0 << " enable 1\n"
       << "  " << argv0
@@ -874,6 +876,36 @@ int main(int argc, char **argv) {
     }
 
     PrintMaxinePrettyFromStatusJson(res.json);
+    return 0;
+  }
+
+  if (cmd == "diagnostics") {
+    if (argc != 3 || !argv[2] || std::string_view(argv[2]) != "refresh") {
+      std::cerr << "ERROR: diagnostics requires the 'refresh' subcommand\n";
+      return 2;
+    }
+
+    // Diagnostics initialization is explicit setup-time work and can include
+    // provider/model probes. Keep it off status polling and the frame loop,
+    // while retaining a hard end-to-end IPC deadline.
+    studiocast::ipc::DaemonCallResult res;
+    studiocast::ipc::DaemonCallOptions options;
+    options.connect_timeout_ms = 1000;
+    options.io_timeout_ms = 30000;
+    std::string err;
+    if (!studiocast::ipc::DaemonCall("REFRESH_DIAGNOSTICS", &res, &err,
+                                     options)) {
+      std::cerr << "ERROR: " << err << "\n";
+      return 1;
+    }
+    if (!res.ok) {
+      std::cerr << (res.error_json.empty()
+                        ? std::string("{\"error\":\"daemon_error\"}")
+                        : res.error_json)
+                << "\n";
+      return 1;
+    }
+    std::cout << (res.json.empty() ? std::string("{}") : res.json) << "\n";
     return 0;
   }
 
