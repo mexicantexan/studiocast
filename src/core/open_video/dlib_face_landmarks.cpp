@@ -221,15 +221,13 @@ bool DlibFaceLandmarks::EnsureLandmarksForFrame(
     return false;
   }
 
-  FaceLandmarks out;
   const unsigned long n = det.num_parts();
-  out.points.reserve(n);
+  auto &out = cache->PrepareFaceLandmarks(n);
   for (unsigned long i = 0; i < n; ++i) {
     const auto pt = det.part(i);
     out.points.emplace_back(static_cast<float>(pt.x() + rx0),
                             static_cast<float>(pt.y() + ry0));
   }
-  cache->face_landmarks = std::move(out);
   return true;
 #endif
 }

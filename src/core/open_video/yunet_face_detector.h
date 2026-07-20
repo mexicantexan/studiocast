@@ -36,9 +36,49 @@ YunetOrtSessionOptions(YunetProviderPolicy policy);
 
 // Validates the graph's first input against the manifest/runtime contract.
 // Fixed graph dimensions must match exactly; dynamic dimensions are accepted.
-bool ValidateYunetInputTensorContract(
-    const std::vector<int64_t> &graph_shape, bool manifest_nhwc,
-    int manifest_width, int manifest_height, std::string *error);
+bool ValidateYunetInputTensorContract(const std::vector<int64_t> &graph_shape,
+                                      bool manifest_nhwc, int manifest_width,
+                                      int manifest_height, std::string *error);
+
+// Bounded, reusable CPU postprocess workspace for YuNet. Configure is a setup
+// operation; BeginFrame/Consider/Finalize perform no heap allocation while the
+// configured top-k remains unchanged.
+class YunetDetectionScratch {
+public:
+  static constexpr std::size_t kMaximumTopK = 20000;
+
+  struct Stats {
+    std::uint64_t rebuilds = 0;
+    std::uint64_t invalidations = 0;
+    std::size_t top_k = 0;
+    std::size_t candidate_capacity = 0;
+    std::size_t mapped_capacity = 0;
+    std::size_t kept_capacity = 0;
+  };
+
+  bool Configure(std::size_t top_k);
+  void Invalidate();
+  void BeginFrame();
+  void Consider(FaceDetection detection);
+  const std::vector<FaceDetection> &Finalize(float scale, int pad_x, int pad_y,
+                                             int frame_width, int frame_height,
+                                             float nms_threshold);
+  Stats stats() const;
+
+private:
+  struct Candidate {
+    FaceDetection detection;
+    std::uint64_t insertion_order = 0;
+  };
+
+  std::size_t top_k_ = 0;
+  std::uint64_t next_insertion_order_ = 0;
+  std::uint64_t rebuilds_ = 0;
+  std::uint64_t invalidations_ = 0;
+  std::vector<Candidate> candidates_;
+  std::vector<FaceDetection> mapped_;
+  std::vector<FaceDetection> kept_;
+};
 
 struct FaceDetectionRuntimeStatus {
   bool uses_cpu_preprocess = true;
@@ -90,13 +130,11 @@ public:
   // Returns true if the model ran (even if zero faces were detected).
   // Returns false if the model could not run; cache->face_detections is left
   // unset.
-  bool EnsureDetectionsForFrame(const std::uint8_t *rgb, int width, int height,
-                                std::size_t stride,
-                                const std::string &requested_model_id,
-                                std::uint64_t capture_sequence,
-                                FrameAnalysisCache *cache, std::string *error,
-                                YunetProviderPolicy provider_policy =
-                                    YunetProviderPolicy::prefer_cuda);
+  bool EnsureDetectionsForFrame(
+      const std::uint8_t *rgb, int width, int height, std::size_t stride,
+      const std::string &requested_model_id, std::uint64_t capture_sequence,
+      FrameAnalysisCache *cache, std::string *error,
+      YunetProviderPolicy provider_policy = YunetProviderPolicy::prefer_cuda);
 
   bool available() const { return initialized_; }
   const std::string &active_model_id() const { return active_model_id_; }
@@ -147,6 +185,9 @@ private:
 
   // Output bindings in the order passed to ORT.
   std::vector<OutputBinding> outputs_;
+  studiocast::onnx::OrtSession::RunInput run_input_{};
+  std::vector<studiocast::onnx::OrtSession::RunOutput> run_outputs_;
+  YunetDetectionScratch detection_scratch_;
 
   // Indices in outputs_ for each stride.
   std::array<int, 3> cls_idx_{{-1, -1, -1}};

@@ -1,6 +1,7 @@
 #include "core/open_video/fastdvdnet_denoiser.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -815,8 +816,8 @@ void FastDvdnetDenoiser::BuildNoisyTensorFromHistory(
   const std::vector<float> *f_tp1 = f_t0;
   const std::vector<float> *f_tp2 = f_t0;
 
-  const std::vector<const std::vector<float> *> frames = {f_t2, f_t1, f_t0,
-                                                          f_tp1, f_tp2};
+  const std::array<const std::vector<float> *, kFastDvdnetWindowFrames> frames =
+      {f_t2, f_t1, f_t0, f_tp1, f_tp2};
 
   for (std::size_t fi = 0; fi < frames.size(); ++fi) {
     const auto *f = frames[fi];
