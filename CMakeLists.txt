@@ -1464,6 +1464,30 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-open-video-scratch-tests
             COMMAND studiocast-open-video-scratch-tests)
 
+    add_executable(studiocast-video-frame-plan-tests
+            tests/video_frame_plan_tests.cpp
+    )
+
+    target_link_libraries(studiocast-video-frame-plan-tests PRIVATE
+            studiocast_core)
+
+    target_include_directories(studiocast-video-frame-plan-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-video-frame-plan-tests)
+    studiocast_enable_sanitizers(studiocast-video-frame-plan-tests)
+
+    set_target_properties(studiocast-video-frame-plan-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-video-frame-plan-tests
+            COMMAND studiocast-video-frame-plan-tests)
+
     add_executable(studiocast-vulkan-frame-plan-tests
             tests/vulkan_frame_execution_plan_tests.cpp
             src/core/vulkan/frame_execution_plan.cpp

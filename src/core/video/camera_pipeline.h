@@ -96,6 +96,23 @@ bool EffectsPlanRequiresRebuild(
     const effects::BroadcastCameraEffects &current_effects,
     std::uint64_t current_generation);
 
+// Production-connected instrumentation for the generation-gated frame-plan
+// decision region. A zero publication is an in-progress configuration
+// transition: the frame keeps using its already prepared generation and does
+// not contend on the configuration mutex.
+struct EffectsFramePreparationCounters {
+  std::uint64_t generation_loads = 0;
+  std::uint64_t transition_sentinel_loads = 0;
+  std::uint64_t snapshot_requests = 0;
+  std::uint64_t config_lock_acquisitions = 0;
+  std::uint64_t config_copies = 0;
+  std::uint64_t rebuilds = 0;
+
+  bool ObservePublishedGeneration(std::uint64_t published_generation,
+                                  std::uint64_t applied_generation) noexcept;
+  void RecordConfigSnapshot(bool rebuilt) noexcept;
+};
+
 // Tracks effect/backend attribution at the same boundary as a successfully
 // written output frame. Setup-time selection and an attempted effect are not
 // live evidence: callers begin a pending frame, record only completed effect
@@ -287,6 +304,8 @@ struct CameraPipelineStatus {
     std::uint64_t yuyv_output_from_rgb_calls = 0;
     std::uint64_t raw_yuyv_passthrough_frames = 0;
     std::uint64_t raw_yuyv_passthrough_bytes = 0;
+
+    EffectsFramePreparationCounters effects_preparation{};
 
     // Output pacing/jitter diagnostics (useful for browser/WebRTC capture).
     double pace_sleep_ms = 0.0;
