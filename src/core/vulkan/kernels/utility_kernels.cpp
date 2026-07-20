@@ -486,19 +486,37 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
                                  error_out))
     return false;
 
-  std::array<VkBufferMemoryBarrier, 4> read_barriers{};
-  const VkBuffer read_buffers[] = {bound_buffers_[0], bound_buffers_[1],
-                                   bound_buffers_[2], params_.buffer()};
-  for (std::size_t i = 0; i < read_barriers.size(); ++i) {
-    read_barriers[i].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    read_barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    read_barriers[i].buffer = read_buffers[i];
-    read_barriers[i].size = VK_WHOLE_SIZE;
+  // The generic utility entry point consumes both setup/uploaded images and
+  // images produced by a preceding compute submission. Keep data provenance
+  // conservative here; the mapped parameter buffer remains the precise
+  // HOST_WRITE -> SHADER_READ case below.
+  const auto data_read =
+      VulkanBufferBarrier(VulkanBufferAccess::host_or_compute_write,
+                          VulkanBufferAccess::compute_read);
+  std::array<VkBufferMemoryBarrier, 3> data_read_barriers{};
+  const VkBuffer data_read_buffers[] = {bound_buffers_[0], bound_buffers_[1],
+                                        bound_buffers_[2]};
+  for (std::size_t i = 0; i < data_read_barriers.size(); ++i) {
+    data_read_barriers[i].srcAccessMask = data_read.src_access_mask;
+    data_read_barriers[i].dstAccessMask = data_read.dst_access_mask;
+    data_read_barriers[i].buffer = data_read_buffers[i];
+    data_read_barriers[i].size = VK_WHOLE_SIZE;
   }
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_HOST_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                          static_cast<std::uint32_t>(read_barriers.size()),
-                          read_barriers.data(), 0, nullptr);
+  vf.vkCmdPipelineBarrier(command_buffer_, data_read.src_stage_mask,
+                          data_read.dst_stage_mask, 0, 0, nullptr,
+                          static_cast<std::uint32_t>(data_read_barriers.size()),
+                          data_read_barriers.data(), 0, nullptr);
+
+  const auto parameter_read = VulkanBufferBarrier(
+      VulkanBufferAccess::host_write, VulkanBufferAccess::compute_read);
+  VkBufferMemoryBarrier parameter_read_barrier{};
+  parameter_read_barrier.srcAccessMask = parameter_read.src_access_mask;
+  parameter_read_barrier.dstAccessMask = parameter_read.dst_access_mask;
+  parameter_read_barrier.buffer = params_.buffer();
+  parameter_read_barrier.size = VK_WHOLE_SIZE;
+  vf.vkCmdPipelineBarrier(command_buffer_, parameter_read.src_stage_mask,
+                          parameter_read.dst_stage_mask, 0, 0, nullptr, 1,
+                          &parameter_read_barrier, 0, nullptr);
 
   vf.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                        pipeline_);

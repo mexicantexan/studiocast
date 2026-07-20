@@ -4261,8 +4261,31 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return true;
       }
 
+      // A production Run() has two independently synchronous boundaries: the
+      // utility preprocess submission and the resident runtime inference. Count
+      // the observed completion deltas, including work that completed before a
+      // later failure, instead of treating the whole call as one hardcoded
+      // sync.
+      const std::uint64_t utility_submissions_before =
+          kernels.synchronous_submission_count();
+      const std::uint64_t runtime_completions_before =
+          matting_session->RuntimeEvidence().completion_count;
       std::string matte_err;
-      if (!matting_session->Run(in_rgb, &alpha_model, &matte_err)) {
+      const bool matting_run_ok =
+          matting_session->Run(in_rgb, &alpha_model, &matte_err);
+      const std::uint64_t utility_submissions_after =
+          kernels.synchronous_submission_count();
+      const std::uint64_t runtime_completions_after =
+          matting_session->RuntimeEvidence().completion_count;
+      if (utility_submissions_after >= utility_submissions_before) {
+        forced_sync_calls +=
+            utility_submissions_after - utility_submissions_before;
+      }
+      if (runtime_completions_after >= runtime_completions_before) {
+        forced_sync_calls +=
+            runtime_completions_after - runtime_completions_before;
+      }
+      if (!matting_run_ok) {
         matting_failure_latched = true;
         last_error = matte_err;
         if (error_out)
@@ -4271,7 +4294,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       ++preprocess_dispatch_calls;
       ++matting_inference_calls;
-      ++forced_sync_calls;
 
       cached_matte_valid = true;
       cached_matte_sequence = capture_sequence;
