@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/maxine/ar_api.h"
+#include "core/maxine/effects/maxine_effect.h"
 #include "core/maxine/nvcv_types.h"
 
 namespace studiocast::maxine::effects {
@@ -56,6 +57,9 @@ public:
 
   RectF SmoothedCropPx() const { return crop_smoothed_px_; }
   bool last_had_detection() const { return last_had_detection_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
 
   // Math helpers (deterministic; used by self-test).
   static float SmoothingAlpha(int smoothing_percent);
@@ -105,6 +109,7 @@ private:
   RectF crop_smoothed_px_{};
   bool have_smoothed_ = false;
   bool last_had_detection_ = false;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects

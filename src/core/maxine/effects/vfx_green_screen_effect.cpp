@@ -177,8 +177,7 @@ NvCV_Status VfxGreenScreenEffect::Process(studiocast::video::GpuFrame &frame,
     bound_input_ = frame.nvcv_gpu;
   }
   if (bound_output_ != &matte_gpu_) {
-    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE,
-                         &matte_gpu_);
+    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &matte_gpu_);
     if (s != maxine::NVCV_SUCCESS) {
       if (error)
         *error = "NvVFX_SetImage(dstImage) failed: " +
@@ -190,6 +189,7 @@ NvCV_Status VfxGreenScreenEffect::Process(studiocast::video::GpuFrame &frame,
   }
 
   // Run synchronously for simplicity.
+  ++execution_telemetry_.synchronous_run_attempts;
   s = f.NvVFX_Run(handle_, /*async=*/0);
   if (s != maxine::NVCV_SUCCESS) {
     InvalidateBindings();
@@ -197,6 +197,7 @@ NvCV_Status VfxGreenScreenEffect::Process(studiocast::video::GpuFrame &frame,
       *error = "NvVFX_Run failed: " + StatusToString(vfx_, nvcv_, s);
     return s;
   }
+  ++execution_telemetry_.synchronous_run_successes;
 
   matte_ready_ = true;
   return s;
@@ -235,8 +236,8 @@ bool VfxGreenScreenEffect::EnsureEffectCreated(std::string *error) {
     s = f.NvVFX_CudaStreamCreate(&stream_);
     if (s != maxine::NVCV_SUCCESS || !stream_) {
       if (error)
-        *error = "NvVFX_CudaStreamCreate failed: " +
-                 StatusToString(vfx_, nvcv_, s);
+        *error =
+            "NvVFX_CudaStreamCreate failed: " + StatusToString(vfx_, nvcv_, s);
       Destroy();
       return false;
     }
@@ -331,8 +332,8 @@ bool VfxGreenScreenEffect::EnsureStreamBound(std::string *error) {
       handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
   if (status != maxine::NVCV_SUCCESS) {
     if (error)
-      *error = "NvVFX_SetCudaStream failed: " +
-               StatusToString(vfx_, nvcv_, status);
+      *error =
+          "NvVFX_SetCudaStream failed: " + StatusToString(vfx_, nvcv_, status);
     return false;
   }
   stream_bound_ = true;

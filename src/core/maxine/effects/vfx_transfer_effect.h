@@ -52,6 +52,9 @@ public:
   }
 
   maxine::CUstream cuda_stream() const { return stream_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
 
 private:
   bool EnsureEffectCreated(std::string *error);
@@ -83,6 +86,7 @@ private:
   maxine::NvCVImage *bound_output_ = nullptr;
   unsigned bound_width_ = 0;
   unsigned bound_height_ = 0;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects

@@ -310,8 +310,8 @@ VfxTransferEffect::Process(studiocast::video::GpuFrame &frame,
     bound_input_ = frame.nvcv_gpu;
   }
   if (bound_output_ != &out_gpu_) {
-    const auto bind = f.NvVFX_SetImage(
-        handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &out_gpu_);
+    const auto bind =
+        f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &out_gpu_);
     if (bind != maxine::NVCV_SUCCESS) {
       if (error)
         *error = "NvVFX_SetImage(transfer output) failed: " +
@@ -321,6 +321,7 @@ VfxTransferEffect::Process(studiocast::video::GpuFrame &frame,
     bound_output_ = &out_gpu_;
   }
 
+  ++execution_telemetry_.asynchronous_run_attempts;
   const auto st = f.NvVFX_Run(handle_, /*async=*/1);
   if (st != maxine::NVCV_SUCCESS) {
     InvalidateBindings();
@@ -329,6 +330,7 @@ VfxTransferEffect::Process(studiocast::video::GpuFrame &frame,
     }
     return st;
   }
+  ++execution_telemetry_.asynchronous_run_successes;
 
   output_ready_ = true;
   return maxine::NVCV_SUCCESS;

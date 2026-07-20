@@ -261,6 +261,8 @@ add_library(studiocast_core
         src/core/maxine/nvcv_types.h
         src/core/maxine/resident_frame_section.h
         src/core/maxine/resident_frame_section.cpp
+        src/core/maxine/production_resident_frame_executor.h
+        src/core/maxine/production_resident_frame_executor.cpp
         src/core/maxine/nvcv_api.h
         src/core/maxine/nvcv_api.cpp
         src/core/maxine/vfx_api.h
@@ -1095,6 +1097,63 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-maxine-effect-binding-tests PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
     )
+
+    add_executable(studiocast-maxine-production-resident-tests
+            tests/maxine_production_resident_executor_tests.cpp
+    )
+    target_link_libraries(studiocast-maxine-production-resident-tests PRIVATE
+            studiocast_core
+            studiocast-maxine-effect-fake-sdk
+    )
+    target_include_directories(studiocast-maxine-production-resident-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+    target_compile_definitions(studiocast-maxine-production-resident-tests PRIVATE
+            STUDIOCAST_FAKE_MAXINE_SDK_PATH="$<TARGET_FILE:studiocast-maxine-effect-fake-sdk>"
+    )
+    studiocast_set_project_warnings(studiocast-maxine-production-resident-tests)
+    studiocast_enable_sanitizers(studiocast-maxine-production-resident-tests)
+    set_target_properties(studiocast-maxine-production-resident-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+    add_dependencies(studiocast-maxine-production-resident-tests
+            studiocast-maxine-effect-fake-cudart)
+    add_test(NAME studiocast-maxine-production-resident-tests
+            COMMAND studiocast-maxine-production-resident-tests)
+    set_tests_properties(studiocast-maxine-production-resident-tests PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
+    )
+
+    if (STUDIOCAST_BUILD_BENCHMARKS)
+        add_executable(studiocast-maxine-production-resident-fake-bench
+                src/tools/studiocast_maxine_production_resident_fake_bench_main.cpp
+        )
+        target_link_libraries(studiocast-maxine-production-resident-fake-bench PRIVATE
+                studiocast_core
+                studiocast-maxine-effect-fake-sdk
+        )
+        target_include_directories(studiocast-maxine-production-resident-fake-bench PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+                "${STUDIOCAST_GENERATED_DIR}"
+        )
+        target_compile_definitions(studiocast-maxine-production-resident-fake-bench PRIVATE
+                STUDIOCAST_FAKE_MAXINE_SDK_PATH="$<TARGET_FILE:studiocast-maxine-effect-fake-sdk>"
+        )
+        studiocast_set_project_warnings(studiocast-maxine-production-resident-fake-bench)
+        studiocast_enable_sanitizers(studiocast-maxine-production-resident-fake-bench)
+        set_target_properties(studiocast-maxine-production-resident-fake-bench PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF
+        )
+        add_dependencies(studiocast-maxine-production-resident-fake-bench
+                studiocast-maxine-effect-fake-cudart)
+    endif()
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)

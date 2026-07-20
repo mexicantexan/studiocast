@@ -33,6 +33,9 @@ public:
   void InvalidateBindings() noexcept override;
 
   const char *Backend() const override { return "maxine_ar"; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
 
 private:
   bool EnsureCreated(std::string *error);
@@ -67,6 +70,7 @@ private:
   studiocast::maxine::NvCVImage *bound_output_ = nullptr;
   unsigned bound_width_ = 0;
   unsigned bound_height_ = 0;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects
