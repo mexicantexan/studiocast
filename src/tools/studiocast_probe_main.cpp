@@ -2384,23 +2384,25 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
       fx.virtual_background.mode = VirtualBackgroundMode::blur;
       fx.vignette.enabled = true;
       fx.vignette.intensity = 50;
+      fx.vignette.center_on_tracked_face = false;
       fx.mirror = true;
 
       const auto plan = BuildBroadcastEffectsPlan(fx);
       expectVecEq(
-          "EffectPlan: ordering eye_contact -> vb.blur -> vignette (mirror "
-          "ignored)",
+          "EffectPlan: ordering eye_contact -> vb.blur -> vignette -> mirror",
           plan.ordered_effect_ids,
           {std::string(
                studiocast::video::effects::contract::kEffectIdEyeContact),
            std::string(studiocast::video::effects::contract::
                            kEffectIdVirtualBackgroundBlur),
            std::string(
-               studiocast::video::effects::contract::kEffectIdVignette)});
+               studiocast::video::effects::contract::kEffectIdVignette),
+           std::string(
+               studiocast::video::effects::contract::kEffectIdMirror)});
       expectTrue(
-          "EffectPlan: mirror is reported as disabled",
-          disabledHas(plan,
-                      studiocast::video::effects::contract::kEffectIdMirror));
+          "EffectPlan: mirror is retained at the final visual boundary",
+          !disabledHas(plan,
+                       studiocast::video::effects::contract::kEffectIdMirror));
       expectEq("EffectPlan: vignette attaches to last GPU stage (vb.blur)",
                plan.vignette_attach_to_effect_id,
                std::string(studiocast::video::effects::contract::
