@@ -271,6 +271,142 @@ bool TestStatusJsonCompatibilityShapes() {
                 "top-level open_audio diagnostics should parse");
 }
 
+bool TestVideoComputeResolutionDoesNotImplyActivity() {
+  const QString idleJson = QStringLiteral(
+      R"({
+        "service_running":true,
+        "video":{
+          "enabled":true,
+          "virtual_device_present":true,
+          "virtual_device_available":true,
+          "consumer_count":0,
+          "compute":{
+            "preference":"vulkan",
+            "resolved_backend":"vulkan",
+            "active_backend":"",
+            "fallback_reason":"",
+            "degraded_reason":"",
+            "active_engines":[],
+            "fallback":{"active":false,"from":"vulkan","to":"vulkan","code":"","detail":""},
+            "provider":{"mode":"","active_provider":"","device":"","tensor_io_mode":""},
+            "cpu_tails":{"active":false,"stages":[]}
+          },
+          "video_effects":{"engine":"auto","mirror":true},
+          "effect_readiness":{
+            "mirror":{
+              "state":"ready",
+              "summary":"Mirror is ready.",
+              "detail":"",
+              "backend":"open_vulkan",
+              "requested_model_id":"",
+              "resolved_model_id":"",
+              "reason":""
+            }
+          },
+          "pipeline":{
+            "running":false,
+            "starting":false,
+            "active_needed":false,
+            "state":"idle_no_consumer",
+            "idle_reason":"no_consumer",
+            "effects_backends":"mirror:open_vulkan"
+          }
+        },
+        "audio":{
+          "mic_present":true,
+          "pipeline":{"running":false,"starting":false,"last_error":""},
+          "speakers":{"present":true,"routing_active":false,"route_mode":"off","last_error":"","pipeline_last_error":""}
+        }
+      })");
+
+  const auto idle =
+      studiocast::gui::DaemonStatusSnapshot::FromJson(idleJson);
+  if (!Expect(idle.parsed, "idle resolved Vulkan status should parse") ||
+      !Expect(idle.videoComputeResolvedBackend == QStringLiteral("vulkan"),
+              "idle status should preserve resolved Vulkan") ||
+      !Expect(idle.videoComputeActiveBackend.isEmpty(),
+              "idle status should preserve an empty active backend") ||
+      !Expect(idle.videoComputeActiveEngines.isEmpty(),
+              "idle status should preserve empty active engines") ||
+      !Expect(idle.videoComputeProviderMode.isEmpty() &&
+                  idle.videoComputeActiveProvider.isEmpty(),
+              "idle status should preserve an empty active provider") ||
+      !Expect(!idle.videoComputeFallbackActive,
+              "idle resolution should not parse as an active fallback")) {
+    return false;
+  }
+
+  studiocast::gui::VideoPage page;
+  page.UpdateStatus(idle);
+  auto *computeLabel = page.findChild<QLabel *>(
+      QStringLiteral("videoComputeBackendActiveValue"));
+  if (!Expect(computeLabel != nullptr,
+              "active compute value should be findable") ||
+      !Expect(computeLabel->text() ==
+                  QStringLiteral("Inactive — resolved Vulkan"),
+              "the Camera page must distinguish idle Vulkan resolution from "
+              "active Vulkan") ||
+      !Expect(computeLabel->toolTip().contains(
+                  QStringLiteral("Resolved: Vulkan")) &&
+                  computeLabel->toolTip().contains(
+                      QStringLiteral("Active: None")),
+              "the idle compute tooltip must distinguish resolved and active")) {
+    return false;
+  }
+
+  const QString activeJson = QStringLiteral(
+      R"({
+        "service_running":true,
+        "video":{
+          "enabled":true,
+          "virtual_device_present":true,
+          "virtual_device_available":true,
+          "consumer_count":1,
+          "compute":{
+            "preference":"vulkan",
+            "resolved_backend":"vulkan",
+            "active_backend":"vulkan",
+            "fallback_reason":"",
+            "degraded_reason":"",
+            "active_engines":["open_vulkan"],
+            "fallback":{"active":false,"from":"vulkan","to":"vulkan","code":"","detail":""},
+            "provider":{"mode":"open_vulkan","active_provider":"Vulkan","device":"GPU","tensor_io_mode":"vulkan_device_kernels"},
+            "cpu_tails":{"active":false,"stages":[]}
+          },
+          "video_effects":{"engine":"auto","mirror":true},
+          "pipeline":{
+            "running":true,
+            "starting":false,
+            "active_needed":true,
+            "state":"running",
+            "idle_reason":"",
+            "effects_backends":"mirror:open_vulkan"
+          }
+        },
+        "audio":{
+          "mic_present":true,
+          "pipeline":{"running":false,"starting":false,"last_error":""},
+          "speakers":{"present":true,"routing_active":false,"route_mode":"off","last_error":"","pipeline_last_error":""}
+        }
+      })");
+  const auto active =
+      studiocast::gui::DaemonStatusSnapshot::FromJson(activeJson);
+  page.UpdateStatus(active);
+  return Expect(active.parsed &&
+                    active.videoComputeActiveBackend ==
+                        QStringLiteral("vulkan") &&
+                    active.videoComputeActiveProvider ==
+                        QStringLiteral("Vulkan"),
+                "running status should preserve authoritative Vulkan "
+                "activity") &&
+         Expect(computeLabel->text() == QStringLiteral("Vulkan"),
+                "the Camera page should show Vulkan as active only for the "
+                "running active-map case") &&
+         Expect(computeLabel->toolTip().contains(
+                    QStringLiteral("Active: Vulkan")),
+                "the running compute tooltip should report active Vulkan");
+}
+
 bool TestNestedPipelineEffectsPlanAndRawEffectsPreservation() {
   const QString json = QStringLiteral(
       R"({
@@ -1883,6 +2019,7 @@ int main(int argc, char **argv) {
   bool ok = true;
   ok = TestUnreachableStatus() && ok;
   ok = TestStatusJsonCompatibilityShapes() && ok;
+  ok = TestVideoComputeResolutionDoesNotImplyActivity() && ok;
   ok = TestNestedPipelineEffectsPlanAndRawEffectsPreservation() && ok;
   ok = TestVideoEffectReadinessMissingModelWhileIdle() && ok;
   ok = TestVulkanPixelReadinessFailuresRemainFailClosed() && ok;
