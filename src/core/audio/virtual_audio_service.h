@@ -13,6 +13,9 @@
 
 #include "core/audio/audio_backend_resolver.h"
 #include "core/audio/effects/broadcast_audio_effects.h"
+#include "core/config/settings.h"
+#include "core/maxine/gpu_selection.h"
+#include "core/maxine/paths.h"
 
 namespace studiocast::audio {
 
@@ -191,6 +194,12 @@ struct VirtualAudioServiceHooks {
       probe_speaker_backend_availability;
   std::function<AudioConsumerSnapshot()> detect_microphone_consumers;
   std::function<AudioConsumerSnapshot()> detect_speaker_consumers;
+  std::function<studiocast::config::Settings()> load_settings;
+  std::function<studiocast::maxine::GpuSelectionResult(
+      const studiocast::config::GpuSelection &, const std::atomic_bool *)>
+      select_gpu;
+  std::function<studiocast::maxine::MaxinePathsReport()>
+      resolve_maxine_paths;
   // Test/measurement seam for setup-only discovery. Called immediately before
   // the named operation. A hook may wait while observing stop_requested to
   // exercise bounded shutdown without launching a real provider helper.

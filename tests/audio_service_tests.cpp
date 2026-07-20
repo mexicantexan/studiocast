@@ -3313,12 +3313,27 @@ bool TestSpeakerAvailabilityCacheIgnoresMicrophoneOnlyChanges() {
 bool TestStableAudioPreparationUsesExplicitInvalidation() {
   std::atomic<int> backend_probes{0};
   std::atomic<int> source_probes{0};
+  std::atomic<int> sink_probes{0};
   std::atomic<int> pipeline_creates{0};
   std::atomic<bool> mic_consumer_present{true};
 
   VirtualAudioServiceHooks hooks;
   HookMicrophoneConsumerFlag(&hooks, &mic_consumer_present);
+  hooks.detect_speaker_consumers = [] { return ConsumerSnapshot(true); };
+  hooks.create_virtual_speaker = [](std::string *error) {
+    if (error)
+      error->clear();
+    return true;
+  };
   hooks.probe_microphone_backend_availability =
+      [&](const VirtualAudioServiceConfig &) {
+        backend_probes.fetch_add(1, std::memory_order_relaxed);
+        AudioBackendAvailability avail;
+        avail.maxine_reason = "synthetic maxine unavailable";
+        avail.open_source_reason = "synthetic open audio unavailable";
+        return avail;
+      };
+  hooks.probe_speaker_backend_availability =
       [&](const VirtualAudioServiceConfig &) {
         backend_probes.fetch_add(1, std::memory_order_relaxed);
         AudioBackendAvailability avail;
@@ -3330,6 +3345,8 @@ bool TestStableAudioPreparationUsesExplicitInvalidation() {
                                        const std::atomic_bool &) {
     if (name == "source")
       source_probes.fetch_add(1, std::memory_order_relaxed);
+    if (name == "sink")
+      sink_probes.fetch_add(1, std::memory_order_relaxed);
   };
   hooks.create_pipeline =
       [&](AudioProcessor *) -> std::unique_ptr<AudioPipelineRunner> {
@@ -3344,8 +3361,11 @@ bool TestStableAudioPreparationUsesExplicitInvalidation() {
   VirtualAudioServiceConfig cfg;
   cfg.enabled = true;
   cfg.create_virtual_mic = false;
-  cfg.create_virtual_speakers = false;
+  cfg.create_virtual_speakers = true;
+  cfg.speakers_enabled = true;
+  cfg.speaker_target_sink = "physical_test_sink";
   cfg.effects.microphone.noise_removal_enabled = true;
+  cfg.effects.speaker.noise_removal_enabled = true;
   cfg.poll_ms = 1;
 
   std::string err;
@@ -3356,9 +3376,10 @@ bool TestStableAudioPreparationUsesExplicitInvalidation() {
 
   if (!WaitUntil(
           [&] {
-            return backend_probes.load(std::memory_order_relaxed) == 1 &&
+            return backend_probes.load(std::memory_order_relaxed) == 2 &&
                    source_probes.load(std::memory_order_relaxed) == 1 &&
-                   pipeline_creates.load(std::memory_order_relaxed) == 1;
+                   sink_probes.load(std::memory_order_relaxed) == 1 &&
+                   pipeline_creates.load(std::memory_order_relaxed) == 2;
           },
           250ms)) {
     std::cerr << "initial audio preparation did not complete exactly once\n";
@@ -3369,10 +3390,11 @@ bool TestStableAudioPreparationUsesExplicitInvalidation() {
   // Cross the previous two-second TTL. Stable active service must remain on
   // the cached preparation and authoritative cached source status.
   std::this_thread::sleep_for(2100ms);
-  if (backend_probes.load() != 1 || source_probes.load() != 1 ||
-      pipeline_creates.load() != 1) {
+  if (backend_probes.load() != 2 || source_probes.load() != 1 ||
+      sink_probes.load() != 1 || pipeline_creates.load() != 2) {
     std::cerr << "stable audio repeated preparation after old TTL; backend="
               << backend_probes.load() << " source=" << source_probes.load()
+              << " sink=" << sink_probes.load()
               << " pipelines=" << pipeline_creates.load() << "\n";
     service.Stop();
     return false;
@@ -3381,31 +3403,35 @@ bool TestStableAudioPreparationUsesExplicitInvalidation() {
   service.RefreshPreparation();
   const bool refreshed = WaitUntil(
       [&] {
-        return backend_probes.load(std::memory_order_relaxed) == 2 &&
+        return backend_probes.load(std::memory_order_relaxed) == 4 &&
                source_probes.load(std::memory_order_relaxed) == 2 &&
-               pipeline_creates.load(std::memory_order_relaxed) == 2;
+               sink_probes.load(std::memory_order_relaxed) == 2 &&
+               pipeline_creates.load(std::memory_order_relaxed) == 4;
       },
       250ms);
   cfg.effects.microphone.model_id = "synthetic-new-model";
   service.UpdateConfig(cfg);
   const bool config_rebuilt = WaitUntil(
       [&] {
-        return backend_probes.load(std::memory_order_relaxed) == 3 &&
+        return backend_probes.load(std::memory_order_relaxed) == 5 &&
                source_probes.load(std::memory_order_relaxed) == 2 &&
-               pipeline_creates.load(std::memory_order_relaxed) == 2;
+               sink_probes.load(std::memory_order_relaxed) == 2 &&
+               pipeline_creates.load(std::memory_order_relaxed) == 4;
       },
       250ms);
   std::this_thread::sleep_for(50ms);
   const int final_backend = backend_probes.load();
   const int final_source = source_probes.load();
+  const int final_sink = sink_probes.load();
   const int final_pipelines = pipeline_creates.load();
   service.Stop();
 
-  if (!refreshed || !config_rebuilt || final_backend != 3 ||
-      final_source != 2 || final_pipelines != 2) {
+  if (!refreshed || !config_rebuilt || final_backend != 5 ||
+      final_source != 2 || final_sink != 2 || final_pipelines != 4) {
     std::cerr << "explicit refresh did not produce exactly one preparation; "
               << "backend=" << final_backend << " source=" << final_source
-              << " pipelines=" << final_pipelines << "\n";
+              << " sink=" << final_sink << " pipelines=" << final_pipelines
+              << "\n";
     return false;
   }
   return true;
@@ -3454,6 +3480,188 @@ bool TestForcedOpenAudioSkipsMaxinePreparation() {
     std::cerr << "forced Open Audio performed Maxine preparation; probes="
               << maxine_probes.load() << "\n";
     return false;
+  }
+  return true;
+}
+
+bool TestProviderPreparationFailuresStayStickyUntilRefresh() {
+  {
+    std::atomic<int> settings_probes{0};
+    std::atomic<int> gpu_probes{0};
+    std::atomic<int> sdk_probes{0};
+    std::atomic<bool> mic_consumer_present{true};
+
+    VirtualAudioServiceHooks hooks;
+    HookMicrophoneConsumerFlag(&hooks, &mic_consumer_present);
+    hooks.probe_microphone_backend_availability =
+        [](const VirtualAudioServiceConfig &) {
+          AudioBackendAvailability avail;
+          avail.maxine_ok = true;
+          return avail;
+        };
+    hooks.before_preparation_probe =
+        [&](std::string_view name, const std::atomic_bool &) {
+          if (name == "settings")
+            settings_probes.fetch_add(1, std::memory_order_relaxed);
+          if (name == "gpu_selection")
+            gpu_probes.fetch_add(1, std::memory_order_relaxed);
+          if (name == "sdk_paths")
+            sdk_probes.fetch_add(1, std::memory_order_relaxed);
+        };
+    hooks.load_settings = [] { return studiocast::config::Settings{}; };
+    hooks.select_gpu = [](const studiocast::config::GpuSelection &,
+                          const std::atomic_bool *) {
+      studiocast::maxine::GpuSelectionResult result;
+      studiocast::maxine::SelectedGpu selected;
+      selected.index = 0;
+      selected.name = "synthetic supported GPU";
+      selected.compute_capability = std::pair<int, int>{8, 6};
+      result.selected = selected;
+      result.all_gpus.push_back(std::move(selected));
+      return result;
+    };
+    hooks.resolve_maxine_paths = [] {
+      studiocast::maxine::MaxinePathsReport paths;
+      paths.afx.ok = false;
+      paths.afx.problems.push_back("synthetic missing AFX SDK");
+      return paths;
+    };
+    hooks.create_pipeline =
+        [](AudioProcessor *) -> std::unique_ptr<AudioPipelineRunner> {
+      return std::make_unique<FixedStatsPipeline>(true, "");
+    };
+    hooks.sleep_for = [](std::chrono::milliseconds) {
+      std::this_thread::sleep_for(1ms);
+    };
+
+    VirtualAudioService service(std::move(hooks));
+    VirtualAudioServiceConfig cfg;
+    cfg.enabled = true;
+    cfg.create_virtual_mic = false;
+    cfg.create_virtual_speakers = false;
+    cfg.source_name = "physical_test_mic";
+    cfg.effects.engine =
+        studiocast::audio::effects::AudioEffectsEnginePreference::kMaxine;
+    cfg.effects.microphone.noise_removal_enabled = true;
+    cfg.poll_ms = 1;
+    cfg.start_retry_ms = 50;
+
+    std::string err;
+    if (!service.Start(cfg, &err)) {
+      std::cerr << "Maxine sticky service.Start failed: " << err << "\n";
+      return false;
+    }
+    if (!WaitUntil(
+            [&] {
+              return settings_probes.load() == 1 && gpu_probes.load() == 1 &&
+                     sdk_probes.load() == 1;
+            },
+            250ms)) {
+      std::cerr << "synthetic Maxine preparation did not run once\n";
+      service.Stop();
+      return false;
+    }
+    std::this_thread::sleep_for(2100ms);
+    if (settings_probes.load() != 1 || gpu_probes.load() != 1 ||
+        sdk_probes.load() != 1) {
+      std::cerr << "failed Maxine preparation retried with wall time; settings="
+                << settings_probes.load() << " gpu=" << gpu_probes.load()
+                << " sdk=" << sdk_probes.load() << "\n";
+      service.Stop();
+      return false;
+    }
+    service.RefreshPreparation();
+    const bool refreshed = WaitUntil(
+        [&] {
+          return settings_probes.load() == 2 && gpu_probes.load() == 2 &&
+                 sdk_probes.load() == 2;
+        },
+        250ms);
+    cfg.effects.microphone.model_id = "synthetic-new-maxine-config";
+    service.UpdateConfig(cfg);
+    const bool config_rebuilt = WaitUntil(
+        [&] {
+          return settings_probes.load() == 3 && gpu_probes.load() == 3 &&
+                 sdk_probes.load() == 3;
+        },
+        250ms);
+    service.Stop();
+    if (!refreshed || !config_rebuilt) {
+      std::cerr << "Maxine invalidation did not run exactly one new "
+                   "preparation\n";
+      return false;
+    }
+  }
+
+  {
+    std::atomic<int> model_probes{0};
+    std::atomic<int> maxine_probes{0};
+    std::atomic<bool> mic_consumer_present{true};
+    VirtualAudioServiceHooks hooks;
+    HookMicrophoneConsumerFlag(&hooks, &mic_consumer_present);
+    hooks.probe_microphone_backend_availability =
+        [](const VirtualAudioServiceConfig &) {
+          AudioBackendAvailability avail;
+          avail.open_source_ok = true;
+          return avail;
+        };
+    hooks.before_preparation_probe =
+        [&](std::string_view name, const std::atomic_bool &) {
+          if (name == "model_registry")
+            model_probes.fetch_add(1, std::memory_order_relaxed);
+          if (name == "settings" || name == "gpu_selection" ||
+              name == "sdk_paths") {
+            maxine_probes.fetch_add(1, std::memory_order_relaxed);
+          }
+        };
+    hooks.create_pipeline =
+        [](AudioProcessor *) -> std::unique_ptr<AudioPipelineRunner> {
+      return std::make_unique<FixedStatsPipeline>(true, "");
+    };
+    hooks.sleep_for = [](std::chrono::milliseconds) {
+      std::this_thread::sleep_for(1ms);
+    };
+
+    VirtualAudioService service(std::move(hooks));
+    VirtualAudioServiceConfig cfg;
+    cfg.enabled = true;
+    cfg.create_virtual_mic = false;
+    cfg.create_virtual_speakers = false;
+    cfg.source_name = "physical_test_mic";
+    cfg.effects.engine =
+        studiocast::audio::effects::AudioEffectsEnginePreference::kOpenSource;
+    cfg.effects.microphone.noise_removal_enabled = true;
+    cfg.effects.microphone.model_path =
+        "/tmp/studiocast-definitely-missing-open-audio-model.onnx";
+    cfg.poll_ms = 1;
+    cfg.start_retry_ms = 50;
+
+    std::string err;
+    if (!service.Start(cfg, &err)) {
+      std::cerr << "Open Audio sticky service.Start failed: " << err << "\n";
+      return false;
+    }
+    if (!WaitUntil([&] { return model_probes.load() == 1; }, 250ms)) {
+      std::cerr << "Open Audio model preparation did not run once\n";
+      service.Stop();
+      return false;
+    }
+    std::this_thread::sleep_for(2100ms);
+    if (model_probes.load() != 1 || maxine_probes.load() != 0) {
+      std::cerr << "failed model preparation retried with wall time; probes="
+                << model_probes.load()
+                << " maxine_probes=" << maxine_probes.load() << "\n";
+      service.Stop();
+      return false;
+    }
+    service.RefreshPreparation();
+    const bool refreshed =
+        WaitUntil([&] { return model_probes.load() == 2; }, 250ms);
+    service.Stop();
+    if (!refreshed || maxine_probes.load() != 0) {
+      std::cerr << "model refresh did not run exactly one new preparation\n";
+      return false;
+    }
   }
   return true;
 }
@@ -4953,6 +5161,8 @@ int main() {
        &TestStableAudioPreparationUsesExplicitInvalidation, true},
       {"forced Open Audio skips Maxine preparation",
        &TestForcedOpenAudioSkipsMaxinePreparation, true},
+      {"provider preparation failures stay sticky until refresh",
+       &TestProviderPreparationFailuresStayStickyUntilRefresh, true},
       {"stop interrupts blocked preparation hook",
        &TestStopInterruptsBlockedPreparationHook},
       {"exec capture cancellation bounds provider helper",

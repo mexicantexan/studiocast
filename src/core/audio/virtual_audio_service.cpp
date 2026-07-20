@@ -662,13 +662,14 @@ void VirtualAudioService::ThreadMain() {
   std::string speakerLoopbackStopRetryError;
   std::string speakerDestroyRetryError;
 
-  // If the Open Audio backend fails to initialize, latch-disable it for a short
-  // cooldown to avoid rapid restart loops.
+  // Provider preparation failures remain sticky until a relevant config key
+  // changes or RefreshPreparation() advances the generation. Wall time alone
+  // must never relaunch provider discovery helpers.
   steady_clock::time_point openAudioCooldownUntil{};
   std::string openAudioCooldownReason;
 
   // If microphone Maxine setup fails after availability selection, keep the
-  // mic route alive in pass-through and avoid retry churn for a short cooldown.
+  // mic route alive in pass-through without periodic rediscovery.
   steady_clock::time_point maxineCooldownUntil{};
   std::string maxineCooldownReason;
 
@@ -676,6 +677,8 @@ void VirtualAudioService::ThreadMain() {
   // doesn't permanently disable the other.
   steady_clock::time_point speakerOpenAudioCooldownUntil{};
   std::string speakerOpenAudioCooldownReason;
+  steady_clock::time_point speakerMaxineCooldownUntil{};
+  std::string speakerMaxineCooldownReason;
 
   steady_clock::time_point lastMicConsumerSeen{};
   steady_clock::time_point lastSpeakerConsumerSeen{};
@@ -777,6 +780,8 @@ void VirtualAudioService::ThreadMain() {
         cachedSpeakerBackendGeneration != speakerBackendGeneration) {
       speakerOpenAudioCooldownUntil = {};
       speakerOpenAudioCooldownReason.clear();
+      speakerMaxineCooldownUntil = {};
+      speakerMaxineCooldownReason.clear();
     }
 
     const bool resolveAutoMicSource = cfg.enabled;
@@ -1320,6 +1325,13 @@ void VirtualAudioService::ThreadMain() {
         // Availability + backend selection.
         const auto speakerAvailabilityKey =
             MakeSpeakerAvailabilityCacheKey(cfg.effects);
+        if (cachedSpeakerAvailabilityKey.has_value() &&
+            *cachedSpeakerAvailabilityKey != speakerAvailabilityKey) {
+          speakerOpenAudioCooldownUntil = {};
+          speakerOpenAudioCooldownReason.clear();
+          speakerMaxineCooldownUntil = {};
+          speakerMaxineCooldownReason.clear();
+        }
         const bool speakerAvailabilityExpired =
             !cachedSpeakerAvailability ||
             !cachedSpeakerAvailabilityKey.has_value() ||
@@ -1337,9 +1349,16 @@ void VirtualAudioService::ThreadMain() {
           speakerAvail.open_source_ok = false;
           speakerAvail.open_source_reason =
               speakerOpenAudioCooldownReason.empty()
-                  ? "Open Audio backend is temporarily disabled due to a "
-                    "previous failure."
+                  ? "Open Audio backend is disabled after a preparation "
+                    "failure. Refresh diagnostics to retry."
                   : speakerOpenAudioCooldownReason;
+        }
+        if (now < speakerMaxineCooldownUntil) {
+          speakerAvail.maxine_ok = false;
+          speakerAvail.maxine_reason =
+              speakerMaxineCooldownReason.empty()
+                  ? "Maxine backend is disabled after a preparation failure."
+                  : speakerMaxineCooldownReason;
         }
         const auto speakerDecision =
             ResolveAudioBackend(cfg.effects, speakerAvail);
@@ -1540,7 +1559,7 @@ void VirtualAudioService::ThreadMain() {
                   CreateForSpeaker(cfg.effects, &selected, &oerr);
               if (!oa) {
                 speakerOpenAudioCooldownUntil =
-                    now + StartFailureRetryDelay(cfg);
+                    steady_clock::time_point::max();
                 speakerOpenAudioCooldownReason = oerr;
 
                 desiredSpkBackend = "passthrough";
@@ -1574,13 +1593,21 @@ void VirtualAudioService::ThreadMain() {
               BeforePreparationProbe(&hooks_, "settings", &stop_);
               if (stop_.load(std::memory_order_acquire))
                 break;
-              const auto settings = studiocast::config::LoadSettings();
+              const auto settings = hooks_.load_settings
+                                        ? hooks_.load_settings()
+                                        : studiocast::config::LoadSettings();
               BeforePreparationProbe(&hooks_, "gpu_selection", &stop_);
               if (stop_.load(std::memory_order_acquire))
                 break;
-              const auto sel =
-                  studiocast::maxine::SelectGpu(settings.gpu, &stop_);
+              const auto sel = hooks_.select_gpu
+                                   ? hooks_.select_gpu(settings.gpu, &stop_)
+                                   : studiocast::maxine::SelectGpu(settings.gpu,
+                                                                  &stop_);
               if (!sel.selected || !sel.selected->compute_capability) {
+                speakerMaxineCooldownUntil =
+                    steady_clock::time_point::max();
+                speakerMaxineCooldownReason =
+                    "GPU selection failed: " + sel.error;
                 desiredSpkBackend = "passthrough";
                 spk_processor = std::make_unique<PassthroughAudioProcessor>();
                 {
@@ -1597,7 +1624,10 @@ void VirtualAudioService::ThreadMain() {
                 BeforePreparationProbe(&hooks_, "sdk_paths", &stop_);
                 if (stop_.load(std::memory_order_acquire))
                   break;
-                const auto paths = studiocast::maxine::ResolveMaxinePaths();
+                const auto paths =
+                    hooks_.resolve_maxine_paths
+                        ? hooks_.resolve_maxine_paths()
+                        : studiocast::maxine::ResolveMaxinePaths();
                 if (!paths.afx.ok) {
                   std::string msg = "AFX SDK not available";
                   if (!paths.afx.problems.empty()) {
@@ -1605,6 +1635,9 @@ void VirtualAudioService::ThreadMain() {
                     msg += paths.afx.problems.front();
                   }
                   desiredSpkBackend = "passthrough";
+                  speakerMaxineCooldownUntil =
+                      steady_clock::time_point::max();
+                  speakerMaxineCooldownReason = msg;
                   spk_processor = std::make_unique<PassthroughAudioProcessor>();
                   {
                     std::lock_guard<std::mutex> lock(mu_);
@@ -1622,6 +1655,10 @@ void VirtualAudioService::ThreadMain() {
                     std::string aerr;
                     if (!spk_api->InitializeFromLibraryPath(paths.afx.library,
                                                             &aerr)) {
+                      speakerMaxineCooldownUntil =
+                          steady_clock::time_point::max();
+                      speakerMaxineCooldownReason =
+                          "AFX init failed: " + aerr;
                       desiredSpkBackend = "passthrough";
                       spk_api.reset();
                       spk_processor =
@@ -1666,6 +1703,10 @@ void VirtualAudioService::ThreadMain() {
 
                     std::string ferr;
                     if (!spk_fx->Configure(e, &ferr) || !spk_fx->Load(&ferr)) {
+                      speakerMaxineCooldownUntil =
+                          steady_clock::time_point::max();
+                      speakerMaxineCooldownReason =
+                          "AFX load failed: " + ferr;
                       desiredSpkBackend = "passthrough";
                       spk_fx->Destroy();
                       spk_fx.reset();
@@ -1940,6 +1981,13 @@ void VirtualAudioService::ThreadMain() {
       const auto now2 = steady_clock::now();
       const auto micAvailabilityKey =
           MakeMicrophoneAvailabilityCacheKey(cfg.effects);
+      if (cachedMicAvailabilityKey.has_value() &&
+          *cachedMicAvailabilityKey != micAvailabilityKey) {
+        openAudioCooldownUntil = {};
+        openAudioCooldownReason.clear();
+        maxineCooldownUntil = {};
+        maxineCooldownReason.clear();
+      }
       const bool micAvailabilityExpired =
           !cachedMicAvailability || !cachedMicAvailabilityKey.has_value() ||
           *cachedMicAvailabilityKey != micAvailabilityKey ||
@@ -1954,15 +2002,17 @@ void VirtualAudioService::ThreadMain() {
         micOpenAudioCooldownActive = true;
         avail.open_source_ok = false;
         avail.open_source_reason = openAudioCooldownReason.empty()
-                                       ? "Open Audio backend is temporarily "
-                                         "disabled due to a previous failure."
+                                       ? "Open Audio backend is disabled after "
+                                         "a preparation failure. Refresh "
+                                         "diagnostics to retry."
                                        : openAudioCooldownReason;
       }
       if (now2 < maxineCooldownUntil) {
         avail.maxine_ok = false;
         avail.maxine_reason = maxineCooldownReason.empty()
-                                  ? "Maxine backend is temporarily disabled "
-                                    "due to a previous failure."
+                                  ? "Maxine backend is disabled after a "
+                                    "preparation failure. Refresh diagnostics "
+                                    "to retry."
                                   : maxineCooldownReason;
       }
     }
@@ -2131,7 +2181,7 @@ void VirtualAudioService::ThreadMain() {
     auto startMicPassthroughFallback =
         [&](const std::string &note,
             const std::string &failure_reason) -> bool {
-      maxineCooldownUntil = steady_clock::now() + StartFailureRetryDelay(cfg);
+      maxineCooldownUntil = steady_clock::time_point::max();
       maxineCooldownReason = failure_reason;
       SetLastError(failure_reason);
 
@@ -2238,7 +2288,7 @@ void VirtualAudioService::ThreadMain() {
         if (!oa) {
           // Fall back to pass-through with a cooldown to avoid restart loops.
           SetLastError("Open Audio initialization failed: " + oerr);
-          openAudioCooldownUntil = now + StartFailureRetryDelay(cfg);
+          openAudioCooldownUntil = steady_clock::time_point::max();
           openAudioCooldownReason = oerr;
 
           desiredBackend = "passthrough";
@@ -2458,11 +2508,16 @@ void VirtualAudioService::ThreadMain() {
       BeforePreparationProbe(&hooks_, "settings", &stop_);
       if (stop_.load(std::memory_order_acquire))
         break;
-      const auto settings = studiocast::config::LoadSettings();
+      const auto settings = hooks_.load_settings
+                                ? hooks_.load_settings()
+                                : studiocast::config::LoadSettings();
       BeforePreparationProbe(&hooks_, "gpu_selection", &stop_);
       if (stop_.load(std::memory_order_acquire))
         break;
-      const auto sel = studiocast::maxine::SelectGpu(settings.gpu, &stop_);
+      const auto sel = hooks_.select_gpu
+                           ? hooks_.select_gpu(settings.gpu, &stop_)
+                           : studiocast::maxine::SelectGpu(settings.gpu,
+                                                          &stop_);
       {
         std::lock_guard<std::mutex> lock(mu_);
         st_.gpu_index = sel.selected ? sel.selected->index : -1;
@@ -2486,7 +2541,9 @@ void VirtualAudioService::ThreadMain() {
       BeforePreparationProbe(&hooks_, "sdk_paths", &stop_);
       if (stop_.load(std::memory_order_acquire))
         break;
-      const auto paths = studiocast::maxine::ResolveMaxinePaths();
+      const auto paths = hooks_.resolve_maxine_paths
+                             ? hooks_.resolve_maxine_paths()
+                             : studiocast::maxine::ResolveMaxinePaths();
       if (!paths.afx.ok) {
         std::string msg = "AFX SDK not available";
         if (!paths.afx.problems.empty()) {
