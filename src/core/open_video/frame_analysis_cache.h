@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -86,13 +87,19 @@ struct FrameMatteArtifact {
   // Opaque provider handles for GPU/device-local artifacts. For Open CUDA this
   // can identify a CudaImage/CudaTensor allocation; for Open Vulkan this can
   // identify a VulkanImage/VulkanTensor allocation; for Maxine it can identify
-  // an NvCVImage. Ownership stays with the provider that published the artifact.
+  // an NvCVImage. Ownership stays with the provider that published the
+  // artifact.
   std::uintptr_t handle = 0;
   std::uintptr_t aux_handle = 0;
 };
 
 class FrameArtifactCache {
 public:
+  // The prepared pipeline currently has fewer than eight matte consumers. Keep
+  // the per-frame cache explicitly bounded so a malformed effect graph cannot
+  // turn it into an unbounded hot-path cache.
+  static constexpr std::size_t kMaxMatteArtifactsPerFrame = 8;
+
   std::uint64_t capture_sequence() const { return capture_sequence_; }
 
   void BeginFrame(std::uint64_t seq) {
@@ -102,37 +109,42 @@ public:
     ClearArtifacts();
   }
 
-  void ClearArtifacts() { mattes_.clear(); }
+  void ClearArtifacts() { active_mattes_ = 0; }
 
-  const FrameMatteArtifact *
-  FindMatte(std::uint64_t seq, const FrameMatteArtifactKey &key) const {
+  std::size_t active_matte_count() const { return active_mattes_; }
+
+  const FrameMatteArtifact *FindMatte(std::uint64_t seq,
+                                      const FrameMatteArtifactKey &key) const {
     if (seq != capture_sequence_)
       return nullptr;
-    for (const auto &matte : mattes_) {
+    for (std::size_t i = 0; i < active_mattes_; ++i) {
+      const auto &matte = mattes_[i];
       if (matte.key == key)
         return &matte;
     }
     return nullptr;
   }
 
-  const FrameMatteArtifact *
-  StoreMatte(std::uint64_t seq, FrameMatteArtifact artifact) {
+  const FrameMatteArtifact *StoreMatte(std::uint64_t seq,
+                                       FrameMatteArtifact artifact) {
     BeginFrame(seq);
-    for (auto &matte : mattes_) {
+    for (std::size_t i = 0; i < active_mattes_; ++i) {
+      auto &matte = mattes_[i];
       if (matte.key == artifact.key) {
-        matte = std::move(artifact);
+        AssignPreservingStorage(artifact, &matte);
         return &matte;
       }
     }
-    mattes_.push_back(std::move(artifact));
-    return &mattes_.back();
+    if (active_mattes_ >= mattes_.size())
+      return nullptr;
+    auto &slot = mattes_[active_mattes_++];
+    AssignPreservingStorage(artifact, &slot);
+    return &slot;
   }
 
   template <typename Producer>
-  bool GetOrComputeMatte(std::uint64_t seq,
-                         const FrameMatteArtifactKey &key,
-                         Producer &&producer,
-                         const FrameMatteArtifact **out,
+  bool GetOrComputeMatte(std::uint64_t seq, const FrameMatteArtifactKey &key,
+                         Producer &&producer, const FrameMatteArtifact **out,
                          std::string *error) {
     if (error)
       error->clear();
@@ -146,8 +158,19 @@ public:
       return true;
     }
 
-    FrameMatteArtifact produced;
+    if (active_mattes_ >= mattes_.size()) {
+      if (error)
+        *error = "per-frame matte artifact capacity exceeded";
+      return false;
+    }
+
+    // Produce directly into an inactive cache slot. Clearing the payload keeps
+    // its allocation available for the next capture sequence.
+    auto &produced = mattes_[active_mattes_];
     produced.key = key;
+    produced.cpu_alpha.clear();
+    produced.handle = 0;
+    produced.aux_handle = 0;
     std::string producer_error;
     if (!producer(&produced, &producer_error)) {
       if (error)
@@ -160,15 +183,25 @@ public:
       return false;
     }
 
-    const auto *stored = StoreMatte(seq, std::move(produced));
+    const auto *stored = &produced;
+    ++active_mattes_;
     if (out)
       *out = stored;
     return true;
   }
 
 private:
+  static void AssignPreservingStorage(const FrameMatteArtifact &src,
+                                      FrameMatteArtifact *dst) {
+    dst->key = src.key;
+    dst->cpu_alpha.assign(src.cpu_alpha.begin(), src.cpu_alpha.end());
+    dst->handle = src.handle;
+    dst->aux_handle = src.aux_handle;
+  }
+
   std::uint64_t capture_sequence_ = 0;
-  std::vector<FrameMatteArtifact> mattes_;
+  std::array<FrameMatteArtifact, kMaxMatteArtifactsPerFrame> mattes_{};
+  std::size_t active_mattes_ = 0;
 };
 
 struct FrameAnalysisCache {
@@ -181,19 +214,61 @@ struct FrameAnalysisCache {
     if (seq == capture_sequence)
       return;
     capture_sequence = seq;
-    face_detections.reset();
-    face_landmarks.reset();
+    RecycleFaceDetections();
+    RecycleFaceLandmarks();
     artifacts.BeginFrame(seq);
   }
 
   void Clear() {
-    face_detections.reset();
-    face_landmarks.reset();
+    RecycleFaceDetections();
+    RecycleFaceLandmarks();
     artifacts.ClearArtifacts();
+  }
+
+  std::vector<FaceDetection> &PrepareFaceDetections(std::size_t capacity) {
+    if (!face_detections) {
+      face_detections.emplace();
+      face_detections->swap(recycled_face_detections_);
+    }
+    face_detections->clear();
+    if (face_detections->capacity() < capacity)
+      face_detections->reserve(capacity);
+    return *face_detections;
+  }
+
+  FaceLandmarks &PrepareFaceLandmarks(std::size_t capacity) {
+    if (!face_landmarks) {
+      face_landmarks.emplace();
+      face_landmarks->points.swap(recycled_face_landmarks_.points);
+    }
+    face_landmarks->points.clear();
+    if (face_landmarks->points.capacity() < capacity)
+      face_landmarks->points.reserve(capacity);
+    return *face_landmarks;
   }
 
   std::optional<std::vector<FaceDetection>> face_detections;
   std::optional<FaceLandmarks> face_landmarks;
+
+private:
+  void RecycleFaceDetections() {
+    if (!face_detections)
+      return;
+    recycled_face_detections_.clear();
+    face_detections->swap(recycled_face_detections_);
+    face_detections.reset();
+  }
+
+  void RecycleFaceLandmarks() {
+    if (!face_landmarks)
+      return;
+    recycled_face_landmarks_.points.clear();
+    face_landmarks->points.swap(recycled_face_landmarks_.points);
+    face_landmarks.reset();
+  }
+
+  std::vector<FaceDetection> recycled_face_detections_;
+  FaceLandmarks recycled_face_landmarks_;
 };
 
 } // namespace studiocast::open_video

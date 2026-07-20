@@ -70,8 +70,8 @@ JsonObject(const util::json::Value::Object &obj, const std::string &key) {
   return it->second.AsObject();
 }
 
-const util::json::Value::Array *
-JsonArray(const util::json::Value::Object &obj, const std::string &key) {
+const util::json::Value::Array *JsonArray(const util::json::Value::Object &obj,
+                                          const std::string &key) {
   auto it = obj.find(key);
   if (it == obj.end())
     return nullptr;
@@ -109,9 +109,9 @@ YunetOrtSessionOptions(YunetProviderPolicy policy) {
   return opts;
 }
 
-bool ValidateYunetInputTensorContract(
-    const std::vector<int64_t> &graph_shape, bool manifest_nhwc,
-    int manifest_width, int manifest_height, std::string *error) {
+bool ValidateYunetInputTensorContract(const std::vector<int64_t> &graph_shape,
+                                      bool manifest_nhwc, int manifest_width,
+                                      int manifest_height, std::string *error) {
   if (error)
     error->clear();
   auto fail = [&](std::string detail) {
@@ -141,11 +141,130 @@ bool ValidateYunetInputTensorContract(
       (graph_height > 0 && graph_height != manifest_height)) {
     std::ostringstream oss;
     oss << "YuNet graph input is fixed at " << graph_width << "x"
-        << graph_height << " but model.json declares " << manifest_width
-        << "x" << manifest_height;
+        << graph_height << " but model.json declares " << manifest_width << "x"
+        << manifest_height;
     return fail(oss.str());
   }
   return true;
+}
+
+bool YunetDetectionScratch::Configure(std::size_t top_k) {
+  if (top_k == 0 || top_k > kMaximumTopK)
+    return false;
+  if (top_k_ == top_k)
+    return true;
+  top_k_ = top_k;
+  candidates_.clear();
+  mapped_.clear();
+  kept_.clear();
+  candidates_.reserve(top_k_);
+  mapped_.reserve(top_k_);
+  kept_.reserve(top_k_);
+  ++rebuilds_;
+  return true;
+}
+
+void YunetDetectionScratch::Invalidate() {
+  top_k_ = 0;
+  next_insertion_order_ = 0;
+  candidates_.clear();
+  mapped_.clear();
+  kept_.clear();
+  ++invalidations_;
+}
+
+void YunetDetectionScratch::BeginFrame() {
+  next_insertion_order_ = 0;
+  candidates_.clear();
+  mapped_.clear();
+  kept_.clear();
+}
+
+void YunetDetectionScratch::Consider(FaceDetection detection) {
+  if (top_k_ == 0)
+    return;
+  Candidate candidate{detection, next_insertion_order_++};
+  // std::heap operations with this comparator retain the lowest-ranked entry
+  // at the front, allowing exact bounded top-k selection without collecting
+  // every anchor candidate first. Earlier candidates win equal-score ties.
+  const auto better = [](const Candidate &a, const Candidate &b) {
+    if (a.detection.score != b.detection.score)
+      return a.detection.score > b.detection.score;
+    return a.insertion_order < b.insertion_order;
+  };
+  if (candidates_.size() < top_k_) {
+    candidates_.push_back(candidate);
+    std::push_heap(candidates_.begin(), candidates_.end(), better);
+    return;
+  }
+  if (!better(candidate, candidates_.front()))
+    return;
+  std::pop_heap(candidates_.begin(), candidates_.end(), better);
+  candidates_.back() = candidate;
+  std::push_heap(candidates_.begin(), candidates_.end(), better);
+}
+
+const std::vector<FaceDetection> &
+YunetDetectionScratch::Finalize(float scale, int pad_x, int pad_y,
+                                int frame_width, int frame_height,
+                                float nms_threshold) {
+  const auto better = [](const Candidate &a, const Candidate &b) {
+    if (a.detection.score != b.detection.score)
+      return a.detection.score > b.detection.score;
+    return a.insertion_order < b.insertion_order;
+  };
+  std::sort(candidates_.begin(), candidates_.end(), better);
+  mapped_.clear();
+  kept_.clear();
+  if (!(scale > 0.0f) || frame_width <= 0 || frame_height <= 0)
+    return kept_;
+
+  for (const auto &candidate : candidates_) {
+    FaceDetection out = candidate.detection;
+    out.x = (out.x - static_cast<float>(pad_x)) / scale;
+    out.y = (out.y - static_cast<float>(pad_y)) / scale;
+    out.w /= scale;
+    out.h /= scale;
+    out.x = std::clamp(out.x, 0.0f, static_cast<float>(frame_width));
+    out.y = std::clamp(out.y, 0.0f, static_cast<float>(frame_height));
+    out.w = std::clamp(out.w, 0.0f, static_cast<float>(frame_width) - out.x);
+    out.h = std::clamp(out.h, 0.0f, static_cast<float>(frame_height) - out.y);
+    mapped_.push_back(out);
+  }
+
+  for (const auto &candidate : mapped_) {
+    bool suppress = false;
+    for (const auto &previous : kept_) {
+      const float ax1 = candidate.x + candidate.w;
+      const float ay1 = candidate.y + candidate.h;
+      const float bx1 = previous.x + previous.w;
+      const float by1 = previous.y + previous.h;
+      const float ix0 = std::max(candidate.x, previous.x);
+      const float iy0 = std::max(candidate.y, previous.y);
+      const float ix1 = std::min(ax1, bx1);
+      const float iy1 = std::min(ay1, by1);
+      const float inter = std::max(0.0f, ix1 - ix0) * std::max(0.0f, iy1 - iy0);
+      const float area_a =
+          std::max(0.0f, candidate.w) * std::max(0.0f, candidate.h);
+      const float area_b =
+          std::max(0.0f, previous.w) * std::max(0.0f, previous.h);
+      const float uni = area_a + area_b - inter;
+      const float iou = uni > 0.0f ? inter / uni : 0.0f;
+      if (iou > nms_threshold) {
+        suppress = true;
+        break;
+      }
+    }
+    if (!suppress)
+      kept_.push_back(candidate);
+  }
+  return kept_;
+}
+
+YunetDetectionScratch::Stats YunetDetectionScratch::stats() const {
+  return Stats{
+      rebuilds_,          invalidations_,  top_k_, candidates_.capacity(),
+      mapped_.capacity(), kept_.capacity()};
 }
 
 void YunetFaceDetector::Reset() {
@@ -163,6 +282,9 @@ void YunetFaceDetector::Reset() {
   input_tensor_.clear();
   input_shape_.clear();
   outputs_.clear();
+  run_input_ = {};
+  run_outputs_.clear();
+  detection_scratch_.Invalidate();
   cls_idx_ = {{-1, -1, -1}};
   obj_idx_ = {{-1, -1, -1}};
   bbox_idx_ = {{-1, -1, -1}};
@@ -263,7 +385,9 @@ bool YunetFaceDetector::LoadSettingsFromManifest(
   settings_.input_h = std::clamp(settings_.input_h, 64, 2048);
   settings_.score_threshold = std::clamp(settings_.score_threshold, 0.0f, 1.0f);
   settings_.nms_threshold = std::clamp(settings_.nms_threshold, 0.0f, 1.0f);
-  settings_.top_k = std::clamp(settings_.top_k, 1, 20000);
+  settings_.top_k =
+      std::clamp(settings_.top_k, 1,
+                 static_cast<int>(YunetDetectionScratch::kMaximumTopK));
 
   return true;
 }
@@ -284,9 +408,9 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
   }
 
   std::string geometry_error;
-  if (!ValidateYunetInputTensorContract(
-          session_info_.input_shapes[0], settings_.input_nhwc,
-          settings_.input_w, settings_.input_h, &geometry_error)) {
+  if (!ValidateYunetInputTensorContract(session_info_.input_shapes[0],
+                                        settings_.input_nhwc, settings_.input_w,
+                                        settings_.input_h, &geometry_error)) {
     if (error)
       *error = geometry_error;
     return false;
@@ -338,18 +462,18 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
     int stride = 0;
     const int si = stride_index(name);
     switch (si) {
-      case 0:
-        stride = 8;
-        break;
-      case 1:
-        stride = 16;
-        break;
-      case 2:
-        stride = 32;
-        break;
-      default:
-        stride = 8;
-        break;
+    case 0:
+      stride = 8;
+      break;
+    case 1:
+      stride = 16;
+      break;
+    case 2:
+      stride = 32;
+      break;
+    default:
+      stride = 8;
+      break;
     }
 
     const int rows = std::max(1, settings_.input_h / stride);
@@ -426,6 +550,23 @@ bool YunetFaceDetector::BuildBindings(std::string *error) {
     }
   }
 
+  run_input_ = studiocast::onnx::OrtSession::RunInput{
+      session_info_.input_names[0].c_str(), input_tensor_.data(),
+      input_tensor_.size(), input_shape_.data(), input_shape_.size()};
+  run_outputs_.clear();
+  run_outputs_.reserve(outputs_.size());
+  for (auto &binding : outputs_) {
+    run_outputs_.push_back(studiocast::onnx::OrtSession::RunOutput{
+        binding.name.c_str(), binding.data.data(), binding.data.size(),
+        binding.shape.data(), binding.shape.size()});
+  }
+  if (!detection_scratch_.Configure(
+          static_cast<std::size_t>(settings_.top_k))) {
+    if (error)
+      *error = "YuNet postprocess top-k exceeds its declared capacity";
+    return false;
+  }
+
   return true;
 }
 
@@ -438,27 +579,14 @@ bool YunetFaceDetector::Warmup(std::string *error) {
                              "YuNet ORT session is not initialized");
     return false;
   }
-  studiocast::onnx::OrtSession::RunInput input;
-  input.name = session_info_.input_names[0].c_str();
-  input.data = input_tensor_.data();
-  input.num_floats = input_tensor_.size();
-  input.shape = input_shape_.data();
-  input.shape_rank = input_shape_.size();
-
-  std::vector<studiocast::onnx::OrtSession::RunOutput> outputs;
-  outputs.reserve(outputs_.size());
-  for (auto &binding : outputs_) {
-    outputs.push_back(studiocast::onnx::OrtSession::RunOutput{
-        binding.name.c_str(), binding.data.data(), binding.data.size(),
-        binding.shape.data(), binding.shape.size()});
-  }
-  session_->ReserveRunScratch(1, outputs.size());
+  session_->ReserveRunScratch(1, run_outputs_.size());
   std::string run_error;
-  if (!session_->RunCpu(&input, 1, outputs.data(), outputs.size(), &run_error)) {
+  if (!session_->RunCpu(&run_input_, 1, run_outputs_.data(),
+                        run_outputs_.size(), &run_error)) {
     if (error) {
-      *error = StableFailure(
-          kYunetWarmupFailedReason,
-          run_error.empty() ? "YuNet setup warm-up failed" : run_error);
+      *error = StableFailure(kYunetWarmupFailedReason,
+                             run_error.empty() ? "YuNet setup warm-up failed"
+                                               : run_error);
     }
     return false;
   }
@@ -788,37 +916,16 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
       ComputeLetterbox(width, height, settings_.input_w, settings_.input_h);
   FillInputTensorBgr(rgb, width, height, stride, lb);
 
-  // Bind input.
-  studiocast::onnx::OrtSession::RunInput in;
-  in.name = session_info_.input_names[0].c_str();
-  in.data = input_tensor_.data();
-  in.num_floats = input_tensor_.size();
-  in.shape = input_shape_.data();
-  in.shape_rank = input_shape_.size();
-
-  // Bind outputs.
-  std::vector<studiocast::onnx::OrtSession::RunOutput> outs;
-  outs.reserve(outputs_.size());
-  for (auto &ob : outputs_) {
-    studiocast::onnx::OrtSession::RunOutput o;
-    o.name = ob.name.c_str();
-    o.data = ob.data.data();
-    o.num_floats = ob.data.size();
-    o.shape = ob.shape.data();
-    o.shape_rank = ob.shape.size();
-    outs.push_back(o);
-  }
-
   std::string run_err;
-  if (!session_->RunCpu(&in, 1, outs.data(), outs.size(), &run_err)) {
+  if (!session_->RunCpu(&run_input_, 1, run_outputs_.data(),
+                        run_outputs_.size(), &run_err)) {
     if (error)
       *error = run_err;
     return false;
   }
 
   // Decode YuNet outputs.
-  std::vector<FaceDetection> faces;
-  faces.reserve(16);
+  detection_scratch_.BeginFrame();
 
   const int padW = settings_.input_w;
   const int padH = settings_.input_h;
@@ -836,12 +943,10 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
     const auto &bbox = outputs_[static_cast<std::size_t>(bbox_idx_[s])];
     const auto &kps = outputs_[static_cast<std::size_t>(kps_idx_[s])];
 
-    const bool bbox_nhwc =
-        (bbox.shape.size() == 4 && bbox.shape[3] == 4) ||
-        (bbox.shape.size() == 3 && bbox.shape[2] == 4);
-    const bool kps_nhwc =
-        (kps.shape.size() == 4 && kps.shape[3] == 10) ||
-        (kps.shape.size() == 3 && kps.shape[2] == 10);
+    const bool bbox_nhwc = (bbox.shape.size() == 4 && bbox.shape[3] == 4) ||
+                           (bbox.shape.size() == 3 && bbox.shape[2] == 4);
+    const bool kps_nhwc = (kps.shape.size() == 4 && kps.shape[3] == 10) ||
+                          (kps.shape.size() == 3 && kps.shape[2] == 10);
 
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < cols; ++c) {
@@ -881,7 +986,7 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
         (void)kps_nhwc;
         // Keypoints are available but are not currently needed for Auto Frame.
 
-        faces.push_back(FaceDetection{
+        detection_scratch_.Consider(FaceDetection{
             .x = x1,
             .y = y1,
             .w = w,
@@ -892,50 +997,11 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
     }
   }
 
-  // Sort by score descending.
-  std::sort(faces.begin(), faces.end(),
-            [](const FaceDetection &a, const FaceDetection &b) {
-              return a.score > b.score;
-            });
-  if (static_cast<int>(faces.size()) > settings_.top_k) {
-    faces.resize(static_cast<std::size_t>(settings_.top_k));
-  }
-
-  // Map to original frame space and run NMS.
-  std::vector<FaceDetection> mapped;
-  mapped.reserve(faces.size());
-  for (const auto &f : faces) {
-    FaceDetection out = f;
-    // Undo letterbox.
-    out.x = (out.x - static_cast<float>(lb.pad_x)) / lb.scale;
-    out.y = (out.y - static_cast<float>(lb.pad_y)) / lb.scale;
-    out.w = out.w / lb.scale;
-    out.h = out.h / lb.scale;
-
-    // Clip to image bounds (best-effort).
-    out.x = std::clamp(out.x, 0.0f, static_cast<float>(width));
-    out.y = std::clamp(out.y, 0.0f, static_cast<float>(height));
-    out.w = std::clamp(out.w, 0.0f, static_cast<float>(width) - out.x);
-    out.h = std::clamp(out.h, 0.0f, static_cast<float>(height) - out.y);
-    mapped.push_back(out);
-  }
-
-  std::vector<FaceDetection> kept;
-  kept.reserve(mapped.size());
-  for (const auto &cand : mapped) {
-    bool suppress = false;
-    for (const auto &prev : kept) {
-      if (IoU(cand, prev) > settings_.nms_threshold) {
-        suppress = true;
-        break;
-      }
-    }
-    if (!suppress) {
-      kept.push_back(cand);
-    }
-  }
-
-  cache->face_detections = std::move(kept);
+  const auto &kept = detection_scratch_.Finalize(
+      lb.scale, lb.pad_x, lb.pad_y, width, height, settings_.nms_threshold);
+  auto &cached =
+      cache->PrepareFaceDetections(static_cast<std::size_t>(settings_.top_k));
+  cached.assign(kept.begin(), kept.end());
   return true;
 }
 

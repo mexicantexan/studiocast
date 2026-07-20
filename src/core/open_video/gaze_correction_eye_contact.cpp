@@ -96,6 +96,25 @@ void GazeCorrectionEyeContact::Reset() {
   dlib_landmarks_.Reset();
   left_ = EyeRuntime();
   right_ = EyeRuntime();
+  left_eye_scratch_.valid = false;
+  right_eye_scratch_.valid = false;
+  left_corrected_scratch_.clear();
+  right_corrected_scratch_.clear();
+  upscale_scratch_.clear();
+  left_extract_plan_.Clear();
+  right_extract_plan_.Clear();
+  left_upscale_plan_.Clear();
+  right_upscale_plan_.Clear();
+  left_extract_geometry_ = {};
+  right_extract_geometry_ = {};
+  left_upscale_geometry_ = {};
+  right_upscale_geometry_ = {};
+  scratch_frame_width_ = 0;
+  scratch_frame_height_ = 0;
+  scratch_left_input_width_ = 0;
+  scratch_left_input_height_ = 0;
+  scratch_right_input_width_ = 0;
+  scratch_right_input_height_ = 0;
   sticky_warning_.clear();
   runtime_failures_ = 0;
 }
@@ -140,6 +159,91 @@ EyeContactRuntimeStatus GazeCorrectionEyeContact::runtime_status() const {
   }
 
   return s;
+}
+
+EyeContactScratchStatus GazeCorrectionEyeContact::scratch_status() const {
+  return EyeContactScratchStatus{
+      scratch_geometry_rebuilds_, scratch_resize_plan_rebuilds_,
+      scratch_frame_width_, scratch_frame_height_, upscale_scratch_.capacity()};
+}
+
+bool GazeCorrectionEyeContact::PrepareScratch(int frame_width, int frame_height,
+                                              int left_input_width,
+                                              int left_input_height,
+                                              int right_input_width,
+                                              int right_input_height,
+                                              std::string *error) {
+  if (error)
+    error->clear();
+  // CameraPipeline rejects frame geometry above 4096. Eye-contact packs are
+  // explicitly bounded more tightly; curated packs currently use 64x48.
+  constexpr int kMaxFrameDimension = 4096;
+  constexpr int kMaxEyeInputDimension = 512;
+  if (frame_width <= 0 || frame_height <= 0 ||
+      frame_width > kMaxFrameDimension || frame_height > kMaxFrameDimension ||
+      left_input_width <= 0 || left_input_height <= 0 ||
+      right_input_width <= 0 || right_input_height <= 0 ||
+      left_input_width > kMaxEyeInputDimension ||
+      left_input_height > kMaxEyeInputDimension ||
+      right_input_width > kMaxEyeInputDimension ||
+      right_input_height > kMaxEyeInputDimension) {
+    if (error)
+      *error = "eye-contact scratch geometry exceeds its declared bounds";
+    return false;
+  }
+  if (scratch_frame_width_ == frame_width &&
+      scratch_frame_height_ == frame_height &&
+      scratch_left_input_width_ == left_input_width &&
+      scratch_left_input_height_ == left_input_height &&
+      scratch_right_input_width_ == right_input_width &&
+      scratch_right_input_height_ == right_input_height) {
+    return true;
+  }
+
+  const auto prepare_eye = [](int width, int height, EyeData *eye,
+                              std::vector<std::uint8_t> *corrected) {
+    const std::size_t plane =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    eye->eye_rgb_u8.reserve(plane * 3u);
+    eye->eye_nchw_f32.reserve(plane * 3u);
+    eye->anchors_nchw_f32.reserve(plane * 12u);
+    corrected->reserve(plane * 3u);
+  };
+  prepare_eye(left_input_width, left_input_height, &left_eye_scratch_,
+              &left_corrected_scratch_);
+  prepare_eye(right_input_width, right_input_height, &right_eye_scratch_,
+              &right_corrected_scratch_);
+  upscale_scratch_.reserve(static_cast<std::size_t>(frame_width) *
+                           static_cast<std::size_t>(frame_height) * 3u);
+
+  scratch_frame_width_ = frame_width;
+  scratch_frame_height_ = frame_height;
+  scratch_left_input_width_ = left_input_width;
+  scratch_left_input_height_ = left_input_height;
+  scratch_right_input_width_ = right_input_width;
+  scratch_right_input_height_ = right_input_height;
+  ++scratch_geometry_rebuilds_;
+  return true;
+}
+
+bool GazeCorrectionEyeContact::EnsureResizePlan(bool left_eye, bool upscale,
+                                                int src_w, int src_h, int dst_w,
+                                                int dst_h, std::string *error) {
+  auto *geometry =
+      left_eye
+          ? (upscale ? &left_upscale_geometry_ : &left_extract_geometry_)
+          : (upscale ? &right_upscale_geometry_ : &right_extract_geometry_);
+  auto *plan = left_eye
+                   ? (upscale ? &left_upscale_plan_ : &left_extract_plan_)
+                   : (upscale ? &right_upscale_plan_ : &right_extract_plan_);
+  const std::array<int, 4> desired{src_w, src_h, dst_w, dst_h};
+  if (*geometry == desired)
+    return true;
+  if (!plan->Configure(src_w, src_h, dst_w, dst_h, error))
+    return false;
+  *geometry = desired;
+  ++scratch_resize_plan_rebuilds_;
+  return true;
 }
 
 float GazeCorrectionEyeContact::Clamp01(float x) {
@@ -613,7 +717,7 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
       *error = "ExtractEyeData: out is null";
     return false;
   }
-  *out = EyeData();
+  out->valid = false;
   out->is_left = left_eye;
   out->input_w = input_w;
   out->input_h = input_h;
@@ -673,27 +777,25 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
 
   // Resize crop to the model input size.
   const std::uint8_t *crop_ptr = rgb + ByteOffset(frame_stride, left, top);
-  std::vector<std::uint8_t> resized;
   std::string rerr;
-  if (!studiocast::video::ResizeRgb24Bilinear(
-          crop_ptr, crop_w, crop_h, frame_stride, input_w, input_h, &resized,
-          static_cast<std::size_t>(input_w * 3), &rerr)) {
+  if (!EnsureResizePlan(left_eye, false, crop_w, crop_h, input_w, input_h,
+                        &rerr) ||
+      !(left_eye ? left_extract_plan_ : right_extract_plan_)
+           .Apply(crop_ptr, frame_stride, &out->eye_rgb_u8,
+                  static_cast<std::size_t>(input_w * 3), &rerr)) {
     if (error)
       *error = "Eye crop resize failed: " + rerr;
     return false;
   }
-  out->eye_rgb_u8 = std::move(resized);
-
   // Convert eye to NCHW float32 in 0..1.
   const std::size_t input_w_sz = static_cast<std::size_t>(input_w);
   const std::size_t input_h_sz = static_cast<std::size_t>(input_h);
   const std::size_t plane = input_w_sz * input_h_sz;
-  out->eye_nchw_f32.assign(static_cast<std::size_t>(3) * plane,
-                           0.f);
+  out->eye_nchw_f32.assign(static_cast<std::size_t>(3) * plane, 0.f);
   for (int y = 0; y < input_h; ++y) {
     for (int x = 0; x < input_w; ++x) {
-      const std::size_t idx =
-          static_cast<std::size_t>(y) * input_w_sz + static_cast<std::size_t>(x);
+      const std::size_t idx = static_cast<std::size_t>(y) * input_w_sz +
+                              static_cast<std::size_t>(x);
       const std::size_t src = idx * 3u;
       out->eye_nchw_f32[idx] = out->eye_rgb_u8[src + 0] / 255.0f;
       out->eye_nchw_f32[plane + idx] = out->eye_rgb_u8[src + 1] / 255.0f;
@@ -709,8 +811,7 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
   std::array<int, 6> seq = left_eye ? std::array<int, 6>{3, 2, 1, 0, 5, 4}
                                     : std::array<int, 6>{0, 1, 2, 3, 4, 5};
 
-  out->anchors_nchw_f32.assign(static_cast<std::size_t>(12) * plane,
-                               0.f);
+  out->anchors_nchw_f32.assign(static_cast<std::size_t>(12) * plane, 0.f);
 
   for (int i = 0; i < 6; ++i) {
     const auto pt =
@@ -724,10 +825,10 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
 
     const int c_x = 2 * i;
     const int c_y = 2 * i + 1;
-    float *ch_x = out->anchors_nchw_f32.data() +
-                  static_cast<std::size_t>(c_x) * plane;
-    float *ch_y = out->anchors_nchw_f32.data() +
-                  static_cast<std::size_t>(c_y) * plane;
+    float *ch_x =
+        out->anchors_nchw_f32.data() + static_cast<std::size_t>(c_x) * plane;
+    float *ch_y =
+        out->anchors_nchw_f32.data() + static_cast<std::size_t>(c_y) * plane;
 
     for (int y = 0; y < input_h; ++y) {
       const float dy = static_cast<float>(y - resize_y);
@@ -961,7 +1062,7 @@ bool GazeCorrectionEyeContact::WarpOrDecodeOutputToRgbU8(
 void GazeCorrectionEyeContact::CompositeEyeIntoFrame(
     std::uint8_t *frame_rgb, int frame_w, int frame_h, std::size_t frame_stride,
     const EyeData &eye, const std::vector<std::uint8_t> &corrected_rgb_u8,
-    float strength01) {
+    float strength01, bool left_eye) {
   if (!frame_rgb || !eye.valid)
     return;
   strength01 = Clamp01(strength01);
@@ -969,12 +1070,15 @@ void GazeCorrectionEyeContact::CompositeEyeIntoFrame(
     return;
 
   // Upscale corrected eye to the crop size.
-  std::vector<std::uint8_t> up;
   std::string rerr;
-  (void)studiocast::video::ResizeRgb24Bilinear(
-      corrected_rgb_u8.data(), eye.input_w, eye.input_h,
-      static_cast<std::size_t>(eye.input_w * 3), eye.crop_w, eye.crop_h, &up,
-      static_cast<std::size_t>(eye.crop_w * 3), &rerr);
+  if (!EnsureResizePlan(left_eye, true, eye.input_w, eye.input_h, eye.crop_w,
+                        eye.crop_h, &rerr))
+    return;
+  auto &plan = left_eye ? left_upscale_plan_ : right_upscale_plan_;
+  if (!plan.Apply(corrected_rgb_u8.data(),
+                  static_cast<std::size_t>(eye.input_w * 3), &upscale_scratch_,
+                  static_cast<std::size_t>(eye.crop_w * 3), &rerr))
+    return;
 
   // Blend into the original frame.
   const int x0 = ClampInt(eye.crop_left, 0, frame_w - 1);
@@ -992,7 +1096,7 @@ void GazeCorrectionEyeContact::CompositeEyeIntoFrame(
                             static_cast<std::size_t>(y0 + y) * frame_stride +
                             static_cast<std::size_t>(x0) * 3;
     const std::uint8_t *src_row =
-        up.data() +
+        upscale_scratch_.data() +
         static_cast<std::size_t>(y) * static_cast<std::size_t>(eye.crop_w) * 3;
     for (int x = 0; x < out_w; ++x) {
       const std::size_t d = static_cast<std::size_t>(x) * 3;
@@ -1048,6 +1152,14 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
     return false;
   }
 
+  std::string scratch_error;
+  if (!PrepareScratch(width, height, left_.input_w, left_.input_h,
+                      right_.input_w, right_.input_h, &scratch_error)) {
+    if (error)
+      *error = scratch_error;
+    return false;
+  }
+
   // Ensure face detections.
   std::string det_err;
   if (!yunet->EnsureDetectionsForFrame(rgb, width, height, stride,
@@ -1078,20 +1190,18 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
     return true;
 
   // Extract eye inputs.
-  EyeData left_eye;
-  EyeData right_eye;
   std::string ex_err;
   const auto &lms = *cache->face_landmarks;
   if (!ExtractEyeData(rgb, width, height, stride, lms, true, left_.input_w,
-                      left_.input_h, &left_eye, &ex_err)) {
+                      left_.input_h, &left_eye_scratch_, &ex_err)) {
     // No usable eye region.
   }
   if (!ExtractEyeData(rgb, width, height, stride, lms, false, right_.input_w,
-                      right_.input_h, &right_eye, &ex_err)) {
+                      right_.input_h, &right_eye_scratch_, &ex_err)) {
     // No usable eye region.
   }
 
-  if (!left_eye.valid && !right_eye.valid)
+  if (!left_eye_scratch_.valid && !right_eye_scratch_.valid)
     return true;
 
   // Placeholder gaze angles: aim slightly upward towards a typical webcam
@@ -1102,8 +1212,8 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
   // Run models + composite.
   std::string run_err;
 
-  if (left_eye.valid) {
-    if (!RunModelForEye(&left_, left_eye, yaw, pitch, &run_err)) {
+  if (left_eye_scratch_.valid) {
+    if (!RunModelForEye(&left_, left_eye_scratch_, yaw, pitch, &run_err)) {
       if (error)
         *error = run_err;
       runtime_failures_++;
@@ -1113,16 +1223,16 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
       }
       return false;
     }
-    std::vector<std::uint8_t> corrected;
     std::string werr;
-    if (WarpOrDecodeOutputToRgbU8(left_, left_eye, &corrected, &werr)) {
-      CompositeEyeIntoFrame(rgb, width, height, stride, left_eye, corrected,
-                            strength01);
+    if (WarpOrDecodeOutputToRgbU8(left_, left_eye_scratch_,
+                                  &left_corrected_scratch_, &werr)) {
+      CompositeEyeIntoFrame(rgb, width, height, stride, left_eye_scratch_,
+                            left_corrected_scratch_, strength01, true);
     }
   }
 
-  if (right_eye.valid) {
-    if (!RunModelForEye(&right_, right_eye, yaw, pitch, &run_err)) {
+  if (right_eye_scratch_.valid) {
+    if (!RunModelForEye(&right_, right_eye_scratch_, yaw, pitch, &run_err)) {
       if (error)
         *error = run_err;
       runtime_failures_++;
@@ -1132,11 +1242,11 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
       }
       return false;
     }
-    std::vector<std::uint8_t> corrected;
     std::string werr;
-    if (WarpOrDecodeOutputToRgbU8(right_, right_eye, &corrected, &werr)) {
-      CompositeEyeIntoFrame(rgb, width, height, stride, right_eye, corrected,
-                            strength01);
+    if (WarpOrDecodeOutputToRgbU8(right_, right_eye_scratch_,
+                                  &right_corrected_scratch_, &werr)) {
+      CompositeEyeIntoFrame(rgb, width, height, stride, right_eye_scratch_,
+                            right_corrected_scratch_, strength01, false);
     }
   }
 
