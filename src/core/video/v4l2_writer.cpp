@@ -16,6 +16,98 @@
 namespace studiocast::video {
 namespace {
 
+template <typename WriteOnce>
+FrameWriteResult WriteFrameWith(WriteOnce write_once, bool transport_valid,
+                                int fd, const std::uint8_t *data,
+                                std::size_t bytes, std::size_t size_image,
+                                const std::atomic_bool *stop,
+                                FrameWriteCounters *counters) noexcept {
+  FrameWriteResult result;
+  const auto fail = [&](FrameWriteFailure failure, int error_number = 0) {
+    result.status = FrameWriteStatus::fatal;
+    result.failure = failure;
+    result.error_number = error_number;
+    if (counters) {
+      ++counters->fatal_failures;
+      if (failure == FrameWriteFailure::partial_frame)
+        ++counters->partial_frame_failures;
+    }
+    return result;
+  };
+
+  if (fd < 0)
+    return fail(FrameWriteFailure::writer_not_open, EBADF);
+  if (!data)
+    return fail(FrameWriteFailure::null_data, EINVAL);
+  if (size_image == 0 || bytes < size_image)
+    return fail(FrameWriteFailure::undersized_input, EMSGSIZE);
+  if (!transport_valid)
+    return fail(FrameWriteFailure::io_error, EINVAL);
+
+  std::uint32_t eintr_retries = 0;
+  for (;;) {
+    if (stop && stop->load(std::memory_order_relaxed)) {
+      result.status = FrameWriteStatus::stopped;
+      result.failure = FrameWriteFailure::none;
+      if (counters)
+        ++counters->stopped_writes;
+      return result;
+    }
+
+    const ssize_t wrote = write_once(fd, data, size_image);
+    ++result.write_syscalls;
+    if (counters)
+      ++counters->write_syscalls;
+
+    if (wrote == static_cast<ssize_t>(size_image)) {
+      result.status = FrameWriteStatus::written;
+      result.failure = FrameWriteFailure::none;
+      result.bytes_written = size_image;
+      if (counters)
+        ++counters->frames_written;
+      return result;
+    }
+    if (wrote > 0) {
+      result.bytes_written = static_cast<std::size_t>(wrote);
+      return fail(FrameWriteFailure::partial_frame, EIO);
+    }
+    if (wrote == 0)
+      return fail(FrameWriteFailure::zero_write, EIO);
+
+    const int write_errno = errno;
+    if (write_errno == EINTR) {
+      if (eintr_retries >= kV4l2WriterMaxEintrRetries)
+        return fail(FrameWriteFailure::interrupted_retry_limit, EINTR);
+      ++eintr_retries;
+      if (counters)
+        ++counters->eintr_retries;
+      continue;
+    }
+    if (write_errno == EAGAIN || write_errno == EWOULDBLOCK) {
+      if (stop && stop->load(std::memory_order_relaxed)) {
+        result.status = FrameWriteStatus::stopped;
+        result.failure = FrameWriteFailure::none;
+        if (counters)
+          ++counters->stopped_writes;
+      } else {
+        result.status = FrameWriteStatus::would_block_dropped;
+        result.failure = FrameWriteFailure::none;
+        result.error_number = write_errno;
+        if (counters)
+          ++counters->would_block_drops;
+      }
+      return result;
+    }
+    if (write_errno == ENODEV || write_errno == ENXIO ||
+        write_errno == EPIPE || write_errno == EBADF) {
+      return fail(FrameWriteFailure::disconnected, write_errno);
+    }
+    if (write_errno == EINVAL || write_errno == EMSGSIZE)
+      return fail(FrameWriteFailure::format_mismatch, write_errno);
+    return fail(FrameWriteFailure::io_error, write_errno);
+  }
+}
+
 std::string ToLowerAscii(std::string s) {
   for (char &c : s) {
     if (c >= 'A' && c <= 'Z')
@@ -660,7 +752,7 @@ NegotiationResult NegotiateFormat(int fd, const std::string &device, int width,
 bool TryOpenNegotiate(const std::string &device, int openFlags, int width,
                       int height, int fps, PixelFormat fmt, int *outFd,
                       ActualFormat *outActual, std::string *outErr) {
-  const int fd = ::open(device.c_str(), openFlags | O_CLOEXEC);
+  const int fd = ::open(device.c_str(), openFlags);
   if (fd < 0) {
     if (outErr)
       *outErr = "open() failed: " + std::string(std::strerror(errno));
@@ -683,6 +775,86 @@ bool TryOpenNegotiate(const std::string &device, int openFlags, int width,
 }
 
 } // namespace
+
+int V4l2WriterOpenFlags(bool read_write) noexcept {
+  return (read_write ? O_RDWR : O_WRONLY) | O_CLOEXEC | O_NONBLOCK;
+}
+
+FrameWriteResult WriteFrameToTransport(
+    const FrameWriteTransport &transport, int fd, const std::uint8_t *data,
+    std::size_t bytes, std::size_t size_image, const std::atomic_bool *stop,
+    FrameWriteCounters *counters) noexcept {
+  const auto write_once = [&](int write_fd, const void *write_data,
+                              std::size_t write_bytes) {
+    return transport.write(transport.context, write_fd, write_data,
+                           write_bytes);
+  };
+  return WriteFrameWith(write_once, transport.write != nullptr, fd, data,
+                        bytes, size_image, stop, counters);
+}
+
+FrameWriteResult WriteFrameToFd(int fd, const std::uint8_t *data,
+                                std::size_t bytes, std::size_t size_image,
+                                const std::atomic_bool *stop,
+                                FrameWriteCounters *counters) noexcept {
+  const auto direct_write = [](int write_fd, const void *write_data,
+                               std::size_t write_bytes) {
+    return ::write(write_fd, write_data, write_bytes);
+  };
+  return WriteFrameWith(direct_write, true, fd, data, bytes, size_image, stop,
+                        counters);
+}
+
+std::string DescribeFrameWriteResult(const FrameWriteResult &result) {
+  switch (result.status) {
+  case FrameWriteStatus::written:
+    return {};
+  case FrameWriteStatus::would_block_dropped:
+    return "nonblocking output would block; current frame dropped";
+  case FrameWriteStatus::stopped:
+    return "output write stopped";
+  case FrameWriteStatus::fatal:
+    break;
+  }
+
+  std::ostringstream oss;
+  switch (result.failure) {
+  case FrameWriteFailure::none:
+    oss << "output write failed";
+    break;
+  case FrameWriteFailure::writer_not_open:
+    oss << "writer not open";
+    break;
+  case FrameWriteFailure::null_data:
+    oss << "frame data is null";
+    break;
+  case FrameWriteFailure::undersized_input:
+    oss << "frame buffer too small for size_image";
+    break;
+  case FrameWriteFailure::partial_frame:
+    oss << "partial frame write (" << result.bytes_written
+        << " bytes); transport must be reopened";
+    break;
+  case FrameWriteFailure::zero_write:
+    oss << "write returned zero bytes";
+    break;
+  case FrameWriteFailure::interrupted_retry_limit:
+    oss << "write interrupted beyond retry limit";
+    break;
+  case FrameWriteFailure::disconnected:
+    oss << "output device disconnected";
+    break;
+  case FrameWriteFailure::format_mismatch:
+    oss << "output format changed or frame size was rejected";
+    break;
+  case FrameWriteFailure::io_error:
+    oss << "output write failed";
+    break;
+  }
+  if (result.error_number != 0)
+    oss << ": " << std::strerror(result.error_number);
+  return oss.str();
+}
 
 std::string PixelFormatName(PixelFormat fmt) {
   switch (fmt) {
@@ -716,6 +888,7 @@ void V4l2Writer::Close() {
 bool V4l2Writer::Open(const std::string &device, int width, int height, int fps,
                       PixelFormat fmt, std::string *error) {
   Close();
+  write_counters_ = {};
 
   if (device.empty()) {
     if (error)
@@ -739,16 +912,16 @@ bool V4l2Writer::Open(const std::string &device, int width, int height, int fps,
 
   // Prefer O_WRONLY (important for exclusive_caps setups and avoids grabbing
   // the read side).
-  if (TryOpenNegotiate(device, O_WRONLY, width, height, fps, fmt, &fd, &a,
-                       &err1)) {
+  if (TryOpenNegotiate(device, V4l2WriterOpenFlags(false), width, height, fps,
+                       fmt, &fd, &a, &err1)) {
     fd_ = fd;
     actual_ = a;
     return true;
   }
 
   // Fallback: try O_RDWR (some implementations/drivers only accept this).
-  if (TryOpenNegotiate(device, O_RDWR, width, height, fps, fmt, &fd, &a,
-                       &err2)) {
+  if (TryOpenNegotiate(device, V4l2WriterOpenFlags(true), width, height, fps,
+                       fmt, &fd, &a, &err2)) {
     fd_ = fd;
     actual_ = a;
     return true;
@@ -917,44 +1090,26 @@ bool V4l2Writer::Renegotiate(const std::string &device, int width, int height,
 
 bool V4l2Writer::WriteFrame(const std::uint8_t *data, std::size_t bytes,
                             std::string *error) {
-  if (fd_ < 0) {
-    if (error)
-      *error = "Writer not open.";
-    return false;
-  }
-  if (!data) {
-    if (error)
-      *error = "Frame data is null.";
-    return false;
-  }
-  if (bytes < actual_.size_image) {
-    if (error)
-      *error = "Frame buffer too small for size_image.";
-    return false;
-  }
+  const FrameWriteResult result = WriteFrameDetailed(data, bytes);
+  if (result.FrameCommitted())
+    return true;
+  if (error)
+    *error = DescribeFrameWriteResult(result);
+  return false;
+}
 
-  const std::size_t toWrite = actual_.size_image;
-  std::size_t offset = 0;
-
-  while (offset < toWrite) {
-    const std::size_t chunk = toWrite - offset;
-    const ssize_t wrote = ::write(fd_, data + offset, chunk);
-    if (wrote < 0) {
-      if (errno == EINTR)
-        continue;
-      if (error)
-        *error = std::string("write() failed: ") + std::strerror(errno);
-      return false;
-    }
-    if (wrote == 0) {
-      if (error)
-        *error = "write() returned 0 (unexpected).";
-      return false;
-    }
-    offset += static_cast<std::size_t>(wrote);
+FrameWriteResult
+V4l2Writer::WriteFrameDetailed(const std::uint8_t *data, std::size_t bytes,
+                               const std::atomic_bool *stop) noexcept {
+  const FrameWriteResult result =
+      WriteFrameToFd(fd_, data, bytes, actual_.size_image, stop,
+                     &write_counters_);
+  if (result.RequiresReopen()) {
+    // Once part of a frame has reached a V4L2 write transport there is no safe
+    // frame boundary to resume from. Closing is the only fail-closed recovery.
+    Close();
   }
-
-  return true;
+  return result;
 }
 
 } // namespace studiocast::video

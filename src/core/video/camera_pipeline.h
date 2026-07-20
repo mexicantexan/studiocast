@@ -368,6 +368,14 @@ struct CameraPipelineStatus {
     int output_format_changes = 0;
     int output_refresh_failures = 0;
     int output_write_recoveries = 0;
+    std::uint64_t output_write_syscalls = 0;
+    std::uint64_t output_frames_committed = 0;
+    std::uint64_t output_would_block_drops = 0;
+    std::uint64_t output_stopped_writes = 0;
+    std::uint64_t output_eintr_retries = 0;
+    std::uint64_t output_partial_frame_failures = 0;
+    std::uint64_t output_fatal_failures = 0;
+    std::size_t output_queue_capacity = kV4l2WriterMaxQueuedFrames;
 
     // Actual YUYV frame-path call-site counters.
     std::uint64_t yuyv_capture_to_rgb_calls = 0;

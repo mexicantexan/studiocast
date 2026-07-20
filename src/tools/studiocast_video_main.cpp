@@ -188,12 +188,22 @@ int main(int argc, char **argv) {
         return 6;
       }
 
-      std::string werr;
-      if (!writer.WriteFrame(frame.data(), frame.size(), &werr)) {
+      const auto write_result =
+          writer.WriteFrameDetailed(frame.data(), frame.size());
+      if (write_result.status ==
+          studiocast::video::FrameWriteStatus::stopped) {
+        break;
+      }
+      if (write_result.status ==
+          studiocast::video::FrameWriteStatus::fatal) {
+        const std::string werr =
+            studiocast::video::DescribeFrameWriteResult(write_result);
         std::cerr << "ERROR: write failed: " << werr << "\n";
         return 7;
       }
 
+      // EAGAIN follows the same zero-queue latest-frame policy as the service:
+      // advance the pattern and try the newest frame at the next cadence.
       ++frameIndex;
       std::this_thread::sleep_until(next);
     }
