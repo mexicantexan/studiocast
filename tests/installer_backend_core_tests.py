@@ -349,6 +349,11 @@ class InstallerBackendCoreTests(unittest.TestCase):
         one = self.recommendation(); two = self.recommendation()
         self.assertEqual(one, two)
         self.assertEqual(one["selections"]["model_pack_ids"], DEFAULT_PACKS)
+        self.assertEqual(one["disk"], {"free_bytes": 20_000_000_000,
+                                       "base_required_bytes": 3,
+                                       "download_bytes": 131224287,
+                                       "required_bytes": 131224290})
+        self.assertNotIn("artifact_sizes_untrusted", {item["code"] for item in one["blockers"]})
         self.assertEqual(one["selections"]["effects"]["virtual_background"]["selected"], "cuda")
         facts = base_facts(); facts["effects"]["capabilities"]["virtual_background"]["cuda"] = "unavailable"
         # A legacy string or forged aggregate availability has no exact
@@ -744,29 +749,47 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(len(downloads), 8)
         self.assertEqual({x["pack_id"] for x in downloads}, set(DEFAULT_PACKS))
         self.assertTrue(all(x["sha256"].startswith("sha256:") for x in downloads))
+        self.assertEqual([x["size"] for x in downloads],
+                         [832775, 2033628, 25888640, 232589, 99693937,
+                          1062936, 1062994, 416788])
+        self.assertTrue(all(x["size_status"] == "known" for x in downloads))
+        self.assertEqual(plan["disk"]["download_bytes"], 131224287)
+        self.assertEqual(plan["disk"]["required_bytes"], 131224290)
+        self.assertEqual(plan["disk"]["free_bytes"], 20_000_000_000)
         transactions = [x for x in plan["operations"] if x["kind"] == "model_transaction"]
         self.assertEqual(len(transactions), 7)
         gaze = next(x for x in transactions if x["inputs"]["pack_id"] == "gaze_correction_cam_flx_v0_1_1")
         self.assertEqual([a["name"] for a in gaze["inputs"]["pack"]["artifacts"]],
                          ["gaze_flx_left.onnx", "gaze_flx_right.onnx"])
 
-    def test_recommended_models_require_trusted_sizes_before_any_mutation(self):
+    def test_recommended_models_use_trusted_sizes_and_low_disk_blocks_before_apply(self):
         plan = self.s.json("plan", "install", "--facts", str(self.s.facts),
                            "--no-v4l2loopback", "--no-service", "--models")
-        self.assertIn("artifact_sizes_untrusted", [item["code"] for item in plan["blockers"]])
+        self.assertNotIn("artifact_sizes_untrusted", [item["code"] for item in plan["blockers"]])
         transactions = [op for op in plan["operations"] if op["kind"] == "model_transaction"]
         self.assertTrue(transactions)
         self.assertTrue(all(op["inputs"]["recommended"] for op in transactions))
-        path = self.s.root / "blocked-model-plan.json"
-        path.write_text(json.dumps(plan), encoding="utf-8")
-        result = self.s.run("apply-plan", "--plan", str(path), "--digest", plan["plan_digest"],
-                            "--token", plan["approval_token"], "--facts", str(self.s.facts),
-                            check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertFalse((Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast/builds").exists())
         advanced = self.plan("--models")
         self.assertTrue(all(not op["inputs"]["recommended"] for op in advanced["operations"]
                             if op["kind"] == "model_transaction"))
+
+        low_disk_facts = base_facts()
+        low_disk_facts["paths"]["free_bytes"] = 131224289
+        self.s.write_facts(low_disk_facts)
+        blocked = self.s.json("plan", "install", "--facts", str(self.s.facts),
+                              "--no-v4l2loopback", "--no-service", "--models")
+        disk_blocker = next(item for item in blocked["blockers"]
+                            if item["code"] == "disk.staging.insufficient")
+        self.assertEqual((disk_blocker["free_bytes"], disk_blocker["required_bytes"]),
+                         (131224289, 131224290))
+        path = self.s.root / "blocked-model-plan.json"
+        path.write_text(json.dumps(blocked), encoding="utf-8")
+        result = self.s.run("apply-plan", "--plan", str(path),
+                            "--digest", blocked["plan_digest"],
+                            "--token", blocked["approval_token"],
+                            "--facts", str(self.s.facts), check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((Path(self.s.env["XDG_CACHE_HOME"]) / "studiocast/builds").exists())
 
         repair_facts = base_facts(classification="partial", active_version="0.2.8",
             desired_configuration={"build_type": "Release", "features": {},
@@ -778,7 +801,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
                              "--no-v4l2loopback", "--no-service", "--models")
         self.assertEqual((repair["route"], repair["detected_route"]),
                          ("recommended", "repair"))
-        self.assertIn("artifact_sizes_untrusted", [item["code"] for item in repair["blockers"]])
+        self.assertNotIn("artifact_sizes_untrusted", [item["code"] for item in repair["blockers"]])
         self.assertTrue(all(op["inputs"]["recommended"] for op in repair["operations"]
                             if op["kind"] == "model_transaction"))
 
@@ -819,7 +842,9 @@ class InstallerBackendCoreTests(unittest.TestCase):
         catalog_path.parent.mkdir(parents=True)
         catalog_path.write_text(json.dumps(catalog))
 
-        def run_for(root: Path, *, expect_success: bool) -> tuple[subprocess.CompletedProcess[str], dict]:
+        def run_for(root: Path, *, expect_success: bool,
+                    tamper_catalog: bool = False) -> tuple[subprocess.CompletedProcess[str], dict]:
+            catalog_path.write_text(json.dumps(catalog))
             env = self.s.env | {"HOME": str(root / "home"), "XDG_DATA_HOME": str(root / "data"),
                 "XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
                 "XDG_CACHE_HOME": str(root / "cache"), "STUDIOCAST_INSTALLER_TEST_MODE": "1",
@@ -835,6 +860,10 @@ class InstallerBackendCoreTests(unittest.TestCase):
             self.assertEqual(plan_process.returncode, 0, plan_process.stderr)
             plan = json.loads(plan_process.stdout)
             plan_path = root / "plan.json"; plan_path.write_text(json.dumps(plan))
+            if tamper_catalog:
+                changed = json.loads(catalog_path.read_text())
+                changed["packs"][0]["artifacts"][0]["size_bytes"] += 1
+                catalog_path.write_text(json.dumps(changed))
             fake_tools = self._fake_cmake()
             fake_env = env | {"PATH": fake_tools["PATH"]}
             result = subprocess.run([str(staged_backend), "apply-plan", "--plan", str(plan_path),
@@ -854,6 +883,12 @@ class InstallerBackendCoreTests(unittest.TestCase):
 
         installed, value = run_for(self.s.root / "model-success", expect_success=True)
         self.assertEqual((installed.returncode, value["state"]), (0, "committed"))
+        tampered, value = run_for(self.s.root / "model-catalog-tampered",
+                                  expect_success=False, tamper_catalog=True)
+        self.assertEqual(tampered.returncode, 2)
+        self.assertEqual(value["error"]["code"], "model.catalog.changed")
+        self.assertFalse((self.s.root / "model-catalog-tampered/data/studiocast/payloads").exists())
+        self.assertFalse((self.s.root / "model-catalog-tampered/cache/studiocast/builds").exists())
         artifact_path.unlink()
         degraded, value = run_for(self.s.root / "model-missing", expect_success=False)
         self.assertEqual((degraded.returncode, value["state"], value["core_committed"]),

@@ -182,6 +182,16 @@ if len(defaults) != 7:
     raise SystemExit(f"packaged catalog has {len(defaults)} default packs, expected 7")
 if sum(len(pack["artifacts"]) for pack in defaults) != 8:
     raise SystemExit("packaged default catalog does not contain exactly 8 artifacts")
+if summary.get("size_metadata", {}).get("trusted") is not True:
+    raise SystemExit("packaged default catalog does not have trusted artifact sizes")
+if not summary.get("size_metadata", {}).get("reason_code"):
+    raise SystemExit("packaged default catalog has no trusted-size evidence reason")
+for pack in defaults:
+    for artifact in pack["artifacts"]:
+        if (type(artifact.get("size_bytes")) is not int or
+                artifact["size_bytes"] <= 0 or
+                artifact.get("size_status") != "known"):
+            raise SystemExit("packaged default catalog has incomplete trusted artifact sizes")
 PY
 
   local forbidden

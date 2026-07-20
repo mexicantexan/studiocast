@@ -1300,6 +1300,7 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         present = all((root / artifact["name"]).is_file() for artifact in artifacts)
         verified = all((root / artifact["name"]).is_file() and
                        not (root / artifact["name"]).is_symlink() and
+                       (root / artifact["name"]).stat().st_size == artifact["size_bytes"] and
                        file_sha256(root / artifact["name"]) == "sha256:" + artifact["sha256"]
                        for artifact in artifacts)
         integrity = "verified" if verified else "corrupt" if present else "absent"
@@ -1650,7 +1651,26 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
     if not facts.get("os", {}).get("supported", False):
         blockers.append({"code": "os.unsupported.automatic_changes_blocked", "applies_to": "installation"})
     free = facts.get("paths", {}).get("free_bytes", 0)
-    required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
+    base_required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
+    model_download_bytes = 0
+    try:
+        _, model_catalog, _, _ = load_model_catalog()
+        catalog_packs = {pack["id"]: pack for pack in model_catalog["packs"]}
+        selected_packs = [catalog_packs[pack_id] for pack_id in selections["model_pack_ids"]]
+        sizes_trusted = (model_catalog["size_metadata"]["trusted"] and
+                         bool(model_catalog["size_metadata"]["reason_code"]) and
+                         all(type(artifact["size_bytes"]) is int and artifact["size_bytes"] > 0 and
+                             artifact["size_status"] == "known"
+                             for pack in selected_packs for artifact in pack["artifacts"]))
+        if sizes_trusted:
+            model_download_bytes = sum(artifact["size_bytes"] for pack in selected_packs
+                                       for artifact in pack["artifacts"])
+        elif route == "recommended" and selections["model_pack_ids"]:
+            blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
+    except (KeyError, BackendError):
+        if route == "recommended" and selections["model_pack_ids"]:
+            blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
+    required = base_required + model_download_bytes
     if free < required:
         blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths"})
     if detected_route == "offline" and route == "recommended":
@@ -1686,6 +1706,8 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         "intent": intent, "route": detected_route if route == "recommended" else route,
         "selection_route": route,
         "primary_action": primary, "selections": selections,
+        "disk": {"free_bytes": free, "base_required_bytes": base_required,
+                 "download_bytes": model_download_bytes, "required_bytes": required},
         "reasons": reasons, "blockers": blockers, "warnings": warnings,
         "alternatives": [{"code": "route.custom", "action": "customize"}]}
 
@@ -2006,7 +2028,9 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     if (intent != "uninstall" and rec.get("selection_route", rec["route"]) == "recommended" and
             desired.get("model_pack_ids") and
             (not model_catalog.get("size_metadata", {}).get("trusted", False) or
-             any(type(artifact.get("size_bytes")) is not int
+             not model_catalog.get("size_metadata", {}).get("reason_code") or
+             any(type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] <= 0 or
+                 artifact.get("size_status") != "known"
                  for pack_id in desired["model_pack_ids"]
                  for artifact in model_packs[pack_id]["artifacts"]))):
         blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
@@ -2098,6 +2122,35 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
         encoded = "/".join(urllib.parse.quote(part, safe="") for part in relative.split("/"))
         return base.rstrip("/") + "/" + encoded
 
+    downloads = ([{"artifact_id": "studiocast-source", "url": verified_release["archive_url"],
+        "size": verified_release["archive_size"], "sha256": verified_release["archive_sha256"],
+        "signature": verified_release["archive_signature"], "provenance": verified_release["provenance"],
+        "license": verified_release["license"], "cache_path": verified_release["archive_path"],
+        "destination": str(build_cache), "required_for_core": True}] if verified_release else []) + [
+        {"artifact_id": f"{pack_id}:{artifact['name']}", "pack_id": pack_id,
+         "filename": artifact["name"],
+         "url": reviewed_model_url(model_source, artifact["source_paths"][0]),
+         "source_base": model_source,
+         "source_paths": copy.deepcopy(artifact["source_paths"]),
+         "size": artifact["size_bytes"], "size_status": artifact["size_status"],
+         "sha256": "sha256:" + artifact["sha256"], "signature": None,
+         "provenance": copy.deepcopy(model_packs[pack_id]["provenance"]),
+         "license": copy.deepcopy(model_packs[pack_id]["license"]),
+         "cache_path": str(r["cache"] / "models/sha256" / artifact["sha256"]),
+         "destination": str(model_destination / model_packs[pack_id]["family"] /
+                            model_packs[pack_id]["pack_path"]),
+         "required_for_core": False}
+        for pack_id in ([] if intent == "uninstall" else desired.get("model_pack_ids", []))
+        for artifact in model_packs[pack_id]["artifacts"]]
+    base_required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
+    download_bytes = sum(item["size"] for item in downloads if type(item.get("size")) is int)
+    required_bytes = base_required + download_bytes
+    free_bytes = facts.get("paths", {}).get("free_bytes", 0)
+    blockers = [item for item in blockers if item.get("code") != "disk.staging.insufficient"]
+    if intent != "uninstall" and free_bytes < required_bytes:
+        blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths",
+                         "free_bytes": free_bytes, "required_bytes": required_bytes})
+
     plan = {"schema_version": 1, "plan_version": PLAN_VERSION, "policy_version": POLICY_VERSION,
         "plan_id": plan_id, "created_at": created, "expires_at": expires, "intent": intent,
         "route": rec.get("selection_route", rec["route"]),
@@ -2113,6 +2166,8 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                            "systemd_user": copy.deepcopy(facts.get("systemd_user", {})),
                            "v4l2": copy.deepcopy(facts.get("v4l2", {}))},
         "current_state": copy.deepcopy(facts.get("installation", {})), "desired_state": desired,
+        "disk": {"free_bytes": free_bytes, "base_required_bytes": base_required,
+                 "download_bytes": download_bytes, "required_bytes": required_bytes},
         "paths": {"build_cache": str(build_cache), "staging_payload": str(staging),
             "target_payload": str(target_payload), "current_link": str(current)},
         "source": ({"kind": "official_release", "path": source_path, "official": True,
@@ -2130,26 +2185,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
                      "release_page_url": verified_release["release_page_url"],
                      "installer_appimage": verified_release["installer_appimage"]}
                     if verified_release else None),
-        "downloads": ([{"artifact_id": "studiocast-source", "url": verified_release["archive_url"],
-            "size": verified_release["archive_size"], "sha256": verified_release["archive_sha256"],
-            "signature": verified_release["archive_signature"], "provenance": verified_release["provenance"],
-            "license": verified_release["license"], "cache_path": verified_release["archive_path"],
-            "destination": str(build_cache), "required_for_core": True}] if verified_release else []) +
-            [{"artifact_id": f"{pack_id}:{artifact['name']}", "pack_id": pack_id,
-              "filename": artifact["name"],
-              "url": reviewed_model_url(model_source, artifact["source_paths"][0]),
-              "source_base": model_source,
-              "source_paths": copy.deepcopy(artifact["source_paths"]),
-              "size": artifact["size_bytes"], "size_status": artifact["size_status"],
-              "sha256": "sha256:" + artifact["sha256"], "signature": None,
-              "provenance": copy.deepcopy(model_packs[pack_id]["provenance"]),
-              "license": copy.deepcopy(model_packs[pack_id]["license"]),
-              "cache_path": str(r["cache"] / "models/sha256" / artifact["sha256"]),
-              "destination": str(model_destination / model_packs[pack_id]["family"] /
-                                 model_packs[pack_id]["pack_path"]),
-              "required_for_core": False}
-             for pack_id in desired.get("model_pack_ids", [])
-             for artifact in model_packs[pack_id]["artifacts"]],
+        "downloads": downloads,
         "operations": ops, "preservation": preservation, "blockers": blockers, "warnings": warnings,
         "expected_validation": [{"code": "payload.binaries.executable"}, {"code": "manifest.atomic"}],
         "approval_token": uuid.uuid4().hex + uuid.uuid4().hex}
@@ -2872,7 +2908,7 @@ def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> Non
                 type(inputs.get("offline")) is not bool or
                 re.fullmatch(r"[A-Za-z0-9._-]{1,128}", str(artifact.get("filename", ""))) is None or
                 re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", ""))) is None or
-                type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] < 0):
+                type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] <= 0):
             raise BackendError("plan.operation_schema", "Release acquisition metadata is invalid")
         validate_mutation_path(Path(inputs["cache_dir"]), [roots()["cache"]])
         expected_source = Path(inputs["cache_dir"]) / artifact["filename"]
@@ -2956,6 +2992,74 @@ def validate_current_preconditions(plan: dict[str, Any]) -> None:
                                    "Trusted helper compatibility changed after review")
 
 
+def validate_model_plan_contract(plan: dict[str, Any]) -> None:
+    model_ops = [op for op in plan.get("operations", [])
+                 if op.get("kind") == "model_transaction"]
+    downloads = plan.get("downloads")
+    disk = plan.get("disk")
+    if not isinstance(downloads, list) or not isinstance(disk, dict):
+        raise BackendError("plan.operation_schema", "Reviewed download/disk contract is incomplete")
+    if any(type(item.get("size")) is not int or item["size"] <= 0
+           for item in downloads if isinstance(item, dict)):
+        raise BackendError("plan.operation_schema", "Reviewed downloads require positive exact sizes")
+    if any(not isinstance(item, dict) for item in downloads):
+        raise BackendError("plan.operation_schema", "Reviewed downloads must be objects")
+    download_bytes = sum(item["size"] for item in downloads)
+    required_fields = {"free_bytes", "base_required_bytes", "download_bytes", "required_bytes"}
+    if (set(disk) != required_fields or
+            any(type(disk.get(field)) is not int or disk[field] < 0 for field in required_fields) or
+            disk["download_bytes"] != download_bytes or
+            disk["required_bytes"] != disk["base_required_bytes"] + download_bytes):
+        raise BackendError("plan.operation_schema", "Reviewed disk totals do not match downloads")
+    if not model_ops:
+        if any("pack_id" in item for item in downloads):
+            raise BackendError("plan.operation_schema", "Model downloads have no reviewed transaction")
+        return
+
+    _, catalog, _, catalog_hash = load_model_catalog()
+    catalog_packs = {pack["id"]: pack for pack in catalog["packs"]}
+    inputs_by_id = {op["inputs"]["pack_id"]: op["inputs"] for op in model_ops}
+    desired_ids = plan.get("desired_state", {}).get("model_pack_ids")
+    if (not isinstance(desired_ids, list) or len(desired_ids) != len(set(desired_ids)) or
+            set(desired_ids) != set(inputs_by_id) or len(inputs_by_id) != len(model_ops)):
+        raise BackendError("model.catalog.changed", "Reviewed model selection is not canonical")
+    if (catalog["size_metadata"].get("trusted") is not True or
+            not catalog["size_metadata"].get("reason_code")):
+        raise BackendError("artifact_sizes_untrusted", "Packaged model sizes are not trusted")
+    expected_downloads: dict[str, dict[str, Any]] = {}
+    for pack_id in desired_ids:
+        current = catalog_packs.get(pack_id)
+        inputs = inputs_by_id[pack_id]
+        if (current is None or inputs.get("catalog_sha256") != catalog_hash or
+                inputs.get("catalog_version") != catalog["catalog_version"] or
+                canonical_bytes(inputs.get("pack")) != canonical_bytes(current) or
+                inputs.get("family") != current["family"]):
+            raise BackendError("model.catalog.changed",
+                               "Packaged model catalog differs from the reviewed plan")
+        for artifact in current["artifacts"]:
+            if (type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] <= 0 or
+                    artifact.get("size_status") != "known"):
+                raise BackendError("artifact_sizes_untrusted",
+                                   "Packaged model sizes are incomplete or inconsistent")
+            artifact_id = f"{pack_id}:{artifact['name']}"
+            expected_downloads[artifact_id] = {
+                "pack_id": pack_id, "filename": artifact["name"],
+                "size": artifact["size_bytes"], "size_status": "known",
+                "sha256": "sha256:" + artifact["sha256"],
+                "source_paths": artifact["source_paths"],
+            }
+    reviewed_model_downloads = {item.get("artifact_id"): item for item in downloads
+                                if "pack_id" in item}
+    if (len(reviewed_model_downloads) != len(expected_downloads) or
+            sum("pack_id" in item for item in downloads) != len(expected_downloads) or
+            set(reviewed_model_downloads) != set(expected_downloads)):
+        raise BackendError("model.catalog.changed", "Reviewed model downloads are incomplete")
+    for artifact_id, expected in expected_downloads.items():
+        reviewed = reviewed_model_downloads[artifact_id]
+        if any(reviewed.get(key) != value for key, value in expected.items()):
+            raise BackendError("model.catalog.changed", "Reviewed model download metadata changed")
+
+
 def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts: dict[str, Any] | None) -> None:
     if plan.get("schema_version") != 1 or plan.get("plan_version") != PLAN_VERSION or plan.get("policy_version") != POLICY_VERSION:
         raise BackendError("plan.unsupported_schema", "Unsupported plan schema or policy")
@@ -3003,6 +3107,7 @@ def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts:
                 raise BackendError("plan.unsafe_privilege", f"Unsafe privileged operation: {op.get('id')}")
         validate_operation_contract(plan, op)
         known.add(op_id)
+    validate_model_plan_contract(plan)
     pending["used"] = True
     atomic_write(pending_path(plan["plan_id"]), pending)
 

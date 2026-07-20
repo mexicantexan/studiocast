@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-07-12",
+  "catalog_version": "2026-07-19",
   "policy_version": 1,
   "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/main",
   "size_metadata": {
-    "trusted": false,
-    "reason_code": "artifact_sizes_pending_signed_release_metadata"
+    "trusted": true,
+    "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256"
   },
   "packs": [
     {
@@ -21,7 +21,7 @@
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "Upstream MIT license text is installed with the pack."},
       "provenance": {"project": "FastEnhancer", "url": "https://github.com/aask1357/fastenhancer", "release": "onnx-vd-v1.0.0"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_audio/fastenhancer_s_vd_v1/model.onnx", "fastenhancer_s_vd_v1/model.onnx"]}
+        {"name": "model.onnx", "sha256": "e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8", "size_bytes": 832775, "size_status": "known", "source_paths": ["open_audio/fastenhancer_s_vd_v1/model.onnx", "fastenhancer_s_vd_v1/model.onnx"]}
       ]
     },
     {
@@ -37,7 +37,7 @@
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "Upstream MIT license text is installed with the pack."},
       "provenance": {"project": "FastEnhancer", "url": "https://github.com/aask1357/fastenhancer", "release": "onnx-vd-v1.0.0"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_audio/fastenhancer_m_vd_v1/model.onnx", "fastenhancer_m_vd_v1/model.onnx"]}
+        {"name": "model.onnx", "sha256": "367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa", "size_bytes": 2033628, "size_status": "known", "source_paths": ["open_audio/fastenhancer_m_vd_v1/model.onnx", "fastenhancer_m_vd_v1/model.onnx"]}
       ]
     },
     {
@@ -53,7 +53,7 @@
       "license": {"spdx": "Apache-2.0", "redistribution": "permitted", "notes": "Upstream repository identifies the model as Apache-2.0."},
       "provenance": {"project": "MODNet WebNN", "url": "https://huggingface.co/onnx-community/modnet-webnn", "release": "catalog-pinned SHA-256"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/matting/Good Quality/model.onnx", "matting/Good Quality/model.onnx", "open_cuda/matting/Good Quality/model.onnx"]}
+        {"name": "model.onnx", "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9", "size_bytes": 25888640, "size_status": "known", "source_paths": ["open_video/matting/Good Quality/model.onnx", "matting/Good Quality/model.onnx", "open_cuda/matting/Good Quality/model.onnx"]}
       ]
     },
     {
@@ -69,7 +69,7 @@
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "OpenCV Zoo YuNet model; upstream MIT terms are summarized in LICENSE.txt."},
       "provenance": {"project": "OpenCV Zoo YuNet", "url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet", "release": "2023mar FP32"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/face_detection/Best Quality (YuNet FP32)/model.onnx", "face_detection/Best Quality (YuNet FP32)/model.onnx", "open_cuda/face_detection/Best Quality (YuNet FP32)/model.onnx"]}
+        {"name": "model.onnx", "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4", "size_bytes": 232589, "size_status": "known", "source_paths": ["open_video/face_detection/Best Quality (YuNet FP32)/model.onnx", "face_detection/Best Quality (YuNet FP32)/model.onnx", "open_cuda/face_detection/Best Quality (YuNet FP32)/model.onnx"]}
       ]
     },
     {
@@ -85,7 +85,7 @@
       "license": {"spdx": "LicenseRef-iBUG-300-W-NonCommercial", "redistribution": "restricted", "notes": "The training dataset excludes commercial use. Users must review the installed LICENSE.txt."},
       "provenance": {"project": "dlib 68-point predictor", "url": "https://dlib.net/face_landmark_detection.py.html", "release": "shape_predictor_68_face_landmarks"},
       "artifacts": [
-        {"name": "shape_predictor_68_face_landmarks.dat", "sha256": "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat", "face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat", "open_cuda/face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat"]}
+        {"name": "shape_predictor_68_face_landmarks.dat", "sha256": "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f", "size_bytes": 99693937, "size_status": "known", "source_paths": ["open_video/face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat", "face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat", "open_cuda/face_landmarks/Dlib 68 (iBUG 300-W)/shape_predictor_68_face_landmarks.dat"]}
       ]
     },
     {
@@ -101,8 +101,8 @@
       "license": {"spdx": "BSD-3-Clause", "redistribution": "permitted", "notes": "Depends on the separately licensed non-commercial dlib iBUG landmark pack."},
       "provenance": {"project": "gaze-correction-cam", "url": "https://github.com/WangWilly/gaze-correction-cam", "release": "FLX v0.1.1 FP32 export"},
       "artifacts": [
-        {"name": "gaze_flx_left.onnx", "sha256": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx"]},
-        {"name": "gaze_flx_right.onnx", "sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx"]}
+        {"name": "gaze_flx_left.onnx", "sha256": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00", "size_bytes": 1062936, "size_status": "known", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx"]},
+        {"name": "gaze_flx_right.onnx", "sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1", "size_bytes": 1062994, "size_status": "known", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx"]}
       ]
     },
     {
@@ -118,7 +118,7 @@
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "FastDVDnet MIT license summary and paper provenance are installed with the pack."},
       "provenance": {"project": "FastDVDnet", "url": "https://github.com/m-tassano/fastdvdnet", "release": "StudioCast-compatible ONNX export"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc", "size_bytes": null, "size_status": "unknown", "source_paths": ["open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "open_cuda/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx"]}
+        {"name": "model.onnx", "sha256": "500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc", "size_bytes": 416788, "size_status": "known", "source_paths": ["open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "open_cuda/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx"]}
       ]
     }
   ]
