@@ -184,6 +184,23 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           expected_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          git check-ref-format --branch "${DEFAULT_BRANCH}" >/dev/null
+          default_branch_ref="refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git fetch --no-tags --force origin \
+              "+refs/heads/${DEFAULT_BRANCH}:${default_branch_ref}"; then
+            echo "Could not fetch repository default branch: ${DEFAULT_BRANCH}" >&2
+            exit 2
+          fi
+          if ! git show-ref --verify --quiet "${default_branch_ref}"; then
+            echo "Remote default branch ref is unavailable: ${default_branch_ref}" >&2
+            exit 2
+          fi
+          default_branch_commit="$(git rev-parse --verify "${default_branch_ref}^{commit}")"
+          if ! git merge-base --is-ancestor \
+              "${expected_commit}" "${default_branch_commit}"; then
+            echo "Signing commit is not an ancestor of ${default_branch_ref}." >&2
+            exit 2
+          fi
           version="$(git show "${expected_commit}:VERSION" | tr -d '[:space:]')"
           [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
@@ -315,6 +332,10 @@ jobs:
           cmp \
             "${RELEASE_PUBLIC_KEY_PATH}" \
             "${extracted}/squashfs-root/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem"
+          embedded_source="${extracted}/squashfs-root/usr/share/studiocast/source/$(basename "${source_archive}")"
+          test -f "${embedded_source}"
+          test ! -L "${embedded_source}"
+          cmp "${source_archive}" "${embedded_source}"
 
           forbidden='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
           test -z "$(find "${extracted}/squashfs-root" -type f \

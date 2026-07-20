@@ -32,10 +32,13 @@ signing capability only through the protected `RELEASE_SIGNING_KEY_B64` secret;
 a shipped installer.
 
 GitHub stores `RELEASE_SIGNING_KEY_B64` only in the protected
-`release-signing` environment. That environment requires approval from reviewer
-`mexicantexan` and permits deployments only from branch `master` or tags matching
-`v*`. The non-secret `RELEASE_SIGNING_KEY_ID` remains a repository Actions
-variable.
+`release-signing` environment. That environment names `mexicantexan` as its
+required reviewer and permits deployments only from branch `master` or tags
+matching `v*`. Its current settings allow the workflow initiator to approve
+their own deployment (`prevent_self_review=false`) and allow administrators to
+bypass environment protection (`can_admins_bypass=true`), so review is not the
+only trust boundary. The non-secret `RELEASE_SIGNING_KEY_ID` remains a
+repository Actions variable.
 
 Release-grade AppImage packaging also requires each production public key
 explicitly:
@@ -204,9 +207,13 @@ signing variable or secret. It verifies and uploads an exact unsigned artifact
 set: AppImage, AppDir archive, source archive, and checksum file. A fresh signing
 job downloads those bytes, checks their exact names and checksums, binds the
 source archive's embedded `git archive` commit to the event commit, verifies the
-version/tag identity, and compares the AppDir's public key and staged source to
-the committed inputs before the protected environment secret is injected into
-the signing step.
+event commit is an ancestor of the fetched remote default branch, then checks
+the version/tag identity and compares the AppDir's public key and staged source
+to the committed inputs before the protected environment secret is injected
+into the signing step. A missing remote default-branch ref or failed ancestry
+check fails closed for both published releases and signed dry runs. This
+workflow check still runs when self-review or administrator bypass permits the
+protected job to start.
 
 Only the signing job references `RELEASE_SIGNING_KEY_B64` and the repository
 variable `RELEASE_SIGNING_KEY_ID=studiocast-release-2026`. It runs in the
@@ -228,10 +235,10 @@ matching GitHub Release.
 After the private-key file has been removed, CI verifies the detached manifest
 signature and both artifacts' signed size, SHA-256, filename, and Ed25519
 identity against the committed public key. It also extracts the final AppImage,
-compares its
-`usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem` bytes to
-the committed key, and rejects forbidden secret PEM markers in staged and
-uploaded release artifacts.
+byte-compares its embedded source archive to the verified standalone source,
+compares its `usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem`
+bytes to the committed key, and rejects forbidden secret PEM markers in staged
+and uploaded release artifacts.
 
 Key rotation must first ship the replacement public key in an installer signed
 by `studiocast-release-2026`. Release manifests may use the replacement key ID

@@ -223,16 +223,21 @@ Release packaging:
   `signing_dry_run` input is explicitly enabled on the repository default
   branch. Signed dispatch from another ref fails closed.
 - The signing job uses the protected `release-signing` environment, which
-  requires reviewer `mexicantexan` and permits branch `master` and tags matching
-  `v*`. `RELEASE_SIGNING_KEY_B64` exists only as an environment secret;
+  names reviewer `mexicantexan` and permits branch `master` and tags matching
+  `v*`. The current environment settings allow self-review and administrator
+  bypass, so human approval is not an unconditional barrier.
+  `RELEASE_SIGNING_KEY_B64` exists only as an environment secret;
   `RELEASE_SIGNING_KEY_ID` is the repository variable. The job downloads the
   unsigned artifact set, validates its exact names, checksums, source commit,
-  version/tag identity, staged source, and packaged public key before injecting
-  the secret into the signing step. It checks out signing code at the immutable
-  workflow commit, removes its ephemeral key before inspecting the built
-  AppImage, then hermetically verifies the manifest and both signed artifacts
-  against the committed public key. The workflow does not tag commits or publish
-  release assets by itself.
+  version/tag identity, staged source, and packaged public key, and requires the
+  event commit to be an ancestor of the fetched remote default branch before
+  injecting the secret into the signing step. Missing or non-ancestral refs fail
+  closed even when environment self-review or administrator bypass lets the job
+  start. It checks out signing code at the immutable workflow commit, removes
+  its ephemeral key before inspecting the built AppImage, then hermetically
+  verifies the manifest, both signed artifacts, and the AppImage's byte-identical
+  embedded source archive against the committed public key and verified source.
+  The workflow does not tag commits or publish release assets by itself.
 - Recommended remains a target-machine source build, but only after the backend
   verifies the signed stable manifest and source artifact signature/hash/size.
   `--official-source` is not proof. Local directories/archives remain
@@ -282,8 +287,11 @@ First release checklist:
 
 6. In GitHub, create and publish a Release for that tag. Publishing the Release
    triggers `.github/workflows/release-packaging.yml`.
-7. Approve the `release-signing` environment deployment after checking the tag
-   and workflow run identity.
+7. Review the `release-signing` environment deployment and, when GitHub presents
+   the gate, approve it after checking the tag and workflow run identity. The
+   environment currently allows self-review and administrator bypass; the
+   workflow's default-branch ancestry check remains mandatory after the job
+   starts.
 8. After release packaging finishes, download the
    `studiocast-gui-installer-ubuntu-22.04-signed` workflow artifact and attach
    the AppImage, AppDir archive, source archive, SHA256 file, release manifest,

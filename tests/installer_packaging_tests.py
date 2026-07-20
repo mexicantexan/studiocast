@@ -208,10 +208,28 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn(default_ref_gate, signing_job)
         self.assertIn("test \"${GITHUB_REF}\" = \"refs/tags/${RELEASE_TAG}\"", signing_job)
         self.assertIn("test \"${RELEASE_TAG}\" = \"v${version}\"", signing_job)
+        self.assertIn(
+            'default_branch_ref="refs/remotes/origin/${DEFAULT_BRANCH}"', signing_job
+        )
+        self.assertIn("git fetch --no-tags --force origin", signing_job)
+        self.assertIn('git show-ref --verify --quiet "${default_branch_ref}"', signing_job)
+        self.assertIn(
+            'git rev-parse --verify "${default_branch_ref}^{commit}"', signing_job
+        )
+        self.assertIn("git merge-base --is-ancestor", signing_job)
+        self.assertLess(
+            signing_job.index("git merge-base --is-ancestor"),
+            signing_job.index("secrets.RELEASE_SIGNING_KEY_B64"),
+        )
         self.assertIn("git get-tar-commit-id", signing_job)
         self.assertIn("sha256sum --check", signing_job)
         self.assertIn("packaging/release/release_tool.py", signing_job)
         self.assertIn("Hermetically verify signed release and packaged trust root", signing_job)
+        self.assertIn(
+            'embedded_source="${extracted}/squashfs-root/usr/share/studiocast/source/',
+            signing_job,
+        )
+        self.assertIn('cmp "${source_archive}" "${embedded_source}"', signing_job)
         self.assertIn("Upload signed release artifacts", signing_job)
         self.assertIn('test "${RELEASE_SIGNING_KEY_ID}" = "${RELEASE_PUBLIC_KEY_ID}"', workflow)
         self.assertIn("packaging/release/verify_signed_release.py", workflow)
@@ -221,6 +239,11 @@ class PackagingIntegrationTests(unittest.TestCase):
         key_readme = (ROOT / "packaging/release/keys/README.md").read_text(encoding="utf-8")
         self.assertIn(f"`{PRODUCTION_KEY_ID}.pem`", key_readme)
         self.assertNotIn("No production key has been supplied", key_readme)
+
+        release_docs = (ROOT / "docs/RELEASE_CHANNEL.md").read_text(encoding="utf-8")
+        self.assertIn("prevent_self_review=false", release_docs)
+        self.assertIn("can_admins_bypass=true", release_docs)
+        self.assertIn("ancestor of the fetched remote default branch", release_docs)
 
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
         self.assertIn('"${appimage}" --appimage-extract', verifier)
