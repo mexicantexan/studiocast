@@ -67,6 +67,9 @@ public:
   maxine::CUstream cuda_stream() const { return stream_; }
 
   const Config &config() const { return cfg_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
   void SetConfig(const Config &cfg);
 
 private:
@@ -105,6 +108,7 @@ private:
   maxine::NvCVImage *bound_output_ = nullptr;
   unsigned bound_width_ = 0;
   unsigned bound_height_ = 0;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects

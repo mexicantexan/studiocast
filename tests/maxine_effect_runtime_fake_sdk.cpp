@@ -10,11 +10,11 @@
 namespace {
 
 using studiocast::maxine::CUstream;
+using studiocast::maxine::NvCV_Status;
 using studiocast::maxine::NVCV_SUCCESS;
 using studiocast::maxine::NvCVImage;
 using studiocast::maxine::NvCVImage_ComponentType;
 using studiocast::maxine::NvCVImage_PixelFormat;
-using studiocast::maxine::NvCV_Status;
 
 constexpr std::size_t kCounterCount =
     static_cast<std::size_t>(FakeMaxineCounter::count);
@@ -24,6 +24,8 @@ std::atomic<bool> g_fail_vfx_run{false};
 std::atomic<bool> g_fail_ar_run{false};
 std::atomic<bool> g_fail_ar_set_stream{false};
 std::atomic<bool> g_fail_vfx_set_stream{false};
+std::atomic<bool> g_fail_nvcv_transfer{false};
+std::atomic<bool> g_fail_nvcv_composite{false};
 std::array<float, 64> g_boxes{};
 
 void Count(FakeMaxineCounter counter) {
@@ -100,6 +102,12 @@ extern "C" void StudioCastFakeMaxineFailNextArSetStream() {
 extern "C" void StudioCastFakeMaxineFailNextVfxSetStream() {
   g_fail_vfx_set_stream.store(true, std::memory_order_relaxed);
 }
+extern "C" void StudioCastFakeMaxineFailNextNvcvTransfer() {
+  g_fail_nvcv_transfer.store(true, std::memory_order_relaxed);
+}
+extern "C" void StudioCastFakeMaxineFailNextNvcvComposite() {
+  g_fail_nvcv_composite.store(true, std::memory_order_relaxed);
+}
 
 extern "C" NvCV_Status NvVFX_CreateEffect(const char *, void **handle) {
   Count(FakeMaxineCounter::vfx_create);
@@ -113,10 +121,13 @@ extern "C" NvCV_Status NvVFX_Load(void *) {
   Count(FakeMaxineCounter::vfx_load);
   return NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvVFX_Run(void *, int) {
+extern "C" NvCV_Status NvVFX_Run(void *, int async) {
   Count(FakeMaxineCounter::vfx_run);
-  return g_fail_vfx_run.exchange(false, std::memory_order_relaxed) ? -9
-                                                                  : NVCV_SUCCESS;
+  Count(async == 0 ? FakeMaxineCounter::vfx_run_sync
+                   : FakeMaxineCounter::vfx_run_async);
+  return g_fail_vfx_run.exchange(false, std::memory_order_relaxed)
+             ? -9
+             : NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvVFX_SetImage(void *, const char *, NvCVImage *) {
   Count(FakeMaxineCounter::vfx_set_image);
@@ -162,7 +173,7 @@ extern "C" NvCV_Status NvVFX_SetObject(void *, const char *, void *) {
   return NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvVFX_GetObject(void *, const char *, void **out,
-                                         unsigned long) {
+                                       unsigned long) {
   if (out)
     *out = nullptr;
   return NVCV_SUCCESS;
@@ -174,12 +185,9 @@ extern "C" NvCV_Status NvVFX_AllocateState(void *, void **state) {
 extern "C" NvCV_Status NvVFX_DeallocateState(void *, void *) {
   return NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvVFX_ResetState(void *, void *) {
-  return NVCV_SUCCESS;
-}
+extern "C" NvCV_Status NvVFX_ResetState(void *, void *) { return NVCV_SUCCESS; }
 extern "C" NvCV_Status NvVFX_SetStateObjectHandleArray(void *, const char *,
-                                                         void **,
-                                                         std::uint32_t) {
+                                                       void **, std::uint32_t) {
   Count(FakeMaxineCounter::vfx_set_state_array);
   return NVCV_SUCCESS;
 }
@@ -192,6 +200,7 @@ extern "C" void NvVFX_CudaStreamDestroy(CUstream) {
   Count(FakeMaxineCounter::vfx_stream_destroy);
 }
 extern "C" NvCV_Status NvVFX_CudaStreamSynchronize(CUstream) {
+  Count(FakeMaxineCounter::vfx_stream_synchronize);
   return NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvVFX_SetCudaStream(void *, const char *, CUstream) {
@@ -201,16 +210,17 @@ extern "C" NvCV_Status NvVFX_SetCudaStream(void *, const char *, CUstream) {
              : NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvVFX_GetCudaStream(void *, const char *,
-                                             CUstream *stream) {
+                                           CUstream *stream) {
   if (stream)
     *stream = nullptr;
   return NVCV_SUCCESS;
 }
 
-extern "C" NvCV_Status NvCVImage_Init(
-    NvCVImage *image, unsigned width, unsigned height, int pitch, void *pixels,
-    NvCVImage_PixelFormat format, NvCVImage_ComponentType type, unsigned layout,
-    unsigned mem_space) {
+extern "C" NvCV_Status NvCVImage_Init(NvCVImage *image, unsigned width,
+                                      unsigned height, int pitch, void *pixels,
+                                      NvCVImage_PixelFormat format,
+                                      NvCVImage_ComponentType type,
+                                      unsigned layout, unsigned mem_space) {
   if (!image)
     return -1;
   *image = {};
@@ -227,17 +237,17 @@ extern "C" NvCV_Status NvCVImage_Init(
   image->pixels = pixels;
   return NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvCVImage_Alloc(
-    NvCVImage *image, unsigned width, unsigned height,
-    NvCVImage_PixelFormat format, NvCVImage_ComponentType type, unsigned layout,
-    unsigned mem_space, unsigned) {
+extern "C" NvCV_Status
+NvCVImage_Alloc(NvCVImage *image, unsigned width, unsigned height,
+                NvCVImage_PixelFormat format, NvCVImage_ComponentType type,
+                unsigned layout, unsigned mem_space, unsigned) {
   Count(FakeMaxineCounter::nvcv_alloc);
   return AllocateImage(image, width, height, format, type, layout, mem_space);
 }
-extern "C" NvCV_Status NvCVImage_Realloc(
-    NvCVImage *image, unsigned width, unsigned height,
-    NvCVImage_PixelFormat format, NvCVImage_ComponentType type, unsigned layout,
-    unsigned mem_space, unsigned alignment) {
+extern "C" NvCV_Status
+NvCVImage_Realloc(NvCVImage *image, unsigned width, unsigned height,
+                  NvCVImage_PixelFormat format, NvCVImage_ComponentType type,
+                  unsigned layout, unsigned mem_space, unsigned alignment) {
   Count(FakeMaxineCounter::nvcv_realloc);
   if (image && image->pixels)
     std::free(image->pixels);
@@ -252,18 +262,25 @@ extern "C" NvCV_Status NvCVImage_Dealloc(NvCVImage *image) {
     *image = {};
   return NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvCVImage_Transfer(const NvCVImage *, NvCVImage *,
-                                            float, CUstream, NvCVImage *) {
-  return NVCV_SUCCESS;
+extern "C" NvCV_Status NvCVImage_Transfer(const NvCVImage *, NvCVImage *, float,
+                                          CUstream, NvCVImage *) {
+  Count(FakeMaxineCounter::nvcv_transfer);
+  return g_fail_nvcv_transfer.exchange(false, std::memory_order_relaxed)
+             ? -11
+             : NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvCVImage_Composite(const NvCVImage *,
-                                             const NvCVImage *,
-                                             const NvCVImage *, NvCVImage *,
-                                             CUstream) {
-  return NVCV_SUCCESS;
+extern "C" NvCV_Status NvCVImage_Composite(const NvCVImage *, const NvCVImage *,
+                                           const NvCVImage *, NvCVImage *,
+                                           CUstream) {
+  Count(FakeMaxineCounter::nvcv_composite);
+  return g_fail_nvcv_composite.exchange(false, std::memory_order_relaxed)
+             ? -12
+             : NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvCVImage_CompositeOverConstant(
-    const NvCVImage *, const NvCVImage *, const void *, NvCVImage *, CUstream) {
+extern "C" NvCV_Status NvCVImage_CompositeOverConstant(const NvCVImage *,
+                                                       const NvCVImage *,
+                                                       const void *,
+                                                       NvCVImage *, CUstream) {
   return NVCV_SUCCESS;
 }
 extern "C" const char *NvCV_GetErrorStringFromCode(NvCV_Status) {
@@ -281,8 +298,9 @@ extern "C" NvCV_Status NvAR_Load(void *) {
 }
 extern "C" NvCV_Status NvAR_Run(void *) {
   Count(FakeMaxineCounter::ar_run);
-  return g_fail_ar_run.exchange(false, std::memory_order_relaxed) ? -8
-                                                                  : NVCV_SUCCESS;
+  return g_fail_ar_run.exchange(false, std::memory_order_relaxed)
+             ? -8
+             : NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvAR_Destroy(void *) {
   Count(FakeMaxineCounter::ar_destroy);
@@ -309,7 +327,7 @@ extern "C" NvCV_Status NvAR_SetString(void *, const char *, const char *) {
   return NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvAR_SetObject(void *, const char *, void *,
-                                        unsigned long) {
+                                      unsigned long) {
   Count(FakeMaxineCounter::ar_set_object);
   return NVCV_SUCCESS;
 }
@@ -348,13 +366,13 @@ extern "C" NvCV_Status NvAR_GetString(void *, const char *, const char **out) {
   return NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvAR_GetObject(void *, const char *, void **out,
-                                        unsigned long) {
+                                      unsigned long) {
   if (out)
     *out = nullptr;
   return NVCV_SUCCESS;
 }
-extern "C" NvCV_Status NvAR_GetF32Array(void *, const char *,
-                                          const float **out, int *count) {
+extern "C" NvCV_Status NvAR_GetF32Array(void *, const char *, const float **out,
+                                        int *count) {
   if (out)
     *out = g_boxes.data();
   if (count)
@@ -377,7 +395,7 @@ extern "C" NvCV_Status NvAR_SetCudaStream(void *, const char *, CUstream) {
              : NVCV_SUCCESS;
 }
 extern "C" NvCV_Status NvAR_GetCudaStream(void *, const char *,
-                                            CUstream *stream) {
+                                          CUstream *stream) {
   if (stream)
     *stream = nullptr;
   return NVCV_SUCCESS;

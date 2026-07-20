@@ -283,10 +283,13 @@ NvCV_Status ArEyeContactEffect::Process(studiocast::video::GpuFrame &frame,
     bound_output_ = out;
   }
 
+  ++execution_telemetry_.synchronous_run_attempts;
   st = ar_->f().NvAR_Run(handle_);
   if (st != studiocast::maxine::NVCV_SUCCESS) {
     InvalidateBindings();
     *error = MakeStatusError(*ar_, "NvAR_Run", st);
+  } else {
+    ++execution_telemetry_.synchronous_run_successes;
   }
   return st;
 }

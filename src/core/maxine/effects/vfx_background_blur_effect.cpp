@@ -203,6 +203,7 @@ NvCV_Status VfxBackgroundBlurEffect::Process(studiocast::video::GpuFrame &frame,
     bound_output_ = &output_gpu_;
   }
 
+  ++execution_telemetry_.synchronous_run_attempts;
   s = f.NvVFX_Run(handle_, /*async=*/0);
   if (s != maxine::NVCV_SUCCESS) {
     InvalidateBindings();
@@ -210,6 +211,7 @@ NvCV_Status VfxBackgroundBlurEffect::Process(studiocast::video::GpuFrame &frame,
       *error = "NvVFX_Run failed: " + StatusToString(vfx_, nvcv_, s);
     return s;
   }
+  ++execution_telemetry_.synchronous_run_successes;
 
   output_ready_ = true;
   return s;
@@ -247,8 +249,8 @@ bool VfxBackgroundBlurEffect::EnsureEffectCreated(std::string *error) {
     s = f.NvVFX_CudaStreamCreate(&stream_);
     if (s != maxine::NVCV_SUCCESS || !stream_) {
       if (error)
-        *error = "NvVFX_CudaStreamCreate failed: " +
-                 StatusToString(vfx_, nvcv_, s);
+        *error =
+            "NvVFX_CudaStreamCreate failed: " + StatusToString(vfx_, nvcv_, s);
       Destroy();
       return false;
     }
@@ -327,8 +329,8 @@ bool VfxBackgroundBlurEffect::EnsureStreamBound(std::string *error) {
       handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
   if (status != maxine::NVCV_SUCCESS) {
     if (error)
-      *error = "NvVFX_SetCudaStream failed: " +
-               StatusToString(vfx_, nvcv_, status);
+      *error =
+          "NvVFX_SetCudaStream failed: " + StatusToString(vfx_, nvcv_, status);
     return false;
   }
   stream_bound_ = true;

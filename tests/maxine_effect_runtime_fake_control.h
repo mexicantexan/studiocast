@@ -17,9 +17,14 @@ enum class FakeMaxineCounter : std::size_t {
   vfx_stream_create,
   vfx_stream_destroy,
   vfx_set_stream,
+  vfx_run_sync,
+  vfx_run_async,
+  vfx_stream_synchronize,
   nvcv_alloc,
   nvcv_realloc,
   nvcv_dealloc,
+  nvcv_transfer,
+  nvcv_composite,
   ar_create,
   ar_destroy,
   ar_load,
@@ -35,9 +40,10 @@ enum class FakeMaxineCounter : std::size_t {
 };
 
 extern "C" void StudioCastFakeMaxineResetCounters();
-extern "C" std::uint64_t
-StudioCastFakeMaxineCounter(std::size_t counter_index);
+extern "C" std::uint64_t StudioCastFakeMaxineCounter(std::size_t counter_index);
 extern "C" void StudioCastFakeMaxineFailNextVfxRun();
 extern "C" void StudioCastFakeMaxineFailNextArRun();
 extern "C" void StudioCastFakeMaxineFailNextArSetStream();
 extern "C" void StudioCastFakeMaxineFailNextVfxSetStream();
+extern "C" void StudioCastFakeMaxineFailNextNvcvTransfer();
+extern "C" void StudioCastFakeMaxineFailNextNvcvComposite();

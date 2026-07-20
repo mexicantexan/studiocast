@@ -42,8 +42,7 @@ bool ArAutoFrameTracker::SetExternalCudaStream(
       *error_out = "External CUDA stream must be non-null.";
     return false;
   }
-  if (external_stream_ == stream &&
-      (!face_handle_ || face_stream_bound_) &&
+  if (external_stream_ == stream && (!face_handle_ || face_stream_bound_) &&
       (!body_handle_ || body_stream_bound_))
     return true;
   external_stream_ = stream;
@@ -360,6 +359,7 @@ bool ArAutoFrameTracker::RunAndExtractBestBox(NvAR_FeatureHandle handle,
     return false;
   }
 
+  ++execution_telemetry_.synchronous_run_attempts;
   auto st = ar_->f().NvAR_Run(handle);
   if (st != studiocast::maxine::NVCV_SUCCESS) {
     InvalidateBindings();
@@ -367,6 +367,7 @@ bool ArAutoFrameTracker::RunAndExtractBestBox(NvAR_FeatureHandle handle,
       *error_out = "NvAR_Run failed: " + ar_->StatusToString(st);
     return false;
   }
+  ++execution_telemetry_.synchronous_run_successes;
 
   uint32_t num = 0;
   if (!num_param_selector_.empty() && ar_->f().NvAR_GetU32) {

@@ -49,6 +49,9 @@ public:
   }
 
   maxine::CUstream cuda_stream() const { return stream_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
 
 private:
   bool EnsureEffectCreated(std::string *error);
@@ -88,6 +91,7 @@ private:
   void *state_device_ = nullptr;
   std::size_t state_bytes_ = 0;
   bool state_bound_ = false;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects
