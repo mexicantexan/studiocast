@@ -1110,6 +1110,31 @@ if (BUILD_TESTING)
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
 
+    add_executable(studiocast-open-audio-prepared-binding-tests
+            tests/open_audio_prepared_binding_tests.cpp
+    )
+
+    target_link_libraries(studiocast-open-audio-prepared-binding-tests PRIVATE
+            studiocast_core
+    )
+
+    target_include_directories(studiocast-open-audio-prepared-binding-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-open-audio-prepared-binding-tests)
+    studiocast_enable_sanitizers(studiocast-open-audio-prepared-binding-tests)
+
+    set_target_properties(studiocast-open-audio-prepared-binding-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-open-audio-prepared-binding-tests
+            COMMAND studiocast-open-audio-prepared-binding-tests)
+
     add_executable(studiocast-cuda-driver-api-tests
             tests/cuda_driver_api_tests.cpp
     )

@@ -1,6 +1,8 @@
 #include "core/onnx/ort_session.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdlib>
 #include <optional>
 #include <sstream>
@@ -851,36 +853,53 @@ struct OrtSession::Impl {
 #if STUDIOCAST_HAVE_ONNXRUNTIME
   std::unique_ptr<Ort::Session> session;
 
-  // CUDA-only (lazily created when RunCudaIoBinding is used).
-  std::unique_ptr<Ort::IoBinding> binding;
   std::optional<Ort::MemoryInfo> cuda_mem_info;
 
-  // Scratch space to avoid per-frame heap churn in real-time processing.
-  std::vector<const char *> scratch_input_names;
-  std::vector<const char *> scratch_output_names;
-  std::vector<Ort::Value> scratch_inputs;
-  std::vector<Ort::Value> scratch_outputs;
+  struct TensorContract {
+    std::string name;
+    const void *data = nullptr;
+    std::size_t num_floats = 0;
+    std::vector<int64_t> shape;
 
-  void ClearCpuRunScratch() noexcept {
-    scratch_input_names.clear();
-    scratch_output_names.clear();
-    scratch_inputs.clear();
-    scratch_outputs.clear();
-  }
-
-  void ClearCudaRunScratch() noexcept {
-    if (binding) {
-      try {
-        binding->ClearBoundInputs();
-        binding->ClearBoundOutputs();
-      } catch (...) {
-        // Best-effort cleanup only. The caller's run result/error remains the
-        // source of truth.
-      }
+    bool Matches(const char *candidate_name, const void *candidate_data,
+                 std::size_t candidate_num_floats,
+                 const int64_t *candidate_shape,
+                 std::size_t candidate_shape_rank) const {
+      return candidate_name && name == candidate_name &&
+             data == candidate_data && num_floats == candidate_num_floats &&
+             shape.size() == candidate_shape_rank && candidate_shape &&
+             std::equal(shape.begin(), shape.end(), candidate_shape);
     }
-    ClearCpuRunScratch();
-  }
+  };
+
+  struct PreparedCpuBinding {
+    const void *session_identity = nullptr;
+    std::string provider_identity;
+    std::vector<TensorContract> input_contracts;
+    std::vector<TensorContract> output_contracts;
+    std::vector<const char *> input_names;
+    std::vector<const char *> output_names;
+    std::vector<Ort::Value> input_values;
+    std::vector<Ort::Value> output_values;
+  };
+
+  struct PreparedCudaBinding {
+    const void *session_identity = nullptr;
+    std::string provider_identity;
+    std::vector<TensorContract> input_contracts;
+    std::vector<TensorContract> output_contracts;
+    std::vector<Ort::Value> input_values;
+    std::vector<Ort::Value> output_values;
+    std::unique_ptr<Ort::IoBinding> binding;
+  };
+
+  std::array<PreparedCpuBinding, OrtSession::kPreparedBindingSlots>
+      cpu_bindings;
+  std::array<PreparedCudaBinding, OrtSession::kPreparedBindingSlots>
+      cuda_bindings;
 #endif
+
+  OrtSession::PreparedRunStats prepared_run_stats;
 
   void LatchFailure(const std::string &err) {
     latched_failure = true;
@@ -888,13 +907,12 @@ struct OrtSession::Impl {
 
 #if STUDIOCAST_HAVE_ONNXRUNTIME
     // Best-effort cleanup to release allocations held by this session.
-    binding.reset();
-    session.reset();
+    for (auto &binding : cpu_bindings)
+      binding = PreparedCpuBinding{};
+    for (auto &binding : cuda_bindings)
+      binding = PreparedCudaBinding{};
     cuda_mem_info.reset();
-    scratch_input_names.clear();
-    scratch_output_names.clear();
-    scratch_inputs.clear();
-    scratch_outputs.clear();
+    session.reset();
 #endif
   }
 };
@@ -909,13 +927,38 @@ void OrtSession::ReserveRunScratch(std::size_t input_count,
 #if STUDIOCAST_HAVE_ONNXRUNTIME
   if (!impl_)
     return;
-  impl_->scratch_input_names.reserve(input_count);
-  impl_->scratch_output_names.reserve(output_count);
-  impl_->scratch_inputs.reserve(input_count);
-  impl_->scratch_outputs.reserve(output_count);
+  for (auto &binding : impl_->cpu_bindings) {
+    binding.input_contracts.reserve(input_count);
+    binding.output_contracts.reserve(output_count);
+    binding.input_names.reserve(input_count);
+    binding.output_names.reserve(output_count);
+    binding.input_values.reserve(input_count);
+    binding.output_values.reserve(output_count);
+  }
+  for (auto &binding : impl_->cuda_bindings) {
+    binding.input_contracts.reserve(input_count);
+    binding.output_contracts.reserve(output_count);
+    binding.input_values.reserve(input_count);
+    binding.output_values.reserve(output_count);
+  }
 #else
   (void)input_count;
   (void)output_count;
+#endif
+}
+
+OrtSession::PreparedRunStats OrtSession::prepared_run_stats() const {
+  return impl_ ? impl_->prepared_run_stats : PreparedRunStats{};
+}
+
+void OrtSession::InvalidatePreparedBindings() {
+#if STUDIOCAST_HAVE_ONNXRUNTIME
+  if (!impl_)
+    return;
+  for (auto &binding : impl_->cpu_bindings)
+    binding = Impl::PreparedCpuBinding{};
+  for (auto &binding : impl_->cuda_bindings)
+    binding = Impl::PreparedCudaBinding{};
 #endif
 }
 
@@ -1075,6 +1118,15 @@ OrtSession::Create(const std::filesystem::path &model_path,
 bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
                         const RunOutput *outputs, std::size_t output_count,
                         std::string *error) {
+  return RunCpuPrepared(0, inputs, input_count, outputs, output_count, error);
+}
+
+bool OrtSession::RunCpuPrepared(std::size_t binding_slot,
+                                const RunInput *inputs,
+                                std::size_t input_count,
+                                const RunOutput *outputs,
+                                std::size_t output_count,
+                                std::string *error) {
   if (error)
     error->clear();
 
@@ -1083,6 +1135,7 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
   (void)input_count;
   (void)outputs;
   (void)output_count;
+  (void)binding_slot;
   if (error) {
     *error = "ONNX Runtime is not available in this build "
              "(STUDIOCAST_HAVE_ONNXRUNTIME=0).";
@@ -1110,24 +1163,15 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
       *error = "ORT Run() requires at least one input and one output.";
     return false;
   }
+  if (binding_slot >= kPreparedBindingSlots) {
+    if (error)
+      *error = "ORT prepared CPU binding slot is out of range.";
+    return false;
+  }
 
   try {
-    impl_->ClearCpuRunScratch();
-    struct ScratchGuard {
-      Impl *impl = nullptr;
-      ~ScratchGuard() {
-        if (impl)
-          impl->ClearCpuRunScratch();
-      }
-    } scratch_guard{impl_.get()};
-
     static Ort::MemoryInfo mem_info =
         Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-
-    impl_->scratch_input_names.clear();
-    impl_->scratch_inputs.clear();
-    impl_->scratch_input_names.reserve(input_count);
-    impl_->scratch_inputs.reserve(input_count);
 
     for (std::size_t i = 0; i < input_count; ++i) {
       const auto &in = inputs[i];
@@ -1149,16 +1193,7 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
         return false;
       }
 
-      impl_->scratch_input_names.push_back(in.name);
-      impl_->scratch_inputs.emplace_back(Ort::Value::CreateTensor<float>(
-          mem_info, const_cast<float *>(in.data), in.num_floats, in.shape,
-          in.shape_rank));
     }
-
-    impl_->scratch_output_names.clear();
-    impl_->scratch_outputs.clear();
-    impl_->scratch_output_names.reserve(output_count);
-    impl_->scratch_outputs.reserve(output_count);
 
     for (std::size_t i = 0; i < output_count; ++i) {
       const auto &o = outputs[i];
@@ -1180,16 +1215,107 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
         return false;
       }
 
-      impl_->scratch_output_names.push_back(o.name);
-      impl_->scratch_outputs.emplace_back(Ort::Value::CreateTensor<float>(
-          mem_info, o.data, o.num_floats, o.shape, o.shape_rank));
+    }
+
+    auto &prepared = impl_->cpu_bindings[binding_slot];
+    const auto contracts_match = [&]() {
+      if (prepared.session_identity != impl_->session.get() ||
+          prepared.provider_identity != impl_->info.active_provider)
+        return false;
+      if (prepared.input_contracts.size() != input_count ||
+          prepared.output_contracts.size() != output_count)
+        return false;
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        if (!prepared.input_contracts[i].Matches(
+                in.name, in.data, in.num_floats, in.shape, in.shape_rank))
+          return false;
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        if (!prepared.output_contracts[i].Matches(
+                out.name, out.data, out.num_floats, out.shape,
+                out.shape_rank))
+          return false;
+      }
+      return true;
+    };
+
+    if (!contracts_match()) {
+      Impl::PreparedCpuBinding next;
+      std::uint64_t allocation_requests = 0;
+      const auto reserve = [&](auto &storage, std::size_t count) {
+        if (count > storage.capacity())
+          ++allocation_requests;
+        storage.reserve(count);
+      };
+      next.session_identity = impl_->session.get();
+      if (impl_->info.active_provider.size() >
+          next.provider_identity.capacity())
+        ++allocation_requests;
+      next.provider_identity = impl_->info.active_provider;
+      reserve(next.input_contracts, input_count);
+      reserve(next.output_contracts, output_count);
+      reserve(next.input_values, input_count);
+      reserve(next.output_values, output_count);
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(in.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = in.name;
+        contract.data = in.data;
+        contract.num_floats = in.num_floats;
+        if (in.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(in.shape, in.shape + in.shape_rank);
+        next.input_contracts.push_back(std::move(contract));
+        next.input_values.emplace_back(Ort::Value::CreateTensor<float>(
+            mem_info, const_cast<float *>(in.data), in.num_floats, in.shape,
+            in.shape_rank));
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(out.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = out.name;
+        contract.data = out.data;
+        contract.num_floats = out.num_floats;
+        if (out.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(out.shape, out.shape + out.shape_rank);
+        next.output_contracts.push_back(std::move(contract));
+        next.output_values.emplace_back(Ort::Value::CreateTensor<float>(
+            mem_info, out.data, out.num_floats, out.shape, out.shape_rank));
+      }
+      reserve(next.input_names, input_count);
+      reserve(next.output_names, output_count);
+
+      prepared = std::move(next);
+      // Rebuild name pointers from the moved-to owned strings; do not rely on
+      // allocator-specific vector move address preservation.
+      prepared.input_names.clear();
+      prepared.output_names.clear();
+      for (const auto &contract : prepared.input_contracts)
+        prepared.input_names.push_back(contract.name.c_str());
+      for (const auto &contract : prepared.output_contracts)
+        prepared.output_names.push_back(contract.name.c_str());
+      ++impl_->prepared_run_stats.binding_rebuilds;
+      impl_->prepared_run_stats.tensor_wrapper_constructions +=
+          input_count + output_count;
+      impl_->prepared_run_stats.application_binding_allocation_requests +=
+          allocation_requests;
+    } else {
+      ++impl_->prepared_run_stats.cache_hits;
     }
 
     impl_->session->Run(Ort::RunOptions{nullptr},
-                        impl_->scratch_input_names.data(),
-                        impl_->scratch_inputs.data(), input_count,
-                        impl_->scratch_output_names.data(),
-                        impl_->scratch_outputs.data(), output_count);
+                        prepared.input_names.data(),
+                        prepared.input_values.data(), input_count,
+                        prepared.output_names.data(),
+                        prepared.output_values.data(), output_count);
+    ++impl_->prepared_run_stats.runs;
     return true;
 
   } catch (const Ort::Exception &e) {
@@ -1218,6 +1344,14 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
                                   const CudaBindingOutput *outputs,
                                   std::size_t output_count,
                                   std::string *error) {
+  return RunCudaIoBindingPrepared(0, inputs, input_count, outputs,
+                                  output_count, error);
+}
+
+bool OrtSession::RunCudaIoBindingPrepared(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
   if (error)
     error->clear();
 
@@ -1226,6 +1360,7 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
   (void)input_count;
   (void)outputs;
   (void)output_count;
+  (void)binding_slot;
   if (error) {
     *error = "ONNX Runtime is not available in this build "
              "(STUDIOCAST_HAVE_ONNXRUNTIME=0).";
@@ -1258,30 +1393,18 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
           "ORT RunCudaIoBinding() requires at least one input and one output.";
     return false;
   }
+  if (binding_slot >= kPreparedBindingSlots) {
+    if (error)
+      *error = "ORT prepared CUDA binding slot is out of range.";
+    return false;
+  }
 
   try {
-    impl_->ClearCudaRunScratch();
-    struct ScratchGuard {
-      Impl *impl = nullptr;
-      ~ScratchGuard() {
-        if (impl)
-          impl->ClearCudaRunScratch();
-      }
-    } scratch_guard{impl_.get()};
-
-    if (!impl_->binding) {
-      impl_->binding = std::make_unique<Ort::IoBinding>(*impl_->session);
-    }
     if (!impl_->cuda_mem_info.has_value()) {
       impl_->cuda_mem_info.emplace("Cuda", OrtDeviceAllocator,
                                    impl_->opts.cuda_device_id,
                                    OrtMemTypeDefault);
     }
-
-    impl_->scratch_inputs.clear();
-    impl_->scratch_outputs.clear();
-    impl_->scratch_inputs.reserve(input_count);
-    impl_->scratch_outputs.reserve(output_count);
 
     for (std::size_t i = 0; i < input_count; ++i) {
       const auto &in = inputs[i];
@@ -1302,10 +1425,6 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
                    "' has empty shape.";
         return false;
       }
-
-      impl_->scratch_inputs.emplace_back(Ort::Value::CreateTensor<float>(
-          *impl_->cuda_mem_info, const_cast<float *>(in.device_ptr),
-          in.num_floats, in.shape, in.shape_rank));
     }
 
     for (std::size_t i = 0; i < output_count; ++i) {
@@ -1327,27 +1446,112 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
                    "' has empty shape.";
         return false;
       }
-
-      impl_->scratch_outputs.emplace_back(Ort::Value::CreateTensor<float>(
-          *impl_->cuda_mem_info, out.device_ptr, out.num_floats, out.shape,
-          out.shape_rank));
     }
 
-    for (std::size_t i = 0; i < input_count; ++i) {
-      impl_->binding->BindInput(inputs[i].name, impl_->scratch_inputs[i]);
-    }
-    for (std::size_t i = 0; i < output_count; ++i) {
-      impl_->binding->BindOutput(outputs[i].name, impl_->scratch_outputs[i]);
+    auto &prepared = impl_->cuda_bindings[binding_slot];
+    const auto contracts_match = [&]() {
+      if (prepared.session_identity != impl_->session.get() ||
+          prepared.provider_identity != impl_->info.active_provider)
+        return false;
+      if (prepared.input_contracts.size() != input_count ||
+          prepared.output_contracts.size() != output_count)
+        return false;
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        if (!prepared.input_contracts[i].Matches(
+                in.name, in.device_ptr, in.num_floats, in.shape,
+                in.shape_rank))
+          return false;
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        if (!prepared.output_contracts[i].Matches(
+                out.name, out.device_ptr, out.num_floats, out.shape,
+                out.shape_rank))
+          return false;
+      }
+      return true;
+    };
+
+    if (!contracts_match()) {
+      Impl::PreparedCudaBinding next;
+      std::uint64_t allocation_requests = 0;
+      const auto reserve = [&](auto &storage, std::size_t count) {
+        if (count > storage.capacity())
+          ++allocation_requests;
+        storage.reserve(count);
+      };
+      next.session_identity = impl_->session.get();
+      if (impl_->info.active_provider.size() >
+          next.provider_identity.capacity())
+        ++allocation_requests;
+      next.provider_identity = impl_->info.active_provider;
+      reserve(next.input_contracts, input_count);
+      reserve(next.output_contracts, output_count);
+      reserve(next.input_values, input_count);
+      reserve(next.output_values, output_count);
+      ++allocation_requests; // std::make_unique<Ort::IoBinding>
+      next.binding = std::make_unique<Ort::IoBinding>(*impl_->session);
+
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(in.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = in.name;
+        contract.data = in.device_ptr;
+        contract.num_floats = in.num_floats;
+        if (in.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(in.shape, in.shape + in.shape_rank);
+        next.input_contracts.push_back(std::move(contract));
+        next.input_values.emplace_back(Ort::Value::CreateTensor<float>(
+            *impl_->cuda_mem_info, const_cast<float *>(in.device_ptr),
+            in.num_floats, in.shape, in.shape_rank));
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(out.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = out.name;
+        contract.data = out.device_ptr;
+        contract.num_floats = out.num_floats;
+        if (out.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(out.shape, out.shape + out.shape_rank);
+        next.output_contracts.push_back(std::move(contract));
+        next.output_values.emplace_back(Ort::Value::CreateTensor<float>(
+            *impl_->cuda_mem_info, out.device_ptr, out.num_floats, out.shape,
+            out.shape_rank));
+      }
+      for (std::size_t i = 0; i < input_count; ++i)
+        next.binding->BindInput(next.input_contracts[i].name.c_str(),
+                                next.input_values[i]);
+      for (std::size_t i = 0; i < output_count; ++i)
+        next.binding->BindOutput(next.output_contracts[i].name.c_str(),
+                                 next.output_values[i]);
+
+      prepared = std::move(next);
+      ++impl_->prepared_run_stats.binding_rebuilds;
+      impl_->prepared_run_stats.tensor_wrapper_constructions +=
+          input_count + output_count;
+      ++impl_->prepared_run_stats.io_binding_constructions;
+      impl_->prepared_run_stats.application_binding_allocation_requests +=
+          allocation_requests;
+    } else {
+      ++impl_->prepared_run_stats.cache_hits;
     }
 
-    impl_->session->Run(Ort::RunOptions{nullptr}, *impl_->binding);
+    impl_->session->Run(Ort::RunOptions{nullptr}, *prepared.binding);
 
     if (impl_->info.cuda_needs_stream_sync) {
       // Ensure outputs are ready before downstream consumers access the GPU
       // buffers.
-      impl_->binding->SynchronizeOutputs();
+      prepared.binding->SynchronizeOutputs();
     }
 
+    ++impl_->prepared_run_stats.runs;
     return true;
 
   } catch (const Ort::Exception &e) {

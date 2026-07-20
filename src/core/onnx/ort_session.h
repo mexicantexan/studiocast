@@ -200,6 +200,18 @@ std::string HumanizeOrtError(const std::string &ort_msg,
 //   - Fall back to CPU if neither Maxine nor CUDA EP is available
 class OrtSession {
 public:
+  static constexpr std::size_t kPreparedBindingSlots = 2;
+
+  struct PreparedRunStats {
+    std::uint64_t runs = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t binding_rebuilds = 0;
+    std::uint64_t tensor_wrapper_constructions = 0;
+    std::uint64_t io_binding_constructions = 0;
+    // Allocation requests made by StudioCast-owned prepared-binding
+    // containers. This intentionally excludes opaque ORT allocator activity.
+    std::uint64_t application_binding_allocation_requests = 0;
+  };
   static OrtRuntimeInfo QueryRuntimeInfo();
 
   // Create an ORT session for the given model.
@@ -240,6 +252,16 @@ public:
               const RunOutput *outputs, std::size_t output_count,
               std::string *error);
 
+  // Run using one of two bounded prepared binding slots. A slot retains the
+  // external-buffer tensor wrappers until the session is destroyed or its
+  // provider/session/name/pointer/size/shape contract changes. Streaming
+  // callers with recurrent state should use one slot for each side of their
+  // state ping-pong. Caller-owned names, shapes, and buffers must remain valid
+  // until InvalidatePreparedBindings() is called or this session is destroyed.
+  bool RunCpuPrepared(std::size_t binding_slot, const RunInput *inputs,
+                      std::size_t input_count, const RunOutput *outputs,
+                      std::size_t output_count, std::string *error);
+
   struct CudaBindingInput {
     const char *name = nullptr;
     const float *device_ptr = nullptr;
@@ -263,12 +285,28 @@ public:
   // synchronize before/after this call so producer/consumer kernels see
   // consistent data.
   //
-  // The wrapper clears bound Ort::Value objects before returning, so caller
-  // owned device buffers only need to remain valid for the duration of this
-  // call and any required caller-side stream synchronization.
+  // This convenience API uses prepared slot 0. Caller-owned names, shapes, and
+  // buffers must remain valid until InvalidatePreparedBindings() is called or
+  // this session is destroyed.
   bool RunCudaIoBinding(const CudaBindingInput *inputs, std::size_t input_count,
                         const CudaBindingOutput *outputs,
                         std::size_t output_count, std::string *error);
+
+  // CUDA equivalent of RunCpuPrepared. The Ort::IoBinding and bound OrtValue
+  // objects remain intact across runs while the external device-buffer
+  // contract is unchanged.
+  bool RunCudaIoBindingPrepared(std::size_t binding_slot,
+                                const CudaBindingInput *inputs,
+                                std::size_t input_count,
+                                const CudaBindingOutput *outputs,
+                                std::size_t output_count, std::string *error);
+
+  // Release all retained CPU/CUDA tensor wrappers and IoBindings before a
+  // caller replaces or frees their backing storage. Rebuilding a session for a
+  // provider/model change naturally invalidates the old session's bindings.
+  void InvalidatePreparedBindings();
+
+  PreparedRunStats prepared_run_stats() const;
 
   // Returns true if the session has latched a fatal ORT failure (e.g., VRAM
   // OOM).
