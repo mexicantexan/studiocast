@@ -633,6 +633,7 @@ std::map<std::string, std::string> JsonStringishMap(const JsonObject &obj,
 
 struct EngineDiagnosticsSummary {
   bool present = false;
+  bool compiled_enabled = false;
   bool ok = false;
   bool supported = false;
   std::string summary;
@@ -650,14 +651,30 @@ struct EngineDiagnosticsSummary {
   bool cuda_context_available = false;
   int cuda_device_count = -1;
   bool runtime_library_found = false;
+  bool instance_created = false;
+  bool physical_device_found = false;
+  bool non_cpu_device_selected = false;
+  bool cpu_device_selected = false;
+  bool compute_queue_available = false;
   bool logical_device_created = false;
+  bool context_created = false;
+  bool context_healthy = false;
+  bool production_hardware_ready = false;
   bool shader_pipeline_created = false;
+  std::string context_failure_reason;
   std::uint32_t vendor_id = 0;
   std::uint32_t device_id = 0;
   std::string vendor_name;
   std::string device_name;
   std::string matting_runtime;
   std::string device_residency_mode;
+  bool mirror_production_ready = false;
+  std::string mirror_readiness_code;
+  std::string mirror_blocker_code;
+  bool vignette_fixed_center_production_ready = false;
+  std::string vignette_readiness_code;
+  std::string vignette_blocker_code;
+  std::string vignette_parameter_contract;
   std::string eye_contact_blocker_code;
   std::string eye_contact_detail;
   std::string video_noise_removal_blocker_code;
@@ -687,6 +704,7 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
     return out;
 
   out.present = true;
+  out.compiled_enabled = JsonBoolField(*obj, "compiled_enabled", false);
   out.ok = JsonBoolField(*obj, "ok", false);
   out.supported = JsonBoolField(*obj, "supported", out.ok);
   if (const std::string *s = JsonStringField(*obj, "summary"))
@@ -719,10 +737,24 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
       static_cast<int>(JsonNumberField(*obj, "cuda_device_count", -1.0));
   out.runtime_library_found =
       JsonBoolField(*obj, "runtime_library_found", false);
+  out.instance_created = JsonBoolField(*obj, "instance_created", false);
+  out.physical_device_found =
+      JsonBoolField(*obj, "physical_device_found", false);
+  out.non_cpu_device_selected =
+      JsonBoolField(*obj, "non_cpu_device_selected", false);
+  out.cpu_device_selected = JsonBoolField(*obj, "cpu_device_selected", false);
+  out.compute_queue_available =
+      JsonBoolField(*obj, "compute_queue_available", false);
   out.logical_device_created =
       JsonBoolField(*obj, "logical_device_created", false);
+  out.context_created = JsonBoolField(*obj, "context_created", false);
+  out.context_healthy = JsonBoolField(*obj, "context_healthy", false);
+  out.production_hardware_ready =
+      JsonBoolField(*obj, "production_hardware_ready", false);
   out.shader_pipeline_created =
       JsonBoolField(*obj, "shader_pipeline_created", false);
+  if (const std::string *s = JsonStringField(*obj, "context_failure_reason"))
+    out.context_failure_reason = *s;
   out.vendor_id =
       static_cast<std::uint32_t>(JsonNumberField(*obj, "vendor_id", 0.0));
   out.device_id =
@@ -735,6 +767,21 @@ ParseEngineDiagnosticsSummary(const std::string &json) {
     out.matting_runtime = *s;
   if (const std::string *s = JsonStringField(*obj, "device_residency_mode"))
     out.device_residency_mode = *s;
+  out.mirror_production_ready =
+      JsonBoolField(*obj, "mirror_production_ready", false);
+  if (const std::string *s = JsonStringField(*obj, "mirror_readiness_code"))
+    out.mirror_readiness_code = *s;
+  if (const std::string *s = JsonStringField(*obj, "mirror_blocker_code"))
+    out.mirror_blocker_code = *s;
+  out.vignette_fixed_center_production_ready =
+      JsonBoolField(*obj, "vignette_fixed_center_production_ready", false);
+  if (const std::string *s = JsonStringField(*obj, "vignette_readiness_code"))
+    out.vignette_readiness_code = *s;
+  if (const std::string *s = JsonStringField(*obj, "vignette_blocker_code"))
+    out.vignette_blocker_code = *s;
+  if (const std::string *s =
+          JsonStringField(*obj, "vignette_parameter_contract"))
+    out.vignette_parameter_contract = *s;
   if (const std::string *s =
           JsonStringField(*obj, "eye_contact_blocker_code"))
     out.eye_contact_blocker_code = *s;
@@ -805,11 +852,6 @@ std::string VideoEffectLabel(const std::string &id) {
   return id;
 }
 
-bool IsBuiltinVideoEffect(const std::string &id) {
-  using namespace studiocast::video::effects::contract;
-  return id == kEffectIdMirror || id == kEffectIdVignette;
-}
-
 bool IsOpenCudaModelReadinessEffect(const std::string &id) {
   using namespace studiocast::video::effects::contract;
   return id == kEffectIdVirtualBackgroundBlur ||
@@ -835,6 +877,129 @@ std::string RequestedVideoModelId(
   if (id == kEffectIdVideoNoiseRemoval)
     return fx.video_noise_removal.model_id;
   return {};
+}
+
+bool IsOpenVulkanBackend(const std::string &backend) {
+  return backend == "open_vulkan" || backend == "vulkan";
+}
+
+bool IsActiveCudaOrMaxineVignetteBackend(const std::string &backend) {
+  return backend == "cuda" || backend == "open_cuda" || backend == "maxine" ||
+         backend == "maxine_ar" || backend == "maxine_ar_cuda";
+}
+
+std::string ExactOpenVulkanEffectBlocker(const EngineDiagnosticsSummary &diag,
+                                         const std::string &id) {
+  using namespace studiocast::video::effects::contract;
+  if (id == kEffectIdMirror && !diag.mirror_blocker_code.empty())
+    return diag.mirror_blocker_code;
+  if (id == kEffectIdVignette && !diag.vignette_blocker_code.empty())
+    return diag.vignette_blocker_code;
+  const auto blocked = diag.blocked_effects.find(id);
+  return blocked == diag.blocked_effects.end() ? std::string{}
+                                               : blocked->second;
+}
+
+std::string
+OpenVulkanCommonProductionBlocker(const EngineDiagnosticsSummary &diag,
+                                  const std::string &id) {
+  if (!diag.present)
+    return "open_vulkan_runtime_diagnostics_unavailable";
+
+  const std::string exactBlocker = ExactOpenVulkanEffectBlocker(diag, id);
+  if (!diag.compiled_enabled)
+    return exactBlocker.empty() ? "open_vulkan_runtime_evidence_inconsistent"
+                                : exactBlocker;
+  if (!diag.runtime_library_found)
+    return exactBlocker.empty() ? "vulkan_runtime_not_found" : exactBlocker;
+  if (!diag.instance_created)
+    return "vulkan_instance_create_failed";
+  if (!diag.physical_device_found)
+    return exactBlocker.empty() ? "vulkan_no_physical_device" : exactBlocker;
+  if (diag.cpu_device_selected)
+    return "vulkan_only_cpu_devices_available";
+  if (!diag.non_cpu_device_selected)
+    return exactBlocker.empty() ? "vulkan_production_hardware_not_ready"
+                                : exactBlocker;
+  if (!diag.compute_queue_available)
+    return exactBlocker.empty() ? "vulkan_no_compute_queue" : exactBlocker;
+  if (!diag.logical_device_created)
+    return exactBlocker.empty() ? "vulkan_device_create_failed" : exactBlocker;
+  if (!diag.context_created)
+    return !diag.context_failure_reason.empty()
+               ? diag.context_failure_reason
+               : (exactBlocker.empty() ? "vulkan_context_uninitialized"
+                                       : exactBlocker);
+  if (!diag.context_healthy)
+    return !diag.context_failure_reason.empty()
+               ? diag.context_failure_reason
+               : (exactBlocker.empty() ? "vulkan_context_uninitialized"
+                                       : exactBlocker);
+  if (!diag.production_hardware_ready)
+    return exactBlocker.empty() ? "vulkan_production_hardware_not_ready"
+                                : exactBlocker;
+  if (!diag.shader_pipeline_created || !diag.ok)
+    return "open_vulkan_utility_kernels_unavailable";
+  return {};
+}
+
+struct OpenVulkanEffectEvidence {
+  bool ready = false;
+  std::string blocker;
+};
+
+OpenVulkanEffectEvidence EvaluateOpenVulkanPixelEffectEvidence(
+    const std::string &id,
+    const studiocast::video::effects::BroadcastCameraEffects &fx,
+    const EngineDiagnosticsSummary &diag) {
+  using namespace studiocast::video::effects::contract;
+
+  OpenVulkanEffectEvidence out;
+  out.blocker = OpenVulkanCommonProductionBlocker(diag, id);
+  if (!out.blocker.empty())
+    return out;
+
+  bool productionReady = false;
+  std::string readinessCode;
+  std::string expectedCode;
+  std::string inconsistentCode;
+  if (id == kEffectIdMirror) {
+    productionReady = diag.mirror_production_ready;
+    readinessCode = diag.mirror_readiness_code;
+    expectedCode = "open_vulkan_mirror_production_ready";
+    inconsistentCode = "open_vulkan_mirror_production_evidence_inconsistent";
+  } else if (id == kEffectIdVignette) {
+    if (fx.vignette.center_on_tracked_face && fx.auto_frame.enabled &&
+        diag.available_effects.count(std::string(kEffectIdAutoFrame)) != 0) {
+      out.blocker = "vulkan_vignette_tracked_center_not_supported";
+      return out;
+    }
+    if (diag.vignette_parameter_contract != "fixed_center") {
+      out.blocker = "open_vulkan_vignette_production_evidence_inconsistent";
+      return out;
+    }
+    productionReady = diag.vignette_fixed_center_production_ready;
+    readinessCode = diag.vignette_readiness_code;
+    expectedCode = "open_vulkan_vignette_fixed_center_production_ready";
+    inconsistentCode = "open_vulkan_vignette_production_evidence_inconsistent";
+  } else {
+    out.blocker = "open_vulkan_effect_evidence_not_defined";
+    return out;
+  }
+
+  if (!productionReady) {
+    out.blocker = ExactOpenVulkanEffectBlocker(diag, id);
+    if (out.blocker.empty())
+      out.blocker = inconsistentCode;
+    return out;
+  }
+  if (readinessCode != expectedCode || diag.available_effects.count(id) == 0) {
+    out.blocker = inconsistentCode;
+    return out;
+  }
+
+  out.ready = true;
+  return out;
 }
 
 std::string ConfiguredVirtualBackgroundEffectId(
@@ -1063,11 +1228,20 @@ std::string ChooseVideoEffectBackend(
   if (activeIt != activeBackends.end())
     return activeIt->second;
 
-  if (IsBuiltinVideoEffect(id))
-    return "builtin";
-
   if (computePreference == studiocast::video::ComputeBackendPreference::vulkan)
     return "open_vulkan";
+
+  using namespace studiocast::video::effects::contract;
+  if (id == kEffectIdMirror || id == kEffectIdVignette) {
+    if (computePreference == studiocast::video::ComputeBackendPreference::cpu) {
+      return "cpu";
+    }
+    if (computePreference ==
+        studiocast::video::ComputeBackendPreference::cuda) {
+      return "cuda";
+    }
+    return "auto";
+  }
 
   using studiocast::video::effects::EffectsEnginePreference;
   if (fx.engine == EffectsEnginePreference::maxine)
@@ -1103,7 +1277,8 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     const EngineDiagnosticsSummary &maxineDiag,
     const EngineDiagnosticsSummary &openCudaDiag,
     const EngineDiagnosticsSummary &openVulkanDiag,
-    studiocast::video::ComputeBackendPreference computePreference) {
+    studiocast::video::ComputeBackendPreference computePreference,
+    bool pipelineActive) {
   VideoEffectReadinessEntry out;
   out.id = id;
   out.backend =
@@ -1137,19 +1312,43 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
     return out;
   }
 
+  using namespace studiocast::video::effects::contract;
+  const bool hasActiveBackend = activeBackends.find(id) != activeBackends.end();
+  if (id == kEffectIdMirror && !IsOpenVulkanBackend(out.backend)) {
+    out.state = "backend_unavailable";
+    out.summary = label + " is unavailable.";
+    out.detail = "Mirror has no selectable live path on backend " +
+                 out.backend + ". Select the Open Vulkan compute backend.";
+    out.reason = out.backend == "cpu" ? "mirror_no_selectable_cpu_path"
+                                      : "mirror_no_live_backend_path";
+    return out;
+  }
+
+  if (id == kEffectIdVignette && !IsOpenVulkanBackend(out.backend)) {
+    if (hasActiveBackend && IsActiveCudaOrMaxineVignetteBackend(out.backend)) {
+      out.state = "ready";
+      out.summary = label + " is ready.";
+      return out;
+    }
+    out.state = "backend_unavailable";
+    out.summary = label + " is unavailable.";
+    out.detail = out.backend == "cpu"
+                     ? "Vignette has no selectable CPU live path."
+                     : "No active CUDA or Maxine vignette path is proven by "
+                       "the live pipeline.";
+    out.reason = out.backend == "cpu"
+                     ? "vignette_no_selectable_cpu_path"
+                     : "vignette_active_backend_evidence_missing";
+    return out;
+  }
+
   const EngineDiagnosticsSummary *diag = nullptr;
   if (out.backend == "maxine")
     diag = &maxineDiag;
   else if (out.backend == "open_cuda" || out.backend == "open_video")
     diag = &openCudaDiag;
-  else if (out.backend == "open_vulkan")
+  else if (IsOpenVulkanBackend(out.backend))
     diag = &openVulkanDiag;
-
-  if (out.backend == "builtin") {
-    out.state = "ready";
-    out.summary = label + " is ready.";
-    return out;
-  }
 
   if (!diag || !diag->present) {
     out.state = "unknown";
@@ -1158,6 +1357,32 @@ VideoEffectReadinessEntry BuildVideoEffectReadinessEntry(
                      ? "No effect backend diagnostics are available yet."
                      : out.backend + " diagnostics are not available yet.";
     out.reason = "diagnostics_unavailable";
+    return out;
+  }
+
+  if (IsOpenVulkanBackend(out.backend) &&
+      (id == kEffectIdMirror || id == kEffectIdVignette)) {
+    if (pipelineActive && !hasActiveBackend) {
+      out.state = "backend_unavailable";
+      out.summary = label + " is not active in the live pipeline.";
+      out.detail = "Exact Open Vulkan readiness exists, but the live pipeline "
+                   "did not publish this effect in effects_backends.";
+      out.reason = id == kEffectIdMirror
+                       ? "open_vulkan_mirror_live_stage_not_active"
+                       : "open_vulkan_vignette_live_stage_not_active";
+      return out;
+    }
+    const OpenVulkanEffectEvidence evidence =
+        EvaluateOpenVulkanPixelEffectEvidence(id, fx, *diag);
+    if (evidence.ready) {
+      out.state = "ready";
+      out.summary = label + " is ready.";
+      return out;
+    }
+    out.state = "backend_unavailable";
+    out.summary = label + " is blocked by the selected backend.";
+    out.detail = evidence.blocker;
+    out.reason = evidence.blocker;
     return out;
   }
 
@@ -1303,8 +1528,22 @@ std::string VideoEffectReadinessToJson(
       !st.pipeline.degraded_effect.effect_id.empty())
     ids.insert(st.pipeline.degraded_effect.effect_id);
 
-  const auto activeBackends =
-      ParseEffectBackendMap(st.pipeline.effects_backends);
+  auto activeBackends = ParseEffectBackendMap(st.pipeline.effects_backends);
+  const std::string vignetteId(
+      studiocast::video::effects::contract::kEffectIdVignette);
+  if (fx.vignette.enabled && activeBackends.count(vignetteId) == 0 &&
+      !plan.vignette_attach_to_effect_id.empty()) {
+    const auto attached =
+        activeBackends.find(plan.vignette_attach_to_effect_id);
+    if (attached != activeBackends.end() &&
+        (attached->second == "maxine" || attached->second == "maxine_ar" ||
+         attached->second == "maxine_ar_cuda")) {
+      // The live Maxine path applies its attached vignette in the same GPU
+      // stage. Inherit attribution only from that authoritative active map;
+      // an availability probe or configured preference is not enough.
+      activeBackends[vignetteId] = attached->second;
+    }
+  }
   const EngineDiagnosticsSummary maxineDiag =
       ParseEngineDiagnosticsSummary(maxineJson);
   const EngineDiagnosticsSummary openCudaDiag =
@@ -1318,7 +1557,8 @@ std::string VideoEffectReadinessToJson(
   for (const auto &id : ids) {
     const VideoEffectReadinessEntry entry = BuildVideoEffectReadinessEntry(
         id, fx, st.pipeline.degraded_effect, activeBackends, ruleDisabled,
-        maxineDiag, openCudaDiag, openVulkanDiag, cfg.pipeline.compute_backend);
+        maxineDiag, openCudaDiag, openVulkanDiag, cfg.pipeline.compute_backend,
+        st.pipeline.running || st.pipeline.starting);
     if (!first)
       oss << ",";
     first = false;
@@ -1341,24 +1581,7 @@ std::string VideoEffectReadinessToJson(
 bool VideoConfigRequestsCompute(
     const studiocast::video::effects::BroadcastCameraEffects &fx) {
   const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(fx);
-  const std::set<std::string> planned(plan.ordered_effect_ids.begin(),
-                                      plan.ordered_effect_ids.end());
-  const auto has = [&](std::string_view id) {
-    return planned.count(std::string(id)) != 0;
-  };
-  return has(studiocast::video::effects::contract::
-                 kEffectIdVideoNoiseRemoval) ||
-         has(studiocast::video::effects::contract::kEffectIdEyeContact) ||
-         has(studiocast::video::effects::contract::
-                 kEffectIdVirtualBackgroundBlur) ||
-         has(studiocast::video::effects::contract::
-                 kEffectIdVirtualBackgroundRemove) ||
-         has(studiocast::video::effects::contract::
-                 kEffectIdVirtualBackgroundReplace) ||
-         has(studiocast::video::effects::contract::kEffectIdAutoFrame) ||
-         has(studiocast::video::effects::contract::
-                 kEffectIdVirtualKeyLight) ||
-         has(studiocast::video::effects::contract::kEffectIdVignette);
+  return studiocast::video::effects::BroadcastEffectsPlanRequestsCompute(plan);
 }
 
 int ParseKeyLightTemperaturePreset(const std::string &raw, int fallback) {
@@ -1459,23 +1682,85 @@ std::string DiagnosticUnavailableReason(const EngineDiagnosticsSummary &diag) {
   return "diagnostics_unavailable";
 }
 
-std::string DiagnosticBlockedOrDegradedReason(
+std::string
+OpenVulkanRequestedEffectBlockerDetail(const std::string &id,
+                                       const std::string &blocker,
+                                       const EngineDiagnosticsSummary &diag) {
+  using namespace studiocast::video::effects::contract;
+  if (id == kEffectIdEyeContact && !diag.eye_contact_blocker_code.empty()) {
+    std::string detail =
+        "[" + blocker + "] [" + diag.eye_contact_blocker_code + "]";
+    if (!diag.eye_contact_detail.empty())
+      detail += " " + diag.eye_contact_detail;
+    return detail;
+  }
+  if (id == kEffectIdVideoNoiseRemoval &&
+      !diag.video_noise_removal_blocker_code.empty()) {
+    std::string detail =
+        "[" + blocker + "] [" + diag.video_noise_removal_blocker_code + "]";
+    if (!diag.video_noise_removal_detail.empty())
+      detail += " " + diag.video_noise_removal_detail;
+    return detail;
+  }
+  if (blocker == diag.blocked_reason && !diag.degraded_reason.empty())
+    return "[" + blocker + "] " + diag.degraded_reason;
+  return blocker;
+}
+
+struct RequestedOpenVulkanEvidence {
+  bool any_ready = false;
+  std::string first_ready_effect;
+  std::string first_blocker;
+};
+
+RequestedOpenVulkanEvidence EvaluateRequestedOpenVulkanEvidence(
+    const studiocast::video::effects::BroadcastCameraEffects &fx,
     const EngineDiagnosticsSummary &diag) {
-  if (!diag.present)
-    return {};
-  if (!diag.degraded_reason.empty())
-    return diag.degraded_reason;
-  if (!diag.fallback_reason.empty())
-    return diag.fallback_reason;
-  if (!diag.blocked_reason.empty())
-    return diag.blocked_reason;
-  if (!diag.blocked_effects.empty())
-    return diag.blocked_effects.begin()->second;
-  if (!diag.error.empty())
-    return diag.error;
-  if (!diag.summary.empty())
-    return diag.summary;
-  return {};
+  using namespace studiocast::video::effects::contract;
+  const auto plan = studiocast::video::effects::BuildBroadcastEffectsPlan(fx);
+  RequestedOpenVulkanEvidence out;
+  for (const std::string &id : plan.ordered_effect_ids) {
+    std::string blocker;
+    if (id == kEffectIdMirror || id == kEffectIdVignette) {
+      const OpenVulkanEffectEvidence evidence =
+          EvaluateOpenVulkanPixelEffectEvidence(id, fx, diag);
+      if (evidence.ready) {
+        out.any_ready = true;
+        if (out.first_ready_effect.empty())
+          out.first_ready_effect = id;
+        continue;
+      }
+      blocker = evidence.blocker;
+    } else {
+      const auto blocked = diag.blocked_effects.find(id);
+      if (blocked != diag.blocked_effects.end()) {
+        blocker = blocked->second;
+      } else if (diag.available_effects.count(id) != 0) {
+        out.any_ready = true;
+        if (out.first_ready_effect.empty())
+          out.first_ready_effect = id;
+        continue;
+      } else {
+        blocker = OpenVulkanCommonProductionBlocker(diag, id);
+        if (blocker.empty())
+          blocker = "open_vulkan_requested_effect_unavailable:" + id;
+      }
+    }
+    if (out.first_blocker.empty()) {
+      out.first_blocker =
+          OpenVulkanRequestedEffectBlockerDetail(id, blocker, diag);
+    }
+  }
+  return out;
+}
+
+std::string OpenVulkanLiveStageNotActiveReason(const std::string &effectId) {
+  using namespace studiocast::video::effects::contract;
+  if (effectId == kEffectIdMirror)
+    return "open_vulkan_mirror_live_stage_not_active";
+  if (effectId == kEffectIdVignette)
+    return "open_vulkan_vignette_live_stage_not_active";
+  return "open_vulkan_requested_effect_live_stage_not_active:" + effectId;
 }
 
 std::string NormalizeComputeEngineName(const std::string &backend) {
@@ -1484,11 +1769,27 @@ std::string NormalizeComputeEngineName(const std::string &backend) {
     return "open_cuda";
   if (backend == "vulkan" || backend == "open_vulkan")
     return "open_vulkan";
-  if (backend == "maxine")
+  if (backend == "maxine" || backend.rfind("maxine_", 0) == 0)
     return "maxine";
   if (backend == "cpu")
     return "cpu";
   return {};
+}
+
+std::string ActiveComputeBackendFromEffectMap(
+    const studiocast::video::CameraPipelineStatus &pipeline) {
+  const auto activeBackends = ParseEffectBackendMap(pipeline.effects_backends);
+  std::string candidate;
+  for (const auto &[_, backend] : activeBackends) {
+    const std::string normalized = NormalizeComputeEngineName(backend);
+    if (normalized == "open_vulkan")
+      return "vulkan";
+    if (normalized == "maxine")
+      candidate = "maxine";
+    else if (normalized == "open_cuda" && candidate.empty())
+      candidate = "cuda";
+  }
+  return candidate;
 }
 
 std::vector<std::string> ActiveComputeEngines(
@@ -1823,6 +2124,47 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
                                   : st.pipeline.compute_backend_active;
   std::string computeFallback = st.pipeline.compute_backend_fallback_reason;
   std::string computeDegraded = st.pipeline.compute_backend_degraded_reason;
+  const std::string mappedActive =
+      ActiveComputeBackendFromEffectMap(st.pipeline);
+  if (!mappedActive.empty()) {
+    // Per-effect runtime attribution is the most specific live evidence. It
+    // also repairs stale/default aggregate fields without guessing from a
+    // configured preference.
+    computeActive = mappedActive;
+    computeResolved = mappedActive == "maxine" ? "cuda" : mappedActive;
+    if ((cfg.pipeline.compute_backend ==
+             studiocast::video::ComputeBackendPreference::vulkan &&
+         mappedActive == "vulkan") ||
+        (cfg.pipeline.compute_backend ==
+             studiocast::video::ComputeBackendPreference::cuda &&
+         (mappedActive == "cuda" || mappedActive == "maxine"))) {
+      computeFallback.clear();
+      computeDegraded.clear();
+    }
+  } else if (computeRequested && !st.pipeline.running &&
+             !st.pipeline.starting && !st.pipeline_active_needed &&
+             cfg.pipeline.compute_backend ==
+                 studiocast::video::ComputeBackendPreference::vulkan) {
+    // A stopped pipeline has no active map. Preflight only the exact requested
+    // effects: one retained ready effect is enough to resolve Vulkan, while a
+    // blocked sibling remains blocked in effect_readiness.
+    const RequestedOpenVulkanEvidence evidence =
+        EvaluateRequestedOpenVulkanEvidence(cfg.pipeline.effects,
+                                            computeOpenVulkanDiag);
+    if (evidence.any_ready) {
+      computeResolved = "vulkan";
+      computeActive = "vulkan";
+      computeFallback.clear();
+      computeDegraded.clear();
+    } else if (!evidence.first_blocker.empty()) {
+      computeResolved = "cpu";
+      computeActive = "cpu";
+      if (computeFallback.empty())
+        computeFallback = evidence.first_blocker;
+      if (computeDegraded.empty())
+        computeDegraded = computeFallback;
+    }
+  }
   if (computeRequested && computeActive == "cpu") {
     if (cfg.pipeline.compute_backend ==
         studiocast::video::ComputeBackendPreference::cpu) {
@@ -1837,8 +2179,15 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
       computeResolved = "cpu";
       computeActive = "cpu";
       if (computeFallback.empty()) {
-        computeFallback =
-            DiagnosticBlockedOrDegradedReason(computeOpenVulkanDiag);
+        const RequestedOpenVulkanEvidence evidence =
+            EvaluateRequestedOpenVulkanEvidence(cfg.pipeline.effects,
+                                                computeOpenVulkanDiag);
+        if (evidence.any_ready && !evidence.first_ready_effect.empty()) {
+          computeFallback =
+              OpenVulkanLiveStageNotActiveReason(evidence.first_ready_effect);
+        } else {
+          computeFallback = evidence.first_blocker;
+        }
         if (computeFallback.empty()) {
           computeFallback =
               "Vulkan compute backend requested, but Vulkan compute is not "

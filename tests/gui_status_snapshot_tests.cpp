@@ -382,7 +382,8 @@ bool TestVideoEffectReadinessMissingModelWhileIdle() {
             "mirror":{
               "state":"ready",
               "summary":"Mirror is ready.",
-              "backend":"builtin"
+              "backend":"open_vulkan",
+              "reason":""
             }
           },
           "pipeline":{
@@ -429,7 +430,76 @@ bool TestVideoEffectReadinessMissingModelWhileIdle() {
          Expect(vb.reason == QStringLiteral("missing_model"),
                 "effect readiness reason should parse") &&
          Expect(mirror.state == studiocast::gui::ReadinessState::Ready,
-                "other effect readiness entries should parse");
+                "other effect readiness entries should parse") &&
+         Expect(mirror.backend == QStringLiteral("open_vulkan"),
+                "GUI snapshots must preserve authoritative Vulkan mirror "
+                "attribution");
+}
+
+bool TestVulkanPixelReadinessFailuresRemainFailClosed() {
+  const QString json = QStringLiteral(
+      R"({
+        "service_running":true,
+        "video":{
+          "enabled":true,
+          "virtual_device_present":true,
+          "virtual_device_available":true,
+          "consumer_present":false,
+          "consumer_count":0,
+          "effect_readiness":{
+            "mirror":{
+              "state":"backend_unavailable",
+              "summary":"Mirror is blocked by the selected backend.",
+              "backend":"open_vulkan",
+              "reason":"vulkan_instance_create_failed"
+            },
+            "vignette":{
+              "state":"backend_unavailable",
+              "summary":"Vignette is blocked by the selected backend.",
+              "backend":"open_vulkan",
+              "reason":"open_vulkan_utility_kernels_unavailable"
+            }
+          },
+          "pipeline":{
+            "running":false,
+            "starting":false,
+            "state":"idle_no_consumer",
+            "idle_reason":"No active virtual camera consumer."
+          }
+        },
+        "audio":{
+          "mic_present":true,
+          "source_error":"",
+          "pipeline":{"running":false,"starting":false,"last_error":""},
+          "speakers":{
+            "present":true,
+            "target_sink_error":"",
+            "routing_active":false,
+            "route_mode":"off",
+            "last_error":"",
+            "pipeline_last_error":""
+          }
+        }
+      })");
+
+  const auto s = studiocast::gui::DaemonStatusSnapshot::FromJson(json);
+  const auto mirror = s.videoEffectReadiness.value(QStringLiteral("mirror"));
+  const auto vignette =
+      s.videoEffectReadiness.value(QStringLiteral("vignette"));
+  return Expect(s.parsed, "Vulkan pixel failure payload should parse") &&
+         Expect(mirror.state ==
+                        studiocast::gui::ReadinessState::RecoverableError &&
+                    mirror.backend == QStringLiteral("open_vulkan") &&
+                    mirror.reason ==
+                        QStringLiteral("vulkan_instance_create_failed"),
+                "GUI must preserve the failed instance readiness reason") &&
+         Expect(vignette.state ==
+                        studiocast::gui::ReadinessState::RecoverableError &&
+                    vignette.backend == QStringLiteral("open_vulkan") &&
+                    vignette.reason ==
+                        QStringLiteral("open_vulkan_utility_kernels_"
+                                       "unavailable"),
+                "GUI must preserve diagnostics-ok failure readiness");
 }
 
 bool TestAudioEndpointActionReadinessFields() {
@@ -1815,6 +1885,7 @@ int main(int argc, char **argv) {
   ok = TestStatusJsonCompatibilityShapes() && ok;
   ok = TestNestedPipelineEffectsPlanAndRawEffectsPreservation() && ok;
   ok = TestVideoEffectReadinessMissingModelWhileIdle() && ok;
+  ok = TestVulkanPixelReadinessFailuresRemainFailClosed() && ok;
   ok = TestAudioEndpointActionReadinessFields() && ok;
   ok = TestEngineModelDetailsAndConfiguredSelections() && ok;
   ok = TestEnginesModelsPageShowsOpenCudaSetupFix() && ok;
