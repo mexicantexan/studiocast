@@ -8,6 +8,14 @@
 
 namespace studiocast::maxine::testing {
 
+enum class FakeResidentImageCorruption : uint8_t {
+  identity_key,
+  pixel_format,
+  component_type,
+  layout,
+  memory_space,
+};
+
 struct FakeResidentFrameCalls {
   uint64_t prepare = 0;
   uint64_t rgb_to_bgr = 0;
@@ -69,9 +77,10 @@ public:
   void FailMatte(ResidentBoundaryResult result) noexcept {
     matte_result_ = result;
   }
-  void FailStage(ResidentStageKind kind, ResidentBoundaryResult result) noexcept {
-    failing_stage_ = kind;
-    stage_failure_result_ = result;
+  void FailStage(ResidentStageKind kind,
+                 ResidentBoundaryResult result) noexcept {
+    if (kind < ResidentStageKind::count)
+      stage_results_[static_cast<std::size_t>(kind)] = result;
   }
   void FailDownload(ResidentBoundaryResult result) noexcept {
     download_result_ = result;
@@ -79,7 +88,12 @@ public:
   void FailSynchronize(ResidentBoundaryResult result) noexcept {
     synchronize_result_ = result;
   }
-  void CorruptNextStageOutput() noexcept { corrupt_next_stage_output_ = true; }
+  void CorruptNextStageOutput(
+      FakeResidentImageCorruption corruption =
+          FakeResidentImageCorruption::identity_key) noexcept {
+    next_stage_output_corruption_ = corruption;
+    corrupt_next_stage_output_ = true;
+  }
   void CorruptNextMatteOutput() noexcept { corrupt_next_matte_output_ = true; }
   void SetSyntheticWork(uint32_t iterations) noexcept {
     synthetic_work_iterations_ = iterations;
@@ -101,12 +115,14 @@ private:
   ResidentBoundaryResult rgb_to_bgr_result_ = ResidentBoundaryResult::success;
   ResidentBoundaryResult upload_result_ = ResidentBoundaryResult::success;
   ResidentBoundaryResult matte_result_ = ResidentBoundaryResult::success;
-  ResidentStageKind failing_stage_ = ResidentStageKind::count;
-  ResidentBoundaryResult stage_failure_result_ =
-      ResidentBoundaryResult::runtime_failure;
+  std::array<ResidentBoundaryResult,
+             static_cast<std::size_t>(ResidentStageKind::count)>
+      stage_results_{};
   ResidentBoundaryResult download_result_ = ResidentBoundaryResult::success;
   ResidentBoundaryResult synchronize_result_ = ResidentBoundaryResult::success;
   bool corrupt_next_stage_output_ = false;
+  FakeResidentImageCorruption next_stage_output_corruption_ =
+      FakeResidentImageCorruption::identity_key;
   bool corrupt_next_matte_output_ = false;
   uint32_t synthetic_work_iterations_ = 0;
   uint64_t work_sink_ = 0;

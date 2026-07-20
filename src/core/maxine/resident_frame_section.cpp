@@ -5,7 +5,8 @@
 namespace studiocast::maxine {
 namespace {
 
-bool ValidMatteImage(const NvCVImage *image, const ResidentFrameKey &key) noexcept {
+bool ValidMatteImage(const NvCVImage *image,
+                     const ResidentFrameKey &key) noexcept {
   if (!image)
     return false;
   NvCVImageValidationSpec spec{};
@@ -23,6 +24,26 @@ std::size_t StageIndex(ResidentStageKind kind) noexcept {
 
 std::size_t CpuTailIndex(CpuTailKind kind) noexcept {
   return static_cast<std::size_t>(kind);
+}
+
+void RecordStageFailure(ResidentFrameExecutionResult &result,
+                        std::size_t plan_stage_index,
+                        const ResidentStageSpec &stage,
+                        ResidentBoundaryResult boundary_result,
+                        ResidentStageFailurePoint point) noexcept {
+  const uint32_t bit = uint32_t{1} << plan_stage_index;
+  result.failed_plan_stage_mask |= bit;
+  if (stage.optional) {
+    result.optional_fail_open_plan_stage_mask |= bit;
+    result.optional_failure_observed = true;
+  }
+  if (boundary_result == ResidentBoundaryResult::incompatible_output)
+    result.incompatible_output_plan_stage_mask |= bit;
+
+  if (result.stage_failure_count < result.stage_failures.size()) {
+    result.stage_failures[result.stage_failure_count++] = ResidentStageFailure{
+        plan_stage_index, stage.kind, boundary_result, point, stage.optional};
+  }
 }
 
 } // namespace
@@ -43,8 +64,7 @@ bool HostRgbFrameView::ValidFor(const ResidentFrameKey &key) const noexcept {
 bool ResidentImage::ValidFor(const ResidentFrameKey &expected) const noexcept {
   if (!image || image_identity == 0 || key != expected)
     return false;
-  if (ValidateNvCVImage(*image, NvCVImageValidationSpec{}) !=
-      NvCVImageValidationStatus::ok)
+  if (ValidateBgrU8CudaNvCVImage(*image) != NvCVImageValidationStatus::ok)
     return false;
   return image->width == expected.width && image->height == expected.height;
 }
@@ -52,7 +72,8 @@ bool ResidentImage::ValidFor(const ResidentFrameKey &expected) const noexcept {
 bool ResidentMatte::ValidFor(const ResidentImage &source,
                              uint64_t expected_capture_sequence,
                              uint64_t expected_fingerprint) const noexcept {
-  return matte_identity != 0 && source_image_identity == source.image_identity &&
+  return matte_identity != 0 &&
+         source_image_identity == source.image_identity &&
          capture_sequence == expected_capture_sequence &&
          fingerprint == expected_fingerprint && key == source.key &&
          ValidMatteImage(image, source.key);
@@ -64,8 +85,8 @@ bool ResidentFramePlan::AddCompatible(ResidentStageKind kind, bool optional,
   if (has_cpu_tail || kind >= ResidentStageKind::count ||
       stage_count >= stages.size())
     return false;
-  stages[stage_count++] =
-      ResidentStageSpec{kind, optional, requires_shared_matte, matte_fingerprint};
+  stages[stage_count++] = ResidentStageSpec{
+      kind, optional, requires_shared_matte, matte_fingerprint};
   return true;
 }
 
@@ -223,6 +244,8 @@ ResidentFrameExecutionResult ResidentFrameSection::Execute(
         } else if (boundary == ResidentBoundaryResult::success) {
           result.boundary_result = ResidentBoundaryResult::incompatible_output;
           ++counters_.incompatible_outputs;
+        } else if (boundary == ResidentBoundaryResult::incompatible_output) {
+          ++counters_.incompatible_outputs;
         }
       } else if (stage.matte_fingerprint == matte_fingerprint &&
                  matte_available &&
@@ -236,9 +259,10 @@ ResidentFrameExecutionResult ResidentFrameSection::Execute(
       }
 
       if (!matte_available) {
+        RecordStageFailure(result, i, stage, result.boundary_result,
+                           ResidentStageFailurePoint::shared_matte);
         if (stage.optional) {
           ++counters_.optional_fail_open;
-          result.optional_failure_observed = true;
           result.resident_stages_consumed = i + 1;
           result.next_stage_index = i + 1;
           continue;
@@ -257,7 +281,8 @@ ResidentFrameExecutionResult ResidentFrameSection::Execute(
     boundary = executor.RunCompatibleStage(stage.kind, result.current, matte,
                                            candidate);
     result.boundary_result = boundary;
-    if (boundary == ResidentBoundaryResult::success && candidate.ValidFor(key)) {
+    if (boundary == ResidentBoundaryResult::success &&
+        candidate.ValidFor(key)) {
       ++counters_.stage_successes[stage_index];
       result.current = candidate;
       result.resident_stages_consumed = i + 1;
@@ -267,10 +292,13 @@ ResidentFrameExecutionResult ResidentFrameSection::Execute(
     if (boundary == ResidentBoundaryResult::success) {
       result.boundary_result = ResidentBoundaryResult::incompatible_output;
       ++counters_.incompatible_outputs;
+    } else if (boundary == ResidentBoundaryResult::incompatible_output) {
+      ++counters_.incompatible_outputs;
     }
+    RecordStageFailure(result, i, stage, result.boundary_result,
+                       ResidentStageFailurePoint::compatible_stage);
     if (stage.optional) {
       ++counters_.optional_fail_open;
-      result.optional_failure_observed = true;
       result.resident_stages_consumed = i + 1;
       result.next_stage_index = i + 1;
       continue;
@@ -308,13 +336,15 @@ ResidentFrameExecutionResult ResidentFrameSection::Execute(
   return result;
 }
 
-void ResidentFrameSection::Invalidate(ResidentInvalidationReason reason) noexcept {
+void ResidentFrameSection::Invalidate(
+    ResidentInvalidationReason reason) noexcept {
   ++counters_.explicit_invalidation_requests;
   if (reason >= ResidentInvalidationReason::count || !prepared_)
     return;
   ++counters_.invalidations;
   ++counters_.explicit_invalidations;
-  ++counters_.explicit_invalidations_by_reason[static_cast<std::size_t>(reason)];
+  ++counters_
+        .explicit_invalidations_by_reason[static_cast<std::size_t>(reason)];
   prepared_ = false;
   prepared_key_ = {};
 }
@@ -333,12 +363,18 @@ std::string_view ResidentStageKindName(ResidentStageKind kind) noexcept {
     return "eye_contact";
   case ResidentStageKind::background_blur:
     return "background_blur";
+  case ResidentStageKind::background_remove:
+    return "background_remove";
+  case ResidentStageKind::background_replace:
+    return "background_replace";
   case ResidentStageKind::relighting:
     return "relighting";
   case ResidentStageKind::transfer:
     return "transfer";
   case ResidentStageKind::auto_frame:
     return "auto_frame";
+  case ResidentStageKind::vignette:
+    return "vignette";
   case ResidentStageKind::count:
     break;
   }

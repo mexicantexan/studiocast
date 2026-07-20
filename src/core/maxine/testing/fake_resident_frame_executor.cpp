@@ -58,15 +58,17 @@ FakeResidentFrameExecutor::Prepare(const ResidentFrameKey &key) noexcept {
   return ResidentBoundaryResult::success;
 }
 
-ResidentBoundaryResult FakeResidentFrameExecutor::StageRgbToBgr(
-    const HostRgbFrameView &, const ResidentFrameKey &) noexcept {
+ResidentBoundaryResult
+FakeResidentFrameExecutor::StageRgbToBgr(const HostRgbFrameView &,
+                                         const ResidentFrameKey &) noexcept {
   ++calls_.rgb_to_bgr;
   DoSyntheticWork();
   return rgb_to_bgr_result_;
 }
 
-ResidentBoundaryResult FakeResidentFrameExecutor::UploadStagedBgr(
-    const ResidentFrameKey &, ResidentImage &output) noexcept {
+ResidentBoundaryResult
+FakeResidentFrameExecutor::UploadStagedBgr(const ResidentFrameKey &,
+                                           ResidentImage &output) noexcept {
   ++calls_.upload;
   DoSyntheticWork(2);
   if (upload_result_ != ResidentBoundaryResult::success)
@@ -85,8 +87,9 @@ ResidentBoundaryResult FakeResidentFrameExecutor::RunSharedMatte(
   DoSyntheticWork(3);
   if (matte_result_ != ResidentBoundaryResult::success)
     return matte_result_;
-  output = ResidentMatte{&matte_image_, next_identity_++, current.image_identity,
-                         capture_sequence, matte_fingerprint, current.key};
+  output =
+      ResidentMatte{&matte_image_,    next_identity_++,  current.image_identity,
+                    capture_sequence, matte_fingerprint, current.key};
   if (corrupt_next_matte_output_) {
     output.source_image_identity += 1;
     corrupt_next_matte_output_ = false;
@@ -95,8 +98,8 @@ ResidentBoundaryResult FakeResidentFrameExecutor::RunSharedMatte(
 }
 
 ResidentBoundaryResult FakeResidentFrameExecutor::RunCompatibleStage(
-    ResidentStageKind kind, const ResidentImage &current,
-    const ResidentMatte *, ResidentImage &output) noexcept {
+    ResidentStageKind kind, const ResidentImage &current, const ResidentMatte *,
+    ResidentImage &output) noexcept {
   const std::size_t index = calls_.stage_count;
   if (index < calls_.stage_input_identities.size()) {
     calls_.stage_input_identities[index] = current.image_identity;
@@ -104,11 +107,30 @@ ResidentBoundaryResult FakeResidentFrameExecutor::RunCompatibleStage(
   }
   ++calls_.stage_count;
   DoSyntheticWork(2);
-  if (kind == failing_stage_)
-    return stage_failure_result_;
+  if (kind >= ResidentStageKind::count)
+    return ResidentBoundaryResult::incompatible_output;
+  const auto configured_result = stage_results_[static_cast<std::size_t>(kind)];
+  if (configured_result != ResidentBoundaryResult::success)
+    return configured_result;
   output = NextImage();
   if (corrupt_next_stage_output_) {
-    output.key.stream_identity += 1;
+    switch (next_stage_output_corruption_) {
+    case FakeResidentImageCorruption::identity_key:
+      output.key.stream_identity += 1;
+      break;
+    case FakeResidentImageCorruption::pixel_format:
+      output.image->pixelFormat = NVCV_RGB;
+      break;
+    case FakeResidentImageCorruption::component_type:
+      output.image->componentType = NVCV_F32;
+      break;
+    case FakeResidentImageCorruption::layout:
+      output.image->planar = static_cast<uint8_t>(NVCV_PLANAR);
+      break;
+    case FakeResidentImageCorruption::memory_space:
+      output.image->gpuMem = static_cast<uint8_t>(NVCV_CPU);
+      break;
+    }
     corrupt_next_stage_output_ = false;
   }
   if (index < calls_.stage_output_identities.size())
@@ -116,16 +138,18 @@ ResidentBoundaryResult FakeResidentFrameExecutor::RunCompatibleStage(
   return ResidentBoundaryResult::success;
 }
 
-ResidentBoundaryResult FakeResidentFrameExecutor::DownloadToHost(
-    ResidentReadbackBoundary boundary, const ResidentImage &) noexcept {
+ResidentBoundaryResult
+FakeResidentFrameExecutor::DownloadToHost(ResidentReadbackBoundary boundary,
+                                          const ResidentImage &) noexcept {
   ++calls_.download;
   calls_.last_download_boundary = boundary;
   DoSyntheticWork(2);
   return download_result_;
 }
 
-ResidentBoundaryResult FakeResidentFrameExecutor::Synchronize(
-    ResidentReadbackBoundary boundary, const ResidentFrameKey &) noexcept {
+ResidentBoundaryResult
+FakeResidentFrameExecutor::Synchronize(ResidentReadbackBoundary boundary,
+                                       const ResidentFrameKey &) noexcept {
   ++calls_.synchronize;
   calls_.last_sync_boundary = boundary;
   DoSyntheticWork();
@@ -137,11 +161,11 @@ void FakeResidentFrameExecutor::ClearFailures() noexcept {
   rgb_to_bgr_result_ = ResidentBoundaryResult::success;
   upload_result_ = ResidentBoundaryResult::success;
   matte_result_ = ResidentBoundaryResult::success;
-  failing_stage_ = ResidentStageKind::count;
-  stage_failure_result_ = ResidentBoundaryResult::runtime_failure;
+  stage_results_.fill(ResidentBoundaryResult::success);
   download_result_ = ResidentBoundaryResult::success;
   synchronize_result_ = ResidentBoundaryResult::success;
   corrupt_next_stage_output_ = false;
+  next_stage_output_corruption_ = FakeResidentImageCorruption::identity_key;
   corrupt_next_matte_output_ = false;
 }
 

@@ -10,14 +10,19 @@
 namespace studiocast::maxine {
 
 inline constexpr std::size_t kMaxResidentFrameStages = 16;
+static_assert(kMaxResidentFrameStages <= 32,
+              "resident failure masks require at most 32 plan stages");
 
 enum class ResidentStageKind : uint8_t {
   denoise,
   eye_contact,
   background_blur,
+  background_remove,
+  background_replace,
   relighting,
   transfer,
   auto_frame,
+  vignette,
   count,
 };
 
@@ -64,8 +69,8 @@ struct ResidentFrameKey {
   uintptr_t stream_identity = 0;
 
   [[nodiscard]] bool Valid() const noexcept;
-  friend bool operator==(const ResidentFrameKey &, const ResidentFrameKey &) =
-      default;
+  friend bool operator==(const ResidentFrameKey &,
+                         const ResidentFrameKey &) = default;
 };
 
 struct HostRgbFrameView {
@@ -82,6 +87,10 @@ struct ResidentImage {
   uint64_t image_identity = 0;
   ResidentFrameKey key{};
 
+  // The public resident-frame contract has one canonical format: BGR, U8,
+  // three-component chunky pixels in GPU memory. Effects such as denoise may
+  // use prepared device-only format bridges internally, but must publish this
+  // canonical format before handing the frame to another resident stage.
   [[nodiscard]] bool ValidFor(const ResidentFrameKey &expected) const noexcept;
 };
 
@@ -126,17 +135,20 @@ public:
 
   // Production adapters bind every image operation to key.stream_identity and
   // must keep these hot methods allocation-free after Prepare succeeds.
-  virtual ResidentBoundaryResult Prepare(const ResidentFrameKey &key) noexcept = 0;
+  virtual ResidentBoundaryResult
+  Prepare(const ResidentFrameKey &key) noexcept = 0;
   virtual ResidentBoundaryResult
   StageRgbToBgr(const HostRgbFrameView &host,
                 const ResidentFrameKey &key) noexcept = 0;
   // This is the section's only CPU-to-GPU transfer boundary. A production
   // adapter wraps exactly one NvCV transfer on the prepared stream here.
   virtual ResidentBoundaryResult
-  UploadStagedBgr(const ResidentFrameKey &key, ResidentImage &output) noexcept = 0;
+  UploadStagedBgr(const ResidentFrameKey &key,
+                  ResidentImage &output) noexcept = 0;
   virtual ResidentBoundaryResult
   RunSharedMatte(const ResidentImage &current, uint64_t capture_sequence,
-                 uint64_t matte_fingerprint, ResidentMatte &output) noexcept = 0;
+                 uint64_t matte_fingerprint,
+                 ResidentMatte &output) noexcept = 0;
   // current is immutable. Adapters run into distinct prepared storage and only
   // publish output on success, which makes optional fail-open preserve current.
   virtual ResidentBoundaryResult
@@ -154,6 +166,10 @@ public:
 };
 
 struct ResidentFrameCounters {
+  // These counters describe section orchestration calls and results. They are
+  // useful for deterministic contract tests, but are not authoritative proof
+  // of production transfers or synchronization. Production executors must
+  // separately count immediately around the actual NvCV/CUDA/SDK ABI calls.
   uint64_t prepare_attempts = 0;
   uint64_t prepare_successes = 0;
   uint64_t invalidations = 0;
@@ -198,6 +214,20 @@ struct ResidentFrameCounters {
       cpu_tail_boundaries{};
 };
 
+enum class ResidentStageFailurePoint : uint8_t {
+  shared_matte,
+  compatible_stage,
+};
+
+struct ResidentStageFailure {
+  std::size_t plan_stage_index = 0;
+  ResidentStageKind kind = ResidentStageKind::denoise;
+  ResidentBoundaryResult boundary_result =
+      ResidentBoundaryResult::runtime_failure;
+  ResidentStageFailurePoint point = ResidentStageFailurePoint::compatible_stage;
+  bool optional = true;
+};
+
 struct ResidentFrameExecutionResult {
   ResidentExecutionStatus status = ResidentExecutionStatus::failed;
   ResidentBoundaryResult boundary_result =
@@ -211,6 +241,14 @@ struct ResidentFrameExecutionResult {
   std::size_t resident_stages_consumed = 0;
   std::size_t next_stage_index = 0;
   CpuTailKind cpu_tail = CpuTailKind::incompatible_stage;
+  // Masks use plan-stage indexes, not stage-kind ordinals. This preserves exact
+  // attribution even if a plan contains the same kind more than once.
+  uint32_t failed_plan_stage_mask = 0;
+  uint32_t optional_fail_open_plan_stage_mask = 0;
+  uint32_t incompatible_output_plan_stage_mask = 0;
+  std::array<ResidentStageFailure, kMaxResidentFrameStages> stage_failures{};
+  std::size_t stage_failure_count = 0;
+  // Compatibility summary. New callers should use the masks/records above.
   bool optional_failure_observed = false;
 };
 
@@ -233,20 +271,22 @@ public:
   void ResetSessionStateAndCounters() noexcept;
 
 private:
-  [[nodiscard]] bool EnsurePrepared(const ResidentFrameKey &key,
-                                    IResidentFrameExecutor &executor,
-                                    ResidentFrameExecutionResult &result) noexcept;
-  [[nodiscard]] bool ReadbackAndSynchronize(
-      ResidentReadbackBoundary boundary, const ResidentImage &current,
-      IResidentFrameExecutor &executor,
-      ResidentFrameExecutionResult &result) noexcept;
+  [[nodiscard]] bool
+  EnsurePrepared(const ResidentFrameKey &key, IResidentFrameExecutor &executor,
+                 ResidentFrameExecutionResult &result) noexcept;
+  [[nodiscard]] bool
+  ReadbackAndSynchronize(ResidentReadbackBoundary boundary,
+                         const ResidentImage &current,
+                         IResidentFrameExecutor &executor,
+                         ResidentFrameExecutionResult &result) noexcept;
 
   bool prepared_ = false;
   ResidentFrameKey prepared_key_{};
   ResidentFrameCounters counters_{};
 };
 
-[[nodiscard]] std::string_view ResidentStageKindName(ResidentStageKind kind) noexcept;
+[[nodiscard]] std::string_view
+ResidentStageKindName(ResidentStageKind kind) noexcept;
 [[nodiscard]] std::string_view CpuTailKindName(CpuTailKind kind) noexcept;
 
 } // namespace studiocast::maxine
