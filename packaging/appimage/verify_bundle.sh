@@ -9,6 +9,7 @@ ARCH="$(uname -m)"
 DIST_DIR="${REPO_ROOT}/dist/appimage"
 APPDIR=""
 REQUIRE_APPIMAGE=0
+TRUSTED_RELEASE_KEYS=()
 
 usage() {
   cat <<EOF
@@ -23,6 +24,9 @@ Options:
   --appdir DIR            Staged AppDir path. Defaults to the AppDir expected
                           under --dist-dir for VERSION and uname -m.
   --require-appimage      Require and verify the AppImage artifact.
+  --trusted-release-key ID=PATH
+                          Require this exact public key in the staged AppDir
+                          and final AppImage. May be repeated.
   --help                  Show this help.
 EOF
 }
@@ -226,6 +230,72 @@ verify_trust_roots() {
   if [[ "${required}" -eq 1 && "${count}" -eq 0 ]]; then
     die "release AppImage contains no production release trust root"
   fi
+}
+
+verify_expected_trust_roots() {
+  local appdir="$1"
+  shift
+  local trust_dir="${appdir}/usr/share/studiocast/installer/trust/keys"
+  local specification key_id key_path packaged_key
+  for specification in "$@"; do
+    [[ "${specification}" == *=* ]] ||
+      die "--trusted-release-key requires ID=PATH"
+    key_id="${specification%%=*}"
+    key_path="${specification#*=}"
+    [[ "${key_id}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] ||
+      die "invalid expected release key ID: ${key_id}"
+    require_file "${key_path}"
+    [[ ! -L "${key_path}" ]] ||
+      die "expected release public key may not be a symlink: ${key_path}"
+    packaged_key="${trust_dir}/${key_id}.pem"
+    require_file "${packaged_key}"
+    [[ ! -L "${packaged_key}" ]] ||
+      die "packaged release trust root may not be a symlink: ${packaged_key}"
+    cmp -s "${key_path}" "${packaged_key}" ||
+      die "packaged release trust root differs from expected key: ${key_id}"
+  done
+}
+
+secret_pem_pattern='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
+
+verify_no_secret_pem_in_tree() {
+  local root="$1"
+  local match
+  match="$(find "${root}" -type f -exec grep -IlE -- "${secret_pem_pattern}" {} + || true)"
+  [[ -z "${match}" ]] || die "forbidden secret PEM marker in staged artifact: ${match}"
+}
+
+verify_no_secret_pem_in_source_archive() {
+  local archive="$1"
+  if tar -xOf "${archive}" | grep -aE -- "${secret_pem_pattern}" >/dev/null; then
+    die "forbidden secret PEM marker in source archive"
+  fi
+}
+
+verify_no_secret_pem_in_dist_files() {
+  local dist_dir="$1"
+  local match
+  match="$(find "${dist_dir}" -maxdepth 1 -type f -exec grep -IlE -- \
+    "${secret_pem_pattern}" {} + || true)"
+  [[ -z "${match}" ]] || die "forbidden secret PEM marker in upload artifact: ${match}"
+}
+
+verify_final_appimage() {
+  local appimage
+  appimage="$(realpath -e -- "$1")"
+  shift
+  local temporary extracted
+  temporary="$(mktemp -d)"
+  if ! (cd "${temporary}" && APPIMAGE_EXTRACT_AND_RUN=1 \
+      "${appimage}" --appimage-extract >/dev/null); then
+    rm -rf -- "${temporary}"
+    die "could not extract final AppImage for trust-root verification"
+  fi
+  extracted="${temporary}/squashfs-root"
+  verify_trust_roots "${extracted}" 1
+  verify_expected_trust_roots "${extracted}" "$@"
+  verify_no_secret_pem_in_tree "${extracted}"
+  rm -rf -- "${temporary}"
 }
 
 verify_packaged_backend_layout() {
@@ -491,6 +561,11 @@ parse_args() {
         REQUIRE_APPIMAGE=1
         shift
         ;;
+      --trusted-release-key)
+        [[ $# -ge 2 ]] || die "--trusted-release-key requires ID=PATH"
+        TRUSTED_RELEASE_KEYS+=("$2")
+        shift 2
+        ;;
       --help|-h)
         usage
         exit 0
@@ -571,6 +646,13 @@ main() {
   verify_staged_metadata "${APPDIR}" "${VERSION}" "${source_archive_path}" \
     "${staged_source_archive}"
   verify_trust_roots "${APPDIR}" "${REQUIRE_APPIMAGE}"
+  verify_expected_trust_roots "${APPDIR}" "${TRUSTED_RELEASE_KEYS[@]}"
+  verify_no_secret_pem_in_tree "${APPDIR}"
+  verify_no_secret_pem_in_source_archive "${source_archive_path}"
+  verify_no_secret_pem_in_dist_files "${DIST_DIR}"
+  if [[ -f "${appimage_path}" ]]; then
+    verify_final_appimage "${appimage_path}" "${TRUSTED_RELEASE_KEYS[@]}"
+  fi
   verify_packaged_backend_layout "${APPDIR}"
   verify_source_archive_layout "${source_archive_path}" "${source_prefix}" \
     "${VERSION}"

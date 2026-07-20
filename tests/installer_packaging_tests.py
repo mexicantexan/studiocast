@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
+PRODUCTION_KEY_ID = "studiocast-release-2026"
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
@@ -152,13 +153,42 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn('PATTERN "LICENSE.txt"', cmake)
         for forbidden_pattern in ('PATTERN "*.onnx"', 'PATTERN "*.dat"', 'PATTERN "*.bin"'):
             self.assertNotIn(forbidden_pattern, cmake)
-        self.assertEqual([], list((ROOT / "packaging/release/keys").glob("*.pem")))
+        production_keys = list((ROOT / "packaging/release/keys").glob("*.pem"))
+        self.assertEqual(
+            [ROOT / f"packaging/release/keys/{PRODUCTION_KEY_ID}.pem"],
+            production_keys,
+        )
+        public_key_check = subprocess.run(
+            ["openssl", "pkey", "-pubin", "-in", str(production_keys[0]), "-text", "-noout"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(0, public_key_check.returncode, public_key_check.stderr)
+        self.assertIn("ED25519", public_key_check.stdout)
         self.assertNotIn("fixture-ed25519-public.pem", cmake)
         packaging_script = (ROOT / "packaging/appimage/build_appimage.sh").read_text(encoding="utf-8")
         self.assertIn("--trusted-release-key", packaging_script)
         self.assertNotIn("falling back to a working-tree tarball", packaging_script)
         self.assertNotIn("find \"${REPO_ROOT}\" \"${DIST_DIR}\"", packaging_script)
         self.assertIn("official bundles require a clean worktree", packaging_script)
+
+        workflow = (ROOT / ".github/workflows/release-packaging.yml").read_text(encoding="utf-8")
+        self.assertIn("signing_dry_run:", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn(f"RELEASE_PUBLIC_KEY_ID: {PRODUCTION_KEY_ID}", workflow)
+        self.assertIn(
+            f"RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/{PRODUCTION_KEY_ID}.pem",
+            workflow,
+        )
+        self.assertIn('test "${RELEASE_SIGNING_KEY_ID}" = "${RELEASE_PUBLIC_KEY_ID}"', workflow)
+        self.assertIn("packaging/release/verify_signed_release.py", workflow)
+        self.assertEqual(2, workflow.count("inputs.signing_dry_run"))
+        self.assertNotIn("if: github.event_name == 'release'\n", workflow)
+
+        verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
+        self.assertIn('"${appimage}" --appimage-extract', verifier)
+        self.assertIn("forbidden secret PEM marker", verifier)
 
         missing_key = subprocess.run(
             [str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run", "--appimage-required"],
@@ -258,7 +288,7 @@ class PackagingIntegrationTests(unittest.TestCase):
                           "--release-signature", str(self.fixture / "manifest.json.sig"),
                           "--release-archive", str(self.fixture / "source.tar.gz"), check=False, production=True)
         self.assertEqual(2, failed.returncode)
-        self.assertIn("release.signature.production_key_missing", failed.stderr)
+        self.assertIn("release.signature.unknown_key", failed.stderr)
 
     def test_manifest_signature_source_hash_and_receipt_tamper_fail(self) -> None:
         bad_signature = self.fixture / "bad.sig"; bad_signature.write_bytes(b"{}")

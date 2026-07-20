@@ -1029,8 +1029,8 @@ install(DIRECTORY resources/model_packs/
         PATTERN "LICENSE.txt"
 )
 
-# Production release engineering installs <key-id>.pem trust roots here.  No
-# production key is committed yet, so stable-channel verification fails closed.
+# Release packaging installs explicitly selected <key-id>.pem public trust roots
+# here; committed public keys are not staged unless the packaging command names them.
 install(FILES packaging/release/keys/README.md
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/trust/keys"
         COMPONENT Installer

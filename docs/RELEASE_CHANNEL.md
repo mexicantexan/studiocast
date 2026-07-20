@@ -22,11 +22,12 @@ changing transport does not change the pinned trust root. Production accepts
 HTTPS only. Tests can explicitly allow `file:` metadata and inject a transport;
 they never contact GitHub.
 
-There is deliberately no production private key in this repository. Before the
-first signed release, release engineering must provision an offline/HSM-backed
-Ed25519 private key as a protected CI secret and commit/package its public key
-under a stable key ID. Until that prerequisite is met, production consumers
-must report `release.signature.unknown_key` and stop. The key in
+There is deliberately no production signing secret in this repository. The
+stable trust root is the Ed25519 public key committed as
+`packaging/release/keys/studiocast-release-2026.pem` and packaged under the
+durable key ID `studiocast-release-2026`. CI must receive the corresponding
+signing capability only through the protected `RELEASE_SIGNING_KEY_B64` secret;
+`RELEASE_SIGNING_KEY_ID` must equal the packaged key ID. The key in
 `tests/data/installer_release` is visibly test-only and must never be trusted by
 a shipped installer.
 
@@ -35,7 +36,8 @@ explicitly:
 
 ```bash
 packaging/appimage/build_appimage.sh --appimage-required \
-  --trusted-release-key studiocast-release-2026=/run/release-public/studiocast-release-2026.pem
+  --trusted-release-key \
+  studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
 ```
 
 The packaging script validates that each input is a non-symlink Ed25519 public
@@ -192,11 +194,24 @@ python3 packaging/release/release_tool.py \
 ```
 
 For a published-release workflow, CI requires `RELEASE_SIGNING_KEY_B64` and the
-repository variable `RELEASE_SIGNING_KEY_ID`. The temporary private-key file is
-mode `0600` and removed by a shell trap. CI uploads the manifest and signature
-with the AppImage/source artifacts; a release maintainer must attach all of
-them to the matching GitHub Release. Workflow dispatch continues to build
-unsigned packaging artifacts unless signing is explicitly available.
+repository variable `RELEASE_SIGNING_KEY_ID=studiocast-release-2026`. The
+ephemeral signing input is mode `0600` and removed by a shell trap. CI uploads
+the manifest and signature with the AppImage/source artifacts; a release
+maintainer must attach all of them to the matching GitHub Release. Workflow
+dispatch builds unsigned packaging artifacts by default. Setting its explicit
+`signing_dry_run` boolean input performs the same signing and hermetic
+verification without publishing artifacts to a GitHub Release.
+
+After signing, CI verifies the detached manifest signature and both artifacts'
+signed size, SHA-256, and Ed25519 identity against the committed public key. It
+also extracts the final AppImage, compares its
+`usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem` bytes to
+the committed key, and rejects forbidden secret PEM markers in staged and
+uploaded release artifacts.
+
+Key rotation must first ship the replacement public key in an installer signed
+by `studiocast-release-2026`. Release manifests may use the replacement key ID
+only after that trusted installer is available.
 
 ## Verification
 
@@ -204,7 +219,9 @@ Hermetic coverage is in `tests/release_channel_tests.py`:
 
 ```bash
 python3 -m py_compile packaging/release/release_channel.py \
-  packaging/release/release_tool.py tests/release_channel_tests.py
+  packaging/release/release_tool.py \
+  packaging/release/verify_signed_release.py \
+  tests/release_channel_tests.py
 python3 tests/release_channel_tests.py
 ```
 

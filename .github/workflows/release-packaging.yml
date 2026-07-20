@@ -2,6 +2,12 @@ name: release packaging
 
 on:
   workflow_dispatch:
+    inputs:
+      signing_dry_run:
+        description: Generate and verify signed artifacts without publishing a Release
+        required: true
+        default: false
+        type: boolean
   release:
     types:
       - published
@@ -21,6 +27,9 @@ jobs:
   gui-installer-appimage:
     name: GUI installer AppImage (ubuntu-22.04)
     runs-on: ubuntu-22.04
+    env:
+      RELEASE_PUBLIC_KEY_ID: studiocast-release-2026
+      RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/studiocast-release-2026.pem
 
     steps:
       - name: Checkout
@@ -85,24 +94,27 @@ jobs:
           CXX: g++-12
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          packaging/appimage/build_appimage.sh --clean --appimage-required
-
-      - name: Verify GUI installer bundle
-        run: |
-          packaging/appimage/verify_bundle.sh --require-appimage
+          packaging/appimage/build_appimage.sh --clean --appimage-required \
+            --trusted-release-key \
+            "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
 
       - name: Generate signed stable release manifest
-        if: github.event_name == 'release'
+        if: >-
+          github.event_name == 'release' ||
+          (github.event_name == 'workflow_dispatch' && inputs.signing_dry_run)
         env:
           RELEASE_SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY_B64 }}
           RELEASE_SIGNING_KEY_ID: ${{ vars.RELEASE_SIGNING_KEY_ID }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          : "${RELEASE_SIGNING_KEY_B64:?Published releases require RELEASE_SIGNING_KEY_B64}"
-          : "${RELEASE_SIGNING_KEY_ID:?Published releases require RELEASE_SIGNING_KEY_ID}"
+          : "${RELEASE_SIGNING_KEY_B64:?Signed releases require RELEASE_SIGNING_KEY_B64}"
+          : "${RELEASE_SIGNING_KEY_ID:?Signed releases require RELEASE_SIGNING_KEY_ID}"
+          test "${RELEASE_SIGNING_KEY_ID}" = "${RELEASE_PUBLIC_KEY_ID}"
 
           version="$(tr -d '[:space:]' < VERSION)"
-          test "${RELEASE_TAG}" = "v${version}"
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            test "${RELEASE_TAG}" = "v${version}"
+          fi
           source_archive="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-${version}-source.tar.gz" -print -quit)"
           installer_appimage="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-Installer-${version}-*.AppImage" -print -quit)"
           test -n "${source_archive}"
@@ -127,6 +139,31 @@ jobs:
             --key-id "${RELEASE_SIGNING_KEY_ID}" \
             --output dist/appimage/studiocast-release-manifest.json \
             --signature-output dist/appimage/studiocast-release-manifest.json.sig
+
+      - name: Verify GUI installer bundle
+        run: |
+          packaging/appimage/verify_bundle.sh --require-appimage \
+            --trusted-release-key \
+            "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
+
+      - name: Verify signed stable release
+        if: >-
+          github.event_name == 'release' ||
+          (github.event_name == 'workflow_dispatch' && inputs.signing_dry_run)
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          source_archive="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-${version}-source.tar.gz" -print -quit)"
+          installer_appimage="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-Installer-${version}-*.AppImage" -print -quit)"
+          test -n "${source_archive}"
+          test -n "${installer_appimage}"
+
+          python3 packaging/release/verify_signed_release.py \
+            --manifest dist/appimage/studiocast-release-manifest.json \
+            --signature dist/appimage/studiocast-release-manifest.json.sig \
+            --source-archive "${source_archive}" \
+            --installer-appimage "${installer_appimage}" \
+            --public-key "${RELEASE_PUBLIC_KEY_PATH}" \
+            --key-id "${RELEASE_PUBLIC_KEY_ID}"
 
       - name: Upload release packaging artifacts
         uses: actions/upload-artifact@v4

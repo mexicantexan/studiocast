@@ -392,6 +392,45 @@ class ReleaseChannelTests(unittest.TestCase):
             )
             generated = rc.verify_manifest(output.read_bytes(), signature.read_bytes(), rc.TrustedKeyStore({"ephemeral-test": public}))
             rc.verify_artifact(source, generated["artifacts"]["source_archive"], rc.TrustedKeyStore({"ephemeral-test": public}))
+            verified = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "packaging/release/verify_signed_release.py"),
+                    "--manifest", str(output),
+                    "--signature", str(signature),
+                    "--source-archive", str(source),
+                    "--installer-appimage", str(appimage),
+                    "--public-key", str(public),
+                    "--key-id", "ephemeral-test",
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            verification = json.loads(verified.stdout)
+            self.assertEqual("ephemeral-test", verification["manifest_key_id"])
+            self.assertEqual("ephemeral-test", verification["artifacts"]["source_archive"]["key_id"])
+
+            wrong_identity = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "packaging/release/verify_signed_release.py"),
+                    "--manifest", str(output),
+                    "--signature", str(signature),
+                    "--source-archive", str(source),
+                    "--installer-appimage", str(appimage),
+                    "--public-key", str(public),
+                    "--key-id", "different-production-key",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(2, wrong_identity.returncode)
+            self.assertEqual(
+                "release.signature.key_id_mismatch",
+                json.loads(wrong_identity.stderr)["error"]["code"],
+            )
 
             output_before = output.read_bytes()
             signature_before = signature.read_bytes()

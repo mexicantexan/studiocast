@@ -196,9 +196,10 @@ Release packaging:
   installed path the GUI already probes relative to the installer binary.
 - The Installer component also stages `release/release_channel.py`, the strict
   manifest schema, and `trust/keys/`. Production public keys are named
-  `<key-id>.pem` in that trust root. No production key is committed yet, so a
-  production build fails closed until release engineering provisions one; test
-  keys are never copied there.
+  `<key-id>.pem` in that trust root. The initial stable key is committed as
+  `packaging/release/keys/studiocast-release-2026.pem`; test keys are never
+  copied there. Release-grade packaging must still pass the committed key
+  explicitly as `--trusted-release-key studiocast-release-2026=<path>`.
 - The same packaging script creates `StudioCast-<version>-source.tar.gz` from
   `HEAD` with `git archive` when available, stages it at
   `usr/share/studiocast/source/StudioCast-<version>-source.tar.gz`, and leaves
@@ -214,10 +215,13 @@ Release packaging:
 - Release CI is in `.github/workflows/release-packaging.yml`. It runs only from
   `workflow_dispatch` or a published GitHub Release event, downloads AppImage
   packaging tools from `packaging/appimage/tools.lock`, verifies each tool's
-  SHA256 before making it executable, requires AppImage generation, and uploads
-  the installer bundle, AppDir archive, source archive, and checksum file as
-  workflow artifacts. It does not tag commits or publish release assets by
-  itself.
+  SHA256 before making it executable, requires AppImage generation with the
+  committed public trust root, and uploads the installer bundle, AppDir archive,
+  source archive, and checksum file as workflow artifacts. Published releases
+  are signed; workflow dispatch is unsigned unless its `signing_dry_run` input
+  is explicitly enabled. Signed runs hermetically verify the manifest and both
+  artifacts against the committed public key. The workflow does not tag commits
+  or publish release assets by itself.
 - Recommended remains a target-machine source build, but only after the backend
   verifies the signed stable manifest and source artifact signature/hash/size.
   `--official-source` is not proof. Local directories/archives remain
@@ -291,7 +295,9 @@ packaging/appimage/build_appimage.sh --clean
 For release-equivalent local validation with preinstalled packaging tools:
 
 ```bash
-packaging/appimage/build_appimage.sh --clean --appimage-required
+packaging/appimage/build_appimage.sh --clean --appimage-required \
+  --trusted-release-key \
+  studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
 ```
 
 ## Daemon architecture
