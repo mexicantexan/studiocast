@@ -328,6 +328,8 @@ bool TestVideoComputeResolutionDoesNotImplyActivity() {
               "idle status should preserve an empty active backend") ||
       !Expect(idle.videoComputeActiveEngines.isEmpty(),
               "idle status should preserve empty active engines") ||
+      !Expect(idle.videoEffectsActiveBackends.isEmpty(),
+              "idle status must suppress stale effect backend attribution") ||
       !Expect(idle.videoComputeProviderMode.isEmpty() &&
                   idle.videoComputeActiveProvider.isEmpty(),
               "idle status should preserve an empty active provider") ||
@@ -392,19 +394,148 @@ bool TestVideoComputeResolutionDoesNotImplyActivity() {
   const auto active =
       studiocast::gui::DaemonStatusSnapshot::FromJson(activeJson);
   page.UpdateStatus(active);
-  return Expect(active.parsed &&
-                    active.videoComputeActiveBackend ==
-                        QStringLiteral("vulkan") &&
-                    active.videoComputeActiveProvider ==
-                        QStringLiteral("Vulkan"),
-                "running status should preserve authoritative Vulkan "
-                "activity") &&
+  return Expect(
+             active.parsed &&
+                 active.videoComputeActiveBackend == QStringLiteral("vulkan") &&
+                 active.videoComputeActiveProvider == QStringLiteral("Vulkan"),
+             "running status should preserve authoritative Vulkan "
+             "activity") &&
+         Expect(active.videoEffectsActiveBackends ==
+                    QStringLiteral("mirror:open_vulkan"),
+                "running status should preserve authoritative live effect "
+                "attribution") &&
          Expect(computeLabel->text() == QStringLiteral("Vulkan"),
                 "the Camera page should show Vulkan as active only for the "
                 "running active-map case") &&
-         Expect(computeLabel->toolTip().contains(
-                    QStringLiteral("Active: Vulkan")),
-                "the running compute tooltip should report active Vulkan");
+         Expect(
+             computeLabel->toolTip().contains(QStringLiteral("Active: Vulkan")),
+             "the running compute tooltip should report active Vulkan");
+}
+
+bool TestEffectBackendAttributionRequiresStructuredRunningEvidence() {
+  const auto snapshot = [](const QString &pipelineState,
+                           const QString &activeBackend,
+                           const QString &activeEngines,
+                           bool starting = false) {
+    const QString stateField =
+        pipelineState.isNull()
+            ? QString()
+            : QStringLiteral(",\"state\":\"%1\"").arg(pipelineState);
+    return studiocast::gui::DaemonStatusSnapshot::FromJson(
+        QStringLiteral(
+            R"({"service_running":true,"video":{"compute":{"active_backend":"%1","active_engines":%2},"video_effects":{"engine":"auto"},"pipeline":{"running":true,"starting":%3%4,"effects_backends":"mirror:open_vulkan"}},"audio":{}})")
+            .arg(activeBackend, activeEngines,
+                 starting ? QStringLiteral("true") : QStringLiteral("false"),
+                 stateField));
+  };
+
+  const auto missingState = snapshot(QString(), QStringLiteral("vulkan"),
+                                     QStringLiteral("[\"open_vulkan\"]"));
+  const auto emptyStructured =
+      snapshot(QStringLiteral("running"), QString(), QStringLiteral("[]"));
+  const auto cpuStructured =
+      snapshot(QStringLiteral("running"), QStringLiteral("cpu"),
+               QStringLiteral("[\"cpu\"]"));
+  const auto missingEngine =
+      snapshot(QStringLiteral("running"), QStringLiteral("vulkan"),
+               QStringLiteral("[]"));
+  const auto mismatchedEngine =
+      snapshot(QStringLiteral("running"), QStringLiteral("vulkan"),
+               QStringLiteral("[\"vulkan\"]"));
+  const auto authoritative =
+      snapshot(QStringLiteral("running"), QStringLiteral("vulkan"),
+               QStringLiteral("[\"open_vulkan\"]"));
+  const auto starting =
+      snapshot(QStringLiteral("running"), QStringLiteral("vulkan"),
+               QStringLiteral("[\"open_vulkan\"]"), true);
+  const auto nonRunning =
+      studiocast::gui::DaemonStatusSnapshot::FromJson(QStringLiteral(
+          R"({"service_running":true,"video":{"compute":{"active_backend":"vulkan","active_engines":["open_vulkan"]},"video_effects":{"engine":"auto"},"pipeline":{"running":false,"starting":false,"state":"backing_off","effects_backends":"mirror:open_vulkan"}},"audio":{}})"));
+
+  if (!Expect(nonRunning.parsed &&
+                  nonRunning.videoEffectsActiveBackends.isEmpty(),
+              "non-running lifecycle must suppress stale attribution") ||
+      !Expect(missingState.parsed &&
+                  missingState.videoPipelineState.isEmpty() &&
+                  missingState.videoEffectsActiveBackends.isEmpty(),
+              "legacy running=true without an exact pipeline state must fail "
+              "closed") ||
+      !Expect(
+          emptyStructured.videoEffectsActiveBackends.isEmpty(),
+          "missing structured compute evidence must suppress attribution") ||
+      !Expect(
+          cpuStructured.videoEffectsActiveBackends.isEmpty(),
+          "CPU-only structured evidence must suppress Vulkan attribution") ||
+      !Expect(missingEngine.videoEffectsActiveBackends.isEmpty(),
+              "a Vulkan backend without an active Vulkan engine must suppress "
+              "attribution") ||
+      !Expect(mismatchedEngine.videoEffectsActiveBackends.isEmpty(),
+              "a non-canonical Vulkan engine identifier must not validate "
+              "stale attribution") ||
+      !Expect(starting.videoEffectsActiveBackends.isEmpty(),
+              "starting must suppress attribution even when running is also "
+              "reported") ||
+      !Expect(authoritative.videoEffectsActiveBackends ==
+                  QStringLiteral("mirror:open_vulkan"),
+              "exact running lifecycle and matching structured Vulkan evidence "
+              "must preserve attribution")) {
+    return false;
+  }
+
+  studiocast::gui::EnginesModelsPage page;
+  auto *activeLabel = page.findChild<QLabel *>(
+      QStringLiteral("enginesVideoActiveBackendValue"));
+  if (!Expect(activeLabel != nullptr,
+              "Engines & Models active camera backend should be findable")) {
+    return false;
+  }
+
+  page.UpdateStatus(nonRunning);
+  if (!Expect(activeLabel->text() == QStringLiteral("Inactive"),
+              "non-running lifecycle must render inactive instead of stale "
+              "Vulkan")) {
+    return false;
+  }
+  page.UpdateStatus(missingState);
+  if (!Expect(activeLabel->text() == QStringLiteral("Inactive"),
+              "legacy running state must render inactive instead of stale "
+              "Vulkan")) {
+    return false;
+  }
+  page.UpdateStatus(emptyStructured);
+  if (!Expect(activeLabel->text() == QStringLiteral("Pass-through"),
+              "running without active structured evidence must not render a "
+              "backend")) {
+    return false;
+  }
+  page.UpdateStatus(cpuStructured);
+  if (!Expect(activeLabel->text() == QStringLiteral("Pass-through"),
+              "CPU-only evidence must not render stale Vulkan attribution")) {
+    return false;
+  }
+  page.UpdateStatus(missingEngine);
+  if (!Expect(
+          activeLabel->text() == QStringLiteral("Pass-through"),
+          "a missing active engine must render without stale attribution")) {
+    return false;
+  }
+  page.UpdateStatus(mismatchedEngine);
+  if (!Expect(activeLabel->text() == QStringLiteral("Pass-through"),
+              "mismatched structured engine evidence must not render stale "
+              "attribution")) {
+    return false;
+  }
+  page.UpdateStatus(authoritative);
+  if (!Expect(activeLabel->text() == QStringLiteral("Open Vulkan"),
+              "authoritative live Vulkan attribution should render clearly") ||
+      !Expect(activeLabel->toolTip() == QStringLiteral("mirror:open_vulkan"),
+              "authoritative attribution should be available in the tooltip")) {
+    return false;
+  }
+  page.UpdateStatus(starting);
+  return Expect(activeLabel->text() == QStringLiteral("Starting"),
+                "starting lifecycle must override stale or pre-frame "
+                "attribution");
 }
 
 bool TestNestedPipelineEffectsPlanAndRawEffectsPreservation() {
@@ -806,6 +937,10 @@ bool TestEngineModelDetailsAndConfiguredSelections() {
           "virtual_device_present":true,
           "virtual_device_available":true,
           "consumer_count":1,
+          "compute":{
+            "active_backend":"cuda",
+            "active_engines":["open_cuda"]
+          },
           "video_effects":{
             "engine":"open_cuda",
             "virtual_background":{"model_id":"matting-good"},
@@ -815,6 +950,7 @@ bool TestEngineModelDetailsAndConfiguredSelections() {
           "pipeline":{
             "running":true,
             "starting":false,
+            "state":"running",
             "effects_backends":"virtual_background.blur:open_cuda,mirror:passthrough"
           }
         },
@@ -2020,6 +2156,7 @@ int main(int argc, char **argv) {
   ok = TestUnreachableStatus() && ok;
   ok = TestStatusJsonCompatibilityShapes() && ok;
   ok = TestVideoComputeResolutionDoesNotImplyActivity() && ok;
+  ok = TestEffectBackendAttributionRequiresStructuredRunningEvidence() && ok;
   ok = TestNestedPipelineEffectsPlanAndRawEffectsPreservation() && ok;
   ok = TestVideoEffectReadinessMissingModelWhileIdle() && ok;
   ok = TestVulkanPixelReadinessFailuresRemainFailClosed() && ok;

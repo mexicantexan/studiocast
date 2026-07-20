@@ -196,6 +196,22 @@ ComputeFields ComputeFieldsFor(const std::string &statusJson) {
   return out;
 }
 
+std::string PipelineEffectsBackendsFor(const std::string &statusJson) {
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(statusJson, &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return {};
+  }
+  const JsonObject *root = rootValue.AsObject();
+  const JsonObject *video = root ? JsonObjectField(*root, "video") : nullptr;
+  const JsonObject *pipeline =
+      video ? JsonObjectField(*video, "pipeline") : nullptr;
+  const std::string *backends =
+      pipeline ? JsonStringField(*pipeline, "effects_backends") : nullptr;
+  return backends ? *backends : std::string{};
+}
+
 std::string StatusForEffects(
     const studiocast::video::effects::BroadcastCameraEffects &effects) {
   studiocast::video::VirtualCameraServiceStatus videoStatus;
@@ -516,6 +532,7 @@ bool TestVideoComputeStatusReportsCachedCountersAndProvider() {
   videoStatus.virtual_device_present = true;
   videoStatus.virtual_device_available = true;
   videoStatus.pipeline.running = true;
+  videoStatus.pipeline_state = "running";
   videoStatus.pipeline.compute_backend_resolved = "cuda";
   videoStatus.pipeline.compute_backend_active = "cuda";
   videoStatus.pipeline.effects_backends =
@@ -627,6 +644,7 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
   videoStatus.virtual_device_present = true;
   videoStatus.virtual_device_available = true;
   videoStatus.pipeline.running = true;
+  videoStatus.pipeline_state = "running";
 
   auto &cu = videoStatus.pipeline.open_cuda_transfers;
   cu.upload_calls = 17;
@@ -1128,6 +1146,7 @@ bool TestVideoStatusReportsCaptureFallbackState() {
   videoStatus.virtual_device_present = true;
   videoStatus.virtual_device_available = true;
   videoStatus.pipeline.running = true;
+  videoStatus.pipeline_state = "running";
   videoStatus.pipeline.capture_fallback_state =
       "raw_after_mjpeg_decode_failure";
   videoStatus.pipeline.capture_fallback_reason =
@@ -1917,6 +1936,78 @@ bool TestOpenVulkanInactiveLifecycleSeparatesResolutionFromActivity() {
   return ok;
 }
 
+bool TestDaemonPublishesOnlyAuthoritativeRunningEffectBackends() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+  const std::string diagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"mirror\"]", "\"mirror_production_ready\":true,"
+                      "\"mirror_readiness_code\":"
+                      "\"open_vulkan_mirror_production_ready\","
+                      "\"mirror_blocker_code\":\"\"");
+
+  const auto statusJson = [&](const auto &status) {
+    return StatusForVideoStateWithDiagnostics(status, config, "", "",
+                                              diagnostics);
+  };
+  const auto expectSuppressed = [&](const char *label, const auto &status) {
+    return Expect(
+        PipelineEffectsBackendsFor(statusJson(status)).empty(),
+        (std::string(label) + " must suppress stale effect attribution")
+            .c_str());
+  };
+
+  bool ok = true;
+  studiocast::video::VirtualCameraServiceStatus stopped;
+  stopped.service_running = true;
+  stopped.pipeline.effects_backends = "mirror:open_vulkan";
+  ok = expectSuppressed("stopped", stopped) && ok;
+
+  auto starting = stopped;
+  starting.pipeline.starting = true;
+  starting.pipeline_active_needed = true;
+  starting.pipeline_state = "starting";
+  ok = expectSuppressed("starting", starting) && ok;
+
+  auto backingOff = stopped;
+  backingOff.pipeline_state = "backing_off";
+  backingOff.pipeline_active_needed = true;
+  ok = expectSuppressed("failed/backoff", backingOff) && ok;
+
+  auto forgedRunningWithoutState = stopped;
+  forgedRunningWithoutState.pipeline.running = true;
+  forgedRunningWithoutState.pipeline.compute_backend_active = "vulkan";
+  ok = expectSuppressed("running flag without running state",
+                        forgedRunningWithoutState) &&
+       ok;
+
+  auto inconsistentStarting = forgedRunningWithoutState;
+  inconsistentStarting.pipeline_state = "starting";
+  ok = expectSuppressed("running flag with starting state",
+                        inconsistentStarting) &&
+       ok;
+
+  auto overlappingStart = forgedRunningWithoutState;
+  overlappingStart.pipeline.starting = true;
+  overlappingStart.pipeline_state = "running";
+  ok = expectSuppressed("running state while start remains in progress",
+                        overlappingStart) &&
+       ok;
+
+  auto active = forgedRunningWithoutState;
+  active.pipeline_state = "running";
+  const std::string activeJson = statusJson(active);
+  ok = Expect(PipelineEffectsBackendsFor(activeJson) == "mirror:open_vulkan",
+              "authoritative running frame must publish exact attribution") &&
+       ok;
+  const ReadinessFields mirror = ReadinessEntryFor(activeJson, "mirror");
+  return Expect(mirror.state == "ready" && mirror.backend == "open_vulkan",
+                "authoritative running map must retain exact readiness") &&
+         ok;
+}
+
 bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
   studiocast::video::VirtualCameraServiceConfig config;
   config.enabled = true;
@@ -1932,6 +2023,7 @@ bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
   studiocast::video::VirtualCameraServiceStatus inactive;
   inactive.service_running = true;
   inactive.pipeline.running = true;
+  inactive.pipeline_state = "running";
   inactive.pipeline.compute_backend_resolved = "vulkan";
   inactive.pipeline.compute_backend_active = "vulkan";
   const std::string inactiveStatus =
@@ -2133,6 +2225,7 @@ bool TestPixelEffectsRequireRealBackendPaths() {
   studiocast::video::VirtualCameraServiceStatus cudaVignetteStatus;
   cudaVignetteStatus.service_running = true;
   cudaVignetteStatus.pipeline.running = true;
+  cudaVignetteStatus.pipeline_state = "running";
   cudaVignetteStatus.pipeline.effects_backends = "vignette:cuda";
   const ReadinessFields cudaVignette =
       ReadinessEntryFor(StatusForVideoStateWithDiagnostics(
@@ -2149,6 +2242,7 @@ bool TestPixelEffectsRequireRealBackendPaths() {
   studiocast::video::VirtualCameraServiceStatus maxineVignetteStatus;
   maxineVignetteStatus.service_running = true;
   maxineVignetteStatus.pipeline.running = true;
+  maxineVignetteStatus.pipeline_state = "running";
   maxineVignetteStatus.pipeline.effects_backends = "auto_frame:maxine_ar_cuda";
   const ReadinessFields maxineVignette = ReadinessEntryFor(
       StatusForVideoStateWithDiagnostics(maxineVignetteStatus,
@@ -2394,6 +2488,7 @@ int main() {
   ok = TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() && ok;
   ok = TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() && ok;
   ok = TestOpenVulkanInactiveLifecycleSeparatesResolutionFromActivity() && ok;
+  ok = TestDaemonPublishesOnlyAuthoritativeRunningEffectBackends() && ok;
   ok = TestLiveOpenVulkanPixelReadinessRequiresActiveMap() && ok;
   ok = TestOpenVulkanPixelEvidenceFailsClosedWhenInconsistent() && ok;
   ok = TestOpenVulkanPixelCommonHardwareFactsFailClosed() && ok;

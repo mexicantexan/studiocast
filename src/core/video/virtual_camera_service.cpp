@@ -425,6 +425,13 @@ VirtualCameraServiceStatus VirtualCameraService::Status() const {
   }
 
   s.pipeline = pipeline_ ? pipeline_->Status() : CameraPipelineStatus{};
+  if (!s.pipeline.running || s.pipeline.starting ||
+      s.pipeline_state != "running") {
+    // The supervisor state is the public lifecycle authority. A runner may be
+    // starting, stopping, failed/backing off, or retain compatibility fields;
+    // none of those states prove current-frame effect execution.
+    s.pipeline.effects_backends.clear();
+  }
   s.last_error = last_error_;
   return s;
 }

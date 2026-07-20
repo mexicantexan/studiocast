@@ -829,6 +829,20 @@ ParseEffectBackendMap(const std::string &raw) {
   return out;
 }
 
+bool HasAuthoritativeRunningVideoFrame(
+    const studiocast::video::VirtualCameraServiceStatus &status) {
+  return status.pipeline.running && !status.pipeline.starting &&
+         status.pipeline_state == "running";
+}
+
+const std::string &AuthoritativeLiveEffectBackends(
+    const studiocast::video::VirtualCameraServiceStatus &status) {
+  static const std::string empty;
+  return HasAuthoritativeRunningVideoFrame(status)
+             ? status.pipeline.effects_backends
+             : empty;
+}
+
 std::string VideoEffectLabel(const std::string &id) {
   using namespace studiocast::video::effects::contract;
   if (id == kEffectIdMirror)
@@ -1528,13 +1542,9 @@ std::string VideoEffectReadinessToJson(
       !st.pipeline.degraded_effect.effect_id.empty())
     ids.insert(st.pipeline.degraded_effect.effect_id);
 
-  // CameraPipeline retains its last effects_backends string across Stop() so
-  // diagnostics can explain the previous run.  It is authoritative activity
-  // evidence only while that pipeline is actually running.
+  const bool pipelineActive = HasAuthoritativeRunningVideoFrame(st);
   auto activeBackends =
-      st.pipeline.running
-          ? ParseEffectBackendMap(st.pipeline.effects_backends)
-          : std::map<std::string, std::string>{};
+      ParseEffectBackendMap(AuthoritativeLiveEffectBackends(st));
   const std::string vignetteId(
       studiocast::video::effects::contract::kEffectIdVignette);
   if (fx.vignette.enabled && activeBackends.count(vignetteId) == 0 &&
@@ -1564,7 +1574,7 @@ std::string VideoEffectReadinessToJson(
     const VideoEffectReadinessEntry entry = BuildVideoEffectReadinessEntry(
         id, fx, st.pipeline.degraded_effect, activeBackends, ruleDisabled,
         maxineDiag, openCudaDiag, openVulkanDiag, cfg.pipeline.compute_backend,
-        st.pipeline.running);
+        pipelineActive);
     if (!first)
       oss << ",";
     first = false;
@@ -1782,9 +1792,9 @@ std::string NormalizeComputeEngineName(const std::string &backend) {
   return {};
 }
 
-std::string ActiveComputeBackendFromEffectMap(
-    const studiocast::video::CameraPipelineStatus &pipeline) {
-  const auto activeBackends = ParseEffectBackendMap(pipeline.effects_backends);
+std::string
+ActiveComputeBackendFromEffectMap(const std::string &liveEffectBackends) {
+  const auto activeBackends = ParseEffectBackendMap(liveEffectBackends);
   std::string candidate;
   for (const auto &[_, backend] : activeBackends) {
     const std::string normalized = NormalizeComputeEngineName(backend);
@@ -1798,18 +1808,15 @@ std::string ActiveComputeBackendFromEffectMap(
   return candidate;
 }
 
-std::vector<std::string> ActiveComputeEngines(
-    const studiocast::video::CameraPipelineStatus &pipeline,
-    const std::string &computeActive) {
+std::vector<std::string>
+ActiveComputeEngines(const std::string &liveEffectBackends,
+                     const std::string &computeActive) {
   std::set<std::string> engines;
-  if (pipeline.running) {
-    const auto activeBackends =
-        ParseEffectBackendMap(pipeline.effects_backends);
-    for (const auto &[_, backend] : activeBackends) {
-      const std::string normalized = NormalizeComputeEngineName(backend);
-      if (!normalized.empty())
-        engines.insert(normalized);
-    }
+  const auto activeBackends = ParseEffectBackendMap(liveEffectBackends);
+  for (const auto &[_, backend] : activeBackends) {
+    const std::string normalized = NormalizeComputeEngineName(backend);
+    if (!normalized.empty())
+      engines.insert(normalized);
   }
   if (engines.empty() && !computeActive.empty()) {
     const std::string normalized = NormalizeComputeEngineName(computeActive);
@@ -1929,14 +1936,14 @@ void AppendCpuTailStages(std::ostringstream &oss,
 void AppendVideoComputeStatusJson(
     std::ostringstream &oss,
     const studiocast::video::CameraPipelineStatus &pipeline,
-    const std::string &preference, const std::string &resolved,
-    const std::string &active, const std::string &fallbackReason,
-    const std::string &degradedReason,
+    const std::string &liveEffectBackends, const std::string &preference,
+    const std::string &resolved, const std::string &active,
+    const std::string &fallbackReason, const std::string &degradedReason,
     const EngineDiagnosticsSummary &maxineDiag,
     const EngineDiagnosticsSummary &openCudaDiag,
     const EngineDiagnosticsSummary &openVulkanDiag) {
   const std::vector<std::string> activeEngines =
-      ActiveComputeEngines(pipeline, active);
+      ActiveComputeEngines(liveEffectBackends, active);
   std::string cudaUnavailable = DiagnosticUnavailableReason(openCudaDiag);
   std::string vulkanUnavailable = DiagnosticUnavailableReason(openVulkanDiag);
   std::string maxineUnavailable = DiagnosticUnavailableReason(maxineDiag);
@@ -2141,20 +2148,19 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   std::string computeResolved = st.pipeline.compute_backend_resolved.empty()
                                     ? std::string("cpu")
                                     : st.pipeline.compute_backend_resolved;
-  // Active means executing now. CameraPipeline intentionally reports a CPU
-  // default while stopped, and can retain the previous effects_backends map;
-  // neither is live activity evidence.
-  std::string computeActive =
-      st.pipeline.running
-          ? (st.pipeline.compute_backend_active.empty()
-                 ? std::string("cpu")
-                 : st.pipeline.compute_backend_active)
-          : std::string{};
+  const bool pipelineHasLiveFrame = HasAuthoritativeRunningVideoFrame(st);
+  const std::string &liveEffectBackends = AuthoritativeLiveEffectBackends(st);
+  // Active means executing in a successfully written running frame. Aggregate
+  // setup fields and maps from any other lifecycle state are not live evidence.
+  std::string computeActive = pipelineHasLiveFrame
+                                  ? (st.pipeline.compute_backend_active.empty()
+                                         ? std::string("cpu")
+                                         : st.pipeline.compute_backend_active)
+                                  : std::string{};
   std::string computeFallback = st.pipeline.compute_backend_fallback_reason;
   std::string computeDegraded = st.pipeline.compute_backend_degraded_reason;
   const std::string mappedActive =
-      st.pipeline.running ? ActiveComputeBackendFromEffectMap(st.pipeline)
-                          : std::string{};
+      ActiveComputeBackendFromEffectMap(liveEffectBackends);
   if (!mappedActive.empty()) {
     // Per-effect runtime attribution is the most specific live evidence. It
     // also repairs stale/default aggregate fields without guessing from a
@@ -2170,13 +2176,13 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
       computeFallback.clear();
       computeDegraded.clear();
     }
-  } else if (computeRequested && st.pipeline.running) {
+  } else if (computeRequested && pipelineHasLiveFrame) {
     // A running pipeline without per-effect attribution has not proven that
     // its configured aggregate GPU backend executed the requested effect.
     // Report the actual pass-through/CPU execution until effects_backends
     // supplies the authoritative live mapping.
     computeActive = "cpu";
-  } else if (computeRequested && !st.pipeline.running &&
+  } else if (computeRequested && !pipelineHasLiveFrame &&
              cfg.pipeline.compute_backend ==
                  studiocast::video::ComputeBackendPreference::vulkan) {
     // Idle, waiting, starting, and failed-start pipelines have no active
@@ -2264,11 +2270,10 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   oss << "\"apply_policy\":\"next_vulkan_device_initialization\"";
   oss << "},";
   oss << "\"compute\":";
-  AppendVideoComputeStatusJson(oss, st.pipeline, computePreference,
-                               computeResolved, computeActive,
-                               computeFallback, computeDegraded,
-                               computeMaxineDiag, computeOpenCudaDiag,
-                               computeOpenVulkanDiag);
+  AppendVideoComputeStatusJson(
+      oss, st.pipeline, liveEffectBackends, computePreference, computeResolved,
+      computeActive, computeFallback, computeDegraded, computeMaxineDiag,
+      computeOpenCudaDiag, computeOpenVulkanDiag);
   oss << ",";
   oss << "\"output_format_requested\":\""
       << JsonEscape(
@@ -2395,8 +2400,7 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
       << "\",";
   oss << "\"idle_reason\":\"" << JsonEscape(st.pipeline_idle_reason) << "\",";
   oss << "\"frame_index\":" << st.pipeline.frame_index << ",";
-  oss << "\"effects_backends\":\"" << JsonEscape(st.pipeline.effects_backends)
-      << "\",";
+  oss << "\"effects_backends\":\"" << JsonEscape(liveEffectBackends) << "\",";
   oss << "\"effects_note\":\"" << JsonEscape(st.pipeline.effects_note) << "\",";
   if (st.pipeline.degraded_effect.active) {
     const auto &fx = st.pipeline.degraded_effect;

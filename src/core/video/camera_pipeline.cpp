@@ -243,6 +243,135 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   return true;
 }
 
+void LiveEffectBackendAttribution::BeginFrame() { pending_.fill(0); }
+
+void LiveEffectBackendAttribution::MarkEffectSucceeded(
+    std::string_view effect_id, std::string_view backend) {
+  const std::size_t slot = EffectSlot(effect_id);
+  const std::uint8_t code = BackendCode(backend);
+  if (slot >= kEffectCount || code == 0)
+    return;
+  pending_[slot] = code;
+}
+
+bool LiveEffectBackendAttribution::RemoveEffect(std::string_view effect_id) {
+  const std::size_t slot = EffectSlot(effect_id);
+  if (slot >= kEffectCount)
+    return false;
+  pending_[slot] = 0;
+  if (active_[slot] == 0)
+    return false;
+  active_[slot] = 0;
+  SerializeActive();
+  return true;
+}
+
+void LiveEffectBackendAttribution::DiscardFrame() { pending_.fill(0); }
+
+bool LiveEffectBackendAttribution::CommitSuccessfulFrame(
+    const std::vector<std::string> &canonical_order) {
+  if (active_ == pending_) {
+    pending_.fill(0);
+    return false;
+  }
+  active_ = pending_;
+  pending_.fill(0);
+  RememberOrder(canonical_order);
+  SerializeActive();
+  return true;
+}
+
+void LiveEffectBackendAttribution::Clear() {
+  pending_.fill(0);
+  active_.fill(0);
+  active_order_.fill(0);
+  active_order_size_ = 0;
+  active_backends_.clear();
+}
+
+std::size_t
+LiveEffectBackendAttribution::EffectSlot(std::string_view effect_id) {
+  static constexpr std::array<std::string_view, kEffectCount> ids = {
+      "mirror",
+      "virtual_background.blur",
+      "virtual_background.remove",
+      "virtual_background.replace",
+      "auto_frame",
+      "eye_contact",
+      "video_noise_removal",
+      "virtual_key_light",
+      "vignette"};
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (effect_id == ids[i])
+      return i;
+  }
+  return kEffectCount;
+}
+
+std::uint8_t
+LiveEffectBackendAttribution::BackendCode(std::string_view backend) {
+  static constexpr std::array<std::string_view, 7> ids = {
+      "open_vulkan", "open_cuda",      "open_video", "maxine",
+      "maxine_ar",   "maxine_ar_cuda", "cuda"};
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (backend == ids[i])
+      return static_cast<std::uint8_t>(i + 1);
+  }
+  return 0;
+}
+
+std::string_view LiveEffectBackendAttribution::EffectId(std::size_t slot) {
+  static constexpr std::array<std::string_view, kEffectCount> ids = {
+      "mirror",
+      "virtual_background.blur",
+      "virtual_background.remove",
+      "virtual_background.replace",
+      "auto_frame",
+      "eye_contact",
+      "video_noise_removal",
+      "virtual_key_light",
+      "vignette"};
+  return slot < ids.size() ? ids[slot] : std::string_view{};
+}
+
+std::string_view LiveEffectBackendAttribution::BackendId(std::uint8_t code) {
+  static constexpr std::array<std::string_view, 7> ids = {
+      "open_vulkan", "open_cuda",      "open_video", "maxine",
+      "maxine_ar",   "maxine_ar_cuda", "cuda"};
+  return code > 0 && code <= ids.size() ? ids[code - 1] : std::string_view{};
+}
+
+void LiveEffectBackendAttribution::RememberOrder(
+    const std::vector<std::string> &canonical_order) {
+  active_order_.fill(0);
+  active_order_size_ = 0;
+  std::array<bool, kEffectCount> present{};
+  const auto append_slot = [&](std::size_t slot) {
+    if (slot >= kEffectCount || present[slot])
+      return;
+    present[slot] = true;
+    active_order_[active_order_size_++] = static_cast<std::uint8_t>(slot);
+  };
+  for (const auto &effect_id : canonical_order)
+    append_slot(EffectSlot(effect_id));
+  for (std::size_t slot = 0; slot < kEffectCount; ++slot)
+    append_slot(slot);
+}
+
+void LiveEffectBackendAttribution::SerializeActive() {
+  active_backends_.clear();
+  for (std::size_t i = 0; i < active_order_size_; ++i) {
+    const std::size_t slot = active_order_[i];
+    if (slot >= kEffectCount || active_[slot] == 0)
+      continue;
+    if (!active_backends_.empty())
+      active_backends_.push_back(',');
+    active_backends_.append(EffectId(slot));
+    active_backends_.push_back(':');
+    active_backends_.append(BackendId(active_[slot]));
+  }
+}
+
 OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
     const effects::BroadcastCameraEffects &fx,
     effects::BroadcastEffectsPlan *retained_plan) {
@@ -800,7 +929,11 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.maxine_transfers = CameraPipelineStatus::MaxineTransfers{};
   }
   s.frame_index = frame_index_;
-  s.effects_backends = effects_backends_;
+  // Live attribution is meaningful only while a successfully-started pipeline
+  // is running. Starting/stopped status must never expose setup or prior-run
+  // backend choices.
+  s.effects_backends =
+      running_ && !starting_ ? effects_backends_ : std::string{};
   s.effects_note = effects_note_;
   s.degraded_effect = degraded_effect_;
   s.last_error = last_error_;
@@ -1255,6 +1388,7 @@ void CameraPipeline::Stop() {
   std::thread toJoin;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    effects_backends_.clear();
     if (th_.joinable()) {
       toJoin = std::move(th_);
     } else {
@@ -1276,6 +1410,7 @@ void CameraPipeline::Stop() {
   std::lock_guard<std::mutex> lock(mu_);
   running_ = false;
   starting_ = false;
+  effects_backends_.clear();
   capture_ = CaptureFormat{};
   output_ = ActualFormat{};
   capture_fallback_state_ = "none";
@@ -8102,6 +8237,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   bool want_maxine_vignette_only = false;
   bool have_maxine_vignette_only = false;
 
+  LiveEffectBackendAttribution live_effect_attribution;
+
   enum class OptionalEffectSlot : std::size_t {
     denoise = 0,
     eye_contact,
@@ -8152,6 +8289,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     auto &breaker = optional_breaker(slot);
     breaker.OnFailure(effect_id, backend, std::move(reason), frame_index,
                       ++optional_effect_trip_order);
+    if (live_effect_attribution.RemoveEffect(effect_id)) {
+      std::lock_guard<std::mutex> lock(mu_);
+      effects_backends_ = live_effect_attribution.active_backends();
+    }
     publish_optional_effect_status(frame_index);
   };
 
@@ -8175,6 +8316,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                           const detail::PreparedReplaceBackgroundSource
                               &replace_source,
                           std::uint64_t effects_generation) {
+    // A rebuilt plan is not active until one frame has executed its stages and
+    // crossed the writer boundary successfully.
+    live_effect_attribution.Clear();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      effects_backends_.clear();
+    }
     chain.Clear();
     // An effects generation is a hard temporal boundary. Recreate the YuNet
     // provider session so provider/model policy cannot leak across explicit
@@ -9398,17 +9546,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       std::lock_guard<std::mutex> lock(mu_);
       const bool last_error_was_previous_effects_note =
           !effects_note_.empty() && last_error_ == effects_note_;
-      std::string backends;
-      for (const auto &id : plan.ordered_effect_ids) {
-        const auto it = backend_for_effect.find(id);
-        if (it == backend_for_effect.end())
-          continue;
-        if (!backends.empty())
-          backends += ",";
-        backends += id + ":" + it->second;
-      }
-
-      effects_backends_ = backends;
+      // `backend_for_effect` is setup/readiness evidence only. Public live
+      // attribution is committed after successful effect execution and output
+      // write, never while building this plan.
+      effects_backends_.clear();
       effects_note_ = note;
       compute_backend_preference_ =
           ComputeBackendPreferenceToString(cfg.compute_backend);
@@ -9866,6 +10007,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     // consumer-driven VIDIOC_S_FMT changes (common in Zoom/Teams) do not force
     // pipeline restarts.
     (void)RefreshOutputActual("periodic", /*force=*/false);
+
+    live_effect_attribution.BeginFrame();
+    const auto mark_live_effect_success = [&](std::string_view effect_id,
+                                              std::string_view backend) {
+      live_effect_attribution.MarkEffectSucceeded(effect_id, backend);
+    };
+    const auto remove_live_effect = [&](std::string_view effect_id) {
+      if (!live_effect_attribution.RemoveEffect(effect_id))
+        return;
+      std::lock_guard<std::mutex> lock(mu_);
+      effects_backends_ = live_effect_attribution.active_backends();
+    };
 
     DeferredGpuOut deferred_gpu_out{};
     bool have_deferred_gpu_out = false;
@@ -10391,6 +10544,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               count_maxine_stage(/*deferred_readback=*/false,
                                  /*runs_green_screen=*/false);
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "maxine");
             }
             return;
           }
@@ -10413,8 +10567,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               // Best-effort fallback: run the lightweight Open CUDA temporal
               // denoiser.
               std::string oc_err;
-              (void)open_cuda_video_denoise.ApplyRgbInPlace(
-                  rgb.data(), capA.width, capA.height, rgbStride, fx, &oc_err);
+              if (open_cuda_video_denoise.ApplyRgbInPlace(
+                      rgb.data(), capA.width, capA.height, rgbStride, fx,
+                      &oc_err)) {
+                mark_live_effect_success(stage_id, "open_cuda");
+              }
+            } else {
+              mark_live_effect_success(stage_id, "open_video");
             }
             return;
           }
@@ -10430,6 +10589,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 std::lock_guard<std::mutex> lock(mu_);
                 last_error_ = "Open CUDA video noise removal failed: " + oc_err;
               }
+            } else {
+              mark_live_effect_success(stage_id, "open_cuda");
             }
           }
           return;
@@ -10449,6 +10610,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &deferred_gpu_out)) {
               if (IsVignetteFailureReason(mx_err)) {
                 clear_optional_effect_on_success(breaker, capture_sequence);
+                mark_live_effect_success(stage_id, "maxine_ar");
                 block_optional_effect(
                     OptionalEffectSlot::vignette,
                     studiocast::video::effects::contract::kEffectIdVignette,
@@ -10467,6 +10629,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       deferred_gpu_out.kind != DeferredGpuKind::none,
                   /*runs_green_screen=*/false);
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "maxine_ar");
+              if (apply_vignette_on_eye_contact) {
+                mark_live_effect_success(
+                    studiocast::video::effects::contract::kEffectIdVignette,
+                    "maxine_ar");
+              }
             }
             if (defer_readback &&
                 deferred_gpu_out.kind != DeferredGpuKind::none)
@@ -10488,6 +10656,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 std::lock_guard<std::mutex> lock(mu_);
                 last_error_ = "Open Video eye contact failed: " + ov_err;
               }
+            } else {
+              mark_live_effect_success(stage_id, "open_video");
             }
             return;
           }
@@ -10551,6 +10721,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &deferred_gpu_out)) {
               if (IsVignetteFailureReason(mx_err)) {
                 clear_optional_effect_on_success(breaker, capture_sequence);
+                mark_live_effect_success(stage_id, "maxine");
                 block_optional_effect(
                     OptionalEffectSlot::vignette,
                     studiocast::video::effects::contract::kEffectIdVignette,
@@ -10572,6 +10743,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       deferred_gpu_out.kind != DeferredGpuKind::none,
                   /*runs_green_screen=*/!used_shared_green_screen_matte);
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "maxine");
+              if (apply_vignette_on_relight) {
+                mark_live_effect_success(
+                    studiocast::video::effects::contract::kEffectIdVignette,
+                    "maxine");
+              }
             }
             if (defer_readback &&
                 deferred_gpu_out.kind != DeferredGpuKind::none)
@@ -10633,11 +10810,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 have_deferred_gpu_out = true;
                 clear_optional_effect_on_success(key_light_breaker,
                                                  capture_sequence);
+                mark_live_effect_success(stage_id, "open_vulkan");
                 return;
               }
               if (keep_gpu_for_auto_frame) {
                 clear_optional_effect_on_success(key_light_breaker,
                                                  capture_sequence);
+                mark_live_effect_success(stage_id, "open_vulkan");
                 return;
               }
               std::string down_err;
@@ -10657,6 +10836,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               } else {
                 clear_optional_effect_on_success(key_light_breaker,
                                                  capture_sequence);
+                mark_live_effect_success(stage_id, "open_vulkan");
               }
               return;
             }
@@ -10707,6 +10887,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 if (defer_readback) {
                   have_deferred_gpu_out = true;
                   open_cuda_gpu_frame_pending_cpu_readback = true;
+                  mark_live_effect_success(stage_id, "open_cuda");
                   return;
                 }
 
@@ -10722,6 +10903,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                           ShouldAbortPipelineOnOpenCudaVbApplyFailure()) {
                     fx_failed = true;
                   }
+                } else {
+                  mark_live_effect_success(stage_id, "open_cuda");
                 }
                 return;
               }
@@ -10783,6 +10966,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       ShouldAbortPipelineOnOpenCudaVbApplyFailure()) {
                 fx_failed = true;
               }
+            } else {
+              mark_live_effect_success(stage_id, "open_cuda");
             }
           }
           return;
@@ -10887,6 +11072,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               if (is_wrapped_vulkan_vb) {
                 clear_optional_effect_on_success(vulkan_vb_breaker,
                                                  capture_sequence);
+                mark_live_effect_success(stage_id, "open_vulkan");
               }
               have_deferred_gpu_out = defer_readback;
               return;
@@ -10908,6 +11094,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             } else if (is_wrapped_vulkan_vb) {
               clear_optional_effect_on_success(vulkan_vb_breaker,
                                                capture_sequence);
+              mark_live_effect_success(stage_id, "open_vulkan");
             }
             return;
           }
@@ -10926,6 +11113,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &deferred_gpu_out)) {
               if (IsVignetteFailureReason(mx_err)) {
                 clear_optional_effect_on_success(breaker, capture_sequence);
+                mark_live_effect_success(stage_id, "maxine");
                 block_optional_effect(
                     OptionalEffectSlot::vignette,
                     studiocast::video::effects::contract::kEffectIdVignette,
@@ -10954,6 +11142,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     /*matte_ready_cross_stream=*/true);
               }
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "maxine");
+              if (apply_vignette_on_bg) {
+                mark_live_effect_success(
+                    studiocast::video::effects::contract::kEffectIdVignette,
+                    "maxine");
+              }
             }
             if (defer_readback &&
                 deferred_gpu_out.kind != DeferredGpuKind::none)
@@ -11003,6 +11197,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                         rgbStride, fx, &kl_err)) {
                   fail_key_light("Open CUDA virtual key light failed: " +
                                  kl_err);
+                } else {
+                  mark_live_effect_success(
+                      studiocast::video::effects::contract::
+                          kEffectIdVirtualKeyLight,
+                      "open_cuda");
                 }
               };
 
@@ -11039,6 +11238,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       (stage_id == last_stage_for_defer);
                   if (keep_gpu_for_auto_frame || keep_gpu_for_final) {
                     have_deferred_gpu_out = true;
+                    mark_live_effect_success(
+                        studiocast::video::effects::contract::
+                            kEffectIdVirtualKeyLight,
+                        "open_cuda");
                     return;
                   }
 
@@ -11046,6 +11249,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   if (!download_open_cuda_current_to_cpu(&down_err)) {
                     fail_key_light("Open CUDA virtual key light failed: " +
                                    down_err);
+                  } else {
+                    mark_live_effect_success(
+                        studiocast::video::effects::contract::
+                            kEffectIdVirtualKeyLight,
+                        "open_cuda");
                   }
                   have_deferred_gpu_out = false;
                   return;
@@ -11089,6 +11297,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                         ShouldAbortPipelineOnOpenCudaVbApplyFailure()) {
                   fx_failed = true;
                 }
+              } else {
+                mark_live_effect_success(studiocast::video::effects::contract::
+                                             kEffectIdVirtualKeyLight,
+                                         "open_cuda");
               }
             };
 
@@ -11191,6 +11403,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               return;
             }
 
+            mark_live_effect_success(stage_id, "open_cuda");
+
             // Ping-pong swap.
             const bool curr_was_a = (open_cuda_curr == &open_cuda_frame_a);
             open_cuda_curr = open_cuda_next;
@@ -11240,6 +11454,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               }
 
               apply_deferred_open_cuda_key_light();
+              remove_live_effect(stage_id);
               return;
             }
 
@@ -11350,6 +11565,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               mark_open_vulkan_auto_frame_cpu_tail(tracking_tail_source,
                                                    /*cpu_crop_resize=*/false);
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "open_vulkan");
               return;
             }
 
@@ -11383,6 +11599,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &deferred_gpu_out)) {
               if (IsVignetteFailureReason(mx_err)) {
                 clear_optional_effect_on_success(breaker, capture_sequence);
+                mark_live_effect_success(stage_id, "maxine_ar_cuda");
                 block_optional_effect(
                     OptionalEffectSlot::vignette,
                     studiocast::video::effects::contract::kEffectIdVignette,
@@ -11401,6 +11618,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                       deferred_gpu_out.kind != DeferredGpuKind::none,
                   /*runs_green_screen=*/false);
               clear_optional_effect_on_success(breaker, capture_sequence);
+              mark_live_effect_success(stage_id, "maxine_ar_cuda");
+              if (apply_vignette_on_auto_frame) {
+                mark_live_effect_success(
+                    studiocast::video::effects::contract::kEffectIdVignette,
+                    "maxine_ar_cuda");
+              }
             }
             if (defer_readback &&
                 deferred_gpu_out.kind != DeferredGpuKind::none)
@@ -11476,6 +11699,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
                 const bool keep_deferred_after_auto_frame =
                     allow_defer_readback && (stage_id == last_stage_for_defer);
+                bool auto_frame_output_visible = keep_deferred_after_auto_frame;
                 if (!keep_deferred_after_auto_frame && have_deferred_gpu_out &&
                     deferred_gpu_out.cuda_img && deferred_gpu_out.cuda) {
                   std::string derr;
@@ -11489,6 +11713,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     ++open_cuda_forced_sync_calls;
                     have_deferred_gpu_out = false;
                     open_cuda_gpu_frame_pending_cpu_readback = false;
+                    auto_frame_output_visible = true;
                   } else {
                     std::lock_guard<std::mutex> lock(mu_);
                     last_error_ =
@@ -11498,6 +11723,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 }
                 mark_open_cuda_auto_frame_cpu_tail(tracking_tail_source,
                                                    /*cpu_crop_resize=*/false);
+                if (auto_frame_output_visible) {
+                  mark_live_effect_success(stage_id, "open_cuda");
+                } else {
+                  remove_live_effect(stage_id);
+                }
                 return;
               }
 
@@ -11532,6 +11762,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 std::lock_guard<std::mutex> lock(mu_);
                 last_error_ = "Open CUDA auto frame failed: " + oc_err;
               }
+            } else {
+              mark_live_effect_success(stage_id, "open_cuda");
             }
             mark_open_cuda_auto_frame_cpu_tail(tracking_tail_source,
                                                cpu_crop_resize_applied);
@@ -11565,6 +11797,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     deferred_gpu_out.kind != DeferredGpuKind::none,
                 /*runs_green_screen=*/false);
             clear_optional_effect_on_success(breaker, capture_sequence);
+            mark_live_effect_success(stage_id, "cuda");
           }
           if (defer_readback && deferred_gpu_out.kind != DeferredGpuKind::none)
             have_deferred_gpu_out = true;
@@ -11597,6 +11830,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   ShouldAbortPipelineOnOpenCudaVbApplyFailure()) {
             fx_failed = true;
           }
+        } else {
+          mark_live_effect_success(
+              studiocast::video::effects::contract::kEffectIdVirtualKeyLight,
+              "open_cuda");
         }
       }
 
@@ -11808,6 +12045,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           }
         }
 
+        if (!readback_ok)
+          live_effect_attribution.DiscardFrame();
+
         std::lock_guard<std::mutex> lock(mu_);
         last_error_ = "Open CUDA deferred GPU resize path failed";
         if (!gerr.empty())
@@ -11821,6 +12061,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                deferred_gpu_out.kind == DeferredGpuKind::vulkan_rgb) {
       std::string gerr;
       bool ok = true;
+      bool final_vignette_applied = false;
+      bool final_mirror_applied = false;
 
       if (!deferred_gpu_out.vulkan_img || !deferred_gpu_out.vulkan_kernels) {
         ok = false;
@@ -11877,6 +12119,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
         if (open_vulkan_vignette_attempt_this_frame) {
           if (final_result.vignette_applied) {
+            final_vignette_applied = true;
             open_vulkan_effect_ran_this_frame = true;
             clear_optional_effect_on_success(
                 optional_breaker(OptionalEffectSlot::vignette), f.sequence);
@@ -11893,6 +12136,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
         if (open_vulkan_mirror_attempt_this_frame) {
           if (final_result.mirror_applied) {
+            final_mirror_applied = true;
             open_vulkan_effect_ran_this_frame = true;
             clear_optional_effect_on_success(
                 optional_breaker(OptionalEffectSlot::mirror), f.sequence);
@@ -11930,6 +12174,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (ok) {
         ++open_vulkan_download_calls;
         ++open_vulkan_final_download_calls;
+        if (final_vignette_applied) {
+          mark_live_effect_success(
+              studiocast::video::effects::contract::kEffectIdVignette,
+              "open_vulkan");
+        }
+        if (final_mirror_applied) {
+          mark_live_effect_success(
+              studiocast::video::effects::contract::kEffectIdMirror,
+              "open_vulkan");
+        }
         frameW = outW;
         frameH = outH;
         rgbOut = rgbScaled.data();
@@ -11938,6 +12192,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         have_deferred_gpu_out = false;
         open_vulkan_gpu_frame_pending_cpu_readback = false;
       } else {
+        if (final_vignette_applied) {
+          remove_live_effect(
+              studiocast::video::effects::contract::kEffectIdVignette);
+        }
+        if (final_mirror_applied) {
+          remove_live_effect(
+              studiocast::video::effects::contract::kEffectIdMirror);
+        }
         std::string derr;
         bool readback_ok = false;
         if (deferred_gpu_out.vulkan_img) {
@@ -11961,6 +12223,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             open_vulkan_gpu_frame_pending_cpu_readback = false;
           }
         }
+
+        if (!readback_ok)
+          live_effect_attribution.DiscardFrame();
 
         std::lock_guard<std::mutex> lock(mu_);
         last_error_ = "Open Vulkan deferred GPU resize path failed";
@@ -12185,6 +12450,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             }
           }
         }
+
+        if (!readback_ok)
+          live_effect_attribution.DiscardFrame();
 
         std::lock_guard<std::mutex> lock(mu_);
         last_error_ = "Maxine/NVCV deferred GPU resize failed";
@@ -12658,6 +12926,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
+    if (live_effect_attribution.CommitSuccessfulFrame(
+            appliedPlan.ordered_effect_ids)) {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (running_ && !stop_.load())
+        effects_backends_ = live_effect_attribution.active_backends();
+    }
+
     const auto t_write_end = Clock::now();
     const double write_ms = ToMs(t_write_end - t_write_start);
 
@@ -13052,6 +13327,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     frame_index_ = frameIndex;
     running_ = false;
+    effects_backends_.clear();
 
     if (!start_notified_) {
       start_notified_ = true;

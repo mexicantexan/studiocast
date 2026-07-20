@@ -80,6 +80,7 @@ namespace {
 using studiocast::video::CameraPipelineConfig;
 using studiocast::video::CameraPipelineRunner;
 using studiocast::video::CameraPipelineStatus;
+using studiocast::video::LiveEffectBackendAttribution;
 using studiocast::video::OptionalEffectBreaker;
 using studiocast::video::VideoConsumerSnapshot;
 using studiocast::video::VirtualCameraService;
@@ -118,6 +119,7 @@ public:
     std::lock_guard<std::mutex> lock(mu_);
     status_.running = true;
     status_.starting = false;
+    status_.effects_backends.clear();
     status_.input_device = cfg.input_device.empty()
                                ? std::string("/dev/video-real")
                                : cfg.input_device;
@@ -185,6 +187,11 @@ public:
     std::lock_guard<std::mutex> lock(mu_);
     status_.degraded_effect = std::move(degraded);
     status_.effects_note = std::move(effects_note);
+  }
+
+  void SetEffectsBackends(std::string effects_backends) {
+    std::lock_guard<std::mutex> lock(mu_);
+    status_.effects_backends = std::move(effects_backends);
   }
 
   std::atomic<int> start_calls{0};
@@ -262,6 +269,139 @@ VirtualCameraServiceConfig TestConfig() {
   cfg.pipeline.height = 480;
   cfg.pipeline.fps = 30;
   return cfg;
+}
+
+bool TestLiveEffectBackendAttributionRequiresSuccessfulFrameCommit() {
+  LiveEffectBackendAttribution attribution;
+  const std::vector<std::string> order = {"virtual_background.blur", "vignette",
+                                          "mirror"};
+
+  attribution.BeginFrame();
+  attribution.MarkEffectSucceeded("mirror", "open_vulkan");
+  if (!attribution.active_backends().empty()) {
+    std::cerr << "attempted effect leaked before the first successful frame\n";
+    return false;
+  }
+
+  if (!attribution.CommitSuccessfulFrame(order) ||
+      attribution.active_backends() != "mirror:open_vulkan") {
+    std::cerr << "first successful frame did not publish mirror attribution\n";
+    return false;
+  }
+
+  // A circuit-broken frame succeeds as pass-through. Removing the effect must
+  // be visible immediately and the successful frame commits the empty map.
+  attribution.BeginFrame();
+  if (!attribution.RemoveEffect("mirror") ||
+      !attribution.active_backends().empty() ||
+      attribution.CommitSuccessfulFrame(order)) {
+    std::cerr << "circuit-broken effect remained active\n";
+    return false;
+  }
+
+  // Retry attempts are not evidence until the output writer accepts the frame.
+  attribution.BeginFrame();
+  attribution.MarkEffectSucceeded("mirror", "open_vulkan");
+  attribution.DiscardFrame();
+  if (!attribution.active_backends().empty()) {
+    std::cerr << "discarded retry republished effect attribution\n";
+    return false;
+  }
+
+  attribution.BeginFrame();
+  attribution.MarkEffectSucceeded("mirror", "open_vulkan");
+  attribution.MarkEffectSucceeded("vignette", "open_vulkan");
+  if (!attribution.CommitSuccessfulFrame(order) ||
+      attribution.active_backends() !=
+          "vignette:open_vulkan,mirror:open_vulkan") {
+    std::cerr << "recovered effects were not published in canonical order\n";
+    return false;
+  }
+
+  attribution.BeginFrame();
+  attribution.MarkEffectSucceeded("mirror", "open_vulkan");
+  attribution.MarkEffectSucceeded("vignette", "open_vulkan");
+  if (attribution.CommitSuccessfulFrame(order)) {
+    std::cerr << "unchanged attribution was treated as a status transition\n";
+    return false;
+  }
+
+  attribution.BeginFrame();
+  attribution.MarkEffectSucceeded("mirror", "configured_only");
+  if (!attribution.CommitSuccessfulFrame(order) ||
+      !attribution.active_backends().empty()) {
+    std::cerr << "unknown backend attribution did not fail closed\n";
+    return false;
+  }
+
+  attribution.Clear();
+  if (!attribution.active_backends().empty()) {
+    std::cerr << "stop/restart clear did not remove active attribution\n";
+    return false;
+  }
+  return true;
+}
+
+bool TestVideoServiceSanitizesEffectBackendsAcrossLifecycle() {
+  ServiceHarness h;
+  h.consumer_present.store(true, std::memory_order_relaxed);
+  VirtualCameraService service(h.Hooks());
+  auto cfg = TestConfig();
+
+  std::string err;
+  if (!service.Start(cfg, &err)) {
+    std::cerr << "service.Start failed: " << err << "\n";
+    return false;
+  }
+  if (!WaitUntil([&] { return service.Status().pipeline_state == "running"; },
+                 250ms)) {
+    std::cerr << "pipeline did not reach running for attribution lifecycle\n";
+    service.Stop();
+    return false;
+  }
+
+  // Start is setup only. The fake mirrors CameraPipeline by publishing no map
+  // until a first successful frame is injected.
+  if (!service.Status().pipeline.effects_backends.empty()) {
+    std::cerr << "start leaked effect attribution before a successful frame\n";
+    service.Stop();
+    return false;
+  }
+  h.pipeline->SetEffectsBackends("mirror:open_vulkan");
+  if (!WaitUntil(
+          [&] {
+            return service.Status().pipeline.effects_backends ==
+                   "mirror:open_vulkan";
+          },
+          100ms)) {
+    std::cerr << "authoritative running attribution was suppressed\n";
+    service.Stop();
+    return false;
+  }
+
+  // A failed restart deliberately leaves the fake runner's old map in place;
+  // the service must still publish an empty map while stopped/backing off.
+  h.pipeline->fail_start.store(true, std::memory_order_relaxed);
+  auto restarted = cfg;
+  restarted.pipeline.width = 800;
+  service.UpdateConfig(restarted);
+  const bool backedOffWithoutStaleMap = WaitUntil(
+      [&] {
+        const auto status = service.Status();
+        return status.pipeline_state == "backing_off" &&
+               status.pipeline.effects_backends.empty();
+      },
+      750ms);
+  service.Stop();
+  if (!backedOffWithoutStaleMap) {
+    std::cerr << "failed/backoff lifecycle leaked stale attribution\n";
+    return false;
+  }
+  if (!service.Status().pipeline.effects_backends.empty()) {
+    std::cerr << "stopped service leaked stale attribution\n";
+    return false;
+  }
+  return true;
 }
 
 bool TestVideoPipelineDoesNotStartWithoutConsumer() {
@@ -1580,6 +1720,10 @@ int main() {
     const char *name;
     bool (*fn)();
   } tests[] = {
+      {"live effect attribution requires successful frame commit",
+       &TestLiveEffectBackendAttributionRequiresSuccessfulFrameCommit},
+      {"video service sanitizes effect attribution across lifecycle",
+       &TestVideoServiceSanitizesEffectBackendsAcrossLifecycle},
       {"video pipeline does not start without consumer",
        &TestVideoPipelineDoesNotStartWithoutConsumer},
       {"video pipeline starts when consumer appears",
