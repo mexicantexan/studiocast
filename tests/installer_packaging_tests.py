@@ -181,10 +181,46 @@ class PackagingIntegrationTests(unittest.TestCase):
             f"RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/{PRODUCTION_KEY_ID}.pem",
             workflow,
         )
+        self.assertIn("reject-unsafe-signing-request:", workflow)
+        self.assertIn("gui-installer-appimage:", workflow)
+        self.assertIn("sign-release:", workflow)
+        build_job = workflow.split("  gui-installer-appimage:\n", 1)[1].split(
+            "\n  sign-release:\n", 1
+        )[0]
+        signing_job = workflow.split("\n  sign-release:\n", 1)[1]
+        self.assertNotIn("RELEASE_SIGNING_KEY_B64", build_job)
+        self.assertNotIn("RELEASE_SIGNING_KEY_ID", build_job)
+        self.assertNotIn("secrets.", build_job)
+        self.assertNotIn("packaging/release/release_tool.py", build_job)
+        self.assertIn("actions/upload-artifact@v4", build_job)
+        self.assertIn("studiocast-gui-installer-ubuntu-22.04-unsigned", build_job)
+        self.assertEqual(1, workflow.count("secrets.RELEASE_SIGNING_KEY_B64"))
+        self.assertEqual(1, workflow.count("vars.RELEASE_SIGNING_KEY_ID"))
+        self.assertEqual(1, workflow.count("environment: release-signing"))
+        self.assertIn("environment: release-signing", signing_job)
+        self.assertIn("needs:\n      - gui-installer-appimage", signing_job)
+        self.assertIn("actions/download-artifact@v4", signing_job)
+        self.assertIn("ref: ${{ github.workflow_sha }}", signing_job)
+        default_ref_gate = (
+            "github.ref == format('refs/heads/{0}', "
+            "github.event.repository.default_branch)"
+        )
+        self.assertIn(default_ref_gate, signing_job)
+        self.assertIn("test \"${GITHUB_REF}\" = \"refs/tags/${RELEASE_TAG}\"", signing_job)
+        self.assertIn("test \"${RELEASE_TAG}\" = \"v${version}\"", signing_job)
+        self.assertIn("git get-tar-commit-id", signing_job)
+        self.assertIn("sha256sum --check", signing_job)
+        self.assertIn("packaging/release/release_tool.py", signing_job)
+        self.assertIn("Hermetically verify signed release and packaged trust root", signing_job)
+        self.assertIn("Upload signed release artifacts", signing_job)
         self.assertIn('test "${RELEASE_SIGNING_KEY_ID}" = "${RELEASE_PUBLIC_KEY_ID}"', workflow)
         self.assertIn("packaging/release/verify_signed_release.py", workflow)
         self.assertEqual(2, workflow.count("inputs.signing_dry_run"))
         self.assertNotIn("if: github.event_name == 'release'\n", workflow)
+
+        key_readme = (ROOT / "packaging/release/keys/README.md").read_text(encoding="utf-8")
+        self.assertIn(f"`{PRODUCTION_KEY_ID}.pem`", key_readme)
+        self.assertNotIn("No production key has been supplied", key_readme)
 
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
         self.assertIn('"${appimage}" --appimage-extract', verifier)

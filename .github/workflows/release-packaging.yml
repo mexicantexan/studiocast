@@ -24,18 +24,32 @@ defaults:
     shell: bash
 
 jobs:
+  reject-unsafe-signing-request:
+    name: Reject signed dispatch outside the default branch
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.signing_dry_run &&
+      github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Reject unsafe signing ref
+        run: |
+          echo "Signed workflow dispatch is restricted to the repository default branch." >&2
+          exit 1
+
   gui-installer-appimage:
-    name: GUI installer AppImage (ubuntu-22.04)
+    name: Build unsigned GUI installer AppImage (ubuntu-22.04)
     runs-on: ubuntu-22.04
     env:
       RELEASE_PUBLIC_KEY_ID: studiocast-release-2026
       RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/studiocast-release-2026.pem
 
     steps:
-      - name: Checkout
+      - name: Checkout build source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -98,32 +112,169 @@ jobs:
             --trusted-release-key \
             "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
 
+      - name: Verify unsigned GUI installer bundle
+        run: |
+          packaging/appimage/verify_bundle.sh --require-appimage \
+            --trusted-release-key \
+            "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
+
+      - name: Validate unsigned artifact set
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          bundle="StudioCast-Installer-${version}-x86_64"
+          expected=(
+            "${bundle}.AppImage"
+            "${bundle}.AppDir.tar.gz"
+            "${bundle}.sha256"
+            "StudioCast-${version}-source.tar.gz"
+          )
+
+          mapfile -t actual < <(
+            find dist/appimage -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#actual[@]}" -eq "${#wanted[@]}"
+          test "$(printf '%s\n' "${actual[@]}")" = "$(printf '%s\n' "${wanted[@]}")"
+          test -z "$(find dist/appimage -maxdepth 1 -type l -print -quit)"
+
+      - name: Upload verified unsigned release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: studiocast-gui-installer-ubuntu-22.04-unsigned
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/appimage/StudioCast-Installer-*.AppImage
+            dist/appimage/StudioCast-Installer-*.AppDir.tar.gz
+            dist/appimage/StudioCast-Installer-*.sha256
+            dist/appimage/StudioCast-*-source.tar.gz
+
+  sign-release:
+    name: Sign and verify release artifacts
+    needs:
+      - gui-installer-appimage
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.signing_dry_run &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-22.04
+    environment: release-signing
+    env:
+      RELEASE_PUBLIC_KEY_ID: studiocast-release-2026
+      RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/studiocast-release-2026.pem
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+    steps:
+      - name: Checkout trusted signing tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified unsigned release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: studiocast-gui-installer-ubuntu-22.04-unsigned
+          path: dist/appimage
+
+      - name: Validate unsigned artifact identity
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          version="$(git show "${expected_commit}:VERSION" | tr -d '[:space:]')"
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            test -n "${RELEASE_TAG}"
+            test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+            test "${RELEASE_TAG}" = "v${version}"
+          else
+            test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+            test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"
+          fi
+
+          bundle="StudioCast-Installer-${version}-x86_64"
+          source_archive="dist/appimage/StudioCast-${version}-source.tar.gz"
+          installer_appimage="dist/appimage/${bundle}.AppImage"
+          appdir_archive="dist/appimage/${bundle}.AppDir.tar.gz"
+          checksum_file="dist/appimage/${bundle}.sha256"
+          expected=(
+            "$(basename "${installer_appimage}")"
+            "$(basename "${appdir_archive}")"
+            "$(basename "${checksum_file}")"
+            "$(basename "${source_archive}")"
+          )
+
+          mapfile -t actual < <(
+            find dist/appimage -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#actual[@]}" -eq 4
+          test "$(printf '%s\n' "${actual[@]}")" = "$(printf '%s\n' "${wanted[@]}")"
+          test -z "$(find dist/appimage -maxdepth 1 -type l -print -quit)"
+          for artifact in "${source_archive}" "${installer_appimage}" \
+              "${appdir_archive}" "${checksum_file}"; do
+            test -f "${artifact}"
+            test ! -L "${artifact}"
+          done
+
+          mapfile -t checksum_names < <(awk '{print $2}' "${checksum_file}" | sort)
+          mapfile -t checksum_expected < <(
+            printf '%s\n' "${expected[0]}" "${expected[1]}" "${expected[3]}" | sort
+          )
+          test "${#checksum_names[@]}" -eq 3
+          test "$(printf '%s\n' "${checksum_names[@]}")" = \
+            "$(printf '%s\n' "${checksum_expected[@]}")"
+          (cd dist/appimage && sha256sum --check "$(basename "${checksum_file}")")
+
+          archive_commit="$(gzip -cd -- "${source_archive}" | git get-tar-commit-id)"
+          test "${archive_commit}" = "${expected_commit}"
+          test "$(tar -xOzf "${source_archive}" "StudioCast-${version}/VERSION" | \
+            tr -d '[:space:]')" = "${version}"
+          tar -xOzf "${appdir_archive}" \
+            "${bundle}.AppDir/usr/share/studiocast/source/$(basename "${source_archive}")" | \
+            cmp - "${source_archive}"
+          tar -xOzf "${appdir_archive}" \
+            "${bundle}.AppDir/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem" | \
+            cmp - "${RELEASE_PUBLIC_KEY_PATH}"
+
+          forbidden='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
+          ! tar -xOzf "${source_archive}" | grep -aE -- "${forbidden}" >/dev/null
+          ! tar -xOzf "${appdir_archive}" | grep -aE -- "${forbidden}" >/dev/null
+
+          {
+            echo "version=${version}"
+            echo "expected_commit=${expected_commit}"
+            echo "source_archive=${source_archive}"
+            echo "installer_appimage=${installer_appimage}"
+            echo "appdir_archive=${appdir_archive}"
+            echo "checksum_file=${checksum_file}"
+          } >> "${GITHUB_ENV}"
+
       - name: Generate signed stable release manifest
-        if: >-
-          github.event_name == 'release' ||
-          (github.event_name == 'workflow_dispatch' && inputs.signing_dry_run)
         env:
           RELEASE_SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY_B64 }}
           RELEASE_SIGNING_KEY_ID: ${{ vars.RELEASE_SIGNING_KEY_ID }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           : "${RELEASE_SIGNING_KEY_B64:?Signed releases require RELEASE_SIGNING_KEY_B64}"
           : "${RELEASE_SIGNING_KEY_ID:?Signed releases require RELEASE_SIGNING_KEY_ID}"
           test "${RELEASE_SIGNING_KEY_ID}" = "${RELEASE_PUBLIC_KEY_ID}"
 
-          version="$(tr -d '[:space:]' < VERSION)"
-          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
-            test "${RELEASE_TAG}" = "v${version}"
-          fi
-          source_archive="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-${version}-source.tar.gz" -print -quit)"
-          installer_appimage="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-Installer-${version}-*.AppImage" -print -quit)"
-          test -n "${source_archive}"
-          test -n "${installer_appimage}"
-
-          private_key="$(mktemp)"
-          trap 'rm -f "${private_key}"' EXIT
-          chmod 0600 "${private_key}"
+          umask 077
+          private_key="$(mktemp "${RUNNER_TEMP}/studiocast-release-key.XXXXXX")"
+          cleanup_private_key() {
+            rm -f -- "${private_key}"
+          }
+          trap cleanup_private_key EXIT
           printf '%s' "${RELEASE_SIGNING_KEY_B64}" | base64 --decode > "${private_key}"
+          unset RELEASE_SIGNING_KEY_B64
+          chmod 0600 "${private_key}"
+          cmp \
+            <(openssl pkey -in "${private_key}" -pubout -outform DER) \
+            <(openssl pkey -pubin -in "${RELEASE_PUBLIC_KEY_PATH}" -outform DER)
 
           python3 packaging/release/release_tool.py \
             --version "${version}" \
@@ -133,30 +284,20 @@ jobs:
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}" \
             --release-page-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${version}" \
             --repository "https://github.com/${GITHUB_REPOSITORY}" \
-            --commit "${GITHUB_SHA}" \
+            --commit "${expected_commit}" \
             --workflow-run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --private-key "${private_key}" \
             --key-id "${RELEASE_SIGNING_KEY_ID}" \
             --output dist/appimage/studiocast-release-manifest.json \
             --signature-output dist/appimage/studiocast-release-manifest.json.sig
+          cleanup_private_key
+          trap - EXIT
+          unset private_key
 
-      - name: Verify GUI installer bundle
+      - name: Hermetically verify signed release and packaged trust root
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          packaging/appimage/verify_bundle.sh --require-appimage \
-            --trusted-release-key \
-            "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
-
-      - name: Verify signed stable release
-        if: >-
-          github.event_name == 'release' ||
-          (github.event_name == 'workflow_dispatch' && inputs.signing_dry_run)
-        run: |
-          version="$(tr -d '[:space:]' < VERSION)"
-          source_archive="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-${version}-source.tar.gz" -print -quit)"
-          installer_appimage="$(find dist/appimage -maxdepth 1 -type f -name "StudioCast-Installer-${version}-*.AppImage" -print -quit)"
-          test -n "${source_archive}"
-          test -n "${installer_appimage}"
-
           python3 packaging/release/verify_signed_release.py \
             --manifest dist/appimage/studiocast-release-manifest.json \
             --signature dist/appimage/studiocast-release-manifest.json.sig \
@@ -165,10 +306,37 @@ jobs:
             --public-key "${RELEASE_PUBLIC_KEY_PATH}" \
             --key-id "${RELEASE_PUBLIC_KEY_ID}"
 
-      - name: Upload release packaging artifacts
+          # actions/download-artifact does not preserve executable modes.
+          chmod 0755 "${installer_appimage}"
+          extracted="$(mktemp -d "${RUNNER_TEMP}/studiocast-appimage.XXXXXX")"
+          trap 'rm -rf -- "${extracted}"' EXIT
+          (cd "${extracted}" && "${GITHUB_WORKSPACE}/${installer_appimage}" \
+            --appimage-extract >/dev/null)
+          cmp \
+            "${RELEASE_PUBLIC_KEY_PATH}" \
+            "${extracted}/squashfs-root/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem"
+
+          forbidden='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
+          test -z "$(find "${extracted}/squashfs-root" -type f \
+            -exec grep -IlE -- "${forbidden}" {} + || true)"
+          ! tar -xOzf "${source_archive}" | grep -aE -- "${forbidden}" >/dev/null
+          ! tar -xOzf "${appdir_archive}" | grep -aE -- "${forbidden}" >/dev/null
+          test -z "$(find dist/appimage -maxdepth 1 -type f \
+            -exec grep -IlE -- "${forbidden}" {} + || true)"
+
+          mapfile -t final_files < <(
+            find dist/appimage -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          test "${#final_files[@]}" -eq 6
+          printf '%s\n' "${final_files[@]}" | grep -Fx \
+            'studiocast-release-manifest.json' >/dev/null
+          printf '%s\n' "${final_files[@]}" | grep -Fx \
+            'studiocast-release-manifest.json.sig' >/dev/null
+
+      - name: Upload signed release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: studiocast-gui-installer-ubuntu-22.04
+          name: studiocast-gui-installer-ubuntu-22.04-signed
           if-no-files-found: error
           path: |
             dist/appimage/StudioCast-Installer-*.AppImage

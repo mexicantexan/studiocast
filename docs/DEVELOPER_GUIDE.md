@@ -216,12 +216,23 @@ Release packaging:
   `workflow_dispatch` or a published GitHub Release event, downloads AppImage
   packaging tools from `packaging/appimage/tools.lock`, verifies each tool's
   SHA256 before making it executable, requires AppImage generation with the
-  committed public trust root, and uploads the installer bundle, AppDir archive,
-  source archive, and checksum file as workflow artifacts. Published releases
-  are signed; workflow dispatch is unsigned unless its `signing_dry_run` input
-  is explicitly enabled. Signed runs hermetically verify the manifest and both
-  artifacts against the committed public key. The workflow does not tag commits
-  or publish release assets by itself.
+  committed public trust root, and uploads an exact unsigned set containing the
+  installer bundle, AppDir archive, source archive, and checksum file. The build
+  job has no access to signing variables or secrets. Published releases are
+  signed by a separate fresh job; workflow dispatch is unsigned unless its
+  `signing_dry_run` input is explicitly enabled on the repository default
+  branch. Signed dispatch from another ref fails closed.
+- The signing job uses the protected `release-signing` environment, which
+  requires reviewer `mexicantexan` and permits branch `master` and tags matching
+  `v*`. `RELEASE_SIGNING_KEY_B64` exists only as an environment secret;
+  `RELEASE_SIGNING_KEY_ID` is the repository variable. The job downloads the
+  unsigned artifact set, validates its exact names, checksums, source commit,
+  version/tag identity, staged source, and packaged public key before injecting
+  the secret into the signing step. It checks out signing code at the immutable
+  workflow commit, removes its ephemeral key before inspecting the built
+  AppImage, then hermetically verifies the manifest and both signed artifacts
+  against the committed public key. The workflow does not tag commits or publish
+  release assets by itself.
 - Recommended remains a target-machine source build, but only after the backend
   verifies the signed stable manifest and source artifact signature/hash/size.
   `--official-source` is not proof. Local directories/archives remain
@@ -271,10 +282,12 @@ First release checklist:
 
 6. In GitHub, create and publish a Release for that tag. Publishing the Release
    triggers `.github/workflows/release-packaging.yml`.
-7. After release packaging finishes, download the
-   `studiocast-gui-installer-ubuntu-22.04` workflow artifact and attach the
-   AppImage, AppDir archive, source archive, and SHA256 file to the GitHub
-   Release.
+7. Approve the `release-signing` environment deployment after checking the tag
+   and workflow run identity.
+8. After release packaging finishes, download the
+   `studiocast-gui-installer-ubuntu-22.04-signed` workflow artifact and attach
+   the AppImage, AppDir archive, source archive, SHA256 file, release manifest,
+   and manifest signature to the GitHub Release.
 
 Pinned AppImage tool updates:
 

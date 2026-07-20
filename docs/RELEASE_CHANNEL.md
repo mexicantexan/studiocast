@@ -31,6 +31,12 @@ signing capability only through the protected `RELEASE_SIGNING_KEY_B64` secret;
 `tests/data/installer_release` is visibly test-only and must never be trusted by
 a shipped installer.
 
+GitHub stores `RELEASE_SIGNING_KEY_B64` only in the protected
+`release-signing` environment. That environment requires approval from reviewer
+`mexicantexan` and permits deployments only from branch `master` or tags matching
+`v*`. The non-secret `RELEASE_SIGNING_KEY_ID` remains a repository Actions
+variable.
+
 Release-grade AppImage packaging also requires each production public key
 explicitly:
 
@@ -193,18 +199,36 @@ python3 packaging/release/release_tool.py \
   --signature-output dist/appimage/studiocast-release-manifest.json.sig
 ```
 
-For a published-release workflow, CI requires `RELEASE_SIGNING_KEY_B64` and the
-repository variable `RELEASE_SIGNING_KEY_ID=studiocast-release-2026`. The
-ephemeral signing input is mode `0600` and removed by a shell trap. CI uploads
-the manifest and signature with the AppImage/source artifacts; a release
-maintainer must attach all of them to the matching GitHub Release. Workflow
-dispatch builds unsigned packaging artifacts by default. Setting its explicit
-`signing_dry_run` boolean input performs the same signing and hermetic
-verification without publishing artifacts to a GitHub Release.
+Release CI separates building from signing. The build job never references a
+signing variable or secret. It verifies and uploads an exact unsigned artifact
+set: AppImage, AppDir archive, source archive, and checksum file. A fresh signing
+job downloads those bytes, checks their exact names and checksums, binds the
+source archive's embedded `git archive` commit to the event commit, verifies the
+version/tag identity, and compares the AppDir's public key and staged source to
+the committed inputs before the protected environment secret is injected into
+the signing step.
 
-After signing, CI verifies the detached manifest signature and both artifacts'
-signed size, SHA-256, and Ed25519 identity against the committed public key. It
-also extracts the final AppImage, compares its
+Only the signing job references `RELEASE_SIGNING_KEY_B64` and the repository
+variable `RELEASE_SIGNING_KEY_ID=studiocast-release-2026`. It runs in the
+protected `release-signing` environment and checks out signing tooling at the
+immutable workflow commit rather than from the artifact-producing ref. The
+ephemeral private-key file is mode `0600`; the base64 environment value is
+unset immediately after decoding, and the file is removed before artifact code
+is executed for AppImage inspection.
+
+Published Release events may enter the signing job and must still use a release
+tag exactly equal to `v<VERSION>`. Workflow dispatch builds unsigned packaging
+artifacts by default. Its explicit `signing_dry_run` boolean may enter the
+signing environment only when the workflow itself is dispatched from the
+repository default branch; a signed dispatch from another ref fails. The signed
+artifact upload includes the manifest and signature with the four verified
+packaging files, and a release maintainer must attach the release files to the
+matching GitHub Release.
+
+After the private-key file has been removed, CI verifies the detached manifest
+signature and both artifacts' signed size, SHA-256, filename, and Ed25519
+identity against the committed public key. It also extracts the final AppImage,
+compares its
 `usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem` bytes to
 the committed key, and rejects forbidden secret PEM markers in staged and
 uploaded release artifacts.
