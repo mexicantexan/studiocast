@@ -515,7 +515,8 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
       Contains(pipeline, "have_open_vulkan_vignette") &&
           Contains(pipeline,
                    "Open Vulkan: Vignette (fixed center after framing") &&
-          Contains(pipeline, "device-resident attenuation mask") &&
+          Contains(pipeline, "DEVICE_LOCAL source/scratch/output and") &&
+          Contains(pipeline, "attenuation mask, bounded upload/final-readback") &&
           !Contains(pipeline, "device-resident radial mask") &&
           Contains(pipeline,
                    "open_vulkan_vignette_counters.factor_generation_calls") &&
@@ -553,9 +554,15 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
 
   const std::string helper =
       ReadFile(root / "src" / "core" / "video" / "open_vulkan_vignette.cpp");
+  const std::string helper_header =
+      ReadFile(root / "src" / "core" / "video" / "open_vulkan_vignette.h");
   ok &= Require(Contains(helper, "OpenVulkanVignetteRuntimeFailure") &&
                     Contains(helper, "ApplyFinalVignetteU8x3") &&
                     Contains(helper, "production_hardware_ready") &&
+                    Contains(helper, "UploadF32_1ToDeviceLocal") &&
+                    Contains(helper, "/*map_memory=*/false") &&
+                    Contains(helper_header,
+                             "vulkan_effect_residency_contract_failed") &&
                     Contains(helper, "factor_upload_calls") &&
                     Contains(helper, "0.70710677f"),
                 "vignette stable reasons, hardware gate, CUDA coordinate "
@@ -615,6 +622,10 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
           Contains(orchestration, "resources.mirror->ApplyFinal") &&
           Contains(executable_test, "mirror RGB no resize") &&
           Contains(executable_test, "mirror BGR resize") &&
+          Contains(executable_test, "input_image.device_local()") &&
+          Contains(executable_test,
+                   "host_visible_intermediate_allocation_calls") &&
+          Contains(executable_test, "ReadbackU8x3") &&
           Contains(executable_test, "STUDIOCAST_REQUIRE_VULKAN_RUNTIME") &&
           Contains(cmake,
                    "studiocast-vulkan-final-stage-integration-tests"),
@@ -623,6 +634,8 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
 
   const std::string helper =
       ReadFile(root / "src" / "core" / "video" / "open_vulkan_mirror.cpp");
+  const std::string helper_header =
+      ReadFile(root / "src" / "core" / "video" / "open_vulkan_mirror.h");
   ok &= Require(Contains(helper, "vulkan_effect_initialization_failed") ||
                     Contains(ReadFile(root / "src" / "core" / "video" /
                                       "open_vulkan_mirror.h"),
@@ -631,6 +644,9 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
   ok &= Require(Contains(helper, "OpenVulkanMirrorRuntimeFailure") &&
                     Contains(helper, "MirrorHorizontalU8x3") &&
                     Contains(helper, "ResizeMirrorHorizontalU8x3") &&
+                    Contains(helper_header,
+                             "vulkan_effect_residency_contract_failed") &&
+                    Contains(helper, "non-mapped DEVICE_LOCAL resources") &&
                     Contains(helper, "production_hardware_ready"),
                 "mirror runtime stable reason or real kernel call is missing");
   const std::string utility = ReadFile(root / "src" / "core" / "vulkan" /

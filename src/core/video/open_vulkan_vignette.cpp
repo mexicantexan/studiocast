@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <vector>
 
 namespace studiocast::video {
 namespace {
@@ -35,6 +36,16 @@ std::string NestedSharedFailure(const OpenVulkanVignetteReadiness &readiness) {
 bool FinalImageMatches(const studiocast::vulkan::VulkanImage *image, int width,
                        int height) {
   return image && image->width() == width && image->height() == height;
+}
+
+bool IsDeviceLocalResident(const studiocast::vulkan::VulkanImage &image) {
+  return image.Valid() && image.device_local() && !image.mapped();
+}
+
+std::string ResidencyFailure(std::string_view detail) {
+  return StableFailure(kOpenVulkanVignetteResidencyFailureReason,
+                       "Open Vulkan vignette residency contract failed",
+                       detail);
 }
 
 } // namespace
@@ -173,7 +184,8 @@ bool OpenVulkanVignette::EnsureInitialized(
   const bool reusable_factor =
       initialized_ && kernels_ == kernels && width_ == width &&
       height_ == height && attenuation_factor_.Valid() &&
-      attenuation_factor_.BelongsTo(*kernels->device());
+      attenuation_factor_.BelongsTo(*kernels->device()) &&
+      IsDeviceLocalResident(attenuation_factor_);
   if (reusable_factor && intensity_percent_ == intensity_percent) {
     return true;
   }
@@ -182,7 +194,7 @@ bool OpenVulkanVignette::EnsureInitialized(
     if (!attenuation_factor_.Allocate(
             kernels->device(), width, height,
             studiocast::vulkan::VulkanPixelFormat::f32_1,
-            /*map_memory=*/true, &detail)) {
+            /*map_memory=*/false, &detail)) {
       if (error_out)
         *error_out = OpenVulkanVignetteInitializationFailure(detail);
       return false;
@@ -190,15 +202,18 @@ bool OpenVulkanVignette::EnsureInitialized(
     ++counters->factor_allocation_calls;
   }
 
-  auto *mask = static_cast<float *>(attenuation_factor_.mapped());
-  if (!mask) {
+  if (!IsDeviceLocalResident(attenuation_factor_)) {
     Shutdown();
     if (error_out) {
       *error_out = OpenVulkanVignetteInitializationFailure(
-          "device attenuation-factor mask is not mapped");
+          ResidencyFailure(
+              "attenuation-factor mask is not non-mapped DEVICE_LOCAL"));
     }
     return false;
   }
+  const std::size_t factor_count = static_cast<std::size_t>(width) *
+                                   static_cast<std::size_t>(height);
+  std::vector<float> factors(factor_count);
   const float center_x = static_cast<float>(width) * 0.5f;
   const float center_y = static_cast<float>(height) * 0.5f;
   const float intensity = static_cast<float>(intensity_percent) / 100.0f;
@@ -206,19 +221,33 @@ bool OpenVulkanVignette::EnsureInitialized(
     for (int x = 0; x < width; ++x) {
       const float radial_squared = detail::OpenVulkanVignetteRadialSquaredAt(
           x, y, width, height, center_x, center_y);
-      mask[static_cast<std::size_t>(y) * attenuation_factor_.pitch_pixels() +
-           static_cast<std::size_t>(x)] =
+      factors[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+              static_cast<std::size_t>(x)] =
           std::max(0.0f, 1.0f - intensity * radial_squared);
     }
   }
   ++counters->factor_generation_calls;
-  if (!attenuation_factor_.Flush(&detail)) {
+  studiocast::vulkan::VulkanImage upload_staging;
+  if (!upload_staging.Allocate(
+          kernels->device(), width, height,
+          studiocast::vulkan::VulkanPixelFormat::f32_1,
+          /*map_memory=*/true, &detail)) {
+    Shutdown();
+    if (error_out)
+      *error_out = OpenVulkanVignetteInitializationFailure(detail);
+    return false;
+  }
+  ++counters->factor_staging_allocation_calls;
+  if (!kernels->UploadF32_1ToDeviceLocal(
+          factors.data(), factors.size(), upload_staging, attenuation_factor_,
+          &detail)) {
     Shutdown();
     if (error_out)
       *error_out = OpenVulkanVignetteInitializationFailure(detail);
     return false;
   }
   ++counters->factor_upload_calls;
+  ++counters->factor_upload_completion_calls;
 
   if (!reusable_factor) {
     // The old mask was destroyed before this allocation. Vulkan is allowed to
@@ -262,6 +291,15 @@ bool OpenVulkanVignette::ApplyFinal(
     ++counters->runtime_failure_frames;
     return false;
   }
+  if (!IsDeviceLocalResident(attenuation_factor_)) {
+    if (error_out) {
+      *error_out = OpenVulkanVignetteRuntimeFailure(ResidencyFailure(
+          "persistent attenuation-factor mask is not non-mapped "
+          "DEVICE_LOCAL"));
+    }
+    ++counters->runtime_failure_frames;
+    return false;
+  }
   if (!input.src || !input.dst) {
     if (error_out)
       *error_out = OpenVulkanVignetteRuntimeFailure("input or output is null");
@@ -276,6 +314,19 @@ bool OpenVulkanVignette::ApplyFinal(
        !FinalImageMatches(input.mirrored_dst, width_, height_))) {
     if (error_out)
       *error_out = OpenVulkanVignetteRuntimeFailure("frame dimensions changed");
+    ++counters->runtime_failure_frames;
+    return false;
+  }
+  if (!IsDeviceLocalResident(*input.src) ||
+      (input.resize_scratch &&
+       !IsDeviceLocalResident(*input.resize_scratch)) ||
+      !IsDeviceLocalResident(*input.dst) ||
+      (input.mirrored_dst && !IsDeviceLocalResident(*input.mirrored_dst))) {
+    if (error_out) {
+      *error_out = OpenVulkanVignetteRuntimeFailure(ResidencyFailure(
+          "source, resize scratch, vignette output, and optional mirror "
+          "output must all be non-mapped DEVICE_LOCAL resources"));
+    }
     ++counters->runtime_failure_frames;
     return false;
   }

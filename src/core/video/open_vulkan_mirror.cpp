@@ -30,6 +30,15 @@ std::string NestedSharedFailure(const OpenVulkanMirrorReadiness &readiness) {
   return StableFailure(readiness.shared_reason_code, readiness.detail, {});
 }
 
+bool IsDeviceLocalResident(const studiocast::vulkan::VulkanImage &image) {
+  return image.Valid() && image.device_local() && !image.mapped();
+}
+
+std::string ResidencyFailure(std::string_view detail) {
+  return StableFailure(kOpenVulkanMirrorResidencyFailureReason,
+                       "Open Vulkan mirror residency contract failed", detail);
+}
+
 } // namespace
 
 std::string OpenVulkanMirrorInitializationFailure(std::string_view detail) {
@@ -172,6 +181,14 @@ bool OpenVulkanMirror::ApplyFinal(const OpenVulkanMirrorFinalStageInput &input,
     ++counters->runtime_failure_frames;
     return false;
   }
+  if (!IsDeviceLocalResident(src) || !IsDeviceLocalResident(dst)) {
+    if (error_out) {
+      *error_out = OpenVulkanMirrorRuntimeFailure(ResidencyFailure(
+          "source and output must be non-mapped DEVICE_LOCAL resources"));
+    }
+    ++counters->runtime_failure_frames;
+    return false;
+  }
 
   std::string detail;
   const std::uint64_t submissions_before =
@@ -225,6 +242,17 @@ bool OpenVulkanMirror::ApplyResizeFinal(
       input.dst->width() != width_ || input.dst->height() != height_) {
     if (error_out)
       *error_out = OpenVulkanMirrorRuntimeFailure("frame dimensions changed");
+    ++counters->runtime_failure_frames;
+    return false;
+  }
+  if (!IsDeviceLocalResident(*input.src) ||
+      !IsDeviceLocalResident(*input.resized) ||
+      !IsDeviceLocalResident(*input.dst)) {
+    if (error_out) {
+      *error_out = OpenVulkanMirrorRuntimeFailure(ResidencyFailure(
+          "source, resize scratch, and output must be non-mapped "
+          "DEVICE_LOCAL resources"));
+    }
     ++counters->runtime_failure_frames;
     return false;
   }

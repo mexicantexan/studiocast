@@ -43,6 +43,11 @@ struct OpenVulkanFinalResidentStageInput {
 struct OpenVulkanFinalResidentStageCounters {
   std::uint64_t execution_calls = 0;
   std::uint64_t resource_allocation_calls = 0;
+  std::uint64_t device_local_allocation_calls = 0;
+  // The helper never allocates mapped effect/intermediate storage. Initial
+  // upload and final readback staging remain caller-owned transport resources.
+  std::uint64_t host_visible_intermediate_allocation_calls = 0;
+  std::uint64_t residency_rejection_calls = 0;
   std::uint64_t successful_output_frames = 0;
   // The resident helper has no host continuation. These stay zero and are
   // asserted by the executable production-path test.
@@ -71,8 +76,10 @@ struct OpenVulkanFinalResidentStageResult {
 
 // Runs the canonical resident final-output decision in this fixed order:
 // output resize (when needed) -> fixed-center vignette -> mirror. It performs
-// no CPU fallback and no readback; the caller owns the single final output
-// readback required by the camera writer boundary.
+// no CPU fallback and no readback. Source, scratch, and every effect output
+// must be non-mapped DEVICE_LOCAL resources; the caller owns the bounded
+// upload staging and the single final readback staging required by the camera
+// writer boundary.
 bool ExecuteOpenVulkanFinalResidentStage(
     const OpenVulkanFinalResidentStageInput &input,
     const OpenVulkanFinalResidentStageResources &resources,
