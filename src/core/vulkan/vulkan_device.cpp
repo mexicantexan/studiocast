@@ -247,11 +247,11 @@ VkDeviceSize DerivedAllocationBudget(
   return total;
 }
 
-void QuarantineUnsafeTimeoutLoader(std::shared_ptr<VulkanLoader> loader) {
-  // A fence timeout means command buffers/resources may still be in use.
-  // Calling child destruction or vkDestroyDevice can violate Vulkan lifetime
-  // rules or block indefinitely. Retain the loader until process teardown and
-  // let the OS reclaim the abandoned poisoned context.
+void QuarantineUnsafeContextLoader(std::shared_ptr<VulkanLoader> loader) {
+  // An uncompleted submitted command means command buffers/resources may still
+  // be in use. Calling child destruction or vkDestroyDevice can violate Vulkan
+  // lifetime rules or block indefinitely. Retain the loader until process
+  // teardown and let the OS reclaim the abandoned poisoned context.
   static auto *mutex = new std::mutex();
   static auto *loaders = new std::vector<std::shared_ptr<VulkanLoader>>();
   std::lock_guard<std::mutex> lock(*mutex);
@@ -320,7 +320,7 @@ VulkanContextState::~VulkanContextState() {
   if (!loader)
     return;
   if (!SafeToDestroyChildren()) {
-    QuarantineUnsafeTimeoutLoader(std::move(loader));
+    QuarantineUnsafeContextLoader(std::move(loader));
     return;
   }
   const auto &vf = loader->f();
@@ -355,7 +355,11 @@ bool VulkanContextState::Healthy() const {
 
 bool VulkanContextState::SafeToDestroyChildren() const {
   std::lock_guard<std::mutex> lock(health_mutex);
-  return health.health != VulkanContextHealth::unsafe_timeout;
+  const bool fatal_wait_completion_unknown =
+      health.health == VulkanContextHealth::fatal_submission_error &&
+      health.submitted_serial > health.completed_serial;
+  return health.health != VulkanContextHealth::unsafe_timeout &&
+         !fatal_wait_completion_unknown;
 }
 
 VulkanHealthSnapshot VulkanContextState::HealthSnapshot() const {
@@ -1510,39 +1514,23 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
     return false;
   }
 
-  {
-    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
-    ++context_->health.submitted_serial;
-  }
-
-  if (context_->injected_submission_result) {
-    const auto injected = *context_->injected_submission_result;
-    context_->injected_submission_result.reset();
-    const char *operation = "injected Vulkan submission";
-    switch (injected.first) {
-    case VulkanSubmissionPhase::reset_fence:
-      operation = "vkResetFences";
-      break;
-    case VulkanSubmissionPhase::queue_submit:
-      operation = "vkQueueSubmit";
-      break;
-    case VulkanSubmissionPhase::wait_for_fence:
-      operation = "vkWaitForFences";
-      break;
+  const auto consume_injected_failure = [&](VulkanSubmissionPhase phase) {
+    std::optional<VkResult> injected_failure;
+    if (context_->injected_submission_result &&
+        context_->injected_submission_result->first == phase) {
+      const VkResult injected = context_->injected_submission_result->second;
+      context_->injected_submission_result.reset();
+      if (injected != VK_SUCCESS)
+        injected_failure = injected;
     }
-    if (!context_->RecordDriverFailure(injected.second, operation,
-                                       /*submission_failure=*/true,
-                                       error_out)) {
-      diagnostics_ = DiagnosticsSnapshot();
-      return false;
-    }
-    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
-    context_->health.completed_serial = context_->health.submitted_serial;
-    return true;
-  }
+    return injected_failure;
+  };
 
   const auto &vf = loader_->f();
-  VkResult result = vf.vkResetFences(device_, 1, &fence_);
+  const auto reset_failure =
+      consume_injected_failure(VulkanSubmissionPhase::reset_fence);
+  VkResult result =
+      reset_failure ? *reset_failure : vf.vkResetFences(device_, 1, &fence_);
   if (!context_->RecordDriverFailure(result, "vkResetFences",
                                      /*submission_failure=*/true, error_out)) {
     diagnostics_ = DiagnosticsSnapshot();
@@ -1552,15 +1540,25 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
   VkSubmitInfo submit{};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command_buffer;
-  result = vf.vkQueueSubmit(queue_, 1, &submit, fence_);
+  const auto submit_failure =
+      consume_injected_failure(VulkanSubmissionPhase::queue_submit);
+  result = submit_failure ? *submit_failure
+                          : vf.vkQueueSubmit(queue_, 1, &submit, fence_);
   if (!context_->RecordDriverFailure(result, "vkQueueSubmit",
                                      /*submission_failure=*/true, error_out)) {
     diagnostics_ = DiagnosticsSnapshot();
     return false;
   }
+  {
+    std::lock_guard<std::mutex> health_lock(context_->health_mutex);
+    ++context_->health.submitted_serial;
+  }
 
-  result =
-      vf.vkWaitForFences(device_, 1, &fence_, 1, context_->fence_timeout_ns);
+  const auto wait_failure =
+      consume_injected_failure(VulkanSubmissionPhase::wait_for_fence);
+  result = wait_failure ? *wait_failure
+                        : vf.vkWaitForFences(device_, 1, &fence_, 1,
+                                             context_->fence_timeout_ns);
   if (!context_->RecordDriverFailure(result, "vkWaitForFences",
                                      /*submission_failure=*/true, error_out)) {
     diagnostics_ = DiagnosticsSnapshot();
@@ -1935,57 +1933,59 @@ bool VulkanCommandBatch::Complete(std::string *error_out) {
     recording_owner_ = {};
     return false;
   }
+  const auto consume_injected_failure = [&](VulkanSubmissionPhase phase) {
+    std::optional<VkResult> injected_failure;
+    if (context_->injected_submission_result &&
+        context_->injected_submission_result->first == phase) {
+      const VkResult injected = context_->injected_submission_result->second;
+      context_->injected_submission_result.reset();
+      if (injected != VK_SUCCESS)
+        injected_failure = injected;
+    }
+    return injected_failure;
+  };
+
+  const auto reset_failure =
+      consume_injected_failure(VulkanSubmissionPhase::reset_fence);
+  result = reset_failure ? *reset_failure
+                         : context_->f().vkResetFences(context_->device, 1,
+                                                       &context_->fence);
+  if (!context_->RecordDriverFailure(result, "vkResetFences",
+                                     /*submission_failure=*/true, error_out)) {
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
+  }
+  VkSubmitInfo submit{};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer_;
+  const auto submit_failure =
+      consume_injected_failure(VulkanSubmissionPhase::queue_submit);
+  result = submit_failure ? *submit_failure
+                          : context_->f().vkQueueSubmit(
+                                context_->queue, 1, &submit, context_->fence);
+  if (!context_->RecordDriverFailure(result, "vkQueueSubmit",
+                                     /*submission_failure=*/true, error_out)) {
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
+  }
   {
     std::lock_guard<std::mutex> health_lock(context_->health_mutex);
     ++context_->health.submitted_serial;
   }
-
-  if (context_->injected_submission_result) {
-    const auto injected = *context_->injected_submission_result;
-    context_->injected_submission_result.reset();
-    const char *operation =
-        injected.first == VulkanSubmissionPhase::reset_fence ? "vkResetFences"
-        : injected.first == VulkanSubmissionPhase::queue_submit
-            ? "vkQueueSubmit"
-            : "vkWaitForFences";
-    result = injected.second;
-    if (!context_->RecordDriverFailure(result, operation,
-                                       /*submission_failure=*/true,
-                                       error_out)) {
-      recording_ = false;
-      recording_owner_ = {};
-      return false;
-    }
-  } else {
-    result = context_->f().vkResetFences(context_->device, 1, &context_->fence);
-    if (!context_->RecordDriverFailure(result, "vkResetFences",
-                                       /*submission_failure=*/true,
-                                       error_out)) {
-      recording_ = false;
-      recording_owner_ = {};
-      return false;
-    }
-    VkSubmitInfo submit{};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command_buffer_;
-    result = context_->f().vkQueueSubmit(context_->queue, 1, &submit,
-                                         context_->fence);
-    if (!context_->RecordDriverFailure(result, "vkQueueSubmit",
-                                       /*submission_failure=*/true,
-                                       error_out)) {
-      recording_ = false;
-      recording_owner_ = {};
-      return false;
-    }
-    result = context_->f().vkWaitForFences(
-        context_->device, 1, &context_->fence, 1, context_->fence_timeout_ns);
-    if (!context_->RecordDriverFailure(result, "vkWaitForFences",
-                                       /*submission_failure=*/true,
-                                       error_out)) {
-      recording_ = false;
-      recording_owner_ = {};
-      return false;
-    }
+  const auto wait_failure =
+      consume_injected_failure(VulkanSubmissionPhase::wait_for_fence);
+  result =
+      wait_failure
+          ? *wait_failure
+          : context_->f().vkWaitForFences(context_->device, 1, &context_->fence,
+                                          1, context_->fence_timeout_ns);
+  if (!context_->RecordDriverFailure(result, "vkWaitForFences",
+                                     /*submission_failure=*/true, error_out)) {
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
   }
 
   {

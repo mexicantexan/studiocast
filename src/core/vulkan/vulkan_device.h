@@ -419,8 +419,10 @@ public:
   bool InvalidateMemory(VkDeviceMemory memory, VkDeviceSize offset,
                         VkDeviceSize size, std::string *error_out) const;
 
-  // Deterministic fault-injection seam. When present, SubmitAndWait consumes
-  // this result without calling the driver and exercises the same latch path.
+  // Deterministic fault-injection seam. A failing result replaces the named
+  // driver call at its actual phase. In particular, wait_for_fence injection
+  // occurs only after vkQueueSubmit succeeds, so tests can prove the
+  // completion-unknown teardown quarantine. Production defaults are unchanged.
   void InjectNextSubmissionResultForTesting(VulkanSubmissionPhase phase,
                                             VkResult result);
 

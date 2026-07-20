@@ -1296,6 +1296,87 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
   return ok;
 }
 
+bool TestSharedVulkanSynchronizationAndLifetimeContracts() {
+  const fs::path root(STUDIOCAST_SOURCE_DIR);
+  const std::string utility = ReadFile(root / "src" / "core" / "vulkan" /
+                                       "kernels" / "utility_kernels.cpp");
+  const std::string device =
+      ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.cpp");
+  const std::string pipeline =
+      ReadFile(root / "src" / "core" / "video" / "camera_pipeline.cpp");
+  bool ok = Require(!utility.empty() && !device.empty() && !pipeline.empty(),
+                    "shared Vulkan synchronization sources are missing");
+
+  const std::string generic_dispatch =
+      Section(utility, "bool UtilityKernels::DispatchTwoPass(",
+              "bool UtilityKernels::SubmitRecorded(");
+  ok &= Require(
+      Contains(generic_dispatch, "data_read_barriers") &&
+          Contains(generic_dispatch,
+                   "VulkanBufferAccess::host_or_compute_write") &&
+          Contains(generic_dispatch, "VulkanBufferAccess::host_write") &&
+          Contains(generic_dispatch, "parameter_read_barrier") &&
+          !Contains(generic_dispatch,
+                    "std::array<VkBufferMemoryBarrier, 4> read_barriers"),
+      "generic utility dispatch must synchronize uploaded or compute-produced "
+      "data separately from its exact host-written parameter buffer");
+
+  const std::string safe_destroy =
+      Section(device, "bool VulkanContextState::SafeToDestroyChildren() const",
+              "VulkanHealthSnapshot VulkanContextState::HealthSnapshot()");
+  ok &= Require(
+      Contains(safe_destroy, "fatal_wait_completion_unknown") &&
+          Contains(safe_destroy,
+                   "health.submitted_serial > health.completed_serial") &&
+          Contains(safe_destroy, "VulkanContextHealth::unsafe_timeout"),
+      "teardown must quarantine timeout and non-timeout fatal wait failures "
+      "whose accepted submission has no proven completion");
+
+  const auto verify_submission_order = [&](const std::string &section,
+                                           const char *label) {
+    const std::size_t reset = section.find("vkResetFences");
+    const std::size_t submit = section.find("vkQueueSubmit", reset);
+    const std::size_t submitted_serial =
+        section.find("++context_->health.submitted_serial", submit);
+    const std::size_t wait = section.find("vkWaitForFences", submitted_serial);
+    return Require(
+        Contains(section, "consume_injected_failure") &&
+            Contains(section, "VulkanSubmissionPhase::wait_for_fence") &&
+            reset != std::string::npos && submit != std::string::npos &&
+            submitted_serial != std::string::npos &&
+            wait != std::string::npos && reset < submit &&
+            submit < submitted_serial && submitted_serial < wait,
+        std::string(label) +
+            " must inject at the named phase and record submission only after "
+            "vkQueueSubmit succeeds");
+  };
+  ok &= verify_submission_order(
+      Section(device, "bool VulkanDevice::SubmitAndWait(",
+              "bool VulkanDevice::CheckDriverResult("),
+      "single-command submission");
+  ok &= verify_submission_order(Section(device,
+                                        "bool VulkanCommandBatch::Complete(",
+                                        "void VulkanCommandBatch::Abort()"),
+                                "batched submission");
+
+  const std::string vulkan_context =
+      Section(pipeline, "struct OpenVulkanVirtualBackgroundContext",
+              "} open_vulkan_vb;");
+  const std::string matte =
+      Section(vulkan_context, "bool EnsureMatteForFrameGpu(",
+              "bool EnsureFrameAlphaForFrameGpu(");
+  ok &= Require(
+      Contains(matte, "utility_submissions_before") &&
+          Contains(matte, "utility_submissions_after") &&
+          Contains(matte, "runtime_completions_before") &&
+          Contains(matte, "runtime_completions_after") &&
+          Contains(matte, "forced_sync_calls +=") &&
+          !Contains(matte, "++forced_sync_calls"),
+      "production Vulkan matting must count observed preprocess and inference "
+      "synchronous completions rather than one hardcoded completion");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -1313,5 +1394,6 @@ int main() {
   ok = TestVirtualKeyLightUsesTheCanonicalResidentWrapper() && ok;
   ok = TestDefaultMattingDiagnosticsRemainFailClosed() && ok;
   ok = TestAutoFrameDegradedPathRemainsExplicit() && ok;
+  ok = TestSharedVulkanSynchronizationAndLifetimeContracts() && ok;
   return ok ? 0 : 1;
 }

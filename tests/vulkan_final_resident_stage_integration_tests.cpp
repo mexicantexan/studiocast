@@ -377,6 +377,68 @@ bool RunProductionCases(UtilityKernels *kernels) {
   return ok;
 }
 
+bool RunComputeProducedSameSizeMirrorCase(UtilityKernels *kernels) {
+  constexpr int width = 5;
+  constexpr int height = 3;
+  // Prior production fixtures released their images. Prevent recycled opaque
+  // handles from matching stale descriptor tuples before this new setup.
+  kernels->InvalidateDescriptorBindingCacheForSetup();
+  std::vector<std::uint8_t> source(static_cast<std::size_t>(width) *
+                                   static_cast<std::size_t>(height) * 3u);
+  for (std::size_t index = 0; index < source.size(); ++index)
+    source[index] = static_cast<std::uint8_t>((index * 53u + 31u) & 0xffu);
+
+  std::string error;
+  VulkanImage uploaded;
+  VulkanImage compute_produced;
+  if (!AllocateAndUpload(kernels, &uploaded, width, height,
+                         VulkanPixelFormat::rgb_u8, source, &error) ||
+      !compute_produced.Allocate(kernels->device(), width, height,
+                                 VulkanPixelFormat::rgb_u8,
+                                 /*map_memory=*/false, &error)) {
+    return Require(false,
+                   "compute-produced final-stage setup failed: " + error);
+  }
+
+  const auto submissions_before = kernels->synchronous_submission_count();
+  if (!Require(kernels->ResizeBilinear(uploaded, compute_produced, &error),
+               "preceding real Vulkan producer failed: " + error)) {
+    return false;
+  }
+
+  FinalStageFixture fixture;
+  auto resources = fixture.Resources(kernels);
+  OpenVulkanFinalResidentStageInput input;
+  input.source = &compute_produced;
+  input.output_width = width;
+  input.output_height = height;
+  input.request_mirror = true;
+  input.preceding_effects_complete = true;
+  input.unmirrored_analysis_complete = true;
+  OpenVulkanFinalResidentStageResult result;
+  bool ok = Require(ExecuteOpenVulkanFinalResidentStage(
+                        input, resources, &fixture.counters, &result),
+                    "canonical same-size mirror after GPU producer failed: " +
+                        result.fatal_error);
+  ok &= Require(
+      result.output_valid && result.output && result.mirror_applied &&
+          !result.resize_applied && result.synchronous_completion_count == 1 &&
+          result.resident_stage_count == 1 &&
+          kernels->synchronous_submission_count() == submissions_before + 2,
+      "GPU producer and exact canonical same-size mirror must execute as two "
+      "ordered resident submissions");
+  std::uint64_t final_readbacks = 0;
+  const auto actual = ReadFinalOutput(*result.output, &final_readbacks, &error);
+  ok &= CompareBytes(actual, MirrorReference(source, width, height), true,
+                     "compute-produced canonical same-size mirror");
+  ok &= Require(final_readbacks == 1 &&
+                    fixture.counters.intermediate_readback_calls == 0 &&
+                    fixture.counters.cpu_fallback_calls == 0,
+                "compute-produced final path must retain one final-only "
+                "readback and no CPU/intermediate fallback");
+  return ok;
+}
+
 bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
   constexpr int width = 5;
   constexpr int height = 3;
@@ -486,6 +548,7 @@ int main() {
                     "real-device integration requires a healthy non-CPU "
                     "compute context");
   ok &= RunProductionCases(&kernels);
+  ok &= RunComputeProducedSameSizeMirrorCase(&kernels);
   ok &= RunOrderingAndIsolationCases(&kernels);
   if (ok)
     std::cout << "Open Vulkan final resident production-path tests passed\n";

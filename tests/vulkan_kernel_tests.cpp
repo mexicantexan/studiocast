@@ -850,6 +850,38 @@ int main() {
 
   ok &= TestVulkanDeviceSelectionPolicy();
   {
+    const auto data_read = studiocast::vulkan::VulkanBufferBarrier(
+        studiocast::vulkan::VulkanBufferAccess::host_or_compute_write,
+        studiocast::vulkan::VulkanBufferAccess::compute_read);
+    const auto parameter_read = studiocast::vulkan::VulkanBufferBarrier(
+        studiocast::vulkan::VulkanBufferAccess::host_write,
+        studiocast::vulkan::VulkanBufferAccess::compute_read);
+    ok &= Require(
+        data_read.src_access_mask ==
+                (studiocast::vulkan::VK_ACCESS_HOST_WRITE_BIT |
+                 studiocast::vulkan::VK_ACCESS_SHADER_WRITE_BIT) &&
+            data_read.src_stage_mask ==
+                (studiocast::vulkan::VK_PIPELINE_STAGE_HOST_BIT |
+                 studiocast::vulkan::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) &&
+            data_read.dst_access_mask ==
+                studiocast::vulkan::VK_ACCESS_SHADER_READ_BIT &&
+            data_read.dst_stage_mask ==
+                studiocast::vulkan::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        "generic Vulkan data inputs must synchronize both host-upload and "
+        "compute-producer provenance");
+    ok &= Require(
+        parameter_read.src_access_mask ==
+                studiocast::vulkan::VK_ACCESS_HOST_WRITE_BIT &&
+            parameter_read.src_stage_mask ==
+                studiocast::vulkan::VK_PIPELINE_STAGE_HOST_BIT &&
+            parameter_read.dst_access_mask ==
+                studiocast::vulkan::VK_ACCESS_SHADER_READ_BIT &&
+            parameter_read.dst_stage_mask ==
+                studiocast::vulkan::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        "mapped Vulkan parameter inputs must retain precise HOST_WRITE to "
+        "SHADER_READ synchronization");
+  }
+  {
     const auto diagnostics =
         studiocast::vulkan::DiagnoseOpenVulkanDefault();
     const auto mirror =
@@ -1663,6 +1695,45 @@ int main() {
     ok &= Require(kernels.device()->context_identity().Valid(),
                   "initialized Vulkan device should expose context/generation "
                   "identity");
+  }
+
+  {
+    constexpr int width = 5;
+    constexpr int height = 3;
+    std::vector<std::uint8_t> source(static_cast<std::size_t>(width) *
+                                     static_cast<std::size_t>(height) * 3u);
+    for (std::size_t index = 0; index < source.size(); ++index)
+      source[index] = static_cast<std::uint8_t>((index * 71u + 13u) & 0xffu);
+    VulkanImage uploaded, compute_produced, consumed;
+    if (!AllocateU8(kernels, &uploaded, width, height,
+                    VulkanPixelFormat::rgb_u8, &error) ||
+        !compute_produced.Allocate(kernels.device(), width, height,
+                                   VulkanPixelFormat::rgb_u8,
+                                   /*map_memory=*/false, &error) ||
+        !AllocateU8(kernels, &consumed, width, height,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("generic producer/consumer allocation failed: " +
+                          error);
+    }
+    FillU8(uploaded, source);
+    if (!uploaded.Flush(&error))
+      return OptionalSkip("generic producer source flush failed: " + error);
+    const auto submissions_before = kernels.synchronous_submission_count();
+    ok &= Require(kernels.ResizeBilinear(uploaded, compute_produced, &error),
+                  "real Vulkan producer dispatch failed: " + error);
+    ok &= Require(
+        kernels.MirrorHorizontalU8x3(compute_produced, consumed, &error),
+        "generic Vulkan consumer of a compute-written resident image failed: " +
+            error);
+    ok &= Require(kernels.synchronous_submission_count() ==
+                          submissions_before + 2 &&
+                      consumed.Invalidate(&error),
+                  "producer and generic consumer must complete as two ordered "
+                  "real Vulkan submissions: " +
+                      error);
+    ok &= CompareU8Exact(ReadU8(consumed),
+                         MirrorU8Reference(source, width, height),
+                         "compute producer to generic mirror consumer");
   }
 
   {
@@ -3632,6 +3703,7 @@ int main() {
 
   {
     using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VK_ERROR_INITIALIZATION_FAILED;
     using studiocast::vulkan::VK_TIMEOUT;
     using studiocast::vulkan::VulkanContextHealth;
     using studiocast::vulkan::VulkanDevice;
@@ -3659,18 +3731,101 @@ int main() {
                   "poisoned Vulkan context must reject later frames without "
                   "retrying submission");
 
-    VulkanDevice timeout_device;
-    if (!timeout_device.Initialize(&error))
-      return OptionalSkip("timeout test context init failed: " + error);
-    timeout_device.InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::wait_for_fence, VK_TIMEOUT);
-    ok &= Require(!timeout_device.SubmitAndWait(fake_command, &error) &&
-                      timeout_device.health().health ==
-                          VulkanContextHealth::unsafe_timeout &&
-                      timeout_device.health().reason_code ==
-                          "vulkan_submission_timeout",
-                  "unsafe Vulkan timeout should poison and latch with a stable "
-                  "reason");
+    VulkanDevice reset_failure_device;
+    if (!reset_failure_device.Initialize(&error)) {
+      return OptionalSkip("reset-failure test context init failed: " + error);
+    }
+    reset_failure_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::reset_fence, VK_ERROR_INITIALIZATION_FAILED);
+    ok &= Require(
+        !reset_failure_device.SubmitAndWait(fake_command, &error) &&
+            reset_failure_device.health().health ==
+                VulkanContextHealth::fatal_submission_error &&
+            reset_failure_device.health().submitted_serial == 0 &&
+            reset_failure_device.health().completed_serial == 0 &&
+            reset_failure_device.SafeToDestroyResources(),
+        "a reset failure proven before submission must poison later work but "
+        "must not quarantine child teardown");
+
+    VulkanDevice submit_failure_device;
+    if (!submit_failure_device.Initialize(&error)) {
+      return OptionalSkip("submit-failure test context init failed: " + error);
+    }
+    submit_failure_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_INITIALIZATION_FAILED);
+    ok &= Require(
+        !submit_failure_device.SubmitAndWait(fake_command, &error) &&
+            submit_failure_device.health().health ==
+                VulkanContextHealth::fatal_submission_error &&
+            submit_failure_device.health().submitted_serial == 0 &&
+            submit_failure_device.health().completed_serial == 0 &&
+            submit_failure_device.SafeToDestroyResources(),
+        "a queue-submit failure must not claim an accepted submission or "
+        "quarantine child teardown");
+
+    const auto run_wait_failure_case = [&](studiocast::vulkan::VkResult failure,
+                                           VulkanContextHealth expected_health,
+                                           std::string_view expected_reason,
+                                           const char *label) {
+      UtilityKernels wait_failure_kernels;
+      if (!wait_failure_kernels.Initialize(&error)) {
+        return Require(false, std::string(label) +
+                                  " context initialization failed: " + error);
+      }
+      VulkanImage src, dst;
+      if (!AllocateU8(wait_failure_kernels, &src, 2, 2,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(wait_failure_kernels, &dst, 2, 2,
+                      VulkanPixelFormat::rgb_u8, &error)) {
+        return Require(false,
+                       std::string(label) + " allocation failed: " + error);
+      }
+      FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+      if (!src.Flush(&error)) {
+        return Require(false,
+                       std::string(label) + " source flush failed: " + error);
+      }
+      const auto before = wait_failure_kernels.device()->health();
+      wait_failure_kernels.device()->InjectNextSubmissionResultForTesting(
+          VulkanSubmissionPhase::wait_for_fence, failure);
+      bool case_ok = Require(
+          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
+              error.find(expected_reason) != std::string::npos,
+          std::string(label) +
+              " must fail at the actual post-submit fence-wait phase");
+      const auto failed = wait_failure_kernels.device()->health();
+      case_ok &= Require(
+          failed.health == expected_health && failed.poisoned &&
+              failed.reason_code == expected_reason &&
+              failed.submitted_serial == before.submitted_serial + 1 &&
+              failed.completed_serial == before.completed_serial &&
+              !wait_failure_kernels.device()->SafeToDestroyResources(),
+          std::string(label) +
+              " must retain an accepted-but-uncompleted serial and quarantine "
+              "resource teardown");
+      const auto submitted_after_failure = failed.submitted_serial;
+      case_ok &= Require(
+          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
+              wait_failure_kernels.device()->health().submitted_serial ==
+                  submitted_after_failure,
+          std::string(label) +
+              " must reject later work without another driver submission");
+      src.Free();
+      dst.Free();
+      case_ok &= Require(
+          !src.Valid() && !dst.Valid() &&
+              !wait_failure_kernels.device()->SafeToDestroyResources(),
+          std::string(label) +
+              " child release must clear facades while retaining teardown "
+              "quarantine for unknown GPU completion");
+      return case_ok;
+    };
+    ok &= run_wait_failure_case(VK_TIMEOUT, VulkanContextHealth::unsafe_timeout,
+                                "vulkan_submission_timeout", "wait timeout");
+    ok &= run_wait_failure_case(VK_ERROR_INITIALIZATION_FAILED,
+                                VulkanContextHealth::fatal_submission_error,
+                                "vulkan_submission_failed",
+                                "non-timeout wait failure");
   }
 
   {
