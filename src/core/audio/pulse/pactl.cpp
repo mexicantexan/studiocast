@@ -13,21 +13,37 @@ namespace studiocast::audio::pulse {
 namespace {
 std::mutex g_exec_hook_mu;
 PactlExecCaptureHook g_exec_hook;
+PactlExecCaptureStopAwareHook g_stop_aware_exec_hook;
 
 util::ExecResult RunPactlCommand(
     const std::string &command,
     const std::atomic_bool *stop_requested = nullptr) {
   PactlExecCaptureHook hook;
+  PactlExecCaptureStopAwareHook stopAwareHook;
   {
     std::lock_guard<std::mutex> lock(g_exec_hook_mu);
     hook = g_exec_hook;
+    stopAwareHook = g_stop_aware_exec_hook;
   }
+  if (stopAwareHook)
+    return stopAwareHook(command, stop_requested);
   if (hook)
     return hook(command);
   util::ExecCaptureOptions options;
   options.timeout_ms = 2500;
   options.stop_requested = stop_requested;
   return util::ExecCapture(command, options);
+}
+
+std::string PactlFailureText(const util::ExecResult &res) {
+  const std::string output = util::TrimCopy(res.stdout_str);
+  if (!output.empty())
+    return output;
+  if (res.cancelled)
+    return "pactl command cancelled";
+  if (res.timed_out)
+    return "pactl command timed out";
+  return "pactl command failed";
 }
 
 std::vector<std::string> SplitTabs(const std::string &line) {
@@ -147,6 +163,12 @@ void SetPactlExecCaptureHookForTesting(PactlExecCaptureHook hook) {
   g_exec_hook = std::move(hook);
 }
 
+void SetPactlExecCaptureStopAwareHookForTesting(
+    PactlExecCaptureStopAwareHook hook) {
+  std::lock_guard<std::mutex> lock(g_exec_hook_mu);
+  g_stop_aware_exec_hook = std::move(hook);
+}
+
 std::optional<std::string>
 ParseDefaultFromPactlInfo(const std::string &pactl_info_text,
                           const std::string &key) {
@@ -235,7 +257,7 @@ ListSources(std::string *error, const std::atomic_bool *stop_requested) {
       RunPactlCommand("pactl list short sources 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
-      *error = util::TrimCopy(res.stdout_str);
+      *error = PactlFailureText(res);
     return {};
   }
 
@@ -263,7 +285,7 @@ ListSinks(std::string *error, const std::atomic_bool *stop_requested) {
   auto res = RunPactlCommand("pactl list short sinks 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
-      *error = util::TrimCopy(res.stdout_str);
+      *error = PactlFailureText(res);
     return {};
   }
 
@@ -286,11 +308,13 @@ ListSinks(std::string *error, const std::atomic_bool *stop_requested) {
   return out;
 }
 
-std::vector<PactlSourceOutput> ListSourceOutputs(std::string *error) {
-  auto res = RunPactlCommand("pactl list short source-outputs 2>&1");
+std::vector<PactlSourceOutput>
+ListSourceOutputs(std::string *error, const std::atomic_bool *stop_requested) {
+  auto res =
+      RunPactlCommand("pactl list short source-outputs 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
-      *error = util::TrimCopy(res.stdout_str);
+      *error = PactlFailureText(res);
     return {};
   }
 
@@ -313,11 +337,13 @@ std::vector<PactlSourceOutput> ListSourceOutputs(std::string *error) {
   return out;
 }
 
-std::vector<PactlSinkInput> ListSinkInputs(std::string *error) {
-  auto res = RunPactlCommand("pactl list short sink-inputs 2>&1");
+std::vector<PactlSinkInput>
+ListSinkInputs(std::string *error, const std::atomic_bool *stop_requested) {
+  auto res =
+      RunPactlCommand("pactl list short sink-inputs 2>&1", stop_requested);
   if (res.exit_code != 0) {
     if (error)
-      *error = util::TrimCopy(res.stdout_str);
+      *error = PactlFailureText(res);
     return {};
   }
 

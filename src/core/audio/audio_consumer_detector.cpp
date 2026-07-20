@@ -1,12 +1,20 @@
 #include "core/audio/audio_consumer_detector.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "core/audio/pulse/pactl.h"
 
@@ -22,104 +30,376 @@
 namespace studiocast::audio {
 namespace {
 
-bool TokenMatchesNameOrId(const std::string &token, const std::string &name,
-                          const std::vector<int> &ids) {
-  if (token == name)
-    return true;
-  for (const int id : ids) {
-    if (token == std::to_string(id))
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+bool SetNonBlocking(int fd) {
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+bool WaitForChild(pid_t pid, std::chrono::milliseconds timeout, int *status) {
+  const auto deadline = Clock::now() + timeout;
+  for (;;) {
+    const pid_t result = ::waitpid(pid, status, WNOHANG);
+    if (result == pid)
       return true;
+    if (result < 0 && errno != EINTR)
+      return true;
+    if (Clock::now() >= deadline)
+      return false;
+    std::this_thread::sleep_for(2ms);
   }
-  return false;
 }
 
-AudioConsumerSnapshot
-DetectSourceConsumersByPactl(const std::string &source_name) {
-  AudioConsumerSnapshot out;
-
-  std::string err;
-  const auto sources = pulse::ListSources(&err);
-  if (!err.empty()) {
-    out.error = "Failed to list Pulse sources: " + err;
-    return out;
-  }
-
-  std::vector<int> sourceIds;
-  for (const auto &source : sources) {
-    if (source.name == source_name)
-      sourceIds.push_back(source.id);
-  }
-  if (sourceIds.empty()) {
-    out.error = "Pulse source '" + source_name + "' is not present.";
-    return out;
-  }
-
-  err.clear();
-  const auto outputs = pulse::ListSourceOutputs(&err);
-  if (!err.empty()) {
-    out.error = "Failed to list Pulse source outputs: " + err;
-    return out;
-  }
-
-  for (const auto &output : outputs) {
-    if (TokenMatchesNameOrId(output.source, source_name, sourceIds))
-      ++out.count;
-  }
-  out.present = out.count > 0;
-  return out;
+void SignalChildProcessGroup(pid_t pid, int signal) {
+  if (pid <= 0)
+    return;
+  if (::kill(-pid, signal) != 0 && errno == ESRCH)
+    (void)::kill(pid, signal);
 }
 
-AudioConsumerSnapshot DetectSinkConsumersByPactl(const std::string &sink_name) {
-  AudioConsumerSnapshot out;
+class PactlSubscribeProcess final : public PactlSubscriptionMonitor {
+public:
+  static std::unique_ptr<PactlSubscribeProcess> Create(std::string *error) {
+    if (error)
+      error->clear();
 
-  std::string err;
-  const auto sinks = pulse::ListSinks(&err);
-  if (!err.empty()) {
-    out.error = "Failed to list Pulse sinks: " + err;
-    return out;
+    int pipeFds[2] = {-1, -1};
+    if (::pipe2(pipeFds, O_CLOEXEC) != 0) {
+      if (error)
+        *error = "pactl subscription pipe creation failed";
+      return nullptr;
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+      ::close(pipeFds[0]);
+      ::close(pipeFds[1]);
+      if (error)
+        *error = "pactl subscription process creation failed";
+      return nullptr;
+    }
+
+    if (pid == 0) {
+      (void)::setpgid(0, 0);
+      ::close(pipeFds[0]);
+      (void)::dup2(pipeFds[1], STDOUT_FILENO);
+      (void)::dup2(pipeFds[1], STDERR_FILENO);
+      ::close(pipeFds[1]);
+      ::execlp("pactl", "pactl", "subscribe", static_cast<char *>(nullptr));
+      _exit(127);
+    }
+
+    (void)::setpgid(pid, pid);
+    ::close(pipeFds[1]);
+    if (!SetNonBlocking(pipeFds[0])) {
+      ::close(pipeFds[0]);
+      int status = 0;
+      SignalChildProcessGroup(pid, SIGKILL);
+      (void)WaitForChild(pid, 250ms, &status);
+      if (error)
+        *error = "pactl subscription pipe setup failed";
+      return nullptr;
+    }
+
+    return std::unique_ptr<PactlSubscribeProcess>(
+        new PactlSubscribeProcess(pid, pipeFds[0]));
   }
 
-  std::vector<int> sinkIds;
-  for (const auto &sink : sinks) {
-    if (sink.name == sink_name)
-      sinkIds.push_back(sink.id);
-  }
-  if (sinkIds.empty()) {
-    out.error = "Pulse sink '" + sink_name + "' is not present.";
-    return out;
+  ~PactlSubscribeProcess() override { Stop(); }
+
+  PactlSubscriptionPollResult Poll() override {
+    PactlSubscriptionPollResult result;
+    if (pid_ <= 0 || read_fd_ < 0) {
+      result.disconnected = true;
+      result.error = "pactl subscription is not running";
+      return result;
+    }
+
+    // Drain at most a fixed amount. The application stores only a dirty bit;
+    // the kernel pipe is bounded and remaining events are handled next poll.
+    std::array<char, 4096> buffer{};
+    std::size_t drained = 0;
+    bool pipeDisconnected = false;
+    constexpr std::size_t kMaxDrainBytes = 64 * 1024;
+    while (drained < kMaxDrainBytes) {
+      const ssize_t n = ::read(read_fd_, buffer.data(), buffer.size());
+      if (n > 0) {
+        drained += static_cast<std::size_t>(n);
+        result.event_received = true;
+        continue;
+      }
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        break;
+      pipeDisconnected = true;
+      break;
+    }
+
+    int status = 0;
+    const pid_t waited = ::waitpid(pid_, &status, WNOHANG);
+    if (waited == pid_ || (waited < 0 && errno != EINTR)) {
+      result.disconnected = true;
+      if (waited == pid_ && WIFEXITED(status)) {
+        result.error = "pactl subscription exited with status " +
+                       std::to_string(WEXITSTATUS(status));
+      } else {
+        result.error = "pactl subscription disconnected";
+      }
+      ::close(read_fd_);
+      read_fd_ = -1;
+      pid_ = -1;
+    } else if (pipeDisconnected) {
+      result.disconnected = true;
+      result.error = "pactl subscription output disconnected";
+    }
+    return result;
   }
 
-  err.clear();
-  const auto inputs = pulse::ListSinkInputs(&err);
-  if (!err.empty()) {
-    out.error = "Failed to list Pulse sink inputs: " + err;
-    return out;
+  void Stop() override {
+    if (read_fd_ >= 0) {
+      ::close(read_fd_);
+      read_fd_ = -1;
+    }
+    if (pid_ <= 0)
+      return;
+
+    int status = 0;
+    SignalChildProcessGroup(pid_, SIGTERM);
+    if (!WaitForChild(pid_, 50ms, &status)) {
+      SignalChildProcessGroup(pid_, SIGKILL);
+      (void)WaitForChild(pid_, 250ms, &status);
+    }
+    pid_ = -1;
   }
 
-  for (const auto &input : inputs) {
-    if (TokenMatchesNameOrId(input.sink, sink_name, sinkIds))
-      ++out.count;
-  }
-  out.present = out.count > 0;
-  return out;
-}
+private:
+  PactlSubscribeProcess(pid_t pid, int read_fd)
+      : pid_(pid), read_fd_(read_fd) {}
 
-struct ConsumerDetectionResult {
-  AudioConsumerSnapshot snapshot;
-  bool detector_unavailable = false;
+  pid_t pid_ = -1;
+  int read_fd_ = -1;
 };
 
-class PactlAudioConsumerDetector final : public AudioConsumerDetector {
+std::unique_ptr<PactlSubscriptionMonitor>
+CreatePactlSubscribeProcess(std::string *error) {
+  return PactlSubscribeProcess::Create(error);
+}
+
+struct PactlConsumerCache {
+  std::vector<pulse::PactlSource> sources;
+  std::vector<pulse::PactlSink> sinks;
+  std::vector<pulse::PactlSourceOutput> source_outputs;
+  std::vector<pulse::PactlSinkInput> sink_inputs;
+};
+
+class PactlSubscriptionAudioConsumerDetector final
+    : public AudioConsumerDetector {
 public:
+  PactlSubscriptionAudioConsumerDetector(
+      PactlSubscriptionMonitorFactory monitor_factory,
+      const std::atomic_bool *stop_requested,
+      std::chrono::milliseconds reconnect_delay)
+      : monitor_factory_(std::move(monitor_factory)),
+        stop_requested_(stop_requested), reconnect_delay_(reconnect_delay) {}
+
+  ~PactlSubscriptionAudioConsumerDetector() override { Suspend(); }
+
   AudioConsumerSnapshot
   DetectSourceConsumersByName(const std::string &source_name) override {
-    return DetectSourceConsumersByPactl(source_name);
+    if (!PrepareSnapshot())
+      return UnavailableSnapshot();
+
+    AudioConsumerSnapshot out;
+    bool found = false;
+    for (const auto &source : cache_.sources) {
+      if (source.name == source_name)
+        found = true;
+    }
+    if (!found) {
+      out.error = "Pulse source '" + source_name + "' is not present.";
+      return out;
+    }
+    for (const auto &output : cache_.source_outputs) {
+      if (output.source == source_name) {
+        ++out.count;
+        continue;
+      }
+      for (const auto &source : cache_.sources) {
+        if (source.name == source_name &&
+            output.source == std::to_string(source.id)) {
+          ++out.count;
+          break;
+        }
+      }
+    }
+    out.present = out.count > 0;
+    return out;
   }
 
   AudioConsumerSnapshot
   DetectSinkConsumersByName(const std::string &sink_name) override {
-    return DetectSinkConsumersByPactl(sink_name);
+    if (!PrepareSnapshot())
+      return UnavailableSnapshot();
+
+    AudioConsumerSnapshot out;
+    bool found = false;
+    for (const auto &sink : cache_.sinks) {
+      if (sink.name == sink_name)
+        found = true;
+    }
+    if (!found) {
+      out.error = "Pulse sink '" + sink_name + "' is not present.";
+      return out;
+    }
+    for (const auto &input : cache_.sink_inputs) {
+      if (input.sink == sink_name) {
+        ++out.count;
+        continue;
+      }
+      for (const auto &sink : cache_.sinks) {
+        if (sink.name == sink_name && input.sink == std::to_string(sink.id)) {
+          ++out.count;
+          break;
+        }
+      }
+    }
+    out.present = out.count > 0;
+    return out;
   }
+
+  void Suspend() {
+    if (monitor_) {
+      monitor_->Stop();
+      monitor_.reset();
+    }
+    snapshot_valid_ = false;
+    dirty_ = true;
+  }
+
+private:
+  bool EnsureMonitor() {
+    if (monitor_)
+      return true;
+    if (stop_requested_ && stop_requested_->load(std::memory_order_acquire)) {
+      last_error_ = "pactl consumer subscription stopped";
+      return false;
+    }
+
+    const auto now = Clock::now();
+    if (now < next_monitor_attempt_)
+      return false;
+
+    std::string error;
+    monitor_ = monitor_factory_ ? monitor_factory_(&error) : nullptr;
+    if (!monitor_) {
+      last_error_ = error.empty() ? "pactl subscription unavailable" : error;
+      next_monitor_attempt_ = now + reconnect_delay_;
+      return false;
+    }
+
+    last_error_.clear();
+    next_monitor_attempt_ = {};
+    dirty_ = true;
+    return true;
+  }
+
+  bool PrepareSnapshot() {
+    if (!EnsureMonitor())
+      return false;
+
+    const auto event = monitor_->Poll();
+    if (event.disconnected) {
+      last_error_ =
+          event.error.empty() ? "pactl subscription disconnected" : event.error;
+      monitor_->Stop();
+      monitor_.reset();
+      snapshot_valid_ = false;
+      dirty_ = true;
+      next_monitor_attempt_ = Clock::now() + reconnect_delay_;
+      return false;
+    }
+    if (event.event_received)
+      dirty_ = true;
+
+    if (!dirty_)
+      return snapshot_valid_;
+
+    std::string error;
+    if (!RefreshSnapshot(&error)) {
+      last_error_ = error.empty() ? "pactl consumer snapshot refresh failed"
+                                  : std::move(error);
+      monitor_->Stop();
+      monitor_.reset();
+      snapshot_valid_ = false;
+      dirty_ = true;
+      next_monitor_attempt_ = Clock::now() + reconnect_delay_;
+      return false;
+    }
+
+    last_error_.clear();
+    dirty_ = false;
+    snapshot_valid_ = true;
+    return true;
+  }
+
+  bool RefreshSnapshot(std::string *error) {
+    PactlConsumerCache next;
+    std::string detail;
+    next.sources = pulse::ListSources(&detail, stop_requested_);
+    if (!detail.empty()) {
+      if (error)
+        *error = "Failed to list Pulse sources: " + detail;
+      return false;
+    }
+
+    next.sinks = pulse::ListSinks(&detail, stop_requested_);
+    if (!detail.empty()) {
+      if (error)
+        *error = "Failed to list Pulse sinks: " + detail;
+      return false;
+    }
+
+    next.source_outputs = pulse::ListSourceOutputs(&detail, stop_requested_);
+    if (!detail.empty()) {
+      if (error)
+        *error = "Failed to list Pulse source outputs: " + detail;
+      return false;
+    }
+
+    next.sink_inputs = pulse::ListSinkInputs(&detail, stop_requested_);
+    if (!detail.empty()) {
+      if (error)
+        *error = "Failed to list Pulse sink inputs: " + detail;
+      return false;
+    }
+
+    cache_ = std::move(next);
+    return true;
+  }
+
+  AudioConsumerSnapshot UnavailableSnapshot() const {
+    AudioConsumerSnapshot out;
+    out.error = "Pulse consumer subscription unavailable: " + last_error_;
+    return out;
+  }
+
+  PactlSubscriptionMonitorFactory monitor_factory_;
+  const std::atomic_bool *stop_requested_ = nullptr;
+  std::chrono::milliseconds reconnect_delay_{};
+  std::unique_ptr<PactlSubscriptionMonitor> monitor_;
+  Clock::time_point next_monitor_attempt_{};
+  PactlConsumerCache cache_;
+  bool dirty_ = true;
+  bool snapshot_valid_ = false;
+  std::string last_error_;
+};
+
+struct ConsumerDetectionResult {
+  AudioConsumerSnapshot snapshot;
+  bool detector_unavailable = false;
 };
 
 #if STUDIOCAST_HAVE_PULSE_SIMPLE
@@ -640,11 +920,16 @@ private:
 
 class DefaultAudioConsumerDetector final : public AudioConsumerDetector {
 public:
+  explicit DefaultAudioConsumerDetector(const std::atomic_bool *stop_requested)
+      : pactl_(CreatePactlSubscribeProcess, stop_requested,
+               kPactlReconnectDelay) {}
+
   AudioConsumerSnapshot
   DetectSourceConsumersByName(const std::string &source_name) override {
 #if STUDIOCAST_HAVE_PULSE_SIMPLE
     if (auto result = DetectWithPulseSource(source_name);
         result.has_value && !result.detection.detector_unavailable) {
+      pactl_.Suspend();
       return result.detection.snapshot;
     }
 #endif
@@ -657,6 +942,7 @@ public:
 #if STUDIOCAST_HAVE_PULSE_SIMPLE
     if (auto result = DetectWithPulseSink(sink_name);
         result.has_value && !result.detection.detector_unavailable) {
+      pactl_.Suspend();
       return result.detection.snapshot;
     }
 #endif
@@ -664,7 +950,9 @@ public:
   }
 
 private:
-  PactlAudioConsumerDetector pactl_;
+  static constexpr auto kPactlReconnectDelay = std::chrono::seconds(5);
+
+  PactlSubscriptionAudioConsumerDetector pactl_;
 
 #if STUDIOCAST_HAVE_PULSE_SIMPLE
   struct MaybePulseResult {
@@ -745,8 +1033,18 @@ private:
 
 } // namespace
 
-std::unique_ptr<AudioConsumerDetector> CreateDefaultAudioConsumerDetector() {
-  return std::make_unique<DefaultAudioConsumerDetector>();
+std::unique_ptr<AudioConsumerDetector>
+CreateDefaultAudioConsumerDetector(const std::atomic_bool *stop_requested) {
+  return std::make_unique<DefaultAudioConsumerDetector>(stop_requested);
+}
+
+std::unique_ptr<AudioConsumerDetector>
+CreatePactlSubscriptionAudioConsumerDetectorForTesting(
+    PactlSubscriptionMonitorFactory monitor_factory,
+    const std::atomic_bool *stop_requested,
+    std::chrono::milliseconds reconnect_delay) {
+  return std::make_unique<PactlSubscriptionAudioConsumerDetector>(
+      std::move(monitor_factory), stop_requested, reconnect_delay);
 }
 
 } // namespace studiocast::audio

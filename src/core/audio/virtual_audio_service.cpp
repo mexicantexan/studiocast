@@ -481,6 +481,7 @@ void VirtualAudioService::Stop() {
   if (th_.joinable()) {
     th_.join();
   }
+  std::unique_ptr<AudioConsumerDetector> consumerDetector;
   {
     std::lock_guard<std::mutex> lock(mu_);
     running_ = false;
@@ -523,8 +524,11 @@ void VirtualAudioService::Stop() {
     st_.speakers_pipeline_pulse_playback_latency_us_last = 0;
     st_.speakers_pipeline_pulse_latency_us_max = 0;
     st_.speakers_pipeline_resync_events = 0;
-    consumer_detector_.reset();
+    consumerDetector = std::move(consumer_detector_);
   }
+  // The fallback monitor may need to terminate a blocked `pactl subscribe`
+  // child. Keep that bounded wait outside the status/configuration mutex.
+  consumerDetector.reset();
 }
 
 void VirtualAudioService::UpdateConfig(const VirtualAudioServiceConfig &cfg) {
@@ -630,7 +634,7 @@ AudioConsumerSnapshot VirtualAudioService::DetectMicrophoneConsumers() const {
     return hooks_.detect_microphone_consumers();
   }
   if (!consumer_detector_) {
-    consumer_detector_ = CreateDefaultAudioConsumerDetector();
+    consumer_detector_ = CreateDefaultAudioConsumerDetector(&stop_);
   }
   return consumer_detector_->DetectSourceConsumersByName(kVirtualMicSourceName);
 }
@@ -640,7 +644,7 @@ AudioConsumerSnapshot VirtualAudioService::DetectSpeakerConsumers() const {
     return hooks_.detect_speaker_consumers();
   }
   if (!consumer_detector_) {
-    consumer_detector_ = CreateDefaultAudioConsumerDetector();
+    consumer_detector_ = CreateDefaultAudioConsumerDetector(&stop_);
   }
   return consumer_detector_->DetectSinkConsumersByName(
       kVirtualSpeakersSinkName);
