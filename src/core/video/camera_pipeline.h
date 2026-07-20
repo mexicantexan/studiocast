@@ -25,6 +25,10 @@ namespace effects {
 struct BroadcastEffectsPlan;
 }
 
+namespace detail {
+struct CameraPipelineIssue1TestAccess;
+}
+
 enum class CaptureMode {
   // Use the requested `width`/`height` (must be > 0).
   requested,
@@ -85,6 +89,12 @@ std::string ResolveActiveComputeBackendName(
     bool vulkan_compute_available);
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
+
+bool EffectsPlanRequiresRebuild(
+    const effects::BroadcastCameraEffects &applied_effects,
+    std::uint64_t applied_generation,
+    const effects::BroadcastCameraEffects &current_effects,
+    std::uint64_t current_generation);
 
 // Tracks effect/backend attribution at the same boundary as a successfully
 // written output frame. Setup-time selection and an attempted effect are not
@@ -501,6 +511,12 @@ public:
   void SetEffects(const studiocast::video::effects::BroadcastCameraEffects
                       &effects) override;
 
+  // Explicitly invalidates resources derived from the current effect
+  // configuration. Unlike SetEffects(), this is an intentional generation
+  // boundary even when the canonical configuration is unchanged (for example,
+  // after a user-driven model-pack or replacement-image refresh).
+  void RefreshEffectsResources();
+
   // Convenience for legacy callers.
   void SetMirrorEnabled(bool enabled) override;
 
@@ -552,10 +568,23 @@ private:
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
 
   // Effects: updated live by SetEffects.
+  //
+  // Update serialization is intentionally separate from effects_mu_: a
+  // replacement-image stat may occur while preparing a genuine configuration
+  // change, but the frame thread must remain able to snapshot the currently
+  // published generation while that setup work runs.
+  mutable std::mutex effects_update_mu_;
   mutable std::mutex effects_mu_;
   studiocast::video::effects::BroadcastCameraEffects effects_{};
   detail::PreparedReplaceBackgroundSource replace_background_source_{};
   std::uint64_t effects_generation_ = 0;
+  std::uint64_t effects_set_requests_ = 0;
+  std::uint64_t effects_ignored_updates_ = 0;
+  std::uint64_t effects_applied_updates_ = 0;
+  std::uint64_t effects_resource_refreshes_ = 0;
+  std::uint64_t replacement_background_preparations_ = 0;
+
+  friend struct detail::CameraPipelineIssue1TestAccess;
 
   // Effect runtime info (written by pipeline thread when effects chain
   // changes).
