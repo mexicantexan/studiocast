@@ -384,6 +384,8 @@ add_library(studiocast_core
         src/core/video/effects/background_remove_cpu.cpp
         src/core/video/v4l2_capture.h
         src/core/video/v4l2_capture.cpp
+        src/core/video/yuyv_passthrough.h
+        src/core/video/yuyv_passthrough.cpp
         src/core/video/camera_pipeline.h
         src/core/video/camera_pipeline.cpp
         src/core/video/open_vulkan_matting_setup_policy.h
@@ -1392,6 +1394,7 @@ if (BUILD_TESTING)
             tests/v4l2_capture_negotiation_tests.cpp
             tests/video_effect_cpu_tests.cpp
             tests/rgb_yuyv_convert_tests.cpp
+            tests/yuyv_passthrough_tests.cpp
     )
 
     target_link_libraries(studiocast-video-tests PRIVATE studiocast_core)

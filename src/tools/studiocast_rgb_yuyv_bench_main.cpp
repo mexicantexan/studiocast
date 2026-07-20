@@ -4,6 +4,7 @@
 #include "core/video/convert_yuyv_rgb_internal.h"
 #include "core/video/effects/background_remove_cpu.h"
 #include "core/video/image_ppm.h"
+#include "core/video/yuyv_passthrough.h"
 
 #include <algorithm>
 #include <chrono>
@@ -63,6 +64,11 @@ struct Stats {
   double min_ms{};
   double max_ms{};
   std::uint64_t checksum{};
+};
+
+struct PassthroughStats {
+  Stats timing{};
+  studiocast::video::YuyvFramePathCounters counters{};
 };
 
 constexpr std::size_t ActiveYuyvBytes(int width) {
@@ -672,6 +678,97 @@ Stats RunYuyvToRgbBench(YuyvToRgbBenchBackend backend, const SizeCase &size,
   return stats;
 }
 
+PassthroughStats RunYuyvPipelineBench(bool raw_passthrough,
+                                      const SizeCase &size, int iterations,
+                                      int warmup) {
+  const std::size_t active_yuyv = ActiveYuyvBytes(size.width);
+  const std::size_t yuyv_stride = active_yuyv + 64u;
+  const std::size_t yuyv_bytes =
+      yuyv_stride * static_cast<std::size_t>(size.height) + 32u;
+  const std::size_t rgb_stride = static_cast<std::size_t>(size.width) * 3u;
+
+  studiocast::video::CaptureFormat capture;
+  capture.width = size.width;
+  capture.height = size.height;
+  capture.format = studiocast::video::CapturePixelFormat::yuyv;
+  capture.bytes_per_line = yuyv_stride;
+  capture.size_image = yuyv_bytes;
+  studiocast::video::ActualFormat output;
+  output.width = size.width;
+  output.height = size.height;
+  output.format = studiocast::video::PixelFormat::yuyv;
+  output.bytes_per_line = yuyv_stride;
+  output.size_image = yuyv_bytes;
+  const auto plan = studiocast::video::PrepareRawYuyvPassthroughPlan(
+      capture, output, studiocast::video::effects::BroadcastCameraEffects{});
+  if (!plan.eligible)
+    std::abort();
+
+  std::vector<std::uint8_t> source(yuyv_bytes);
+  std::vector<std::uint8_t> rgb(rgb_stride *
+                                static_cast<std::size_t>(size.height));
+  std::vector<std::uint8_t> destination(yuyv_bytes);
+  std::vector<std::uint8_t> scratch(
+      studiocast::video::Rgb24ToYuyvScratchBytes(size.width, size.height));
+  FillDeterministicYuyv(&source, size.width, size.height, yuyv_stride);
+  for (std::size_t i = yuyv_stride * static_cast<std::size_t>(size.height);
+       i < source.size(); ++i) {
+    source[i] = static_cast<std::uint8_t>((i * 17u + 23u) & 0xffu);
+  }
+
+  const auto run_once = [&](studiocast::video::YuyvFramePathCounters *counts) {
+    if (raw_passthrough) {
+      if (studiocast::video::CopyRawYuyvFrame(
+              plan, source.data(), source.size(), destination.data(),
+              destination.size(), counts) !=
+          studiocast::video::RawYuyvCopyResult::ok) {
+        std::abort();
+      }
+      return;
+    }
+    studiocast::video::CountedYuyvToRgb24(source.data(), size.width,
+                                          size.height, yuyv_stride, rgb.data(),
+                                          rgb_stride, counts);
+    studiocast::video::CountedRgb24ToYuyvWithScratch(
+        rgb.data(), size.width, size.height, rgb_stride, destination.data(),
+        yuyv_stride, scratch.empty() ? nullptr : scratch.data(), scratch.size(),
+        counts);
+  };
+
+  for (int i = 0; i < warmup; ++i)
+    run_once(nullptr);
+
+  PassthroughStats result;
+  std::vector<double> samples_ms;
+  samples_ms.reserve(static_cast<std::size_t>(iterations));
+  for (int i = 0; i < iterations; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    run_once(&result.counters);
+    const auto t1 = std::chrono::steady_clock::now();
+    samples_ms.push_back(
+        std::chrono::duration<double, std::milli>(t1 - t0).count());
+    result.timing.checksum +=
+        destination[(static_cast<std::size_t>(i) * 131u) % destination.size()];
+  }
+
+  std::sort(samples_ms.begin(), samples_ms.end());
+  const auto percentile = [&](double p) {
+    const double pos =
+        (p / 100.0) * static_cast<double>(samples_ms.size() - 1u);
+    const std::size_t idx = static_cast<std::size_t>(pos + 0.5);
+    return samples_ms[std::min(idx, samples_ms.size() - 1u)];
+  };
+  double sum = 0.0;
+  for (double sample : samples_ms)
+    sum += sample;
+  result.timing.avg_ms = sum / static_cast<double>(samples_ms.size());
+  result.timing.p95_ms = percentile(95.0);
+  result.timing.p99_ms = percentile(99.0);
+  result.timing.min_ms = samples_ms.front();
+  result.timing.max_ms = samples_ms.back();
+  return result;
+}
+
 Stats RunRgbBgrBench(RgbBgrBenchBackend backend, const SizeCase &size,
                      int iterations, int warmup) {
   const std::size_t src_stride = static_cast<std::size_t>(size.width) * 3u;
@@ -1000,7 +1097,7 @@ void Usage(const char *argv0) {
             << "Usage:\n"
             << "  " << argv0
             << " [--iterations N] [--warmup N] [--csv] "
-               "[--only all|convert|resize|copy|prep|effects]\n"
+               "[--only all|convert|resize|copy|prep|effects|passthrough]\n"
             << "      [--rgb-yuyv-backend NAME] [--yuyv-rgb-backend NAME]\n"
             << "      [--rgb-bgr-backend NAME]\n\n"
             << "RGB24 -> YUYV backends: original-scalar, current-scalar, "
@@ -1033,6 +1130,7 @@ int main(int argc, char **argv) {
       only.empty() || only == "all" || only == "copy" || only == "prep";
   const bool run_effects =
       only.empty() || only == "all" || only == "effects";
+  const bool run_passthrough = only == "passthrough";
 
   const std::vector<SizeCase> sizes{{640, 480}, {1280, 720}, {1920, 1080}};
   const std::vector<ResizeCase> resize_sizes{
@@ -1103,7 +1201,12 @@ int main(int argc, char **argv) {
   std::cout << "Iterations: " << iterations << " measured, " << warmup
             << " warmup\n\n";
 
-  if (csv) {
+  if (csv && run_passthrough) {
+    std::cout << "mode,width,height,input_stride,output_stride,warmup,"
+                 "iterations,avg_ms,p95_ms,p99_ms,min_ms,max_ms,"
+                 "capture_to_rgb_calls,output_from_rgb_calls,"
+                 "raw_passthrough_frames,raw_passthrough_bytes,checksum\n";
+  } else if (csv) {
     std::cout << "direction,backend,width,height,avg_ms,p95_ms,p99_ms,min_ms,"
                  "max_ms,checksum\n";
   } else if (run_conversions) {
@@ -1113,6 +1216,53 @@ int main(int argc, char **argv) {
               << std::setw(12) << "p95 ms" << std::setw(12) << "p99 ms"
               << std::setw(12) << "min ms" << std::setw(12) << "max ms"
               << "\n";
+  }
+
+  if (run_passthrough) {
+    if (!csv) {
+      std::cout << "Prepared YUYV pipeline path (64-byte row padding, "
+                   "32-byte size_image tail)\n";
+      std::cout << std::left << std::setw(18) << "mode" << std::right
+                << std::setw(12) << "size" << std::setw(12) << "avg ms"
+                << std::setw(12) << "p95 ms" << std::setw(12) << "p99 ms"
+                << std::setw(12) << "min ms" << std::setw(12) << "max ms"
+                << "\n";
+    }
+    const std::array<SizeCase, 2> passthrough_sizes{
+        {{1280, 720}, {1920, 1080}}};
+    for (bool raw : {false, true}) {
+      const char *mode = raw ? "raw-copy" : "legacy-roundtrip";
+      for (const SizeCase &size : passthrough_sizes) {
+        const PassthroughStats stats =
+            RunYuyvPipelineBench(raw, size, iterations, warmup);
+        const std::size_t stride = ActiveYuyvBytes(size.width) + 64u;
+        if (csv) {
+          std::cout << mode << "," << size.width << "," << size.height << ","
+                    << stride << "," << stride << "," << warmup << ","
+                    << iterations << "," << stats.timing.avg_ms << ","
+                    << stats.timing.p95_ms << "," << stats.timing.p99_ms << ","
+                    << stats.timing.min_ms << "," << stats.timing.max_ms << ","
+                    << stats.counters.capture_to_rgb_calls << ","
+                    << stats.counters.output_from_rgb_calls << ","
+                    << stats.counters.raw_passthrough_frames << ","
+                    << stats.counters.raw_passthrough_bytes << ","
+                    << stats.timing.checksum << "\n";
+        } else {
+          std::cout << std::fixed << std::setprecision(3);
+          std::cout << std::left << std::setw(18) << mode << std::right
+                    << std::setw(7) << size.width << "x" << std::left
+                    << std::setw(4) << size.height << std::right
+                    << std::setw(12) << stats.timing.avg_ms << std::setw(12)
+                    << stats.timing.p95_ms << std::setw(12)
+                    << stats.timing.p99_ms << std::setw(12)
+                    << stats.timing.min_ms << std::setw(12)
+                    << stats.timing.max_ms
+                    << "  conversions=" << stats.counters.capture_to_rgb_calls
+                    << "/" << stats.counters.output_from_rgb_calls
+                    << " raw=" << stats.counters.raw_passthrough_frames << "\n";
+        }
+      }
+    }
   }
 
   if (run_conversions) {

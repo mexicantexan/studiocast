@@ -68,6 +68,11 @@ bool TestYuyvToRgb24BackendsMatchScalarReference();
 bool TestRgb24ToYuyvMatchesBt601WithinChromaRounding();
 bool TestRgb24ToYuyvBackendsMatchScalarReference();
 bool TestRgb24ToYuyvPublicPathMatchesScalarWithScratchVariants();
+bool TestRawYuyvPassthroughPredicateIsStrict();
+bool TestRawYuyvPassthroughPreservesExactLayouts();
+bool TestRawYuyvPassthroughCopiesActiveRowsAndZerosPadding();
+bool TestRawYuyvPassthroughRejectsUnsafeFrames();
+bool TestRawYuyvPassthroughCountersTrackActualCallSites();
 bool TestRgb24Bgr24BackendsMatchScalarAndPreservePadding();
 bool TestRgb24Bgr24PublicPathMatchesScalarInPlace();
 bool TestResizeRgb24BilinearPreservesActivePixelsAndZerosPadding();
@@ -1988,6 +1993,17 @@ int main() {
       {"RGB24 to YUYV public path matches scalar with scratch variants",
        &studiocast::tests::
            TestRgb24ToYuyvPublicPathMatchesScalarWithScratchVariants},
+      {"raw YUYV passthrough predicate rejects every RGB operation",
+       &studiocast::tests::TestRawYuyvPassthroughPredicateIsStrict},
+      {"raw YUYV passthrough preserves exact tight and padded layouts",
+       &studiocast::tests::TestRawYuyvPassthroughPreservesExactLayouts},
+      {"raw YUYV passthrough copies active rows and zeros destination padding",
+       &studiocast::tests::
+           TestRawYuyvPassthroughCopiesActiveRowsAndZerosPadding},
+      {"raw YUYV passthrough rejects unsafe frame buffers",
+       &studiocast::tests::TestRawYuyvPassthroughRejectsUnsafeFrames},
+      {"raw YUYV passthrough counters track actual conversion call sites",
+       &studiocast::tests::TestRawYuyvPassthroughCountersTrackActualCallSites},
       {"RGB24/BGR24 backends match scalar and preserve padding",
        &studiocast::tests::TestRgb24Bgr24BackendsMatchScalarAndPreservePadding},
       {"RGB24/BGR24 public path matches scalar in-place",

@@ -57,6 +57,7 @@
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
+#include "core/video/yuyv_passthrough.h"
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
 #include "core/open_video/vulkan_matting_session.h"
@@ -880,11 +881,17 @@ CameraPipeline::~CameraPipeline() { Stop(); }
 
 void CameraPipeline::SetMirrorEnabled(bool enabled) {
   std::lock_guard<std::mutex> update_lock(effects_update_mu_);
-  std::lock_guard<std::mutex> lock(effects_mu_);
-  if (effects_.mirror == enabled)
-    return;
-  effects_.mirror = enabled;
-  ++effects_generation_;
+  std::uint64_t published_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    if (effects_.mirror == enabled)
+      return;
+    effects_generation_published_.store(0, std::memory_order_release);
+    effects_.mirror = enabled;
+    published_generation = ++effects_generation_;
+  }
+  effects_generation_published_.store(published_generation,
+                                      std::memory_order_release);
 }
 
 void CameraPipeline::SetEffects(
@@ -900,6 +907,7 @@ void CameraPipeline::SetEffects(
       ++effects_ignored_updates_;
       return;
     }
+    effects_generation_published_.store(0, std::memory_order_release);
 
     if (CanReusePreparedReplaceBackgroundSource(effects_, effects)) {
       replace_source = replace_background_source_;
@@ -919,13 +927,16 @@ void CameraPipeline::SetEffects(
     ++replacement_background_preparations_;
   }
 
+  std::uint64_t published_generation = 0;
   {
     std::lock_guard<std::mutex> lock(effects_mu_);
     effects_ = effects;
     replace_background_source_ = std::move(replace_source);
-    ++effects_generation_;
+    published_generation = ++effects_generation_;
     ++effects_applied_updates_;
   }
+  effects_generation_published_.store(published_generation,
+                                      std::memory_order_release);
 }
 
 void CameraPipeline::RefreshEffectsResources() {
@@ -935,6 +946,7 @@ void CameraPipeline::RefreshEffectsResources() {
   {
     std::lock_guard<std::mutex> lock(effects_mu_);
     effects = effects_;
+    effects_generation_published_.store(0, std::memory_order_release);
   }
 
   const bool prepare_replace_source =
@@ -944,12 +956,17 @@ void CameraPipeline::RefreshEffectsResources() {
                             ? PrepareReplaceBackgroundSourceForEffects(effects)
                             : detail::PreparedReplaceBackgroundSource{};
 
-  std::lock_guard<std::mutex> lock(effects_mu_);
-  if (prepare_replace_source)
-    ++replacement_background_preparations_;
-  replace_background_source_ = std::move(replace_source);
-  ++effects_generation_;
-  ++effects_resource_refreshes_;
+  std::uint64_t published_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    if (prepare_replace_source)
+      ++replacement_background_preparations_;
+    replace_background_source_ = std::move(replace_source);
+    published_generation = ++effects_generation_;
+    ++effects_resource_refreshes_;
+  }
+  effects_generation_published_.store(published_generation,
+                                      std::memory_order_release);
 }
 
 CameraPipelineStatus CameraPipeline::Status() const {
@@ -1073,6 +1090,8 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
     effects_ = cfg.effects;
     replace_background_source_ = replace_source;
     ++effects_generation_;
+    effects_generation_published_.store(effects_generation_,
+                                        std::memory_order_release);
   }
 
   last_error_.clear();
@@ -1956,6 +1975,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   studiocast::video::effects::BroadcastCameraEffects appliedFx{};
   studiocast::video::effects::BroadcastEffectsPlan appliedPlan{};
   std::uint64_t appliedEffectsGeneration = 0;
+  RawYuyvPassthroughPlan raw_yuyv_plan{};
+  YuyvFramePathCounters yuyv_frame_path_counters{};
 
   // Optional deferred GPU output (used to avoid CPU resize when scaling is
   // needed and no CPU tail effects are active).
@@ -9656,6 +9677,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     appliedPlan = plan;
     appliedFx = fx;
     appliedEffectsGeneration = effects_generation;
+    raw_yuyv_plan = PrepareRawYuyvPassthroughPlan(capA, outA, appliedFx);
   };
 
   // Initial chain based on config at pipeline start.
@@ -9878,6 +9900,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     capA = fallback;
     rgbStride = rgb.stride_bytes;
+    raw_yuyv_plan =
+        PrepareRawYuyvPassthroughPlan(capA, outA, appliedFx);
     {
       std::lock_guard<std::mutex> lock(mu_);
       capture_ = capA;
@@ -9945,6 +9969,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       outBuf.resize(need);
     ResizeYuyvConversionScratch();
     ZeroRgbOutputPadding();
+    raw_yuyv_plan =
+        PrepareRawYuyvPassthroughPlan(capA, outA, appliedFx);
 
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -10018,11 +10044,42 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 
     const auto t_capture_start = Clock::now();
+    bool raw_yuyv_passthrough_frame = false;
 
     // Convert capture -> internal RGB (tight stride)
     if (capA.format == CapturePixelFormat::yuyv) {
-      YuyvToRgb24(f.data, capA.width, capA.height, capA.bytes_per_line,
-                  rgb.data(), rgbStride);
+      if (ValidateYuyvCaptureFrame(capA, f.bytes) !=
+          YuyvCaptureFrameValidation::ok) {
+        std::string rerr;
+        (void)cap.ReleaseFrame(f, &rerr);
+        std::lock_guard<std::mutex> lock(mu_);
+        last_error_ =
+            "Invalid or undersized negotiated YUYV capture frame layout.";
+        break;
+      }
+
+      const std::uint64_t published_effects_generation =
+          effects_generation_published_.load(std::memory_order_acquire);
+      raw_yuyv_passthrough_frame =
+          raw_yuyv_plan.eligible && published_effects_generation != 0 &&
+          published_effects_generation == appliedEffectsGeneration;
+
+      if (raw_yuyv_passthrough_frame) {
+        const auto copy_result = CopyRawYuyvFrame(
+            raw_yuyv_plan, f.data, f.bytes, outBuf.data(), outBuf.size(),
+            &yuyv_frame_path_counters);
+        if (copy_result != RawYuyvCopyResult::ok) {
+          std::string rerr;
+          (void)cap.ReleaseFrame(f, &rerr);
+          std::lock_guard<std::mutex> lock(mu_);
+          last_error_ = "Raw YUYV passthrough copy rejected the frame layout.";
+          break;
+        }
+      } else {
+        CountedYuyvToRgb24(f.data, capA.width, capA.height,
+                           capA.bytes_per_line, rgb.data(), rgbStride,
+                           &yuyv_frame_path_counters);
+      }
     } else if (capA.format == CapturePixelFormat::mjpeg) {
       if (f.bytes == 0) {
         std::string rerr;
@@ -10093,7 +10150,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     // Periodically refresh the v4l2loopback negotiated format so
     // consumer-driven VIDIOC_S_FMT changes (common in Zoom/Teams) do not force
     // pipeline restarts.
-    (void)RefreshOutputActual("periodic", /*force=*/false);
+    const bool output_changed =
+        RefreshOutputActual("periodic", /*force=*/false);
+    if (raw_yuyv_passthrough_frame && output_changed) {
+      // The bounded copy was prepared for the previous negotiated layout.
+      // Drop it and use the newly prepared plan on the next captured frame.
+      continue;
+    }
 
     live_effect_attribution.BeginFrame();
     const auto mark_live_effect_success = [&](std::string_view effect_id,
@@ -12933,6 +12996,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     const auto t_write_start = Clock::now();
 
+    if (raw_yuyv_passthrough_frame &&
+        effects_generation_published_.load(std::memory_order_acquire) !=
+            appliedEffectsGeneration) {
+      // An effect change raced with this prepared raw frame. Drop it before
+      // the write boundary; the next loop rebuilds and uses the RGB path.
+      continue;
+    }
+
     if (outA.format == PixelFormat::rgb24) {
       const std::size_t wantRow = static_cast<std::size_t>(outW) * 3u;
 
@@ -12976,12 +13047,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       }
     } else {
-      // Output is YUYV; convert RGB -> YUYV into outBuf with output stride.
-      Rgb24ToYuyvWithScratch(
-          rgbOut, outW, outH, rgbOutStride, outBuf.data(), outA.bytes_per_line,
-          yuyvConversionScratch.empty() ? nullptr
-                                        : yuyvConversionScratch.data(),
-          yuyvConversionScratch.size());
+      if (!raw_yuyv_passthrough_frame) {
+        // Output is YUYV; convert RGB -> YUYV into outBuf with output stride.
+        CountedRgb24ToYuyvWithScratch(
+            rgbOut, outW, outH, rgbOutStride, outBuf.data(),
+            outA.bytes_per_line,
+            yuyvConversionScratch.empty() ? nullptr
+                                          : yuyvConversionScratch.data(),
+            yuyvConversionScratch.size(), &yuyv_frame_path_counters);
+      }
 
       std::string werr;
       if (!writer_.WriteFrame(outBuf.data(), outBuf.size(), &werr)) {
@@ -13118,6 +13192,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       debug_.output_format_changes = output_format_changes;
       debug_.output_refresh_failures = output_refresh_failures;
       debug_.output_write_recoveries = output_write_recoveries;
+      debug_.yuyv_capture_to_rgb_calls =
+          yuyv_frame_path_counters.capture_to_rgb_calls;
+      debug_.yuyv_output_from_rgb_calls =
+          yuyv_frame_path_counters.output_from_rgb_calls;
+      debug_.raw_yuyv_passthrough_frames =
+          yuyv_frame_path_counters.raw_passthrough_frames;
+      debug_.raw_yuyv_passthrough_bytes =
+          yuyv_frame_path_counters.raw_passthrough_bytes;
 
       debug_.pace_sleep_ms = ema_pace_sleep.ValueOrZero();
       debug_.pace_late_ms = ema_pace_late.ValueOrZero();
