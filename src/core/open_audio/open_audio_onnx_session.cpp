@@ -66,10 +66,6 @@ struct OpenAudioOrtSession::Impl {
   OrtSessionInfo info;
   std::unique_ptr<studiocast::onnx::OrtSession> session;
 
-  // Scratch space to avoid per-block heap churn in real-time processing.
-  std::vector<studiocast::onnx::OrtSession::RunInput> scratch_inputs;
-  std::vector<studiocast::onnx::OrtSession::RunOutput> scratch_outputs;
-
   // Run1D is a diagnostics/self-test convenience path, not the live audio path.
   std::vector<int64_t> run1d_input_shape;
   std::vector<int64_t> run1d_output_shape;
@@ -86,8 +82,6 @@ void OpenAudioOrtSession::ReserveRunScratch(std::size_t input_count,
                                             std::size_t output_count) {
   if (!impl_)
     return;
-  impl_->scratch_inputs.reserve(input_count);
-  impl_->scratch_outputs.reserve(output_count);
   if (impl_->session) {
     impl_->session->ReserveRunScratch(input_count, output_count);
   }
@@ -130,6 +124,13 @@ bool OpenAudioOrtSession::Run(const OrtRunInput *inputs,
                               std::size_t input_count,
                               const OrtRunOutput *outputs,
                               std::size_t output_count, std::string *error) {
+  return RunPrepared(0, inputs, input_count, outputs, output_count, error);
+}
+
+bool OpenAudioOrtSession::RunPrepared(
+    std::size_t binding_slot, const OrtRunInput *inputs,
+    std::size_t input_count, const OrtRunOutput *outputs,
+    std::size_t output_count, std::string *error) {
   if (error)
     error->clear();
 
@@ -144,26 +145,19 @@ bool OpenAudioOrtSession::Run(const OrtRunInput *inputs,
     return false;
   }
 
-  impl_->scratch_inputs.clear();
-  impl_->scratch_outputs.clear();
-  impl_->scratch_inputs.reserve(input_count);
-  impl_->scratch_outputs.reserve(output_count);
+  return impl_->session->RunCpuPrepared(binding_slot, inputs, input_count,
+                                        outputs, output_count, error);
+}
 
-  for (std::size_t i = 0; i < input_count; ++i) {
-    const auto &in = inputs[i];
-    impl_->scratch_inputs.push_back(studiocast::onnx::OrtSession::RunInput{
-        in.name, in.data, in.num_floats, in.shape, in.shape_rank});
-  }
+void OpenAudioOrtSession::InvalidatePreparedBindings() {
+  if (impl_ && impl_->session)
+    impl_->session->InvalidatePreparedBindings();
+}
 
-  for (std::size_t i = 0; i < output_count; ++i) {
-    const auto &out = outputs[i];
-    impl_->scratch_outputs.push_back(studiocast::onnx::OrtSession::RunOutput{
-        out.name, out.data, out.num_floats, out.shape, out.shape_rank});
-  }
-
-  return impl_->session->RunCpu(impl_->scratch_inputs.data(), input_count,
-                                impl_->scratch_outputs.data(), output_count,
-                                error);
+OpenAudioOrtSession::PreparedRunStats
+OpenAudioOrtSession::prepared_run_stats() const {
+  return (impl_ && impl_->session) ? impl_->session->prepared_run_stats()
+                                  : PreparedRunStats{};
 }
 
 bool OpenAudioOrtSession::Run1D(const float *input, std::size_t samples,
