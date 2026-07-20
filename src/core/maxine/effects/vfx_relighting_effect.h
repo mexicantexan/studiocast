@@ -48,6 +48,9 @@ public:
   // The relit foreground output is stored in an internal GPU NvCVImage.
   NvCV_Status Process(studiocast::video::GpuFrame &frame,
                       std::string *error) override;
+  bool SetExternalCudaStream(maxine::CUstream stream,
+                             std::string *error) override;
+  void InvalidateBindings() noexcept override;
 
   const maxine::NvCVImage *OutputGpu() const {
     return output_ready_ ? &output_gpu_ : nullptr;
@@ -61,6 +64,7 @@ public:
 private:
   bool EnsureEffectCreated(std::string *error);
   bool ApplyConfigLocked(std::string *error);
+  bool EnsureStreamBound(std::string *error);
   bool EnsureOutputImage(unsigned width, unsigned height, std::string *error);
   bool BindMatte(const maxine::NvCVImage *matte, std::string *error);
 
@@ -72,7 +76,10 @@ private:
 
   maxine::vfx::NvVFX_Handle handle_ = nullptr;
   maxine::CUstream stream_ = nullptr;
+  maxine::CUstream external_stream_ = nullptr;
+  bool external_stream_selected_ = false;
   bool own_stream_ = false;
+  bool stream_bound_ = false;
 
   Config cfg_{};
   bool cfg_dirty_ = true;
@@ -80,6 +87,13 @@ private:
   maxine::NvCVImage output_gpu_{};
   bool output_ready_ = false;
   bool output_allocated_ = false;
+  const maxine::NvCVImage *bound_input_ = nullptr;
+  const maxine::NvCVImage *bound_matte_ = nullptr;
+  maxine::NvCVImage *bound_output_ = nullptr;
+  const char *matte_selector_ = nullptr;
+  const char *output_selector_ = nullptr;
+  unsigned bound_width_ = 0;
+  unsigned bound_height_ = 0;
 };
 
 } // namespace studiocast::maxine::effects

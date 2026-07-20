@@ -1041,6 +1041,61 @@ elseif (BUILD_TESTING)
 endif()
 
 if (BUILD_TESTING)
+    add_library(studiocast-maxine-effect-fake-sdk SHARED
+            tests/maxine_effect_runtime_fake_sdk.cpp
+    )
+    target_include_directories(studiocast-maxine-effect-fake-sdk PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+    )
+    set_target_properties(studiocast-maxine-effect-fake-sdk PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+    studiocast_set_project_warnings(studiocast-maxine-effect-fake-sdk)
+
+    add_library(studiocast-maxine-effect-fake-cudart SHARED
+            tests/maxine_effect_runtime_fake_cudart.cpp
+    )
+    set_target_properties(studiocast-maxine-effect-fake-cudart PROPERTIES
+            OUTPUT_NAME cudart
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+    studiocast_set_project_warnings(studiocast-maxine-effect-fake-cudart)
+
+    add_executable(studiocast-maxine-effect-binding-tests
+            tests/maxine_effect_binding_tests.cpp
+    )
+    target_link_libraries(studiocast-maxine-effect-binding-tests PRIVATE
+            studiocast_core
+            studiocast-maxine-effect-fake-sdk
+    )
+    target_include_directories(studiocast-maxine-effect-binding-tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+    target_compile_definitions(studiocast-maxine-effect-binding-tests PRIVATE
+            STUDIOCAST_FAKE_MAXINE_SDK_PATH="$<TARGET_FILE:studiocast-maxine-effect-fake-sdk>"
+    )
+    studiocast_set_project_warnings(studiocast-maxine-effect-binding-tests)
+    studiocast_enable_sanitizers(studiocast-maxine-effect-binding-tests)
+    set_target_properties(studiocast-maxine-effect-binding-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+    add_dependencies(studiocast-maxine-effect-binding-tests
+            studiocast-maxine-effect-fake-cudart)
+    add_test(NAME studiocast-maxine-effect-binding-tests
+            COMMAND studiocast-maxine-effect-binding-tests)
+    set_tests_properties(studiocast-maxine-effect-binding-tests PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
+    )
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         add_test(NAME studiocast-embedded-ptx-freshness

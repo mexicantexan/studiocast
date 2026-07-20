@@ -39,6 +39,9 @@ public:
 
   NvCV_Status Process(studiocast::video::GpuFrame &frame,
                       std::string *error) override;
+  bool SetExternalCudaStream(maxine::CUstream stream,
+                             std::string *error) override;
+  void InvalidateBindings() noexcept override;
 
   maxine::NvCVImage *OutputGpu() { return output_ready_ ? &out_gpu_ : nullptr; }
   const maxine::NvCVImage *OutputGpu() const {
@@ -50,6 +53,7 @@ public:
 private:
   bool EnsureEffectCreated(std::string *error);
   bool ApplyConfigLocked(std::string *error);
+  bool EnsureStreamBound(std::string *error);
   bool EnsureOutputImage(unsigned width, unsigned height, std::string *error);
   bool EnsureStateBufferLocked(std::string *error);
   bool QueryStateBytesLocked(std::size_t *out_bytes, std::string *error);
@@ -64,7 +68,11 @@ private:
 
   maxine::vfx::NvVFX_Handle handle_ = nullptr;
   maxine::CUstream stream_ = nullptr;
+  maxine::CUstream external_stream_ = nullptr;
+  bool external_stream_selected_ = false;
   bool own_stream_ = false;
+  bool stream_bound_ = false;
+  bool model_bound_ = false;
 
   bool cfg_dirty_ = true;
   float strength_ = 0.5f; // [0..1]
@@ -72,6 +80,10 @@ private:
   maxine::NvCVImage out_gpu_{};
   bool out_allocated_ = false;
   bool output_ready_ = false;
+  const maxine::NvCVImage *bound_input_ = nullptr;
+  maxine::NvCVImage *bound_output_ = nullptr;
+  unsigned bound_width_ = 0;
+  unsigned bound_height_ = 0;
 
   void *state_device_ = nullptr;
   std::size_t state_bytes_ = 0;

@@ -47,9 +47,51 @@ VfxBackgroundBlurEffect::VfxBackgroundBlurEffect(
 VfxBackgroundBlurEffect::~VfxBackgroundBlurEffect() { Destroy(); }
 
 void VfxBackgroundBlurEffect::SetConfig(const Config &cfg) {
-  cfg_ = cfg;
-  cfg_.strength = Clamp01(cfg_.strength);
+  Config next = cfg;
+  next.strength = Clamp01(next.strength);
+  if (next.strength == cfg_.strength)
+    return;
+  cfg_ = next;
   cfg_dirty_ = true;
+}
+
+bool VfxBackgroundBlurEffect::SetExternalCudaStream(maxine::CUstream stream,
+                                                    std::string *error) {
+  if (!stream) {
+    if (error)
+      *error = "External CUDA stream must be non-null.";
+    return false;
+  }
+  if (stream_ == stream && !own_stream_)
+    return !handle_ || EnsureStreamBound(error);
+  if (handle_) {
+    const auto status = vfx_->f().NvVFX_SetCudaStream(
+        handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream);
+    if (status != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetCudaStream failed: " +
+                 StatusToString(vfx_, nvcv_, status);
+      return false;
+    }
+  }
+  if (own_stream_ && stream_ && vfx_ && vfx_->IsInitialized())
+    vfx_->f().NvVFX_CudaStreamDestroy(stream_);
+  stream_ = stream;
+  external_stream_ = stream;
+  external_stream_selected_ = true;
+  own_stream_ = false;
+  stream_bound_ = handle_ != nullptr;
+  return true;
+}
+
+void VfxBackgroundBlurEffect::InvalidateBindings() noexcept {
+  stream_bound_ = false;
+  bound_input_ = nullptr;
+  bound_matte_ = nullptr;
+  bound_output_ = nullptr;
+  bound_width_ = 0;
+  bound_height_ = 0;
+  output_ready_ = false;
 }
 
 bool VfxBackgroundBlurEffect::Initialize(std::string *error) {
@@ -101,6 +143,8 @@ NvCV_Status VfxBackgroundBlurEffect::Process(studiocast::video::GpuFrame &frame,
       *error = init_err;
     return -1;
   }
+  if (!EnsureStreamBound(error))
+    return -1;
 
   if (cfg_dirty_) {
     std::string cfg_err;
@@ -121,30 +165,47 @@ NvCV_Status VfxBackgroundBlurEffect::Process(studiocast::video::GpuFrame &frame,
 
   auto &f = vfx_->f();
 
-  // Bind I/O images.
-  NvCV_Status s =
-      f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_IMAGE, frame.nvcv_gpu);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error =
-          "NvVFX_SetImage(srcImage) failed: " + StatusToString(vfx_, nvcv_, s);
-    return s;
+  const auto width = static_cast<unsigned>(frame.width);
+  const auto height = static_cast<unsigned>(frame.height);
+  if (bound_width_ != width || bound_height_ != height) {
+    bound_input_ = nullptr;
+    bound_matte_ = nullptr;
+    bound_output_ = nullptr;
+    bound_width_ = width;
+    bound_height_ = height;
   }
-
+  NvCV_Status s = maxine::NVCV_SUCCESS;
+  if (bound_input_ != frame.nvcv_gpu) {
+    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_IMAGE,
+                         frame.nvcv_gpu);
+    if (s != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetImage(srcImage) failed: " +
+                 StatusToString(vfx_, nvcv_, s);
+      bound_input_ = nullptr;
+      return s;
+    }
+    bound_input_ = frame.nvcv_gpu;
+  }
   if (!BindMatte(frame.matte_gpu, error)) {
     return -1;
   }
-
-  s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &output_gpu_);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error =
-          "NvVFX_SetImage(dstImage) failed: " + StatusToString(vfx_, nvcv_, s);
-    return s;
+  if (bound_output_ != &output_gpu_) {
+    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE,
+                         &output_gpu_);
+    if (s != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetImage(dstImage) failed: " +
+                 StatusToString(vfx_, nvcv_, s);
+      bound_output_ = nullptr;
+      return s;
+    }
+    bound_output_ = &output_gpu_;
   }
 
   s = f.NvVFX_Run(handle_, /*async=*/0);
   if (s != maxine::NVCV_SUCCESS) {
+    InvalidateBindings();
     if (error)
       *error = "NvVFX_Run failed: " + StatusToString(vfx_, nvcv_, s);
     return s;
@@ -179,21 +240,21 @@ bool VfxBackgroundBlurEffect::EnsureEffectCreated(std::string *error) {
     return false;
   }
 
-  // CUDA stream.
-  s = f.NvVFX_CudaStreamCreate(&stream_);
-  if (s != maxine::NVCV_SUCCESS || !stream_) {
-    if (error)
-      *error =
-          "NvVFX_CudaStreamCreate failed: " + StatusToString(vfx_, nvcv_, s);
-    Destroy();
-    return false;
+  if (external_stream_selected_) {
+    stream_ = external_stream_;
+    own_stream_ = false;
+  } else if (!stream_) {
+    s = f.NvVFX_CudaStreamCreate(&stream_);
+    if (s != maxine::NVCV_SUCCESS || !stream_) {
+      if (error)
+        *error = "NvVFX_CudaStreamCreate failed: " +
+                 StatusToString(vfx_, nvcv_, s);
+      Destroy();
+      return false;
+    }
+    own_stream_ = true;
   }
-  own_stream_ = true;
-
-  s = f.NvVFX_SetCudaStream(handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error = "NvVFX_SetCudaStream failed: " + StatusToString(vfx_, nvcv_, s);
+  if (!EnsureStreamBound(error)) {
     Destroy();
     return false;
   }
@@ -231,6 +292,8 @@ bool VfxBackgroundBlurEffect::EnsureEffectCreated(std::string *error) {
 }
 
 bool VfxBackgroundBlurEffect::ApplyConfigLocked(std::string *error) {
+  if (!cfg_dirty_)
+    return true;
   if (!handle_) {
     if (error)
       *error = "Background Blur effect not created.";
@@ -249,6 +312,26 @@ bool VfxBackgroundBlurEffect::ApplyConfigLocked(std::string *error) {
   }
 
   cfg_dirty_ = false;
+  return true;
+}
+
+bool VfxBackgroundBlurEffect::EnsureStreamBound(std::string *error) {
+  if (stream_bound_)
+    return true;
+  if (!handle_ || !stream_) {
+    if (error)
+      *error = "Background Blur stream is unavailable.";
+    return false;
+  }
+  const auto status = vfx_->f().NvVFX_SetCudaStream(
+      handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
+  if (status != maxine::NVCV_SUCCESS) {
+    if (error)
+      *error = "NvVFX_SetCudaStream failed: " +
+               StatusToString(vfx_, nvcv_, status);
+    return false;
+  }
+  stream_bound_ = true;
   return true;
 }
 
@@ -290,6 +373,11 @@ bool VfxBackgroundBlurEffect::EnsureOutputImage(unsigned width, unsigned height,
   }
 
   output_allocated_ = true;
+  bound_input_ = nullptr;
+  bound_matte_ = nullptr;
+  bound_output_ = nullptr;
+  bound_width_ = width;
+  bound_height_ = height;
   return true;
 }
 
@@ -305,22 +393,40 @@ bool VfxBackgroundBlurEffect::BindMatte(const maxine::NvCVImage *matte,
       *error = "Null matte image.";
     return false;
   }
+  if (bound_matte_ == matte)
+    return true;
 
   auto &f = vfx_->f();
 
   // Primary selector per VFX docs.
-  NvCV_Status s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_MATTE,
-                                   const_cast<maxine::NvCVImage *>(matte));
-  if (s == maxine::NVCV_SUCCESS)
+  NvCV_Status s = static_cast<NvCV_Status>(-1);
+  if (matte_selector_) {
+    s = f.NvVFX_SetImage(handle_, matte_selector_,
+                         const_cast<maxine::NvCVImage *>(matte));
+    if (s == maxine::NVCV_SUCCESS) {
+      bound_matte_ = matte;
+      return true;
+    }
+    matte_selector_ = nullptr;
+  }
+  s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_MATTE,
+                       const_cast<maxine::NvCVImage *>(matte));
+  if (s == maxine::NVCV_SUCCESS) {
+    matte_selector_ = maxine::vfx::NVVFX_INPUT_MATTE;
+    bound_matte_ = matte;
     return true;
+  }
 
   // Some distributions/builds use different selector strings; try a small set
   // of known alternates before failing.
   static constexpr const char *kAlternates[] = {"matte", "srcMask", "mask"};
   for (const char *alt : kAlternates) {
     s = f.NvVFX_SetImage(handle_, alt, const_cast<maxine::NvCVImage *>(matte));
-    if (s == maxine::NVCV_SUCCESS)
+    if (s == maxine::NVCV_SUCCESS) {
+      matte_selector_ = alt;
+      bound_matte_ = matte;
       return true;
+    }
   }
 
   if (error) {
@@ -352,6 +458,7 @@ void VfxBackgroundBlurEffect::Destroy() {
   }
   stream_ = nullptr;
   own_stream_ = false;
+  InvalidateBindings();
 
   cfg_dirty_ = true;
 }

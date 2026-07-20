@@ -35,6 +35,58 @@ ArAutoFrameTracker::~ArAutoFrameTracker() {
   }
 }
 
+bool ArAutoFrameTracker::SetExternalCudaStream(
+    studiocast::maxine::CUstream stream, std::string *error_out) {
+  if (!stream) {
+    if (error_out)
+      *error_out = "External CUDA stream must be non-null.";
+    return false;
+  }
+  if (external_stream_ == stream &&
+      (!face_handle_ || face_stream_bound_) &&
+      (!body_handle_ || body_stream_bound_))
+    return true;
+  external_stream_ = stream;
+  external_stream_selected_ = true;
+  face_stream_bound_ = false;
+  body_stream_bound_ = false;
+  if (!BindStream(face_handle_, &face_stream_bound_, error_out))
+    return false;
+  if (!BindStream(body_handle_, &body_stream_bound_, error_out))
+    return false;
+  return true;
+}
+
+void ArAutoFrameTracker::InvalidateBindings() noexcept {
+  face_input_bound_ = false;
+  body_input_configured_ = false;
+  face_stream_bound_ = false;
+  body_stream_bound_ = false;
+}
+
+bool ArAutoFrameTracker::BindStream(NvAR_FeatureHandle handle, bool *bound,
+                                    std::string *error_out) {
+  if (!handle || !external_stream_selected_)
+    return true;
+  if (bound && *bound)
+    return true;
+  if (!ar_ || !ar_->IsInitialized() || !ar_->f().NvAR_SetCudaStream) {
+    if (error_out)
+      *error_out = "NvAR_SetCudaStream unavailable for Auto Frame.";
+    return false;
+  }
+  const auto status = ar_->f().NvAR_SetCudaStream(
+      handle, NvAR_Parameter_Config(CUDAStream), external_stream_);
+  if (status != studiocast::maxine::NVCV_SUCCESS) {
+    if (error_out)
+      *error_out = "NvAR_SetCudaStream failed: " + ar_->StatusToString(status);
+    return false;
+  }
+  if (bound)
+    *bound = true;
+  return true;
+}
+
 void ArAutoFrameTracker::Reset() {
   have_smoothed_ = false;
   crop_smoothed_px_ = {};
@@ -132,8 +184,6 @@ bool ArAutoFrameTracker::EnsureInitialized(NvCVImage *input_bgr_gpu,
     return false;
   }
 
-  input_bgr_gpu_ = input_bgr_gpu;
-
   std::string err;
   if (!EnsureFeatureInitialized(
           studiocast::maxine::ar::NVAR_FEATURE_FACE_BOX_DETECTION,
@@ -148,8 +198,23 @@ bool ArAutoFrameTracker::EnsureInitialized(NvCVImage *input_bgr_gpu,
       studiocast::maxine::ar::NVAR_FEATURE_BODY_BOX_DETECTION, &body_handle_,
       nullptr);
 
+  if (!BindStream(face_handle_, &face_stream_bound_, error_out) ||
+      !BindStream(body_handle_, &body_stream_bound_, error_out))
+    return false;
+
+  const bool input_changed = input_bgr_gpu_ != input_bgr_gpu ||
+                             input_width_ != input_bgr_gpu->width ||
+                             input_height_ != input_bgr_gpu->height;
+  if (input_changed) {
+    face_input_bound_ = false;
+    body_input_configured_ = false;
+  }
+  input_bgr_gpu_ = input_bgr_gpu;
+  input_width_ = input_bgr_gpu->width;
+  input_height_ = input_bgr_gpu->height;
+
   // Bind input image.
-  if (ar_->f().NvAR_SetObject) {
+  if (!face_input_bound_ && ar_->f().NvAR_SetObject) {
     const auto st =
         ar_->f().NvAR_SetObject(face_handle_, NvAR_Parameter_Input(Image),
                                 input_bgr_gpu_, sizeof(*input_bgr_gpu_));
@@ -159,32 +224,43 @@ bool ArAutoFrameTracker::EnsureInitialized(NvCVImage *input_bgr_gpu,
             "NvAR_SetObject(Input.Image) failed: " + ar_->StatusToString(st);
       return false;
     }
-    if (body_handle_) {
-      (void)ar_->f().NvAR_SetObject(body_handle_, NvAR_Parameter_Input(Image),
-                                    input_bgr_gpu_, sizeof(*input_bgr_gpu_));
-    }
+    face_input_bound_ = true;
+  }
+  if (body_handle_ && !body_input_configured_ && ar_->f().NvAR_SetObject) {
+    // Body detection is optional. Cache an unsupported input selector until
+    // the input identity changes or a runtime failure invalidates bindings.
+    // This preserves best-effort fallback without retrying a stable failure
+    // on every frame.
+    (void)ar_->f().NvAR_SetObject(body_handle_, NvAR_Parameter_Input(Image),
+                                  input_bgr_gpu_, sizeof(*input_bgr_gpu_));
+    body_input_configured_ = true;
   }
 
   // Best-effort output binding.
-  (void)ConfigureBoxOutputs(face_handle_, nullptr);
-  if (body_handle_)
-    (void)ConfigureBoxOutputs(body_handle_, nullptr);
+  if (!face_outputs_configured_) {
+    (void)ConfigureBoxOutputs(face_handle_, nullptr);
 
-  // Best-effort: discover a count selector.
-  if (ar_->f().NvAR_GetU32) {
-    const char *countCandidates[] = {
-        NvAR_Parameter_Output(NumBoxes),
-        NvAR_Parameter_Output(NumFaces),
-        NvAR_Parameter_Output(FaceCount),
-    };
-    uint32_t tmp = 0;
-    for (const char *sel : countCandidates) {
-      const auto st = ar_->f().NvAR_GetU32(face_handle_, sel, &tmp);
-      if (st == studiocast::maxine::NVCV_SUCCESS) {
-        num_param_selector_ = sel;
-        break;
+    // Best-effort: discover a count selector.
+    if (ar_->f().NvAR_GetU32) {
+      const char *countCandidates[] = {
+          NvAR_Parameter_Output(NumBoxes),
+          NvAR_Parameter_Output(NumFaces),
+          NvAR_Parameter_Output(FaceCount),
+      };
+      uint32_t tmp = 0;
+      for (const char *sel : countCandidates) {
+        const auto st = ar_->f().NvAR_GetU32(face_handle_, sel, &tmp);
+        if (st == studiocast::maxine::NVCV_SUCCESS) {
+          num_param_selector_ = sel;
+          break;
+        }
       }
     }
+    face_outputs_configured_ = true;
+  }
+  if (body_handle_ && !body_outputs_configured_) {
+    (void)ConfigureBoxOutputs(body_handle_, nullptr);
+    body_outputs_configured_ = true;
   }
 
   return true;
@@ -286,6 +362,7 @@ bool ArAutoFrameTracker::RunAndExtractBestBox(NvAR_FeatureHandle handle,
 
   auto st = ar_->f().NvAR_Run(handle);
   if (st != studiocast::maxine::NVCV_SUCCESS) {
+    InvalidateBindings();
     if (error_out)
       *error_out = "NvAR_Run failed: " + ar_->StatusToString(st);
     return false;
