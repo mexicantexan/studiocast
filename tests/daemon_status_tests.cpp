@@ -92,6 +92,16 @@ struct ReadinessFields {
   bool present = false;
 };
 
+struct ComputeFields {
+  std::string resolved;
+  std::string active;
+  std::string fallback;
+  std::string degraded;
+  std::string provider_mode;
+  bool fallback_active = false;
+  bool present = false;
+};
+
 ReadinessFields ReadinessEntryFor(const std::string &statusJson,
                                   const std::string &effectId) {
   ReadinessFields out;
@@ -135,6 +145,42 @@ ReadinessFields ReadinessEntryFor(const std::string &statusJson,
   out.reason = *reason;
   out.backend = *backend;
   out.detail = *detail;
+  out.present = true;
+  return out;
+}
+
+ComputeFields ComputeFieldsFor(const std::string &statusJson) {
+  ComputeFields out;
+  studiocast::util::json::Value rootValue;
+  std::string error;
+  if (!studiocast::util::json::Parse(statusJson, &rootValue, &error)) {
+    std::cerr << "status JSON should parse: " << error << "\n";
+    return out;
+  }
+  const JsonObject *root = rootValue.AsObject();
+  const JsonObject *video = root ? JsonObjectField(*root, "video") : nullptr;
+  const JsonObject *compute =
+      video ? JsonObjectField(*video, "compute") : nullptr;
+  const JsonObject *fallback =
+      compute ? JsonObjectField(*compute, "fallback") : nullptr;
+  const JsonObject *provider =
+      compute ? JsonObjectField(*compute, "provider") : nullptr;
+  if (!compute || !fallback || !provider)
+    return out;
+  const std::string *resolved = JsonStringField(*compute, "resolved_backend");
+  const std::string *active = JsonStringField(*compute, "active_backend");
+  const std::string *fallbackReason =
+      JsonStringField(*compute, "fallback_reason");
+  const std::string *degraded = JsonStringField(*compute, "degraded_reason");
+  const std::string *providerMode = JsonStringField(*provider, "mode");
+  if (!resolved || !active || !fallbackReason || !degraded || !providerMode)
+    return out;
+  out.resolved = *resolved;
+  out.active = *active;
+  out.fallback = *fallbackReason;
+  out.degraded = *degraded;
+  out.provider_mode = *providerMode;
+  out.fallback_active = JsonBoolField(*fallback, "active", false);
   out.present = true;
   return out;
 }
@@ -205,6 +251,44 @@ std::string StatusForVideoConfigWithDiagnostics(
                       std::filesystem::path("/tmp/studiocastd-test.sock"),
                       maxineJson, openCudaJson, openVulkanJson,
                       /*openAudioJson=*/"", /*loopbackJson=*/"");
+}
+
+std::string StatusForVideoStateWithDiagnostics(
+    const studiocast::video::VirtualCameraServiceStatus &videoStatus,
+    const studiocast::video::VirtualCameraServiceConfig &videoConfig,
+    const std::string &maxineJson, const std::string &openCudaJson,
+    const std::string &openVulkanJson) {
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  audioStatus.service_running = true;
+  audioStatus.mic_present = true;
+  audioStatus.speakers_present = true;
+
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+  return StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig,
+                      std::filesystem::path("/tmp/studiocastd-test.sock"),
+                      maxineJson, openCudaJson, openVulkanJson,
+                      /*openAudioJson=*/"", /*loopbackJson=*/"");
+}
+
+std::string ReadyOpenVulkanPixelDiagnostics(
+    const std::string &availableEffects, const std::string &pixelEvidence,
+    const std::string &extra = std::string{},
+    const std::string &blockedEffects = std::string("{}")) {
+  return "{\"compiled_enabled\":true,\"ok\":true,"
+         "\"runtime_library_found\":true,\"instance_created\":true,"
+         "\"physical_device_found\":true,"
+         "\"non_cpu_device_selected\":true,\"cpu_device_selected\":false,"
+         "\"compute_queue_available\":true,"
+         "\"logical_device_created\":true,\"context_created\":true,"
+         "\"context_healthy\":true,\"production_hardware_ready\":true,"
+         "\"shader_pipeline_created\":true,"
+         "\"context_failure_reason\":\"\","
+         "\"available_effects\":" +
+         availableEffects + ",\"blocked_effects\":" + blockedEffects +
+         ",\"blocked_reason\":"
+         "\"open_vulkan_matting_unavailable\","
+         "\"degraded_reason\":\"unrelated matting runtime blocker\"," +
+         pixelEvidence + extra + "}";
 }
 
 bool TestVideoStatusReportsAllowCpuResize() {
@@ -389,16 +473,17 @@ bool TestVideoStatusReportsComputeBackend() {
                 "vulkan unavailable status should resolve to cpu") &&
          Expect(*active == "cpu",
                 "vulkan unavailable status should be active cpu") &&
-         Expect(fallback->find("Vulkan compute backend requested") !=
-                    std::string::npos,
-                "vulkan unavailable status should include fallback reason") &&
+         Expect(*fallback == "open_vulkan_runtime_diagnostics_unavailable",
+                "missing Vulkan diagnostics should use a stable exact "
+                "fallback reason") &&
          Expect(*degraded == *fallback,
                 "vulkan unavailable degraded reason should match fallback") &&
          Expect(ArrayContainsString(activeEngines, "cpu"),
                 "vulkan unavailable status should report active cpu engine") &&
-         Expect(vulkanUnavailable->find("Vulkan compute backend requested") !=
-                    std::string::npos,
-                "vulkan unavailable reason should be normalized") &&
+         Expect(*vulkanUnavailable ==
+                    "open_vulkan_runtime_diagnostics_unavailable",
+                "Vulkan unavailable reason should preserve the exact "
+                "runtime evidence blocker") &&
          Expect(JsonBoolField(*fallbackObject, "active", false),
                 "fallback object should mark fallback active") &&
          Expect(*fallbackCode == "vulkan_unavailable",
@@ -1651,21 +1736,399 @@ bool TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() {
 #endif
 }
 
-bool TestBuiltinEffectReadyWithoutDiagnostics() {
-  studiocast::video::effects::BroadcastCameraEffects effects;
-  effects.engine =
-      studiocast::video::effects::EffectsEnginePreference::open_cuda;
-  effects.vignette.enabled = true;
+bool TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() {
+  studiocast::video::VirtualCameraServiceConfig mirrorConfig;
+  mirrorConfig.enabled = true;
+  mirrorConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  mirrorConfig.pipeline.effects.mirror = true;
+  const std::string mirrorDiagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"mirror\"]", "\"mirror_production_ready\":true,"
+                      "\"mirror_readiness_code\":"
+                      "\"open_vulkan_mirror_production_ready\","
+                      "\"mirror_blocker_code\":\"\"");
+  const std::string mirrorStatus = StatusForVideoConfigWithDiagnostics(
+      mirrorConfig, "", "", mirrorDiagnostics);
+  const ReadinessFields mirror = ReadinessEntryFor(mirrorStatus, "mirror");
+  const ComputeFields mirrorCompute = ComputeFieldsFor(mirrorStatus);
 
-  const ReadinessFields entry =
-      ReadinessEntryFor(StatusForEffects(effects), "vignette");
-  if (!entry.present)
-    return false;
+  studiocast::video::VirtualCameraServiceConfig vignetteConfig;
+  vignetteConfig.enabled = true;
+  vignetteConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  vignetteConfig.pipeline.effects.vignette.enabled = true;
+  const std::string vignetteDiagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"vignette\"]",
+      "\"vignette_fixed_center_production_ready\":true,"
+      "\"vignette_readiness_code\":"
+      "\"open_vulkan_vignette_fixed_center_production_ready\","
+      "\"vignette_blocker_code\":\"\","
+      "\"vignette_parameter_contract\":\"fixed_center\"");
+  const std::string vignetteStatus = StatusForVideoConfigWithDiagnostics(
+      vignetteConfig, "", "", vignetteDiagnostics);
+  const ReadinessFields vignette =
+      ReadinessEntryFor(vignetteStatus, "vignette");
+  const ComputeFields vignetteCompute = ComputeFieldsFor(vignetteStatus);
 
-  return Expect(entry.backend == "builtin",
-                "vignette should report the builtin backend") &&
-         Expect(entry.state == "ready",
-                "builtin effects should remain ready without diagnostics");
+  const auto mirrorPlan = studiocast::video::effects::BuildBroadcastEffectsPlan(
+      mirrorConfig.pipeline.effects);
+  return Expect(studiocast::video::effects::BroadcastEffectsPlanRequestsCompute(
+                    mirrorPlan) &&
+                    VideoConfigRequestsCompute(mirrorConfig.pipeline.effects),
+                "daemon compute determination must use the canonical "
+                "mirror-aware helper") &&
+         Expect(mirror.present && mirror.state == "ready" &&
+                    mirror.backend == "open_vulkan" && mirror.reason.empty(),
+                "exact mirror production evidence must report Vulkan ready") &&
+         Expect(mirrorCompute.present && mirrorCompute.resolved == "vulkan" &&
+                    mirrorCompute.active == "vulkan" &&
+                    mirrorCompute.provider_mode == "open_vulkan" &&
+                    !mirrorCompute.fallback_active &&
+                    mirrorCompute.fallback.empty(),
+                "stopped mirror-only explicit Vulkan must resolve Vulkan") &&
+         Expect(vignette.present && vignette.state == "ready" &&
+                    vignette.backend == "open_vulkan" &&
+                    vignette.reason.empty(),
+                "exact fixed-center vignette evidence must report Vulkan "
+                "ready") &&
+         Expect(vignetteCompute.present &&
+                    vignetteCompute.resolved == "vulkan" &&
+                    vignetteCompute.active == "vulkan" &&
+                    !vignetteCompute.fallback_active &&
+                    vignetteCompute.fallback.empty(),
+                "stopped vignette-only explicit Vulkan must resolve Vulkan");
+}
+
+bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+  const std::string diagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"mirror\"]", "\"mirror_production_ready\":true,"
+                      "\"mirror_readiness_code\":"
+                      "\"open_vulkan_mirror_production_ready\","
+                      "\"mirror_blocker_code\":\"\"");
+
+  studiocast::video::VirtualCameraServiceStatus inactive;
+  inactive.service_running = true;
+  inactive.pipeline.running = true;
+  const std::string inactiveStatus =
+      StatusForVideoStateWithDiagnostics(inactive, config, "", "", diagnostics);
+  const ReadinessFields missingMap =
+      ReadinessEntryFor(inactiveStatus, "mirror");
+  const ComputeFields missingMapCompute = ComputeFieldsFor(inactiveStatus);
+
+  auto active = inactive;
+  active.pipeline.effects_backends = "mirror:open_vulkan";
+  const std::string activeStatus =
+      StatusForVideoStateWithDiagnostics(active, config, "", "", diagnostics);
+  const ReadinessFields activeMirror =
+      ReadinessEntryFor(activeStatus, "mirror");
+  const ComputeFields activeCompute = ComputeFieldsFor(activeStatus);
+
+  return Expect(missingMap.state == "backend_unavailable" &&
+                    missingMap.reason ==
+                        "open_vulkan_mirror_live_stage_not_active",
+                "a running pipeline must not claim mirror without active-map "
+                "evidence") &&
+         Expect(missingMapCompute.active == "cpu" &&
+                    missingMapCompute.fallback ==
+                        "open_vulkan_mirror_live_stage_not_active",
+                "running mirror fallback must be effect-specific") &&
+         Expect(activeMirror.state == "ready" &&
+                    activeMirror.backend == "open_vulkan",
+                "authoritative live Vulkan mirror attribution must be ready") &&
+         Expect(activeCompute.resolved == "vulkan" &&
+                    activeCompute.active == "vulkan" &&
+                    !activeCompute.fallback_active,
+                "active map must repair aggregate compute attribution");
+}
+
+bool TestOpenVulkanPixelEvidenceFailsClosedWhenInconsistent() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"missing production fact",
+       ReadyOpenVulkanPixelDiagnostics("[\"mirror\"]",
+                                       "\"mirror_blocker_code\":\"\"")},
+      {"false production fact",
+       ReadyOpenVulkanPixelDiagnostics("[\"mirror\"]",
+                                       "\"mirror_production_ready\":false,"
+                                       "\"mirror_readiness_code\":\"\","
+                                       "\"mirror_blocker_code\":\"\"")},
+      {"wrong success code",
+       ReadyOpenVulkanPixelDiagnostics(
+           "[\"mirror\"]", "\"mirror_production_ready\":true,"
+                           "\"mirror_readiness_code\":\"wrong_success_code\","
+                           "\"mirror_blocker_code\":\"\"")},
+      {"missing available membership",
+       ReadyOpenVulkanPixelDiagnostics(
+           "[]", "\"mirror_production_ready\":true,"
+                 "\"mirror_readiness_code\":"
+                 "\"open_vulkan_mirror_production_ready\","
+                 "\"mirror_blocker_code\":\"\"")},
+  };
+
+  bool ok = true;
+  for (const auto &[name, diagnostics] : cases) {
+    const ReadinessFields entry = ReadinessEntryFor(
+        StatusForVideoConfigWithDiagnostics(config, "", "", diagnostics),
+        "mirror");
+    ok = Expect(entry.present && entry.backend == "open_vulkan" &&
+                    entry.state == "backend_unavailable" &&
+                    entry.reason ==
+                        "open_vulkan_mirror_production_evidence_inconsistent",
+                ("mirror must fail closed for " + name).c_str()) &&
+         ok;
+  }
+  return ok;
+}
+
+bool TestOpenVulkanPixelCommonHardwareFactsFailClosed() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+
+  const auto diagnostics =
+      [](bool compiled, bool instance, bool nonCpu, bool cpu, bool queue,
+         bool contextHealthy, bool diagnosticsOk,
+         const std::string &contextReason, const std::string &effectBlocker) {
+        return std::string("{\"compiled_enabled\":") +
+               (compiled ? "true" : "false") +
+               ",\"ok\":" + (diagnosticsOk ? "true" : "false") +
+               ",\"runtime_library_found\":true,\"instance_created\":" +
+               (instance ? "true" : "false") +
+               ","
+               "\"physical_device_found\":true,\"non_cpu_device_selected\":" +
+               (nonCpu ? "true" : "false") +
+               ",\"cpu_device_selected\":" + (cpu ? "true" : "false") +
+               ",\"compute_queue_available\":" + (queue ? "true" : "false") +
+               ",\"logical_device_created\":true,\"context_created\":true,"
+               "\"context_healthy\":" +
+               (contextHealthy ? "true" : "false") +
+               ",\"production_hardware_ready\":" +
+               (nonCpu && queue && contextHealthy ? "true" : "false") +
+               ",\"shader_pipeline_created\":true,"
+               "\"context_failure_reason\":\"" +
+               contextReason +
+               "\",\"available_effects\":[\"mirror\"],"
+               "\"blocked_effects\":{},\"mirror_production_ready\":true,"
+               "\"mirror_readiness_code\":"
+               "\"open_vulkan_mirror_production_ready\","
+               "\"mirror_blocker_code\":\"" +
+               effectBlocker + "\"}";
+      };
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {diagnostics(false, false, false, false, false, false, false, "",
+                   "vulkan_backend_disabled_in_build"),
+       "vulkan_backend_disabled_in_build"},
+      {diagnostics(true, false, true, false, true, true, true, "", ""),
+       "vulkan_instance_create_failed"},
+      {diagnostics(true, true, true, false, true, true, false, "", ""),
+       "open_vulkan_utility_kernels_unavailable"},
+      {diagnostics(true, true, false, true, true, true, true, "", ""),
+       "vulkan_only_cpu_devices_available"},
+      {diagnostics(true, true, true, false, false, true, true, "", ""),
+       "vulkan_no_compute_queue"},
+      {diagnostics(true, true, true, false, true, false, true,
+                   "vulkan_device_lost", ""),
+       "vulkan_device_lost"},
+  };
+
+  bool ok = true;
+  for (const auto &[fixture, reason] : cases) {
+    const ReadinessFields entry = ReadinessEntryFor(
+        StatusForVideoConfigWithDiagnostics(config, "", "", fixture), "mirror");
+    ok = Expect(entry.present && entry.state == "backend_unavailable" &&
+                    entry.reason == reason,
+                ("mirror hardware failure must report " + reason).c_str()) &&
+         ok;
+  }
+  return ok;
+}
+
+bool TestPixelEffectsRequireRealBackendPaths() {
+  bool ok = true;
+  for (const auto pref :
+       {studiocast::video::ComputeBackendPreference::cpu,
+        studiocast::video::ComputeBackendPreference::cuda,
+        studiocast::video::ComputeBackendPreference::auto_select}) {
+    studiocast::video::VirtualCameraServiceConfig config;
+    config.enabled = true;
+    config.pipeline.compute_backend = pref;
+    config.pipeline.effects.mirror = true;
+    const ReadinessFields entry =
+        ReadinessEntryFor(StatusForVideoConfig(config), "mirror");
+    ok = Expect(entry.present && entry.state == "backend_unavailable" &&
+                    entry.backend != "builtin",
+                "CPU/CUDA/auto mirror must not claim a live path") &&
+         ok;
+  }
+
+  studiocast::video::VirtualCameraServiceConfig mirrorConfig;
+  mirrorConfig.enabled = true;
+  mirrorConfig.pipeline.effects.mirror = true;
+  studiocast::video::VirtualCameraServiceStatus mirrorStatus;
+  mirrorStatus.service_running = true;
+  mirrorStatus.pipeline.effects_backends = "mirror:maxine";
+  const ReadinessFields maxineMirror =
+      ReadinessEntryFor(StatusForVideoStateWithDiagnostics(
+                            mirrorStatus, mirrorConfig, "", "", ""),
+                        "mirror");
+  ok = Expect(maxineMirror.state == "backend_unavailable" &&
+                  maxineMirror.reason == "mirror_no_live_backend_path",
+              "Maxine mirror attribution must not invent an implementation") &&
+       ok;
+
+  studiocast::video::VirtualCameraServiceConfig cpuVignetteConfig;
+  cpuVignetteConfig.enabled = true;
+  cpuVignetteConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::cpu;
+  cpuVignetteConfig.pipeline.effects.vignette.enabled = true;
+  const ReadinessFields cpuVignette =
+      ReadinessEntryFor(StatusForVideoConfig(cpuVignetteConfig), "vignette");
+  ok = Expect(cpuVignette.state == "backend_unavailable" &&
+                  cpuVignette.reason == "vignette_no_selectable_cpu_path",
+              "vignette must not expose a CPU path") &&
+       ok;
+
+  studiocast::video::VirtualCameraServiceConfig cudaVignetteConfig;
+  cudaVignetteConfig.enabled = true;
+  cudaVignetteConfig.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::cuda;
+  cudaVignetteConfig.pipeline.effects.vignette.enabled = true;
+  studiocast::video::VirtualCameraServiceStatus cudaVignetteStatus;
+  cudaVignetteStatus.service_running = true;
+  cudaVignetteStatus.pipeline.running = true;
+  cudaVignetteStatus.pipeline.effects_backends = "vignette:cuda";
+  const ReadinessFields cudaVignette =
+      ReadinessEntryFor(StatusForVideoStateWithDiagnostics(
+                            cudaVignetteStatus, cudaVignetteConfig, "", "", ""),
+                        "vignette");
+  ok = Expect(cudaVignette.state == "ready" && cudaVignette.backend == "cuda",
+              "an authoritative active CUDA vignette may report ready") &&
+       ok;
+
+  studiocast::video::VirtualCameraServiceConfig maxineVignetteConfig;
+  maxineVignetteConfig.enabled = true;
+  maxineVignetteConfig.pipeline.effects.auto_frame.enabled = true;
+  maxineVignetteConfig.pipeline.effects.vignette.enabled = true;
+  studiocast::video::VirtualCameraServiceStatus maxineVignetteStatus;
+  maxineVignetteStatus.service_running = true;
+  maxineVignetteStatus.pipeline.running = true;
+  maxineVignetteStatus.pipeline.effects_backends = "auto_frame:maxine_ar_cuda";
+  const ReadinessFields maxineVignette = ReadinessEntryFor(
+      StatusForVideoStateWithDiagnostics(maxineVignetteStatus,
+                                         maxineVignetteConfig, "", "", ""),
+      "vignette");
+  return Expect(maxineVignette.state == "ready" &&
+                    maxineVignette.backend == "maxine_ar_cuda",
+                "an attached vignette may inherit authoritative active "
+                "Maxine attribution") &&
+         ok;
+}
+
+bool TestTrackedCenterVignetteFailsClosedWhenAutoFrameIsRetained() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.auto_frame.enabled = true;
+  config.pipeline.effects.vignette.enabled = true;
+  config.pipeline.effects.vignette.center_on_tracked_face = true;
+  const std::string diagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"auto_frame\",\"vignette\"]",
+      "\"vignette_fixed_center_production_ready\":true,"
+      "\"vignette_readiness_code\":"
+      "\"open_vulkan_vignette_fixed_center_production_ready\","
+      "\"vignette_blocker_code\":\"\","
+      "\"vignette_parameter_contract\":\"fixed_center\"");
+  const std::string status =
+      StatusForVideoConfigWithDiagnostics(config, "", "", diagnostics);
+  const ReadinessFields vignette = ReadinessEntryFor(status, "vignette");
+  const ComputeFields compute = ComputeFieldsFor(status);
+  return Expect(vignette.state == "backend_unavailable" &&
+                    vignette.reason ==
+                        "vulkan_vignette_tracked_center_not_supported",
+                "retained tracked-center Vulkan vignette must fail closed") &&
+         Expect(compute.resolved == "vulkan" && compute.active == "vulkan",
+                "retained Auto Frame evidence may still resolve Vulkan");
+}
+
+bool TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+  config.pipeline.effects.virtual_background.mode =
+      studiocast::video::effects::VirtualBackgroundMode::blur;
+  const std::string diagnostics =
+      ReadyOpenVulkanPixelDiagnostics("[\"mirror\"]",
+                                      "\"mirror_production_ready\":true,"
+                                      "\"mirror_readiness_code\":"
+                                      "\"open_vulkan_mirror_production_ready\","
+                                      "\"mirror_blocker_code\":\"\"",
+                                      "",
+                                      "{\"virtual_background.blur\":"
+                                      "\"open_vulkan_matting_unavailable\"}");
+  const std::string status =
+      StatusForVideoConfigWithDiagnostics(config, "", "", diagnostics);
+  const ReadinessFields mirror = ReadinessEntryFor(status, "mirror");
+  const ReadinessFields blur =
+      ReadinessEntryFor(status, "virtual_background.blur");
+  const ComputeFields compute = ComputeFieldsFor(status);
+  return Expect(mirror.state == "ready" && mirror.backend == "open_vulkan",
+                "mixed request must retain ready mirror") &&
+         Expect(blur.state == "backend_unavailable" &&
+                    blur.reason == "open_vulkan_matting_unavailable",
+                "mixed request must preserve the blocked sibling reason") &&
+         Expect(compute.resolved == "vulkan" && compute.active == "vulkan" &&
+                    !compute.fallback_active && compute.fallback.empty(),
+                "a retained ready Vulkan effect must keep compute on Vulkan");
+}
+
+bool TestUnavailableVulkanRequestUsesRequestedEffectBlocker() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.eye_contact.enabled = true;
+  const std::string diagnostics =
+      "{\"compiled_enabled\":true,\"ok\":true,"
+      "\"runtime_library_found\":true,\"physical_device_found\":true,"
+      "\"non_cpu_device_selected\":true,"
+      "\"compute_queue_available\":true,"
+      "\"logical_device_created\":true,\"context_created\":true,"
+      "\"context_healthy\":true,\"production_hardware_ready\":true,"
+      "\"shader_pipeline_created\":true,\"available_effects\":[],"
+      "\"blocked_effects\":{\"eye_contact\":"
+      "\"open_vulkan_eye_contact_unavailable\"},"
+      "\"blocked_reason\":\"open_vulkan_matting_unavailable\","
+      "\"eye_contact_blocker_code\":"
+      "\"open_vulkan_eye_contact_runtime_unavailable\","
+      "\"eye_contact_detail\":\"exact eye contact runtime missing\"}";
+  const ComputeFields compute = ComputeFieldsFor(
+      StatusForVideoConfigWithDiagnostics(config, "", "", diagnostics));
+  return Expect(compute.present && compute.resolved == "cpu" &&
+                    compute.active == "cpu" && compute.fallback_active,
+                "an unavailable sole Vulkan effect must fail over") &&
+         Expect(compute.fallback.find("open_vulkan_eye_contact_unavailable") !=
+                        std::string::npos &&
+                    compute.fallback.find(
+                        "open_vulkan_eye_contact_runtime_unavailable") !=
+                        std::string::npos &&
+                    compute.fallback.find("open_vulkan_matting_unavailable") ==
+                        std::string::npos,
+                "fallback must use the requested effect blocker only");
 }
 
 bool TestAudioStatusReportsResolvedSourceAndWarnings() {
@@ -1799,7 +2262,14 @@ int main() {
   ok = TestExplicitVulkanEyeContactReportsExactFailClosedFacts() && ok;
   ok = TestExplicitVulkanVideoNoiseRemovalReportsExactFailClosedFacts() && ok;
   ok = TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() && ok;
-  ok = TestBuiltinEffectReadyWithoutDiagnostics() && ok;
+  ok = TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() && ok;
+  ok = TestLiveOpenVulkanPixelReadinessRequiresActiveMap() && ok;
+  ok = TestOpenVulkanPixelEvidenceFailsClosedWhenInconsistent() && ok;
+  ok = TestOpenVulkanPixelCommonHardwareFactsFailClosed() && ok;
+  ok = TestPixelEffectsRequireRealBackendPaths() && ok;
+  ok = TestTrackedCenterVignetteFailsClosedWhenAutoFrameIsRetained() && ok;
+  ok = TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() && ok;
+  ok = TestUnavailableVulkanRequestUsesRequestedEffectBlocker() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;
   return ok ? 0 : 1;
