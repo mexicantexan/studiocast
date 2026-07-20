@@ -91,8 +91,30 @@ public:
             (prefix + "-" + std::to_string(static_cast<long long>(::getpid())));
     fs::remove_all(path_, ec);
     fs::create_directories(path_, ec);
-    if (ec)
+    if (ec) {
       error_ = "create_directories failed: " + ec.message();
+      return;
+    }
+
+    const fs::path environmentDirectories[] = {
+        homeDir(),    xdgConfigDir(), xdgCacheDir(),
+        xdgDataDir(), xdgStateDir(),  xdgRuntimeDir(),
+    };
+    for (const fs::path &directory : environmentDirectories) {
+      fs::create_directories(directory, ec);
+      if (ec) {
+        error_ = "create_directories failed for " + directory.string() + ": " +
+                 ec.message();
+        return;
+      }
+    }
+
+    fs::permissions(xdgRuntimeDir(), fs::perms::owner_all,
+                    fs::perm_options::replace, ec);
+    if (ec) {
+      error_ = "permissions failed for " + xdgRuntimeDir().string() + ": " +
+               ec.message();
+    }
   }
 
   ~ScopedTempDir() {
@@ -103,6 +125,12 @@ public:
   bool ok() const { return error_.empty(); }
   const std::string &error() const { return error_; }
   const fs::path &path() const { return path_; }
+  fs::path homeDir() const { return path_ / "home"; }
+  fs::path xdgConfigDir() const { return path_ / "xdg" / "config"; }
+  fs::path xdgCacheDir() const { return path_ / "xdg" / "cache"; }
+  fs::path xdgDataDir() const { return path_ / "xdg" / "data"; }
+  fs::path xdgStateDir() const { return path_ / "xdg" / "state"; }
+  fs::path xdgRuntimeDir() const { return path_ / "xdg" / "runtime"; }
 
 private:
   fs::path path_;
@@ -115,10 +143,15 @@ std::string BackendCommand(const ScopedTempDir &root,
   const fs::path repo = fs::path(STUDIOCAST_SOURCE_DIR);
   const fs::path backend =
       repo / "installer" / "backend" / "studiocast-installer-backend";
-  const fs::path buildDir = root.path() / "home" / ".cache" / "studiocast" /
-                            "builds" / "test";
+  const fs::path buildDir =
+      root.xdgCacheDir() / "studiocast" / "builds" / "test";
   std::string command =
-      "HOME=" + ShellQuote((root.path() / "home").string()) + " " +
+      "HOME=" + ShellQuote(root.homeDir().string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(root.xdgConfigDir().string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(root.xdgCacheDir().string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(root.xdgDataDir().string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(root.xdgStateDir().string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(root.xdgRuntimeDir().string()) + " " +
       ShellQuote(backend.string()) + " " + subcommand + " --source-dir " +
       ShellQuote(repo.string()) + " --build-dir " +
       ShellQuote(buildDir.string()) +
@@ -128,6 +161,58 @@ std::string BackendCommand(const ScopedTempDir &root,
     command += " " + extra_options;
   }
   return command;
+}
+
+bool TestBackendCommandsIgnoreInheritedXdgRoots() {
+  ScopedTempDir temp("studiocast-installer-backend-hermetic");
+  ScopedTempDir outer("studiocast-installer-backend-hostile-outer");
+  if (!Expect(temp.ok(), temp.error().c_str()) ||
+      !Expect(outer.ok(), outer.error().c_str())) {
+    return false;
+  }
+
+  const fs::path hostileHome = outer.path() / "hostile-home";
+  const fs::path hostileConfig = outer.path() / "hostile-config";
+  const fs::path hostileCache = outer.path() / "hostile-cache";
+  const fs::path hostileData = outer.path() / "hostile-data";
+  const fs::path hostileState = outer.path() / "hostile-state";
+  const fs::path hostileRuntime = outer.path() / "hostile-runtime";
+  const fs::path hostilePaths[] = {
+      hostileHome, hostileConfig, hostileCache,
+      hostileData, hostileState,  hostileRuntime,
+  };
+
+  const std::string command =
+      "HOME=" + ShellQuote(hostileHome.string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(hostileConfig.string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(hostileCache.string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(hostileData.string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(hostileState.string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(hostileRuntime.string()) + " " +
+      "/bin/sh -c " + ShellQuote(BackendCommand(temp, "repair --dry-run"));
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(command, options);
+
+  bool ok = Expect(result.exit_code == 0,
+                   "installer backend must ignore inherited hostile XDG roots");
+  for (const fs::path &path : hostilePaths) {
+    ok = Expect(!fs::exists(path),
+                "installer backend must not write to inherited XDG roots") &&
+         ok;
+  }
+
+  std::error_code ec;
+  const fs::perms runtimePermissions =
+      fs::status(temp.xdgRuntimeDir(), ec).permissions();
+  const fs::perms permissionMask =
+      fs::perms::owner_all | fs::perms::group_all | fs::perms::others_all;
+  ok = Expect(!ec &&
+                  (runtimePermissions & permissionMask) == fs::perms::owner_all,
+              "installer test XDG_RUNTIME_DIR must have mode 0700") &&
+       ok;
+  return ok;
 }
 
 bool TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() {
@@ -512,6 +597,7 @@ bool TestUserServiceDryRunRestartsServiceAfterInstall() {
 
 int main() {
   bool ok = true;
+  ok = TestBackendCommandsIgnoreInheritedXdgRoots() && ok;
   ok = TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() && ok;
   ok = TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() && ok;
   ok = TestRepairPlanInstallsOnlySelectedVulkanPackages() && ok;
