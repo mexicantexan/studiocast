@@ -21,13 +21,13 @@ void *Allocate(std::size_t size) {
   throw std::bad_alloc();
 }
 
-#define CHECK(condition)                                                        \
-  do {                                                                          \
-    if (!(condition)) {                                                         \
-      std::cerr << __func__ << ':' << __LINE__ << ": CHECK failed: "           \
-                << #condition << '\n';                                          \
-      return false;                                                             \
-    }                                                                           \
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      std::cerr << __func__ << ':' << __LINE__                                 \
+                << ": CHECK failed: " << #condition << '\n';                   \
+      return false;                                                            \
+    }                                                                          \
   } while (false)
 
 using studiocast::maxine::CpuTailKind;
@@ -38,8 +38,11 @@ using studiocast::maxine::ResidentFrameKey;
 using studiocast::maxine::ResidentFramePlan;
 using studiocast::maxine::ResidentFrameSection;
 using studiocast::maxine::ResidentInvalidationReason;
+using studiocast::maxine::ResidentStageFailurePoint;
 using studiocast::maxine::ResidentStageKind;
+using studiocast::maxine::ResidentStageKindName;
 using studiocast::maxine::testing::FakeResidentFrameExecutor;
+using studiocast::maxine::testing::FakeResidentImageCorruption;
 
 constexpr ResidentFrameKey Key(uint64_t generation = 1, uint32_t width = 2,
                                uint32_t height = 2, uintptr_t runtime = 11,
@@ -57,8 +60,8 @@ struct HostFixture {
 
 ResidentFramePlan CombinedPlan() {
   ResidentFramePlan plan{};
-  const bool first = plan.AddCompatible(ResidentStageKind::background_blur,
-                                        false, true, 77);
+  const bool first =
+      plan.AddCompatible(ResidentStageKind::background_blur, false, true, 77);
   const bool second =
       plan.AddCompatible(ResidentStageKind::relighting, false, true, 77);
   if (!first || !second)
@@ -70,8 +73,8 @@ bool CombinedFrameUsesOneTransferPairAndOneMatte() {
   HostFixture host{};
   FakeResidentFrameExecutor executor{};
   ResidentFrameSection section{};
-  const auto result = section.Execute(CombinedPlan(), Key(), 99, host.View(),
-                                      executor);
+  const auto result =
+      section.Execute(CombinedPlan(), Key(), 99, host.View(), executor);
   const auto &counters = section.counters();
   const auto &calls = executor.calls();
 
@@ -124,6 +127,17 @@ bool OptionalFailurePreservesPriorResidentCurrent() {
   const auto result = section.Execute(plan, Key(), 1, host.View(), executor);
   CHECK(result.status == ResidentExecutionStatus::resident_output);
   CHECK(result.optional_failure_observed);
+  CHECK(result.failed_plan_stage_mask == 0x1u);
+  CHECK(result.optional_fail_open_plan_stage_mask == 0x1u);
+  CHECK(result.incompatible_output_plan_stage_mask == 0);
+  CHECK(result.stage_failure_count == 1);
+  CHECK(result.stage_failures[0].plan_stage_index == 0);
+  CHECK(result.stage_failures[0].kind == ResidentStageKind::denoise);
+  CHECK(result.stage_failures[0].boundary_result ==
+        ResidentBoundaryResult::runtime_failure);
+  CHECK(result.stage_failures[0].point ==
+        ResidentStageFailurePoint::compatible_stage);
+  CHECK(result.stage_failures[0].optional);
   CHECK(section.counters().optional_fail_open == 1);
   CHECK(executor.calls().stage_count == 2);
   CHECK(executor.calls().stage_input_identities[0] ==
@@ -163,9 +177,10 @@ bool KeysFailClosedAndChangesPrepareExactlyOnce() {
   ResidentFrameSection invalid_section{};
   CHECK(invalid_section.Execute(plan, Key(0), 1, host.View(), invalid_executor)
             .status == ResidentExecutionStatus::failed);
-  CHECK(invalid_section.Execute(plan, Key(1, 2, 2, 11, 0), 2, host.View(),
-                                invalid_executor)
-            .status == ResidentExecutionStatus::failed);
+  CHECK(
+      invalid_section
+          .Execute(plan, Key(1, 2, 2, 11, 0), 2, host.View(), invalid_executor)
+          .status == ResidentExecutionStatus::failed);
   CHECK(invalid_executor.calls().prepare == 0);
 
   FakeResidentFrameExecutor executor{};
@@ -248,8 +263,9 @@ bool AttemptAndSuccessCountersDistinguishFailures() {
   FakeResidentFrameExecutor sync_executor{};
   sync_executor.FailSynchronize(ResidentBoundaryResult::runtime_failure);
   ResidentFrameSection sync_section{};
-  CHECK(sync_section.Execute(plan, Key(), 1, host.View(), sync_executor).status ==
-        ResidentExecutionStatus::failed);
+  CHECK(
+      sync_section.Execute(plan, Key(), 1, host.View(), sync_executor).status ==
+      ResidentExecutionStatus::failed);
   CHECK(sync_section.counters().download_successes == 1);
   CHECK(sync_section.counters().sync_attempts == 1);
   CHECK(sync_section.counters().sync_successes == 0);
@@ -267,6 +283,18 @@ bool MatteValidationMissFailsClosedWithoutSecondInference() {
   const auto result = section.Execute(plan, Key(), 1, host.View(), executor);
   CHECK(result.status == ResidentExecutionStatus::cpu_visible_output);
   CHECK(result.optional_failure_observed);
+  CHECK(result.failed_plan_stage_mask == 0x3u);
+  CHECK(result.optional_fail_open_plan_stage_mask == 0x3u);
+  CHECK(result.incompatible_output_plan_stage_mask == 0x3u);
+  CHECK(result.stage_failure_count == 2);
+  CHECK(result.stage_failures[0].plan_stage_index == 0);
+  CHECK(result.stage_failures[0].kind == ResidentStageKind::background_blur);
+  CHECK(result.stage_failures[0].point ==
+        ResidentStageFailurePoint::shared_matte);
+  CHECK(result.stage_failures[1].plan_stage_index == 1);
+  CHECK(result.stage_failures[1].kind == ResidentStageKind::relighting);
+  CHECK(result.stage_failures[1].point ==
+        ResidentStageFailurePoint::shared_matte);
   CHECK(executor.calls().matte == 1);
   CHECK(executor.calls().stage_count == 0);
   CHECK(section.counters().incompatible_outputs == 1);
@@ -299,6 +327,11 @@ bool RequiredFailureAndIncompatibleOutputFailClosed() {
   CHECK(incompatible.status == ResidentExecutionStatus::failed);
   CHECK(incompatible.boundary_result ==
         ResidentBoundaryResult::incompatible_output);
+  CHECK(incompatible.failed_plan_stage_mask == 0x1u);
+  CHECK(incompatible.incompatible_output_plan_stage_mask == 0x1u);
+  CHECK(incompatible.optional_fail_open_plan_stage_mask == 0);
+  CHECK(incompatible.stage_failure_count == 1);
+  CHECK(!incompatible.stage_failures[0].optional);
   CHECK(incompatible_section.counters().incompatible_outputs == 1);
   CHECK(incompatible_section.counters().required_failures == 1);
   return true;
@@ -324,8 +357,7 @@ bool MatteFingerprintMismatchDoesNotRunAgain() {
 
 bool PlanCapacityAndEnumsFailClosed() {
   ResidentFramePlan full{};
-  for (std::size_t i = 0; i < studiocast::maxine::kMaxResidentFrameStages;
-       ++i)
+  for (std::size_t i = 0; i < studiocast::maxine::kMaxResidentFrameStages; ++i)
     CHECK(full.AddCompatible(ResidentStageKind::denoise, true));
   CHECK(!full.AddCompatible(ResidentStageKind::transfer, true));
   CHECK(full.Valid());
@@ -355,6 +387,90 @@ bool ResidentOutputHasNoReadbackOrSynchronization() {
   CHECK(section.counters().download_attempts == 0);
   CHECK(section.counters().sync_attempts == 0);
   CHECK(executor.calls().download == 0 && executor.calls().synchronize == 0);
+  return true;
+}
+
+bool NewStageKindsAreNamedAndMultipleFailuresRemainAttributable() {
+  HostFixture host{};
+  FakeResidentFrameExecutor executor{};
+  executor.FailStage(ResidentStageKind::background_remove,
+                     ResidentBoundaryResult::runtime_failure);
+  executor.FailStage(ResidentStageKind::background_replace,
+                     ResidentBoundaryResult::incompatible_output);
+  executor.FailStage(ResidentStageKind::vignette,
+                     ResidentBoundaryResult::runtime_failure);
+
+  ResidentFramePlan plan{};
+  CHECK(plan.AddCompatible(ResidentStageKind::background_remove, true));
+  CHECK(plan.AddCompatible(ResidentStageKind::background_replace, true));
+  CHECK(plan.AddCompatible(ResidentStageKind::vignette, true));
+  plan.require_cpu_output = false;
+
+  ResidentFrameSection section{};
+  const auto result = section.Execute(plan, Key(), 1, host.View(), executor);
+  CHECK(result.status == ResidentExecutionStatus::resident_output);
+  CHECK(result.optional_failure_observed);
+  CHECK(result.failed_plan_stage_mask == 0x7u);
+  CHECK(result.optional_fail_open_plan_stage_mask == 0x7u);
+  CHECK(result.incompatible_output_plan_stage_mask == 0x2u);
+  CHECK(result.stage_failure_count == 3);
+  CHECK(section.counters().optional_fail_open == 3);
+  CHECK(section.counters().incompatible_outputs == 1);
+  CHECK(executor.calls().stage_count == 3);
+
+  constexpr std::array kinds{
+      ResidentStageKind::background_remove,
+      ResidentStageKind::background_replace,
+      ResidentStageKind::vignette,
+  };
+  constexpr std::array<std::string_view, 3> names{
+      "background_remove", "background_replace", "vignette"};
+  for (std::size_t i = 0; i < kinds.size(); ++i) {
+    CHECK(result.stage_failures[i].plan_stage_index == i);
+    CHECK(result.stage_failures[i].kind == kinds[i]);
+    CHECK(result.stage_failures[i].optional);
+    CHECK(result.stage_failures[i].point ==
+          ResidentStageFailurePoint::compatible_stage);
+    CHECK(executor.calls().stage_kinds[i] == kinds[i]);
+    CHECK(ResidentStageKindName(kinds[i]) == names[i]);
+  }
+  CHECK(result.stage_failures[0].boundary_result ==
+        ResidentBoundaryResult::runtime_failure);
+  CHECK(result.stage_failures[1].boundary_result ==
+        ResidentBoundaryResult::incompatible_output);
+  CHECK(result.stage_failures[2].boundary_result ==
+        ResidentBoundaryResult::runtime_failure);
+  return true;
+}
+
+bool NonCanonicalResidentStageOutputsFailClosed() {
+  HostFixture host{};
+  ResidentFramePlan plan{};
+  CHECK(plan.AddCompatible(ResidentStageKind::denoise, false));
+  constexpr std::array corruptions{
+      FakeResidentImageCorruption::pixel_format,
+      FakeResidentImageCorruption::component_type,
+      FakeResidentImageCorruption::layout,
+      FakeResidentImageCorruption::memory_space,
+  };
+
+  for (const auto corruption : corruptions) {
+    FakeResidentFrameExecutor executor{};
+    executor.CorruptNextStageOutput(corruption);
+    ResidentFrameSection section{};
+    const auto result = section.Execute(plan, Key(), 1, host.View(), executor);
+    CHECK(result.status == ResidentExecutionStatus::failed);
+    CHECK(result.boundary_result ==
+          ResidentBoundaryResult::incompatible_output);
+    CHECK(result.failed_plan_stage_mask == 0x1u);
+    CHECK(result.incompatible_output_plan_stage_mask == 0x1u);
+    CHECK(result.stage_failure_count == 1);
+    CHECK(result.stage_failures[0].kind == ResidentStageKind::denoise);
+    CHECK(result.stage_failures[0].boundary_result ==
+          ResidentBoundaryResult::incompatible_output);
+    CHECK(section.counters().incompatible_outputs == 1);
+    CHECK(section.counters().required_failures == 1);
+  }
   return true;
 }
 
@@ -391,7 +507,9 @@ void *operator new[](std::size_t size) { return Allocate(size); }
 void operator delete(void *memory) noexcept { std::free(memory); }
 void operator delete[](void *memory) noexcept { std::free(memory); }
 void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 
 int main() {
   const std::array tests{
@@ -407,6 +525,8 @@ int main() {
       MatteFingerprintMismatchDoesNotRunAgain,
       PlanCapacityAndEnumsFailClosed,
       ResidentOutputHasNoReadbackOrSynchronization,
+      NewStageKindsAreNamedAndMultipleFailuresRemainAttributable,
+      NonCanonicalResidentStageOutputsFailClosed,
       SteadyExecutionHasNoApplicationHeapAllocations,
   };
   for (const auto test : tests) {
