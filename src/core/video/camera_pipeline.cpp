@@ -39,6 +39,7 @@
 #include "core/maxine/effects/vfx_relighting_effect.h"
 #include "core/maxine/maxine_manager.h"
 #include "core/maxine/nvcv_api.h"
+#include "core/maxine/production_resident_frame_executor.h"
 #include "core/maxine/vfx_api.h"
 #include "core/open_video/fastdvdnet_denoiser.h"
 #include "core/open_video/frame_analysis_cache.h"
@@ -242,6 +243,153 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   active_this_frame = true;
   ++active_frames;
   return true;
+}
+
+PreparedMaxineResidentIslands CompileMaxineResidentIslands(
+    const effects::PreparedBroadcastEffectsFramePlan &frame_plan,
+    std::uint32_t resolved_maxine_stage_mask,
+    std::uint64_t matte_fingerprint) noexcept {
+  PreparedMaxineResidentIslands result;
+  if (!frame_plan.valid) {
+    result.valid = false;
+    return result;
+  }
+
+  const auto resident_kind = [](effects::BroadcastEffectStage stage) {
+    using BroadcastStage = effects::BroadcastEffectStage;
+    using ResidentStage = maxine::ResidentStageKind;
+    switch (stage) {
+    case BroadcastStage::video_noise_removal:
+      return ResidentStage::denoise;
+    case BroadcastStage::eye_contact:
+      return ResidentStage::eye_contact;
+    case BroadcastStage::virtual_background_blur:
+      return ResidentStage::background_blur;
+    case BroadcastStage::virtual_background_remove:
+      return ResidentStage::background_remove;
+    case BroadcastStage::virtual_background_replace:
+      return ResidentStage::background_replace;
+    case BroadcastStage::virtual_key_light:
+      return ResidentStage::relighting;
+    case BroadcastStage::auto_frame:
+      return ResidentStage::auto_frame;
+    case BroadcastStage::vignette:
+      return ResidentStage::vignette;
+    case BroadcastStage::mirror:
+    case BroadcastStage::none:
+      return ResidentStage::count;
+    }
+    return ResidentStage::count;
+  };
+
+  std::size_t frame_index = 0;
+  while (frame_index < frame_plan.size) {
+    const auto stage = frame_plan.StageAt(frame_index);
+    const auto kind = resident_kind(stage);
+    const bool is_resident = kind < maxine::ResidentStageKind::count &&
+                             (resolved_maxine_stage_mask &
+                              MaxineResolvedStageBit(stage)) != 0;
+    if (!is_resident) {
+      ++frame_index;
+      continue;
+    }
+    if (result.count >= result.islands.size()) {
+      result.valid = false;
+      return result;
+    }
+
+    auto &island = result.islands[result.count++];
+    island.first_frame_stage = frame_index;
+    while (frame_index < frame_plan.size) {
+      const auto candidate_stage = frame_plan.StageAt(frame_index);
+      const auto candidate_kind = resident_kind(candidate_stage);
+      if (candidate_kind >= maxine::ResidentStageKind::count ||
+          (resolved_maxine_stage_mask &
+           MaxineResolvedStageBit(candidate_stage)) == 0) {
+        break;
+      }
+      const bool needs_matte =
+          candidate_kind == maxine::ResidentStageKind::background_blur ||
+          candidate_kind == maxine::ResidentStageKind::background_remove ||
+          candidate_kind == maxine::ResidentStageKind::background_replace ||
+          candidate_kind == maxine::ResidentStageKind::relighting;
+      if (!island.plan.AddCompatible(candidate_kind, /*optional=*/true,
+                                     needs_matte,
+                                     needs_matte ? matte_fingerprint : 0)) {
+        result.valid = false;
+        return result;
+      }
+      result.enabled_resident_stage_mask |=
+          std::uint32_t{1} << static_cast<std::uint32_t>(candidate_kind);
+      ++frame_index;
+    }
+    island.end_frame_stage = frame_index;
+    if (frame_index < frame_plan.size &&
+        !island.plan.SetCpuTail(maxine::CpuTailKind::incompatible_stage)) {
+      result.valid = false;
+      return result;
+    }
+  }
+  return result;
+}
+
+MaxineResidentTelemetryDelta ComputeMaxineResidentTelemetryDelta(
+    const maxine::ProductionResidentTelemetry &current,
+    const maxine::ProductionResidentTelemetry &previous) noexcept {
+  MaxineResidentTelemetryDelta delta;
+  const auto difference = [](std::uint64_t now, std::uint64_t before) {
+    return now >= before ? now - before : 0;
+  };
+  const auto counter_delta = [&](const maxine::ProductionCallCounter &now,
+                                 const maxine::ProductionCallCounter &before,
+                                 std::uint64_t *attempts,
+                                 std::uint64_t *successes) {
+    *attempts = difference(now.attempts, before.attempts);
+    *successes = difference(now.successes, before.successes);
+  };
+  const auto transfer_delta = [&](maxine::ProductionTransferKind kind,
+                                  std::uint64_t *attempts,
+                                  std::uint64_t *successes) {
+    const auto index = static_cast<std::size_t>(kind);
+    counter_delta(current.transfers[index], previous.transfers[index], attempts,
+                  successes);
+  };
+  transfer_delta(maxine::ProductionTransferKind::host_upload,
+                 &delta.upload_attempts, &delta.upload_calls);
+  transfer_delta(maxine::ProductionTransferKind::final_download,
+                 &delta.final_download_attempts, &delta.final_download_calls);
+  transfer_delta(maxine::ProductionTransferKind::cpu_continuation_download,
+                 &delta.cpu_continuation_download_attempts,
+                 &delta.cpu_continuation_download_calls);
+  transfer_delta(maxine::ProductionTransferKind::device_format_bridge,
+                 &delta.device_bridge_attempts, &delta.device_bridge_calls);
+  counter_delta(current.matte_inferences, previous.matte_inferences,
+                &delta.matte_inference_attempts,
+                &delta.matte_inference_calls);
+  counter_delta(current.explicit_synchronizations,
+                previous.explicit_synchronizations, &delta.sync_attempts,
+                &delta.sync_calls);
+  counter_delta(current.composites, previous.composites,
+                &delta.composite_attempts, &delta.composite_calls);
+  counter_delta(current.synchronous_sdk_runs, previous.synchronous_sdk_runs,
+                &delta.synchronous_sdk_run_attempts,
+                &delta.synchronous_sdk_run_calls);
+  counter_delta(current.asynchronous_sdk_runs,
+                previous.asynchronous_sdk_runs,
+                &delta.asynchronous_sdk_run_attempts,
+                &delta.asynchronous_sdk_run_calls);
+  const auto rgb_index = static_cast<std::size_t>(
+      maxine::ProductionCpuStageKind::rgb_to_bgr_staging);
+  std::uint64_t ignored_attempts = 0;
+  counter_delta(current.cpu_stages[rgb_index], previous.cpu_stages[rgb_index],
+                &ignored_attempts, &delta.rgb_to_bgr_calls);
+  delta.shared_matte_reuses = difference(
+      current.shared_matte_reuses, previous.shared_matte_reuses);
+  for (std::size_t i = 0; i < current.stages.size(); ++i) {
+    counter_delta(current.stages[i], previous.stages[i],
+                  &delta.stage_attempts[i], &delta.stage_successes[i]);
+  }
+  return delta;
 }
 
 bool EffectsPlanRequiresRebuild(
@@ -8370,6 +8518,20 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   bool want_maxine_vignette_only = false;
   bool have_maxine_vignette_only = false;
 
+  using EffectStage =
+      studiocast::video::effects::BroadcastEffectStage;
+  PreparedMaxineResidentIslands prepared_maxine_resident_islands{};
+  std::unique_ptr<studiocast::maxine::ProductionResidentFrameExecutor>
+      maxine_resident_executor;
+  studiocast::maxine::ResidentFrameSection maxine_resident_section;
+  std::vector<std::uint8_t> maxine_resident_background_rgb;
+  studiocast::maxine::ProductionResidentTelemetry
+      maxine_resident_telemetry_snapshot{};
+  std::uint64_t maxine_background_setup_upload_attempts = 0;
+  std::uint64_t maxine_background_setup_upload_calls = 0;
+  std::uint64_t maxine_resident_setup_attempts = 0;
+  std::uint64_t maxine_resident_setup_successes = 0;
+
   LiveEffectBackendAttribution live_effect_attribution;
 
   enum class OptionalEffectSlot : std::size_t {
@@ -9647,6 +9809,207 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           studiocast::video::effects::CompileBroadcastEffectsFramePlan(plan);
     }
 
+    // Freeze maximal Maxine-compatible islands only after every canonical
+    // stage has resolved to its actual backend. Runtime objects below borrow
+    // the already discovered SDK libraries; no provider/path discovery occurs
+    // in frame execution.
+    std::uint32_t resolved_maxine_stage_mask = 0;
+    const auto resolve_maxine_stage = [&](EffectStage stage, bool resolved) {
+      if (resolved && prepared_frame_plan.Contains(stage))
+        resolved_maxine_stage_mask |= MaxineResolvedStageBit(stage);
+    };
+    resolve_maxine_stage(EffectStage::video_noise_removal,
+                         have_maxine_denoise);
+    resolve_maxine_stage(EffectStage::eye_contact,
+                         have_maxine_eye_contact);
+    resolve_maxine_stage(EffectStage::virtual_background_blur,
+                         have_maxine_bg_blur);
+    resolve_maxine_stage(EffectStage::virtual_background_remove,
+                         have_maxine_bg_blur);
+    resolve_maxine_stage(EffectStage::virtual_background_replace,
+                         have_maxine_bg_blur);
+    resolve_maxine_stage(EffectStage::virtual_key_light,
+                         have_maxine_relight);
+    resolve_maxine_stage(EffectStage::auto_frame,
+                         have_maxine_auto_frame);
+    const EffectStage attached_vignette_stage =
+        prepared_frame_plan.vignette_attachment;
+    const bool vignette_attachment_is_maxine =
+        (attached_vignette_stage == EffectStage::eye_contact &&
+         have_maxine_eye_contact) ||
+        ((attached_vignette_stage ==
+              EffectStage::virtual_background_blur ||
+          attached_vignette_stage ==
+              EffectStage::virtual_background_remove ||
+          attached_vignette_stage ==
+              EffectStage::virtual_background_replace) &&
+         have_maxine_bg_blur) ||
+        (attached_vignette_stage == EffectStage::virtual_key_light &&
+         have_maxine_relight) ||
+        (attached_vignette_stage == EffectStage::auto_frame &&
+         have_maxine_auto_frame);
+    resolve_maxine_stage(EffectStage::vignette,
+                         have_maxine_vignette_only ||
+                             vignette_attachment_is_maxine);
+
+    std::uint64_t matte_fingerprint =
+        effects_generation * UINT64_C(0x9E3779B185EBCA87);
+    matte_fingerprint ^=
+        static_cast<std::uint64_t>(fx.virtual_background.greenscreen_mode)
+        << 1u;
+    matte_fingerprint ^=
+        static_cast<std::uint64_t>(
+            fx.virtual_background.greenscreen_temporal)
+        << 17u;
+    if (matte_fingerprint == 0)
+      matte_fingerprint = 1;
+    prepared_maxine_resident_islands = CompileMaxineResidentIslands(
+        prepared_frame_plan, resolved_maxine_stage_mask, matte_fingerprint);
+    maxine_resident_executor.reset();
+    maxine_resident_section.ResetSessionStateAndCounters();
+    maxine_resident_background_rgb.clear();
+    maxine_resident_telemetry_snapshot = {};
+
+    if (prepared_maxine_resident_islands.valid &&
+        prepared_maxine_resident_islands.count > 0) {
+      studiocast::maxine::ProductionResidentRuntime resident_runtime{};
+      std::filesystem::path resident_model_dir;
+      if (have_maxine_bg_blur) {
+        resident_runtime.vfx = &maxine_bg_blur.vfx;
+        resident_runtime.nvcv = &maxine_bg_blur.nvcv;
+        resident_runtime.cuda = &maxine_bg_blur.cuda;
+        resident_model_dir = maxine_bg_blur.model_dir;
+      } else if (have_maxine_relight) {
+        resident_runtime.vfx = &maxine_relight.vfx;
+        resident_runtime.nvcv = &maxine_relight.nvcv;
+        resident_runtime.cuda = &maxine_relight.cuda;
+        resident_model_dir = maxine_relight.model_dir;
+      } else if (have_maxine_denoise) {
+        resident_runtime.vfx = &maxine_denoise.vfx;
+        resident_runtime.nvcv = &maxine_denoise.nvcv;
+        resident_runtime.cuda = &maxine_denoise.cuda;
+        resident_model_dir = maxine_denoise.model_dir;
+      }
+      if (have_maxine_eye_contact) {
+        resident_runtime.ar = &maxine_eye_contact.ar;
+        if (!resident_runtime.nvcv)
+          resident_runtime.nvcv = &maxine_eye_contact.nvcv;
+        if (!resident_runtime.cuda)
+          resident_runtime.cuda = &maxine_eye_contact.cuda;
+      } else if (have_maxine_auto_frame) {
+        resident_runtime.ar = &maxine_auto_frame.ar;
+        if (!resident_runtime.nvcv)
+          resident_runtime.nvcv = &maxine_auto_frame.nvcv;
+        if (!resident_runtime.cuda)
+          resident_runtime.cuda = &maxine_auto_frame.cuda;
+      }
+      if (!resident_runtime.nvcv && have_maxine_vignette_only) {
+        resident_runtime.nvcv = &vignette_only.nvcv;
+        resident_runtime.cuda = &vignette_only.cuda;
+      }
+
+      studiocast::maxine::ProductionResidentSetup resident_setup{};
+      resident_setup.configuration_generation = effects_generation;
+      resident_setup.width = static_cast<std::uint32_t>(capA.width);
+      resident_setup.height = static_cast<std::uint32_t>(capA.height);
+      // Every island returns to the existing capture-sized RGB continuation.
+      // Output resize remains a later prepared pipeline stage.
+      resident_setup.output_width = resident_setup.width;
+      resident_setup.output_height = resident_setup.height;
+      resident_setup.runtime_identity =
+          reinterpret_cast<std::uintptr_t>(resident_runtime.cuda);
+      resident_setup.effects = fx;
+      if (have_maxine_relight && !maxine_relight.cached_hdri_path.empty()) {
+        resident_setup.effects.virtual_key_light.hdri_path =
+            maxine_relight.cached_hdri_path.string();
+      }
+      resident_setup.enabled_maxine_stage_mask =
+          prepared_maxine_resident_islands.enabled_resident_stage_mask;
+      resident_setup.vfx_model_directory = resident_model_dir;
+      resident_setup.vignette_center_x_px =
+          static_cast<float>(capA.width) * 0.5f;
+      resident_setup.vignette_center_y_px =
+          static_cast<float>(capA.height) * 0.5f;
+
+      int background_width = 0;
+      int background_height = 0;
+      std::string resident_error;
+      if ((resident_setup.enabled_maxine_stage_mask &
+           studiocast::maxine::ProductionResidentStageBit(
+               studiocast::maxine::ResidentStageKind::background_replace)) !=
+          0) {
+        if (!replace_source.valid ||
+            !LoadImageRgb24(replace_source.path, &background_width,
+                            &background_height,
+                            &maxine_resident_background_rgb,
+                            &resident_error)) {
+          resident_error = resident_error.empty()
+                               ? "Prepared replacement source is unavailable."
+                               : resident_error;
+        } else {
+          resident_setup.replacement_background = {
+              maxine_resident_background_rgb.data(),
+              static_cast<std::uint32_t>(background_width),
+              static_cast<std::uint32_t>(background_height),
+              static_cast<std::size_t>(background_width) * 3u,
+              effects_generation};
+        }
+      }
+
+      if (resident_error.empty() && resident_runtime.nvcv &&
+          resident_runtime.cuda) {
+        maxine_resident_executor = std::make_unique<
+            studiocast::maxine::ProductionResidentFrameExecutor>(
+            resident_runtime);
+        const bool resident_configured =
+            maxine_resident_executor->Configure(resident_setup,
+                                                &resident_error);
+        const auto &setup_telemetry = maxine_resident_executor->telemetry();
+        const auto setup_transfer_index = static_cast<std::size_t>(
+            studiocast::maxine::ProductionTransferKind::
+                background_asset_setup_upload);
+        maxine_background_setup_upload_attempts +=
+            setup_telemetry.transfers[setup_transfer_index].attempts;
+        maxine_background_setup_upload_calls +=
+            setup_telemetry.transfers[setup_transfer_index].successes;
+        maxine_resident_setup_attempts += setup_telemetry.setup_attempts;
+        maxine_resident_setup_successes += setup_telemetry.setup_successes;
+        if (!resident_configured) {
+          maxine_resident_executor.reset();
+        } else {
+          // Setup transfers (for example the replacement-background upload)
+          // are not frame transfers. Begin frame-time delta accounting from
+          // the fully prepared executor state.
+          maxine_resident_telemetry_snapshot =
+              maxine_resident_executor->telemetry();
+        }
+      } else if (resident_error.empty()) {
+        resident_error = "Resolved Maxine runtime is incomplete.";
+      }
+      if (!maxine_resident_executor) {
+        // A stage resolved to Maxine must never silently fall back to the old
+        // stage-isolated upload/download path. Keep the CPU frame unchanged
+        // and publish the disabled generation authoritatively instead.
+        have_maxine_denoise = false;
+        have_maxine_eye_contact = false;
+        have_maxine_bg_blur = false;
+        have_maxine_relight = false;
+        have_maxine_auto_frame = false;
+        have_maxine_vignette_only = false;
+        prepared_maxine_resident_islands = {};
+        if (!note.empty())
+          note += "\n";
+        note += "Maxine resident section unavailable; resolved Maxine effects "
+                "are disabled for this configuration: " +
+                resident_error;
+      } else {
+        if (!note.empty())
+          note += "\n";
+        note += "Maxine: compatible stages share one prepared resident frame "
+                "section, stream, upload, matte, and readback per island.";
+      }
+    }
+
     {
       append_rule_notes();
 
@@ -9861,18 +10224,41 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       (std::getenv("STUDIOCAST_DEBUG_MAXINE_TRANSFERS") != nullptr);
   std::uint64_t maxine_active_frames = 0;
   std::uint64_t maxine_rgb_to_bgr_calls = 0;
+  std::uint64_t maxine_upload_attempts = 0;
   std::uint64_t maxine_upload_calls = 0;
+  std::uint64_t maxine_matte_inference_attempts = 0;
   std::uint64_t maxine_green_screen_calls = 0;
   std::uint64_t maxine_duplicate_green_screen_calls = 0;
   std::uint64_t maxine_shared_green_screen_matte_reuse_calls = 0;
   std::uint64_t maxine_shared_green_screen_matte_incompatible_calls = 0;
   std::uint64_t maxine_shared_green_screen_input_incompatible_calls = 0;
   std::uint64_t maxine_download_calls = 0;
+  std::uint64_t maxine_final_download_attempts = 0;
   std::uint64_t maxine_final_download_calls = 0;
+  std::uint64_t maxine_cpu_continuation_download_attempts = 0;
   std::uint64_t maxine_cpu_continuation_download_calls = 0;
+  std::uint64_t maxine_device_bridge_attempts = 0;
+  std::uint64_t maxine_device_bridge_calls = 0;
   std::uint64_t maxine_bgr_to_rgb_calls = 0;
   std::uint64_t maxine_deferred_readbacks = 0;
+  std::uint64_t maxine_forced_sync_attempts = 0;
   std::uint64_t maxine_forced_sync_calls = 0;
+  std::uint64_t maxine_composite_attempts = 0;
+  std::uint64_t maxine_composite_calls = 0;
+  std::uint64_t maxine_synchronous_sdk_run_attempts = 0;
+  std::uint64_t maxine_synchronous_sdk_run_calls = 0;
+  std::uint64_t maxine_asynchronous_sdk_run_attempts = 0;
+  std::uint64_t maxine_asynchronous_sdk_run_calls = 0;
+  std::uint64_t maxine_cpu_tail_stage_calls = 0;
+  std::uint64_t maxine_runtime_failure_frames = 0;
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(
+                 studiocast::maxine::ResidentStageKind::count)>
+      maxine_stage_attempts{};
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(
+                 studiocast::maxine::ResidentStageKind::count)>
+      maxine_stage_successes{};
   std::uint64_t maxine_standalone_scaler_upload_calls = 0;
   std::uint64_t maxine_standalone_scaler_download_calls = 0;
 
@@ -10463,6 +10849,49 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       ++maxine_bgr_to_rgb_calls;
     };
 
+    auto accumulate_maxine_resident_telemetry = [&]() {
+      if (!maxine_resident_executor)
+        return;
+      const auto &current = maxine_resident_executor->telemetry();
+      const auto delta = ComputeMaxineResidentTelemetryDelta(
+          current, maxine_resident_telemetry_snapshot);
+      maxine_upload_attempts += delta.upload_attempts;
+      if (delta.upload_calls > 0)
+        mark_maxine_active_frame();
+      maxine_upload_calls += delta.upload_calls;
+      maxine_final_download_attempts += delta.final_download_attempts;
+      maxine_cpu_continuation_download_attempts +=
+          delta.cpu_continuation_download_attempts;
+      maxine_final_download_calls += delta.final_download_calls;
+      maxine_cpu_continuation_download_calls +=
+          delta.cpu_continuation_download_calls;
+      maxine_device_bridge_attempts += delta.device_bridge_attempts;
+      maxine_device_bridge_calls += delta.device_bridge_calls;
+      maxine_download_calls += delta.final_download_calls +
+                               delta.cpu_continuation_download_calls;
+      maxine_green_screen_calls += delta.matte_inference_calls;
+      maxine_matte_inference_attempts += delta.matte_inference_attempts;
+      maxine_shared_green_screen_matte_reuse_calls +=
+          delta.shared_matte_reuses;
+      maxine_forced_sync_calls += delta.sync_calls;
+      maxine_forced_sync_attempts += delta.sync_attempts;
+      maxine_composite_attempts += delta.composite_attempts;
+      maxine_composite_calls += delta.composite_calls;
+      maxine_synchronous_sdk_run_attempts +=
+          delta.synchronous_sdk_run_attempts;
+      maxine_synchronous_sdk_run_calls += delta.synchronous_sdk_run_calls;
+      maxine_asynchronous_sdk_run_attempts +=
+          delta.asynchronous_sdk_run_attempts;
+      maxine_asynchronous_sdk_run_calls +=
+          delta.asynchronous_sdk_run_calls;
+      for (std::size_t i = 0; i < current.stages.size(); ++i) {
+        maxine_stage_attempts[i] += delta.stage_attempts[i];
+        maxine_stage_successes[i] += delta.stage_successes[i];
+      }
+      maxine_rgb_to_bgr_calls += delta.rgb_to_bgr_calls;
+      maxine_resident_telemetry_snapshot = current;
+    };
+
     // Open CUDA transfer invariant (pipeline contract)
     //
     // Define "Open CUDA active for this frame" as:
@@ -10534,8 +10963,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const float vignette_center_x_px = static_cast<float>(capA.width) * 0.5f;
       const float vignette_center_y_px = static_cast<float>(capA.height) * 0.5f;
 
-      using EffectStage =
-          studiocast::video::effects::BroadcastEffectStage;
       const auto &frame_plan = appliedFramePlan;
 
       const bool vignette_requested =
@@ -11960,7 +12387,188 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
+      auto execute_maxine_resident_island =
+          [&](const PreparedMaxineResidentIsland &island) {
+            using studiocast::maxine::ResidentExecutionStatus;
+            using studiocast::maxine::ResidentFramePlan;
+            using studiocast::maxine::ResidentInvalidationReason;
+            using studiocast::maxine::ResidentStageKind;
+
+            const auto breaker_for_kind =
+                [&](ResidentStageKind kind) -> OptionalEffectBreaker * {
+              switch (kind) {
+              case ResidentStageKind::denoise:
+                return &optional_breaker(OptionalEffectSlot::denoise);
+              case ResidentStageKind::eye_contact:
+                return &optional_breaker(OptionalEffectSlot::eye_contact);
+              case ResidentStageKind::background_blur:
+              case ResidentStageKind::background_remove:
+              case ResidentStageKind::background_replace:
+                return &optional_breaker(OptionalEffectSlot::virtual_background);
+              case ResidentStageKind::relighting:
+                return &optional_breaker(OptionalEffectSlot::relight);
+              case ResidentStageKind::auto_frame:
+                return &optional_breaker(OptionalEffectSlot::auto_frame);
+              case ResidentStageKind::vignette:
+                return &optional_breaker(OptionalEffectSlot::vignette);
+              case ResidentStageKind::transfer:
+              case ResidentStageKind::count:
+                return nullptr;
+              }
+              return nullptr;
+            };
+            const auto effect_id_for_kind = [](ResidentStageKind kind) {
+              using namespace studiocast::video::effects::contract;
+              switch (kind) {
+              case ResidentStageKind::denoise:
+                return kEffectIdVideoNoiseRemoval;
+              case ResidentStageKind::eye_contact:
+                return kEffectIdEyeContact;
+              case ResidentStageKind::background_blur:
+                return kEffectIdVirtualBackgroundBlur;
+              case ResidentStageKind::background_remove:
+                return kEffectIdVirtualBackgroundRemove;
+              case ResidentStageKind::background_replace:
+                return kEffectIdVirtualBackgroundReplace;
+              case ResidentStageKind::relighting:
+                return kEffectIdVirtualKeyLight;
+              case ResidentStageKind::auto_frame:
+                return kEffectIdAutoFrame;
+              case ResidentStageKind::vignette:
+                return kEffectIdVignette;
+              case ResidentStageKind::transfer:
+              case ResidentStageKind::count:
+                return std::string_view{};
+              }
+              return std::string_view{};
+            };
+            const auto backend_for_kind = [](ResidentStageKind kind) {
+              switch (kind) {
+              case ResidentStageKind::eye_contact:
+                return std::string_view{"maxine_ar"};
+              case ResidentStageKind::auto_frame:
+                return std::string_view{"maxine_ar_cuda"};
+              case ResidentStageKind::vignette:
+                return std::string_view{"cuda"};
+              default:
+                return std::string_view{"maxine"};
+              }
+            };
+
+            ResidentFramePlan runnable{};
+            for (std::size_t i = 0; i < island.plan.stage_count; ++i) {
+              const auto &stage = island.plan.stages[i];
+              auto *breaker = breaker_for_kind(stage.kind);
+              if (breaker && !breaker->AllowsAttempt(capture_sequence))
+                continue;
+              (void)runnable.AddCompatible(
+                  stage.kind, stage.optional, stage.requires_shared_matte,
+                  stage.matte_fingerprint);
+            }
+            if (runnable.Empty())
+              return;
+            if (island.plan.has_cpu_tail)
+              (void)runnable.SetCpuTail(island.plan.cpu_tail);
+
+            const auto key = maxine_resident_executor->key();
+            const studiocast::maxine::HostRgbFrameView host{
+                rgb.data(), static_cast<std::uint32_t>(capA.width),
+                static_cast<std::uint32_t>(capA.height), rgbStride};
+            const auto result = maxine_resident_section.Execute(
+                runnable, key, capture_sequence, host,
+                *maxine_resident_executor);
+            accumulate_maxine_resident_telemetry();
+
+            const auto block_runnable_stages =
+                [&](const char *summary, std::string_view detail) {
+                  const std::string detail_string(detail);
+                  for (std::size_t i = 0; i < runnable.stage_count; ++i) {
+                    const auto kind = runnable.stages[i].kind;
+                    auto *breaker = breaker_for_kind(kind);
+                    const auto effect_id = effect_id_for_kind(kind);
+                    if (!breaker || effect_id.empty())
+                      continue;
+                    block_optional_effect(
+                        static_cast<OptionalEffectSlot>(
+                            breaker - optional_effect_breakers.data()),
+                        effect_id, backend_for_kind(kind),
+                        OptionalEffectFailureReason(summary, detail_string),
+                        capture_sequence);
+                  }
+                };
+
+            const bool cpu_output_ready =
+                result.status == ResidentExecutionStatus::cpu_visible_output ||
+                result.status == ResidentExecutionStatus::cpu_tail_required;
+            if (!cpu_output_ready) {
+              ++maxine_runtime_failure_frames;
+              maxine_resident_executor->InvalidateBindings();
+              maxine_resident_section.Invalidate(
+                  ResidentInvalidationReason::runtime_failure);
+              block_runnable_stages(
+                  "Maxine resident frame boundary failed",
+                  maxine_resident_executor->last_error());
+              return;
+            }
+
+            const auto host_output = maxine_resident_executor->host_output();
+            if (!host_output.Valid() ||
+                host_output.width != static_cast<std::uint32_t>(capA.width) ||
+                host_output.height != static_cast<std::uint32_t>(capA.height)) {
+              ++maxine_runtime_failure_frames;
+              maxine_resident_executor->InvalidateBindings();
+              maxine_resident_section.Invalidate(
+                  ResidentInvalidationReason::runtime_failure);
+              block_runnable_stages(
+                  "Maxine resident host output is incompatible",
+                  maxine_resident_executor->last_error());
+              return;
+            }
+            studiocast::video::Bgr24ToRgb24(
+                host_output.data, rgb.data(), capA.width, capA.height,
+                host_output.stride_bytes, rgbStride);
+            ++maxine_bgr_to_rgb_calls;
+            if (result.status == ResidentExecutionStatus::cpu_tail_required)
+              ++maxine_cpu_tail_stage_calls;
+
+            for (std::size_t i = 0; i < runnable.stage_count; ++i) {
+              const auto kind = runnable.stages[i].kind;
+              auto *breaker = breaker_for_kind(kind);
+              const auto effect_id = effect_id_for_kind(kind);
+              if (!breaker || effect_id.empty())
+                continue;
+              const bool failed =
+                  (result.failed_plan_stage_mask &
+                   (std::uint32_t{1} << static_cast<std::uint32_t>(i))) != 0;
+              if (failed) {
+                block_optional_effect(
+                    static_cast<OptionalEffectSlot>(breaker -
+                        optional_effect_breakers.data()),
+                    effect_id, backend_for_kind(kind),
+                    OptionalEffectFailureReason(
+                        "Maxine resident effect failed",
+                        std::string(maxine_resident_executor->last_error())),
+                    capture_sequence);
+              } else {
+                clear_optional_effect_on_success(*breaker, capture_sequence);
+                mark_live_effect_success(effect_id, backend_for_kind(kind));
+              }
+            }
+          };
+
+      std::size_t maxine_island_index = 0;
       for (std::size_t i = 0; i < frame_plan.size; ++i) {
+        if (maxine_resident_executor &&
+            maxine_island_index < prepared_maxine_resident_islands.count &&
+            i == prepared_maxine_resident_islands
+                     .islands[maxine_island_index]
+                     .first_frame_stage) {
+          const auto &island =
+              prepared_maxine_resident_islands.islands[maxine_island_index++];
+          execute_maxine_resident_island(island);
+          i = island.end_frame_stage - 1;
+          continue;
+        }
         apply_stage(frame_plan.StageAt(i));
         if (fx_failed)
           break;
@@ -13435,7 +14043,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       maxine_transfers_.active_frames = maxine_active_frames;
       maxine_transfers_.rgb_to_bgr_calls = maxine_rgb_to_bgr_calls;
+      maxine_transfers_.upload_attempts = maxine_upload_attempts;
       maxine_transfers_.upload_calls = maxine_upload_calls;
+      maxine_transfers_.matte_inference_attempts =
+          maxine_matte_inference_attempts;
       maxine_transfers_.green_screen_calls = maxine_green_screen_calls;
       maxine_transfers_.duplicate_green_screen_calls =
           maxine_duplicate_green_screen_calls;
@@ -13446,12 +14057,41 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       maxine_transfers_.shared_green_screen_input_incompatible_calls =
           maxine_shared_green_screen_input_incompatible_calls;
       maxine_transfers_.download_calls = maxine_download_calls;
+      maxine_transfers_.final_download_attempts =
+          maxine_final_download_attempts;
       maxine_transfers_.final_download_calls = maxine_final_download_calls;
+      maxine_transfers_.cpu_continuation_download_attempts =
+          maxine_cpu_continuation_download_attempts;
       maxine_transfers_.cpu_continuation_download_calls =
           maxine_cpu_continuation_download_calls;
+      maxine_transfers_.device_bridge_attempts =
+          maxine_device_bridge_attempts;
+      maxine_transfers_.device_bridge_calls = maxine_device_bridge_calls;
+      maxine_transfers_.background_setup_upload_attempts =
+          maxine_background_setup_upload_attempts;
+      maxine_transfers_.background_setup_upload_calls =
+          maxine_background_setup_upload_calls;
       maxine_transfers_.bgr_to_rgb_calls = maxine_bgr_to_rgb_calls;
       maxine_transfers_.deferred_readbacks = maxine_deferred_readbacks;
+      maxine_transfers_.forced_sync_attempts = maxine_forced_sync_attempts;
       maxine_transfers_.forced_sync_calls = maxine_forced_sync_calls;
+      maxine_transfers_.composite_attempts = maxine_composite_attempts;
+      maxine_transfers_.composite_calls = maxine_composite_calls;
+      maxine_transfers_.synchronous_sdk_run_attempts =
+          maxine_synchronous_sdk_run_attempts;
+      maxine_transfers_.synchronous_sdk_run_calls =
+          maxine_synchronous_sdk_run_calls;
+      maxine_transfers_.asynchronous_sdk_run_attempts =
+          maxine_asynchronous_sdk_run_attempts;
+      maxine_transfers_.asynchronous_sdk_run_calls =
+          maxine_asynchronous_sdk_run_calls;
+      maxine_transfers_.setup_attempts = maxine_resident_setup_attempts;
+      maxine_transfers_.setup_successes = maxine_resident_setup_successes;
+      maxine_transfers_.cpu_tail_stage_calls = maxine_cpu_tail_stage_calls;
+      maxine_transfers_.runtime_failure_frames =
+          maxine_runtime_failure_frames;
+      maxine_transfers_.stage_attempts = maxine_stage_attempts;
+      maxine_transfers_.stage_successes = maxine_stage_successes;
       maxine_transfers_.standalone_scaler_upload_calls =
           maxine_standalone_scaler_upload_calls;
       maxine_transfers_.standalone_scaler_download_calls =

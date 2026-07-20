@@ -13,6 +13,9 @@
 #include <vector>
 
 #include "core/video/effects/broadcast_effects.h"
+#include "core/video/effects/broadcast_effect_rules.h"
+#include "core/maxine/resident_frame_section.h"
+#include "core/maxine/production_resident_frame_executor.h"
 #include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/replace_background_cache_policy.h"
@@ -89,6 +92,73 @@ std::string ResolveActiveComputeBackendName(
     bool vulkan_compute_available);
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
+
+inline constexpr std::size_t kMaxPreparedMaxineResidentIslands = 9;
+
+[[nodiscard]] constexpr std::uint32_t MaxineResolvedStageBit(
+    effects::BroadcastEffectStage stage) noexcept {
+  return stage < effects::BroadcastEffectStage::none
+             ? (std::uint32_t{1} << static_cast<std::uint32_t>(stage))
+             : 0u;
+}
+
+struct PreparedMaxineResidentIsland {
+  std::size_t first_frame_stage = 0;
+  std::size_t end_frame_stage = 0;
+  maxine::ResidentFramePlan plan{};
+};
+
+struct PreparedMaxineResidentIslands {
+  std::array<PreparedMaxineResidentIsland,
+             kMaxPreparedMaxineResidentIslands>
+      islands{};
+  std::size_t count = 0;
+  std::uint32_t enabled_resident_stage_mask = 0;
+  bool valid = true;
+};
+
+// Compiles maximal contiguous islands only after setup has resolved each
+// canonical effect to a concrete backend. The mask uses BroadcastEffectStage
+// bits. Island storage is fixed and frame execution performs no allocation.
+PreparedMaxineResidentIslands CompileMaxineResidentIslands(
+    const effects::PreparedBroadcastEffectsFramePlan &frame_plan,
+    std::uint32_t resolved_maxine_stage_mask,
+    std::uint64_t matte_fingerprint) noexcept;
+
+struct MaxineResidentTelemetryDelta {
+  std::uint64_t rgb_to_bgr_calls = 0;
+  std::uint64_t upload_attempts = 0;
+  std::uint64_t upload_calls = 0;
+  std::uint64_t final_download_attempts = 0;
+  std::uint64_t final_download_calls = 0;
+  std::uint64_t cpu_continuation_download_attempts = 0;
+  std::uint64_t cpu_continuation_download_calls = 0;
+  std::uint64_t device_bridge_attempts = 0;
+  std::uint64_t device_bridge_calls = 0;
+  std::uint64_t matte_inference_attempts = 0;
+  std::uint64_t matte_inference_calls = 0;
+  std::uint64_t shared_matte_reuses = 0;
+  std::uint64_t sync_attempts = 0;
+  std::uint64_t sync_calls = 0;
+  std::uint64_t composite_attempts = 0;
+  std::uint64_t composite_calls = 0;
+  std::uint64_t synchronous_sdk_run_attempts = 0;
+  std::uint64_t synchronous_sdk_run_calls = 0;
+  std::uint64_t asynchronous_sdk_run_attempts = 0;
+  std::uint64_t asynchronous_sdk_run_calls = 0;
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+      stage_attempts{};
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+      stage_successes{};
+};
+
+// Computes monotonic callsite-counter deltas used by the live camera status
+// rollup. Invalid/non-monotonic snapshots fail closed to a zero delta.
+MaxineResidentTelemetryDelta ComputeMaxineResidentTelemetryDelta(
+    const maxine::ProductionResidentTelemetry &current,
+    const maxine::ProductionResidentTelemetry &previous) noexcept;
 
 bool EffectsPlanRequiresRebuild(
     const effects::BroadcastCameraEffects &applied_effects,
@@ -419,18 +489,43 @@ struct CameraPipelineStatus {
   struct MaxineTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t rgb_to_bgr_calls = 0;
+    std::uint64_t upload_attempts = 0;
     std::uint64_t upload_calls = 0;
+    std::uint64_t matte_inference_attempts = 0;
     std::uint64_t green_screen_calls = 0;
     std::uint64_t duplicate_green_screen_calls = 0;
     std::uint64_t shared_green_screen_matte_reuse_calls = 0;
     std::uint64_t shared_green_screen_matte_incompatible_calls = 0;
     std::uint64_t shared_green_screen_input_incompatible_calls = 0;
     std::uint64_t download_calls = 0;
+    std::uint64_t final_download_attempts = 0;
     std::uint64_t final_download_calls = 0;
+    std::uint64_t cpu_continuation_download_attempts = 0;
     std::uint64_t cpu_continuation_download_calls = 0;
+    std::uint64_t device_bridge_attempts = 0;
+    std::uint64_t device_bridge_calls = 0;
+    std::uint64_t background_setup_upload_attempts = 0;
+    std::uint64_t background_setup_upload_calls = 0;
     std::uint64_t bgr_to_rgb_calls = 0;
     std::uint64_t deferred_readbacks = 0;
+    std::uint64_t forced_sync_attempts = 0;
     std::uint64_t forced_sync_calls = 0;
+    std::uint64_t composite_attempts = 0;
+    std::uint64_t composite_calls = 0;
+    std::uint64_t synchronous_sdk_run_attempts = 0;
+    std::uint64_t synchronous_sdk_run_calls = 0;
+    std::uint64_t asynchronous_sdk_run_attempts = 0;
+    std::uint64_t asynchronous_sdk_run_calls = 0;
+    std::uint64_t setup_attempts = 0;
+    std::uint64_t setup_successes = 0;
+    std::uint64_t cpu_tail_stage_calls = 0;
+    std::uint64_t runtime_failure_frames = 0;
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+        stage_attempts{};
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+        stage_successes{};
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
   } maxine_transfers{};
