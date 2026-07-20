@@ -329,17 +329,15 @@ bool OpenVulkanVirtualBackgroundRemove::Apply(
           studiocast::vulkan::VulkanPixelFormat::f32_1) {
     return fail("alpha and alpha scratch formats must be f32_1");
   }
-  if (input.alpha->mapped() || input.alpha_tmp->mapped() ||
+  if (input.foreground->mapped() || !input.foreground->device_local() ||
+      input.output->mapped() || !input.output->device_local() ||
+      input.alpha->mapped() || input.alpha_tmp->mapped() ||
       input.alpha_feathered->mapped() || !input.alpha->device_local() ||
       !input.alpha_tmp->device_local() ||
       !input.alpha_feathered->device_local()) {
-    return fail("alpha and alpha scratch must be non-mapped DEVICE_LOCAL "
-                "resources");
+    return fail("foreground, output, alpha, and alpha scratch must be "
+                "non-mapped DEVICE_LOCAL resources");
   }
-  // The mapped output is the pipeline's one final RGB transport. This effect
-  // only writes it through Vulkan and never maps, invalidates, or host-reads it.
-  if (!input.output->mapped())
-    return fail("output must be the mapped final-frame transport resource");
 
   const studiocast::vulkan::VulkanImage *alpha_use = input.alpha;
   std::string detail;

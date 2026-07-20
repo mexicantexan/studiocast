@@ -1921,10 +1921,16 @@ int main() {
     };
     const std::vector<float> alpha = {0.0f,  0.5f,  1.0f, 0.01f,
                                       0.25f, 0.75f, 0.9f, 0.1f};
-    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
-    if (!AllocateU8(key_light_kernels, &gpu_foreground, w, h,
+    VulkanImage foreground_upload, gpu_foreground, gpu_output;
+    VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
+    if (!UploadDeviceLocalU8(key_light_kernels, &foreground_upload,
+                             &gpu_foreground, w, h,
+                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+        !AllocateDeviceLocalU8(key_light_kernels, &gpu_output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(key_light_kernels, &output_readback, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(key_light_kernels, &gpu_output, w, h,
+        !AllocateU8(key_light_kernels, &mapped_output, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(key_light_kernels, &alpha_upload, w, h, &error) ||
         !resident_alpha.Allocate(key_light_kernels.device(), w, h,
@@ -1932,18 +1938,18 @@ int main() {
                                  /*map_memory=*/false, &error)) {
       return OptionalSkip("production key-light allocation failed: " + error);
     }
-    FillU8(gpu_foreground, foreground);
     FillF32(alpha_upload, alpha);
-    if (!gpu_foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+    if (!alpha_upload.Flush(&error) ||
         !key_light_kernels.ResizeBilinearF32_1(alpha_upload, resident_alpha,
                                                &error)) {
       return OptionalSkip("production key-light fixture setup failed: " +
                           error);
     }
-    ok &= Require(!resident_alpha.mapped() && resident_alpha.device_local() &&
-                      gpu_output.mapped(),
-                  "production key light must keep alpha non-mapped "
-                  "DEVICE_LOCAL and use only the mapped RGB transport");
+    ok &= Require(!gpu_foreground.mapped() && gpu_foreground.device_local() &&
+                      !gpu_output.mapped() && gpu_output.device_local() &&
+                      !resident_alpha.mapped() && resident_alpha.device_local(),
+                  "production key light must keep foreground, output, and "
+                  "alpha non-mapped DEVICE_LOCAL");
 
     auto setup_readiness =
         SyntheticProductionMattingReadiness(key_light_kernels, false);
@@ -1979,14 +1985,27 @@ int main() {
         SyntheticProductionMattingReadiness(key_light_kernels, true);
     input.matting_readiness = &current_readiness;
     OpenVulkanVirtualKeyLightCounters counters;
+    OpenVulkanVirtualKeyLightCounters mapped_rejection_counters;
+    input.output = &mapped_output;
+    const auto submissions_before_mapped_rejection =
+        key_light_kernels.synchronous_submission_count();
+    ok &= Require(
+        !key_light.Apply(input, &mapped_rejection_counters, &error) &&
+            error.find("non-mapped DEVICE_LOCAL") != std::string::npos &&
+            mapped_rejection_counters.dispatch_calls == 0 &&
+            key_light_kernels.synchronous_submission_count() ==
+                submissions_before_mapped_rejection,
+        "key light must reject a mapped intermediate output before dispatch");
+    input.output = &gpu_output;
     const auto allocations_before =
         key_light_kernels.device()->allocation_stats().allocation_count;
     const auto submissions_before =
         key_light_kernels.synchronous_submission_count();
-    ok &= Require(key_light.Apply(input, &counters, &error) &&
-                      gpu_output.Invalidate(&error),
+    ok &= Require(key_light.Apply(input, &counters, &error),
                   "independent production key-light dispatch failed: " + error);
-    ok &= CompareU8Exact(ReadU8(gpu_output),
+    const auto key_light_output = ReadbackDeviceLocalU8(
+        key_light_kernels, gpu_output, &output_readback, &error);
+    ok &= CompareU8Exact(key_light_output,
                          KeyLightReference(foreground, alpha, w, h, 255.0f,
                                            242.0f, 228.0f, 0.5f, 1.0f),
                          "production Vulkan key-light Open CUDA parity");
@@ -2008,7 +2027,7 @@ int main() {
             counters.cpu_fallback_calls == 0 &&
             counters.runtime_failure_frames == 0 &&
             key_light_kernels.synchronous_submission_count() ==
-                submissions_before + 2 &&
+                submissions_before + 3 &&
             key_light_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before,
         "key-light inference/reuse accounting must be exact, allocation-free, "
@@ -2095,19 +2114,20 @@ int main() {
                           error);
     constexpr int w = 2;
     constexpr int h = 2;
-    VulkanImage foreground, output, alpha_upload, alpha;
-    if (!AllocateU8(lost_key_light_kernels, &foreground, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_key_light_kernels, &output, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
+    VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
+    if (!UploadDeviceLocalU8(
+            lost_key_light_kernels, &foreground_upload, &foreground, w, h,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_key_light_kernels, &output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_key_light_kernels, &alpha_upload, w, h, &error) ||
         !alpha.Allocate(lost_key_light_kernels.device(), w, h,
                         VulkanPixelFormat::f32_1, false, &error)) {
       return OptionalSkip("key-light device-loss allocation failed: " + error);
     }
-    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
-    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+    if (!alpha_upload.Flush(&error) ||
         !lost_key_light_kernels.ResizeBilinearF32_1(alpha_upload, alpha,
                                                     &error)) {
       return OptionalSkip("key-light device-loss fixture setup failed: " +
@@ -2178,11 +2198,17 @@ int main() {
         0.2f,  0.0f, 1.0f,  0.85f, 0.5f, 0.15f, 0.0f,
     };
 
-    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    VulkanImage foreground_upload, gpu_foreground, gpu_output;
+    VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     VulkanImage alpha_tmp, alpha_feathered, blur_tmp, blurred;
-    if (!AllocateU8(blur_kernels, &gpu_foreground, w, h,
+    if (!UploadDeviceLocalU8(blur_kernels, &foreground_upload,
+                             &gpu_foreground, w, h,
+                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+        !AllocateDeviceLocalU8(blur_kernels, &gpu_output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(blur_kernels, &output_readback, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(blur_kernels, &gpu_output, w, h,
+        !AllocateU8(blur_kernels, &mapped_output, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(blur_kernels, &alpha_upload, w, h, &error) ||
         !resident_alpha.Allocate(blur_kernels.device(), w, h,
@@ -2203,23 +2229,23 @@ int main() {
       return OptionalSkip("production blur resource allocation failed: " +
                           error);
     }
-    FillU8(gpu_foreground, foreground);
     FillF32(alpha_upload, alpha);
-    ok &= Require(gpu_foreground.Flush(&error) && alpha_upload.Flush(&error),
+    ok &= Require(alpha_upload.Flush(&error),
                   "production blur fixture flush failed: " + error);
     blur_kernels.InvalidateDescriptorBindingCacheForSetup();
     ok &= Require(blur_kernels.ResizeBilinearF32_1(alpha_upload,
                                                    resident_alpha, &error),
                   "production blur resident alpha setup failed: " + error);
     ok &= Require(
-        !resident_alpha.mapped() && resident_alpha.device_local() &&
+        !gpu_foreground.mapped() && gpu_foreground.device_local() &&
+            !gpu_output.mapped() && gpu_output.device_local() &&
+            !resident_alpha.mapped() && resident_alpha.device_local() &&
             !alpha_tmp.mapped() && alpha_tmp.device_local() &&
             !alpha_feathered.mapped() && alpha_feathered.device_local() &&
             !blur_tmp.mapped() && blur_tmp.device_local() &&
-            !blurred.mapped() && blurred.device_local() &&
-            gpu_output.mapped(),
-        "production blur must keep alpha/RGB scratch non-mapped DEVICE_LOCAL "
-        "and use only the mapped final-frame output transport");
+            !blurred.mapped() && blurred.device_local(),
+        "production blur must keep foreground, output, alpha, and RGB "
+        "scratch non-mapped DEVICE_LOCAL");
 
     auto setup_readiness =
         SyntheticProductionMattingReadiness(blur_kernels, false);
@@ -2256,6 +2282,18 @@ int main() {
     auto current_readiness =
         SyntheticProductionMattingReadiness(blur_kernels, true);
     input.matting_readiness = &current_readiness;
+    input.output = &mapped_output;
+    OpenVulkanVirtualBackgroundBlurCounters mapped_rejection_counters;
+    const auto mapped_rejection_submissions =
+        blur_kernels.synchronous_submission_count();
+    ok &= Require(
+        !blur.Apply(input, &mapped_rejection_counters, &error) &&
+            error.find("non-mapped DEVICE_LOCAL") != std::string::npos &&
+            mapped_rejection_counters.blur_composite_dispatch_calls == 0 &&
+            blur_kernels.synchronous_submission_count() ==
+                mapped_rejection_submissions,
+        "blur must reject a mapped intermediate output before dispatch");
+    input.output = &gpu_output;
     OpenVulkanVirtualBackgroundBlurCounters counters;
     const auto allocations_before =
         blur_kernels.device()->allocation_stats().allocation_count;
@@ -2270,9 +2308,8 @@ int main() {
       ok &= Require(blur.Apply(input, &counters, &error),
                     "production blur wrapper dispatch failed at strength " +
                         std::to_string(strength) + ": " + error);
-      ok &= Require(gpu_output.Invalidate(&error),
-                    "production blur final transport invalidate failed: " +
-                        error);
+      const auto output = ReadbackDeviceLocalU8(
+          blur_kernels, gpu_output, &output_readback, &error);
       std::vector<float> alpha_reference = alpha;
       if (parameters.alpha_feather_radius > 0) {
         alpha_reference = BlurF32Reference(
@@ -2280,7 +2317,7 @@ int main() {
         ++expected_feather_dispatches;
       }
       ok &= CompareU8(
-          ReadU8(gpu_output),
+          output,
           CompositeReference(
               foreground,
               BlurU8Reference(foreground, w, h,
@@ -2297,7 +2334,7 @@ int main() {
             counters.alpha_readback_calls == 0 &&
             counters.cpu_fallback_calls == 0 &&
             blur_kernels.synchronous_submission_count() ==
-                submissions_before + std::size(strengths) +
+                submissions_before + 2 * std::size(strengths) +
                                          expected_feather_dispatches &&
             blur_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before,
@@ -2364,11 +2401,17 @@ int main() {
                                        static_cast<std::size_t>(h),
                                    0.5f);
 
-    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    VulkanImage foreground_upload, gpu_foreground, gpu_output;
+    VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     VulkanImage alpha_tmp, alpha_feathered;
-    if (!AllocateU8(remove_kernels, &gpu_foreground, w, h,
+    if (!UploadDeviceLocalU8(remove_kernels, &foreground_upload,
+                             &gpu_foreground, w, h,
+                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+        !AllocateDeviceLocalU8(remove_kernels, &gpu_output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(remove_kernels, &output_readback, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(remove_kernels, &gpu_output, w, h,
+        !AllocateU8(remove_kernels, &mapped_output, w, h,
                     VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(remove_kernels, &alpha_upload, w, h, &error) ||
         !resident_alpha.Allocate(remove_kernels.device(), w, h,
@@ -2383,21 +2426,21 @@ int main() {
       return OptionalSkip("production remove resource allocation failed: " +
                           error);
     }
-    FillU8(gpu_foreground, foreground);
     FillF32(alpha_upload, alpha);
-    ok &= Require(gpu_foreground.Flush(&error) && alpha_upload.Flush(&error),
+    ok &= Require(alpha_upload.Flush(&error),
                   "production remove fixture flush failed: " + error);
     remove_kernels.InvalidateDescriptorBindingCacheForSetup();
     ok &= Require(remove_kernels.ResizeBilinearF32_1(
                       alpha_upload, resident_alpha, &error),
                   "production remove resident alpha setup failed: " + error);
     ok &= Require(
-        !resident_alpha.mapped() && resident_alpha.device_local() &&
+        !gpu_foreground.mapped() && gpu_foreground.device_local() &&
+            !gpu_output.mapped() && gpu_output.device_local() &&
+            !resident_alpha.mapped() && resident_alpha.device_local() &&
             !alpha_tmp.mapped() && alpha_tmp.device_local() &&
-            !alpha_feathered.mapped() && alpha_feathered.device_local() &&
-            gpu_output.mapped(),
-        "production remove must keep alpha scratch non-mapped DEVICE_LOCAL "
-        "and use only the mapped final-frame output transport");
+            !alpha_feathered.mapped() && alpha_feathered.device_local(),
+        "production remove must keep foreground, output, and alpha scratch "
+        "non-mapped DEVICE_LOCAL");
 
     auto setup_readiness =
         SyntheticProductionMattingReadiness(remove_kernels, false);
@@ -2432,6 +2475,18 @@ int main() {
     auto current_readiness =
         SyntheticProductionMattingReadiness(remove_kernels, true);
     input.matting_readiness = &current_readiness;
+    input.output = &mapped_output;
+    OpenVulkanVirtualBackgroundRemoveCounters mapped_rejection_counters;
+    const auto mapped_rejection_submissions =
+        remove_kernels.synchronous_submission_count();
+    ok &= Require(
+        !remove.Apply(input, &mapped_rejection_counters, &error) &&
+            error.find("non-mapped DEVICE_LOCAL") != std::string::npos &&
+            mapped_rejection_counters.solid_composite_dispatch_calls == 0 &&
+            remove_kernels.synchronous_submission_count() ==
+                mapped_rejection_submissions,
+        "remove must reject a mapped intermediate output before dispatch");
+    input.output = &gpu_output;
     OpenVulkanVirtualBackgroundRemoveCounters counters;
     const auto allocations_before =
         remove_kernels.device()->allocation_stats().allocation_count;
@@ -2459,9 +2514,8 @@ int main() {
       ok &= Require(remove.Apply(input, &counters, &error),
                     "production remove wrapper dispatch failed at strength " +
                         std::to_string(tc.strength) + ": " + error);
-      ok &= Require(gpu_output.Invalidate(&error),
-                    "production remove final transport invalidate failed: " +
-                        error);
+      const auto output = ReadbackDeviceLocalU8(
+          remove_kernels, gpu_output, &output_readback, &error);
       std::vector<float> alpha_reference = alpha;
       if (parameters.alpha_feather_radius > 0) {
         alpha_reference = BlurF32Reference(
@@ -2469,7 +2523,7 @@ int main() {
         ++expected_feather_dispatches;
       }
       ok &= CompareU8Exact(
-          ReadU8(gpu_output),
+          output,
           CompositeSolidReference(foreground, alpha_reference, tc.rgb),
           "production Vulkan virtual background remove strength/color parity " +
               std::to_string(tc.strength));
@@ -2482,7 +2536,7 @@ int main() {
             counters.alpha_readback_calls == 0 &&
             counters.cpu_fallback_calls == 0 &&
             remove_kernels.synchronous_submission_count() ==
-                submissions_before + std::size(cases) +
+                submissions_before + 2 * std::size(cases) +
                                          expected_feather_dispatches &&
             remove_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before,
@@ -2537,12 +2591,15 @@ int main() {
       return OptionalSkip("remove device-loss context unavailable: " + error);
     constexpr int w = 2;
     constexpr int h = 2;
-    VulkanImage foreground, output, alpha_upload, alpha, alpha_tmp;
+    VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
+    VulkanImage alpha_tmp;
     VulkanImage alpha_feathered;
-    if (!AllocateU8(lost_remove_kernels, &foreground, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_remove_kernels, &output, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
+    if (!UploadDeviceLocalU8(
+            lost_remove_kernels, &foreground_upload, &foreground, w, h,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_remove_kernels, &output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_remove_kernels, &alpha_upload, w, h, &error) ||
         !alpha.Allocate(lost_remove_kernels.device(), w, h,
                         VulkanPixelFormat::f32_1, false, &error) ||
@@ -2552,9 +2609,8 @@ int main() {
                                   VulkanPixelFormat::f32_1, false, &error)) {
       return OptionalSkip("remove device-loss allocation failed: " + error);
     }
-    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
-    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+    if (!alpha_upload.Flush(&error) ||
         !lost_remove_kernels.ResizeBilinearF32_1(alpha_upload, alpha, &error)) {
       return OptionalSkip("remove device-loss fixture setup failed: " + error);
     }
@@ -2700,11 +2756,17 @@ int main() {
       truncated << "P6\n5 3\n255\n\x01\x02";
     }
 
-    VulkanImage gpu_foreground, gpu_output, alpha_upload, resident_alpha;
+    VulkanImage foreground_upload, gpu_foreground, gpu_output;
+    VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     VulkanImage alpha_tmp, alpha_feathered;
-    if (!AllocateU8(replace_kernels, &gpu_foreground, width, height,
+    if (!UploadDeviceLocalU8(replace_kernels, &foreground_upload,
+                             &gpu_foreground, width, height,
+                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+        !AllocateDeviceLocalU8(replace_kernels, &gpu_output, width, height,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(replace_kernels, &output_readback, width, height,
                     VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(replace_kernels, &gpu_output, width, height,
+        !AllocateU8(replace_kernels, &mapped_output, width, height,
                     VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(replace_kernels, &alpha_upload, width, height, &error) ||
         !resident_alpha.Allocate(replace_kernels.device(), width, height,
@@ -2724,9 +2786,8 @@ int main() {
         0.75f, 0.30f, 0.50f, 0.95f, 0.05f,
         0.40f, 1.00f, 0.15f, 0.65f, 0.25f,
     };
-    FillU8(gpu_foreground, foreground);
     FillF32(alpha_upload, alpha);
-    ok &= Require(gpu_foreground.Flush(&error) && alpha_upload.Flush(&error),
+    ok &= Require(alpha_upload.Flush(&error),
                   "production replace fixture flush failed: " + error);
     replace_kernels.InvalidateDescriptorBindingCacheForSetup();
     ok &= Require(replace_kernels.ResizeBilinearF32_1(
@@ -2758,13 +2819,14 @@ int main() {
             replace.source_image().device_local() &&
             !replace.replacement_image().mapped() &&
             replace.replacement_image().device_local() &&
+            !gpu_foreground.mapped() && gpu_foreground.device_local() &&
+            !gpu_output.mapped() && gpu_output.device_local() &&
             !resident_alpha.mapped() && resident_alpha.device_local() &&
             !alpha_tmp.mapped() && alpha_tmp.device_local() &&
-            !alpha_feathered.mapped() && alpha_feathered.device_local() &&
-            gpu_output.mapped(),
-        "replace setup must decode/upload/resize once and retain only explicit "
-        "mapped upload/final transport resources around DEVICE_LOCAL source, "
-        "replacement, and alpha scratch");
+            !alpha_feathered.mapped() && alpha_feathered.device_local(),
+        "replace setup must decode/upload/resize once and retain mapped upload "
+        "staging around DEVICE_LOCAL foreground, output, replacement, and "
+        "alpha scratch");
 
     const auto setup_counters = counters;
     const auto cache_submissions_before =
@@ -2815,6 +2877,19 @@ int main() {
     auto current_readiness =
         SyntheticProductionMattingReadiness(replace_kernels, true);
     input.matting_readiness = &current_readiness;
+    input.output = &mapped_output;
+    OpenVulkanVirtualBackgroundReplaceCounters mapped_rejection_counters;
+    const auto mapped_rejection_submissions =
+        replace_kernels.synchronous_submission_count();
+    ok &= Require(
+        !replace.Apply(input, &mapped_rejection_counters, &error) &&
+            error.find("non-mapped DEVICE_LOCAL") != std::string::npos &&
+            mapped_rejection_counters.replacement_composite_dispatch_calls ==
+                0 &&
+            replace_kernels.synchronous_submission_count() ==
+                mapped_rejection_submissions,
+        "replace must reject a mapped intermediate output before dispatch");
+    input.output = &gpu_output;
     const auto allocations_before_frames =
         replace_kernels.device()->allocation_stats().allocation_count;
     const auto submissions_before_frames =
@@ -2829,9 +2904,8 @@ int main() {
       ok &= Require(replace.Apply(input, &counters, &error),
                     "production replace dispatch failed at strength " +
                         std::to_string(strength) + ": " + error);
-      ok &= Require(gpu_output.Invalidate(&error),
-                    "production replace final transport invalidate failed: " +
-                        error);
+      const auto output = ReadbackDeviceLocalU8(
+          replace_kernels, gpu_output, &output_readback, &error);
       const auto parameters =
           ResolveOpenVulkanVirtualBackgroundReplaceParameters(strength);
       std::vector<float> alpha_reference = alpha;
@@ -2841,7 +2915,7 @@ int main() {
         ++expected_feathers;
       }
       ok &= CompareU8Exact(
-          ReadU8(gpu_output),
+          output,
           CompositeReference(foreground, background, alpha_reference),
           "production Vulkan virtual background replace strength parity " +
               std::to_string(strength));
@@ -2856,7 +2930,7 @@ int main() {
             counters.alpha_readback_calls == 0 &&
             counters.cpu_fallback_calls == 0 &&
             replace_kernels.synchronous_submission_count() ==
-                submissions_before_frames + std::size(strengths) +
+                submissions_before_frames + 2 * std::size(strengths) +
                                                  expected_feathers &&
             replace_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before_frames,
@@ -2915,11 +2989,12 @@ int main() {
                           before_geometry.asset_upload_calls + 1,
                   "case-insensitive PNG replacement must decode/upload once "
                   "on path reconfiguration");
-    ok &= Require(replace.Apply(input, &counters, &error) &&
-                      gpu_output.Invalidate(&error),
+    ok &= Require(replace.Apply(input, &counters, &error),
                   "PNG-alpha replace dispatch failed: " + error);
+    const auto png_output = ReadbackDeviceLocalU8(
+        replace_kernels, gpu_output, &output_readback, &error);
     ok &= CompareU8Exact(
-        ReadU8(gpu_output), CompositeReference(foreground, png_background, alpha),
+        png_output, CompositeReference(foreground, png_background, alpha),
         "production Vulkan PNG replacement alpha-on-black parity");
 
     std::vector<std::uint8_t> changed_background = background;
@@ -3011,12 +3086,14 @@ int main() {
     };
     if (!WritePpmFixture(ppm_path, width, height, background))
       return 1;
-    VulkanImage foreground, output, alpha_upload, alpha, alpha_tmp;
+    VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
+    VulkanImage alpha_tmp;
     VulkanImage alpha_feathered;
-    if (!AllocateU8(lost_replace_kernels, &foreground, width, height,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_replace_kernels, &output, width, height,
-                    VulkanPixelFormat::rgb_u8, &error) ||
+    if (!UploadDeviceLocalU8(lost_replace_kernels, &foreground_upload,
+                             &foreground, width, height,
+                             VulkanPixelFormat::rgb_u8, background, &error) ||
+        !AllocateDeviceLocalU8(lost_replace_kernels, &output, width, height,
+                               VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_replace_kernels, &alpha_upload, width, height,
                      &error) ||
         !alpha.Allocate(lost_replace_kernels.device(), width, height,
@@ -3027,9 +3104,8 @@ int main() {
                                   VulkanPixelFormat::f32_1, false, &error)) {
       return OptionalSkip("replace device-loss allocation failed: " + error);
     }
-    FillU8(foreground, background);
     FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
-    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+    if (!alpha_upload.Flush(&error) ||
         !lost_replace_kernels.ResizeBilinearF32_1(alpha_upload, alpha,
                                                   &error)) {
       return OptionalSkip("replace device-loss fixture setup failed: " +
@@ -3092,12 +3168,15 @@ int main() {
       return OptionalSkip("blur device-loss context unavailable: " + error);
     constexpr int w = 2;
     constexpr int h = 2;
-    VulkanImage foreground, output, alpha_upload, alpha, alpha_tmp;
+    VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
+    VulkanImage alpha_tmp;
     VulkanImage alpha_feathered, blur_tmp, blurred;
-    if (!AllocateU8(lost_blur_kernels, &foreground, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_blur_kernels, &output, w, h,
-                    VulkanPixelFormat::rgb_u8, &error) ||
+    if (!UploadDeviceLocalU8(
+            lost_blur_kernels, &foreground_upload, &foreground, w, h,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_blur_kernels, &output, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_blur_kernels, &alpha_upload, w, h, &error) ||
         !alpha.Allocate(lost_blur_kernels.device(), w, h,
                         VulkanPixelFormat::f32_1, false, &error) ||
@@ -3111,9 +3190,8 @@ int main() {
                           VulkanPixelFormat::rgb_u8, false, &error)) {
       return OptionalSkip("blur device-loss allocation failed: " + error);
     }
-    FillU8(foreground, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     FillF32(alpha_upload, {0.0f, 0.25f, 0.75f, 1.0f});
-    if (!foreground.Flush(&error) || !alpha_upload.Flush(&error) ||
+    if (!alpha_upload.Flush(&error) ||
         !lost_blur_kernels.ResizeBilinearF32_1(alpha_upload, alpha, &error)) {
       return OptionalSkip("blur device-loss fixture setup failed: " + error);
     }
@@ -3967,17 +4045,14 @@ int main() {
       return OptionalSkip("Auto Frame device-loss context init failed: " +
                           error);
     }
-    VulkanImage src, dst;
-    if (!AllocateU8(lost_auto_frame_kernels, &src, 2, 2,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_auto_frame_kernels, &dst, 2, 2,
-                    VulkanPixelFormat::rgb_u8, &error)) {
+    VulkanImage upload_staging, src, dst;
+    if (!UploadDeviceLocalU8(
+            lost_auto_frame_kernels, &upload_staging, &src, 2, 2,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_auto_frame_kernels, &dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("Auto Frame device-loss allocation failed: " +
-                          error);
-    }
-    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-    if (!src.Flush(&error)) {
-      return OptionalSkip("Auto Frame device-loss source flush failed: " +
                           error);
     }
 
@@ -4174,15 +4249,15 @@ int main() {
         10,  20,  30,  40,  50,  60,  70,  80,  90,
         110, 120, 130, 140, 150, 160, 170, 180, 190,
     };
-    VulkanImage gpu_src, gpu_dst;
-    if (!AllocateU8(kernels, &gpu_src, w, h, VulkanPixelFormat::rgb_u8,
-                    &error) ||
-        !AllocateU8(kernels, &gpu_dst, w, h, VulkanPixelFormat::rgb_u8,
+    VulkanImage upload_staging, gpu_src, gpu_dst, output_readback, mapped_dst;
+    if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, w, h,
+                             VulkanPixelFormat::rgb_u8, src, &error) ||
+        !AllocateDeviceLocalU8(kernels, &gpu_dst, w, h,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateU8(kernels, &mapped_dst, w, h, VulkanPixelFormat::rgb_u8,
                     &error)) {
       return OptionalSkip("Auto Frame crop allocation failed: " + error);
     }
-    FillU8(gpu_src, src);
-    flush(gpu_src);
 
     studiocast::video::OpenVulkanAutoFrame auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
@@ -4213,6 +4288,16 @@ int main() {
 
     input.host_analysis_complete = true;
     input.cpu_crop_plan_complete = true;
+    input.dst = &mapped_dst;
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+            error.find("[vulkan_effect_residency_contract_failed]") !=
+                std::string::npos &&
+            rejection_counters.residency_rejection_frames == 1 &&
+            kernels.synchronous_submission_count() ==
+                submissions_before_rejections,
+        "Auto Frame must reject a mapped crop output before dispatch");
+
     input.dst = &gpu_src;
     ok &= Require(
         !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
@@ -4253,8 +4338,9 @@ int main() {
     input.dst = &gpu_dst;
     ok &= Require(auto_frame.ApplyCrop(input, &counters, &error),
                   "canonical Auto Frame crop should dispatch: " + error);
-    invalidate(gpu_dst);
-    ok &= CompareU8(ReadU8(gpu_dst),
+    const auto auto_frame_output = ReadbackDeviceLocalU8(
+        kernels, gpu_dst, &output_readback, &error);
+    ok &= CompareU8(auto_frame_output,
                     ResizeU8Reference(src, w, h, w, h, 0.5f, 0.0f, 2.0f,
                                       2.0f),
                     "canonical Vulkan Auto Frame crop parity");

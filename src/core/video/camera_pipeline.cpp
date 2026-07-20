@@ -4294,10 +4294,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const int matte_h = model_pack->matting->output.height;
       if (!EnsureImage(&frame_rgb, frame_w, frame_h,
                        studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                       /*map_memory=*/true, "frame_rgb", error_out) ||
+                       /*map_memory=*/false, "resident frame_rgb", error_out) ||
           !EnsureImage(&out_rgb, frame_w, frame_h,
                        studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                       /*map_memory=*/true, "out_rgb", error_out) ||
+                       /*map_memory=*/false, "resident out_rgb", error_out) ||
           !EnsureImage(&alpha_model, matte_w, matte_h,
                        studiocast::vulkan::VulkanPixelFormat::f32_1,
                        /*map_memory=*/false, "alpha_model", error_out) ||
@@ -4619,7 +4619,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       if (!EnsureImage(out_rgb_img, width, height,
                        studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                       /*map_memory=*/true, "out_rgb", error_out)) {
+                       /*map_memory=*/false, "resident out_rgb", error_out)) {
         return false;
       }
 
@@ -6260,36 +6260,39 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       deferred_out->stream = nullptr;
       deferred_out->vulkan_kernels = &matte->kernels;
 
-      if (!plan.should_crop) {
-        deferred_out->vulkan_img = &in_rgb;
-        return true;
-      }
-
-      if (!matte->EnsureImage(out_rgb, in_rgb.width(), in_rgb.height(),
+      if (plan.should_crop &&
+          !matte->EnsureImage(out_rgb, in_rgb.width(), in_rgb.height(),
                               studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                              /*map_memory=*/true, "auto_frame_out", error)) {
+                              /*map_memory=*/false,
+                              "resident auto_frame_out", error)) {
         return false;
       }
-      OpenVulkanAutoFrameCropInput crop_input;
-      crop_input.src = &in_rgb;
-      crop_input.dst = out_rgb;
-      crop_input.crop_x = plan.crop_px.x;
-      crop_input.crop_y = plan.crop_px.y;
-      crop_input.crop_w = plan.crop_px.w;
-      crop_input.crop_h = plan.crop_px.h;
-      crop_input.host_analysis_complete = true;
-      crop_input.cpu_crop_plan_complete = true;
+      OpenVulkanResidentAutoFrameInput resident_input;
+      resident_input.source = &in_rgb;
+      resident_input.crop_output = plan.should_crop ? out_rgb : nullptr;
+      resident_input.request_crop = plan.should_crop;
+      resident_input.crop_x = plan.crop_px.x;
+      resident_input.crop_y = plan.crop_px.y;
+      resident_input.crop_width = plan.crop_px.w;
+      resident_input.crop_height = plan.crop_px.h;
+      resident_input.host_analysis_complete = true;
+      resident_input.cpu_crop_plan_complete = true;
+      OpenVulkanResidentFrameState resident_state;
       std::string kerr;
-      if (!production_crop.ApplyCrop(crop_input, &counters, &kerr)) {
+      if (!ExecuteOpenVulkanResidentAutoFrameStage(
+              resident_input, &production_crop, &counters, &resident_state,
+              &kerr)) {
         ResetTrackingState(
             OpenVulkanAutoFrameResetReason::runtime_or_device_failure);
         if (error)
           *error = kerr;
         return false;
       }
-      ++matte->crop_resize_dispatch_calls;
-      ++matte->forced_sync_calls;
-      deferred_out->vulkan_img = out_rgb;
+      if (resident_state.auto_frame_crop_applied) {
+        ++matte->crop_resize_dispatch_calls;
+        ++matte->forced_sync_calls;
+      }
+      deferred_out->vulkan_img = resident_state.current;
       return true;
     }
   } open_vulkan_auto_frame;
@@ -10046,6 +10049,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::vulkan::VulkanImage *open_vulkan_curr = nullptr;
     studiocast::vulkan::VulkanImage *open_vulkan_next = nullptr;
     bool open_vulkan_uploaded_this_frame = false;
+    OpenVulkanResidentFrameState open_vulkan_resident_frame;
 #endif
 
     auto mark_open_cuda_active_frame = [&]() {
@@ -10108,34 +10112,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (!open_vulkan_vb.EnsureImage(
               &open_vulkan_vb.frame_rgb, capA.width, capA.height,
               studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "frame_rgb", error) ||
+              /*map_memory=*/false, "resident frame_rgb", error) ||
           !open_vulkan_vb.EnsureImage(
               &open_vulkan_vb.out_rgb, capA.width, capA.height,
               studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-              /*map_memory=*/true, "out_rgb", error)) {
-        return false;
-      }
-      if (!open_vulkan_vb.UploadRgbToImage(rgb.data(), rgbStride, capA.width,
-                                           capA.height,
-                                           &open_vulkan_vb.frame_rgb, error)) {
-        return false;
-      }
-      open_vulkan_curr = &open_vulkan_vb.frame_rgb;
-      open_vulkan_next = &open_vulkan_vb.out_rgb;
-      open_vulkan_uploaded_this_frame = true;
-      ++open_vulkan_upload_calls;
-      return true;
-    };
-
-    auto ensure_open_vulkan_final_current_from_cpu = [&](std::string *error) {
-      if (error)
-        error->clear();
-      mark_open_vulkan_active_frame();
-      std::string vk_err;
-      if (!open_vulkan_vb.kernels.Initialized() &&
-          !open_vulkan_vb.kernels.Initialize(&vk_err)) {
-        if (error)
-          *error = "Open Vulkan: utility kernels unavailable: " + vk_err;
+              /*map_memory=*/false, "resident out_rgb", error)) {
         return false;
       }
       const std::uint64_t submissions_before =
@@ -10148,11 +10129,35 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_vb.kernels.synchronous_submission_count() -
           submissions_before;
       open_vulkan_curr = &open_vulkan_vb.final_source_rgb;
-      open_vulkan_next = nullptr;
+      open_vulkan_next = &open_vulkan_vb.frame_rgb;
+      open_vulkan_resident_frame.current = open_vulkan_curr;
       open_vulkan_uploaded_this_frame = true;
       ++open_vulkan_upload_calls;
       return true;
     };
+
+    auto ensure_open_vulkan_final_current_from_cpu = [&](std::string *error) {
+      return ensure_open_vulkan_current_from_cpu(error);
+    };
+
+    auto ensure_open_vulkan_next = [&]() {
+      if (open_vulkan_next)
+        return;
+      open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                             ? &open_vulkan_vb.out_rgb
+                             : &open_vulkan_vb.frame_rgb;
+    };
+
+    auto adopt_open_vulkan_output =
+        [&](const studiocast::vulkan::VulkanImage *output) {
+          if (!output || output != open_vulkan_next)
+            return;
+          open_vulkan_curr = open_vulkan_next;
+          open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
+                                 ? &open_vulkan_vb.out_rgb
+                                 : &open_vulkan_vb.frame_rgb;
+          open_vulkan_resident_frame.current = open_vulkan_curr;
+        };
 
     auto download_open_vulkan_current_to_cpu = [&](std::string *error) {
       if (error)
@@ -10778,11 +10783,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               return;
             }
 
-            if (!open_vulkan_next) {
-              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                                     ? &open_vulkan_vb.out_rgb
-                                     : &open_vulkan_vb.frame_rgb;
-            }
+            ensure_open_vulkan_next();
 
             const std::uint64_t key_light_failures_before =
                 open_vulkan_vb.key_light_effect_counters.runtime_failure_frames;
@@ -10792,13 +10793,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
                     &vk_err, &deferred_gpu_out)) {
               open_vulkan_effect_ran_this_frame = true;
-              if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
-                const bool curr_was_frame =
-                    (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
-                open_vulkan_curr = open_vulkan_next;
-                open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
-                                                  : &open_vulkan_vb.out_rgb;
-              }
+              adopt_open_vulkan_output(deferred_gpu_out.vulkan_img);
               open_vulkan_gpu_frame_pending_cpu_readback = true;
 
               const bool keep_gpu_for_auto_frame =
@@ -11027,11 +11022,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               return;
             }
 
-            if (!open_vulkan_next) {
-              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                                     ? &open_vulkan_vb.out_rgb
-                                     : &open_vulkan_vb.frame_rgb;
-            }
+            ensure_open_vulkan_next();
 
             if (!open_vulkan_vb.ApplyVulkanRgb(
                     *open_vulkan_curr, open_vulkan_next, fx, capture_sequence,
@@ -11050,11 +11041,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             }
             open_vulkan_effect_ran_this_frame = true;
 
-            const bool curr_was_frame =
-                (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
-            open_vulkan_curr = open_vulkan_next;
-            open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
-                                              : &open_vulkan_vb.out_rgb;
+            adopt_open_vulkan_output(deferred_gpu_out.vulkan_img);
             open_vulkan_gpu_frame_pending_cpu_readback = true;
 
             const bool keep_gpu_frame_for_key_light =
@@ -11513,13 +11500,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   capture_sequence);
               return;
             }
-            if (!open_vulkan_next) {
-              open_vulkan_next = open_vulkan_curr == &open_vulkan_vb.frame_rgb
-                                     ? &open_vulkan_vb.out_rgb
-                                     : &open_vulkan_vb.frame_rgb;
-            }
+            ensure_open_vulkan_next();
 
             DeferredGpuOut auto_frame_gpu_out{};
+            const auto *auto_frame_input = open_vulkan_curr;
             const std::uint64_t auto_frame_failures_before =
                 open_vulkan_auto_frame.counters.runtime_failure_frames;
             const std::uint64_t auto_frame_device_losses_before =
@@ -11530,13 +11514,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     &auto_frame_gpu_out, &vk_err)) {
               open_vulkan_effect_ran_this_frame = true;
               deferred_gpu_out = auto_frame_gpu_out;
-              if (deferred_gpu_out.vulkan_img == open_vulkan_next) {
-                const bool curr_was_frame =
-                    (open_vulkan_curr == &open_vulkan_vb.frame_rgb);
-                open_vulkan_curr = open_vulkan_next;
-                open_vulkan_next = curr_was_frame ? &open_vulkan_vb.frame_rgb
-                                                  : &open_vulkan_vb.out_rgb;
-              }
+              adopt_open_vulkan_output(deferred_gpu_out.vulkan_img);
+              open_vulkan_resident_frame.current =
+                  deferred_gpu_out.vulkan_img;
+              open_vulkan_resident_frame.auto_frame_applied = true;
+              open_vulkan_resident_frame.auto_frame_crop_applied =
+                  deferred_gpu_out.vulkan_img != auto_frame_input;
               open_vulkan_gpu_frame_pending_cpu_readback = true;
 
               const bool keep_deferred_after_auto_frame =
@@ -12109,7 +12092,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         final_resources.mirror_counters = &open_vulkan_mirror_counters;
 
         OpenVulkanFinalResidentStageResult final_result;
-        ok = ExecuteOpenVulkanFinalResidentStage(
+        open_vulkan_resident_frame.current = deferred_gpu_out.vulkan_img;
+        ok = ExecuteOpenVulkanResidentFrameFinalStage(
+            open_vulkan_resident_frame,
             final_input, final_resources, &open_vulkan_final_stage_counters,
             &final_result);
         if (vulkan_rgb_scaled.Valid())

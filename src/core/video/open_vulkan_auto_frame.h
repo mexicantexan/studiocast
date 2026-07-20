@@ -67,6 +67,9 @@ OpenVulkanAutoFrameResetReason OpenVulkanAutoFrameReuseKeyResetReason(
 
 struct OpenVulkanAutoFrameCounters {
   std::uint64_t crop_resize_dispatch_calls = 0;
+  std::uint64_t resident_output_frames = 0;
+  std::uint64_t identity_resident_output_frames = 0;
+  std::uint64_t residency_rejection_frames = 0;
   std::uint64_t cpu_face_tracking_calls = 0;
   std::uint64_t matte_alpha_readback_calls = 0;
   std::uint64_t matte_cpu_box_calls = 0;
