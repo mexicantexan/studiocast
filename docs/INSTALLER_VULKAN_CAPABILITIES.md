@@ -22,7 +22,7 @@ The status vocabulary is:
 
 | Canonical effect ID | Vulkan implementation status | Live evidence and limitation | Selectable production CPU fallback | Installer readiness/blocker codes |
 | --- | --- | --- | --- | --- |
-| `mirror` | production usable | The canonical final visual transform uses the shared production Vulkan context, stays resident through the final effect boundary, and is covered by deterministic parity/live-pipeline tests. Recommendation still requires exact per-effect readiness plus non-CPU device, compute queue, healthy context, and utility-kernel evidence. | none | ready: `open_vulkan_mirror_production_ready`; otherwise the exact common Vulkan blocker |
+| `mirror` | production usable | The canonical final visual transform uses the shared production Vulkan context. One bounded mapped upload staging buffer feeds a non-mapped `DEVICE_LOCAL` source; resize scratch and mirror output are non-mapped `DEVICE_LOCAL`; one distinct mapped staging buffer is used only for the final writer-boundary readback. Real-device parity/live-pipeline tests assert the allocation properties, one upload, zero intermediate readbacks/CPU fallback, one final readback, synchronization, ordering, and reuse. Recommendation still requires exact per-effect readiness plus non-CPU device, compute queue, healthy context, and utility-kernel evidence. | none | ready: `open_vulkan_mirror_production_ready`; otherwise the exact common Vulkan blocker |
 | `virtual_background.blur` | experimental | A canonical resident blur/composite stage exists. Production remains fail-closed because the distributed packs are ONNX-only and no reviewed exact-device ncnn Vulkan adapter/runtime is available. Synthetic matting seams are test evidence only. | none; the CPU class is an unwired center-focus placeholder, not semantic matting | `open_vulkan_matting_unavailable`, with the exact nested adapter/artifact/runtime blocker |
 | `virtual_background.remove` | experimental | A canonical resident solid composite exists, behind the same production matting contract as blur. | none; the CPU class is an unwired center-focus placeholder | `open_vulkan_matting_unavailable`, with the exact nested blocker |
 | `virtual_background.replace` | experimental | A canonical resident replacement composite and bounded setup-time image upload lifecycle exist. It remains behind production matting readiness and validates the replacement image separately. | none | `open_vulkan_matting_unavailable`, with the exact nested blocker |
@@ -30,7 +30,7 @@ The status vocabulary is:
 | `eye_contact` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but there is no callable Vulkan live stage, exact-device inference provider/adapter, validated Vulkan artifact contract, resident analysis/tensor path, or production gaze/look-away contract. | none | `open_vulkan_eye_contact_unavailable`, nested `open_vulkan_eye_contact_runtime_unavailable` |
 | `video_noise_removal` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but FastDVDnet currently uses CUDA/CPU providers, host temporal history, CPU preprocessing/postprocessing, and ONNX-only artifacts. There is no callable Vulkan stage or bounded resident temporal-history contract. | none | `open_vulkan_video_noise_removal_unavailable`, nested `open_vulkan_video_noise_removal_runtime_unavailable` |
 | `virtual_key_light` | experimental | The canonical relight stage is resident, but production readiness requires the same exact same-frame, exact-device production matte evidence as the virtual-background modes. | none; CPU work in other backends is not a selectable CPU engine | `open_vulkan_matting_unavailable`, with the exact nested blocker |
-| `vignette` | production usable (fixed center only) | The canonical final Vulkan stage matches the CUDA-reference fixed-center parameter contract and reuses a device-resident factor mask. `center_on_tracked_face` is not supported by this Vulkan implementation; when that semantic becomes observable with retained Auto Frame, only vignette is removed. | none | ready: `open_vulkan_vignette_fixed_center_production_ready`; tracked-center: `vulkan_vignette_tracked_center_not_supported`; otherwise the exact common Vulkan blocker |
+| `vignette` | production usable (fixed center only) | The canonical final Vulkan stage matches the CUDA-reference fixed-center parameter contract. A bounded setup-only staging allocation uploads the generated factor plane into a persistent non-mapped `DEVICE_LOCAL` mask; source, resize scratch, vignette output, and optional following mirror output are also non-mapped `DEVICE_LOCAL`. Only the initial upload transport and single final readback transport are mapped. `center_on_tracked_face` is not supported by this Vulkan implementation; when that semantic becomes observable with retained Auto Frame, only vignette is removed. | none | ready: `open_vulkan_vignette_fixed_center_production_ready`; tracked-center: `vulkan_vignette_tracked_center_not_supported`; otherwise the exact common Vulkan blocker |
 
 Mirror and fixed-center vignette are the only canonical effects currently
 eligible for a Vulkan recommendation, and only when their exact daemon
@@ -51,9 +51,10 @@ The analyzer and recommendation deliberately separate these layers:
 5. **Kernels**: the utility shader pipeline is created and healthy.
 6. **Runtime/model**: model-backed effects prove their exact runtime, artifact,
    warm-up, and model contract. Loader or kernel success is not model evidence.
-7. **Residency/ownership**: the exact StudioCast device and queue are shared,
-   buffers stay resident, CPU layers/readbacks are absent, and allocations are
-   bounded.
+7. **Residency/ownership**: the exact StudioCast device and queue are shared;
+   claimed persistent and intermediate buffers are non-mapped `DEVICE_LOCAL`;
+   mapped memory is restricted to bounded upload/final-readback transport;
+   CPU layers/intermediate readbacks are absent; and allocations are bounded.
 8. **Per-effect live stage**: the exact canonical effect has an implemented
    live stage and an effect-specific production-ready attestation.
 
@@ -98,6 +99,14 @@ device, mismatched/absent per-effect evidence, missing model/artifact/runtime,
 failed warm-up, mismatched device identity, CPU layers/readbacks/tails, or
 missing live stage all prevent recommendation for the affected effect. They do
 not disable an unrelated effect whose exact evidence remains valid.
+
+Installer analysis does not treat a previously cached or cold daemon snapshot
+as current evidence. Before consuming installed status it invokes the bounded
+installed CLI diagnostics-refresh operation and then reads status. Missing CLI
+support, a failed refresh, timeout, malformed response, or absent refreshed
+per-effect facts remains fail-closed as
+`open_vulkan_runtime_diagnostics_unavailable` or the more exact reported
+blocker; it never falls back to loader/device guesses.
 
 ## Matting and model boundary
 
@@ -151,8 +160,10 @@ independently for an effect with higher-precedence production evidence.
 - `src/core/video/open_vulkan_final_resident_stage.*` and
   `tests/vulkan_final_resident_stage_integration_tests.cpp`: the exact
   CameraPipeline final resident orchestration and its real-device executable
-  coverage for resize, fixed-center vignette, mirror, combined ordering,
-  isolation, allocation reuse, and the final-only readback boundary.
+  coverage for device-local source/scratch/effect/mask allocation, bounded
+  upload/readback staging, resize, fixed-center vignette, mirror, combined
+  ordering, isolation, allocation reuse, synchronization counters, and the
+  final-only readback boundary.
 - `src/core/video/camera_pipeline.cpp`: canonical live calls, final-stage
   ordering, fixed-center compatibility, Auto Frame CPU tails, matting consumers,
   and fail-closed ML stage filtering.
@@ -164,7 +175,8 @@ independently for an effect with higher-precedence production evidence.
 - `src/core/video/open_vulkan_eye_contact.*` and
   `open_vulkan_video_noise_removal.*`: diagnostics-only exact blockers.
 - `installer/backend/studiocast-installer-backend`: per-effect facts and pure
-  recommendation precedence.
+  recommendation precedence, including the bounded installed-CLI cold
+  diagnostics refresh before status consumption.
 - `tests/installer_backend_core_tests.py`: hermetic NVIDIA, AMD, Intel, hybrid,
   no-GPU, loader-only, CPU-device-only, no-compute, device-loss, precedence,
   isolation, fixed-center, and no-CPU-continuation fixtures.

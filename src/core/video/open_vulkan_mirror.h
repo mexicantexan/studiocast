@@ -14,6 +14,8 @@ inline constexpr std::string_view kOpenVulkanMirrorRuntimeFailureReason =
     "vulkan_effect_runtime_failed";
 inline constexpr std::string_view kOpenVulkanMirrorProductionReadyReason =
     "open_vulkan_mirror_production_ready";
+inline constexpr std::string_view kOpenVulkanMirrorResidencyFailureReason =
+    "vulkan_effect_residency_contract_failed";
 
 std::string OpenVulkanMirrorInitializationFailure(std::string_view detail);
 std::string OpenVulkanMirrorRuntimeFailure(std::string_view detail);
@@ -57,7 +59,7 @@ struct OpenVulkanMirrorCounters {
 
 // Mirror-specific production wrapper over the shared Vulkan context. It owns
 // no device or per-frame allocation and accepts only same-context,
-// same-size/out-of-place RGB/BGR images.
+// non-mapped DEVICE_LOCAL, same-size/out-of-place RGB/BGR images.
 class OpenVulkanMirror {
 public:
   bool EnsureInitialized(studiocast::vulkan::kernels::UtilityKernels *kernels,

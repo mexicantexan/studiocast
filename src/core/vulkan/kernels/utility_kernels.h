@@ -105,14 +105,43 @@ public:
                            std::string *error_out);
 
   // Setup/reconfiguration-only RGB upload seam. Packs tightly packed RGB24
-  // into one caller-owned mapped staging image, copies it into an exact-shape
-  // non-mapped DEVICE_LOCAL image, and completes the transfer before return.
+  // into matching rgb_u8 staging/destination images, copies it into an
+  // exact-shape non-mapped DEVICE_LOCAL image, and completes the transfer
+  // before return.
   // Neither allocation nor filesystem/image decoding belongs here.
   bool UploadRgb24ToDeviceLocal(const std::uint8_t *src,
                                 std::size_t src_stride,
                                 const VulkanImage &upload_staging,
                                 const VulkanImage &device_dst,
                                 std::string *error_out);
+
+  // Equivalent explicit-channel-order seam used by production RGB/BGR pixel
+  // effects and parity fixtures. The source bytes are already in the matching
+  // staging/destination memory channel order; no channel reinterpretation is
+  // performed.
+  bool UploadU8x3ToDeviceLocal(const std::uint8_t *src,
+                               std::size_t src_stride,
+                               const VulkanImage &upload_staging,
+                               const VulkanImage &device_dst,
+                               std::string *error_out);
+
+  // Setup/reconfiguration-only scalar upload seam. Copies exactly one
+  // width*height float plane through a caller-owned mapped staging image into
+  // a distinct non-mapped DEVICE_LOCAL image, and completes the transfer
+  // before return.
+  bool UploadF32_1ToDeviceLocal(const float *src, std::size_t src_count,
+                                const VulkanImage &upload_staging,
+                                const VulkanImage &device_dst,
+                                std::string *error_out);
+
+  // Final-output boundary seam. Copies a non-mapped DEVICE_LOCAL RGB/BGR
+  // image into one caller-owned mapped staging image, waits for completion,
+  // invalidates it, and unpacks the three stored channels into caller-owned
+  // CPU memory. This is a final transport operation, not an intermediate
+  // effect readback.
+  bool ReadbackU8x3(const VulkanImage &src,
+                    const VulkanImage &readback_staging, std::uint8_t *dst,
+                    std::size_t dst_stride, std::string *error_out);
 
   // Explicit degraded CPU-tail seam. Copies a device-local, non-mapped alpha
   // image into one caller-owned reusable host-visible staging image, waits for

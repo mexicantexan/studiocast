@@ -3647,6 +3647,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     studiocast::vulkan::VulkanImage blur_tmp;       // rgb_u8, WxH
     studiocast::vulkan::VulkanImage blurred;        // rgb_u8, WxH
     studiocast::vulkan::VulkanImage auto_frame_rgb; // rgb_u8, WxH
+    // Mirror/fixed-center-vignette production transport and resident block.
+    // The two mapped resources are boundary-only staging; source, resize, mask,
+    // and effect outputs are separate non-mapped DEVICE_LOCAL allocations.
+    studiocast::vulkan::VulkanImage final_upload_staging;   // mapped capture RGB
+    studiocast::vulkan::VulkanImage final_source_rgb;      // device-local RGB
+    studiocast::vulkan::VulkanImage final_readback_staging; // mapped final RGB
     studiocast::vulkan::VulkanImage vignette_rgb;   // rgb_u8, final output WxH
     studiocast::vulkan::VulkanImage mirror_rgb;     // rgb_u8, final output WxH
 
@@ -3719,6 +3725,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       blur_tmp.Free();
       blurred.Free();
       auto_frame_rgb.Free();
+      final_upload_staging.Free();
+      final_source_rgb.Free();
+      final_readback_staging.Free();
       vignette_rgb.Free();
       mirror_rgb.Free();
     }
@@ -3801,6 +3810,30 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       return true;
     }
 
+    bool UploadRgbToDeviceLocal(const std::uint8_t *rgb, std::size_t stride,
+                                int width, int height,
+                                std::string *error_out) {
+      if (!EnsureImage(&final_upload_staging, width, height,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/true, "final upload staging", error_out) ||
+          !EnsureImage(&final_source_rgb, width, height,
+                       studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                       /*map_memory=*/false, "final resident source",
+                       error_out)) {
+        return false;
+      }
+      if (!final_source_rgb.device_local() || final_source_rgb.mapped()) {
+        if (error_out) {
+          *error_out =
+              "[vulkan_effect_residency_contract_failed] Open Vulkan final "
+              "source is not non-mapped DEVICE_LOCAL.";
+        }
+        return false;
+      }
+      return kernels.UploadRgb24ToDeviceLocal(
+          rgb, stride, final_upload_staging, final_source_rgb, error_out);
+    }
+
     bool DownloadImageToRgb(const studiocast::vulkan::VulkanImage &image,
                             std::uint8_t *rgb, std::size_t stride,
                             std::string *error_out) {
@@ -3816,9 +3849,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         return false;
       }
       if (!image.mapped()) {
-        if (error_out)
-          *error_out = "Open Vulkan: RGB download image is not mapped.";
-        return false;
+        if (!image.device_local()) {
+          if (error_out) {
+            *error_out = "[vulkan_effect_residency_contract_failed] Open "
+                         "Vulkan RGB download source is neither mapped "
+                         "transport nor DEVICE_LOCAL.";
+          }
+          return false;
+        }
+        if (!EnsureImage(&final_readback_staging, image.width(), image.height(),
+                         image.format(), /*map_memory=*/true,
+                         "final readback staging", error_out)) {
+          return false;
+        }
+        return kernels.ReadbackU8x3(image, final_readback_staging, rgb, stride,
+                                    error_out);
       }
       std::string ierr;
       if (!image.Invalidate(&ierr)) {
@@ -9169,24 +9214,37 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       if (vignette_ready) {
         vignette_ready =
             open_vulkan_vb.EnsureImage(
-                &open_vulkan_vb.frame_rgb, capA.width, capA.height,
+                &open_vulkan_vb.final_upload_staging, capA.width, capA.height,
                 studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                /*map_memory=*/true, "frame_rgb", &vk_err) &&
+                /*map_memory=*/true, "final upload staging", &vk_err) &&
             open_vulkan_vb.EnsureImage(
-                &open_vulkan_vb.out_rgb, capA.width, capA.height,
+                &open_vulkan_vb.final_source_rgb, capA.width, capA.height,
                 studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                /*map_memory=*/true, "out_rgb", &vk_err) &&
+                /*map_memory=*/false, "final resident source", &vk_err) &&
+            open_vulkan_vb.EnsureImage(
+                &vulkan_rgb_scaled, outA.width, outA.height,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/false, "final resize scratch", &vk_err) &&
             open_vulkan_vb.EnsureImage(
                 &open_vulkan_vb.vignette_rgb, outA.width, outA.height,
                 studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                /*map_memory=*/true, "vignette_rgb", &vk_err);
+                /*map_memory=*/false, "vignette output", &vk_err) &&
+            open_vulkan_vb.EnsureImage(
+                &open_vulkan_vb.final_readback_staging, outA.width, outA.height,
+                studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                /*map_memory=*/true, "final readback staging", &vk_err) &&
+            !open_vulkan_vignette.attenuation_factor_mask().mapped() &&
+            open_vulkan_vignette.attenuation_factor_mask().device_local();
+        vulkan_rgb_scaled_allocated = vulkan_rgb_scaled.Valid();
       }
       if (vignette_ready) {
         have_open_vulkan_vignette = true;
         compute_available.vulkan_available = true;
         set_backend(stage_id, "open_vulkan");
         append_note("Open Vulkan: Vignette (fixed center after framing; "
-                    "device-resident attenuation mask, no tracking CPU tail).");
+                    "non-mapped DEVICE_LOCAL source/scratch/output and "
+                    "attenuation mask, bounded upload/final-readback staging, "
+                    "no tracking CPU tail).");
       } else {
         if (vk_err.find("[vulkan_effect_initialization_failed]") ==
             std::string::npos) {
@@ -9245,23 +9303,34 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         if (mirror_ready) {
           mirror_ready =
               open_vulkan_vb.EnsureImage(
-                  &open_vulkan_vb.frame_rgb, capA.width, capA.height,
+                  &open_vulkan_vb.final_upload_staging, capA.width, capA.height,
                   studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                  /*map_memory=*/true, "frame_rgb", &vk_err) &&
+                  /*map_memory=*/true, "final upload staging", &vk_err) &&
               open_vulkan_vb.EnsureImage(
-                  &open_vulkan_vb.out_rgb, capA.width, capA.height,
+                  &open_vulkan_vb.final_source_rgb, capA.width, capA.height,
                   studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                  /*map_memory=*/true, "out_rgb", &vk_err) &&
+                  /*map_memory=*/false, "final resident source", &vk_err) &&
+              open_vulkan_vb.EnsureImage(
+                  &vulkan_rgb_scaled, outA.width, outA.height,
+                  studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                  /*map_memory=*/false, "final resize scratch", &vk_err) &&
               open_vulkan_vb.EnsureImage(
                   &open_vulkan_vb.mirror_rgb, outA.width, outA.height,
                   studiocast::vulkan::VulkanPixelFormat::rgb_u8,
-                  /*map_memory=*/true, "mirror_rgb", &vk_err);
+                  /*map_memory=*/false, "mirror output", &vk_err) &&
+              open_vulkan_vb.EnsureImage(
+                  &open_vulkan_vb.final_readback_staging, outA.width,
+                  outA.height, studiocast::vulkan::VulkanPixelFormat::rgb_u8,
+                  /*map_memory=*/true, "final readback staging", &vk_err);
+          vulkan_rgb_scaled_allocated = vulkan_rgb_scaled.Valid();
         }
         if (mirror_ready) {
           have_open_vulkan_mirror = true;
           compute_available.vulkan_available = true;
           set_backend(stage_id, "open_vulkan");
-          append_note("Open Vulkan: Mirror (final resident output transform).");
+          append_note("Open Vulkan: Mirror (non-mapped DEVICE_LOCAL final "
+                      "source/scratch/output with bounded upload and one "
+                      "final-readback staging boundary).");
         } else {
           if (vk_err.find("[vulkan_effect_initialization_failed]") ==
               std::string::npos) {
@@ -9900,6 +9969,33 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       open_vulkan_curr = &open_vulkan_vb.frame_rgb;
       open_vulkan_next = &open_vulkan_vb.out_rgb;
+      open_vulkan_uploaded_this_frame = true;
+      ++open_vulkan_upload_calls;
+      return true;
+    };
+
+    auto ensure_open_vulkan_final_current_from_cpu = [&](std::string *error) {
+      if (error)
+        error->clear();
+      mark_open_vulkan_active_frame();
+      std::string vk_err;
+      if (!open_vulkan_vb.kernels.Initialized() &&
+          !open_vulkan_vb.kernels.Initialize(&vk_err)) {
+        if (error)
+          *error = "Open Vulkan: utility kernels unavailable: " + vk_err;
+        return false;
+      }
+      const std::uint64_t submissions_before =
+          open_vulkan_vb.kernels.synchronous_submission_count();
+      if (!open_vulkan_vb.UploadRgbToDeviceLocal(
+              rgb.data(), rgbStride, capA.width, capA.height, error)) {
+        return false;
+      }
+      open_vulkan_forced_sync_calls +=
+          open_vulkan_vb.kernels.synchronous_submission_count() -
+          submissions_before;
+      open_vulkan_curr = &open_vulkan_vb.final_source_rgb;
+      open_vulkan_next = nullptr;
       open_vulkan_uploaded_this_frame = true;
       ++open_vulkan_upload_calls;
       return true;
@@ -11553,7 +11649,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
          open_vulkan_mirror_attempt_this_frame) &&
         !have_deferred_gpu_out) {
       std::string final_err;
-      if (ensure_open_vulkan_current_from_cpu(&final_err)) {
+      if (ensure_open_vulkan_final_current_from_cpu(&final_err)) {
         deferred_gpu_out.kind = DeferredGpuKind::vulkan_rgb;
         deferred_gpu_out.nvcv_img = nullptr;
         deferred_gpu_out.nvcv = nullptr;
@@ -11820,10 +11916,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       if (ok) {
         rgbScaled.resize(tightBytes);
+        const std::uint64_t readback_submissions_before =
+            deferred_gpu_out.vulkan_kernels->synchronous_submission_count();
         if (!open_vulkan_vb.DownloadImageToRgb(*download_img, rgbScaled.data(),
                                                tightStride, &gerr)) {
           ok = false;
         }
+        open_vulkan_forced_sync_calls +=
+            deferred_gpu_out.vulkan_kernels->synchronous_submission_count() -
+            readback_submissions_before;
       }
 
       if (ok) {
@@ -11840,10 +11941,21 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         std::string derr;
         bool readback_ok = false;
         if (deferred_gpu_out.vulkan_img) {
+          const std::uint64_t readback_submissions_before =
+              deferred_gpu_out.vulkan_kernels
+                  ? deferred_gpu_out.vulkan_kernels
+                        ->synchronous_submission_count()
+                  : 0;
           if (open_vulkan_vb.DownloadImageToRgb(*deferred_gpu_out.vulkan_img,
                                                 rgb.data(), rgbStride, &derr)) {
             ++open_vulkan_download_calls;
             ++open_vulkan_cpu_continuation_download_calls;
+            if (deferred_gpu_out.vulkan_kernels) {
+              open_vulkan_forced_sync_calls +=
+                  deferred_gpu_out.vulkan_kernels
+                      ->synchronous_submission_count() -
+                  readback_submissions_before;
+            }
             readback_ok = true;
             have_deferred_gpu_out = false;
             open_vulkan_gpu_frame_pending_cpu_readback = false;

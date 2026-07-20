@@ -143,51 +143,36 @@ VignetteReference(const std::vector<std::uint8_t> &source, int width,
   return output;
 }
 
-bool AllocateAndUpload(UtilityKernels *kernels, VulkanImage *image, int width,
-                       int height, VulkanPixelFormat format,
+bool AllocateAndUpload(UtilityKernels *kernels, VulkanImage *upload_staging,
+                       VulkanImage *image, int width, int height,
+                       VulkanPixelFormat format,
                        const std::vector<std::uint8_t> &bytes,
                        std::string *error) {
-  if (!image->Allocate(kernels->device(), width, height, format,
-                       /*map_memory=*/true, error)) {
+  if (!upload_staging->Allocate(kernels->device(), width, height, format,
+                                /*map_memory=*/true, error) ||
+      !image->Allocate(kernels->device(), width, height, format,
+                       /*map_memory=*/false, error)) {
     return false;
   }
-  auto *pixels = static_cast<std::uint32_t *>(image->mapped());
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const std::size_t source = ChannelIndex(x, y, width, 0);
-      pixels[static_cast<std::size_t>(y) * image->pitch_pixels() +
-             static_cast<std::size_t>(x)] =
-          static_cast<std::uint32_t>(bytes[source]) |
-          (static_cast<std::uint32_t>(bytes[source + 1]) << 8u) |
-          (static_cast<std::uint32_t>(bytes[source + 2]) << 16u) | 0xff000000u;
-    }
-  }
-  return image->Flush(error);
+  return kernels->UploadU8x3ToDeviceLocal(
+      bytes.data(), static_cast<std::size_t>(width) * 3u, *upload_staging,
+      *image, error);
 }
 
-std::vector<std::uint8_t> ReadFinalOutput(const VulkanImage &image,
+std::vector<std::uint8_t> ReadFinalOutput(UtilityKernels *kernels,
+                                          const VulkanImage &image,
+                                          const VulkanImage &readback_staging,
                                           std::uint64_t *readback_count,
                                           std::string *error) {
-  if (!image.Invalidate(error))
-    return {};
-  ++*readback_count;
   std::vector<std::uint8_t> output(static_cast<std::size_t>(image.width()) *
                                    static_cast<std::size_t>(image.height()) *
                                    3u);
-  const auto *pixels = static_cast<const std::uint32_t *>(image.mapped());
-  for (int y = 0; y < image.height(); ++y) {
-    for (int x = 0; x < image.width(); ++x) {
-      const std::uint32_t pixel =
-          pixels[static_cast<std::size_t>(y) * image.pitch_pixels() +
-                 static_cast<std::size_t>(x)];
-      const std::size_t destination = ChannelIndex(x, y, image.width(), 0);
-      output[destination] = static_cast<std::uint8_t>(pixel & 0xffu);
-      output[destination + 1] =
-          static_cast<std::uint8_t>((pixel >> 8u) & 0xffu);
-      output[destination + 2] =
-          static_cast<std::uint8_t>((pixel >> 16u) & 0xffu);
-    }
+  if (!kernels->ReadbackU8x3(
+          image, readback_staging, output.data(),
+          static_cast<std::size_t>(image.width()) * 3u, error)) {
+    return {};
   }
+  ++*readback_count;
   return output;
 }
 
@@ -213,6 +198,7 @@ struct FinalStageFixture {
   VulkanImage resize_scratch;
   VulkanImage vignette_output;
   VulkanImage mirror_output;
+  VulkanImage final_readback_staging;
   OpenVulkanVignette vignette;
   OpenVulkanVignetteCounters vignette_counters;
   OpenVulkanMirror mirror;
@@ -271,12 +257,21 @@ bool RunProductionCases(UtilityKernels *kernels) {
       source[index] = static_cast<std::uint8_t>((index * 67u + 29u) & 0xffu);
     }
     std::string error;
+    VulkanImage input_upload_staging;
     VulkanImage input_image;
-    if (!AllocateAndUpload(kernels, &input_image, test.source_width,
+    const std::uint64_t input_upload_submissions_before =
+        kernels->synchronous_submission_count();
+    if (!AllocateAndUpload(kernels, &input_upload_staging, &input_image,
+                           test.source_width,
                            test.source_height, test.format, source, &error)) {
       std::cerr << test.label << ": source setup failed: " << error << '\n';
       return false;
     }
+    ok &= Require(kernels->synchronous_submission_count() ==
+                      input_upload_submissions_before + 1,
+                  std::string(test.label) +
+                      ": source preparation must use exactly one synchronized "
+                      "host-staging to DEVICE_LOCAL upload");
 
     std::vector<std::uint8_t> expected = source;
     if (test.source_width != test.output_width ||
@@ -295,6 +290,34 @@ bool RunProductionCases(UtilityKernels *kernels) {
     }
 
     FinalStageFixture fixture;
+    if (!fixture.final_readback_staging.Allocate(
+            kernels->device(), test.output_width, test.output_height,
+            test.format, /*map_memory=*/true, &error)) {
+      return Require(false, std::string(test.label) +
+                                ": final readback staging failed: " + error);
+    }
+    if (test.vignette) {
+      const std::uint64_t setup_submissions_before =
+          kernels->synchronous_submission_count();
+      if (!fixture.vignette.EnsureInitialized(
+              kernels, test.output_width, test.output_height, test.intensity,
+              &fixture.vignette_counters, &error)) {
+        return Require(false, std::string(test.label) +
+                                  ": vignette setup failed: " + error);
+      }
+      ok &= Require(
+          kernels->synchronous_submission_count() ==
+                  setup_submissions_before + 1 &&
+              fixture.vignette.attenuation_factor_mask().device_local() &&
+              !fixture.vignette.attenuation_factor_mask().mapped() &&
+              fixture.vignette_counters.factor_allocation_calls == 1 &&
+              fixture.vignette_counters.factor_staging_allocation_calls == 1 &&
+              fixture.vignette_counters.factor_upload_calls == 1 &&
+              fixture.vignette_counters.factor_upload_completion_calls == 1,
+          std::string(test.label) +
+              ": setup must perform one bounded staging upload into one "
+              "persistent DEVICE_LOCAL attenuation mask");
+    }
     auto resources = fixture.Resources(kernels);
     OpenVulkanFinalResidentStageInput input;
     input.source = &input_image;
@@ -324,6 +347,27 @@ bool RunProductionCases(UtilityKernels *kernels) {
                              test.source_height != test.output_height),
                     std::string(test.label) +
                         ": canonical stage attribution/order is wrong");
+      if (!result.output_valid || !result.output)
+        return false;
+      ok &= Require(
+          result.output->device_local() && !result.output->mapped() &&
+              (!fixture.resize_scratch.Valid() ||
+               (fixture.resize_scratch.device_local() &&
+                !fixture.resize_scratch.mapped())) &&
+              (!fixture.vignette_output.Valid() ||
+               (fixture.vignette_output.device_local() &&
+                !fixture.vignette_output.mapped())) &&
+              (!fixture.mirror_output.Valid() ||
+               (fixture.mirror_output.device_local() &&
+                !fixture.mirror_output.mapped())) &&
+              input_image.device_local() && !input_image.mapped() &&
+              input_upload_staging.host_visible() &&
+              input_upload_staging.mapped() &&
+              fixture.final_readback_staging.host_visible() &&
+              fixture.final_readback_staging.mapped(),
+          std::string(test.label) +
+              ": only upload/readback transports may be mapped; every "
+              "source/intermediate/effect output must be DEVICE_LOCAL");
       ok &= Require(
           (!test.vignette || result.vignette_backend == "open_vulkan") &&
               (!test.mirror || result.mirror_backend == "open_vulkan"),
@@ -339,10 +383,18 @@ bool RunProductionCases(UtilityKernels *kernels) {
                     std::string(test.label) +
                         ": resident stages must share one completion");
 
-      const auto actual =
-          ReadFinalOutput(*result.output, &final_readbacks, &error);
+      const std::uint64_t readback_submissions_before =
+          kernels->synchronous_submission_count();
+      const auto actual = ReadFinalOutput(
+          kernels, *result.output, fixture.final_readback_staging,
+          &final_readbacks, &error);
       ok &= Require(!actual.empty(), std::string(test.label) +
                                          ": final readback failed: " + error);
+      ok &= Require(kernels->synchronous_submission_count() ==
+                        readback_submissions_before + 1,
+                    std::string(test.label) +
+                        ": the final host transport must use exactly one "
+                        "synchronized readback submission");
       ok &= CompareBytes(actual, expected,
                          /*exact=*/!test.vignette &&
                              test.source_width == test.output_width &&
@@ -368,6 +420,11 @@ bool RunProductionCases(UtilityKernels *kernels) {
                       fixture.counters.successful_output_frames == 2 &&
                       fixture.counters.intermediate_readback_calls == 0 &&
                       fixture.counters.cpu_fallback_calls == 0 &&
+                      fixture.counters.host_visible_intermediate_allocation_calls ==
+                          0 &&
+                      fixture.counters.residency_rejection_calls == 0 &&
+                      fixture.counters.device_local_allocation_calls ==
+                          fixture.counters.resource_allocation_calls &&
                       fixture.vignette_counters.runtime_failure_frames == 0 &&
                       fixture.mirror_counters.runtime_failure_frames == 0,
                   std::string(test.label) +
@@ -389,9 +446,10 @@ bool RunComputeProducedSameSizeMirrorCase(UtilityKernels *kernels) {
     source[index] = static_cast<std::uint8_t>((index * 53u + 31u) & 0xffu);
 
   std::string error;
+  VulkanImage upload_staging;
   VulkanImage uploaded;
   VulkanImage compute_produced;
-  if (!AllocateAndUpload(kernels, &uploaded, width, height,
+  if (!AllocateAndUpload(kernels, &upload_staging, &uploaded, width, height,
                          VulkanPixelFormat::rgb_u8, source, &error) ||
       !compute_produced.Allocate(kernels->device(), width, height,
                                  VulkanPixelFormat::rgb_u8,
@@ -407,6 +465,12 @@ bool RunComputeProducedSameSizeMirrorCase(UtilityKernels *kernels) {
   }
 
   FinalStageFixture fixture;
+  if (!fixture.final_readback_staging.Allocate(
+          kernels->device(), width, height, VulkanPixelFormat::rgb_u8,
+          /*map_memory=*/true, &error)) {
+    return Require(false,
+                   "compute-produced final readback setup failed: " + error);
+  }
   auto resources = fixture.Resources(kernels);
   OpenVulkanFinalResidentStageInput input;
   input.source = &compute_produced;
@@ -428,7 +492,11 @@ bool RunComputeProducedSameSizeMirrorCase(UtilityKernels *kernels) {
       "GPU producer and exact canonical same-size mirror must execute as two "
       "ordered resident submissions");
   std::uint64_t final_readbacks = 0;
-  const auto actual = ReadFinalOutput(*result.output, &final_readbacks, &error);
+  if (!result.output)
+    return false;
+  const auto actual = ReadFinalOutput(
+      kernels, *result.output, fixture.final_readback_staging,
+      &final_readbacks, &error);
   ok &= CompareBytes(actual, MirrorReference(source, width, height), true,
                      "compute-produced canonical same-size mirror");
   ok &= Require(final_readbacks == 1 &&
@@ -448,12 +516,19 @@ bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
     source[index] = static_cast<std::uint8_t>((index * 41u + 17u) & 0xffu);
 
   std::string error;
+  VulkanImage input_upload_staging;
   VulkanImage input_image;
-  if (!AllocateAndUpload(kernels, &input_image, width, height,
+  if (!AllocateAndUpload(kernels, &input_upload_staging, &input_image, width,
+                         height,
                          VulkanPixelFormat::rgb_u8, source, &error)) {
     return Require(false, "isolation source setup failed: " + error);
   }
   FinalStageFixture fixture;
+  if (!fixture.final_readback_staging.Allocate(
+          kernels->device(), width, height, VulkanPixelFormat::rgb_u8,
+          /*map_memory=*/true, &error)) {
+    return Require(false, "isolation final readback setup failed: " + error);
+  }
   auto resources = fixture.Resources(kernels);
   OpenVulkanFinalResidentStageInput input;
   input.source = &input_image;
@@ -478,7 +553,11 @@ bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
           kernels->synchronous_submission_count() == submissions_before + 1,
       "vignette ordering failure must not disable unrelated mirror");
   std::uint64_t final_readbacks = 0;
-  const auto actual = ReadFinalOutput(*result.output, &final_readbacks, &error);
+  if (!result.output)
+    return false;
+  const auto actual = ReadFinalOutput(
+      kernels, *result.output, fixture.final_readback_staging,
+      &final_readbacks, &error);
   ok &= CompareBytes(actual, MirrorReference(source, width, height), true,
                      "isolated mirror output");
   ok &= Require(final_readbacks == 1 &&
@@ -498,8 +577,10 @@ bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
   UtilityKernels foreign_kernels;
   if (!foreign_kernels.Initialize(&error))
     return Require(false, "foreign context setup failed: " + error);
+  VulkanImage foreign_upload_staging;
   VulkanImage foreign_source;
-  if (!AllocateAndUpload(&foreign_kernels, &foreign_source, width, height,
+  if (!AllocateAndUpload(&foreign_kernels, &foreign_upload_staging,
+                         &foreign_source, width, height,
                          VulkanPixelFormat::rgb_u8, source, &error)) {
     return Require(false, "foreign source setup failed: " + error);
   }
@@ -528,6 +609,27 @@ bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
                     input, resources, &fixture.counters, &result) &&
                     result.mirror_applied,
                 "context mismatch must not latch or disable a later mirror");
+
+  VulkanImage mapped_source;
+  if (!mapped_source.Allocate(kernels->device(), width, height,
+                              VulkanPixelFormat::rgb_u8,
+                              /*map_memory=*/true, &error)) {
+    return Require(false, "mapped-source rejection setup failed: " + error);
+  }
+  input.source = &mapped_source;
+  const auto submissions_before_residency_rejection =
+      kernels->synchronous_submission_count();
+  ok &= Require(
+      !ExecuteOpenVulkanFinalResidentStage(input, resources, &fixture.counters,
+                                           &result) &&
+          result.mirror_error.find(
+              "[vulkan_effect_residency_contract_failed]") !=
+              std::string::npos &&
+          fixture.counters.residency_rejection_calls == 1 &&
+          kernels->synchronous_submission_count() ==
+              submissions_before_residency_rejection,
+      "mapped source must fail the production residency contract before any "
+      "dispatch or fallback");
   return ok;
 }
 

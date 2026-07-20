@@ -18,6 +18,8 @@ inline constexpr std::string_view
         "open_vulkan_vignette_fixed_center_production_ready";
 inline constexpr std::string_view kOpenVulkanVignetteParameterContract =
     "fixed_center";
+inline constexpr std::string_view kOpenVulkanVignetteResidencyFailureReason =
+    "vulkan_effect_residency_contract_failed";
 
 std::string OpenVulkanVignetteInitializationFailure(std::string_view detail);
 std::string OpenVulkanVignetteRuntimeFailure(std::string_view detail);
@@ -59,18 +61,21 @@ struct OpenVulkanVignetteCounters {
   // Setup/configuration counters. They must not change on repeated frames at
   // the same geometry and shared-context generation.
   std::uint64_t factor_allocation_calls = 0;
+  std::uint64_t factor_staging_allocation_calls = 0;
   std::uint64_t factor_generation_calls = 0;
   std::uint64_t factor_upload_calls = 0;
+  std::uint64_t factor_upload_completion_calls = 0;
   std::uint64_t dispatch_calls = 0;
   std::uint64_t runtime_failure_frames = 0;
 };
 
 // Production fixed-center Vulkan vignette. The attenuation-factor lookup is
-// generated and uploaded once per geometry/intensity/context configuration,
-// then all frame work stays device resident. This backend does not consume
-// tracked-center data: planning rejects that semantic when a retained Auto
-// Frame stage would make it observable, while standalone vignette remains
-// fixed-center and introduces no analysis tail.
+// generated through one bounded setup staging allocation and uploaded into a
+// non-mapped DEVICE_LOCAL mask once per geometry/intensity/context
+// configuration, then all frame work stays device resident. This backend does
+// not consume tracked-center data: planning rejects that semantic when a
+// retained Auto Frame stage would make it observable, while standalone
+// vignette remains fixed-center and introduces no analysis tail.
 class OpenVulkanVignette {
 public:
   bool EnsureInitialized(studiocast::vulkan::kernels::UtilityKernels *kernels,

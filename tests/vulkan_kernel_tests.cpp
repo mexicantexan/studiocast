@@ -590,6 +590,50 @@ bool AllocateF32(studiocast::vulkan::kernels::UtilityKernels &kernels,
                          /*map_memory=*/true, error);
 }
 
+bool AllocateDeviceLocalU8(
+    studiocast::vulkan::kernels::UtilityKernels &kernels,
+    studiocast::vulkan::VulkanImage *image, int w, int h,
+    studiocast::vulkan::VulkanPixelFormat format, std::string *error) {
+  return image->Allocate(kernels.device(), w, h, format,
+                         /*map_memory=*/false, error);
+}
+
+bool UploadDeviceLocalU8(
+    studiocast::vulkan::kernels::UtilityKernels &kernels,
+    studiocast::vulkan::VulkanImage *upload_staging,
+    studiocast::vulkan::VulkanImage *device_image, int w, int h,
+    studiocast::vulkan::VulkanPixelFormat format,
+    const std::vector<std::uint8_t> &bytes, std::string *error) {
+  return AllocateU8(kernels, upload_staging, w, h, format, error) &&
+         AllocateDeviceLocalU8(kernels, device_image, w, h, format, error) &&
+         kernels.UploadU8x3ToDeviceLocal(
+             bytes.data(), static_cast<std::size_t>(w) * 3u, *upload_staging,
+             *device_image, error);
+}
+
+std::vector<std::uint8_t> ReadbackDeviceLocalU8(
+    studiocast::vulkan::kernels::UtilityKernels &kernels,
+    const studiocast::vulkan::VulkanImage &device_image,
+    studiocast::vulkan::VulkanImage *readback_staging, std::string *error) {
+  if ((!readback_staging->Valid() ||
+       readback_staging->width() != device_image.width() ||
+       readback_staging->height() != device_image.height() ||
+       readback_staging->format() != device_image.format()) &&
+      !AllocateU8(kernels, readback_staging, device_image.width(),
+                  device_image.height(), device_image.format(), error)) {
+    return {};
+  }
+  std::vector<std::uint8_t> output(
+      static_cast<std::size_t>(device_image.width()) *
+      static_cast<std::size_t>(device_image.height()) * 3u);
+  if (!kernels.ReadbackU8x3(
+          device_image, *readback_staging, output.data(),
+          static_cast<std::size_t>(device_image.width()) * 3u, error)) {
+    return {};
+  }
+  return output;
+}
+
 studiocast::open_vulkan::VulkanMattingReadiness
 SyntheticProductionMattingReadiness(
     studiocast::vulkan::kernels::UtilityKernels &kernels,
@@ -3146,18 +3190,22 @@ int main() {
       for (std::size_t i = 0; i < source.size(); ++i)
         source[i] = static_cast<std::uint8_t>((i * 73u + 19u) & 0xffu);
 
+      VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_dst, gpu_round_trip;
-      if (!AllocateU8(kernels, &gpu_src, tc.width, tc.height, tc.format,
-                      &error) ||
-          !AllocateU8(kernels, &gpu_dst, tc.width, tc.height, tc.format,
-                      &error) ||
-          !AllocateU8(kernels, &gpu_round_trip, tc.width, tc.height, tc.format,
-                      &error)) {
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, tc.width,
+                               tc.height, tc.format, source, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_dst, tc.width, tc.height,
+                                 tc.format, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_round_trip, tc.width,
+                                 tc.height, tc.format, &error)) {
         return OptionalSkip(std::string("mirror allocation failed: ") + error);
       }
-      FillU8(gpu_src, source);
-      ok &= Require(gpu_src.Flush(&error),
-                    std::string(tc.label) + " source flush failed: " + error);
+      ok &= Require(gpu_src.device_local() && !gpu_src.mapped() &&
+                        gpu_dst.device_local() && !gpu_dst.mapped() &&
+                        gpu_round_trip.device_local() &&
+                        !gpu_round_trip.mapped(),
+                    std::string(tc.label) +
+                        " production mirror images must be DEVICE_LOCAL");
 
       OpenVulkanMirror mirror;
       ok &= Require(
@@ -3181,10 +3229,8 @@ int main() {
       ok &=
           Require(mirror.ApplyFinal(input, &counters, &error),
                   std::string(tc.label) + " mirror dispatch failed: " + error);
-      ok &= Require(gpu_dst.Invalidate(&error),
-                    std::string(tc.label) +
-                        " output invalidate failed: " + error);
-      ok &= CompareU8Exact(ReadU8(gpu_dst),
+      ok &= CompareU8Exact(ReadbackDeviceLocalU8(
+                               kernels, gpu_dst, &readback_staging, &error),
                            MirrorU8Reference(source, tc.width, tc.height),
                            std::string("Vulkan mirror ") + tc.label);
 
@@ -3196,10 +3242,10 @@ int main() {
       ok &= Require(mirror.ApplyFinal(second, &counters, &error),
                     std::string(tc.label) +
                         " double mirror dispatch failed: " + error);
-      ok &= Require(gpu_round_trip.Invalidate(&error),
-                    std::string(tc.label) +
-                        " round-trip invalidate failed: " + error);
-      ok &= CompareU8Exact(ReadU8(gpu_round_trip), source,
+      ok &= CompareU8Exact(ReadbackDeviceLocalU8(
+                               kernels, gpu_round_trip, &readback_staging,
+                               &error),
+                           source,
                            std::string("Vulkan double mirror ") + tc.label);
       ok &= Require(counters.dispatch_calls == 2 &&
                         counters.runtime_failure_frames == 0,
@@ -3217,18 +3263,17 @@ int main() {
           5,  17, 29, 41, 53, 65, 77, 89,  101,
           13, 31, 47, 59, 71, 83, 97, 109, 127,
       };
+      VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_resized, gpu_dst;
-      if (!AllocateU8(kernels, &gpu_src, src_w, src_h,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(kernels, &gpu_resized, dst_w, dst_h,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(kernels, &gpu_dst, dst_w, dst_h,
-                      VulkanPixelFormat::rgb_u8, &error)) {
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w,
+                               src_h, VulkanPixelFormat::rgb_u8, source,
+                               &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_resized, dst_w, dst_h,
+                                 VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_dst, dst_w, dst_h,
+                                 VulkanPixelFormat::rgb_u8, &error)) {
         return OptionalSkip("mirror resize-batch allocation failed: " + error);
       }
-      FillU8(gpu_src, source);
-      ok &= Require(gpu_src.Flush(&error),
-                    "mirror resize-batch source flush failed: " + error);
 
       OpenVulkanMirror mirror;
       ok &= Require(mirror.EnsureInitialized(&kernels, dst_w, dst_h, &error),
@@ -3256,10 +3301,9 @@ int main() {
                         counters.runtime_failure_frames == 0,
                     "combined resize/mirror should count one final mirror "
                     "operation");
-      ok &= Require(gpu_dst.Invalidate(&error),
-                    "combined resize/mirror invalidate failed: " + error);
       ok &=
-          CompareU8(ReadU8(gpu_dst),
+          CompareU8(ReadbackDeviceLocalU8(kernels, gpu_dst, &readback_staging,
+                                          &error),
                     MirrorU8Reference(
                         ResizeU8Reference(source, src_w, src_h, dst_w, dst_h,
                                           0.0f, 0.0f, static_cast<float>(src_w),
@@ -3300,17 +3344,15 @@ int main() {
       for (std::size_t i = 0; i < source.size(); ++i)
         source[i] = static_cast<std::uint8_t>((i * 61u + 23u) & 0xffu);
 
+      VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_dst;
-      if (!AllocateU8(kernels, &gpu_src, tc.width, tc.height, tc.format,
-                      &error) ||
-          !AllocateU8(kernels, &gpu_dst, tc.width, tc.height, tc.format,
-                      &error)) {
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, tc.width,
+                               tc.height, tc.format, source, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_dst, tc.width, tc.height,
+                                 tc.format, &error)) {
         return OptionalSkip(std::string("vignette allocation failed: ") +
                             error);
       }
-      FillU8(gpu_src, source);
-      ok &= Require(gpu_src.Flush(&error),
-                    std::string(tc.label) + " source flush failed: " + error);
 
       OpenVulkanVignetteCounters counters;
       ok &= Require(vignette.EnsureInitialized(&kernels, tc.width, tc.height,
@@ -3322,8 +3364,12 @@ int main() {
           Require(vignette.EnsureInitialized(&kernels, tc.width, tc.height,
                                              tc.intensity, &counters, &error) &&
                       counters.factor_allocation_calls == 1 &&
+                      counters.factor_staging_allocation_calls == 1 &&
                       counters.factor_generation_calls == 1 &&
-                      counters.factor_upload_calls == 1,
+                      counters.factor_upload_calls == 1 &&
+                      counters.factor_upload_completion_calls == 1 &&
+                      vignette.attenuation_factor_mask().device_local() &&
+                      !vignette.attenuation_factor_mask().mapped(),
                   std::string(tc.label) +
                       " repeated initialization must reuse one attenuation "
                       "factor mask");
@@ -3333,6 +3379,12 @@ int main() {
                             setup_stats.allocation_count,
                     std::string(tc.label) +
                         " repeated initialization must not allocate again");
+      if (!AllocateU8(kernels, &readback_staging, tc.width, tc.height,
+                      tc.format, &error)) {
+        return OptionalSkip(std::string(tc.label) +
+                            " final readback staging allocation failed: " +
+                            error);
+      }
 
       OpenVulkanVignetteFinalStageInput input;
       input.src = &gpu_src;
@@ -3362,13 +3414,12 @@ int main() {
                           kernels.last_frame_batch_stage_count() == 1,
                       std::string(tc.label) +
                           " must use one stage and one bounded completion");
-        ok &= Require(gpu_dst.Invalidate(&error),
-                      std::string(tc.label) +
-                          " output invalidate failed: " + error);
         const auto padded_reference = VignetteU8ReferencePadded(
             source, tc.width, tc.height,
             static_cast<std::size_t>(tc.width) * 3u, tc.intensity);
-        ok &= CompareU8(ReadU8(gpu_dst), padded_reference,
+        ok &= CompareU8(ReadbackDeviceLocalU8(
+                            kernels, gpu_dst, &readback_staging, &error),
+                        padded_reference,
                         std::string("Vulkan vignette ") + tc.label);
       }
       const auto allocations_after_frames =
@@ -3381,8 +3432,10 @@ int main() {
               allocations_after_frames.allocation_count ==
                   allocations_before_frames.allocation_count &&
               counters.factor_allocation_calls == 1 &&
+              counters.factor_staging_allocation_calls == 1 &&
               counters.factor_generation_calls == 1 &&
               counters.factor_upload_calls == 1 &&
+              counters.factor_upload_completion_calls == 1 &&
               counters.dispatch_calls == 2 &&
               kernels.descriptor_binding_update_count() ==
                   descriptor_updates_before_frames + 1,
@@ -3409,15 +3462,21 @@ int main() {
         vignette.EnsureInitialized(&kernels, 6, 4, 73,
                                    &intensity_reconfigure_counters, &error) &&
             intensity_reconfigure_counters.factor_allocation_calls == 0 &&
+            intensity_reconfigure_counters.factor_staging_allocation_calls ==
+                0 &&
             intensity_reconfigure_counters.factor_generation_calls == 0 &&
-            intensity_reconfigure_counters.factor_upload_calls == 0,
+            intensity_reconfigure_counters.factor_upload_calls == 0 &&
+            intensity_reconfigure_counters.factor_upload_completion_calls == 0,
         "unchanged geometry/intensity must not touch setup data");
     ok &= Require(
         vignette.EnsureInitialized(&kernels, 6, 4, 74,
                                    &intensity_reconfigure_counters, &error) &&
             intensity_reconfigure_counters.factor_allocation_calls == 0 &&
+            intensity_reconfigure_counters.factor_staging_allocation_calls ==
+                1 &&
             intensity_reconfigure_counters.factor_generation_calls == 1 &&
-            intensity_reconfigure_counters.factor_upload_calls == 1,
+            intensity_reconfigure_counters.factor_upload_calls == 1 &&
+            intensity_reconfigure_counters.factor_upload_completion_calls == 1,
         "intensity-only reconfigure must regenerate/upload once "
         "without allocating");
     ok &= Require(
@@ -3425,6 +3484,7 @@ int main() {
                                    &intensity_reconfigure_counters, &error) &&
             intensity_reconfigure_counters.factor_generation_calls == 1 &&
             intensity_reconfigure_counters.factor_upload_calls == 1 &&
+            intensity_reconfigure_counters.factor_upload_completion_calls == 1 &&
             kernels.device()->allocation_stats().allocation_count ==
                 intensity_reconfigure_allocations.allocation_count,
         "repeated reconfigure must reuse the attenuation buffer");
@@ -3439,20 +3499,19 @@ int main() {
           5,  17, 29, 41, 53, 65, 77, 89,  101,
           13, 31, 47, 59, 71, 83, 97, 109, 127,
       };
+      VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_resized, gpu_vignette, gpu_mirror;
-      if (!AllocateU8(kernels, &gpu_src, src_w, src_h,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(kernels, &gpu_resized, dst_w, dst_h,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(kernels, &gpu_vignette, dst_w, dst_h,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(kernels, &gpu_mirror, dst_w, dst_h,
-                      VulkanPixelFormat::rgb_u8, &error)) {
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w,
+                               src_h, VulkanPixelFormat::rgb_u8, source,
+                               &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_resized, dst_w, dst_h,
+                                 VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_vignette, dst_w, dst_h,
+                                 VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateDeviceLocalU8(kernels, &gpu_mirror, dst_w, dst_h,
+                                 VulkanPixelFormat::rgb_u8, &error)) {
         return OptionalSkip("combined vignette allocation failed: " + error);
       }
-      FillU8(gpu_src, source);
-      ok &= Require(gpu_src.Flush(&error),
-                    "combined vignette source flush failed: " + error);
 
       OpenVulkanVignette combined_vignette;
       OpenVulkanVignetteCounters counters;
@@ -3470,7 +3529,13 @@ int main() {
           kernels.synchronous_submission_count();
       const std::uint64_t completions_before =
           kernels.frame_batch_completion_count();
-      const auto allocations_before = kernels.device()->allocation_stats();
+      if (!AllocateU8(kernels, &readback_staging, dst_w, dst_h,
+                      VulkanPixelFormat::rgb_u8, &error)) {
+        return OptionalSkip("combined final readback staging allocation failed: " +
+                            error);
+      }
+      const auto allocations_before_frame =
+          kernels.device()->allocation_stats();
       ok &= Require(combined_vignette.ApplyFinal(input, &counters, &error),
                     "resize/vignette/mirror dispatch failed: " + error);
       ok &= Require(kernels.synchronous_submission_count() ==
@@ -3480,23 +3545,24 @@ int main() {
                         kernels.last_frame_batch_stage_count() == 3,
                     "resize/vignette/mirror must record three dependent "
                     "stages under one completion");
-      ok &= Require(gpu_mirror.Invalidate(&error),
-                    "combined vignette/mirror invalidate failed: " + error);
       const auto resized = ResizeU8Reference(
           source, src_w, src_h, dst_w, dst_h, 0.0f, 0.0f,
           static_cast<float>(src_w), static_cast<float>(src_h));
       const auto vignetted = VignetteU8ReferencePadded(
           resized, dst_w, dst_h, static_cast<std::size_t>(dst_w) * 3u,
           intensity);
-      ok &= CompareU8(ReadU8(gpu_mirror),
+      ok &= CompareU8(ReadbackDeviceLocalU8(
+                          kernels, gpu_mirror, &readback_staging, &error),
                       MirrorU8Reference(vignetted, dst_w, dst_h),
                       "Vulkan resize/vignette/mirror parity");
       ok &= Require(kernels.device()->allocation_stats().current_bytes ==
-                            allocations_before.current_bytes &&
+                            allocations_before_frame.current_bytes &&
                         kernels.device()->allocation_stats().high_water_bytes ==
-                            allocations_before.high_water_bytes &&
+                            allocations_before_frame.high_water_bytes &&
                         counters.factor_allocation_calls == 1 &&
-                        counters.factor_upload_calls == 1,
+                        counters.factor_staging_allocation_calls == 1 &&
+                        counters.factor_upload_calls == 1 &&
+                        counters.factor_upload_completion_calls == 1,
                     "combined frame must not allocate or re-upload its factor "
                     "mask");
     }
@@ -3507,12 +3573,12 @@ int main() {
     if (!foreign_kernels.Initialize(&error))
       return OptionalSkip("second Vulkan context init failed: " + error);
     VulkanImage same_src, same_dst, foreign_dst;
-    if (!AllocateU8(kernels, &same_src, 2, 2, VulkanPixelFormat::rgb_u8,
-                    &error) ||
-        !AllocateU8(kernels, &same_dst, 2, 2, VulkanPixelFormat::rgb_u8,
-                    &error) ||
-        !AllocateU8(foreign_kernels, &foreign_dst, 2, 2,
-                    VulkanPixelFormat::rgb_u8, &error)) {
+    if (!AllocateDeviceLocalU8(kernels, &same_src, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(kernels, &same_dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(foreign_kernels, &foreign_dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("context identity allocation failed: " + error);
     }
     ok &= Require(same_src.BelongsTo(*kernels.device()) &&
@@ -3558,6 +3624,22 @@ int main() {
             mirror_counters.runtime_failure_frames == 1,
         "production mirror helper must reject a foreign context before "
         "dispatch with stable effect/context reasons");
+    VulkanImage mapped_same_context;
+    if (!AllocateU8(kernels, &mapped_same_context, 2, 2,
+                    VulkanPixelFormat::rgb_u8, &error)) {
+      return OptionalSkip("mapped residency rejection allocation failed: " +
+                          error);
+    }
+    mirror_input.src = &mapped_same_context;
+    mirror_input.dst = &same_dst;
+    ok &= Require(
+        !mirror.ApplyFinal(mirror_input, &mirror_counters, &error) &&
+            error.find("[vulkan_effect_residency_contract_failed]") !=
+                std::string::npos &&
+            mirror_counters.dispatch_calls == 0 &&
+            mirror_counters.runtime_failure_frames == 2,
+        "production mirror wrapper must reject mapped same-context storage "
+        "before dispatch");
 
     studiocast::video::OpenVulkanVignette vignette;
     studiocast::video::OpenVulkanVignetteCounters vignette_counters;
@@ -3587,6 +3669,16 @@ int main() {
             vignette_counters.runtime_failure_frames == 2,
         "production vignette helper must reject a foreign context before "
         "dispatch with stable effect/context reasons");
+    vignette_input.src = &mapped_same_context;
+    vignette_input.dst = &same_dst;
+    ok &= Require(
+        !vignette.ApplyFinal(vignette_input, &vignette_counters, &error) &&
+            error.find("[vulkan_effect_residency_contract_failed]") !=
+                std::string::npos &&
+            vignette_counters.dispatch_calls == 0 &&
+            vignette_counters.runtime_failure_frames == 3,
+        "production vignette wrapper must reject mapped same-context storage "
+        "before dispatch");
   }
 
   {
@@ -3835,16 +3927,15 @@ int main() {
     UtilityKernels lost_kernels;
     if (!lost_kernels.Initialize(&error))
       return OptionalSkip("mirror device-loss context init failed: " + error);
-    VulkanImage src, dst;
-    if (!AllocateU8(lost_kernels, &src, 2, 2, VulkanPixelFormat::rgb_u8,
-                    &error) ||
-        !AllocateU8(lost_kernels, &dst, 2, 2, VulkanPixelFormat::rgb_u8,
-                    &error)) {
+    VulkanImage upload_staging, src, dst;
+    if (!UploadDeviceLocalU8(
+            lost_kernels, &upload_staging, &src, 2, 2,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_kernels, &dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("mirror device-loss allocation failed: " + error);
     }
-    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-    if (!src.Flush(&error))
-      return OptionalSkip("mirror device-loss source flush failed: " + error);
 
     studiocast::video::OpenVulkanMirror mirror;
     ok &= Require(mirror.EnsureInitialized(&lost_kernels, 2, 2, &error),
@@ -3937,19 +4028,16 @@ int main() {
       return OptionalSkip("mirror batch device-loss context init failed: " +
                           error);
     }
-    VulkanImage src, resized, dst;
-    if (!AllocateU8(lost_batch_kernels, &src, 2, 2, VulkanPixelFormat::rgb_u8,
-                    &error) ||
-        !AllocateU8(lost_batch_kernels, &resized, 3, 3,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_batch_kernels, &dst, 3, 3, VulkanPixelFormat::rgb_u8,
-                    &error)) {
+    VulkanImage upload_staging, src, resized, dst;
+    if (!UploadDeviceLocalU8(
+            lost_batch_kernels, &upload_staging, &src, 2, 2,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_batch_kernels, &resized, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_batch_kernels, &dst, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("mirror batch device-loss allocation failed: " +
-                          error);
-    }
-    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-    if (!src.Flush(&error)) {
-      return OptionalSkip("mirror batch device-loss source flush failed: " +
                           error);
     }
 
@@ -3983,20 +4071,18 @@ int main() {
     if (!lost_vignette_kernels.Initialize(&error)) {
       return OptionalSkip("vignette device-loss context init failed: " + error);
     }
-    VulkanImage src, resized, vignetted, mirrored;
-    if (!AllocateU8(lost_vignette_kernels, &src, 2, 2,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_vignette_kernels, &resized, 3, 3,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_vignette_kernels, &vignetted, 3, 3,
-                    VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateU8(lost_vignette_kernels, &mirrored, 3, 3,
-                    VulkanPixelFormat::rgb_u8, &error)) {
+    VulkanImage upload_staging, src, resized, vignetted, mirrored;
+    if (!UploadDeviceLocalU8(
+            lost_vignette_kernels, &upload_staging, &src, 2, 2,
+            VulkanPixelFormat::rgb_u8,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &resized, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &vignetted, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &mirrored, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("vignette device-loss allocation failed: " + error);
-    }
-    FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-    if (!src.Flush(&error)) {
-      return OptionalSkip("vignette device-loss source flush failed: " + error);
     }
 
     studiocast::video::OpenVulkanVignette vignette;

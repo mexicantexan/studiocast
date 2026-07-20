@@ -20,14 +20,14 @@ bool EnsureReusableImage(studiocast::vulkan::kernels::UtilityKernels *kernels,
   }
   if (image->Valid() && image->BelongsTo(*kernels->device()) &&
       image->width() == width && image->height() == height &&
-      image->format() == format && image->mapped()) {
+      image->format() == format && !image->mapped() && image->device_local()) {
     return true;
   }
 
   std::string detail;
   kernels->InvalidateDescriptorBindingCacheForSetup();
   if (!image->Allocate(kernels->device(), width, height, format,
-                       /*map_memory=*/true, &detail)) {
+                       /*map_memory=*/false, &detail)) {
     if (error_out) {
       *error_out = std::string("Open Vulkan final stage: failed to allocate ") +
                    label + ": " + detail;
@@ -35,12 +35,24 @@ bool EnsureReusableImage(studiocast::vulkan::kernels::UtilityKernels *kernels,
     return false;
   }
   ++counters->resource_allocation_calls;
+  ++counters->device_local_allocation_calls;
   return true;
 }
 
 std::string ForeignSourceFailure() {
   return "[vulkan_foreign_context] final resident source does not belong to "
          "the shared Vulkan context";
+}
+
+std::string ResidencyFailure(std::string_view detail) {
+  std::string out = "[vulkan_effect_residency_contract_failed] Open Vulkan "
+                    "final resident stage requires non-mapped DEVICE_LOCAL "
+                    "resources";
+  if (!detail.empty()) {
+    out += ": ";
+    out += detail;
+  }
+  return out;
 }
 
 } // namespace
@@ -72,6 +84,21 @@ bool ExecuteOpenVulkanFinalResidentStage(
       input.source->format() != VulkanPixelFormat::bgr_u8) {
     result->fatal_error =
         "Open Vulkan final resident source must be RGB or BGR u8.";
+    return false;
+  }
+  if (input.source->mapped() || !input.source->device_local()) {
+    const std::string detail = ResidencyFailure(
+        "the final-stage source is mapped or not DEVICE_LOCAL");
+    if (input.request_fixed_center_vignette) {
+      result->vignette_failed = true;
+      result->vignette_error = OpenVulkanVignetteRuntimeFailure(detail);
+    }
+    if (input.request_mirror) {
+      result->mirror_failed = true;
+      result->mirror_error = OpenVulkanMirrorRuntimeFailure(detail);
+    }
+    result->fatal_error = detail;
+    ++counters->residency_rejection_calls;
     return false;
   }
 
