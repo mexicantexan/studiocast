@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 #include <unistd.h>
@@ -10,6 +11,14 @@
 
 #ifndef STUDIOCAST_SOURCE_DIR
 #define STUDIOCAST_SOURCE_DIR ""
+#endif
+
+#ifndef STUDIOCAST_BINARY_DIR
+#define STUDIOCAST_BINARY_DIR ""
+#endif
+
+#ifndef STUDIOCAST_PYTHON_EXECUTABLE
+#define STUDIOCAST_PYTHON_EXECUTABLE ""
 #endif
 
 namespace {
@@ -76,6 +85,14 @@ bool WriteExecutable(const fs::path &path, const std::string &text,
     return false;
   }
   return true;
+}
+
+std::string ReadTextFile(const fs::path &path) {
+  std::ifstream file(path);
+  if (!file)
+    return {};
+  return std::string(std::istreambuf_iterator<char>(file),
+                     std::istreambuf_iterator<char>());
 }
 
 class ScopedTempDir {
@@ -593,6 +610,122 @@ bool TestUserServiceDryRunRestartsServiceAfterInstall() {
                 "already-running daemons");
 }
 
+bool TestAnalyzerRefreshesColdInstalledDaemonThroughCli() {
+  ScopedTempDir temp("studiocast-installer-cold-diagnostics");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  const fs::path binaryDir = fs::path(STUDIOCAST_BINARY_DIR);
+  const fs::path daemon = binaryDir / "studiocastd";
+  const fs::path builtCtl = binaryDir / "studiocastctl";
+  const fs::path python = fs::path(STUDIOCAST_PYTHON_EXECUTABLE);
+  const fs::path installedCtl =
+      temp.xdgDataDir() / "studiocast/current/bin/studiocastctl";
+  const fs::path backend = fs::path(STUDIOCAST_SOURCE_DIR) / "installer" /
+                           "backend/studiocast-installer-backend";
+  if (!Expect(fs::is_regular_file(daemon),
+              "cold diagnostics test requires the real studiocastd binary") ||
+      !Expect(fs::is_regular_file(builtCtl),
+              "cold diagnostics test requires the real studiocastctl binary") ||
+      !Expect(fs::is_regular_file(python),
+              "cold diagnostics test requires the configured Python interpreter")) {
+    return false;
+  }
+
+  std::error_code ec;
+  fs::create_directories(installedCtl.parent_path(), ec);
+  if (!Expect(!ec, "failed to create installed CLI fixture directory"))
+    return false;
+  fs::copy_file(builtCtl, installedCtl, fs::copy_options::overwrite_existing,
+                ec);
+  if (!Expect(!ec, "failed to copy installed CLI fixture"))
+    return false;
+
+  const fs::path configDir = temp.xdgConfigDir() / "studiocast";
+  fs::create_directories(configDir, ec);
+  if (!Expect(!ec, "failed to create cold daemon config fixture"))
+    return false;
+  {
+    std::ofstream config(configDir / "daemon.conf");
+    config << "video.enabled = false\n"
+              "audio.enabled = false\n"
+              "audio.create_virtual_mic = false\n"
+              "audio.create_virtual_speakers = false\n";
+    if (!Expect(config.good(), "failed to write cold daemon config fixture"))
+      return false;
+  }
+
+  const fs::path toolDir = temp.path() / "probe-tools";
+  fs::create_directories(toolDir, ec);
+  if (!Expect(!ec, "failed to create hermetic probe-tool directory"))
+    return false;
+  fs::create_symlink(python, toolDir / "python3", ec);
+  if (!Expect(!ec, "failed to stage hermetic python3 launcher"))
+    return false;
+
+  const fs::path socket =
+      temp.xdgRuntimeDir() / "studiocast/studiocastd.sock";
+  const fs::path coldStatus = temp.path() / "cold-status.json";
+  const fs::path analyzedFacts = temp.path() / "analyzed-facts.json";
+  const fs::path warmStatus = temp.path() / "warm-status.json";
+  const fs::path daemonLog = temp.path() / "daemon.log";
+
+  const std::string environment =
+      "HOME=" + ShellQuote(temp.homeDir().string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(temp.xdgConfigDir().string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(temp.xdgCacheDir().string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(temp.xdgDataDir().string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(temp.xdgStateDir().string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(temp.xdgRuntimeDir().string()) + " " +
+      "STUDIOCAST_INSTALLER_OFFLINE=1 "
+      "STUDIOCAST_INSTALLER_TEST_MODE=1 " +
+      "PATH=" + ShellQuote(toolDir.string()) + " ";
+
+  // The first status read proves the real daemon starts with an empty
+  // diagnostics cache. The analyzer must then use the installed public CLI's
+  // explicit refresh command before its status read; the final status and
+  // analyzed facts prove that boundary was crossed successfully.
+  const std::string command =
+      environment + ShellQuote(daemon.string()) + " --output /dev/null >" +
+      ShellQuote(daemonLog.string()) + " 2>&1 & daemon_pid=$!; "
+      "cleanup() { kill \"$daemon_pid\" 2>/dev/null || true; "
+      "wait \"$daemon_pid\" 2>/dev/null || true; }; trap cleanup EXIT; "
+      "ready=0; i=0; while [ \"$i\" -lt 200 ]; do "
+      "if [ -S " + ShellQuote(socket.string()) + " ]; then ready=1; break; fi; "
+      "i=$((i + 1)); /bin/sleep 0.05; done; "
+      "[ \"$ready\" -eq 1 ] || exit 70; " +
+      environment + ShellQuote(installedCtl.string()) + " status >" +
+      ShellQuote(coldStatus.string()) + " || exit 71; " + environment +
+      ShellQuote(backend.string()) + " analyze --target-version 0.2.9 >" +
+      ShellQuote(analyzedFacts.string()) + " || exit 72; " + environment +
+      ShellQuote(installedCtl.string()) + " status >" +
+      ShellQuote(warmStatus.string()) + " || exit 73";
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 60000;
+  options.max_output_bytes = 256 * 1024;
+  const auto result = studiocast::util::ExecCapture(command, options);
+  if (!Expect(result.exit_code == 0 && !result.timed_out,
+              "cold daemon installer analysis should complete through the "
+              "installed CLI")) {
+    std::cerr << "subprocess output:\n" << result.stdout_str << "\n";
+    std::cerr << "daemon log:\n" << ReadTextFile(daemonLog) << "\n";
+    std::cerr << "cold status:\n" << ReadTextFile(coldStatus) << "\n";
+    std::cerr << "analyzed facts:\n" << ReadTextFile(analyzedFacts) << "\n";
+    std::cerr << "warm status:\n" << ReadTextFile(warmStatus) << "\n";
+    return false;
+  }
+
+  const std::string cold = ReadTextFile(coldStatus);
+  const std::string facts = ReadTextFile(analyzedFacts);
+  const std::string warm = ReadTextFile(warmStatus);
+  return ExpectContains("cold daemon status", cold, "\"open_vulkan\":{}") &&
+         ExpectContains("refreshed daemon status", warm,
+                        "\"compiled_enabled\":") &&
+         ExpectContains("installer analyzed facts", facts,
+                        "\"runtime_diagnostics_available\": true");
+}
+
 } // namespace
 
 int main() {
@@ -608,5 +741,6 @@ int main() {
   ok = TestStatusReportsOptionalComponents() && ok;
   ok = TestPackageSafetyDoesNotBundleOrInstallMaxineArtifacts() && ok;
   ok = TestUserServiceDryRunRestartsServiceAfterInstall() && ok;
+  ok = TestAnalyzerRefreshesColdInstalledDaemonThroughCli() && ok;
   return ok ? 0 : 1;
 }

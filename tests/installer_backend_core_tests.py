@@ -944,6 +944,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
     def test_host_analyzer_consumes_runtime_diagnostics_and_real_vulkan_compute_evidence(self):
         current_bin = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current/bin"
         current_bin.mkdir(parents=True)
+        ctl_calls = self.s.root / "studiocastctl-calls"
         diagnostics = {"engines": {
             "maxine": {"ok": True, "available_effects": ["auto_frame"], "components": {},
                        "vfx": {"root_found": True, "library_loadable": True, "ok": True},
@@ -996,7 +997,10 @@ class InstallerBackendCoreTests(unittest.TestCase):
                     "open_vulkan_video_noise_removal_runtime_unavailable",
             }}}
         ctl = current_bin / "studiocastctl"
-        ctl.write_text("#!/bin/sh\nprintf '%s\\n' " + repr(json.dumps(diagnostics)) + "\n")
+        ctl.write_text(
+            "#!/bin/sh\n"
+            + "printf '%s\\n' \"$*\" >> " + repr(str(ctl_calls)) + "\n"
+            + "printf '%s\\n' " + repr(json.dumps(diagnostics)) + "\n")
         ctl.chmod(0o755)
         fake = self.s.root / "probe-bin"; fake.mkdir()
         (fake / "vulkaninfo").write_text("""#!/bin/sh
@@ -1017,6 +1021,8 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
             (fake / name).chmod(0o755)
         env = self.s.env | {"PATH": str(fake) + ":/usr/bin:/bin"}
         facts = self.s.json("analyze", "--target-version", "0.2.9", env=env)
+        self.assertEqual(ctl_calls.read_text().splitlines(),
+                         ["diagnostics refresh", "status"])
         self.assertTrue(facts["gpus"]["vulkan"]["compute_device_usable"])
         self.assertEqual(facts["gpus"]["vulkan"]["reason_codes"], ["vulkan_compute_device_usable"])
         self.assertTrue(facts["gpus"]["nvidia"]["cuda_usable"])
@@ -1037,6 +1043,56 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
                       facts["effects"]["capabilities"]
                       ["virtual_background.blur"]["blocker_reason_codes"]
                       ["vulkan"])
+
+        # An installed older CLI may still return production-looking cached
+        # status, but without a successful explicit refresh that evidence is
+        # stale/unknown and must not promote an effect.
+        current_bin = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current/bin"
+        current_bin.mkdir(parents=True, exist_ok=True)
+        ctl_calls = self.s.root / "older-studiocastctl-calls"
+        production_looking = {"engines": {"open_vulkan": {
+            "compiled_enabled": True, "ok": True,
+            "runtime_library_found": True, "instance_created": True,
+            "physical_device_found": True, "non_cpu_device_selected": True,
+            "compute_queue_available": True, "logical_device_created": True,
+            "context_created": True, "context_healthy": True,
+            "production_hardware_ready": True, "shader_pipeline_created": True,
+            "available_effects": ["mirror"],
+            "mirror_production_ready": True,
+            "mirror_readiness_code": "open_vulkan_mirror_production_ready",
+        }}}
+        ctl = current_bin / "studiocastctl"
+        ctl.write_text(
+            "#!/bin/sh\n"
+            + "printf '%s\\n' \"$*\" >> " + repr(str(ctl_calls)) + "\n"
+            + "if [ \"${1:-}\" = diagnostics ]; then exit 2; fi\n"
+            + "printf '%s\\n' " + repr(json.dumps(production_looking)) + "\n")
+        ctl.chmod(0o755)
+
+        facts = self.s.json("analyze", "--target-version", "0.2.9")
+        self.assertEqual(ctl_calls.read_text().splitlines(),
+                         ["diagnostics refresh", "status"])
+        mirror = facts["effects"]["capabilities"]["mirror"]
+        self.assertEqual(mirror["vulkan"], "unavailable")
+        self.assertFalse(mirror["vulkan_evidence"]["runtime_diagnostics_available"])
+        self.assertIn("open_vulkan_runtime_diagnostics_unavailable",
+                      mirror["blocker_reason_codes"]["vulkan"])
+
+        ctl_calls = self.s.root / "empty-refresh-studiocastctl-calls"
+        ctl.write_text(
+            "#!/bin/sh\n"
+            + "printf '%s\\n' \"$*\" >> " + repr(str(ctl_calls)) + "\n"
+            + "if [ \"${1:-}\" = diagnostics ]; then "
+              "printf '%s\\n' '{\"engines\":{}}'; exit 0; fi\n"
+            + "printf '%s\\n' " + repr(json.dumps(production_looking)) + "\n")
+        ctl.chmod(0o755)
+        facts = self.s.json("analyze", "--target-version", "0.2.9")
+        self.assertEqual(ctl_calls.read_text().splitlines(),
+                         ["diagnostics refresh", "status"])
+        mirror = facts["effects"]["capabilities"]["mirror"]
+        self.assertEqual(mirror["vulkan"], "unavailable")
+        self.assertIn("open_vulkan_runtime_diagnostics_unavailable",
+                      mirror["blocker_reason_codes"]["vulkan"])
 
     def test_unsupported_override_is_advanced_only_and_rewires_removed_privilege(self):
         facts = base_facts(); facts["os"]["supported"] = False
