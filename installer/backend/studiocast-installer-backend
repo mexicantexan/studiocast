@@ -55,6 +55,7 @@ DEFAULT_MODEL_PACKS = (
     "dlib_68_ibug_300w", "gaze_correction_cam_flx_v0_1_1",
     "fastdvdnet_sigma15",
 )
+DEFAULT_MODEL_ARTIFACT_COUNT = 8
 ALLOWED_OPERATION_KINDS = {
     "preflight", "settings_snapshot", "release_acquire", "source_extract", "build_cache_prepare",
     "build_configure", "build_compile", "payload_stage", "payload_validate",
@@ -184,6 +185,89 @@ def load_model_catalog() -> tuple[Any, dict[str, Any], Path, str]:
         code = getattr(exc, "reason_code", "model.catalog_unavailable")
         raise BackendError(code, str(exc)) from exc
     return module, catalog, root, file_sha256(path)
+
+
+def catalog_size_summary(catalog: dict[str, Any], catalog_sha256: str) -> dict[str, Any]:
+    """Return the bounded catalog evidence carried by analysis facts."""
+    catalog_packs = {pack["id"]: pack for pack in catalog["packs"]}
+    if any(pack_id not in catalog_packs for pack_id in DEFAULT_MODEL_PACKS):
+        raise BackendError("model.catalog_missing_default",
+                           "The packaged catalog omits a default model pack")
+    packs: list[dict[str, Any]] = []
+    for pack_id in DEFAULT_MODEL_PACKS:
+        artifacts = catalog_packs[pack_id]["artifacts"]
+        known = all(type(item.get("size_bytes")) is int and item["size_bytes"] > 0 and
+                    item.get("size_status") == "known" for item in artifacts)
+        packs.append({
+            "id": pack_id,
+            "artifact_count": len(artifacts),
+            "download_bytes": (sum(item["size_bytes"] for item in artifacts) if known else None),
+            "size_status": "known" if known else "unknown",
+        })
+    all_known = all(pack["size_status"] == "known" for pack in packs)
+    return {
+        "schema_version": 1,
+        "catalog_version": catalog["catalog_version"],
+        "catalog_sha256": catalog_sha256,
+        "trusted": catalog["size_metadata"]["trusted"],
+        "reason_code": catalog["size_metadata"]["reason_code"],
+        "pack_count": len(packs),
+        "artifact_count": sum(pack["artifact_count"] for pack in packs),
+        "download_bytes": (sum(pack["download_bytes"] for pack in packs) if all_known else None),
+        "packs": packs,
+    }
+
+
+def validated_catalog_size_summary(facts: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate only declared facts; never consult the packaged catalog."""
+    models = facts.get("models")
+    if not isinstance(models, dict) or models.get("default_pack_ids") != list(DEFAULT_MODEL_PACKS):
+        return None
+    summary = models.get("catalog_size_summary")
+    required = {"schema_version", "catalog_version", "catalog_sha256", "trusted",
+                "reason_code", "pack_count", "artifact_count", "download_bytes", "packs"}
+    if not isinstance(summary, dict) or set(summary) != required:
+        return None
+    if (type(summary["schema_version"]) is not int or summary["schema_version"] != 1 or
+            not isinstance(summary["catalog_version"], str) or not summary["catalog_version"] or
+            not isinstance(summary["catalog_sha256"], str) or
+            re.fullmatch(r"sha256:[0-9a-f]{64}", summary["catalog_sha256"]) is None or
+            summary["trusted"] is not True or
+            not isinstance(summary["reason_code"], str) or not summary["reason_code"].strip() or
+            type(summary["pack_count"]) is not int or
+            summary["pack_count"] != len(DEFAULT_MODEL_PACKS) or
+            type(summary["artifact_count"]) is not int or
+            summary["artifact_count"] != DEFAULT_MODEL_ARTIFACT_COUNT or
+            type(summary["download_bytes"]) is not int or summary["download_bytes"] <= 0):
+        return None
+    packs = summary["packs"]
+    if not isinstance(packs, list) or len(packs) != summary["pack_count"]:
+        return None
+    expected_pack_fields = {"id", "artifact_count", "download_bytes", "size_status"}
+    for expected_id, pack in zip(DEFAULT_MODEL_PACKS, packs):
+        if (not isinstance(pack, dict) or set(pack) != expected_pack_fields or
+                pack.get("id") != expected_id or
+                type(pack.get("artifact_count")) is not int or pack["artifact_count"] <= 0 or
+                type(pack.get("download_bytes")) is not int or pack["download_bytes"] <= 0 or
+                pack.get("size_status") != "known"):
+            return None
+    if (sum(pack["artifact_count"] for pack in packs) != summary["artifact_count"] or
+            sum(pack["download_bytes"] for pack in packs) != summary["download_bytes"]):
+        return None
+    return summary
+
+
+def model_download_bytes_from_facts(facts: dict[str, Any], selected_pack_ids: Any) -> int | None:
+    summary = validated_catalog_size_summary(facts)
+    if summary is None or not isinstance(selected_pack_ids, list):
+        return None
+    if (any(not isinstance(pack_id, str) for pack_id in selected_pack_ids) or
+            len(selected_pack_ids) != len(set(selected_pack_ids))):
+        return None
+    pack_sizes = {pack["id"]: pack["download_bytes"] for pack in summary["packs"]}
+    if any(pack_id not in pack_sizes for pack_id in selected_pack_ids):
+        return None
+    return sum(pack_sizes[pack_id] for pack_id in selected_pack_ids)
 
 
 def verify_release_evidence(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -1292,7 +1376,7 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
     effects = effect_capabilities(diagnostics, maxine)
     owned_v4l = validated_v4l_ownership(manifest)
     model_packs: dict[str, Any] = {}
-    _, catalog, _, _ = load_model_catalog()
+    _, catalog, _, catalog_hash = load_model_catalog()
     for pack in catalog["packs"]:
         pack_id = pack["id"]
         root = r["data"] / "models" / pack["family"] / pack["pack_path"]
@@ -1341,7 +1425,8 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
         "gpus": {"devices": gpu_devices, "nvidia": nvidia, "vulkan": vulkan},
         "maxine": maxine,
         "effects": {"capabilities": effects},
-        "models": {"packs": model_packs, "default_pack_ids": list(DEFAULT_MODEL_PACKS)},
+        "models": {"packs": model_packs, "default_pack_ids": list(DEFAULT_MODEL_PACKS),
+                   "catalog_size_summary": catalog_size_summary(catalog, catalog_hash)},
         "cache": {"release_artifacts": {}, "model_artifacts": {
             pack["id"]: {"verified": all(
                 (r["cache"] / "models/sha256" / artifact["sha256"]).is_file() and
@@ -1652,24 +1737,10 @@ def recommend(facts: dict[str, Any], intent: str, prior: dict[str, Any] | None,
         blockers.append({"code": "os.unsupported.automatic_changes_blocked", "applies_to": "installation"})
     free = facts.get("paths", {}).get("free_bytes", 0)
     base_required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
-    model_download_bytes = 0
-    try:
-        _, model_catalog, _, _ = load_model_catalog()
-        catalog_packs = {pack["id"]: pack for pack in model_catalog["packs"]}
-        selected_packs = [catalog_packs[pack_id] for pack_id in selections["model_pack_ids"]]
-        sizes_trusted = (model_catalog["size_metadata"]["trusted"] and
-                         bool(model_catalog["size_metadata"]["reason_code"]) and
-                         all(type(artifact["size_bytes"]) is int and artifact["size_bytes"] > 0 and
-                             artifact["size_status"] == "known"
-                             for pack in selected_packs for artifact in pack["artifacts"]))
-        if sizes_trusted:
-            model_download_bytes = sum(artifact["size_bytes"] for pack in selected_packs
-                                       for artifact in pack["artifacts"])
-        elif route == "recommended" and selections["model_pack_ids"]:
-            blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
-    except (KeyError, BackendError):
-        if route == "recommended" and selections["model_pack_ids"]:
-            blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
+    declared_model_bytes = model_download_bytes_from_facts(facts, selections["model_pack_ids"])
+    model_download_bytes = declared_model_bytes if declared_model_bytes is not None else 0
+    if declared_model_bytes is None and route == "recommended" and selections["model_pack_ids"]:
+        blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
     required = base_required + model_download_bytes
     if free < required:
         blockers.append({"code": "disk.staging.insufficient", "applies_to": "paths"})
@@ -2025,15 +2096,19 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     if type(desired.get("virtual_camera", {}).get("desired")) is bool:
         blockers = [item for item in blockers
                     if item.get("code") != "configuration.virtual_camera.selection_required"]
-    if (intent != "uninstall" and rec.get("selection_route", rec["route"]) == "recommended" and
-            desired.get("model_pack_ids") and
-            (not model_catalog.get("size_metadata", {}).get("trusted", False) or
-             not model_catalog.get("size_metadata", {}).get("reason_code") or
-             any(type(artifact.get("size_bytes")) is not int or artifact["size_bytes"] <= 0 or
-                 artifact.get("size_status") != "known"
-                 for pack_id in desired["model_pack_ids"]
-                 for artifact in model_packs[pack_id]["artifacts"]))):
-        blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
+    if intent != "uninstall" and rec.get("selection_route", rec["route"]) == "recommended" and desired.get("model_pack_ids"):
+        declared_summary = validated_catalog_size_summary(facts)
+        packaged_summary = catalog_size_summary(model_catalog, model_catalog_sha256)
+        local_sizes_trusted = (
+            model_catalog.get("size_metadata", {}).get("trusted", False) is True and
+            bool(model_catalog.get("size_metadata", {}).get("reason_code")) and
+            all(type(artifact.get("size_bytes")) is int and artifact["size_bytes"] > 0 and
+                artifact.get("size_status") == "known"
+                for pack_id in desired["model_pack_ids"]
+                for artifact in model_packs[pack_id]["artifacts"]))
+        if (not local_sizes_trusted or declared_summary != packaged_summary) and not any(
+                item.get("code") == "artifact_sizes_untrusted" for item in blockers):
+            blockers.append({"code": "artifact_sizes_untrusted", "applies_to": "models"})
     missing_build = facts.get("toolchain", {}).get("missing_build_dependencies", [])
     if missing_build and not desired.get("manage_dependencies"):
         blockers.append({"code": "toolchain.build_dependencies_missing", "applies_to": "system_changes",
