@@ -481,6 +481,7 @@ void VirtualCameraService::ThreadMain() {
 
   bool haveAppliedCfg = false;
   CameraPipelineConfig appliedPipelineCfg{};
+  std::optional<effects::BroadcastCameraEffects> appliedEffectsForPipeline;
 
   while (!stop_.load()) {
     VirtualCameraServiceConfig cfg;
@@ -973,13 +974,26 @@ void VirtualCameraService::ThreadMain() {
       }
     }
 
-    // Apply effects live regardless of consumer state.
-    pipeline_->SetEffects(effects_for_pipeline);
-
     auto pipelineCfgForPipeline = cfg.pipeline;
     pipelineCfgForPipeline.effects = effects_for_pipeline;
 
     auto pst = pipeline_->Status();
+    const bool pipelineRestartPending =
+        pst.running && haveAppliedCfg &&
+        NeedsPipelineRestart(appliedPipelineCfg, pipelineCfgForPipeline);
+
+    // Start() consumes the effective effect configuration directly. While the
+    // pipeline is active, deliver only genuine live changes; stable supervisor
+    // polls must not create generation boundaries or repeat setup work. If a
+    // restart is already required, let the next Start() apply both changes in
+    // one generation instead of updating a pipeline that is about to stop.
+    if (!blocked && !pipelineRestartPending && (pst.running || pst.starting) &&
+        (!appliedEffectsForPipeline.has_value() ||
+         *appliedEffectsForPipeline != effects_for_pipeline)) {
+      pipeline_->SetEffects(effects_for_pipeline);
+      appliedEffectsForPipeline = effects_for_pipeline;
+    }
+
     if (blocked) {
       {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1003,8 +1017,7 @@ void VirtualCameraService::ThreadMain() {
     }
 
     // Restart if config changed and we are running.
-    if (pst.running && haveAppliedCfg &&
-        NeedsPipelineRestart(appliedPipelineCfg, pipelineCfgForPipeline)) {
+    if (!blocked && pipelineRestartPending) {
       if (dbg)
         VcamDbg("pipeline Stop: config restart " +
                 DiffPipelineCfg(appliedPipelineCfg, pipelineCfgForPipeline));
@@ -1088,6 +1101,7 @@ void VirtualCameraService::ThreadMain() {
             outputAvailableForState = true;
             haveAppliedCfg = true;
             appliedPipelineCfg = pipelineCfgForPipeline;
+            appliedEffectsForPipeline = effects_for_pipeline;
             nextStartRetry = std::chrono::steady_clock::time_point{};
             pipelineBecameRunningAt = now;
             if (cfg.always_on) {

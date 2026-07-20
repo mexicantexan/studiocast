@@ -1382,6 +1382,7 @@ if (BUILD_TESTING)
 
     add_executable(studiocast-video-tests
             tests/video_service_tests.cpp
+            tests/camera_effects_update_tests.cpp
             tests/latest_frame_wins_worker_tests.cpp
             tests/open_video_denoise_contract_tests.cpp
             tests/frame_artifact_cache_tests.cpp

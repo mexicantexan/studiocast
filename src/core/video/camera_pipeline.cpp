@@ -243,6 +243,15 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   return true;
 }
 
+bool EffectsPlanRequiresRebuild(
+    const effects::BroadcastCameraEffects &applied_effects,
+    std::uint64_t applied_generation,
+    const effects::BroadcastCameraEffects &current_effects,
+    std::uint64_t current_generation) {
+  return applied_effects != current_effects ||
+         applied_generation != current_generation;
+}
+
 void LiveEffectBackendAttribution::BeginFrame() { pending_.fill(0); }
 
 void LiveEffectBackendAttribution::MarkEffectSucceeded(
@@ -482,6 +491,16 @@ PrepareReplaceBackgroundSourceForEffects(
   (void)detail::PrepareReplaceBackgroundSourceForConfig(
       fx.virtual_background.replace_path, &prepared, &error);
   return prepared;
+}
+
+bool CanReusePreparedReplaceBackgroundSource(
+    const studiocast::video::effects::BroadcastCameraEffects &current,
+    const studiocast::video::effects::BroadcastCameraEffects &next) {
+  using studiocast::video::effects::VirtualBackgroundMode;
+  return current.virtual_background.mode == VirtualBackgroundMode::replace &&
+         next.virtual_background.mode == VirtualBackgroundMode::replace &&
+         current.virtual_background.replace_path ==
+             next.virtual_background.replace_path;
 }
 
 std::string ChooseDefaultOutputLoopback(std::string *error) {
@@ -860,18 +879,77 @@ OptionalEffectBreaker::ToStatus(std::uint64_t frame_index) const {
 CameraPipeline::~CameraPipeline() { Stop(); }
 
 void CameraPipeline::SetMirrorEnabled(bool enabled) {
+  std::lock_guard<std::mutex> update_lock(effects_update_mu_);
   std::lock_guard<std::mutex> lock(effects_mu_);
+  if (effects_.mirror == enabled)
+    return;
   effects_.mirror = enabled;
   ++effects_generation_;
 }
 
 void CameraPipeline::SetEffects(
     const studiocast::video::effects::BroadcastCameraEffects &effects) {
-  const auto replace_source = PrepareReplaceBackgroundSourceForEffects(effects);
+  std::lock_guard<std::mutex> update_lock(effects_update_mu_);
+
+  detail::PreparedReplaceBackgroundSource replace_source;
+  bool prepare_replace_source = false;
+  {
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    ++effects_set_requests_;
+    if (effects_ == effects) {
+      ++effects_ignored_updates_;
+      return;
+    }
+
+    if (CanReusePreparedReplaceBackgroundSource(effects_, effects)) {
+      replace_source = replace_background_source_;
+    } else {
+      prepare_replace_source =
+          effects.virtual_background.mode ==
+          studiocast::video::effects::VirtualBackgroundMode::replace;
+    }
+  }
+
+  // Genuine configuration preparation may touch the filesystem. Keep it
+  // outside effects_mu_ so the frame thread can continue using the currently
+  // published generation while the replacement source is prepared.
+  if (prepare_replace_source) {
+    replace_source = PrepareReplaceBackgroundSourceForEffects(effects);
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    ++replacement_background_preparations_;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    effects_ = effects;
+    replace_background_source_ = std::move(replace_source);
+    ++effects_generation_;
+    ++effects_applied_updates_;
+  }
+}
+
+void CameraPipeline::RefreshEffectsResources() {
+  std::lock_guard<std::mutex> update_lock(effects_update_mu_);
+
+  studiocast::video::effects::BroadcastCameraEffects effects;
+  {
+    std::lock_guard<std::mutex> lock(effects_mu_);
+    effects = effects_;
+  }
+
+  const bool prepare_replace_source =
+      effects.virtual_background.mode ==
+      studiocast::video::effects::VirtualBackgroundMode::replace;
+  auto replace_source = prepare_replace_source
+                            ? PrepareReplaceBackgroundSourceForEffects(effects)
+                            : detail::PreparedReplaceBackgroundSource{};
+
   std::lock_guard<std::mutex> lock(effects_mu_);
-  effects_ = effects;
-  replace_background_source_ = replace_source;
+  if (prepare_replace_source)
+    ++replacement_background_preparations_;
+  replace_background_source_ = std::move(replace_source);
   ++effects_generation_;
+  ++effects_resource_refreshes_;
 }
 
 CameraPipelineStatus CameraPipeline::Status() const {
@@ -966,8 +1044,12 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
     return false;
   }
 
+  std::unique_lock<std::mutex> effects_update_lock(effects_update_mu_);
   const auto replace_source =
       PrepareReplaceBackgroundSourceForEffects(cfg.effects);
+  const bool prepared_replace_source =
+      cfg.effects.virtual_background.mode ==
+      studiocast::video::effects::VirtualBackgroundMode::replace;
 
   std::unique_lock<std::mutex> lock(mu_);
   if (running_ || starting_) {
@@ -986,6 +1068,8 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
 
   {
     std::lock_guard<std::mutex> fxLock(effects_mu_);
+    if (prepared_replace_source)
+      ++replacement_background_preparations_;
     effects_ = cfg.effects;
     replace_background_source_ = replace_source;
     ++effects_generation_;
@@ -10305,7 +10389,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         replace_source = replace_background_source_;
         effects_generation = effects_generation_;
       }
-      if (fx != appliedFx || effects_generation != appliedEffectsGeneration) {
+      if (EffectsPlanRequiresRebuild(appliedFx, appliedEffectsGeneration, fx,
+                                     effects_generation)) {
         rebuildChain(fx, replace_source, effects_generation);
       }
 

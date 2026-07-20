@@ -17,6 +17,8 @@
 #include "core/video/virtual_camera_service.h"
 
 namespace studiocast::tests {
+bool TestCameraPipelineIdenticalEffectsPreserveRuntimeGeneration();
+bool TestCameraPipelineExplicitEffectsRefreshIsSeparateInvalidation();
 bool TestLatestFrameWinsOverwritesPendingWithBlockedProcessor();
 bool TestLatestFrameWinsStopWakesAndJoins();
 bool TestLatestFrameWinsGenerationRejectsStaleResults();
@@ -131,6 +133,7 @@ public:
     status_.output.fps_den = cfg.fps;
     status_.output.format = cfg.output_format;
     status_.last_error.clear();
+    applied_effects_ = cfg.effects;
     return true;
   }
 
@@ -175,9 +178,11 @@ public:
     return status_;
   }
 
-  void SetEffects(
-      const studiocast::video::effects::BroadcastCameraEffects &) override {
+  void SetEffects(const studiocast::video::effects::BroadcastCameraEffects
+                      &effects) override {
     set_effects_calls.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mu_);
+    applied_effects_ = effects;
   }
 
   void SetMirrorEnabled(bool) override {}
@@ -194,6 +199,11 @@ public:
     status_.effects_backends = std::move(effects_backends);
   }
 
+  studiocast::video::effects::BroadcastCameraEffects AppliedEffects() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return applied_effects_;
+  }
+
   std::atomic<int> start_calls{0};
   std::atomic<int> stop_calls{0};
   std::atomic<int> ensure_output_calls{0};
@@ -205,6 +215,7 @@ public:
 private:
   mutable std::mutex mu_;
   CameraPipelineStatus status_{};
+  studiocast::video::effects::BroadcastCameraEffects applied_effects_{};
 };
 
 struct ServiceHarness {
@@ -212,6 +223,7 @@ struct ServiceHarness {
   std::atomic<bool> consumer_present{false};
   std::atomic<bool> device_exists{true};
   std::atomic<bool> detection_error{false};
+  std::atomic<int> consumer_probe_calls{0};
 
   VirtualCameraServiceHooks Hooks(std::chrono::milliseconds sleep = 1ms) {
     VirtualCameraServiceHooks hooks;
@@ -244,6 +256,7 @@ struct ServiceHarness {
       return true;
     };
     hooks.detect_consumers = [&](const std::string &, int) {
+      consumer_probe_calls.fetch_add(1, std::memory_order_relaxed);
       VideoConsumerSnapshot out;
       if (detection_error.load(std::memory_order_relaxed)) {
         out.error = "synthetic consumer scan failure";
@@ -399,6 +412,81 @@ bool TestVideoServiceSanitizesEffectBackendsAcrossLifecycle() {
   }
   if (!service.Status().pipeline.effects_backends.empty()) {
     std::cerr << "stopped service leaked stale attribution\n";
+    return false;
+  }
+  return true;
+}
+
+bool TestVideoServiceDeliversOnlyGenuineLiveEffectChanges() {
+  ServiceHarness h;
+  h.consumer_present.store(true, std::memory_order_relaxed);
+  VirtualCameraService service(h.Hooks());
+  auto cfg = TestConfig();
+
+  std::string err;
+  if (!service.Start(cfg, &err)) {
+    std::cerr << "service.Start failed: " << err << "\n";
+    return false;
+  }
+  if (!WaitUntil([&] { return service.Status().pipeline_state == "running"; },
+                 500ms)) {
+    std::cerr << "pipeline did not reach running for stable effects test\n";
+    service.Stop();
+    return false;
+  }
+
+  const int stable_probe_baseline =
+      h.consumer_probe_calls.load(std::memory_order_relaxed);
+  if (!WaitUntil(
+          [&] {
+            return h.consumer_probe_calls.load(std::memory_order_relaxed) >=
+                   stable_probe_baseline + 4;
+          },
+          500ms)) {
+    std::cerr << "supervisor did not complete stable polls\n";
+    service.Stop();
+    return false;
+  }
+  if (h.pipeline->set_effects_calls.load(std::memory_order_relaxed) != 0) {
+    std::cerr << "stable polls redundantly delivered effects after Start\n";
+    service.Stop();
+    return false;
+  }
+
+  cfg.pipeline.effects.mirror = true;
+  service.UpdateConfig(cfg);
+  if (!WaitUntil(
+          [&] {
+            return h.pipeline->set_effects_calls.load(
+                       std::memory_order_relaxed) == 1 &&
+                   h.pipeline->AppliedEffects().mirror;
+          },
+          500ms)) {
+    std::cerr << "genuine live effect change was not delivered exactly once\n";
+    service.Stop();
+    return false;
+  }
+
+  const int changed_probe_baseline =
+      h.consumer_probe_calls.load(std::memory_order_relaxed);
+  service.UpdateConfig(cfg);
+  const bool completed_stable_polls = WaitUntil(
+      [&] {
+        return h.consumer_probe_calls.load(std::memory_order_relaxed) >=
+               changed_probe_baseline + 4;
+      },
+      500ms);
+  const int final_set_effects_calls =
+      h.pipeline->set_effects_calls.load(std::memory_order_relaxed);
+  service.Stop();
+
+  if (!completed_stable_polls) {
+    std::cerr << "supervisor did not complete post-change stable polls\n";
+    return false;
+  }
+  if (final_set_effects_calls != 1) {
+    std::cerr << "identical post-change polls redelivered effects: calls="
+              << final_set_effects_calls << "\n";
     return false;
   }
   return true;
@@ -1724,6 +1812,14 @@ int main() {
        &TestLiveEffectBackendAttributionRequiresSuccessfulFrameCommit},
       {"video service sanitizes effect attribution across lifecycle",
        &TestVideoServiceSanitizesEffectBackendsAcrossLifecycle},
+      {"video service delivers only genuine live effect changes",
+       &TestVideoServiceDeliversOnlyGenuineLiveEffectChanges},
+      {"identical pipeline effects preserve runtime generation",
+       &studiocast::tests::
+           TestCameraPipelineIdenticalEffectsPreserveRuntimeGeneration},
+      {"explicit effects resource refresh is a separate invalidation",
+       &studiocast::tests::
+           TestCameraPipelineExplicitEffectsRefreshIsSeparateInvalidation},
       {"video pipeline does not start without consumer",
        &TestVideoPipelineDoesNotStartWithoutConsumer},
       {"video pipeline starts when consumer appears",
