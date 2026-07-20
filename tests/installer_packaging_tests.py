@@ -209,8 +209,17 @@ class PackagingIntegrationTests(unittest.TestCase):
             "open_audio": True, "open_cuda": True, "open_vulkan": False})
         self.assertNotIn("source.signed_verification_receipt_required",
                          {item["code"] for item in plan["blockers"]})
-        self.assertEqual(len([item for item in plan["downloads"]
-                              if not item["required_for_core"]]), 8)
+        model_downloads = [item for item in plan["downloads"]
+                           if not item["required_for_core"]]
+        self.assertEqual(len(model_downloads), 8)
+        self.assertEqual([item["size"] for item in model_downloads],
+                         [832775, 2033628, 25888640, 232589, 99693937,
+                          1062936, 1062994, 416788])
+        self.assertNotIn("artifact_sizes_untrusted",
+                         {item["code"] for item in plan["blockers"]})
+        expected_downloads = receipt["archive_size"] + 131224287
+        self.assertEqual(plan["disk"]["download_bytes"], expected_downloads)
+        self.assertEqual(plan["disk"]["required_bytes"], expected_downloads + 3)
 
     def test_arbitrary_archive_routes_advanced_without_becoming_official(self) -> None:
         plan = json.loads(self.backend("plan", "install", "--json", "--facts", str(self.facts_path),

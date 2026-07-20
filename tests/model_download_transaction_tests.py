@@ -173,8 +173,27 @@ class CatalogContractTests(TempTest):
         self.assertEqual(sum(len(pack["artifacts"]) for pack in catalog["packs"]), 8)
         gaze = next(pack for pack in catalog["packs"] if pack["id"] == "gaze_correction_cam_flx_v0_1_1")
         self.assertEqual({item["name"] for item in gaze["artifacts"]}, {"gaze_flx_left.onnx", "gaze_flx_right.onnx"})
-        self.assertFalse(catalog["size_metadata"]["trusted"])
-        self.assertTrue(all(item["size_bytes"] is None for pack in catalog["packs"] for item in pack["artifacts"]))
+        expected = {
+            ("fastenhancer_s_vd_v1", "model.onnx"): (832775, "e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8"),
+            ("fastenhancer_m_vd_v1", "model.onnx"): (2033628, "367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa"),
+            ("modnet-webnn-256-fp32", "model.onnx"): (25888640, "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9"),
+            ("yunet_opencv_zoo_2023mar_fp32", "model.onnx"): (232589, "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"),
+            ("dlib_68_ibug_300w", "shape_predictor_68_face_landmarks.dat"): (99693937, "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f"),
+            ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_left.onnx"): (1062936, "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00"),
+            ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_right.onnx"): (1062994, "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"),
+            ("fastdvdnet_sigma15", "model.onnx"): (416788, "500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc"),
+        }
+        actual = {(pack["id"], item["name"]): (item["size_bytes"], item["sha256"])
+                  for pack in catalog["packs"] for item in pack["artifacts"]}
+        self.assertEqual(actual, expected)
+        self.assertEqual(sum(size for size, _ in actual.values()), 131224287)
+        self.assertEqual(catalog["catalog_version"], "2026-07-19")
+        self.assertEqual(catalog["size_metadata"], {
+            "trusted": True,
+            "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
+        })
+        self.assertTrue(all(item["size_status"] == "known" for pack in catalog["packs"]
+                            for item in pack["artifacts"]))
         self.assertNotIn("maxine", json.dumps(catalog).lower())
 
     def test_catalog_metadata_and_license_hashes_match_trusted_sources(self):
@@ -189,41 +208,64 @@ class CatalogContractTests(TempTest):
             self.assertTrue(pack["license"]["spdx"])
             self.assertTrue(pack["provenance"]["url"])
 
-    def test_recommended_unknown_sizes_block_before_filesystem_mutation(self):
-        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+    def test_recommended_untrusted_known_sizes_block_before_filesystem_mutation(self):
+        fixture = Fixture(self.root)
+        raw = json.loads(fixture.catalog_path.read_text())
+        raw["size_metadata"] = {"trusted": False, "reason_code": "fixture_untrusted"}
+        fixture.catalog_path.write_text(json.dumps(raw))
+        catalog = model_tx.load_catalog(fixture.catalog_path)
         destination = self.root / "never-created-destination"
         cache = self.root / "never-created-cache"
         installer = model_tx.ModelTransactionInstaller(
-            catalog, REPO_ROOT, destination, cache, None, offline=False
+            catalog, fixture.repo, destination, cache, None, offline=False
         )
         result = installer.install("open_audio", recommended=True)
         self.assertEqual((result["state"], result["reason_code"]), ("blocked", "artifact_sizes_untrusted"))
-        self.assertEqual(len(result["blockers"]), 2)
+        self.assertEqual(result["blockers"], [])
         self.assertFalse(destination.exists())
         self.assertFalse(cache.exists())
 
-    def test_unsafe_duplicate_unknown_and_untrusted_known_size_catalogs_rejected(self):
-        fixture = Fixture(self.root)
+    def test_size_validation_matrix_and_closed_schema_fail_closed(self):
+        fixture = Fixture(self.root, pack_count=2)
         base = json.loads(fixture.catalog_path.read_text())
-        cases = []
+        cases = {}
+        missing = json.loads(json.dumps(base))
+        del missing["packs"][0]["artifacts"][0]["size_bytes"]
+        cases["missing"] = missing
+        for label, invalid in (("null", None), ("zero", 0), ("negative", -1),
+                               ("bool", True), ("float", 1.5), ("string", "123")):
+            value = json.loads(json.dumps(base))
+            value["packs"][0]["artifacts"][0]["size_bytes"] = invalid
+            if invalid is None:
+                value["packs"][0]["artifacts"][0]["size_status"] = "unknown"
+            cases[label] = value
+        status = json.loads(json.dumps(base))
+        status["packs"][0]["artifacts"][0]["size_status"] = "unknown"
+        cases["status_mismatch"] = status
+        partial = json.loads(json.dumps(base))
+        partial["packs"][0]["artifacts"][0].update(size_bytes=None, size_status="unknown")
+        cases["partial_trusted"] = partial
+        empty_reason = json.loads(json.dumps(base))
+        empty_reason["size_metadata"]["reason_code"] = ""
+        cases["empty_reason"] = empty_reason
         traversal = json.loads(json.dumps(base))
         traversal["packs"][0]["pack_path"] = "../outside"
-        cases.append(traversal)
+        cases["traversal"] = traversal
         unknown = json.loads(json.dumps(base))
         unknown["packs"][0]["command"] = "touch sentinel"
-        cases.append(unknown)
+        cases["unknown_field"] = unknown
         duplicate = json.loads(json.dumps(base))
         duplicate["packs"].append(json.loads(json.dumps(duplicate["packs"][0])))
-        cases.append(duplicate)
-        inconsistent_size = json.loads(json.dumps(base))
-        inconsistent_size["packs"][0]["artifacts"][0]["size_bytes"] = None
-        inconsistent_size["packs"][0]["artifacts"][0]["size_status"] = "unknown"
-        cases.append(inconsistent_size)
-        for index, value in enumerate(cases):
-            path = self.root / f"bad-{index}.json"
+        cases["duplicate"] = duplicate
+        for label, value in cases.items():
+            path = self.root / f"bad-{label}.json"
             path.write_text(json.dumps(value))
-            with self.subTest(index=index), self.assertRaises(model_tx.CatalogError):
+            with self.subTest(label=label), self.assertRaises(model_tx.CatalogError):
                 model_tx.load_catalog(path)
+        truncated = self.root / "bad-truncated.json"
+        truncated.write_text('{"schema_version":1')
+        with self.assertRaises(model_tx.CatalogError):
+            model_tx.load_catalog(truncated)
 
 
 class InstallTransactionTests(TempTest):

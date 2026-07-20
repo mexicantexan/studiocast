@@ -1301,6 +1301,13 @@ if (BUILD_TESTING)
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_backend_core_tests.py")
         set_tests_properties(studiocast-installer-backend-core-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME studiocast-model-download-transaction-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_download_transaction_tests.py")
+        set_tests_properties(studiocast-model-download-transaction-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME studiocast-installer-packaging-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"

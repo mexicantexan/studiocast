@@ -124,7 +124,9 @@ def _validate_catalog(value: Any) -> dict[str, Any]:
     if not isinstance(size_metadata, dict):
         raise CatalogError("invalid_catalog", "size_metadata must be an object.")
     _exact_fields(size_metadata, {"trusted", "reason_code"}, set(), "size_metadata")
-    if not isinstance(size_metadata["trusted"], bool) or not isinstance(size_metadata["reason_code"], str):
+    if (not isinstance(size_metadata["trusted"], bool) or
+            not isinstance(size_metadata["reason_code"], str) or
+            not size_metadata["reason_code"]):
         raise CatalogError("invalid_catalog", "Invalid size metadata contract.")
     packs = value["packs"]
     if not isinstance(packs, list) or not packs or len(packs) > MAX_PACKS:
@@ -191,8 +193,8 @@ def _validate_catalog(value: Any) -> dict[str, Any]:
             artifact_names.add(name)
             _sha(artifact["sha256"], "artifact")
             size = artifact["size_bytes"]
-            if size is not None and (type(size) is not int or size < 0):
-                raise CatalogError("invalid_catalog", "Artifact size must be a non-negative integer or null.")
+            if size is not None and (type(size) is not int or size <= 0):
+                raise CatalogError("invalid_catalog", "Artifact size must be a positive integer or null.")
             expected_status = "known" if size is not None else "unknown"
             if artifact["size_status"] != expected_status:
                 raise CatalogError("invalid_catalog", "Artifact size status does not match size_bytes.")

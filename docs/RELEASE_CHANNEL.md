@@ -139,7 +139,18 @@ module, catalog, and referenced `model.json`/`LICENSE.txt` resources. These
 files form a trusted metadata and transaction surface independent of a
 user-selected source tree. No ONNX, dlib, TensorRT, or other model binary is
 redistributed in the AppDir. The verifier asserts the exact seven default packs
-represent eight artifacts and rejects staged model binaries.
+represent eight artifacts, requires their catalog sizes to be trusted, known,
+and strictly positive, and rejects staged model binaries.
+
+Manifest v1 does not enumerate model artifacts. The model sizes and pinned
+hashes are authenticated transitively because the catalog is inside the
+Installer AppImage and clean-HEAD source archive whose exact bytes are
+hash-pinned and signed by the manifest. Recommended planning therefore trusts
+the complete packaged catalog only after strict validation and binds its hash,
+version, selected packs, exact download sizes, and disk totals into the reviewed
+plan. Apply revalidates that packaged surface before mutation. This does not
+remove the production prerequisite for the offline/HSM-backed signing key,
+matching packaged public key, and signed release workflow described above.
 
 ## Installer self-update
 

@@ -300,16 +300,36 @@ QString planTextFromObject(const QJsonObject &plan) {
     const QJsonArray packs =
         desired.value(QStringLiteral("model_pack_ids")).toArray();
     text += QStringLiteral("\nModels/downloads (%1 pack IDs):\n").arg(packs.size());
-    int artifactCount = 0;
     for (const QJsonValue &pack : packs) {
       text += QStringLiteral("  - %1\n").arg(pack.toString());
-      artifactCount += pack.toString() ==
-                               QStringLiteral("gaze_correction_cam_flx_v0_1_1")
-                           ? 2
-                           : 1;
     }
-    text += QStringLiteral("  %1 verified artifact files expected\n")
-                .arg(artifactCount);
+    int artifactCount = 0;
+    qint64 modelBytes = 0;
+    qint64 allDownloadBytes = 0;
+    for (const QJsonValue &value : plan.value(QStringLiteral("downloads")).toArray()) {
+      const QJsonObject download = value.toObject();
+      const qint64 bytes = static_cast<qint64>(
+          download.value(QStringLiteral("size")).toDouble(-1));
+      if (bytes > 0)
+        allDownloadBytes += bytes;
+      if (!download.contains(QStringLiteral("pack_id")))
+        continue;
+      ++artifactCount;
+      if (bytes > 0)
+        modelBytes += bytes;
+      text += QStringLiteral("  - %1: %2 bytes\n")
+                  .arg(jsonString(download, QStringLiteral("artifact_id"),
+                                  QStringLiteral("unknown")))
+                  .arg(bytes);
+    }
+    text += QStringLiteral("  %1 verified artifact files, %2 model bytes\n")
+                .arg(artifactCount)
+                .arg(modelBytes);
+    const QJsonObject disk = plan.value(QStringLiteral("disk")).toObject();
+    text += QStringLiteral("  Reviewed downloads: %1 bytes; disk required/free: %2/%3 bytes\n")
+                .arg(allDownloadBytes)
+                .arg(static_cast<qint64>(disk.value(QStringLiteral("required_bytes")).toDouble()))
+                .arg(static_cast<qint64>(disk.value(QStringLiteral("free_bytes")).toDouble()));
   }
 
   QMap<QString, QStringList> operationsByCategory;

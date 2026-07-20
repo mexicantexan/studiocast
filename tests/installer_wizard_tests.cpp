@@ -137,6 +137,26 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
   QJsonArray packs;
   for (const QString &pack : DefaultPacks())
     packs.append(pack);
+  const QList<qint64> sizes = {832775, 2033628, 25888640, 232589,
+                               99693937, 1062936, 1062994, 416788};
+  const QStringList artifacts = {
+      QStringLiteral("fastenhancer_s_vd_v1:model.onnx"),
+      QStringLiteral("fastenhancer_m_vd_v1:model.onnx"),
+      QStringLiteral("modnet-webnn-256-fp32:model.onnx"),
+      QStringLiteral("yunet_opencv_zoo_2023mar_fp32:model.onnx"),
+      QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_face_landmarks.dat"),
+      QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_left.onnx"),
+      QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_right.onnx"),
+      QStringLiteral("fastdvdnet_sigma15:model.onnx")};
+  QJsonArray downloads;
+  for (qsizetype index = 0; index < artifacts.size(); ++index) {
+    const QString artifactId = artifacts.at(index);
+    downloads.append(QJsonObject{
+        {QStringLiteral("artifact_id"), artifactId},
+        {QStringLiteral("pack_id"), artifactId.section(QLatin1Char(':'), 0, 0)},
+        {QStringLiteral("size"), sizes.at(index)}});
+  }
+  const qint64 modelBytes = 131224287;
   return {{QStringLiteral("schema_version"), 1},
           {QStringLiteral("plan_version"), QStringLiteral("installer-plan/v1")},
           {QStringLiteral("policy_version"),
@@ -152,6 +172,12 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
                         QJsonObject{{QStringLiteral("desired"), true},
                                     {QStringLiteral("required_for_success"), true}}},
                        {QStringLiteral("model_pack_ids"), packs}}},
+          {QStringLiteral("downloads"), downloads},
+          {QStringLiteral("disk"),
+           QJsonObject{{QStringLiteral("free_bytes"), 20000000000LL},
+                       {QStringLiteral("base_required_bytes"), 3},
+                       {QStringLiteral("download_bytes"), modelBytes},
+                       {QStringLiteral("required_bytes"), modelBytes + 3}}},
           {QStringLiteral("operations"),
            QJsonArray{QJsonObject{{QStringLiteral("id"),
                                   QStringLiteral("preflight.validate")},
@@ -767,8 +793,12 @@ bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
   ok = Expect(reviewText && reviewText->toPlainText().contains(
                                   QStringLiteral("Models/downloads (7 pack IDs)")) &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("8 verified artifact files")),
-              "review should list exact seven packs and eight artifacts") && ok;
+                      QStringLiteral("8 verified artifact files, 131224287 model bytes")) &&
+                  reviewText->toPlainText().contains(
+                      QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_face_landmarks.dat: 99693937 bytes")) &&
+                  reviewText->toPlainText().contains(
+                      QStringLiteral("disk required/free: 131224290/20000000000 bytes")),
+              "review should derive exact pack, artifact, size, and disk totals from the plan") && ok;
 
   auto *progress = dynamic_cast<studiocast::installer::ProgressPage *>(
       wizard.page(studiocast::installer::PageProgress));
