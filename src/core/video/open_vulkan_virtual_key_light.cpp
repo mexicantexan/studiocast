@@ -284,10 +284,11 @@ bool OpenVulkanVirtualKeyLight::Apply(
   }
   if (Aliases(input.foreground, input.output))
     return fail("foreground and output resources must be distinct");
-  // The mapped output is the pipeline's shared final RGB transport. This
-  // effect writes it only through Vulkan and never maps or host-reads it.
-  if (!input.output->mapped())
-    return fail("output must be the mapped final-frame transport resource");
+  if (input.foreground->mapped() || !input.foreground->device_local() ||
+      input.output->mapped() || !input.output->device_local()) {
+    return fail("foreground and output must be non-mapped DEVICE_LOCAL "
+                "resources");
+  }
 
   // A zero-intensity frame is a true no-op and must not force inference. The
   // wrapper still required production matting readiness at setup and above,

@@ -304,20 +304,16 @@ bool OpenVulkanVirtualBackgroundBlur::Apply(
           studiocast::vulkan::VulkanPixelFormat::f32_1) {
     return fail("alpha and alpha scratch formats must be f32_1");
   }
-  if (input.alpha->mapped() || input.alpha_tmp->mapped() ||
+  if (input.foreground->mapped() || !input.foreground->device_local() ||
+      input.output->mapped() || !input.output->device_local() ||
+      input.alpha->mapped() || input.alpha_tmp->mapped() ||
       input.alpha_feathered->mapped() || !input.alpha->device_local() ||
       !input.alpha_tmp->device_local() ||
       !input.alpha_feathered->device_local() || input.blur_tmp->mapped() ||
       input.blurred->mapped() || !input.blur_tmp->device_local() ||
       !input.blurred->device_local()) {
-    return fail("alpha and blur scratch must be non-mapped DEVICE_LOCAL "
-                "resources");
-  }
-  // The camera's output transport is intentionally host-visible for its one
-  // final RGB readback. This effect writes it only through Vulkan and never
-  // invalidates, maps, or reads it on the host.
-  if (!input.output->mapped()) {
-    return fail("output must be the mapped final-frame transport resource");
+    return fail("foreground, output, alpha, and blur scratch must be "
+                "non-mapped DEVICE_LOCAL resources");
   }
 
   const auto parameters =

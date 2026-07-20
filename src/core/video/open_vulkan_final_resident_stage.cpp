@@ -57,6 +57,72 @@ std::string ResidencyFailure(std::string_view detail) {
 
 } // namespace
 
+bool ExecuteOpenVulkanResidentAutoFrameStage(
+    const OpenVulkanResidentAutoFrameInput &input,
+    OpenVulkanAutoFrame *auto_frame, OpenVulkanAutoFrameCounters *counters,
+    OpenVulkanResidentFrameState *state, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (state)
+    *state = OpenVulkanResidentFrameState{};
+  auto fail = [&](std::string detail) {
+    if (error_out)
+      *error_out = OpenVulkanAutoFrameRuntimeFailure(detail);
+    return false;
+  };
+  if (!auto_frame || !counters || !state || !input.source ||
+      !input.source->Valid()) {
+    return fail("resident orchestration input is invalid");
+  }
+  if (input.source->mapped() || !input.source->device_local()) {
+    ++counters->residency_rejection_frames;
+    return fail("[vulkan_effect_residency_contract_failed] Auto Frame input "
+                "must be non-mapped DEVICE_LOCAL");
+  }
+
+  const VulkanImage *output = input.source;
+  if (input.request_crop) {
+    OpenVulkanAutoFrameCropInput crop;
+    crop.src = input.source;
+    crop.dst = input.crop_output;
+    crop.crop_x = input.crop_x;
+    crop.crop_y = input.crop_y;
+    crop.crop_w = input.crop_width;
+    crop.crop_h = input.crop_height;
+    crop.host_analysis_complete = input.host_analysis_complete;
+    crop.cpu_crop_plan_complete = input.cpu_crop_plan_complete;
+    if (!auto_frame->ApplyCrop(crop, counters, error_out))
+      return false;
+    output = input.crop_output;
+    state->auto_frame_crop_applied = true;
+  } else {
+    ++counters->identity_resident_output_frames;
+  }
+
+  if (!output || !output->Valid() || output->mapped() ||
+      !output->device_local()) {
+    ++counters->residency_rejection_frames;
+    return fail("[vulkan_effect_residency_contract_failed] Auto Frame output "
+                "must be non-mapped DEVICE_LOCAL");
+  }
+  state->current = output;
+  state->auto_frame_applied = true;
+  ++counters->resident_output_frames;
+  return true;
+}
+
+bool ExecuteOpenVulkanResidentFrameFinalStage(
+    const OpenVulkanResidentFrameState &state,
+    const OpenVulkanFinalResidentStageInput &input_without_source,
+    const OpenVulkanFinalResidentStageResources &resources,
+    OpenVulkanFinalResidentStageCounters *counters,
+    OpenVulkanFinalResidentStageResult *result) {
+  OpenVulkanFinalResidentStageInput input = input_without_source;
+  input.source = state.current;
+  return ExecuteOpenVulkanFinalResidentStage(input, resources, counters,
+                                             result);
+}
+
 bool ExecuteOpenVulkanFinalResidentStage(
     const OpenVulkanFinalResidentStageInput &input,
     const OpenVulkanFinalResidentStageResources &resources,

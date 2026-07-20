@@ -467,7 +467,7 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
   const std::size_t ordering_boundary = pipeline.find(
       "final_input.preceding_effects_complete = true", vignette_request);
   const std::size_t apply = pipeline.find(
-      "ExecuteOpenVulkanFinalResidentStage(", ordering_boundary);
+      "ExecuteOpenVulkanResidentFrameFinalStage(", ordering_boundary);
   const std::size_t download =
       pipeline.find("DownloadImageToRgb(*download_img", apply);
   const std::size_t auto_frame_setup = pipeline.find("// Auto Frame.");
@@ -505,6 +505,8 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
           Contains(orchestration, "stage.mirrored_dst") &&
           Contains(orchestration, "resources.vignette->ApplyFinal") &&
           Contains(executable_test, "RunProductionCases") &&
+          Contains(executable_test,
+                   "RunAutoFrameFinalOrchestrationCases") &&
           Contains(executable_test, "RunOrderingAndIsolationCases") &&
           Contains(executable_test, "STUDIOCAST_REQUIRE_VULKAN_RUNTIME") &&
           Contains(cmake,
@@ -596,7 +598,7 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
   const std::size_t analysis_boundary = pipeline.find(
       "final_input.unmirrored_analysis_complete = true", combined_input);
   const std::size_t apply = pipeline.find(
-      "ExecuteOpenVulkanFinalResidentStage(", analysis_boundary);
+      "ExecuteOpenVulkanResidentFrameFinalStage(", analysis_boundary);
   const std::size_t download =
       pipeline.find("DownloadImageToRgb(*download_img", apply);
   bool ok =
@@ -1291,7 +1293,8 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
               "} open_vulkan_auto_frame;");
   ok &= Require(
       Contains(live_context, "OpenVulkanAutoFrameReuseKeyResetReason") &&
-          Contains(live_context, "production_crop.ApplyCrop") &&
+          Contains(live_context,
+                   "ExecuteOpenVulkanResidentAutoFrameStage") &&
           !Contains(live_context, ".CropResizeBilinear"),
       "the live Auto Frame context must use the reset/reuse contract and route "
       "crop/resize only through the canonical production wrapper");
@@ -1302,7 +1305,11 @@ bool TestAutoFrameDegradedPathRemainsExplicit() {
       pipeline.find("YunetProviderPolicy::cpu_only", cache_begin);
   const std::size_t upload = pipeline.find(
       "ensure_open_vulkan_current_from_cpu(&vk_err)", preupload_face);
-  const std::size_t canonical_crop = pipeline.find("production_crop.ApplyCrop");
+  const std::string orchestration = ReadFile(
+      root / "src" / "core" / "video" /
+      "open_vulkan_final_resident_stage.cpp");
+  const std::size_t canonical_crop =
+      orchestration.find("auto_frame->ApplyCrop");
   ok &= Require(
       cache_begin != std::string::npos && preupload_face != std::string::npos &&
           upload != std::string::npos && canonical_crop != std::string::npos &&

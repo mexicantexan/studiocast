@@ -453,21 +453,19 @@ bool OpenVulkanVirtualBackgroundReplace::Apply(
           studiocast::vulkan::VulkanPixelFormat::f32_1) {
     return fail("alpha and alpha scratch formats must be f32_1");
   }
-  if (input.alpha->mapped() || input.alpha_tmp->mapped() ||
+  if (input.foreground->mapped() || !input.foreground->device_local() ||
+      input.output->mapped() || !input.output->device_local() ||
+      input.alpha->mapped() || input.alpha_tmp->mapped() ||
       input.alpha_feathered->mapped() || !input.alpha->device_local() ||
       !input.alpha_tmp->device_local() ||
       !input.alpha_feathered->device_local() || source_rgb_.mapped() ||
       replacement_rgb_.mapped() || !source_rgb_.device_local() ||
       !replacement_rgb_.device_local()) {
-    return fail("alpha scratch and replacement images must be non-mapped "
-                "DEVICE_LOCAL resources");
+    return fail("foreground, output, alpha scratch, and replacement images "
+                "must be non-mapped DEVICE_LOCAL resources");
   }
   if (!upload_staging_.mapped() || !upload_staging_.host_visible())
     return fail("replacement setup upload staging is not host-visible");
-  // The pipeline's mapped output is the one final RGB transport. Replace only
-  // writes it from Vulkan and never invalidates, maps, or host-reads it.
-  if (!input.output->mapped())
-    return fail("output must be the mapped final-frame transport resource");
 
   const studiocast::vulkan::VulkanImage *alpha_use = input.alpha;
   std::string detail;

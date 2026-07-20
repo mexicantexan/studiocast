@@ -190,6 +190,13 @@ bool OpenVulkanAutoFrame::ApplyCrop(
                 "belong to the initialized shared context",
                 false);
   }
+  if (input.src->mapped() || !input.src->device_local() ||
+      input.dst->mapped() || !input.dst->device_local()) {
+    ++counters->residency_rejection_frames;
+    return fail("[vulkan_effect_residency_contract_failed] Auto Frame crop "
+                "requires non-mapped DEVICE_LOCAL input and output",
+                false);
+  }
   if (!std::isfinite(input.crop_x) || !std::isfinite(input.crop_y) ||
       !std::isfinite(input.crop_w) || !std::isfinite(input.crop_h) ||
       input.crop_w <= 0.0f || input.crop_h <= 0.0f) {

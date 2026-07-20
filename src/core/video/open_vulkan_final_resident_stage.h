@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "core/video/open_vulkan_auto_frame.h"
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_vignette.h"
 
@@ -73,6 +74,42 @@ struct OpenVulkanFinalResidentStageResult {
   std::string mirror_error;
   std::string fatal_error;
 };
+
+// Per-frame state for the production Open Vulkan resident orchestration seam.
+// CameraPipeline and the executable integration test both use these exact
+// branch decisions; the seam performs no transfer or CPU fallback.
+struct OpenVulkanResidentFrameState {
+  const studiocast::vulkan::VulkanImage *current = nullptr;
+  bool auto_frame_applied = false;
+  bool auto_frame_crop_applied = false;
+};
+
+struct OpenVulkanResidentAutoFrameInput {
+  const studiocast::vulkan::VulkanImage *source = nullptr;
+  studiocast::vulkan::VulkanImage *crop_output = nullptr;
+  bool request_crop = false;
+  float crop_x = 0.0f;
+  float crop_y = 0.0f;
+  float crop_width = 0.0f;
+  float crop_height = 0.0f;
+  bool host_analysis_complete = false;
+  bool cpu_crop_plan_complete = false;
+};
+
+bool ExecuteOpenVulkanResidentAutoFrameStage(
+    const OpenVulkanResidentAutoFrameInput &input,
+    OpenVulkanAutoFrame *auto_frame, OpenVulkanAutoFrameCounters *counters,
+    OpenVulkanResidentFrameState *state, std::string *error_out);
+
+// Completes resize -> fixed-center vignette -> mirror from the current
+// resident frame. This is the only CameraPipeline call site for the exact
+// final resident helper, so tests cannot drift into a second orchestration.
+bool ExecuteOpenVulkanResidentFrameFinalStage(
+    const OpenVulkanResidentFrameState &state,
+    const OpenVulkanFinalResidentStageInput &input_without_source,
+    const OpenVulkanFinalResidentStageResources &resources,
+    OpenVulkanFinalResidentStageCounters *counters,
+    OpenVulkanFinalResidentStageResult *result);
 
 // Runs the canonical resident final-output decision in this fixed order:
 // output resize (when needed) -> fixed-center vignette -> mirror. It performs
