@@ -10,6 +10,7 @@
 #include <iostream>
 #include <new>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace {
@@ -109,6 +110,171 @@ bool TestCanonicalStageMappingAndOrder() {
                       variant.last_deferred_stage == expected_stage,
                   "background variant membership/defer metadata changed");
   }
+  return ok;
+}
+
+bool TestPreparedMaxineResidentIslandsFollowResolvedBackends() {
+  namespace effects = studiocast::video::effects;
+  using BroadcastStage = effects::BroadcastEffectStage;
+  using ResidentStage = studiocast::maxine::ResidentStageKind;
+
+  auto all_maxine_effects = AllEffects();
+  all_maxine_effects.mirror = false;
+  const auto all_plan = effects::CompileBroadcastEffectsFramePlan(
+      effects::BuildBroadcastEffectsPlan(all_maxine_effects));
+  std::uint32_t all_mask = 0;
+  for (std::size_t i = 0; i < all_plan.size; ++i)
+    all_mask |= studiocast::video::MaxineResolvedStageBit(all_plan.StageAt(i));
+  const auto all = studiocast::video::CompileMaxineResidentIslands(
+      all_plan, all_mask, 0xCAFE);
+  bool ok = Require(all.valid && all.count == 1,
+                    "all-Maxine stages must compile into one island");
+  ok &= Require(all.islands[0].first_frame_stage == 0 &&
+                    all.islands[0].end_frame_stage == all_plan.size &&
+                    !all.islands[0].plan.has_cpu_tail,
+                "terminal all-Maxine island must use final readback");
+  ok &= Require(all.islands[0].plan.stage_count == all_plan.size,
+                "all-Maxine island lost a stage");
+  ok &= Require(all.islands[0].plan.stages[2].kind ==
+                        ResidentStage::background_blur &&
+                    all.islands[0].plan.stages[2].requires_shared_matte &&
+                    all.islands[0].plan.stages[3].kind ==
+                        ResidentStage::relighting &&
+                    all.islands[0].plan.stages[3].matte_fingerprint == 0xCAFE,
+                "shared-matte stages must retain the setup fingerprint");
+
+  const std::uint32_t mixed_mask =
+      studiocast::video::MaxineResolvedStageBit(
+          BroadcastStage::video_noise_removal) |
+      studiocast::video::MaxineResolvedStageBit(
+          BroadcastStage::virtual_background_blur) |
+      studiocast::video::MaxineResolvedStageBit(
+          BroadcastStage::virtual_key_light) |
+      studiocast::video::MaxineResolvedStageBit(BroadcastStage::vignette);
+  const auto mixed = studiocast::video::CompileMaxineResidentIslands(
+      all_plan, mixed_mask, 7);
+  ok &= Require(mixed.valid && mixed.count == 3,
+                "mixed backends must compile maximal bounded islands");
+  ok &= Require(mixed.islands[0].first_frame_stage == 0 &&
+                    mixed.islands[0].end_frame_stage == 1 &&
+                    mixed.islands[0].plan.has_cpu_tail,
+                "first mixed island must expose its continuation boundary");
+  ok &= Require(mixed.islands[1].first_frame_stage == 2 &&
+                    mixed.islands[1].end_frame_stage == 4 &&
+                    mixed.islands[1].plan.has_cpu_tail,
+                "adjacent background/key-light stages must share an island");
+  ok &= Require(mixed.islands[2].first_frame_stage == 5 &&
+                    mixed.islands[2].end_frame_stage == 6 &&
+                    !mixed.islands[2].plan.has_cpu_tail,
+                "terminal vignette island must use final readback");
+
+  const auto none = studiocast::video::CompileMaxineResidentIslands(
+      all_plan, 0, 1);
+  ok &= Require(none.valid && none.count == 0 &&
+                    none.enabled_resident_stage_mask == 0,
+                "no resolved Maxine stage must compile no executor work");
+
+  for (const auto &[mode, broadcast, resident] :
+       std::array{
+           std::tuple{effects::VirtualBackgroundMode::remove,
+                      BroadcastStage::virtual_background_remove,
+                      ResidentStage::background_remove},
+           std::tuple{effects::VirtualBackgroundMode::replace,
+                      BroadcastStage::virtual_background_replace,
+                      ResidentStage::background_replace}}) {
+    effects::BroadcastCameraEffects background;
+    background.virtual_background.mode = mode;
+    if (mode == effects::VirtualBackgroundMode::replace)
+      background.virtual_background.replace_path = "/prepared/source.ppm";
+    const auto frame = effects::CompileBroadcastEffectsFramePlan(
+        effects::BuildBroadcastEffectsPlan(background));
+    const auto compiled = studiocast::video::CompileMaxineResidentIslands(
+        frame, studiocast::video::MaxineResolvedStageBit(broadcast), 9);
+    ok &= Require(compiled.valid && compiled.count == 1 &&
+                      compiled.islands[0].plan.stage_count == 1 &&
+                      compiled.islands[0].plan.stages[0].kind == resident &&
+                      compiled.islands[0].plan.stages[0].requires_shared_matte,
+                  "background remove/replace resident mapping changed");
+  }
+  return ok;
+}
+
+bool TestProductionMaxineTelemetryFeedsCameraRollup() {
+  using Cpu = studiocast::maxine::ProductionCpuStageKind;
+  using Stage = studiocast::maxine::ResidentStageKind;
+  using Transfer = studiocast::maxine::ProductionTransferKind;
+  studiocast::maxine::ProductionResidentTelemetry previous{};
+  studiocast::maxine::ProductionResidentTelemetry current{};
+  const auto transfer_index = [](Transfer kind) {
+    return static_cast<std::size_t>(kind);
+  };
+  const auto upload = transfer_index(Transfer::host_upload);
+  const auto final_download = transfer_index(Transfer::final_download);
+  const auto continuation =
+      transfer_index(Transfer::cpu_continuation_download);
+  previous.transfers[upload] = {4, 3};
+  current.transfers[upload] = {6, 5};
+  previous.transfers[final_download] = {8, 7};
+  current.transfers[final_download] = {9, 8};
+  previous.transfers[continuation] = {2, 2};
+  current.transfers[continuation] = {3, 3};
+  const auto bridge = transfer_index(Transfer::device_format_bridge);
+  previous.transfers[bridge] = {6, 5};
+  current.transfers[bridge] = {9, 7};
+  previous.matte_inferences = {10, 9};
+  current.matte_inferences = {12, 10};
+  previous.shared_matte_reuses = 5;
+  current.shared_matte_reuses = 7;
+  previous.explicit_synchronizations = {20, 19};
+  current.explicit_synchronizations = {22, 21};
+  previous.composites = {3, 2};
+  current.composites = {5, 4};
+  previous.synchronous_sdk_runs = {50, 49};
+  current.synchronous_sdk_runs = {53, 51};
+  previous.asynchronous_sdk_runs = {60, 59};
+  current.asynchronous_sdk_runs = {62, 61};
+  const auto rgb = static_cast<std::size_t>(Cpu::rgb_to_bgr_staging);
+  previous.cpu_stages[rgb] = {30, 29};
+  current.cpu_stages[rgb] = {32, 31};
+  const auto blur = static_cast<std::size_t>(Stage::background_blur);
+  previous.stages[blur] = {40, 39};
+  current.stages[blur] = {43, 41};
+
+  const auto delta = studiocast::video::ComputeMaxineResidentTelemetryDelta(
+      current, previous);
+  bool ok = Require(delta.upload_attempts == 2 && delta.upload_calls == 2,
+                    "camera rollup lost actual upload attempt/success deltas");
+  ok &= Require(delta.final_download_attempts == 1 &&
+                    delta.final_download_calls == 1 &&
+                    delta.cpu_continuation_download_attempts == 1 &&
+                    delta.cpu_continuation_download_calls == 1,
+                "camera rollup lost named readback boundaries");
+  ok &= Require(delta.matte_inference_attempts == 2 &&
+                    delta.matte_inference_calls == 1 &&
+                    delta.shared_matte_reuses == 2,
+                "camera rollup lost matte attempts, successes, or reuse");
+  ok &= Require(delta.sync_attempts == 2 && delta.sync_calls == 2 &&
+                    delta.rgb_to_bgr_calls == 2,
+                "camera rollup lost synchronization or staging callsites");
+  ok &= Require(delta.device_bridge_attempts == 3 &&
+                    delta.device_bridge_calls == 2 &&
+                    delta.composite_attempts == 2 &&
+                    delta.composite_calls == 2,
+                "camera rollup lost extra device transfer/composite calls");
+  ok &= Require(delta.synchronous_sdk_run_attempts == 3 &&
+                    delta.synchronous_sdk_run_calls == 2 &&
+                    delta.asynchronous_sdk_run_attempts == 2 &&
+                    delta.asynchronous_sdk_run_calls == 2,
+                "camera rollup lost synchronous/asynchronous SDK calls");
+  ok &= Require(delta.stage_attempts[blur] == 3 &&
+                    delta.stage_successes[blur] == 2,
+                "camera rollup lost named resident stage attribution");
+
+  const auto reset_delta =
+      studiocast::video::ComputeMaxineResidentTelemetryDelta(previous, current);
+  ok &= Require(reset_delta.upload_attempts == 0 &&
+                    reset_delta.stage_attempts[blur] == 0,
+                "counter reset must fail closed instead of underflowing");
   return ok;
 }
 
@@ -286,6 +452,8 @@ void operator delete[](void *pointer, std::size_t) noexcept {
 int main() {
   bool ok = true;
   ok &= TestCanonicalStageMappingAndOrder();
+  ok &= TestPreparedMaxineResidentIslandsFollowResolvedBackends();
+  ok &= TestProductionMaxineTelemetryFeedsCameraRollup();
   ok &= TestCompiledPlanTracksSetupMutationsAndRejectsStaleInput();
   ok &= TestSteadyFramePlanDecisionAllocatesAndSnapshotsZero();
   ok &= TestCapturePollNoFrameIsDistinctFromFailure();

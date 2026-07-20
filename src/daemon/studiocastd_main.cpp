@@ -1930,6 +1930,8 @@ void AppendCpuTailStages(std::ostringstream &oss,
         p.open_cuda_transfers.cpu_tail_auto_frame_cpu_crop_calls +
             p.open_vulkan_transfers.cpu_tail_auto_frame_cpu_crop_calls);
   addIf("denoise", p.open_cuda_transfers.cpu_tail_denoise_calls);
+  addIf("maxine_incompatible_stage",
+        p.maxine_transfers.cpu_tail_stage_calls);
   AppendJsonStringVector(oss, stages);
 }
 
@@ -1970,8 +1972,15 @@ void AppendVideoComputeStatusJson(
   const auto &cu = pipeline.open_cuda_transfers;
   const auto &vk = pipeline.open_vulkan_transfers;
   const auto &mx = pipeline.maxine_transfers;
+  std::uint64_t maxineStageAttempts = 0;
+  std::uint64_t maxineStageSuccesses = 0;
+  for (std::size_t i = 0; i < mx.stage_attempts.size(); ++i) {
+    maxineStageAttempts += mx.stage_attempts[i];
+    maxineStageSuccesses += mx.stage_successes[i];
+  }
   const std::uint64_t cpuTailStages =
-      cu.cpu_tail_stage_calls + vk.cpu_tail_stage_calls;
+      cu.cpu_tail_stage_calls + vk.cpu_tail_stage_calls +
+      mx.cpu_tail_stage_calls;
 
   oss << "{";
   oss << "\"preference\":\"" << JsonEscape(preference) << "\",";
@@ -2014,6 +2023,7 @@ void AppendVideoComputeStatusJson(
   oss << "\"counts\":{";
   oss << "\"open_cuda\":" << cu.cpu_tail_stage_calls << ",";
   oss << "\"open_vulkan\":" << vk.cpu_tail_stage_calls << ",";
+  oss << "\"maxine\":" << mx.cpu_tail_stage_calls << ",";
   oss << "\"denoise\":" << cu.cpu_tail_denoise_calls;
   oss << "}";
   oss << "},";
@@ -2061,16 +2071,46 @@ void AppendVideoComputeStatusJson(
   oss << "},";
   oss << "\"maxine\":{";
   oss << "\"active_frames\":" << mx.active_frames << ",";
+  oss << "\"upload_attempts\":" << mx.upload_attempts << ",";
   oss << "\"uploads\":" << mx.upload_calls << ",";
   oss << "\"downloads\":" << mx.download_calls << ",";
+  oss << "\"final_download_attempts\":" << mx.final_download_attempts << ",";
   oss << "\"final_downloads\":" << mx.final_download_calls << ",";
+  oss << "\"cpu_continuation_download_attempts\":"
+      << mx.cpu_continuation_download_attempts << ",";
   oss << "\"cpu_continuation_downloads\":" << mx.cpu_continuation_download_calls
       << ",";
+  oss << "\"device_bridge_attempts\":" << mx.device_bridge_attempts << ",";
+  oss << "\"device_bridges\":" << mx.device_bridge_calls << ",";
+  oss << "\"background_setup_upload_attempts\":"
+      << mx.background_setup_upload_attempts << ",";
+  oss << "\"background_setup_uploads\":"
+      << mx.background_setup_upload_calls << ",";
   oss << "\"standalone_scaler_uploads\":" << mx.standalone_scaler_upload_calls
       << ",";
   oss << "\"standalone_scaler_downloads\":"
       << mx.standalone_scaler_download_calls << ",";
+  oss << "\"matte_inference_attempts\":" << mx.matte_inference_attempts
+      << ",";
+  oss << "\"matte_inferences\":" << mx.green_screen_calls << ",";
+  oss << "\"stage_attempts\":" << maxineStageAttempts << ",";
+  oss << "\"stage_successes\":" << maxineStageSuccesses << ",";
+  oss << "\"forced_sync_attempts\":" << mx.forced_sync_attempts << ",";
   oss << "\"forced_syncs\":" << mx.forced_sync_calls << ",";
+  oss << "\"composite_attempts\":" << mx.composite_attempts << ",";
+  oss << "\"composites\":" << mx.composite_calls << ",";
+  oss << "\"synchronous_sdk_run_attempts\":"
+      << mx.synchronous_sdk_run_attempts << ",";
+  oss << "\"synchronous_sdk_runs\":" << mx.synchronous_sdk_run_calls
+      << ",";
+  oss << "\"asynchronous_sdk_run_attempts\":"
+      << mx.asynchronous_sdk_run_attempts << ",";
+  oss << "\"asynchronous_sdk_runs\":" << mx.asynchronous_sdk_run_calls
+      << ",";
+  oss << "\"setup_attempts\":" << mx.setup_attempts << ",";
+  oss << "\"setup_successes\":" << mx.setup_successes << ",";
+  oss << "\"cpu_tail_stage_calls\":" << mx.cpu_tail_stage_calls << ",";
+  oss << "\"runtime_failure_frames\":" << mx.runtime_failure_frames << ",";
   oss << "\"deferred_readbacks\":" << mx.deferred_readbacks;
   oss << "}";
   oss << "}";
@@ -2666,8 +2706,12 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << ",";
     oss << "\"rgb_to_bgr_calls\":"
         << st.pipeline.maxine_transfers.rgb_to_bgr_calls << ",";
+    oss << "\"upload_attempts\":"
+        << st.pipeline.maxine_transfers.upload_attempts << ",";
     oss << "\"upload_calls\":" << st.pipeline.maxine_transfers.upload_calls
         << ",";
+    oss << "\"matte_inference_attempts\":"
+        << st.pipeline.maxine_transfers.matte_inference_attempts << ",";
     oss << "\"green_screen_calls\":"
         << st.pipeline.maxine_transfers.green_screen_calls << ",";
     oss << "\"duplicate_green_screen_calls\":"
@@ -2685,16 +2729,68 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
         << ",";
     oss << "\"download_calls\":" << st.pipeline.maxine_transfers.download_calls
         << ",";
+    oss << "\"final_download_attempts\":"
+        << st.pipeline.maxine_transfers.final_download_attempts << ",";
     oss << "\"final_download_calls\":"
         << st.pipeline.maxine_transfers.final_download_calls << ",";
+    oss << "\"cpu_continuation_download_attempts\":"
+        << st.pipeline.maxine_transfers.cpu_continuation_download_attempts
+        << ",";
     oss << "\"cpu_continuation_download_calls\":"
         << st.pipeline.maxine_transfers.cpu_continuation_download_calls << ",";
+    oss << "\"device_bridge_attempts\":"
+        << st.pipeline.maxine_transfers.device_bridge_attempts << ",";
+    oss << "\"device_bridge_calls\":"
+        << st.pipeline.maxine_transfers.device_bridge_calls << ",";
+    oss << "\"background_setup_upload_attempts\":"
+        << st.pipeline.maxine_transfers.background_setup_upload_attempts
+        << ",";
+    oss << "\"background_setup_upload_calls\":"
+        << st.pipeline.maxine_transfers.background_setup_upload_calls << ",";
     oss << "\"bgr_to_rgb_calls\":"
         << st.pipeline.maxine_transfers.bgr_to_rgb_calls << ",";
     oss << "\"deferred_readbacks\":"
         << st.pipeline.maxine_transfers.deferred_readbacks << ",";
+    oss << "\"forced_sync_attempts\":"
+        << st.pipeline.maxine_transfers.forced_sync_attempts << ",";
     oss << "\"forced_sync_calls\":"
         << st.pipeline.maxine_transfers.forced_sync_calls << ",";
+    oss << "\"composite_attempts\":"
+        << st.pipeline.maxine_transfers.composite_attempts << ",";
+    oss << "\"composite_calls\":"
+        << st.pipeline.maxine_transfers.composite_calls << ",";
+    oss << "\"synchronous_sdk_run_attempts\":"
+        << st.pipeline.maxine_transfers.synchronous_sdk_run_attempts << ",";
+    oss << "\"synchronous_sdk_run_calls\":"
+        << st.pipeline.maxine_transfers.synchronous_sdk_run_calls << ",";
+    oss << "\"asynchronous_sdk_run_attempts\":"
+        << st.pipeline.maxine_transfers.asynchronous_sdk_run_attempts << ",";
+    oss << "\"asynchronous_sdk_run_calls\":"
+        << st.pipeline.maxine_transfers.asynchronous_sdk_run_calls << ",";
+    oss << "\"setup_attempts\":"
+        << st.pipeline.maxine_transfers.setup_attempts << ",";
+    oss << "\"setup_successes\":"
+        << st.pipeline.maxine_transfers.setup_successes << ",";
+    oss << "\"cpu_tail_stage_calls\":"
+        << st.pipeline.maxine_transfers.cpu_tail_stage_calls << ",";
+    oss << "\"runtime_failure_frames\":"
+        << st.pipeline.maxine_transfers.runtime_failure_frames << ",";
+    oss << "\"stages\":{";
+    for (std::size_t i = 0;
+         i < st.pipeline.maxine_transfers.stage_attempts.size(); ++i) {
+      if (i != 0)
+        oss << ",";
+      const auto kind =
+          static_cast<studiocast::maxine::ResidentStageKind>(i);
+      oss << "\"" << studiocast::maxine::ResidentStageKindName(kind)
+          << "\":{";
+      oss << "\"attempts\":"
+          << st.pipeline.maxine_transfers.stage_attempts[i] << ",";
+      oss << "\"successes\":"
+          << st.pipeline.maxine_transfers.stage_successes[i];
+      oss << "}";
+    }
+    oss << "},";
     oss << "\"standalone_scaler_upload_calls\":"
         << st.pipeline.maxine_transfers.standalone_scaler_upload_calls << ",";
     oss << "\"standalone_scaler_download_calls\":"

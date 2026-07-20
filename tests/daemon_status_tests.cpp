@@ -639,6 +639,7 @@ bool TestVideoComputeStatusReportsCachedCountersAndProvider() {
 }
 
 bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
+  ScopedEnvironmentVariable debug("STUDIOCAST_DEBUG_MAXINE_TRANSFERS", "1");
   studiocast::video::VirtualCameraServiceStatus videoStatus;
   videoStatus.service_running = true;
   videoStatus.virtual_device_present = true;
@@ -669,10 +670,35 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
   vk.standalone_scaler_download_calls = 5;
 
   auto &mx = videoStatus.pipeline.maxine_transfers;
+  mx.upload_attempts = 41;
   mx.upload_calls = 31;
   mx.download_calls = 37;
+  mx.final_download_attempts = 43;
   mx.final_download_calls = 7;
+  mx.cpu_continuation_download_attempts = 47;
   mx.cpu_continuation_download_calls = 11;
+  mx.device_bridge_attempts = 49;
+  mx.device_bridge_calls = 48;
+  mx.background_setup_upload_attempts = 2;
+  mx.background_setup_upload_calls = 1;
+  mx.matte_inference_attempts = 53;
+  mx.green_screen_calls = 51;
+  mx.forced_sync_attempts = 59;
+  mx.forced_sync_calls = 57;
+  mx.composite_attempts = 73;
+  mx.composite_calls = 72;
+  mx.synchronous_sdk_run_attempts = 79;
+  mx.synchronous_sdk_run_calls = 78;
+  mx.asynchronous_sdk_run_attempts = 83;
+  mx.asynchronous_sdk_run_calls = 82;
+  mx.setup_attempts = 3;
+  mx.setup_successes = 2;
+  mx.cpu_tail_stage_calls = 61;
+  mx.runtime_failure_frames = 67;
+  mx.stage_attempts[static_cast<std::size_t>(
+      studiocast::maxine::ResidentStageKind::denoise)] = 71;
+  mx.stage_successes[static_cast<std::size_t>(
+      studiocast::maxine::ResidentStageKind::denoise)] = 69;
   mx.standalone_scaler_upload_calls = 13;
   mx.standalone_scaler_download_calls = 17;
 
@@ -699,6 +725,24 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
     return false;
   const JsonObject *video = ObjectAt(*root, "video", "video should exist");
   if (!video)
+    return false;
+  const JsonObject *pipelineDebug =
+      ObjectAt(*video, "pipeline", "video pipeline should exist");
+  if (!pipelineDebug)
+    return false;
+  const JsonObject *maxineDebug =
+      ObjectAt(*pipelineDebug, "maxine_transfers",
+               "Maxine debug transfer counters should exist");
+  if (!maxineDebug)
+    return false;
+  const JsonObject *maxineDebugStages =
+      ObjectAt(*maxineDebug, "stages", "Maxine debug stages should exist");
+  if (!maxineDebugStages)
+    return false;
+  const JsonObject *denoiseDebug =
+      ObjectAt(*maxineDebugStages, "denoise",
+               "Maxine denoise stage counters should exist");
+  if (!denoiseDebug)
     return false;
   const JsonObject *compute =
       ObjectAt(*video, "compute", "video.compute should exist");
@@ -740,6 +784,61 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
                 "Maxine uploads should be the aggregate total") &&
          Expect(JsonNumberField(*maxine, "downloads", -1.0) == 37.0,
                 "Maxine downloads should be the aggregate total") &&
+         Expect(JsonNumberField(*maxine, "upload_attempts", -1.0) == 41.0,
+                "Maxine upload attempts should remain distinct from "
+                "successful ABI calls") &&
+         Expect(JsonNumberField(*maxine, "final_download_attempts", -1.0) ==
+                    43.0,
+                "Maxine final download attempts should be published") &&
+         Expect(JsonNumberField(*maxine,
+                                "cpu_continuation_download_attempts", -1.0) ==
+                    47.0,
+                "Maxine continuation attempts should be published") &&
+         Expect(JsonNumberField(*maxine, "matte_inference_attempts", -1.0) ==
+                    53.0,
+                "Maxine matte attempts should be published") &&
+         Expect(JsonNumberField(*maxine, "matte_inferences", -1.0) == 51.0,
+                "Maxine matte successes should be published") &&
+         Expect(JsonNumberField(*maxine, "device_bridge_attempts", -1.0) ==
+                    49.0 &&
+                    JsonNumberField(*maxine, "device_bridges", -1.0) == 48.0,
+                "Maxine SDK-mandated device bridges must be visible") &&
+         Expect(JsonNumberField(*maxine,
+                                "background_setup_upload_attempts", -1.0) ==
+                    2.0 &&
+                    JsonNumberField(*maxine, "background_setup_uploads", -1.0) ==
+                        1.0,
+                "Maxine setup-only asset uploads must be visible") &&
+         Expect(JsonNumberField(*maxine, "forced_sync_attempts", -1.0) ==
+                    59.0,
+                "Maxine synchronization attempts should be published") &&
+         Expect(JsonNumberField(*maxine, "cpu_tail_stage_calls", -1.0) ==
+                    61.0,
+                "Maxine CPU continuation boundaries should be published") &&
+         Expect(JsonNumberField(*maxine, "runtime_failure_frames", -1.0) ==
+                    67.0,
+                "Maxine boundary failures should be published") &&
+         Expect(JsonNumberField(*maxine, "stage_attempts", -1.0) == 71.0,
+                "Maxine stage attempts should come from production ABI "
+                "counters") &&
+         Expect(JsonNumberField(*maxine, "stage_successes", -1.0) == 69.0,
+                "Maxine stage successes should remain distinct from "
+                "attempts") &&
+         Expect(JsonNumberField(*maxine, "composite_attempts", -1.0) == 73.0 &&
+                    JsonNumberField(*maxine, "composites", -1.0) == 72.0,
+                "Maxine composite ABI calls must be visible") &&
+         Expect(JsonNumberField(*maxine, "synchronous_sdk_runs", -1.0) ==
+                        78.0 &&
+                    JsonNumberField(*maxine, "asynchronous_sdk_runs", -1.0) ==
+                        82.0,
+                "Maxine SDK execution modes must remain distinguishable") &&
+         Expect(JsonNumberField(*maxine, "setup_attempts", -1.0) == 3.0 &&
+                    JsonNumberField(*maxine, "setup_successes", -1.0) == 2.0,
+                "Maxine setup attempts/successes must be visible") &&
+         Expect(JsonNumberField(*denoiseDebug, "attempts", -1.0) == 71.0,
+                "Maxine debug status should name per-stage attempts") &&
+         Expect(JsonNumberField(*denoiseDebug, "successes", -1.0) == 69.0,
+                "Maxine debug status should name per-stage successes") &&
          Expect(JsonNumberField(*maxine, "standalone_scaler_downloads", -1.0) ==
                     17.0,
                 "Maxine scaler download subcounter should remain available");
