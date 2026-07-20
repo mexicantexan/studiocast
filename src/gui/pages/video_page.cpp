@@ -854,7 +854,7 @@ QString FriendlyBackendLabel(const QString &id) {
 QString FriendlyComputeBackendLabel(const QString &id) {
   const QString v = id.trimmed().toLower();
   if (v.isEmpty())
-    return QStringLiteral("CPU");
+    return QStringLiteral("Inactive");
   if (v == QStringLiteral("cuda") || v == QStringLiteral("open_cuda") ||
       v == QStringLiteral("open_video"))
     return QStringLiteral("CUDA");
@@ -2924,19 +2924,21 @@ void VideoPage::UpdateUiEnabled() {
     } else if (!enabled) {
       computeBackendValue_->setText(QStringLiteral("Off"));
       computeBackendValue_->setToolTip(QString());
-    } else if (!st.pipeline_running && st.pipeline_starting) {
-      computeBackendValue_->setText(QStringLiteral("Starting…"));
-      computeBackendValue_->setToolTip(QString());
     } else {
-      const QString active =
-          st.compute_active_backend.isEmpty() ? QStringLiteral("cpu")
-                                              : st.compute_active_backend;
-      const QString resolved =
-          st.compute_resolved_backend.isEmpty() ? active
-                                                : st.compute_resolved_backend;
-      QString text = FriendlyComputeBackendLabel(active);
-      if (active != resolved)
-        text += QStringLiteral(" (%1)").arg(FriendlyComputeBackendLabel(resolved));
+      const QString active = st.compute_active_backend.trimmed();
+      const QString resolved = st.compute_resolved_backend.trimmed();
+      QString text;
+      if (!st.pipeline_running && st.pipeline_starting) {
+        text = QStringLiteral("Starting…");
+      } else if (active.isEmpty()) {
+        text = QStringLiteral("Inactive");
+      } else {
+        text = FriendlyComputeBackendLabel(active);
+      }
+      if (!resolved.isEmpty() && active != resolved) {
+        text += QStringLiteral(" — resolved %1")
+                    .arg(FriendlyComputeBackendLabel(resolved));
+      }
       computeBackendValue_->setText(text);
 
       QStringList detail;
@@ -2944,8 +2946,14 @@ void VideoPage::UpdateUiEnabled() {
                     .arg(st.compute_preference.isEmpty()
                              ? QStringLiteral("auto")
                              : st.compute_preference);
-      detail << QStringLiteral("Resolved: %1").arg(resolved);
-      detail << QStringLiteral("Active: %1").arg(active);
+      detail << QStringLiteral("Resolved: %1")
+                    .arg(resolved.isEmpty()
+                             ? QStringLiteral("None")
+                             : FriendlyComputeBackendLabel(resolved));
+      detail << QStringLiteral("Active: %1")
+                    .arg(active.isEmpty()
+                             ? QStringLiteral("None")
+                             : FriendlyComputeBackendLabel(active));
       if (!st.compute_fallback_reason.isEmpty())
         detail << st.compute_fallback_reason;
       if (!st.compute_degraded_reason.isEmpty() &&
@@ -4125,7 +4133,7 @@ void VideoPage::UpdateStatusText() {
               : st.compute_resolved_backend.toStdString())
       << ", active="
       << (st.compute_active_backend.isEmpty()
-              ? std::string("cpu")
+              ? std::string("inactive")
               : st.compute_active_backend.toStdString())
       << "\n";
   if (!st.compute_fallback_reason.isEmpty()) {

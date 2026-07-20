@@ -98,6 +98,8 @@ struct ComputeFields {
   std::string fallback;
   std::string degraded;
   std::string provider_mode;
+  std::string active_provider;
+  std::size_t active_engine_count = 0;
   bool fallback_active = false;
   bool present = false;
 };
@@ -165,7 +167,11 @@ ComputeFields ComputeFieldsFor(const std::string &statusJson) {
       compute ? JsonObjectField(*compute, "fallback") : nullptr;
   const JsonObject *provider =
       compute ? JsonObjectField(*compute, "provider") : nullptr;
-  if (!compute || !fallback || !provider)
+  const JsonArray *activeEngines =
+      compute ? ArrayAt(*compute, "active_engines",
+                        "compute active engines should exist")
+              : nullptr;
+  if (!compute || !fallback || !provider || !activeEngines)
     return out;
   const std::string *resolved = JsonStringField(*compute, "resolved_backend");
   const std::string *active = JsonStringField(*compute, "active_backend");
@@ -173,13 +179,18 @@ ComputeFields ComputeFieldsFor(const std::string &statusJson) {
       JsonStringField(*compute, "fallback_reason");
   const std::string *degraded = JsonStringField(*compute, "degraded_reason");
   const std::string *providerMode = JsonStringField(*provider, "mode");
-  if (!resolved || !active || !fallbackReason || !degraded || !providerMode)
+  const std::string *activeProvider =
+      JsonStringField(*provider, "active_provider");
+  if (!resolved || !active || !fallbackReason || !degraded || !providerMode ||
+      !activeProvider)
     return out;
   out.resolved = *resolved;
   out.active = *active;
   out.fallback = *fallbackReason;
   out.degraded = *degraded;
   out.provider_mode = *providerMode;
+  out.active_provider = *activeProvider;
+  out.active_engine_count = activeEngines->size();
   out.fallback_active = JsonBoolField(*fallback, "active", false);
   out.present = true;
   return out;
@@ -471,25 +482,28 @@ bool TestVideoStatusReportsComputeBackend() {
                 "compute preference should report vulkan") &&
          Expect(*resolved == "cpu",
                 "vulkan unavailable status should resolve to cpu") &&
-         Expect(*active == "cpu",
-                "vulkan unavailable status should be active cpu") &&
+         Expect(active->empty(),
+                "an idle unavailable pipeline must not claim an active CPU "
+                "backend") &&
          Expect(*fallback == "open_vulkan_runtime_diagnostics_unavailable",
                 "missing Vulkan diagnostics should use a stable exact "
                 "fallback reason") &&
          Expect(*degraded == *fallback,
                 "vulkan unavailable degraded reason should match fallback") &&
-         Expect(ArrayContainsString(activeEngines, "cpu"),
-                "vulkan unavailable status should report active cpu engine") &&
+         Expect(activeEngines->empty(),
+                "an idle unavailable pipeline must not report active "
+                "engines") &&
          Expect(*vulkanUnavailable ==
                     "open_vulkan_runtime_diagnostics_unavailable",
                 "Vulkan unavailable reason should preserve the exact "
                 "runtime evidence blocker") &&
-         Expect(JsonBoolField(*fallbackObject, "active", false),
-                "fallback object should mark fallback active") &&
-         Expect(*fallbackCode == "vulkan_unavailable",
-                "fallback object should report vulkan_unavailable code") &&
-         Expect(*providerMode == "cpu",
-                "provider should report CPU mode for CPU fallback") &&
+         Expect(!JsonBoolField(*fallbackObject, "active", true),
+                "an idle blocked plan must not claim an active fallback") &&
+         Expect(fallbackCode->empty(),
+                "an idle blocked plan must not publish an active fallback "
+                "code") &&
+         Expect(providerMode->empty(),
+                "an idle blocked plan must not report an active provider") &&
          Expect(!JsonBoolField(*cpuTails, "active", true),
                 "cpu tail summary should report inactive with zero counters") &&
          Expect(*configBackend == "vulkan",
@@ -1318,8 +1332,8 @@ bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
                 "blocked Vulkan VB should report Vulkan matting reason") &&
          Expect(*resolved == "cpu",
                 "blocked explicit Vulkan should resolve compute to cpu") &&
-         Expect(*active == "cpu",
-                "blocked explicit Vulkan should report active cpu") &&
+         Expect(active->empty(),
+                "blocked idle Vulkan must not report an active CPU path") &&
          Expect(fallback->find("production device-resident matting") !=
                     std::string::npos,
                 "blocked explicit Vulkan fallback should report matting "
@@ -1331,12 +1345,13 @@ bool TestExplicitVulkanVirtualBackgroundReportsOpenVulkanBlocked() {
                     std::string::npos,
                 "blocked explicit Vulkan unavailable reason should report "
                 "matting readiness") &&
-         Expect(JsonBoolField(*fallbackObject, "active", false),
-                "blocked explicit Vulkan should mark fallback active") &&
-         Expect(*fallbackCode == "vulkan_unavailable",
-                "blocked explicit Vulkan should use vulkan_unavailable code") &&
-         Expect(*providerMode == "cpu",
-                "blocked explicit Vulkan must not report a CUDA provider");
+         Expect(!JsonBoolField(*fallbackObject, "active", true),
+                "blocked idle Vulkan must not claim an active fallback") &&
+         Expect(fallbackCode->empty(),
+                "blocked idle Vulkan must not publish an active fallback "
+                "code") &&
+         Expect(providerMode->empty(),
+                "blocked idle Vulkan must not report an active provider");
 }
 
 bool TestExplicitVulkanEyeContactReportsExactFailClosedFacts() {
@@ -1781,11 +1796,14 @@ bool TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() {
                     mirror.backend == "open_vulkan" && mirror.reason.empty(),
                 "exact mirror production evidence must report Vulkan ready") &&
          Expect(mirrorCompute.present && mirrorCompute.resolved == "vulkan" &&
-                    mirrorCompute.active == "vulkan" &&
-                    mirrorCompute.provider_mode == "open_vulkan" &&
+                    mirrorCompute.active.empty() &&
+                    mirrorCompute.provider_mode.empty() &&
+                    mirrorCompute.active_provider.empty() &&
+                    mirrorCompute.active_engine_count == 0 &&
                     !mirrorCompute.fallback_active &&
                     mirrorCompute.fallback.empty(),
-                "stopped mirror-only explicit Vulkan must resolve Vulkan") &&
+                "stopped mirror-only explicit Vulkan must resolve Vulkan "
+                "without claiming live activity") &&
          Expect(vignette.present && vignette.state == "ready" &&
                     vignette.backend == "open_vulkan" &&
                     vignette.reason.empty(),
@@ -1793,10 +1811,110 @@ bool TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() {
                 "ready") &&
          Expect(vignetteCompute.present &&
                     vignetteCompute.resolved == "vulkan" &&
-                    vignetteCompute.active == "vulkan" &&
+                    vignetteCompute.active.empty() &&
+                    vignetteCompute.provider_mode.empty() &&
+                    vignetteCompute.active_engine_count == 0 &&
                     !vignetteCompute.fallback_active &&
                     vignetteCompute.fallback.empty(),
-                "stopped vignette-only explicit Vulkan must resolve Vulkan");
+                "stopped vignette-only explicit Vulkan must resolve Vulkan "
+                "without claiming live activity");
+}
+
+bool TestOpenVulkanInactiveLifecycleSeparatesResolutionFromActivity() {
+  studiocast::video::VirtualCameraServiceConfig config;
+  config.pipeline.compute_backend =
+      studiocast::video::ComputeBackendPreference::vulkan;
+  config.pipeline.effects.mirror = true;
+  const std::string diagnostics = ReadyOpenVulkanPixelDiagnostics(
+      "[\"mirror\"]", "\"mirror_production_ready\":true,"
+                      "\"mirror_readiness_code\":"
+                      "\"open_vulkan_mirror_production_ready\","
+                      "\"mirror_blocker_code\":\"\"");
+
+  const auto expectInactive = [&](const char *name,
+                                  const auto &videoStatus,
+                                  bool expectFailureReason) {
+    const std::string statusJson = StatusForVideoStateWithDiagnostics(
+        videoStatus, config, "", "", diagnostics);
+    const ReadinessFields mirror = ReadinessEntryFor(statusJson, "mirror");
+    const ComputeFields compute = ComputeFieldsFor(statusJson);
+    bool ok = true;
+    ok = Expect(mirror.present && mirror.state == "ready" &&
+                    mirror.backend == "open_vulkan",
+                (std::string(name) +
+                 " must retain exact Vulkan mirror readiness")
+                    .c_str()) &&
+         ok;
+    ok = Expect(compute.present && compute.resolved == "vulkan" &&
+                    compute.active.empty(),
+                (std::string(name) +
+                 " must distinguish resolved Vulkan from no active backend")
+                    .c_str()) &&
+         ok;
+    ok = Expect(compute.active_engine_count == 0 &&
+                    compute.provider_mode.empty() &&
+                    compute.active_provider.empty(),
+                (std::string(name) +
+                 " must not publish active engines or a provider")
+                    .c_str()) &&
+         ok;
+    ok = Expect(!compute.fallback_active,
+                (std::string(name) +
+                 " must not claim an active fallback while inactive")
+                    .c_str()) &&
+         ok;
+    if (expectFailureReason) {
+      ok = Expect(compute.fallback == "vulkan_effect_initialization_failed" &&
+                      compute.degraded == compute.fallback,
+                  "failed start must preserve its exact cached failure reason") &&
+           ok;
+    } else {
+      ok = Expect(compute.fallback.empty() && compute.degraded.empty(),
+                  (std::string(name) +
+                   " must not invent a fallback from inactivity")
+                      .c_str()) &&
+           ok;
+    }
+    return ok;
+  };
+
+  bool ok = true;
+
+  studiocast::video::VirtualCameraServiceStatus stopped;
+  stopped.service_running = true;
+  stopped.pipeline.effects_backends = "mirror:open_vulkan";
+  config.enabled = false;
+  ok = expectInactive("stopped pipeline with a stale active map", stopped,
+                      false) &&
+       ok;
+
+  studiocast::video::VirtualCameraServiceStatus waiting;
+  waiting.service_running = true;
+  waiting.pipeline_state = "idle_no_consumer";
+  waiting.pipeline_idle_reason = "no_consumer";
+  config.enabled = true;
+  ok = expectInactive("idle no-consumer pipeline", waiting, false) && ok;
+
+  auto starting = waiting;
+  starting.pipeline.starting = true;
+  starting.pipeline_active_needed = true;
+  starting.pipeline_state = "starting";
+  starting.pipeline_idle_reason.clear();
+  ok = expectInactive("starting pipeline", starting, false) && ok;
+
+  auto failedStart = waiting;
+  failedStart.pipeline_active_needed = true;
+  failedStart.pipeline_state = "backing_off";
+  failedStart.last_transition = "start_failed";
+  failedStart.pipeline_start_failures = 1;
+  failedStart.pipeline.last_error = "Open Vulkan mirror start failed.";
+  failedStart.pipeline.compute_backend_fallback_reason =
+      "vulkan_effect_initialization_failed";
+  failedStart.pipeline.compute_backend_degraded_reason =
+      "vulkan_effect_initialization_failed";
+  ok = expectInactive("failed-start pipeline", failedStart, true) && ok;
+
+  return ok;
 }
 
 bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
@@ -1814,6 +1932,8 @@ bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
   studiocast::video::VirtualCameraServiceStatus inactive;
   inactive.service_running = true;
   inactive.pipeline.running = true;
+  inactive.pipeline.compute_backend_resolved = "vulkan";
+  inactive.pipeline.compute_backend_active = "vulkan";
   const std::string inactiveStatus =
       StatusForVideoStateWithDiagnostics(inactive, config, "", "", diagnostics);
   const ReadinessFields missingMap =
@@ -1834,6 +1954,9 @@ bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
                 "a running pipeline must not claim mirror without active-map "
                 "evidence") &&
          Expect(missingMapCompute.active == "cpu" &&
+                    missingMapCompute.provider_mode == "cpu" &&
+                    missingMapCompute.active_engine_count == 1 &&
+                    missingMapCompute.fallback_active &&
                     missingMapCompute.fallback ==
                         "open_vulkan_mirror_live_stage_not_active",
                 "running mirror fallback must be effect-specific") &&
@@ -1842,6 +1965,8 @@ bool TestLiveOpenVulkanPixelReadinessRequiresActiveMap() {
                 "authoritative live Vulkan mirror attribution must be ready") &&
          Expect(activeCompute.resolved == "vulkan" &&
                     activeCompute.active == "vulkan" &&
+                    activeCompute.provider_mode == "open_vulkan" &&
+                    activeCompute.active_engine_count == 1 &&
                     !activeCompute.fallback_active,
                 "active map must repair aggregate compute attribution");
 }
@@ -2059,8 +2184,10 @@ bool TestTrackedCenterVignetteFailsClosedWhenAutoFrameIsRetained() {
                     vignette.reason ==
                         "vulkan_vignette_tracked_center_not_supported",
                 "retained tracked-center Vulkan vignette must fail closed") &&
-         Expect(compute.resolved == "vulkan" && compute.active == "vulkan",
-                "retained Auto Frame evidence may still resolve Vulkan");
+         Expect(compute.resolved == "vulkan" && compute.active.empty() &&
+                    !compute.fallback_active,
+                "retained Auto Frame evidence may resolve Vulkan without "
+                "claiming idle activity");
 }
 
 bool TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() {
@@ -2091,9 +2218,11 @@ bool TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() {
          Expect(blur.state == "backend_unavailable" &&
                     blur.reason == "open_vulkan_matting_unavailable",
                 "mixed request must preserve the blocked sibling reason") &&
-         Expect(compute.resolved == "vulkan" && compute.active == "vulkan" &&
+         Expect(compute.resolved == "vulkan" && compute.active.empty() &&
+                    compute.active_engine_count == 0 &&
                     !compute.fallback_active && compute.fallback.empty(),
-                "a retained ready Vulkan effect must keep compute on Vulkan");
+                "a retained ready Vulkan effect must resolve Vulkan without "
+                "inventing idle activity");
 }
 
 bool TestUnavailableVulkanRequestUsesRequestedEffectBlocker() {
@@ -2119,8 +2248,9 @@ bool TestUnavailableVulkanRequestUsesRequestedEffectBlocker() {
   const ComputeFields compute = ComputeFieldsFor(
       StatusForVideoConfigWithDiagnostics(config, "", "", diagnostics));
   return Expect(compute.present && compute.resolved == "cpu" &&
-                    compute.active == "cpu" && compute.fallback_active,
-                "an unavailable sole Vulkan effect must fail over") &&
+                    compute.active.empty() && !compute.fallback_active,
+                "an unavailable idle Vulkan effect must stay inactive while "
+                "reporting its blocker") &&
          Expect(compute.fallback.find("open_vulkan_eye_contact_unavailable") !=
                         std::string::npos &&
                     compute.fallback.find(
@@ -2263,6 +2393,7 @@ int main() {
   ok = TestExplicitVulkanVideoNoiseRemovalReportsExactFailClosedFacts() && ok;
   ok = TestOpenVulkanDisabledBuildKeepsVideoNoiseRemovalSchema() && ok;
   ok = TestExactOpenVulkanPixelEffectsReadyAndIgnoreMattingBlocker() && ok;
+  ok = TestOpenVulkanInactiveLifecycleSeparatesResolutionFromActivity() && ok;
   ok = TestLiveOpenVulkanPixelReadinessRequiresActiveMap() && ok;
   ok = TestOpenVulkanPixelEvidenceFailsClosedWhenInconsistent() && ok;
   ok = TestOpenVulkanPixelCommonHardwareFactsFailClosed() && ok;
