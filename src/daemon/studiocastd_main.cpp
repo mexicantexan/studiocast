@@ -3592,6 +3592,8 @@ int main(int argc, char **argv) {
 
             if (pc.cmd == "GET_DIAGNOSTICS" ||
                 pc.cmd == "REFRESH_DIAGNOSTICS") {
+              if (pc.cmd == "REFRESH_DIAGNOSTICS")
+                audioSvc.RefreshPreparation();
               const DiagnosticsJsonSnapshot diagnostics =
                   RefreshDiagnosticsJsonCache();
               return std::string("OK ") +

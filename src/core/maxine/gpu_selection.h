@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <utility>
@@ -30,6 +31,7 @@ struct GpuSelectionResult {
 // Maxine VFX is effectively RTX-class/Turing+ in practice (Tensor cores).
 bool IsComputeCapabilitySupported(int major, int minor);
 
-GpuSelectionResult SelectGpu(const config::GpuSelection &policy);
+GpuSelectionResult SelectGpu(const config::GpuSelection &policy,
+                             const std::atomic_bool *stop_requested = nullptr);
 
 } // namespace studiocast::maxine

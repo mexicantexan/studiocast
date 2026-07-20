@@ -104,6 +104,12 @@ bool IsUnsafeSpeakerTargetSinkName(const std::string &name,
 
 AudioSourceResolution
 ResolveSafeInputSourceName(const std::string &configured_source) {
+  return ResolveSafeInputSourceName(configured_source, nullptr);
+}
+
+AudioSourceResolution ResolveSafeInputSourceName(
+    const std::string &configured_source,
+    const std::atomic_bool *stop_requested) {
   AudioSourceResolution out;
 
   std::string chosen = Trimmed(configured_source);
@@ -122,7 +128,7 @@ ResolveSafeInputSourceName(const std::string &configured_source) {
   }
 
   std::string defaultErr;
-  auto def = pulse::GetDefaultSourceName(&defaultErr);
+  auto def = pulse::GetDefaultSourceName(&defaultErr, stop_requested);
   if (def) {
     chosen = Trimmed(*def);
     if (!IsUnsafeInputSourceName(chosen, &reason)) {
@@ -140,7 +146,7 @@ ResolveSafeInputSourceName(const std::string &configured_source) {
   }
 
   std::string listErr;
-  const auto sources = pulse::ListSources(&listErr);
+  const auto sources = pulse::ListSources(&listErr, stop_requested);
   for (const auto &source : sources) {
     std::string candidateReason;
     if (!source.name.empty() &&
@@ -177,6 +183,12 @@ ResolveSafeInputSourceName(const std::string &configured_source) {
 std::optional<std::string>
 ChooseSafeSpeakerTargetSinkName(const std::string &configured_target,
                                 std::string *error) {
+  return ChooseSafeSpeakerTargetSinkName(configured_target, error, nullptr);
+}
+
+std::optional<std::string> ChooseSafeSpeakerTargetSinkName(
+    const std::string &configured_target, std::string *error,
+    const std::atomic_bool *stop_requested) {
   if (error)
     error->clear();
 
@@ -195,7 +207,7 @@ ChooseSafeSpeakerTargetSinkName(const std::string &configured_target,
   }
 
   std::string defaultErr;
-  auto def = pulse::GetDefaultSinkName(&defaultErr);
+  auto def = pulse::GetDefaultSinkName(&defaultErr, stop_requested);
   if (def) {
     chosen = Trimmed(*def);
     if (!IsUnsafeSpeakerTargetSinkName(chosen, &reason))
@@ -203,7 +215,7 @@ ChooseSafeSpeakerTargetSinkName(const std::string &configured_target,
   }
 
   std::string listErr;
-  const auto sinks = pulse::ListSinks(&listErr);
+  const auto sinks = pulse::ListSinks(&listErr, stop_requested);
   for (const auto &sink : sinks) {
     std::string candidateReason;
     if (!sink.name.empty() &&
