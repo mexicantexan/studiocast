@@ -221,12 +221,21 @@ class PackagingIntegrationTests(unittest.TestCase):
             signing_job.index("git merge-base --is-ancestor"),
             signing_job.index("secrets.RELEASE_SIGNING_KEY_B64"),
         )
-        self.assertIn("git get-tar-commit-id", signing_job)
         self.assertIn("sha256sum --check", signing_job)
         self.assertIn("packaging/release/release_tool.py", signing_job)
+        self.assertIn("packaging/release/verify_canonical_source_archive.sh", signing_job)
+        self.assertNotIn("git get-tar-commit-id", signing_job)
+        self.assertIn("packaging/appimage/verify_type2_appimage.py", signing_job)
+        self.assertIn("--runtime-sha256 \"${appimage_runtime_sha256}\"", signing_job)
+        self.assertLess(
+            signing_job.index("packaging/appimage/verify_type2_appimage.py"),
+            signing_job.index("secrets.RELEASE_SIGNING_KEY_B64"),
+        )
+        self.assertIn("APPIMAGE_RUNTIME_ASSET_ID", signing_job)
+        self.assertIn("Accept: application/octet-stream", signing_job)
         self.assertIn("Hermetically verify signed release and packaged trust root", signing_job)
         self.assertIn(
-            'embedded_source="${extracted}/squashfs-root/usr/share/studiocast/source/',
+            'embedded_source="${appimage_extract_dir}/usr/share/studiocast/source/',
             signing_job,
         )
         self.assertIn('cmp "${source_archive}" "${embedded_source}"', signing_job)
@@ -246,8 +255,17 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn("ancestor of the fetched remote default branch", release_docs)
 
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
-        self.assertIn('"${appimage}" --appimage-extract', verifier)
+        self.assertNotIn("--appimage-extract", verifier)
+        self.assertIn("verify_type2_appimage.py", verifier)
+        self.assertIn("--appdir-tar", verifier)
         self.assertIn("forbidden secret PEM marker", verifier)
+
+        tools_lock = (ROOT / "packaging/appimage/tools.lock").read_text(encoding="utf-8")
+        self.assertIn('APPIMAGE_RUNTIME_ASSET_ID="456065460"', tools_lock)
+        self.assertIn(
+            'APPIMAGE_RUNTIME_SHA256="1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"',
+            tools_lock,
+        )
 
         missing_key = subprocess.run(
             [str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run", "--appimage-required"],
@@ -258,6 +276,20 @@ class PackagingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(2, missing_key.returncode)
         self.assertIn("require at least one --trusted-release-key", missing_key.stderr)
+
+        missing_runtime = subprocess.run(
+            [
+                str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run",
+                "--appimage-required", "--trusted-release-key",
+                f"{PRODUCTION_KEY_ID}={ROOT / f'packaging/release/keys/{PRODUCTION_KEY_ID}.pem'}",
+            ],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(2, missing_runtime.returncode)
+        self.assertIn("require --appimage-runtime", missing_runtime.stderr)
 
         contradictory = subprocess.run(
             [

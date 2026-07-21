@@ -60,7 +60,7 @@ jobs:
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
-            desktop-file-utils file patchelf
+            desktop-file-utils file patchelf squashfs-tools
 
       - name: Download pinned AppImage packaging tools
         run: |
@@ -98,6 +98,15 @@ jobs:
             "${LINUXDEPLOY_PLUGIN_QT_SHA256}" \
             "${HOME}/.local/bin/linuxdeploy-plugin-qt-x86_64.AppImage"
 
+          echo "Downloading SHA-pinned AppImage runtime asset ${APPIMAGE_RUNTIME_ASSET_ID}"
+          curl --fail --location --retry 3 \
+            --header 'Accept: application/octet-stream' \
+            --output "${HOME}/.local/bin/runtime-x86_64" \
+            "${APPIMAGE_RUNTIME_URL}"
+          printf '%s  %s\n' \
+            "${APPIMAGE_RUNTIME_SHA256}" "${HOME}/.local/bin/runtime-x86_64" | \
+            sha256sum --check -
+
           ln -sf "${HOME}/.local/bin/linuxdeploy-plugin-qt-x86_64.AppImage" \
             "${HOME}/.local/bin/linuxdeploy-plugin-qt"
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
@@ -109,12 +118,14 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           packaging/appimage/build_appimage.sh --clean --appimage-required \
+            --appimage-runtime "${HOME}/.local/bin/runtime-x86_64" \
             --trusted-release-key \
             "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
 
       - name: Verify unsigned GUI installer bundle
         run: |
           packaging/appimage/verify_bundle.sh --require-appimage \
+            --appimage-runtime "${HOME}/.local/bin/runtime-x86_64" \
             --trusted-release-key \
             "${RELEASE_PUBLIC_KEY_ID}=${RELEASE_PUBLIC_KEY_PATH}"
 
@@ -178,6 +189,28 @@ jobs:
         with:
           name: studiocast-gui-installer-ubuntu-22.04-unsigned
           path: dist/appimage
+
+      - name: Install independent AppImage verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+
+      - name: Download SHA-pinned AppImage runtime
+        run: |
+          # shellcheck source=/dev/null
+          source packaging/appimage/tools.lock
+          runtime_file="${RUNNER_TEMP}/runtime-x86_64"
+          echo "Downloading SHA-pinned AppImage runtime asset ${APPIMAGE_RUNTIME_ASSET_ID}"
+          curl --fail --location --retry 3 \
+            --header 'Accept: application/octet-stream' \
+            --output "${runtime_file}" \
+            "${APPIMAGE_RUNTIME_URL}"
+          printf '%s  %s\n' "${APPIMAGE_RUNTIME_SHA256}" "${runtime_file}" | \
+            sha256sum --check -
+          {
+            echo "appimage_runtime_file=${runtime_file}"
+            echo "appimage_runtime_sha256=${APPIMAGE_RUNTIME_SHA256}"
+          } >> "${GITHUB_ENV}"
 
       - name: Validate unsigned artifact identity
         env:
@@ -247,8 +280,9 @@ jobs:
             "$(printf '%s\n' "${checksum_expected[@]}")"
           (cd dist/appimage && sha256sum --check "$(basename "${checksum_file}")")
 
-          archive_commit="$(gzip -cd -- "${source_archive}" | git get-tar-commit-id)"
-          test "${archive_commit}" = "${expected_commit}"
+          packaging/release/verify_canonical_source_archive.sh \
+            "${source_archive}" "${expected_commit}" "${version}" "${GITHUB_WORKSPACE}" \
+            >/dev/null
           test "$(tar -xOzf "${source_archive}" "StudioCast-${version}/VERSION" | \
             tr -d '[:space:]')" = "${version}"
           tar -xOzf "${appdir_archive}" \
@@ -262,6 +296,22 @@ jobs:
           ! tar -xOzf "${source_archive}" | grep -aE -- "${forbidden}" >/dev/null
           ! tar -xOzf "${appdir_archive}" | grep -aE -- "${forbidden}" >/dev/null
 
+          appimage_extract_parent="$(mktemp -d \
+            "${RUNNER_TEMP}/studiocast-appimage.XXXXXX")"
+          appimage_extract_dir="${appimage_extract_parent}/squashfs-root"
+          python3 packaging/appimage/verify_type2_appimage.py \
+            --appimage "${installer_appimage}" \
+            --runtime-file "${appimage_runtime_file}" \
+            --runtime-sha256 "${appimage_runtime_sha256}" \
+            --appdir-tar "${appdir_archive}" \
+            --extract-dir "${appimage_extract_dir}"
+          cmp "${RELEASE_PUBLIC_KEY_PATH}" \
+            "${appimage_extract_dir}/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem"
+          cmp "${source_archive}" \
+            "${appimage_extract_dir}/usr/share/studiocast/source/$(basename "${source_archive}")"
+          test -z "$(find "${appimage_extract_dir}" -type f \
+            -exec grep -IlE -- "${forbidden}" {} + || true)"
+
           {
             echo "version=${version}"
             echo "expected_commit=${expected_commit}"
@@ -269,6 +319,8 @@ jobs:
             echo "installer_appimage=${installer_appimage}"
             echo "appdir_archive=${appdir_archive}"
             echo "checksum_file=${checksum_file}"
+            echo "appimage_extract_parent=${appimage_extract_parent}"
+            echo "appimage_extract_dir=${appimage_extract_dir}"
           } >> "${GITHUB_ENV}"
 
       - name: Generate signed stable release manifest
@@ -312,8 +364,6 @@ jobs:
           unset private_key
 
       - name: Hermetically verify signed release and packaged trust root
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           python3 packaging/release/verify_signed_release.py \
             --manifest dist/appimage/studiocast-release-manifest.json \
@@ -323,22 +373,17 @@ jobs:
             --public-key "${RELEASE_PUBLIC_KEY_PATH}" \
             --key-id "${RELEASE_PUBLIC_KEY_ID}"
 
-          # actions/download-artifact does not preserve executable modes.
-          chmod 0755 "${installer_appimage}"
-          extracted="$(mktemp -d "${RUNNER_TEMP}/studiocast-appimage.XXXXXX")"
-          trap 'rm -rf -- "${extracted}"' EXIT
-          (cd "${extracted}" && "${GITHUB_WORKSPACE}/${installer_appimage}" \
-            --appimage-extract >/dev/null)
+          trap 'rm -rf -- "${appimage_extract_parent}"' EXIT
           cmp \
             "${RELEASE_PUBLIC_KEY_PATH}" \
-            "${extracted}/squashfs-root/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem"
-          embedded_source="${extracted}/squashfs-root/usr/share/studiocast/source/$(basename "${source_archive}")"
+            "${appimage_extract_dir}/usr/share/studiocast/installer/trust/keys/${RELEASE_PUBLIC_KEY_ID}.pem"
+          embedded_source="${appimage_extract_dir}/usr/share/studiocast/source/$(basename "${source_archive}")"
           test -f "${embedded_source}"
           test ! -L "${embedded_source}"
           cmp "${source_archive}" "${embedded_source}"
 
           forbidden='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
-          test -z "$(find "${extracted}/squashfs-root" -type f \
+          test -z "$(find "${appimage_extract_dir}" -type f \
             -exec grep -IlE -- "${forbidden}" {} + || true)"
           ! tar -xOzf "${source_archive}" | grep -aE -- "${forbidden}" >/dev/null
           ! tar -xOzf "${appdir_archive}" | grep -aE -- "${forbidden}" >/dev/null

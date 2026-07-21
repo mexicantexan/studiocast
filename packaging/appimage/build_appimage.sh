@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=packaging/appimage/tools.lock
+source "${SCRIPT_DIR}/tools.lock"
 
 VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
 ARCH="$(uname -m)"
@@ -18,6 +20,7 @@ SOURCE_ARCHIVE_PATH="${DIST_DIR}/${SOURCE_ARCHIVE_NAME}"
 STAGED_SOURCE_ARCHIVE="${APPDIR}/usr/share/studiocast/source/${SOURCE_ARCHIVE_NAME}"
 CHECKSUM_FILE="${DIST_DIR}/${BUNDLE_BASENAME}.sha256"
 LINUXDEPLOY_PATH="${LINUXDEPLOY:-}"
+APPIMAGE_RUNTIME_PATH="${APPIMAGE_RUNTIME:-}"
 DRY_RUN=0
 APPIMAGE_REQUIRED=0
 SKIP_APPIMAGE=0
@@ -52,6 +55,9 @@ Options:
   --cmake-arg ARG           Extra CMake configure argument. May be repeated.
   --linuxdeploy PATH        linuxdeploy executable/AppImage path.
                             Defaults to \$LINUXDEPLOY or PATH lookup.
+  --appimage-runtime PATH   SHA-pinned type-2 AppImage runtime passed to
+                            linuxdeploy via LDAI_RUNTIME_FILE. Required with
+                            --appimage-required.
   --skip-appimage           Only stage and archive the AppDir.
   --appimage-required       Fail if linuxdeploy cannot produce an AppImage.
   --trusted-release-key ID=PATH
@@ -176,6 +182,15 @@ validate_paths_and_trust() {
   if [[ "${APPIMAGE_REQUIRED}" -eq 1 && "${#TRUSTED_RELEASE_KEYS[@]}" -eq 0 ]]; then
     die "release AppImages require at least one --trusted-release-key ID=PATH"
   fi
+  if [[ -n "${APPIMAGE_RUNTIME_PATH}" ]]; then
+    [[ -f "${APPIMAGE_RUNTIME_PATH}" && ! -L "${APPIMAGE_RUNTIME_PATH}" ]] ||
+      die "AppImage runtime must be a regular non-symlink file: ${APPIMAGE_RUNTIME_PATH}"
+    printf '%s  %s\n' "${APPIMAGE_RUNTIME_SHA256}" "${APPIMAGE_RUNTIME_PATH}" |
+      sha256sum --check - >/dev/null 2>&1 ||
+      die "AppImage runtime does not match packaging/appimage/tools.lock"
+  elif [[ "${APPIMAGE_REQUIRED}" -eq 1 ]]; then
+    die "release AppImages require --appimage-runtime PATH"
+  fi
 }
 
 validate_source_identity() {
@@ -286,6 +301,11 @@ parse_args() {
       --linuxdeploy)
         [[ $# -ge 2 ]] || die "--linuxdeploy requires a path"
         LINUXDEPLOY_PATH="$2"
+        shift 2
+        ;;
+      --appimage-runtime)
+        [[ $# -ge 2 ]] || die "--appimage-runtime requires a path"
+        APPIMAGE_RUNTIME_PATH="$2"
         shift 2
         ;;
       --skip-appimage)
@@ -437,6 +457,13 @@ build_appimage() {
     log "Skipping AppImage generation by request"
     return 1
   }
+  if [[ -z "${APPIMAGE_RUNTIME_PATH}" ]]; then
+    if [[ "${APPIMAGE_REQUIRED}" -eq 1 ]]; then
+      die "required AppImage generation needs a SHA-pinned --appimage-runtime"
+    fi
+    log "No SHA-pinned AppImage runtime supplied; leaving the staged AppDir archive"
+    return 1
+  fi
 
   local linuxdeploy
   if ! linuxdeploy="$(find_linuxdeploy)"; then
@@ -467,6 +494,7 @@ build_appimage() {
     VERSION="${VERSION}" \
     OUTPUT="${APPIMAGE_PATH}" \
     APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}" \
+    LDAI_RUNTIME_FILE="${APPIMAGE_RUNTIME_PATH}" \
     QMAKE="${qmake6}" \
     PATH="${qmake_shim_dir}:${PATH}" \
     "${linuxdeploy}" \

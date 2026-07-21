@@ -206,14 +206,16 @@ Release CI separates building from signing. The build job never references a
 signing variable or secret. It verifies and uploads an exact unsigned artifact
 set: AppImage, AppDir archive, source archive, and checksum file. A fresh signing
 job downloads those bytes, checks their exact names and checksums, binds the
-source archive's embedded `git archive` commit to the event commit, verifies the
-event commit is an ancestor of the fetched remote default branch, then checks
-the version/tag identity and compares the AppDir's public key and staged source
-to the committed inputs before the protected environment secret is injected
-into the signing step. A missing remote default-branch ref or failed ancestry
-check fails closed for both published releases and signed dry runs. This
-workflow check still runs when self-review or administrator bypass permits the
-protected job to start.
+source archive to the event commit by regenerating the exact canonical
+`git archive --format=tar.gz` bytes and comparing them, verifies the event
+commit is an ancestor of the fetched remote default branch, then checks the
+version/tag identity and compares the AppDir's public key and staged source to
+the committed inputs before the protected environment secret is injected into
+the signing step. The archive's forgeable pax commit header is not treated as
+identity evidence. A missing remote default-branch ref, failed ancestry check,
+or byte-different source archive fails closed for both published releases and
+signed dry runs. This workflow check still runs when self-review or
+administrator bypass permits the protected job to start.
 
 Only the signing job references `RELEASE_SIGNING_KEY_B64` and the repository
 variable `RELEASE_SIGNING_KEY_ID=studiocast-release-2026`. It runs in the
@@ -234,11 +236,21 @@ matching GitHub Release.
 
 After the private-key file has been removed, CI verifies the detached manifest
 signature and both artifacts' signed size, SHA-256, filename, and Ed25519
-identity against the committed public key. It also extracts the final AppImage,
-byte-compares its embedded source archive to the verified standalone source,
-compares its `usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem`
-bytes to the committed key, and rejects forbidden secret PEM markers in staged
-and uploaded release artifacts.
+identity against the committed public key. AppImage inspection never executes
+the unsigned target. Before secret injection, CI downloads a type-2 runtime by
+immutable GitHub asset ID, verifies its pinned SHA-256, and uses the fixed
+`/usr/bin/unsquashfs` package tool to locate and extract exactly one SquashFS
+payload. The AppImage must have the expected ELF/type-2 header and a byte-exact
+runtime prefix; only the runtime's non-executable 16-byte AppImage digest field
+may differ. The SquashFS must begin immediately after that runtime, end at the
+canonical padded file boundary with no appended payload, and reproduce the
+verified AppDir archive's complete file types, paths, modes, regular-file
+sizes/hashes, and symlink targets. Unsafe, dangling, cyclic, or escaping links
+fail closed. CI then byte-compares the embedded source archive to the verified
+standalone source, compares
+`usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem` to the
+committed key, and rejects forbidden secret PEM markers in staged and uploaded
+release artifacts.
 
 Key rotation must first ship the replacement public key in an installer signed
 by `studiocast-release-2026`. Release manifests may use the replacement key ID

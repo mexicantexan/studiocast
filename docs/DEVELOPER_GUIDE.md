@@ -208,17 +208,19 @@ Release packaging:
   matching source archive. Runtime dependencies still come from supported system
   packages, ONNX Runtime/model helpers, optional SDK assets, and the installer
   backend scripts.
-- Local packaging does not download tools. If `linuxdeploy` and
-  `linuxdeploy-plugin-qt` are available, the script also creates
+- Local packaging does not download tools. If `linuxdeploy`,
+  `linuxdeploy-plugin-qt`, and the SHA-pinned type-2 AppImage runtime are
+  supplied, the script also creates
   `StudioCast-Installer-<version>-<arch>.AppImage`; otherwise it leaves the
   staged AppDir tarball as the local artifact.
 - Release CI is in `.github/workflows/release-packaging.yml`. It runs only from
   `workflow_dispatch` or a published GitHub Release event, downloads AppImage
-  packaging tools from `packaging/appimage/tools.lock`, verifies each tool's
-  SHA256 before making it executable, requires AppImage generation with the
-  committed public trust root, and uploads an exact unsigned set containing the
-  installer bundle, AppDir archive, source archive, and checksum file. The build
-  job has no access to signing variables or secrets. Published releases are
+  packaging tools and type-2 runtime from `packaging/appimage/tools.lock`,
+  verifies each SHA256 before use, forces linuxdeploy to use that runtime via
+  `LDAI_RUNTIME_FILE`, requires AppImage generation with the committed public
+  trust root, and uploads an exact unsigned set containing the installer bundle,
+  AppDir archive, source archive, and checksum file. The build job has no access
+  to signing variables or secrets. Published releases are
   signed by a separate fresh job; workflow dispatch is unsigned unless its
   `signing_dry_run` input is explicitly enabled on the repository default
   branch. Signed dispatch from another ref fails closed.
@@ -228,16 +230,20 @@ Release packaging:
   bypass, so human approval is not an unconditional barrier.
   `RELEASE_SIGNING_KEY_B64` exists only as an environment secret;
   `RELEASE_SIGNING_KEY_ID` is the repository variable. The job downloads the
-  unsigned artifact set, validates its exact names, checksums, source commit,
-  version/tag identity, staged source, and packaged public key, and requires the
-  event commit to be an ancestor of the fetched remote default branch before
-  injecting the secret into the signing step. Missing or non-ancestral refs fail
-  closed even when environment self-review or administrator bypass lets the job
-  start. It checks out signing code at the immutable workflow commit, removes
-  its ephemeral key before inspecting the built AppImage, then hermetically
-  verifies the manifest, both signed artifacts, and the AppImage's byte-identical
-  embedded source archive against the committed public key and verified source.
-  The workflow does not tag commits or publish release assets by itself.
+  unsigned artifact set, validates its exact names and checksums, regenerates
+  the canonical source archive for the event commit and requires byte identity,
+  validates version/tag identity, staged source, and packaged public key, and
+  requires the event commit to be an ancestor of the fetched remote default
+  branch before injecting the secret into the signing step. Missing or
+  non-ancestral refs and forgeable pax-header-only commit claims fail closed
+  even when environment self-review or administrator bypass lets the job start.
+  It checks out signing code at the immutable workflow commit. Before secret
+  injection it verifies the pinned AppImage runtime prefix, independently
+  extracts the unique SquashFS with `/usr/bin/unsquashfs` without executing the
+  target AppImage, and compares its full topology, modes, hashes, sizes, and
+  symlink targets with the verified AppDir archive. It removes the ephemeral
+  private key before the final signed-artifact checks. The workflow does not tag
+  commits or publish release assets by itself.
 - Recommended remains a target-machine source build, but only after the backend
   verifies the signed stable manifest and source artifact signature/hash/size.
   `--official-source` is not proof. Local directories/archives remain
@@ -297,15 +303,17 @@ First release checklist:
    the AppImage, AppDir archive, source archive, SHA256 file, release manifest,
    and manifest signature to the GitHub Release.
 
-Pinned AppImage tool updates:
+Pinned AppImage tool and runtime updates:
 
 1. Choose fixed release asset URLs for `linuxdeploy` and
-   `linuxdeploy-plugin-qt`; do not pin to upstream `continuous` URLs.
-2. Download each AppImage and record `sha256sum <file>`.
-3. Update `packaging/appimage/tools.lock` with the matching version, URL, and
-   SHA256 values in one change.
+   `linuxdeploy-plugin-qt`; do not pin to upstream `continuous` URLs. Select the
+   type-2 runtime by immutable GitHub release asset ID rather than a moving
+   release URL.
+2. Download each tool and runtime and record `sha256sum <file>`.
+3. Update `packaging/appimage/tools.lock` with the matching tool versions/URLs,
+   runtime commit and asset ID, and all SHA256 values in one change.
 4. Run release packaging or a workflow-dispatch dry run so CI verifies the
-   checksums before either packaging tool is executed.
+   checksums and runtime/payload identity before signing.
 
 Maintainer command:
 
@@ -317,9 +325,15 @@ For release-equivalent local validation with preinstalled packaging tools:
 
 ```bash
 packaging/appimage/build_appimage.sh --clean --appimage-required \
+  --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
   --trusted-release-key \
   studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
 ```
+
+The runtime path must be a regular non-symlink file matching
+`APPIMAGE_RUNTIME_SHA256` in `packaging/appimage/tools.lock`. Install
+`squashfs-tools` to run `verify_bundle.sh`; verification uses the fixed
+`/usr/bin/unsquashfs` path and never invokes the produced AppImage.
 
 ## Daemon architecture
 

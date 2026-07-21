@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=packaging/appimage/tools.lock
+source "${SCRIPT_DIR}/tools.lock"
 
 VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
 ARCH="$(uname -m)"
 DIST_DIR="${REPO_ROOT}/dist/appimage"
 APPDIR=""
 REQUIRE_APPIMAGE=0
+APPIMAGE_RUNTIME_PATH="${APPIMAGE_RUNTIME:-}"
 TRUSTED_RELEASE_KEYS=()
 
 usage() {
@@ -24,6 +27,8 @@ Options:
   --appdir DIR            Staged AppDir path. Defaults to the AppDir expected
                           under --dist-dir for VERSION and uname -m.
   --require-appimage      Require and verify the AppImage artifact.
+  --appimage-runtime PATH SHA-pinned type-2 runtime used to verify the
+                          AppImage executable prefix without running it.
   --trusted-release-key ID=PATH
                           Require this exact public key in the staged AppDir
                           and final AppImage. May be repeated.
@@ -281,17 +286,23 @@ verify_no_secret_pem_in_dist_files() {
 }
 
 verify_final_appimage() {
-  local appimage
+  local appimage appdir_tar runtime
   appimage="$(realpath -e -- "$1")"
-  shift
+  appdir_tar="$(realpath -e -- "$2")"
+  runtime="$(realpath -e -- "$3")"
+  shift 3
   local temporary extracted
   temporary="$(mktemp -d)"
-  if ! (cd "${temporary}" && APPIMAGE_EXTRACT_AND_RUN=1 \
-      "${appimage}" --appimage-extract >/dev/null); then
-    rm -rf -- "${temporary}"
-    die "could not extract final AppImage for trust-root verification"
-  fi
   extracted="${temporary}/squashfs-root"
+  if ! python3 "${SCRIPT_DIR}/verify_type2_appimage.py" \
+      --appimage "${appimage}" \
+      --runtime-file "${runtime}" \
+      --runtime-sha256 "${APPIMAGE_RUNTIME_SHA256}" \
+      --appdir-tar "${appdir_tar}" \
+      --extract-dir "${extracted}"; then
+    rm -rf -- "${temporary}"
+    die "independent final AppImage verification failed"
+  fi
   verify_trust_roots "${extracted}" 1
   verify_expected_trust_roots "${extracted}" "$@"
   verify_no_secret_pem_in_tree "${extracted}"
@@ -561,6 +572,11 @@ parse_args() {
         REQUIRE_APPIMAGE=1
         shift
         ;;
+      --appimage-runtime)
+        [[ $# -ge 2 ]] || die "--appimage-runtime requires a path"
+        APPIMAGE_RUNTIME_PATH="$2"
+        shift 2
+        ;;
       --trusted-release-key)
         [[ $# -ge 2 ]] || die "--trusted-release-key requires ID=PATH"
         TRUSTED_RELEASE_KEYS+=("$2")
@@ -610,8 +626,10 @@ main() {
 
   if [[ "${REQUIRE_APPIMAGE}" -eq 1 ]]; then
     require_executable "${appimage_path}"
+    require_file "${APPIMAGE_RUNTIME_PATH}"
     checksum_contains "${checksum_file}" "${appimage_path}"
   elif [[ -f "${appimage_path}" ]]; then
+    require_file "${APPIMAGE_RUNTIME_PATH}"
     checksum_contains "${checksum_file}" "${appimage_path}"
   fi
 
@@ -651,7 +669,8 @@ main() {
   verify_no_secret_pem_in_source_archive "${source_archive_path}"
   verify_no_secret_pem_in_dist_files "${DIST_DIR}"
   if [[ -f "${appimage_path}" ]]; then
-    verify_final_appimage "${appimage_path}" "${TRUSTED_RELEASE_KEYS[@]}"
+    verify_final_appimage "${appimage_path}" "${appdir_tarball}" \
+      "${APPIMAGE_RUNTIME_PATH}" "${TRUSTED_RELEASE_KEYS[@]}"
   fi
   verify_packaged_backend_layout "${APPDIR}"
   verify_source_archive_layout "${source_archive_path}" "${source_prefix}" \
