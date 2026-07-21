@@ -4,17 +4,34 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
-from release_channel import (
-    ReleaseChannelError,
-    TrustedKeyStore,
-    strict_json_loads,
-    verify_artifact,
-    verify_manifest,
-)
+
+def _load_release_channel():
+    repository_root = Path(__file__).resolve().parents[2]
+    expected_directory = (repository_root / "installer/release").resolve(strict=True)
+    path = repository_root / "installer/release/release_channel.py"
+    resolved = path.resolve(strict=True)
+    if path.is_symlink() or resolved.parent != expected_directory or not resolved.is_file():
+        raise RuntimeError("canonical installer release contract is missing or unsafe")
+    spec = importlib.util.spec_from_file_location("studiocast_installer_release_channel", resolved)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load canonical installer release contract")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_release_channel = _load_release_channel()
+ReleaseChannelError = _release_channel.ReleaseChannelError
+TrustedKeyStore = _release_channel.TrustedKeyStore
+strict_json_loads = _release_channel.strict_json_loads
+verify_artifact = _release_channel.verify_artifact
+verify_manifest = _release_channel.verify_manifest
 
 
 def _require_key_id(value: object, expected: str, where: str) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import io
 import json
 import pathlib
@@ -15,9 +16,13 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/data/installer_release"
-sys.path.insert(0, str(ROOT / "packaging/release"))
-
-import release_channel as rc  # noqa: E402
+MODULE_PATH = ROOT / "installer/release/release_channel.py"
+MODULE_SPEC = importlib.util.spec_from_file_location("studiocast_release_channel_tests", MODULE_PATH)
+if MODULE_SPEC is None or MODULE_SPEC.loader is None:
+    raise RuntimeError("cannot load installer release contract")
+rc = importlib.util.module_from_spec(MODULE_SPEC)
+sys.modules[MODULE_SPEC.name] = rc
+MODULE_SPEC.loader.exec_module(rc)
 
 
 class RecordingTransport(rc.Transport):

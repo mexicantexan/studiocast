@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 TRANSACTION="${REPO_ROOT}/installer/models/studiocast-model-transaction"
-CATALOG="${REPO_ROOT}/packaging/models/curated-model-catalog-v1.json"
+CATALOG="${REPO_ROOT}/installer/models/curated-model-catalog-v1.json"
 DEFAULT_DEST="${XDG_DATA_HOME:-${HOME}/.local/share}/studiocast/models/open_video"
 DEFAULT_CACHE="${XDG_CACHE_HOME:-${HOME}/.cache}/studiocast/models"
 

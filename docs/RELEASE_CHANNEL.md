@@ -24,7 +24,7 @@ they never contact GitHub.
 
 There is deliberately no production signing secret in this repository. The
 stable trust root is the Ed25519 public key committed as
-`packaging/release/keys/studiocast-release-2026.pem` and packaged under the
+`installer/release/keys/studiocast-release-2026.pem` and packaged under the
 durable key ID `studiocast-release-2026`. CI must receive the corresponding
 signing capability only through the protected `RELEASE_SIGNING_KEY_B64` secret;
 `RELEASE_SIGNING_KEY_ID` must equal the packaged key ID. The key in
@@ -47,7 +47,7 @@ explicitly:
 packaging/appimage/build_appimage.sh --appimage-required \
   --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
   --trusted-release-key \
-  studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
+  studiocast-release-2026=installer/release/keys/studiocast-release-2026.pem
 ```
 
 The packaging script validates that each input is a non-symlink Ed25519 public
@@ -61,7 +61,7 @@ the first release; a signing secret alone is insufficient.
 ## Manifest v1
 
 The normative machine-readable shape is
-[`packaging/release/release-manifest-v1.schema.json`](../packaging/release/release-manifest-v1.schema.json).
+[`installer/release/release-manifest-v1.schema.json`](../installer/release/release-manifest-v1.schema.json).
 Runtime validation is intentionally stricter than permissive JSON decoders:
 
 - UTF-8 only; duplicate object keys and non-finite numbers are rejected.
@@ -262,7 +262,7 @@ only after that trusted installer is available.
 Hermetic coverage is in `tests/release_channel_tests.py`:
 
 ```bash
-python3 -m py_compile packaging/release/release_channel.py \
+python3 -m py_compile installer/release/release_channel.py \
   packaging/release/release_tool.py \
   packaging/release/verify_signed_release.py \
   tests/release_channel_tests.py

@@ -1,9 +1,10 @@
 # Production release trust roots
 
-Production installer packages must place the currently trusted Ed25519 public
-key(s) in this directory and bind each file to a stable key ID in their consumer
-configuration. Key rotation should ship the new public key in an older trusted
-installer before a release manifest starts using it.
+This directory owns the production Ed25519 public keys used to build installer
+packages. Packaging stages explicitly selected keys under
+`share/studiocast/installer/trust/keys/` and binds each file to a stable key ID
+in consumer configuration. Key rotation should ship the new public key in an
+older trusted installer before a release manifest starts using it.
 
 The initial production trust root is
 `studiocast-release-2026.pem`, bound to key ID

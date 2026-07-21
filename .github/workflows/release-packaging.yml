@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       RELEASE_PUBLIC_KEY_ID: studiocast-release-2026
-      RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/studiocast-release-2026.pem
+      RELEASE_PUBLIC_KEY_PATH: installer/release/keys/studiocast-release-2026.pem
 
     steps:
       - name: Checkout build source
@@ -173,7 +173,7 @@ jobs:
     environment: release-signing
     env:
       RELEASE_PUBLIC_KEY_ID: studiocast-release-2026
-      RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/studiocast-release-2026.pem
+      RELEASE_PUBLIC_KEY_PATH: installer/release/keys/studiocast-release-2026.pem
       RELEASE_TAG: ${{ github.event.release.tag_name }}
 
     steps:

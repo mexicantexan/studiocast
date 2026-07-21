@@ -194,10 +194,11 @@ Release packaging:
 - The AppDir layout places the backend at
   `usr/share/studiocast/installer/studiocast-installer-backend`, which is the
   installed path the GUI already probes relative to the installer binary.
-- The Installer component also stages `release/release_channel.py`, the strict
-  manifest schema, and `trust/keys/`. Production public keys are named
+- The Installer component stages the runtime contracts from `installer/release/`
+  as `release/release_channel.py`, the strict manifest schema, and
+  `trust/keys/`. Production public keys are named
   `<key-id>.pem` in that trust root. The initial stable key is committed as
-  `packaging/release/keys/studiocast-release-2026.pem`; test keys are never
+  `installer/release/keys/studiocast-release-2026.pem`; test keys are never
   copied there. Release-grade packaging must still pass the committed key
   explicitly as `--trusted-release-key studiocast-release-2026=<path>`.
 - The same packaging script creates `StudioCast-<version>-source.tar.gz` from
@@ -327,7 +328,7 @@ For release-equivalent local validation with preinstalled packaging tools:
 packaging/appimage/build_appimage.sh --clean --appimage-required \
   --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
   --trusted-release-key \
-  studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
+  studiocast-release-2026=installer/release/keys/studiocast-release-2026.pem
 ```
 
 The runtime path must be a regular non-symlink file matching

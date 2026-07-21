@@ -10,13 +10,36 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-from release_channel import MANIFEST_VERSION, canonical_json, sha256_file, validate_manifest
+
+def _load_release_channel():
+    repository_root = Path(__file__).resolve().parents[2]
+    expected_directory = (repository_root / "installer/release").resolve(strict=True)
+    path = repository_root / "installer/release/release_channel.py"
+    resolved = path.resolve(strict=True)
+    if path.is_symlink() or resolved.parent != expected_directory or not resolved.is_file():
+        raise RuntimeError("canonical installer release contract is missing or unsafe")
+    spec = importlib.util.spec_from_file_location("studiocast_installer_release_channel", resolved)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load canonical installer release contract")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_release_channel = _load_release_channel()
+MANIFEST_VERSION = _release_channel.MANIFEST_VERSION
+canonical_json = _release_channel.canonical_json
+sha256_file = _release_channel.sha256_file
+validate_manifest = _release_channel.validate_manifest
 
 
 def sign_file(path: Path, private_key: Path) -> str:
