@@ -21,6 +21,7 @@ UNSQUASHFS = Path("/usr/bin/unsquashfs")
 MAX_APPIMAGE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_BYTES = 16 * 1024 * 1024
 MAX_SQUASHFS_CANDIDATES = 64
+MAX_SYMLINK_EXPANSIONS = 40
 SQUASHFS_MAGIC = b"hsqs"
 AI_TYPE2_MAGIC = b"AI\x02"
 
@@ -314,37 +315,45 @@ def filesystem_manifest(root: Path) -> dict[str, Entry]:
     return entries
 
 
-def lexical_target(link: str, target: str, label: str) -> str:
+def symlink_target_components(link: str, target: str, label: str) -> list[str]:
     if not target or target.startswith("/") or "\\" in target or "\0" in target:
         fail(f"unsafe {label} symlink target at {link}: {target!r}")
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(link), target))
-    if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
-        fail(f"escaping {label} symlink target at {link}: {target!r}")
-    return "" if resolved == "." else resolved
+    return target.split("/")
 
 
 def validate_symlinks(entries: dict[str, Entry], label: str) -> None:
     for link, entry in entries.items():
         if entry.kind != "symlink":
             continue
-        pending = lexical_target(link, entry.target, label).split("/")
-        resolved: list[str] = []
-        seen: set[str] = set()
+        parent = posixpath.dirname(link)
+        resolved = parent.split("/") if parent else []
+        pending = symlink_target_components(link, entry.target, label)
+        expansions = 0
         while pending:
-            resolved.append(pending.pop(0))
-            current = "/".join(part for part in resolved if part)
+            component = pending.pop(0)
+            if component in ("", "."):
+                continue
+            if component == "..":
+                if not resolved:
+                    fail(f"escaping {label} symlink target at {link}: {entry.target!r}")
+                resolved.pop()
+                continue
+
+            current = "/".join([*resolved, component])
             target_entry = entries.get(current)
             if target_entry is None:
                 fail(f"dangling {label} symlink at {link}: {entry.target!r}")
             if target_entry.kind == "symlink":
-                if current in seen:
-                    fail(f"cyclic {label} symlink at {link}")
-                seen.add(current)
-                replacement = lexical_target(current, target_entry.target, label)
-                pending = replacement.split("/") + pending
-                resolved = []
+                expansions += 1
+                if expansions > MAX_SYMLINK_EXPANSIONS:
+                    fail(f"cyclic or excessive {label} symlink chain at {link}")
+                pending = symlink_target_components(
+                    current, target_entry.target, label
+                ) + pending
             elif pending and target_entry.kind != "dir":
                 fail(f"{label} symlink traverses a non-directory at {current}")
+            else:
+                resolved.append(component)
 
 
 def compare_manifests(expected: dict[str, Entry], actual: dict[str, Entry]) -> None:

@@ -310,7 +310,7 @@ jobs:
           cmp "${source_archive}" \
             "${appimage_extract_dir}/usr/share/studiocast/source/$(basename "${source_archive}")"
           test -z "$(find "${appimage_extract_dir}" -type f \
-            -exec grep -IlE -- "${forbidden}" {} + || true)"
+            -exec grep -alE -- "${forbidden}" {} + || true)"
 
           {
             echo "version=${version}"
@@ -384,11 +384,11 @@ jobs:
 
           forbidden='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
           test -z "$(find "${appimage_extract_dir}" -type f \
-            -exec grep -IlE -- "${forbidden}" {} + || true)"
+            -exec grep -alE -- "${forbidden}" {} + || true)"
           ! tar -xOzf "${source_archive}" | grep -aE -- "${forbidden}" >/dev/null
           ! tar -xOzf "${appdir_archive}" | grep -aE -- "${forbidden}" >/dev/null
           test -z "$(find dist/appimage -maxdepth 1 -type f \
-            -exec grep -IlE -- "${forbidden}" {} + || true)"
+            -exec grep -alE -- "${forbidden}" {} + || true)"
 
           mapfile -t final_files < <(
             find dist/appimage -maxdepth 1 -type f -printf '%f\n' | sort

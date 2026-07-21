@@ -161,6 +161,89 @@ class Type2AppImageVerifierTests(unittest.TestCase):
         self.assertEqual(2, result.returncode)
         self.assertIn("escaping", result.stderr)
 
+    def test_intermediate_symlink_escape_chain_is_rejected(self) -> None:
+        valid = self.appdir("ValidLinks.AppDir")
+        (valid / "links/real").mkdir(parents=True)
+        (valid / "links/real/value").write_text("safe\n", encoding="utf-8")
+        (valid / "links/alias").symlink_to("real")
+        (valid / "links/final").symlink_to("alias/value")
+        result = self.verify(
+            self.image(self.payload(valid, "valid-links.squashfs"), "valid-links.AppImage"),
+            self.archive(valid, "valid-links.tar.gz"),
+            "valid-links-output",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        unsafe = self.appdir("EscapeChain.AppDir")
+        (unsafe / "a").mkdir()
+        (unsafe / "a/x").symlink_to("../a/..")
+        (unsafe / "a/l").symlink_to("../a/x/..")
+        result = self.verify(
+            self.image(
+                self.payload(unsafe, "escape-chain.squashfs"),
+                "escape-chain.AppImage",
+            ),
+            self.archive(unsafe, "escape-chain.tar.gz"),
+            "escape-chain-output",
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("escaping", result.stderr)
+
+    def test_dangling_cyclic_and_non_directory_symlinks_are_rejected(self) -> None:
+        cases = [
+            ("Dangling", {"bad": "missing"}, "dangling"),
+            ("Cyclic", {"one": "two", "two": "one"}, "cyclic"),
+            (
+                "NonDirectory",
+                {"bad": "usr/bin/studiocast-installer/child"},
+                "non-directory",
+            ),
+        ]
+        for name, links, expected_error in cases:
+            with self.subTest(name=name):
+                appdir = self.appdir(f"{name}.AppDir")
+                for link, target in links.items():
+                    (appdir / link).symlink_to(target)
+                result = self.verify(
+                    self.image(
+                        self.payload(appdir, f"{name}.squashfs"),
+                        f"{name}.AppImage",
+                    ),
+                    self.archive(appdir, f"{name}.tar.gz"),
+                    f"{name}-output",
+                )
+                self.assertEqual(2, result.returncode)
+                self.assertIn(expected_error, result.stderr)
+
+
+class PrivateKeyMarkerScanTests(unittest.TestCase):
+    def test_binary_private_key_markers_are_not_skipped(self) -> None:
+        verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(
+            encoding="utf-8"
+        )
+        workflow = (ROOT / ".github/workflows/release-packaging.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("grep -IlE", verifier)
+        self.assertNotIn("grep -IlE", workflow)
+        self.assertIn("grep -alE", verifier)
+        self.assertIn("grep -alE", workflow)
+
+        with tempfile.TemporaryDirectory(prefix="studiocast-pem-scan-") as root:
+            artifact = Path(root) / "binary-artifact"
+            artifact.write_bytes(b"binary\0-----BEGIN PRIVATE KEY-----\0payload")
+            result = subprocess.run(
+                [
+                    "grep", "-alE", "--",
+                    r"-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----", str(artifact),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(str(artifact), result.stdout.strip())
+
 
 class CanonicalSourceArchiveTests(unittest.TestCase):
     def setUp(self) -> None:

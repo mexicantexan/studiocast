@@ -266,7 +266,7 @@ secret_pem_pattern='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
 verify_no_secret_pem_in_tree() {
   local root="$1"
   local match
-  match="$(find "${root}" -type f -exec grep -IlE -- "${secret_pem_pattern}" {} + || true)"
+  match="$(find "${root}" -type f -exec grep -alE -- "${secret_pem_pattern}" {} + || true)"
   [[ -z "${match}" ]] || die "forbidden secret PEM marker in staged artifact: ${match}"
 }
 
@@ -280,7 +280,7 @@ verify_no_secret_pem_in_source_archive() {
 verify_no_secret_pem_in_dist_files() {
   local dist_dir="$1"
   local match
-  match="$(find "${dist_dir}" -maxdepth 1 -type f -exec grep -IlE -- \
+  match="$(find "${dist_dir}" -maxdepth 1 -type f -exec grep -alE -- \
     "${secret_pem_pattern}" {} + || true)"
   [[ -z "${match}" ]] || die "forbidden secret PEM marker in upload artifact: ${match}"
 }

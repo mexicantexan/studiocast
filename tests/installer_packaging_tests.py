@@ -253,6 +253,9 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn("prevent_self_review=false", release_docs)
         self.assertIn("can_admins_bypass=true", release_docs)
         self.assertIn("ancestor of the fetched remote default branch", release_docs)
+        self.assertIn(
+            "--appimage-runtime /path/to/sha-pinned/runtime-x86_64", release_docs
+        )
 
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
         self.assertNotIn("--appimage-extract", verifier)

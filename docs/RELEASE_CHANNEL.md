@@ -45,6 +45,7 @@ explicitly:
 
 ```bash
 packaging/appimage/build_appimage.sh --appimage-required \
+  --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
   --trusted-release-key \
   studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
 ```
