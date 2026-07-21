@@ -10,6 +10,41 @@ Planned components:
 - Effects Engine abstraction layer (multiple GPU engines: Maxine + Open CUDA)
 - SDK Manager (downloads/installs user-obtained Maxine assets)
 
+## CMake dependency layers
+
+Production code is split at neutral, reusable boundaries before the high-level
+runtime composition layer:
+
+```text
+studiocast_contracts   ---> studiocast_util
+studiocast_config      ---> studiocast_contracts, studiocast_util
+studiocast_ipc         ---> studiocast_util
+studiocast_cuda_support ---> studiocast_util
+studiocast_core        ---> contracts, config, ipc, cuda_support, util
+```
+
+Each arrow points from a dependent to its dependency.
+
+- `studiocast_util` owns generic filesystem, process, JSON, string, dynamic
+  library, OS-release, and XDG helpers.
+- `studiocast_contracts` owns stable audio/video value types, effect schemas,
+  reason codes, serialization, and backend-independent execution plans.
+- `studiocast_config` owns persisted/runtime configuration parsing and
+  validation. Runtime service adapters remain in the high-level core.
+- `studiocast_ipc` owns Unix-socket protocol mechanics and has std-only public
+  headers.
+- `studiocast_cuda_support` owns runtime-loaded CUDA driver wrappers, buffer
+  value types, and embedded kernel contracts without a CUDA toolkit dependency.
+- `studiocast_core` remains the compatibility and orchestration target. It
+  composes the neutral layers with backend implementations and optional system
+  dependencies.
+
+CMake validates the allowed direct StudioCast target edges, rejects optional
+SDK or GUI dependencies on neutral targets, and verifies unique ownership of
+every configured production translation unit. New backends should link down to
+the smallest neutral layer that owns their shared concepts; sibling backends
+must not link to one another for shared types or utilities.
+
 ## Canonical effect model: `BroadcastCameraEffects`
 
 The single canonical effect schema across **config persistence**, **IPC**, **daemon pipeline**, **GUI rendering**, and
@@ -103,6 +138,41 @@ Required top-level fields:
 - `input`: `{ name, layout, dtype, width, height, channels }`
 - `output`: `{ name, kind, dtype }` where `kind` is `"alpha"`
 - `preprocess`: `{ mean[3], std[3], color, range }` where `color` is `"rgb"` and `range` is `"0..1"`
+
+### Production Vulkan matting schema-v2 extension
+
+A Vulkan matting candidate must use schema v2, declare distinct
+`ncnn_param`/`ncnn_bin` files with `role: "vulkan_matting"` and installed
+SHA-256 digests, and provide an `ncnn_vulkan` object. Its top-level tensor
+contract is exact rather than inferred from the graph:
+
+```json
+{
+  "schema_version": 2,
+  "task": "matting",
+  "input": {
+    "name": "input", "layout": "nchw", "dtype": "float32",
+    "width": 256, "height": 256, "channels": 3
+  },
+  "output": {
+    "name": "alpha", "kind": "alpha", "layout": "nchw",
+    "dtype": "float32", "width": 160, "height": 144, "channels": 1
+  },
+  "ncnn_vulkan": {
+    "param_file": "model.ncnn.param",
+    "bin_file": "model.ncnn.bin",
+    "input_blob": "input",
+    "output_blob": "alpha",
+    "converter": { "name": "pnnx", "version": "20250503" },
+    "precision": "fp16"
+  }
+}
+```
+
+`precision` describes the offline ncnn artifact/weights (`fp32` or `fp16`);
+StudioCast's external resident input and alpha bindings remain float32. The
+output dimensions may differ from the input dimensions and govern alpha
+allocation, artifact identity, resize, and element counts.
 
 ## No CPU fallback (product rule)
 

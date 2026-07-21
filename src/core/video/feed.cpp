@@ -141,6 +141,7 @@ bool VideoFeed::StartTestPattern(const FeedConfig &cfg, std::string *error) {
 
 void VideoFeed::Stop() {
   stop_.store(true);
+  cv_.notify_all();
 
   std::thread toJoin;
   {
@@ -230,13 +231,19 @@ void VideoFeed::ThreadMain(FeedConfig cfg) {
       break;
     }
 
-    std::string werr;
-    if (!writer.WriteFrame(frame.data(), frame.size(), &werr)) {
+    const FrameWriteResult write_result =
+        writer.WriteFrameDetailed(frame.data(), frame.size(), &stop_);
+    if (write_result.status == FrameWriteStatus::stopped)
+      break;
+    if (write_result.status == FrameWriteStatus::fatal) {
+      const std::string werr = DescribeFrameWriteResult(write_result);
       std::lock_guard<std::mutex> lock(mu_);
       last_error_ = "Write failed: " + werr;
       break;
     }
 
+    // Written and backpressured frames both advance the generated latest
+    // frame. EAGAIN is a zero-queue drop, not a transport failure.
     ++frameIndex;
 
     // Update frame count without locking every single frame (cheap but
@@ -246,7 +253,8 @@ void VideoFeed::ThreadMain(FeedConfig cfg) {
       frame_index_ = frameIndex;
     }
 
-    std::this_thread::sleep_until(next);
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait_until(lock, next, [this] { return stop_.load(); });
   }
 
   // Final state update

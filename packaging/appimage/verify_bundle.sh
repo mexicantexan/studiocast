@@ -3,12 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=packaging/appimage/tools.lock
+source "${SCRIPT_DIR}/tools.lock"
 
 VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
 ARCH="$(uname -m)"
 DIST_DIR="${REPO_ROOT}/dist/appimage"
 APPDIR=""
 REQUIRE_APPIMAGE=0
+APPIMAGE_RUNTIME_PATH="${APPIMAGE_RUNTIME:-}"
+TRUSTED_RELEASE_KEYS=()
 
 usage() {
   cat <<EOF
@@ -23,6 +27,11 @@ Options:
   --appdir DIR            Staged AppDir path. Defaults to the AppDir expected
                           under --dist-dir for VERSION and uname -m.
   --require-appimage      Require and verify the AppImage artifact.
+  --appimage-runtime PATH SHA-pinned type-2 runtime used to verify the
+                          AppImage executable prefix without running it.
+  --trusted-release-key ID=PATH
+                          Require this exact public key in the staged AppDir
+                          and final AppImage. May be repeated.
   --help                  Show this help.
 EOF
 }
@@ -157,14 +166,199 @@ verify_staged_metadata() {
     "studiocast-installer ${expected_version}" \
     "${appdir}/AppRun" --version
   require_command_output_contains "installer backend --help" \
-    "StudioCast installer backend" \
+    "usage: studiocast-installer-backend" \
     "${appdir}/usr/share/studiocast/installer/studiocast-installer-backend" \
     --help
+  require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
+  require_file "${appdir}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json"
+  require_file "${appdir}/usr/share/studiocast/installer/privileged/__init__.py"
+  require_file "${appdir}/usr/share/studiocast/installer/privileged/client_contract.py"
+  require_file "${appdir}/usr/share/studiocast/installer/trust/keys/README.md"
+  local model_launcher="${appdir}/usr/share/studiocast/installer/models/studiocast-model-transaction"
+  require_executable "${model_launcher}"
+  require_file "${appdir}/usr/share/studiocast/installer/models/model_transactions.py"
+  require_file "${appdir}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json"
+
+  local model_summary
+  model_summary="$(capture_command "packaged curated model catalog" "${model_launcher}" list --json)"
+  python3 - "${model_summary}" <<'PY'
+import json
+import sys
+
+summary = json.loads(sys.argv[1])
+defaults = [pack for pack in summary["packs"] if pack["default"]]
+if len(defaults) != 7:
+    raise SystemExit(f"packaged catalog has {len(defaults)} default packs, expected 7")
+if sum(len(pack["artifacts"]) for pack in defaults) != 8:
+    raise SystemExit("packaged default catalog does not contain exactly 8 artifacts")
+if summary.get("size_metadata", {}).get("trusted") is not True:
+    raise SystemExit("packaged default catalog does not have trusted artifact sizes")
+if not summary.get("size_metadata", {}).get("reason_code"):
+    raise SystemExit("packaged default catalog has no trusted-size evidence reason")
+for pack in defaults:
+    for artifact in pack["artifacts"]:
+        if (type(artifact.get("size_bytes")) is not int or
+                artifact["size_bytes"] <= 0 or
+                artifact.get("size_status") != "known"):
+            raise SystemExit("packaged default catalog has incomplete trusted artifact sizes")
+PY
+
+  local forbidden
+  forbidden="$(find "${appdir}/usr/share/studiocast" -type f \
+    \( -name '*.onnx' -o -name '*.ort' -o -name '*.engine' -o \
+       -name '*.plan' -o -name '*.dat' -o -name '*.bin' \) -print -quit)"
+  [[ -z "${forbidden}" ]] ||
+    die "AppDir redistributes a model binary: ${forbidden}"
 
   local service
   while IFS= read -r service; do
     validate_service_file "${service}"
   done < <(find "${appdir}" -type f -name '*.service' -print)
+}
+
+verify_trust_roots() {
+  local appdir="$1"
+  local required="$2"
+  local trust_dir="${appdir}/usr/share/studiocast/installer/trust/keys"
+  local count=0 key key_id
+  while IFS= read -r key; do
+    count=$((count + 1))
+    [[ ! -L "${key}" ]] || die "release trust root may not be a symlink: ${key}"
+    key_id="$(basename "${key}" .pem)"
+    [[ "${key_id}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] ||
+      die "invalid release trust-root key ID: ${key_id}"
+    [[ ! "${key_id}" =~ (^|[._-])(test|fixture)([._-]|$) ]] ||
+      die "test/fixture key was staged in the production trust root: ${key_id}"
+    openssl pkey -pubin -in "${key}" -text -noout 2>/dev/null |
+      grep -q 'ED25519' || die "release trust root is not Ed25519: ${key}"
+  done < <(find "${trust_dir}" -maxdepth 1 -type f -name '*.pem' -print | sort)
+  if [[ "${required}" -eq 1 && "${count}" -eq 0 ]]; then
+    die "release AppImage contains no production release trust root"
+  fi
+}
+
+verify_expected_trust_roots() {
+  local appdir="$1"
+  shift
+  local trust_dir="${appdir}/usr/share/studiocast/installer/trust/keys"
+  local specification key_id key_path packaged_key
+  for specification in "$@"; do
+    [[ "${specification}" == *=* ]] ||
+      die "--trusted-release-key requires ID=PATH"
+    key_id="${specification%%=*}"
+    key_path="${specification#*=}"
+    [[ "${key_id}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] ||
+      die "invalid expected release key ID: ${key_id}"
+    require_file "${key_path}"
+    [[ ! -L "${key_path}" ]] ||
+      die "expected release public key may not be a symlink: ${key_path}"
+    packaged_key="${trust_dir}/${key_id}.pem"
+    require_file "${packaged_key}"
+    [[ ! -L "${packaged_key}" ]] ||
+      die "packaged release trust root may not be a symlink: ${packaged_key}"
+    cmp -s "${key_path}" "${packaged_key}" ||
+      die "packaged release trust root differs from expected key: ${key_id}"
+  done
+}
+
+secret_pem_pattern='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
+
+verify_no_secret_pem_in_tree() {
+  local root="$1"
+  local match
+  match="$(find "${root}" -type f -exec grep -alE -- "${secret_pem_pattern}" {} + || true)"
+  [[ -z "${match}" ]] || die "forbidden secret PEM marker in staged artifact: ${match}"
+}
+
+verify_no_secret_pem_in_source_archive() {
+  local archive="$1"
+  if tar -xOf "${archive}" | grep -aE -- "${secret_pem_pattern}" >/dev/null; then
+    die "forbidden secret PEM marker in source archive"
+  fi
+}
+
+verify_no_secret_pem_in_dist_files() {
+  local dist_dir="$1"
+  local match
+  match="$(find "${dist_dir}" -maxdepth 1 -type f -exec grep -alE -- \
+    "${secret_pem_pattern}" {} + || true)"
+  [[ -z "${match}" ]] || die "forbidden secret PEM marker in upload artifact: ${match}"
+}
+
+verify_final_appimage() {
+  local appimage appdir_tar runtime
+  appimage="$(realpath -e -- "$1")"
+  appdir_tar="$(realpath -e -- "$2")"
+  runtime="$(realpath -e -- "$3")"
+  shift 3
+  local temporary extracted
+  temporary="$(mktemp -d)"
+  extracted="${temporary}/squashfs-root"
+  if ! python3 "${SCRIPT_DIR}/verify_type2_appimage.py" \
+      --appimage "${appimage}" \
+      --runtime-file "${runtime}" \
+      --runtime-sha256 "${APPIMAGE_RUNTIME_SHA256}" \
+      --appdir-tar "${appdir_tar}" \
+      --extract-dir "${extracted}"; then
+    rm -rf -- "${temporary}"
+    die "independent final AppImage verification failed"
+  fi
+  verify_trust_roots "${extracted}" 1
+  verify_expected_trust_roots "${extracted}" "$@"
+  verify_no_secret_pem_in_tree "${extracted}"
+  rm -rf -- "${temporary}"
+}
+
+verify_packaged_backend_layout() {
+  local appdir="$1"
+  local backend="${appdir}/usr/share/studiocast/installer/studiocast-installer-backend"
+  local temporary
+  temporary="$(mktemp -d)"
+
+  local home="${temporary}/home"
+  local data="${temporary}/data"
+  local config="${temporary}/config"
+  local state="${temporary}/state"
+  local cache="${temporary}/cache"
+  local fake_bin="${temporary}/bin"
+  install -d -m 0755 "${home}/.local/bin" "${data}/studiocast/payloads/fixture/bin" \
+    "${data}/studiocast/models/custom" "${config}/studiocast" "${state}" "${cache}" "${fake_bin}"
+  cat >"${fake_bin}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod 0755 "${fake_bin}/systemctl"
+  cat >"${data}/studiocast/payloads/fixture/bin/studiocast" <<'EOF'
+#!/usr/bin/env bash
+echo "studiocast fixture"
+EOF
+  chmod 0755 "${data}/studiocast/payloads/fixture/bin/studiocast"
+  ln -s "${data}/studiocast/payloads/fixture" "${data}/studiocast/current"
+  ln -s "${data}/studiocast/current/bin/studiocast" "${home}/.local/bin/studiocast"
+  printf 'preserve\n' >"${data}/studiocast/models/custom/user-model"
+  printf 'preserve\n' >"${config}/studiocast/daemon.conf"
+
+  local -a environment=(env "HOME=${home}" "XDG_DATA_HOME=${data}" "XDG_CONFIG_HOME=${config}"
+    "XDG_STATE_HOME=${state}" "XDG_CACHE_HOME=${cache}" "PATH=${fake_bin}:/usr/bin:/bin")
+  "${environment[@]}" "${backend}" status --json >/dev/null
+  local plan
+  plan="$("${environment[@]}" "${backend}" plan uninstall --json --preserve-user-data \
+    --no-v4l2loopback --no-service --no-models --allow-unsupported)"
+  [[ "${plan}" != *"usr/share/scripts"* ]] ||
+    die "packaged uninstall plan refers to a source-tree uninstall script"
+  [[ "${plan}" == *'"links.reconcile"'* ]] ||
+    die "packaged uninstall plan omits link reconciliation"
+
+  rm -rf -- "${cache}"
+  "${data}/studiocast/current/bin/studiocast" >/dev/null ||
+    die "active payload broke after build/release cache removal"
+  "${environment[@]}" "${backend}" uninstall --yes --preserve-user-data \
+    --no-v4l2loopback --no-service --no-models --allow-unsupported >/dev/null
+  [[ ! -e "${data}/studiocast/payloads" ]] || die "packaged uninstall left owned payloads"
+  [[ ! -L "${home}/.local/bin/studiocast" ]] || die "packaged uninstall left owned links"
+  [[ -f "${data}/studiocast/models/custom/user-model" ]] || die "packaged uninstall removed models by default"
+  [[ -f "${config}/studiocast/daemon.conf" ]] || die "packaged uninstall removed settings by default"
+  rm -rf -- "${temporary}"
 }
 
 verify_source_archive_layout() {
@@ -378,6 +572,16 @@ parse_args() {
         REQUIRE_APPIMAGE=1
         shift
         ;;
+      --appimage-runtime)
+        [[ $# -ge 2 ]] || die "--appimage-runtime requires a path"
+        APPIMAGE_RUNTIME_PATH="$2"
+        shift 2
+        ;;
+      --trusted-release-key)
+        [[ $# -ge 2 ]] || die "--trusted-release-key requires ID=PATH"
+        TRUSTED_RELEASE_KEYS+=("$2")
+        shift 2
+        ;;
       --help|-h)
         usage
         exit 0
@@ -422,8 +626,10 @@ main() {
 
   if [[ "${REQUIRE_APPIMAGE}" -eq 1 ]]; then
     require_executable "${appimage_path}"
+    require_file "${APPIMAGE_RUNTIME_PATH}"
     checksum_contains "${checksum_file}" "${appimage_path}"
   elif [[ -f "${appimage_path}" ]]; then
+    require_file "${APPIMAGE_RUNTIME_PATH}"
     checksum_contains "${checksum_file}" "${appimage_path}"
   fi
 
@@ -437,6 +643,18 @@ main() {
     "${appdir_base}/usr/share/studiocast/installer/studiocast-installer-backend" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/release/release_channel.py" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/trust/keys/README.md" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/models/studiocast-model-transaction" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/applications/studiocast-installer.desktop" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
@@ -445,6 +663,16 @@ main() {
 
   verify_staged_metadata "${APPDIR}" "${VERSION}" "${source_archive_path}" \
     "${staged_source_archive}"
+  verify_trust_roots "${APPDIR}" "${REQUIRE_APPIMAGE}"
+  verify_expected_trust_roots "${APPDIR}" "${TRUSTED_RELEASE_KEYS[@]}"
+  verify_no_secret_pem_in_tree "${APPDIR}"
+  verify_no_secret_pem_in_source_archive "${source_archive_path}"
+  verify_no_secret_pem_in_dist_files "${DIST_DIR}"
+  if [[ -f "${appimage_path}" ]]; then
+    verify_final_appimage "${appimage_path}" "${appdir_tarball}" \
+      "${APPIMAGE_RUNTIME_PATH}" "${TRUSTED_RELEASE_KEYS[@]}"
+  fi
+  verify_packaged_backend_layout "${APPDIR}"
   verify_source_archive_layout "${source_archive_path}" "${source_prefix}" \
     "${VERSION}"
   verify_source_archive_metadata "${source_archive_path}" "${source_prefix}" \

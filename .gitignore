@@ -3,8 +3,17 @@
 /.junie
 /*.zip
 /build/
+/build-ncnn/
+/build-vulkan/
+/build-vulkan-ncnn/
 /dist/
 **/*.onnx
+**/*.ncnn.param
+**/*.ncnn.bin
+**/*.opt.param
+**/*.opt.bin
+resources/model_packs/**/*.param
+resources/model_packs/**/*.bin
 /scripts/models/build_open_video_eye_contact_models.py
 /scripts/models/build_open_video_face_detection_models.py
 /scripts/models/build_open_video_video_denoise_models.py

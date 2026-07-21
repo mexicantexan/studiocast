@@ -29,15 +29,17 @@ StudioCast discovers ONNX Runtime via CMake. For Open CUDA you need an ONNX Runt
 Repo-provided helper (Ubuntu 22.04+):
 
 ```bash
-./scripts/setup.sh --deps
+./scripts/setup.sh --deps --onnxruntime-flavor gpu
 ```
 
 This script (via `scripts/setup/ubuntu.sh`):
 
 - installs build prerequisites (Qt/CMake/Ninja/etc.),
-- downloads the official ONNX Runtime **GPU** tarball,
+- downloads the official ONNX Runtime tarball,
 - installs it under `/opt/studiocast/onnxruntime/<version>/...`,
 - and provides a `pkg-config` entry (`onnxruntime.pc`) so CMake can find it.
+
+Without `--onnxruntime-flavor gpu`, the helper chooses `gpu` only when `nvidia-smi` works; otherwise it installs the CPU flavor. Open CUDA requires the GPU flavor with `CUDAExecutionProvider`.
 
 If you install ONNX Runtime another way, make sure this works:
 
@@ -48,6 +50,7 @@ pkg-config --modversion onnxruntime
 ## 2) Build (ensure Open CUDA is enabled)
 
 On Linux, `STUDIOCAST_ENABLE_OPEN_CUDA` defaults to **ON**.
+CUDA remains the preferred default compute backend for usable NVIDIA systems.
 
 If you want to force it:
 
@@ -193,6 +196,17 @@ This uses the canonical effect IDs (see `src/core/video/effects/broadcast_effect
 
 If everything is installed correctly, the pipeline will select the Open CUDA engine for virtual background blur.
 
+## Backend selection and fallback
+
+StudioCast reports backend selection in `studiocastctl status` under `video.compute`:
+
+- `preference`: user/config preference (`auto`, `cpu`, `cuda`, or `vulkan`)
+- `resolved_backend`: setup-time backend selected by the daemon
+- `active_backend`: backend currently active in the pipeline
+- `fallback_reason` / `degraded_reason`: why the daemon is not using the requested GPU path
+
+`auto` keeps CUDA preferred on NVIDIA systems when CUDA and the ONNX Runtime CUDA provider are usable. Explicit `vulkan` does not silently run CUDA; if Vulkan is unavailable or lacks the requested effect, status reports Vulkan as unavailable/degraded and the active backend falls back to CPU/pass-through where applicable.
+
 ## 5) Selecting an Open CUDA model for Virtual Background
 
 Model packs are an **Open CUDA-only** concern.
@@ -261,12 +275,12 @@ Example (formatted for readability; the on-disk value is on one line):
 ### `open_cuda.ok` is false and `blocked_effects` contains `onnxruntime_not_found`
 
 - Your build was compiled without ONNX Runtime.
-- Install ONNX Runtime (GPU build) and rebuild.
+- Install ONNX Runtime with CUDA provider support and rebuild.
 
 On Ubuntu 22.04+, the intended path is:
 
 ```bash
-./scripts/setup.sh --deps
+./scripts/setup.sh --deps --onnxruntime-flavor gpu
 ```
 
 ### `open_cuda.ok` is false and `blocked_effects` contains `cuda_unavailable`

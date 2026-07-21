@@ -1,0 +1,746 @@
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+#include <unistd.h>
+
+#include "core/util/exec.h"
+
+#ifndef STUDIOCAST_SOURCE_DIR
+#define STUDIOCAST_SOURCE_DIR ""
+#endif
+
+#ifndef STUDIOCAST_BINARY_DIR
+#define STUDIOCAST_BINARY_DIR ""
+#endif
+
+#ifndef STUDIOCAST_PYTHON_EXECUTABLE
+#define STUDIOCAST_PYTHON_EXECUTABLE ""
+#endif
+
+namespace {
+
+namespace fs = std::filesystem;
+
+bool Expect(bool condition, const char *message) {
+  if (!condition) {
+    std::cerr << message << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool ExpectContains(const std::string &name, const std::string &haystack,
+                    const std::string &needle) {
+  if (haystack.find(needle) == std::string::npos) {
+    std::cerr << name << " missing expected text: " << needle << "\n";
+    std::cerr << "Output:\n" << haystack << "\n";
+    return false;
+  }
+  return true;
+}
+
+std::string ShellQuote(const std::string &value) {
+  std::string out = "'";
+  for (char ch : value) {
+    if (ch == '\'') {
+      out += "'\\''";
+    } else {
+      out += ch;
+    }
+  }
+  out += "'";
+  return out;
+}
+
+bool WriteExecutable(const fs::path &path, const std::string &text,
+                     std::string *error = nullptr) {
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  if (ec) {
+    if (error)
+      *error = "create_directories failed: " + ec.message();
+    return false;
+  }
+
+  std::ofstream file(path);
+  if (!file) {
+    if (error)
+      *error = "open failed: " + path.string();
+    return false;
+  }
+  file << text;
+  file.close();
+
+  fs::permissions(path,
+                  fs::perms::owner_read | fs::perms::owner_write |
+                      fs::perms::owner_exec,
+                  fs::perm_options::replace, ec);
+  if (ec) {
+    if (error)
+      *error = "permissions failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+std::string ReadTextFile(const fs::path &path) {
+  std::ifstream file(path);
+  if (!file)
+    return {};
+  return std::string(std::istreambuf_iterator<char>(file),
+                     std::istreambuf_iterator<char>());
+}
+
+class ScopedTempDir {
+public:
+  explicit ScopedTempDir(const std::string &prefix) {
+    std::error_code ec;
+    const fs::path base = fs::temp_directory_path(ec);
+    if (ec) {
+      error_ = "temp_directory_path failed: " + ec.message();
+      return;
+    }
+    path_ = base /
+            (prefix + "-" + std::to_string(static_cast<long long>(::getpid())));
+    fs::remove_all(path_, ec);
+    fs::create_directories(path_, ec);
+    if (ec) {
+      error_ = "create_directories failed: " + ec.message();
+      return;
+    }
+
+    const fs::path environmentDirectories[] = {
+        homeDir(),    xdgConfigDir(), xdgCacheDir(),
+        xdgDataDir(), xdgStateDir(),  xdgRuntimeDir(),
+    };
+    for (const fs::path &directory : environmentDirectories) {
+      fs::create_directories(directory, ec);
+      if (ec) {
+        error_ = "create_directories failed for " + directory.string() + ": " +
+                 ec.message();
+        return;
+      }
+    }
+
+    fs::permissions(xdgRuntimeDir(), fs::perms::owner_all,
+                    fs::perm_options::replace, ec);
+    if (ec) {
+      error_ = "permissions failed for " + xdgRuntimeDir().string() + ": " +
+               ec.message();
+    }
+  }
+
+  ~ScopedTempDir() {
+    std::error_code ec;
+    fs::remove_all(path_, ec);
+  }
+
+  bool ok() const { return error_.empty(); }
+  const std::string &error() const { return error_; }
+  const fs::path &path() const { return path_; }
+  fs::path homeDir() const { return path_ / "home"; }
+  fs::path xdgConfigDir() const { return path_ / "xdg" / "config"; }
+  fs::path xdgCacheDir() const { return path_ / "xdg" / "cache"; }
+  fs::path xdgDataDir() const { return path_ / "xdg" / "data"; }
+  fs::path xdgStateDir() const { return path_ / "xdg" / "state"; }
+  fs::path xdgRuntimeDir() const { return path_ / "xdg" / "runtime"; }
+
+private:
+  fs::path path_;
+  std::string error_;
+};
+
+std::string BackendCommand(const ScopedTempDir &root,
+                           const std::string &subcommand,
+                           const std::string &extra_options = "") {
+  const fs::path repo = fs::path(STUDIOCAST_SOURCE_DIR);
+  const fs::path backend =
+      repo / "installer" / "backend" / "studiocast-installer-backend";
+  const fs::path buildDir =
+      root.xdgCacheDir() / "studiocast" / "builds" / "test";
+  std::string command =
+      "HOME=" + ShellQuote(root.homeDir().string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(root.xdgConfigDir().string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(root.xdgCacheDir().string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(root.xdgDataDir().string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(root.xdgStateDir().string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(root.xdgRuntimeDir().string()) + " " +
+      ShellQuote(backend.string()) + " " + subcommand + " --source-dir " +
+      ShellQuote(repo.string()) + " --build-dir " +
+      ShellQuote(buildDir.string()) +
+      " --skip-deps --no-v4l2loopback --no-service --no-models "
+      "--allow-unsupported";
+  if (!extra_options.empty()) {
+    command += " " + extra_options;
+  }
+  return command;
+}
+
+bool TestBackendCommandsIgnoreInheritedXdgRoots() {
+  ScopedTempDir temp("studiocast-installer-backend-hermetic");
+  ScopedTempDir outer("studiocast-installer-backend-hostile-outer");
+  if (!Expect(temp.ok(), temp.error().c_str()) ||
+      !Expect(outer.ok(), outer.error().c_str())) {
+    return false;
+  }
+
+  const fs::path hostileHome = outer.path() / "hostile-home";
+  const fs::path hostileConfig = outer.path() / "hostile-config";
+  const fs::path hostileCache = outer.path() / "hostile-cache";
+  const fs::path hostileData = outer.path() / "hostile-data";
+  const fs::path hostileState = outer.path() / "hostile-state";
+  const fs::path hostileRuntime = outer.path() / "hostile-runtime";
+  const fs::path hostilePaths[] = {
+      hostileHome, hostileConfig, hostileCache,
+      hostileData, hostileState,  hostileRuntime,
+  };
+
+  const std::string command =
+      "HOME=" + ShellQuote(hostileHome.string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(hostileConfig.string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(hostileCache.string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(hostileData.string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(hostileState.string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(hostileRuntime.string()) + " " +
+      "/bin/sh -c " + ShellQuote(BackendCommand(temp, "repair --dry-run"));
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(command, options);
+
+  bool ok = Expect(result.exit_code == 0,
+                   "installer backend must ignore inherited hostile XDG roots");
+  for (const fs::path &path : hostilePaths) {
+    ok = Expect(!fs::exists(path),
+                "installer backend must not write to inherited XDG roots") &&
+         ok;
+  }
+
+  std::error_code ec;
+  const fs::perms runtimePermissions =
+      fs::status(temp.xdgRuntimeDir(), ec).permissions();
+  const fs::perms permissionMask =
+      fs::perms::owner_all | fs::perms::group_all | fs::perms::others_all;
+  ok = Expect(!ec &&
+                  (runtimePermissions & permissionMask) == fs::perms::owner_all,
+              "installer test XDG_RUNTIME_DIR must have mode 0700") &&
+       ok;
+  return ok;
+}
+
+bool TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() {
+  ScopedTempDir temp("studiocast-installer-backend-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend plan repair should exit successfully") &&
+         ExpectContains("installer backend plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON") &&
+         ExpectContains("installer backend plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
+                    std::string::npos,
+                "default installer plan should not enable Open Vulkan") &&
+         Expect(result.stdout_str.find("--vulkan-runtime") == std::string::npos,
+                "default installer plan should not install Vulkan runtime "
+                "packages") &&
+         ExpectContains("installer backend plan", result.stdout_str,
+                        "Enable CPU resize fallback in the daemon config by "
+                        "default") &&
+         ExpectContains("installer backend plan", result.stdout_str,
+                        "Force Linux CMake configuration to keep Open Video/"
+                        "Open CUDA and Open Audio enabled");
+}
+
+bool TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json",
+                     "--with-deps --vulkan-runtime --mesa-vulkan "
+                     "--shader-tools --open-vulkan"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan plan should exit successfully") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "libvulkan1") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "mesa-vulkan-drivers") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "glslang-tools") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "dependencies.packages.ensure") &&
+         ExpectContains("installer backend Vulkan plan", result.stdout_str,
+                        "packages.ensure.v1") &&
+         Expect(result.stdout_str.find("scripts/setup.sh") == std::string::npos,
+                "installer must not execute selected-source setup scripts with privilege");
+}
+
+bool TestRepairPlanInstallsOnlySelectedVulkanPackages() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-repair-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json",
+                     "--vulkan-runtime --mesa-vulkan --shader-tools "
+                     "--open-vulkan"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan-only repair plan should exit "
+                "successfully") &&
+         ExpectContains("installer backend Vulkan-only repair plan",
+                        result.stdout_str,
+                        "\"packages\": [") &&
+         ExpectContains("installer backend Vulkan-only repair plan",
+                        result.stdout_str, "libvulkan1") &&
+         Expect(result.stdout_str.find("scripts/setup.sh") == std::string::npos,
+                "Vulkan package work must use only the typed trusted helper");
+}
+
+bool TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() {
+  ScopedTempDir temp("studiocast-installer-backend-vulkan-runtime-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json", "--vulkan-runtime"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend Vulkan runtime-only plan should exit "
+                "successfully") &&
+         ExpectContains("installer backend Vulkan runtime-only plan",
+                        result.stdout_str, "libvulkan1") &&
+         ExpectContains("installer backend Vulkan runtime-only plan",
+                        result.stdout_str, "vulkan-tools") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON") ==
+                    std::string::npos,
+                "runtime-only package selection should not implicitly enable "
+                "the Open Vulkan build");
+}
+
+bool TestRepairPlanCanDisableOpenBackendConfigureFlags() {
+  ScopedTempDir temp("studiocast-installer-backend-no-open");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json", "--no-open-backends"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend plan repair without open backends should "
+                "exit successfully") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON") ==
+                    std::string::npos,
+                "disabled Open Source backend setup should omit Open CUDA "
+                "configure flag") &&
+         Expect(result.stdout_str.find("-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") ==
+                    std::string::npos,
+                "disabled Open Source backend setup should omit Open Audio "
+                "configure flag") &&
+         ExpectContains("installer backend disabled plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF") &&
+         ExpectContains("installer backend disabled plan", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF");
+}
+
+bool TestUninstallPlanOmitsInstallOnlyDetails() {
+  ScopedTempDir temp("studiocast-installer-backend-uninstall-plan");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan uninstall --json", "--preserve-user-data"),
+      options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend uninstall plan should exit successfully") &&
+         ExpectContains("installer backend uninstall plan", result.stdout_str,
+                        "Current installed version") &&
+         ExpectContains("installer backend uninstall plan", result.stdout_str,
+                        "downloaded model packs") &&
+         Expect(result.stdout_str.find("Target StudioCast version") ==
+                    std::string::npos,
+                "uninstall plan should omit target version") &&
+         Expect(result.stdout_str.find("Source:") == std::string::npos,
+                "uninstall plan should omit source") &&
+         Expect(result.stdout_str.find("Build directory:") == std::string::npos,
+                "uninstall plan should omit build details");
+}
+
+bool TestRepairDryRunIncludesOpenBackendConfigureFlags() {
+  ScopedTempDir temp("studiocast-installer-backend-dry-run");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "repair --dry-run"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend repair dry-run should exit successfully") &&
+         ExpectContains("installer backend repair dry-run", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_CUDA=ON") &&
+         ExpectContains("installer backend repair dry-run", result.stdout_str,
+                        "-DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON") &&
+         ExpectContains("installer backend repair dry-run", result.stdout_str,
+                        "\"reviewed_operation_ids\"") &&
+         ExpectContains("installer backend repair dry-run", result.stdout_str,
+                        "\"executed_operation_ids\"");
+}
+
+bool TestStatusReportsOptionalComponents() {
+  ScopedTempDir temp("studiocast-installer-backend-status");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "status --json"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend status should exit successfully") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"optional_components\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"onnxruntime_cuda\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"vulkan\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"libvulkan1\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"vulkan-tools\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "\"mesa-vulkan-drivers\"") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "docs/open_source_video_models_install.md") &&
+         ExpectContains("installer backend status", result.stdout_str,
+                        "docs/maxine_install.md");
+}
+
+bool IsSkippedPackageSafetyDir(const fs::path &p) {
+  const std::string name = p.filename().string();
+  return name == ".git" || name == ".idea" || name == "build" ||
+         name.rfind("cmake-build", 0) == 0;
+}
+
+bool IsForbiddenBundledMaxineArtifact(const fs::path &p) {
+  const std::string name = p.filename().string();
+  const char *forbidden_prefixes[] = {
+      "libVideoFX.so",        "libnvvfx.so",          "libNvVFX.so",
+      "libnvVideoEffects.so", "libNVVideoEffects.so", "libnvARPose.so",
+      "libnvar.so",           "libNvAR.so",           "libnv_audiofx.so",
+      "NVIDIA_VFX_SDK_linux", "NVIDIA_AR_SDK_linux",  "Audio_Effects_SDK.tar",
+  };
+  for (const char *prefix : forbidden_prefixes) {
+    if (name.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CmakeInstallBlocksContainForbiddenMaxineArtifact(const std::string &cmake,
+                                                      std::string *matched) {
+  const std::string forbidden[] = {
+      "VideoFX",           "ARSDK",
+      "Audio_Effects_SDK", "libVideoFX.so",
+      "libnv_audiofx.so",  "libnvARPose.so",
+  };
+
+  std::size_t pos = 0;
+  while ((pos = cmake.find("install(", pos)) != std::string::npos) {
+    std::size_t end = cmake.find("\n)", pos);
+    if (end == std::string::npos) {
+      end = cmake.find(')', pos);
+    }
+    if (end == std::string::npos) {
+      end = cmake.size();
+    }
+    const std::string block = cmake.substr(pos, end - pos + 1);
+    for (const std::string &needle : forbidden) {
+      if (block.find(needle) != std::string::npos) {
+        if (matched)
+          *matched = needle;
+        return true;
+      }
+    }
+    pos = end + 1;
+  }
+  return false;
+}
+
+bool TestPackageSafetyDoesNotBundleOrInstallMaxineArtifacts() {
+  const fs::path repo = fs::path(STUDIOCAST_SOURCE_DIR);
+  if (!Expect(!repo.empty() && fs::exists(repo),
+              "source directory should exist for package safety test")) {
+    return false;
+  }
+
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(repo, ec), end; it != end;
+       it.increment(ec)) {
+    if (ec) {
+      std::cerr << "repository walk failed: " << ec.message() << "\n";
+      return false;
+    }
+    if (it->is_directory(ec) && IsSkippedPackageSafetyDir(it->path())) {
+      it.disable_recursion_pending();
+      continue;
+    }
+    if (it->is_regular_file(ec) &&
+        IsForbiddenBundledMaxineArtifact(it->path())) {
+      std::cerr << "forbidden bundled Maxine SDK artifact found: " << it->path()
+                << "\n";
+      return false;
+    }
+  }
+
+  const std::string cmake = [&] {
+    std::ifstream in(repo / "CMakeLists.txt");
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+  }();
+  std::string matched;
+  if (CmakeInstallBlocksContainForbiddenMaxineArtifact(cmake, &matched)) {
+    std::cerr << "CMake install/package surface mentions forbidden Maxine "
+                 "artifact pattern: "
+              << matched << "\n";
+    return false;
+  }
+
+  ScopedTempDir temp("studiocast-installer-backend-maxine-safety");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(
+      BackendCommand(temp, "plan repair --json"), options);
+
+  return Expect(result.exit_code == 0,
+                "installer backend plan repair should exit successfully") &&
+         Expect(result.stdout_str.find("scripts/setup/maxine.sh") ==
+                    std::string::npos,
+                "default installer plan should not run Maxine setup") &&
+         Expect(result.stdout_str.find("install_feature.sh") ==
+                    std::string::npos,
+                "default installer plan should not run Maxine feature "
+                "installers") &&
+         Expect(result.stdout_str.find("download_features.sh") ==
+                    std::string::npos,
+                "default installer plan should not run Maxine feature "
+                "downloaders") &&
+         Expect(result.stdout_str.find("NGC_API_KEY") == std::string::npos &&
+                    result.stdout_str.find("NGC_CLI_API_KEY") ==
+                        std::string::npos,
+                "default installer plan should not mention NGC secrets");
+}
+
+bool TestUserServiceDryRunRestartsServiceAfterInstall() {
+  ScopedTempDir temp("studiocast-user-service-dry-run");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  std::string error;
+  const fs::path fakeSystemctl = temp.path() / "bin" / "systemctl";
+  const fs::path buildDir = temp.path() / "build";
+  const fs::path daemon = buildDir / "studiocastd";
+  if (!Expect(WriteExecutable(fakeSystemctl, "#!/usr/bin/env bash\nexit 0\n",
+                              &error),
+              error.c_str()) ||
+      !Expect(WriteExecutable(daemon, "#!/usr/bin/env bash\nexit 0\n", &error),
+              error.c_str())) {
+    return false;
+  }
+
+  const fs::path repo = fs::path(STUDIOCAST_SOURCE_DIR);
+  const fs::path script = repo / "scripts" / "install" / "user_service.sh";
+  const char *pathEnv = std::getenv("PATH");
+  const std::string command =
+      "HOME=" + ShellQuote((temp.path() / "home").string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote((temp.path() / "config").string()) +
+      " PATH=" +
+      ShellQuote((temp.path() / "bin").string() + ":" +
+                 (pathEnv ? pathEnv : "")) +
+      " " + ShellQuote(script.string()) + " --dry-run --yes --build-dir " +
+      ShellQuote(buildDir.string());
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 10000;
+  const auto result = studiocast::util::ExecCapture(command, options);
+
+  return Expect(result.exit_code == 0,
+                "user service dry-run should exit successfully") &&
+         ExpectContains("user service dry-run", result.stdout_str,
+                        "systemctl --user enable studiocastd.service") &&
+         ExpectContains("user service dry-run", result.stdout_str,
+                        "systemctl --user restart studiocastd.service") &&
+         Expect(result.stdout_str.find("enable --now") == std::string::npos,
+                "user service install should not rely on enable --now for "
+                "already-running daemons");
+}
+
+bool TestAnalyzerRefreshesColdInstalledDaemonThroughCli() {
+  ScopedTempDir temp("studiocast-installer-cold-diagnostics");
+  if (!Expect(temp.ok(), temp.error().c_str()))
+    return false;
+
+  const fs::path binaryDir = fs::path(STUDIOCAST_BINARY_DIR);
+  const fs::path daemon = binaryDir / "studiocastd";
+  const fs::path builtCtl = binaryDir / "studiocastctl";
+  const fs::path python = fs::path(STUDIOCAST_PYTHON_EXECUTABLE);
+  const fs::path installedCtl =
+      temp.xdgDataDir() / "studiocast/current/bin/studiocastctl";
+  const fs::path backend = fs::path(STUDIOCAST_SOURCE_DIR) / "installer" /
+                           "backend/studiocast-installer-backend";
+  if (!Expect(fs::is_regular_file(daemon),
+              "cold diagnostics test requires the real studiocastd binary") ||
+      !Expect(fs::is_regular_file(builtCtl),
+              "cold diagnostics test requires the real studiocastctl binary") ||
+      !Expect(fs::is_regular_file(python),
+              "cold diagnostics test requires the configured Python interpreter")) {
+    return false;
+  }
+
+  std::error_code ec;
+  fs::create_directories(installedCtl.parent_path(), ec);
+  if (!Expect(!ec, "failed to create installed CLI fixture directory"))
+    return false;
+  fs::copy_file(builtCtl, installedCtl, fs::copy_options::overwrite_existing,
+                ec);
+  if (!Expect(!ec, "failed to copy installed CLI fixture"))
+    return false;
+
+  const fs::path configDir = temp.xdgConfigDir() / "studiocast";
+  fs::create_directories(configDir, ec);
+  if (!Expect(!ec, "failed to create cold daemon config fixture"))
+    return false;
+  {
+    std::ofstream config(configDir / "daemon.conf");
+    config << "video.enabled = false\n"
+              "audio.enabled = false\n"
+              "audio.create_virtual_mic = false\n"
+              "audio.create_virtual_speakers = false\n";
+    if (!Expect(config.good(), "failed to write cold daemon config fixture"))
+      return false;
+  }
+
+  const fs::path toolDir = temp.path() / "probe-tools";
+  fs::create_directories(toolDir, ec);
+  if (!Expect(!ec, "failed to create hermetic probe-tool directory"))
+    return false;
+  fs::create_symlink(python, toolDir / "python3", ec);
+  if (!Expect(!ec, "failed to stage hermetic python3 launcher"))
+    return false;
+
+  const fs::path socket =
+      temp.xdgRuntimeDir() / "studiocast/studiocastd.sock";
+  const fs::path coldStatus = temp.path() / "cold-status.json";
+  const fs::path analyzedFacts = temp.path() / "analyzed-facts.json";
+  const fs::path warmStatus = temp.path() / "warm-status.json";
+  const fs::path daemonLog = temp.path() / "daemon.log";
+
+  const std::string environment =
+      "HOME=" + ShellQuote(temp.homeDir().string()) + " " +
+      "XDG_CONFIG_HOME=" + ShellQuote(temp.xdgConfigDir().string()) + " " +
+      "XDG_CACHE_HOME=" + ShellQuote(temp.xdgCacheDir().string()) + " " +
+      "XDG_DATA_HOME=" + ShellQuote(temp.xdgDataDir().string()) + " " +
+      "XDG_STATE_HOME=" + ShellQuote(temp.xdgStateDir().string()) + " " +
+      "XDG_RUNTIME_DIR=" + ShellQuote(temp.xdgRuntimeDir().string()) + " " +
+      "STUDIOCAST_INSTALLER_OFFLINE=1 "
+      "STUDIOCAST_INSTALLER_TEST_MODE=1 " +
+      "PATH=" + ShellQuote(toolDir.string()) + " ";
+
+  // The first status read proves the real daemon starts with an empty
+  // diagnostics cache. The analyzer must then use the installed public CLI's
+  // explicit refresh command before its status read; the final status and
+  // analyzed facts prove that boundary was crossed successfully.
+  const std::string command =
+      environment + ShellQuote(daemon.string()) + " --output /dev/null >" +
+      ShellQuote(daemonLog.string()) + " 2>&1 & daemon_pid=$!; "
+      "cleanup() { kill \"$daemon_pid\" 2>/dev/null || true; "
+      "wait \"$daemon_pid\" 2>/dev/null || true; }; trap cleanup EXIT; "
+      "ready=0; i=0; while [ \"$i\" -lt 200 ]; do "
+      "if [ -S " + ShellQuote(socket.string()) + " ]; then ready=1; break; fi; "
+      "i=$((i + 1)); /bin/sleep 0.05; done; "
+      "[ \"$ready\" -eq 1 ] || exit 70; " +
+      environment + ShellQuote(installedCtl.string()) + " status >" +
+      ShellQuote(coldStatus.string()) + " || exit 71; " + environment +
+      ShellQuote(backend.string()) + " analyze --target-version 0.2.9 >" +
+      ShellQuote(analyzedFacts.string()) + " || exit 72; " + environment +
+      ShellQuote(installedCtl.string()) + " status >" +
+      ShellQuote(warmStatus.string()) + " || exit 73";
+
+  studiocast::util::ExecCaptureOptions options;
+  options.timeout_ms = 60000;
+  options.max_output_bytes = 256 * 1024;
+  const auto result = studiocast::util::ExecCapture(command, options);
+  if (!Expect(result.exit_code == 0 && !result.timed_out,
+              "cold daemon installer analysis should complete through the "
+              "installed CLI")) {
+    std::cerr << "subprocess output:\n" << result.stdout_str << "\n";
+    std::cerr << "daemon log:\n" << ReadTextFile(daemonLog) << "\n";
+    std::cerr << "cold status:\n" << ReadTextFile(coldStatus) << "\n";
+    std::cerr << "analyzed facts:\n" << ReadTextFile(analyzedFacts) << "\n";
+    std::cerr << "warm status:\n" << ReadTextFile(warmStatus) << "\n";
+    return false;
+  }
+
+  const std::string cold = ReadTextFile(coldStatus);
+  const std::string facts = ReadTextFile(analyzedFacts);
+  const std::string warm = ReadTextFile(warmStatus);
+  return ExpectContains("cold daemon status", cold, "\"open_vulkan\":{}") &&
+         ExpectContains("refreshed daemon status", warm,
+                        "\"compiled_enabled\":") &&
+         ExpectContains("installer analyzed facts", facts,
+                        "\"runtime_diagnostics_available\": true");
+}
+
+} // namespace
+
+int main() {
+  bool ok = true;
+  ok = TestBackendCommandsIgnoreInheritedXdgRoots() && ok;
+  ok = TestRepairPlanIncludesDefaultOpenBackendConfigureFlags() && ok;
+  ok = TestRepairPlanCanOptIntoVulkanRuntimeAndBackend() && ok;
+  ok = TestRepairPlanInstallsOnlySelectedVulkanPackages() && ok;
+  ok = TestRepairPlanRuntimeOnlyExplainsVulkanBoundary() && ok;
+  ok = TestRepairPlanCanDisableOpenBackendConfigureFlags() && ok;
+  ok = TestUninstallPlanOmitsInstallOnlyDetails() && ok;
+  ok = TestRepairDryRunIncludesOpenBackendConfigureFlags() && ok;
+  ok = TestStatusReportsOptionalComponents() && ok;
+  ok = TestPackageSafetyDoesNotBundleOrInstallMaxineArtifacts() && ok;
+  ok = TestUserServiceDryRunRestartsServiceAfterInstall() && ok;
+  ok = TestAnalyzerRefreshesColdInstalledDaemonThroughCli() && ok;
+  return ok ? 0 : 1;
+}

@@ -134,12 +134,32 @@ struct DaemonStatusSnapshot {
   DeviceReadiness camera;
   DeviceReadiness microphone;
   DeviceReadiness speakers;
+  QString videoComputePreference;
+  QString videoComputeResolvedBackend;
+  QString videoComputeActiveBackend;
+  QString videoComputeFallbackReason;
+  QString videoComputeDegradedReason;
+  QStringList videoComputeActiveEngines;
+  bool videoComputeFallbackActive = false;
+  QString videoComputeFallbackFrom;
+  QString videoComputeFallbackTo;
+  QString videoComputeFallbackCode;
+  QString videoComputeFallbackDetail;
+  QString videoComputeProviderMode;
+  QString videoComputeActiveProvider;
+  QString videoComputeProviderDevice;
+  QString videoComputeTensorIoMode;
+  bool videoComputeCpuTailsActive = false;
+  QStringList videoComputeCpuTailStages;
   QString videoEffectsEnginePreference;
   QString audioEffectsEnginePreference;
   QString rawVideoEffectsJson;
   QString rawAudioEffectsJson;
   VideoEffectPlan videoEffectPlan;
   QMap<QString, EffectReadiness> videoEffectReadiness;
+  bool videoPipelineRunning = false;
+  bool videoPipelineStarting = false;
+  QString videoPipelineState;
   QString videoEffectsActiveBackends;
   QString microphoneActiveBackend;
   QString speakersActiveBackend;
@@ -151,6 +171,7 @@ struct DaemonStatusSnapshot {
 
   EngineStatus maxine;
   EngineStatus openCuda;
+  EngineStatus openVulkan;
   EngineStatus openAudio;
 
   static DaemonStatusSnapshot Unreachable(const QString &error);

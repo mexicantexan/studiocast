@@ -386,7 +386,6 @@ int main(int argc, char **argv) {
       have_camera = true;
       width = cap.Actual().width;
       height = cap.Actual().height;
-      fps = cap.Actual().fps;
     } else {
       std::cerr << "Warning: failed to open capture device '" << device
                 << "': " << err << "\n";
@@ -623,7 +622,6 @@ int main(int argc, char **argv) {
       have_camera = true;
       width = cap.Actual().width;
       height = cap.Actual().height;
-      fps = cap.Actual().fps;
     } else {
       std::cerr << "Warning: failed to open capture device '" << device
                 << "': " << err << "\n";

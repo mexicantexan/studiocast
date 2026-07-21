@@ -105,6 +105,7 @@ bool HasArg(int argc, char **argv, std::string_view flag) {
   return false;
 }
 
+#if STUDIOCAST_HAVE_ONNXRUNTIME
 std::string ToLowerAscii(std::string s) {
   for (char &c : s) {
     const unsigned char uc = static_cast<unsigned char>(c);
@@ -126,6 +127,7 @@ bool HasProvider(const std::vector<std::string> &providers,
   return std::find(providers.begin(), providers.end(), provider) !=
          providers.end();
 }
+#endif
 
 std::string GetArgValue(int argc, char **argv, std::string_view key) {
   for (int i = 1; i + 1 < argc; ++i) {
@@ -136,6 +138,7 @@ std::string GetArgValue(int argc, char **argv, std::string_view key) {
   return "";
 }
 
+#if STUDIOCAST_HAVE_ONNXRUNTIME
 const char *YesNo(bool v) { return v ? "yes" : "no"; }
 
 void PrintOrtRuntimeInfo(const studiocast::onnx::OrtRuntimeInfo &ort) {
@@ -159,6 +162,7 @@ void PrintOrtRuntimeInfo(const studiocast::onnx::OrtRuntimeInfo &ort) {
     }
   }
 }
+#endif
 
 static int CmdPaths() {
   std::cout << "StudioCast Paths (Open CUDA)\n";
@@ -810,6 +814,8 @@ static int CmdAudioBench(int argc, char **argv) {
                "(STUDIOCAST_ENABLE_OPEN_AUDIO=0).\n";
   (void)cpu_only;
   (void)csv;
+  (void)strength;
+  (void)warmup;
   return 2;
 #elif !STUDIOCAST_HAVE_ONNXRUNTIME
   std::cerr << "ERROR: This build was compiled without ONNX Runtime "
@@ -818,6 +824,8 @@ static int CmdAudioBench(int argc, char **argv) {
                "install onnxruntime dev package).\n";
   (void)cpu_only;
   (void)csv;
+  (void)strength;
+  (void)warmup;
   return 2;
 #else
   std::string effect_kind = effect;

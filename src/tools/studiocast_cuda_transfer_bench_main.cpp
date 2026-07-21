@@ -121,6 +121,83 @@ std::uint64_t Checksum(const std::vector<std::uint8_t> &data) {
   return sum;
 }
 
+std::string CsvSafe(std::string s) {
+  for (char &ch : s) {
+    if (ch == ',')
+      ch = ';';
+    if (ch == '\n' || ch == '\r')
+      ch = ' ';
+  }
+  return s;
+}
+
+void PrintCsvHeader() {
+  std::cout << "backend,stage,width,height,warmup_iterations,iterations,status,"
+               "skip_reason,avg_ms,p95_ms,p99_ms,min_ms,max_ms,checksum,"
+               "roundtrip_ok\n";
+}
+
+void PrintCsvSkipRows(const Options &opts, const std::string &reason) {
+  for (const char *stage : {"upload", "download", "roundtrip"}) {
+    std::cout << "cuda," << stage << "," << opts.width << "," << opts.height
+              << "," << opts.warmup << "," << opts.iterations
+              << ",skipped," << CsvSafe(reason)
+              << ",0,0,0,0,0,0,na\n";
+  }
+}
+
+void PrintCsvResult(const Options &opts, const char *stage,
+                    const Stats &stats, std::uint64_t checksum,
+                    const char *roundtripOk) {
+  std::cout << "cuda," << stage << "," << opts.width << "," << opts.height
+            << "," << opts.warmup << "," << opts.iterations << ",ok,,"
+            << stats.avg_ms << "," << stats.p95_ms << "," << stats.p99_ms
+            << "," << stats.min_ms << "," << stats.max_ms << ","
+            << checksum << "," << roundtripOk << "\n";
+}
+
+void PrintHumanResult(const Options &opts, const char *stage,
+                      const Stats &stats, std::uint64_t checksum,
+                      const char *roundtripOk) {
+  std::cout << "CUDA RGB24 " << stage << " benchmark\n";
+  std::cout << "  size       : " << opts.width << "x" << opts.height << "\n";
+  std::cout << "  iterations : " << opts.iterations << " (warmup "
+            << opts.warmup << ")\n";
+  std::cout << "  avg        : " << std::fixed << std::setprecision(4)
+            << stats.avg_ms << " ms\n";
+  std::cout << "  p95        : " << stats.p95_ms << " ms\n";
+  std::cout << "  p99        : " << stats.p99_ms << " ms\n";
+  std::cout << "  min/max    : " << stats.min_ms << " / " << stats.max_ms
+            << " ms\n";
+  std::cout << "  checksum   : " << checksum << "\n";
+  std::cout << "  roundtrip  : " << roundtripOk << "\n";
+}
+
+template <typename Fn>
+bool RunTimed(const Options &opts, Fn &&fn, Stats *stats) {
+  for (int i = 0; i < opts.warmup; ++i) {
+    if (!fn())
+      return false;
+  }
+
+  std::vector<double> samples;
+  samples.reserve(static_cast<std::size_t>(opts.iterations));
+  using Clock = std::chrono::steady_clock;
+  for (int i = 0; i < opts.iterations; ++i) {
+    const auto t0 = Clock::now();
+    if (!fn())
+      return false;
+    const auto t1 = Clock::now();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+                        .count();
+    samples.push_back(static_cast<double>(ns) / 1'000'000.0);
+  }
+
+  if (stats)
+    *stats = ComputeStats(std::move(samples));
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -133,10 +210,18 @@ int main(int argc, char **argv) {
   studiocast::maxine::CudaDriverApi cuda;
   std::string err;
   if (!cuda.Initialize(&err)) {
+    if (opts.csv) {
+      PrintCsvHeader();
+      PrintCsvSkipRows(opts, err);
+    }
     std::cerr << "SKIP: CUDA unavailable: " << err << "\n";
     return 77;
   }
   if (!cuda.EnsureContext(&err)) {
+    if (opts.csv) {
+      PrintCsvHeader();
+      PrintCsvSkipRows(opts, err);
+    }
     std::cerr << "SKIP: CUDA context unavailable: " << err << "\n";
     return 77;
   }
@@ -169,68 +254,82 @@ int main(int argc, char **argv) {
     }
   }
 
-  auto run_once = [&]() -> bool {
-    return image.UploadFromCpuRgb24(&cuda, src.data(), stride, stream, &err) &&
-           image.DownloadToCpuRgb24(&cuda, dst.data(), stride, stream, &err) &&
-           cuda.StreamSynchronize(stream, &err);
+  const auto cleanup = [&]() {
+    (void)image.Free(&cuda, nullptr);
+    (void)cuda.DestroyStream(stream, nullptr);
   };
 
-  for (int i = 0; i < opts.warmup; ++i) {
-    if (!run_once()) {
-      std::cerr << "ERROR: warmup failed: " << err << "\n";
-      (void)image.Free(&cuda, nullptr);
-      (void)cuda.DestroyStream(stream, nullptr);
-      return 1;
+  if (opts.csv)
+    PrintCsvHeader();
+
+  auto report = [&](const char *stage, const Stats &stats,
+                    std::uint64_t checksum, const char *roundtripOk) {
+    if (opts.csv) {
+      PrintCsvResult(opts, stage, stats, checksum, roundtripOk);
+    } else {
+      PrintHumanResult(opts, stage, stats, checksum, roundtripOk);
+      std::cout << "\n";
     }
+  };
+
+  Stats uploadStats;
+  err.clear();
+  if (!RunTimed(opts,
+                [&]() {
+                  return image.UploadFromCpuRgb24(&cuda, src.data(), stride,
+                                                  stream, &err) &&
+                         cuda.StreamSynchronize(stream, &err);
+                },
+                &uploadStats)) {
+    std::cerr << "ERROR: upload benchmark failed: " << err << "\n";
+    cleanup();
+    return 1;
+  }
+  report("upload", uploadStats, Checksum(src), "na");
+
+  err.clear();
+  if (!image.UploadFromCpuRgb24(&cuda, src.data(), stride, stream, &err) ||
+      !cuda.StreamSynchronize(stream, &err)) {
+    std::cerr << "ERROR: preloading download benchmark failed: " << err << "\n";
+    cleanup();
+    return 1;
   }
 
-  std::vector<double> samples;
-  samples.reserve(static_cast<std::size_t>(opts.iterations));
-  using Clock = std::chrono::steady_clock;
-  for (int i = 0; i < opts.iterations; ++i) {
-    const auto t0 = Clock::now();
-    if (!run_once()) {
-      std::cerr << "ERROR: iteration failed: " << err << "\n";
-      (void)image.Free(&cuda, nullptr);
-      (void)cuda.DestroyStream(stream, nullptr);
-      return 1;
-    }
-    const auto t1 = Clock::now();
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
-                        .count();
-    samples.push_back(static_cast<double>(ns) / 1'000'000.0);
+  Stats downloadStats;
+  err.clear();
+  if (!RunTimed(opts,
+                [&]() {
+                  return image.DownloadToCpuRgb24(&cuda, dst.data(), stride,
+                                                  stream, &err) &&
+                         cuda.StreamSynchronize(stream, &err);
+                },
+                &downloadStats)) {
+    std::cerr << "ERROR: download benchmark failed: " << err << "\n";
+    cleanup();
+    return 1;
   }
+  const bool downloadOk = (src == dst);
+  report("download", downloadStats, Checksum(dst), downloadOk ? "yes" : "no");
 
-  const bool roundtrip_ok = (src == dst);
-  const Stats stats = ComputeStats(std::move(samples));
-  const std::uint64_t checksum = Checksum(dst);
-
-  if (opts.csv) {
-    std::cout << "width,height,iterations,avg_ms,p95_ms,p99_ms,min_ms,max_ms,"
-                 "checksum,roundtrip_ok\n";
-    std::cout << opts.width << "," << opts.height << "," << opts.iterations
-              << "," << stats.avg_ms << "," << stats.p95_ms << ","
-              << stats.p99_ms << "," << stats.min_ms << "," << stats.max_ms
-              << "," << checksum << "," << (roundtrip_ok ? "yes" : "no")
-              << "\n";
-  } else {
-    std::cout << "CUDA RGB24 upload+download+sync benchmark\n";
-    std::cout << "  size       : " << opts.width << "x" << opts.height
-              << "\n";
-    std::cout << "  iterations : " << opts.iterations << " (warmup "
-              << opts.warmup << ")\n";
-    std::cout << "  avg        : " << std::fixed << std::setprecision(4)
-              << stats.avg_ms << " ms\n";
-    std::cout << "  p95        : " << stats.p95_ms << " ms\n";
-    std::cout << "  p99        : " << stats.p99_ms << " ms\n";
-    std::cout << "  min/max    : " << stats.min_ms << " / " << stats.max_ms
-              << " ms\n";
-    std::cout << "  checksum   : " << checksum << "\n";
-    std::cout << "  roundtrip  : " << (roundtrip_ok ? "ok" : "mismatch")
-              << "\n";
+  Stats roundtripStats;
+  err.clear();
+  if (!RunTimed(opts,
+                [&]() {
+                  return image.UploadFromCpuRgb24(&cuda, src.data(), stride,
+                                                  stream, &err) &&
+                         image.DownloadToCpuRgb24(&cuda, dst.data(), stride,
+                                                  stream, &err) &&
+                         cuda.StreamSynchronize(stream, &err);
+                },
+                &roundtripStats)) {
+    std::cerr << "ERROR: roundtrip benchmark failed: " << err << "\n";
+    cleanup();
+    return 1;
   }
+  const bool roundtripOk = (src == dst);
+  report("roundtrip", roundtripStats, Checksum(dst),
+         roundtripOk ? "yes" : "no");
 
-  (void)image.Free(&cuda, nullptr);
-  (void)cuda.DestroyStream(stream, nullptr);
-  return roundtrip_ok ? 0 : 1;
+  cleanup();
+  return (downloadOk && roundtripOk) ? 0 : 1;
 }

@@ -27,17 +27,20 @@ chmod +x StudioCast-Installer-<version>-<arch>.AppImage
 
 The packaged installer includes its backend at
 `usr/share/studiocast/installer/studiocast-installer-backend`, which matches the
-GUI lookup path. It also includes the matching release source archive at
+GUI lookup path. The same installed surface contains the signed stable-channel
+verifier, release-manifest schema, and production public-key directory. It also
+includes the matching release source archive at
 `usr/share/studiocast/source/StudioCast-<version>-source.tar.gz`; the GUI
 automatically selects "Build from selected release archive" with that archive
 prefilled. You can still choose a different release archive manually or build
 from a local checkout.
 
 The release AppImage/AppDir is self-contained for the installer GUI, backend,
-and matching source archive. Runtime dependencies such as Qt build packages,
-v4l2loopback support, PulseAudio tools, ONNX Runtime, and optional model/SDK
-assets are installed or checked through supported system packages and the
-backend scripts.
+user-local uninstall, release verification primitives, and matching source
+archive. Recommended accepts an archive only after signed-manifest and artifact
+signature/hash/size verification. If a production release public key has not
+been provisioned, it stops with `release.signature.production_key_missing`.
+It never trusts the repository's fixture key.
 
 Build and run the installer from a checkout:
 
@@ -47,10 +50,26 @@ cmake --build build --target studiocast-installer
 ./build/studiocast-installer
 ```
 
-The GUI calls the scriptable
-backend at `installer/backend/studiocast-installer-backend`, which uses the
-existing setup/install/uninstall helpers for privileged package/module steps,
-builds, binary links, and the systemd user service.
+The GUI calls the scriptable backend at
+`installer/backend/studiocast-installer-backend`. It performs user-local builds,
+versioned payload activation, service wiring, repair, rollback, and uninstall.
+Any host-level virtual-camera work uses only the fixed root-owned helper and a
+structured polkit authorization result; there is no selected-source or broad
+sudo fallback.
+
+On the **Service and Optional Components** page, users can separately select:
+
+- **Build StudioCast with Open Vulkan support** (`--open-vulkan`).
+- **Install Vulkan loader and diagnostic packages** (`--vulkan-runtime`).
+- **Install Mesa Intel/AMD Vulkan ICDs** (`--mesa-vulkan`).
+- **Install shader developer tools** (`--shader-tools`), which are only needed
+  to validate or regenerate the committed SPIR-V shaders.
+
+These choices are available for install, update, repair, and clean-install
+workflows. They are opt-in. Open Vulkan is runtime-loaded, and package
+installation alone does not make a Vulkan GPU usable: the system still needs a
+working GPU driver/ICD exposing a compute-capable Vulkan device. The review page
+shows the selected backend flags and package operations before anything runs.
 
 CLI equivalents:
 
@@ -92,9 +111,10 @@ and whether user config/model/log/cache data was preserved. Update, repair,
 uninstall, and clean-install workflows use this manifest when available.
 
 Clean install removes app files and the user service before reinstalling. It
-preserves user config, downloaded model packs, logs, and cache by default; the
-GUI and backend require an explicit `--remove-user-data` choice before deleting
-those XDG directories.
+always resets payload, build cache, logs/state, and downloaded models. Preserve
+settings is checked by default and snapshots/restores only user configuration;
+turning it off performs a literal full wipe. Ordinary uninstall separately
+preserves settings, models, and data by default.
 
 ## 1) Install dependencies + v4l2loopback
 
@@ -102,9 +122,10 @@ those XDG directories.
 ./scripts/setup.sh --deps --v4l2loopback --load-loopback --persist-loopback
 ```
 
-This installs build dependencies (Qt6/CMake/Ninja/etc), ONNX Runtime (required; GPU build by default), and runtime dependencies (v4l2loopback tools, v4l-utils),
+This installs build dependencies (Qt6/CMake/Ninja/etc), ONNX Runtime, and runtime dependencies (v4l2loopback tools, v4l-utils),
 then creates a virtual camera device (by default at `/dev/video10` with label **StudioCast Camera**).
 The setup helper prefers a kernel-provided/prebuilt v4l2loopback module and only falls back to `v4l2loopback-dkms` when the running kernel does not already provide one.
+The ONNX Runtime flavor is `gpu` only when `nvidia-smi` works or when you pass `--onnxruntime-flavor gpu`; otherwise the helper installs the CPU flavor.
 
 MJPEG decode uses **libjpeg-turbo** (via CMake `FindJPEG`). If you are installing dependencies manually:
 
@@ -165,7 +186,7 @@ Install/usage docs:
 
 - `docs/open_cuda_install.md`
 
-On Ubuntu 22.04+, the helper script that installs an ONNX Runtime GPU build is:
+On Ubuntu 22.04+, the helper script that installs ONNX Runtime is:
 
 ```bash
 ./scripts/setup.sh --deps
@@ -173,6 +194,46 @@ On Ubuntu 22.04+, the helper script that installs an ONNX Runtime GPU build is:
 
 `--deps` ensures ONNX Runtime is available via `pkg-config onnxruntime` by installing the upstream tarball under
 `/opt/studiocast/onnxruntime/<version>/...` and configuring runtime linking via `ldconfig`.
+For Open CUDA, use a working NVIDIA driver and install the GPU ONNX Runtime flavor explicitly when auto-detection cannot see `nvidia-smi`:
+
+```bash
+./scripts/setup.sh --deps --onnxruntime-flavor gpu
+```
+
+## 3a) Optional: Open Vulkan backend
+
+The Open Vulkan backend is optional and disabled at build time unless requested:
+
+```bash
+cmake -S . -B <build-dir> -G Ninja \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON
+```
+
+Vulkan runtime packages are also optional. On Ubuntu-family systems:
+
+```bash
+./scripts/setup.sh --vulkan-runtime
+```
+
+For Intel/AMD Mesa ICDs, add:
+
+```bash
+./scripts/setup.sh --vulkan-runtime --mesa-vulkan
+```
+
+These packages provide the Vulkan loader and diagnostics (`libvulkan1`, `vulkan-tools`, and optionally `mesa-vulkan-drivers`). They do not guarantee hardware support. You still need a GPU driver/ICD that exposes a compute-capable Vulkan device. Developer shader tools are separate:
+
+```bash
+./scripts/setup.sh --shader-tools
+```
+
+Explicit Vulkan selection does not silently run CUDA. If Vulkan is requested but the build/runtime/device path is unavailable, daemon status reports the Vulkan fallback/degraded reason and the active backend is CPU/pass-through where applicable.
+
+Open Vulkan install/build visibility is ahead of full effect parity. In
+particular, production Vulkan virtual-background matting remains blocked until
+a device-resident Vulkan inference runtime replaces the current stub. Installing
+the Vulkan loader or Mesa ICDs must not be read as a claim of CUDA/NVIDIA effect
+parity.
 
 ## 3b) Optional: Open Audio backend (no Maxine required)
 

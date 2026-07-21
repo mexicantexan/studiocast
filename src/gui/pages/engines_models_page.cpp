@@ -87,6 +87,8 @@ QString FriendlyBackendLabel(const QString &id) {
     return QStringLiteral("Maxine");
   if (v == QStringLiteral("open_cuda") || v == QStringLiteral("open_video"))
     return QStringLiteral("Open Video");
+  if (v == QStringLiteral("open_vulkan") || v == QStringLiteral("vulkan"))
+    return QStringLiteral("Open Vulkan");
   if (v == QStringLiteral("open_source") || v == QStringLiteral("open_audio"))
     return QStringLiteral("Open Audio");
   if (v == QStringLiteral("off"))
@@ -848,6 +850,8 @@ EnginesModelsPage::EnginesModelsPage(QWidget *parent) : QWidget(parent) {
       MutedLabel(QStringLiteral("Active backend"), backendBox), 0, 2);
   videoPreferenceLabel_ = ValueLabel(QStringLiteral("Unknown"), backendBox);
   videoActiveLabel_ = ValueLabel(QStringLiteral("Unknown"), backendBox);
+  videoActiveLabel_->setObjectName(
+      QStringLiteral("enginesVideoActiveBackendValue"));
   backendGrid->addWidget(videoPreferenceLabel_, 1, 1);
   backendGrid->addWidget(videoActiveLabel_, 1, 2);
 
@@ -1615,27 +1619,44 @@ void EnginesModelsPage::UpdateStatus(const DaemonStatusSnapshot &snapshot) {
     videoPreferenceLabel_->setText(
         FriendlyBackendLabel(snapshot.videoEffectsEnginePreference));
   if (videoActiveLabel_) {
-    const QString active =
-        !snapshot.reachable || !snapshot.parsed
-            ? QStringLiteral("Unknown")
-            : ActiveBackendSummary(snapshot.videoEffectsActiveBackends);
+    QString active;
+    if (!snapshot.reachable || !snapshot.parsed) {
+      active = QStringLiteral("Unknown");
+    } else if (snapshot.videoPipelineStarting) {
+      active = QStringLiteral("Starting");
+    } else if (!snapshot.videoPipelineRunning ||
+               snapshot.videoPipelineState != QStringLiteral("running")) {
+      active = QStringLiteral("Inactive");
+    } else {
+      active = ActiveBackendSummary(snapshot.videoEffectsActiveBackends,
+                                    QStringLiteral("Pass-through"));
+    }
     videoActiveLabel_->setText(active);
-    videoActiveLabel_->setToolTip(snapshot.videoEffectsActiveBackends);
+    videoActiveLabel_->setToolTip(
+        snapshot.videoPipelineRunning && !snapshot.videoPipelineStarting &&
+                snapshot.videoPipelineState == QStringLiteral("running")
+            ? snapshot.videoEffectsActiveBackends
+            : QString());
   }
 
   if (audioPreferenceLabel_)
     audioPreferenceLabel_->setText(
         FriendlyBackendLabel(snapshot.audioEffectsEnginePreference));
   if (microphoneActiveLabel_) {
+    const QString microphoneActive =
+        !snapshot.reachable || !snapshot.parsed
+            ? QStringLiteral("Unknown")
+            : FriendlyBackendLabel(snapshot.microphoneActiveBackend);
     microphoneActiveLabel_->setText(
-        QStringLiteral("Microphone: %1")
-            .arg(FriendlyBackendLabel(snapshot.microphoneActiveBackend)));
+        QStringLiteral("Microphone: %1").arg(microphoneActive));
     microphoneActiveLabel_->setToolTip(snapshot.microphoneActiveBackend);
   }
   if (speakersActiveLabel_) {
     QString speakerActive;
     const QString routeMode = snapshot.speakersRouteMode.trimmed().toLower();
-    if (routeMode == QStringLiteral("loopback")) {
+    if (!snapshot.reachable || !snapshot.parsed) {
+      speakerActive = QStringLiteral("Unknown");
+    } else if (routeMode == QStringLiteral("loopback")) {
       speakerActive = QStringLiteral("Loopback / pass-through");
     } else if (routeMode == QStringLiteral("off") &&
                snapshot.speakersActiveBackend.trimmed().isEmpty()) {

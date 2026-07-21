@@ -14,6 +14,36 @@ on:
         required: false
         type: string
         default: '["self-hosted","linux","x64","gpu"]'
+      require_vulkan_nvidia_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an NVIDIA Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_nvidia_runner_labels:
+        description: "JSON runs-on labels for the opt-in NVIDIA Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","nvidia","vulkan"]'
+      require_vulkan_amd_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an AMD Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_amd_runner_labels:
+        description: "JSON runs-on labels for the opt-in AMD Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","amd","vulkan"]'
+      require_vulkan_intel_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an Intel Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_intel_runner_labels:
+        description: "JSON runs-on labels for the opt-in Intel Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","intel","vulkan"]'
 
 permissions:
   contents: read
@@ -68,7 +98,10 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF
 
       - name: Build
         run: |
@@ -116,7 +149,10 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF
 
       - name: Build
         run: |
@@ -148,7 +184,8 @@ jobs:
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
             libblas-dev liblapack-dev \
-            libdlib-dev
+            libdlib-dev \
+            libvulkan1 vulkan-tools
 
       - name: Install ONNX Runtime CPU package
         env:
@@ -215,13 +252,18 @@ jobs:
           mkdir -p build
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON \
-            -DSTUDIOCAST_ENABLE_DLIB=ON 2>&1 | tee build/configure.log
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON 2>&1 | tee build/configure.log
 
           grep -Eq '^STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=ON$' build/CMakeCache.txt
+          grep -Eq '^STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=ON$' build/CMakeCache.txt
           grep -Eq '^STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON$' build/CMakeCache.txt
           grep -Eq '^STUDIOCAST_ENABLE_DLIB:BOOL=ON$' build/CMakeCache.txt
+          grep -Eq '^STUDIOCAST_BUILD_BENCHMARKS:BOOL=ON$' build/CMakeCache.txt
           grep -F 'Open CUDA backend enabled' build/configure.log
+          grep -F 'Open Vulkan backend enabled' build/configure.log
           grep -F 'Open Audio backend enabled' build/configure.log
           grep -F 'dlib found' build/configure.log
 
@@ -278,6 +320,162 @@ jobs:
       - name: Required CUDA runtime self-test
         run: |
           ./build/studiocast-probe --self-test --require-cuda-runtime
+
+  # Push CI intentionally avoids hard Vulkan runtime requirements. These jobs are
+  # opt-in because the runner must provide a real vendor ICD and GPU.
+  vulkan-runtime-smoke-nvidia:
+    name: Vulkan runtime smoke (NVIDIA, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_nvidia_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_nvidia_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools
+
+      - name: Runtime inventory
+        run: |
+          nvidia-smi || true
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
+
+  vulkan-runtime-smoke-amd:
+    name: Vulkan runtime smoke (AMD, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_amd_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_amd_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools mesa-vulkan-drivers
+
+      - name: Runtime inventory
+        run: |
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
+
+  vulkan-runtime-smoke-intel:
+    name: Vulkan runtime smoke (Intel, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_intel_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_intel_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools mesa-vulkan-drivers
+
+      - name: Runtime inventory
+        run: |
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
 
   package-smoke:
     name: package smoke (ubuntu-24.04)

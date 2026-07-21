@@ -553,6 +553,73 @@ Expected:
 - Failure leaves the previous working daemon state intact or clearly reports
   what changed.
 
+## Open Vulkan Adapter Selection
+
+- [ ] On a system with multiple Vulkan devices, inspect
+  `engines.open_vulkan.device_candidates` in daemon status.
+
+Expected:
+
+- Every loader-enumerated device has a stable `enumeration_index` for that run,
+  device/vendor/type details, its compute queue family or a rejection reason,
+  and selected/eligible state.
+- Automatic selection prefers a discrete GPU, then an integrated GPU, then a
+  virtual GPU. A CPU Vulkan implementation such as lavapipe is not treated as
+  hardware acceleration by default.
+- `selected_device_index`, `device_selection_request`, and the top-level device
+  fields agree with the selected candidate.
+
+- [ ] Select a specific candidate and restart the daemon:
+
+```bash
+STUDIOCAST_VULKAN_DEVICE_INDEX=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Open Vulkan selects enumeration index `1`, or reports
+  `vulkan_requested_device_not_found` / `vulkan_requested_device_no_compute_queue`
+  without silently choosing another adapter.
+- Vulkan enumeration indices are not assumed to match NVIDIA `nvidia-smi`
+  indices or the generic `STUDIOCAST_GPU_INDEX` setting.
+
+- [ ] Persist a candidate's `stable_id` through the daemon, then restart it:
+
+```bash
+build/studiocastctl video set vulkan_device=v1:VVVV:DDDD:T:normalized-name
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- `video.vulkan_adapter.configured_device` and
+  `engines.open_vulkan.device_selection_request` report the saved identity.
+- Reordering loader enumeration does not change the selected physical adapter.
+- If the saved identity is absent, status reports
+  `vulkan_requested_device_not_found` without choosing another adapter.
+- If multiple indistinguishable adapters match the fallback identity, status
+  reports `vulkan_requested_device_ambiguous` and fails closed. The v1 identity
+  is a stable-property fallback, not a PCI/UUID identity, so identical GPUs may
+  require a future stronger platform identifier.
+- A changed selection applies to subsequently initialized Vulkan devices;
+  restart the daemon before validating an already-running pipeline.
+
+- [ ] On a CPU-only Vulkan system, test the explicit software-device opt-in:
+
+```bash
+STUDIOCAST_VULKAN_ALLOW_CPU=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Without the opt-in, status reports `vulkan_only_cpu_devices_available` and
+  explains that a working GPU driver/ICD is needed.
+- With the opt-in, the CPU candidate can initialize, but diagnostics set
+  `cpu_device_selected=true` and warn that it is software fallback rather than
+  hardware GPU acceleration.
+
 ## Error And Recovery Cases
 
 - [ ] Start GUI and daemon, then unplug the physical camera during streaming.

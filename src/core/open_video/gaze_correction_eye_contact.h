@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -11,8 +12,33 @@
 #include "core/open_video/frame_analysis_cache.h"
 #include "core/open_video/model_pack_registry.h"
 #include "core/open_video/yunet_face_detector.h"
+#include "core/video/image_ppm.h"
 
 namespace studiocast::open_video {
+
+struct EyeContactRuntimeStatus {
+  bool uses_cpu_face_detection = true;
+  bool uses_cpu_landmarks = true;
+  bool uses_cpu_preprocess = true;
+  bool uses_cpu_tensor_io = true;
+  bool uses_cpu_postprocess = true;
+  bool device_resident_gpu_path = false;
+
+  bool left_cuda_ep_active = false;
+  bool right_cuda_ep_active = false;
+  bool cuda_ep_cpu_tensor_io_active = false;
+  bool cpu_only_session_active = false;
+
+  std::string summary;
+};
+
+struct EyeContactScratchStatus {
+  std::uint64_t geometry_rebuilds = 0;
+  std::uint64_t resize_plan_rebuilds = 0;
+  int frame_width = 0;
+  int frame_height = 0;
+  std::size_t upscale_capacity = 0;
+};
 
 // Open Video Eye Contact effect using gaze-correction-cam style models.
 //
@@ -58,6 +84,14 @@ public:
   bool using_cpu_fallback() const { return using_cpu_fallback_; }
   const std::string &active_model_id() const { return active_model_id_; }
   const std::string &sticky_warning() const { return sticky_warning_; }
+  EyeContactRuntimeStatus runtime_status() const;
+  EyeContactScratchStatus scratch_status() const;
+
+  // Setup/reconfiguration entry point for bounded per-eye scratch. Repeated
+  // calls with the same frame and model geometry are allocation-free.
+  bool PrepareScratch(int frame_width, int frame_height, int left_input_width,
+                      int left_input_height, int right_input_width,
+                      int right_input_height, std::string *error);
 
 private:
   struct EyeRuntime {
@@ -149,7 +183,10 @@ private:
   void CompositeEyeIntoFrame(std::uint8_t *frame_rgb, int frame_w, int frame_h,
                              std::size_t frame_stride, const EyeData &eye,
                              const std::vector<std::uint8_t> &corrected_rgb_u8,
-                             float strength01);
+                             float strength01, bool left_eye);
+
+  bool EnsureResizePlan(bool left_eye, bool upscale, int src_w, int src_h,
+                        int dst_w, int dst_h, std::string *error);
 
   void DisableAfterFailure(const std::string &why);
 
@@ -167,6 +204,28 @@ private:
   DlibFaceLandmarks dlib_landmarks_;
   EyeRuntime left_;
   EyeRuntime right_;
+
+  EyeData left_eye_scratch_;
+  EyeData right_eye_scratch_;
+  std::vector<std::uint8_t> left_corrected_scratch_;
+  std::vector<std::uint8_t> right_corrected_scratch_;
+  std::vector<std::uint8_t> upscale_scratch_;
+  studiocast::video::Rgb24BilinearResizePlan left_extract_plan_;
+  studiocast::video::Rgb24BilinearResizePlan right_extract_plan_;
+  studiocast::video::Rgb24BilinearResizePlan left_upscale_plan_;
+  studiocast::video::Rgb24BilinearResizePlan right_upscale_plan_;
+  std::array<int, 4> left_extract_geometry_{};
+  std::array<int, 4> right_extract_geometry_{};
+  std::array<int, 4> left_upscale_geometry_{};
+  std::array<int, 4> right_upscale_geometry_{};
+  int scratch_frame_width_ = 0;
+  int scratch_frame_height_ = 0;
+  int scratch_left_input_width_ = 0;
+  int scratch_left_input_height_ = 0;
+  int scratch_right_input_width_ = 0;
+  int scratch_right_input_height_ = 0;
+  std::uint64_t scratch_geometry_rebuilds_ = 0;
+  std::uint64_t scratch_resize_plan_rebuilds_ = 0;
 
   std::string sticky_warning_;
   int runtime_failures_ = 0;
