@@ -994,9 +994,9 @@ install(FILES
 )
 
 install(FILES
-        packaging/release/__init__.py
-        packaging/release/release_channel.py
-        packaging/release/release-manifest-v1.schema.json
+        installer/release/__init__.py
+        installer/release/release_channel.py
+        installer/release/release-manifest-v1.schema.json
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/release"
         COMPONENT Installer
 )
@@ -1012,12 +1012,8 @@ install(PROGRAMS installer/models/studiocast-model-transaction
 install(FILES
         installer/models/__init__.py
         installer/models/model_transactions.py
+        installer/models/curated-model-catalog-v1.json
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/models"
-        COMPONENT Installer
-)
-
-install(FILES packaging/models/curated-model-catalog-v1.json
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/packaging/models"
         COMPONENT Installer
 )
 
@@ -1029,10 +1025,14 @@ install(DIRECTORY resources/model_packs/
         PATTERN "LICENSE.txt"
 )
 
-# Release packaging installs explicitly selected <key-id>.pem public trust roots
-# here; committed public keys are not staged unless the packaging command names them.
-install(FILES packaging/release/keys/README.md
+# The Installer component carries the committed production trust root. Release
+# packaging still requires it explicitly and revalidates the same bytes before
+# staging the release-grade AppDir.
+install(FILES
+        installer/release/keys/README.md
+        installer/release/keys/studiocast-release-2026.pem
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/trust/keys"
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
         COMPONENT Installer
 )
 

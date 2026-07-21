@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "installer/models/model_transactions.py"
-REAL_CATALOG_PATH = REPO_ROOT / "packaging/models/curated-model-catalog-v1.json"
+REAL_CATALOG_PATH = REPO_ROOT / "installer/models/curated-model-catalog-v1.json"
 
 
 def load_module():

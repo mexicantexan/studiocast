@@ -93,7 +93,7 @@ CANONICAL_EFFECTS = (
 def release_module() -> Any:
     candidates = [
         Path(__file__).resolve().parent / "release/release_channel.py",
-        Path(__file__).resolve().parents[2] / "packaging/release/release_channel.py",
+        Path(__file__).resolve().parent.parent / "release/release_channel.py",
     ]
     path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:
@@ -109,7 +109,7 @@ def release_module() -> Any:
 
 def trust_root() -> Path:
     installed = Path(__file__).resolve().parent / "trust/keys"
-    return installed if installed.is_dir() else Path(__file__).resolve().parents[2] / "packaging/release/keys"
+    return installed if installed.is_dir() else Path(__file__).resolve().parent.parent / "release/keys"
 
 
 def release_keys(args: argparse.Namespace, rc: Any) -> Any:
@@ -149,7 +149,7 @@ def model_module() -> Any:
 def model_component_root() -> Path:
     candidates = [Path(__file__).resolve().parent.parent, Path(__file__).resolve().parents[2]]
     return next((candidate for candidate in candidates
-                 if (candidate / "packaging/models/curated-model-catalog-v1.json").is_file()), candidates[-1])
+                 if (candidate / "installer/models/curated-model-catalog-v1.json").is_file()), candidates[-1])
 
 
 def privilege_client_module() -> Any | None:
@@ -178,7 +178,7 @@ def privilege_client_module() -> Any | None:
 def load_model_catalog() -> tuple[Any, dict[str, Any], Path, str]:
     module = model_module()
     root = model_component_root()
-    path = root / "packaging/models/curated-model-catalog-v1.json"
+    path = root / "installer/models/curated-model-catalog-v1.json"
     try:
         catalog = module.load_catalog(path)
     except (OSError, module.CatalogError) as exc:

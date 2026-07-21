@@ -861,7 +861,7 @@ def _print_result(result: Mapping[str, Any], json_output: bool) -> None:
 
 def _default_paths() -> tuple[Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
-    catalog = repo_root / "packaging/models/curated-model-catalog-v1.json"
+    catalog = repo_root / "installer/models/curated-model-catalog-v1.json"
     return repo_root, catalog
 
 
