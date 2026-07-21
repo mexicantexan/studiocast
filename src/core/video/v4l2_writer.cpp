@@ -108,14 +108,6 @@ FrameWriteResult WriteFrameWith(WriteOnce write_once, bool transport_valid,
   }
 }
 
-std::string ToLowerAscii(std::string s) {
-  for (char &c : s) {
-    if (c >= 'A' && c <= 'Z')
-      c = static_cast<char>(c - 'A' + 'a');
-  }
-  return s;
-}
-
 int IoctlRetry(int fd, unsigned long req, void *arg) {
   for (;;) {
     const int r = ::ioctl(fd, req, arg);
@@ -854,25 +846,6 @@ std::string DescribeFrameWriteResult(const FrameWriteResult &result) {
   if (result.error_number != 0)
     oss << ": " << std::strerror(result.error_number);
   return oss.str();
-}
-
-std::string PixelFormatName(PixelFormat fmt) {
-  switch (fmt) {
-  case PixelFormat::yuyv:
-    return "yuyv";
-  case PixelFormat::rgb24:
-    return "rgb24";
-  }
-  return "yuyv";
-}
-
-std::optional<PixelFormat> ParsePixelFormat(const std::string &s) {
-  const auto t = ToLowerAscii(s);
-  if (t == "yuyv" || t == "yuy2")
-    return PixelFormat::yuyv;
-  if (t == "rgb24" || t == "rgb")
-    return PixelFormat::rgb24;
-  return std::nullopt;
 }
 
 V4l2Writer::~V4l2Writer() { Close(); }

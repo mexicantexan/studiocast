@@ -4,9 +4,8 @@
 #include <string>
 
 #include "core/audio/effects/broadcast_audio_effects.h"
-#include "core/audio/virtual_audio_service.h"
 #include "core/video/effects/broadcast_effects.h"
-#include "core/video/virtual_camera_service.h"
+#include "core/video/video_config_types.h"
 
 namespace studiocast::config {
 
@@ -90,26 +89,5 @@ std::filesystem::path DaemonConfigPath();
 
 DaemonConfig LoadDaemonConfig();
 bool SaveDaemonConfig(const DaemonConfig &s, std::string *error);
-
-// Convert persisted settings into the runtime VirtualCameraServiceConfig used
-// by the daemon.
-studiocast::video::VirtualCameraServiceConfig
-ToVideoServiceConfig(const DaemonConfig &s);
-
-// Update a DaemonConfig from a runtime service config (useful for persistence
-// on IPC changes).
-void ApplyVideoServiceConfigToDaemonConfig(
-    const studiocast::video::VirtualCameraServiceConfig &cfg,
-    DaemonConfig *out);
-
-// Convert persisted settings into the runtime VirtualAudioServiceConfig used by
-// the daemon.
-studiocast::audio::VirtualAudioServiceConfig
-ToAudioServiceConfig(const DaemonConfig &s);
-
-// Update a DaemonConfig from a runtime audio service config (useful for
-// persistence on IPC changes).
-void ApplyAudioServiceConfigToDaemonConfig(
-    const studiocast::audio::VirtualAudioServiceConfig &cfg, DaemonConfig *out);
 
 } // namespace studiocast::config
