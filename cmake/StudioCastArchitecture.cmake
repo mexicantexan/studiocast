@@ -53,14 +53,16 @@ function(studiocast_assert_neutral_target target)
     get_target_property(link_deps "${target}" LINK_LIBRARIES)
     get_target_property(interface_deps "${target}" INTERFACE_LINK_LIBRARIES)
     get_target_property(compile_definitions "${target}" COMPILE_DEFINITIONS)
+    get_directory_property(directory_compile_definitions COMPILE_DEFINITIONS)
     string(JOIN ";" architecture_surface
-            "${link_deps}" "${interface_deps}" "${compile_definitions}")
+            "${link_deps}" "${interface_deps}" "${compile_definitions}"
+            "${directory_compile_definitions}")
     if (architecture_surface MATCHES
             "Qt|PULSE|JPEG|PNG|[Oo][Nn][Nn][Xx]|dlib|ncnn|CUDA::|Vulkan::|Maxine")
         message(FATAL_ERROR
                 "Neutral target ${target} leaks an optional SDK, GUI, image, or service dependency: ${architecture_surface}")
     endif ()
-    if (architecture_surface MATCHES "STUDIOCAST_(ENABLE|HAVE)_")
+    if (architecture_surface MATCHES "STUDIOCAST_(ENABLE|HAVE|ORT_HAS)_")
         message(FATAL_ERROR
                 "Neutral target ${target} must not carry feature-availability definitions: ${architecture_surface}")
     endif ()

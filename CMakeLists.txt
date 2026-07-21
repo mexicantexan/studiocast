@@ -122,7 +122,13 @@ endif()
 
 set(_studiocast_onnxruntime_found FALSE)
 set(_studiocast_onnxruntime_target "")
-studiocast_configure_onnxruntime(_studiocast_onnxruntime_found _studiocast_onnxruntime_target)
+set(_studiocast_ort_has_cuda_ep_v2 FALSE)
+set(_studiocast_ort_has_tensorrt_ep_v2 FALSE)
+studiocast_configure_onnxruntime(
+        _studiocast_onnxruntime_found
+        _studiocast_onnxruntime_target
+        _studiocast_ort_has_cuda_ep_v2
+        _studiocast_ort_has_tensorrt_ep_v2)
 if (STUDIOCAST_ENABLE_OPEN_CUDA)
     if (_studiocast_onnxruntime_found)
         message(STATUS "ONNX Runtime found (${_studiocast_onnxruntime_target}); Open CUDA backend enabled.")
@@ -456,6 +462,10 @@ target_compile_definitions(studiocast_core PUBLIC
     STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=$<BOOL:${STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING}>
     STUDIOCAST_ENABLE_OPEN_AUDIO=$<BOOL:${STUDIOCAST_ENABLE_OPEN_AUDIO}>
     STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>
+)
+target_compile_definitions(studiocast_core PRIVATE
+    STUDIOCAST_ORT_HAS_CUDA_EP_V2=$<BOOL:${_studiocast_ort_has_cuda_ep_v2}>
+    STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=$<BOOL:${_studiocast_ort_has_tensorrt_ep_v2}>
 )
 
 if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)

@@ -231,7 +231,8 @@ class PrivateKeyMarkerScanTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="studiocast-pem-scan-") as root:
             artifact = Path(root) / "binary-artifact"
-            artifact.write_bytes(b"binary\0-----BEGIN PRIVATE KEY-----\0payload")
+            private_key_marker = b"-----BEGIN " + b"PRIVATE KEY-----"
+            artifact.write_bytes(b"binary\0" + private_key_marker + b"\0payload")
             result = subprocess.run(
                 [
                     "grep", "-alE", "--",
