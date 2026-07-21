@@ -1532,9 +1532,16 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         cmake = fake / "cmake"
         cmake.write_text(f"""#!/bin/sh
 if [ "${{1:-}}" = -S ]; then
+  # Reap the group-signalled child here; container PID 1 may not reap orphans.
+  reap_cancelled_child() {{
+    wait "$child"
+    exit 130
+  }}
+  trap reap_cancelled_child INT TERM
   sleep 60 &
-  printf '%s' "$!" >'{child_pid}'
-  wait
+  child=$!
+  printf '%s' "$child" >'{child_pid}'
+  wait "$child"
 fi
 exit 0
 """); cmake.chmod(0o755)
