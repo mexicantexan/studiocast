@@ -158,7 +158,7 @@ independently for an effect with higher-precedence production evidence.
   `open_vulkan_vignette.*`: strict production predicates and canonical effect
   wrappers.
 - `src/core/video/open_vulkan_final_resident_stage.*` and
-  `tests/vulkan_final_resident_stage_integration_tests.cpp`: the exact
+  `tests/gpu/vulkan/vulkan_final_resident_stage_integration_tests.cpp`: the exact
   CameraPipeline final resident orchestration and its real-device executable
   coverage for device-local source/scratch/effect/mask allocation, bounded
   upload/readback staging, resize, fixed-center vignette, mirror, combined
@@ -177,9 +177,10 @@ independently for an effect with higher-precedence production evidence.
 - `installer/backend/studiocast-installer-backend`: per-effect facts and pure
   recommendation precedence, including the bounded installed-CLI cold
   diagnostics refresh before status consumption.
-- `tests/installer_backend_core_tests.py`: hermetic NVIDIA, AMD, Intel, hybrid,
+- `tests/installer/backend/installer_backend_core_tests.py`: hermetic NVIDIA, AMD, Intel, hybrid,
   no-GPU, loader-only, CPU-device-only, no-compute, device-loss, precedence,
   isolation, fixed-center, and no-CPU-continuation fixtures.
-- `tests/vulkan_capability_audit_tests.cpp`, `tests/vulkan_kernel_tests.cpp`,
-  and `tests/daemon_status_tests.cpp`: documentation/source consistency,
+- `tests/gpu/vulkan/vulkan_capability_audit_tests.cpp`,
+  `tests/gpu/vulkan/vulkan_kernel_tests.cpp`, and
+  `tests/integration/core/daemon_status_tests.cpp`: documentation/source consistency,
   strict readiness, daemon schema, and ON/OFF behavior.

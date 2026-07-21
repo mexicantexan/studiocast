@@ -1,5 +1,5 @@
 #include "core/maxine/resident_frame_section.h"
-#include "core/maxine/testing/fake_resident_frame_executor.h"
+#include "maxine/fake_resident_frame_executor.h"
 
 #include <array>
 #include <atomic>

@@ -458,7 +458,8 @@ bool TestVignetteProductionHelperIsCalledAtTheLiveFinalBoundary() {
       root / "src" / "core" / "video" /
       "open_vulkan_final_resident_stage.cpp");
   const std::string executable_test = ReadFile(
-      root / "tests" / "vulkan_final_resident_stage_integration_tests.cpp");
+      root / "tests" / "gpu" / "vulkan" /
+      "vulkan_final_resident_stage_integration_tests.cpp");
   const std::string cmake = ReadFile(root / "CMakeLists.txt");
   const std::size_t input = pipeline.find(
       "OpenVulkanFinalResidentStageInput final_input");
@@ -591,7 +592,8 @@ bool TestMirrorProductionHelperIsCalledAtTheLiveFinalBoundary() {
       root / "src" / "core" / "video" /
       "open_vulkan_final_resident_stage.cpp");
   const std::string executable_test = ReadFile(
-      root / "tests" / "vulkan_final_resident_stage_integration_tests.cpp");
+      root / "tests" / "gpu" / "vulkan" /
+      "vulkan_final_resident_stage_integration_tests.cpp");
   const std::string cmake = ReadFile(root / "CMakeLists.txt");
   const std::size_t combined_input = pipeline.find(
       "OpenVulkanFinalResidentStageInput final_input");

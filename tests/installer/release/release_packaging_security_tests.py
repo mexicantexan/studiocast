@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 APPIMAGE_VERIFIER = ROOT / "packaging/appimage/verify_type2_appimage.py"
 SOURCE_VERIFIER = ROOT / "packaging/release/verify_canonical_source_archive.sh"
 

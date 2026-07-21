@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 MODULE_PATH = REPO_ROOT / "installer/models/model_transactions.py"
 REAL_CATALOG_PATH = REPO_ROOT / "installer/models/curated-model-catalog-v1.json"
 

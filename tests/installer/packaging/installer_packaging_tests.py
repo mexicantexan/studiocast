@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"

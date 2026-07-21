@@ -259,14 +259,15 @@ only after that trusted installer is available.
 
 ## Verification
 
-Hermetic coverage is in `tests/release_channel_tests.py`:
+Hermetic coverage is in
+`tests/installer/release/release_channel_tests.py`:
 
 ```bash
 python3 -m py_compile installer/release/release_channel.py \
   packaging/release/release_tool.py \
   packaging/release/verify_signed_release.py \
-  tests/release_channel_tests.py
-python3 tests/release_channel_tests.py
+  tests/installer/release/release_channel_tests.py
+python3 tests/installer/release/release_channel_tests.py
 ```
 
 The suite covers valid and invalid manifest signatures, strict JSON/schema,

@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[1]))
+SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[3]))
 BACKEND = SOURCE / "installer/backend/studiocast-installer-backend"
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",

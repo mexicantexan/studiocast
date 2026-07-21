@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "tests/data/installer_release"
 MODULE_PATH = ROOT / "installer/release/release_channel.py"
 MODULE_SPEC = importlib.util.spec_from_file_location("studiocast_release_channel_tests", MODULE_PATH)
