@@ -1,4 +1,4 @@
-#include "core/maxine/testing/fake_resident_frame_executor.h"
+#include "maxine/fake_resident_frame_executor.h"
 
 #include <limits>
 

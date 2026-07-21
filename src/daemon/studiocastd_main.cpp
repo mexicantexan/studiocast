@@ -24,6 +24,7 @@
 #include "core/audio/effects/broadcast_audio_effects_json.h"
 #include "core/audio/virtual_audio_service.h"
 #include "core/config/daemon_config.h"
+#include "core/config/daemon_service_config_adapters.h"
 #include "core/ipc/daemon_server.h"
 #include "core/ipc/daemon_socket.h"
 #include "core/maxine/maxine_manager.h"

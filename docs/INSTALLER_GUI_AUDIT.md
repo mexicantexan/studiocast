@@ -5,7 +5,7 @@ Date: 2026-07-12
 Audited baseline: `v0.2.9` plus the Wave 1 backend and Vulkan audit contracts
 
 Scope: `installer/gui/installer_wizard.*`, `installer/gui/main.cpp`, and
-`tests/installer_wizard_tests.cpp`. This document changes no production code.
+`tests/installer/gui/installer_wizard_tests.cpp`. This document changes no production code.
 
 ## Policy inputs
 
@@ -120,7 +120,7 @@ Confirmed.
   reviewed plan object, digest, or approval token.
 - Current tests validate argument fragments rather than equality between
   reviewed and executed operation IDs. A test explicitly expects the defective
-  Finish commit label (`tests/installer_wizard_tests.cpp:114-130`).
+  Finish commit label (`tests/installer/gui/installer_wizard_tests.cpp:114-130`).
 
 ### 6. “Finish” initiates mutation
 

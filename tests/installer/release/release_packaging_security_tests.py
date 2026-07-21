@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 APPIMAGE_VERIFIER = ROOT / "packaging/appimage/verify_type2_appimage.py"
 SOURCE_VERIFIER = ROOT / "packaging/release/verify_canonical_source_archive.sh"
 
@@ -231,7 +231,8 @@ class PrivateKeyMarkerScanTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="studiocast-pem-scan-") as root:
             artifact = Path(root) / "binary-artifact"
-            artifact.write_bytes(b"binary\0-----BEGIN PRIVATE KEY-----\0payload")
+            private_key_marker = b"-----BEGIN " + b"PRIVATE KEY-----"
+            artifact.write_bytes(b"binary\0" + private_key_marker + b"\0payload")
             result = subprocess.run(
                 [
                     "grep", "-alE", "--",

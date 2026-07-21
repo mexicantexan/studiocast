@@ -26,6 +26,7 @@
 #include "core/audio/effects/broadcast_audio_effects_plan.h"
 #include "core/audio/pulse/pactl.h"
 #include "core/config/daemon_config.h"
+#include "core/config/daemon_service_config_adapters.h"
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
 #include "core/cuda/kernels/open_cuda_vb_kernels.h"

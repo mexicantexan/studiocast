@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
@@ -95,14 +95,11 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.backend_path = installer / "studiocast-installer-backend"
         shutil.copy2(BACKEND, self.backend_path)
         self.backend_path.chmod(0o755)
-        shutil.copytree(ROOT / "packaging/release", installer / "release",
+        shutil.copytree(ROOT / "installer/release", installer / "release",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copytree(ROOT / "installer/models", installer / "models",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         component_root = installer.parent
-        model_catalog = component_root / "packaging/models"
-        model_catalog.mkdir(parents=True)
-        shutil.copy2(ROOT / "packaging/models/curated-model-catalog-v1.json", model_catalog)
         shutil.copytree(ROOT / "resources/model_packs", component_root / "resources/model_packs",
                         ignore=shutil.ignore_patterns("*.onnx", "*.dat", "*.bin"))
         trust = installer / "trust/keys"
@@ -142,20 +139,31 @@ class PackagingIntegrationTests(unittest.TestCase):
 
     def test_installer_component_stages_release_primitives_and_production_trust_contract(self) -> None:
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-        for required in ("packaging/release/release_channel.py", "release-manifest-v1.schema.json",
-                         "packaging/release/keys/README.md", "installer/models/studiocast-model-transaction",
+        for required in ("installer/release/release_channel.py", "release-manifest-v1.schema.json",
+                         "installer/release/keys/README.md",
+                         f"installer/release/keys/{PRODUCTION_KEY_ID}.pem",
+                         "PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ",
+                         "installer/models/studiocast-model-transaction",
                          "installer/models/model_transactions.py", "curated-model-catalog-v1.json",
                          "resources/model_packs/", "installer/privileged/client_contract.py"):
             self.assertIn(required, cmake)
+        for obsolete in (
+            "packaging/release/release_channel.py",
+            "packaging/release/release-manifest-v1.schema.json",
+            "packaging/release/keys/README.md",
+            "studiocast/packaging/models",
+        ):
+            self.assertNotIn(obsolete, cmake)
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text(encoding="utf-8")
         self.assertIn("installer/privileged/client_contract.py", verifier)
+        self.assertNotIn("studiocast/packaging/models", verifier)
         self.assertIn('PATTERN "model.json"', cmake)
         self.assertIn('PATTERN "LICENSE.txt"', cmake)
         for forbidden_pattern in ('PATTERN "*.onnx"', 'PATTERN "*.dat"', 'PATTERN "*.bin"'):
             self.assertNotIn(forbidden_pattern, cmake)
-        production_keys = list((ROOT / "packaging/release/keys").glob("*.pem"))
+        production_keys = list((ROOT / "installer/release/keys").glob("*.pem"))
         self.assertEqual(
-            [ROOT / f"packaging/release/keys/{PRODUCTION_KEY_ID}.pem"],
+            [ROOT / f"installer/release/keys/{PRODUCTION_KEY_ID}.pem"],
             production_keys,
         )
         public_key_check = subprocess.run(
@@ -178,7 +186,7 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn("default: false", workflow)
         self.assertIn(f"RELEASE_PUBLIC_KEY_ID: {PRODUCTION_KEY_ID}", workflow)
         self.assertIn(
-            f"RELEASE_PUBLIC_KEY_PATH: packaging/release/keys/{PRODUCTION_KEY_ID}.pem",
+            f"RELEASE_PUBLIC_KEY_PATH: installer/release/keys/{PRODUCTION_KEY_ID}.pem",
             workflow,
         )
         self.assertIn("reject-unsafe-signing-request:", workflow)
@@ -245,7 +253,7 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertEqual(2, workflow.count("inputs.signing_dry_run"))
         self.assertNotIn("if: github.event_name == 'release'\n", workflow)
 
-        key_readme = (ROOT / "packaging/release/keys/README.md").read_text(encoding="utf-8")
+        key_readme = (ROOT / "installer/release/keys/README.md").read_text(encoding="utf-8")
         self.assertIn(f"`{PRODUCTION_KEY_ID}.pem`", key_readme)
         self.assertNotIn("No production key has been supplied", key_readme)
 
@@ -284,7 +292,7 @@ class PackagingIntegrationTests(unittest.TestCase):
             [
                 str(ROOT / "packaging/appimage/build_appimage.sh"), "--dry-run",
                 "--appimage-required", "--trusted-release-key",
-                f"{PRODUCTION_KEY_ID}={ROOT / f'packaging/release/keys/{PRODUCTION_KEY_ID}.pem'}",
+                f"{PRODUCTION_KEY_ID}={ROOT / f'installer/release/keys/{PRODUCTION_KEY_ID}.pem'}",
             ],
             env=self.env,
             text=True,

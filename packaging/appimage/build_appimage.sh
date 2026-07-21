@@ -434,7 +434,7 @@ stage_appdir() {
     die "staged trusted model transaction launcher is missing"
   fi
   if [[ "${DRY_RUN}" -eq 0 &&
-        ! -f "${APPDIR}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json" ]]; then
+        ! -f "${APPDIR}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json" ]]; then
     die "staged curated model catalog is missing"
   fi
   if [[ "${DRY_RUN}" -eq 0 &&

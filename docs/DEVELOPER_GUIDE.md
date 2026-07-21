@@ -77,8 +77,11 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 
 - [../CMakeLists.txt](../CMakeLists.txt): build graph, options, executable
   targets, and test targets.
-- [../src/core](../src/core): shared non-Qt core code for config, IPC, audio,
-  video, effects, CUDA, Maxine, ONNX Runtime, and utility code.
+- [../src/core](../src/core): shared non-Qt code built as neutral utility,
+  contract, configuration, IPC, and runtime-loaded CUDA-support targets plus
+  the high-level `studiocast_core` compatibility/orchestration target. Source
+  directories remain organized by subsystem; target ownership is documented in
+  [ARCHITECTURE.md](ARCHITECTURE.md).
 - [../src/daemon](../src/daemon): `studiocastd`, the background service that
   owns runtime state and device orchestration.
 - [../src/gui](../src/gui): Qt GUI controller.
@@ -86,8 +89,8 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 - [../installer/gui](../installer/gui): standalone Qt installer wizard.
 - [../installer/backend](../installer/backend): scriptable installer backend
   used by the GUI and CLI fallback.
-- [../tests](../tests): unit and integration-style tests that do not require
-  full desktop hardware workflows.
+- [../tests](../tests): automated tests organized by subsystem and test level,
+  plus reusable support code and hermetic fixtures.
 - [../scripts](../scripts): setup, install, uninstall, model, and developer
   helper scripts. See [../scripts/README.md](../scripts/README.md).
 - [../resources/model_packs](../resources/model_packs): metadata templates for
@@ -98,6 +101,45 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
   for the standalone GUI installer bundle.
 - [../docs](../docs): architecture, setup, model installation, manual testing,
   trademark, roadmap, and design notes.
+
+## Automated test taxonomy and labels
+
+Automated test sources use these directories:
+
+- `tests/unit/{core,audio,model,video}` for small deterministic components.
+- `tests/integration/{core,audio,gui,ipc,video}` for services, pipelines,
+  daemon/GUI coordination, and other multi-component contracts.
+- `tests/installer/{backend,packaging,gui,models,privileged,release}` for the
+  complete installer and signed-release surface.
+- `tests/gpu/{cuda,maxine,open_video,vulkan}` for GPU backend contracts and
+  validators. A test in this tree may still be a no-hardware contract test.
+- `tests/support/` for reusable fake SDKs, mock implementations, generators,
+  and test metadata checks. Support files are not registered as tests.
+- `tests/data/` for hermetic fixtures. This remains the fixture root.
+
+The combined `studiocast-video-tests` executable remains intact to preserve its
+public target and CTest name. It is classified as integration because its
+dominant responsibility is the assembled video pipeline, even though it also
+contains deterministic component cases.
+
+Every registered CTest test has exactly one level label: `unit`, `integration`,
+or `system`. It also has one or more domain labels from `core`, `installer`,
+`release`, `model`, `gui`, `audio`, `video`, `ipc`, `gpu`, `vulkan`, and
+`maxine`. The `gpu`, `vulkan`, and `maxine` labels describe the contract under
+test; they do not imply that unavailable hardware is mandatory. CTest validates
+the label metadata as part of the suite.
+
+Useful selections include:
+
+```bash
+ctest --test-dir <build> -L unit
+ctest --test-dir <build> -L integration
+ctest --test-dir <build> -L system
+ctest --test-dir <build> -L installer
+ctest --test-dir <build> -L release
+ctest --test-dir <build> -L model
+ctest --test-dir <build> -L gpu
+```
 
 ## Main binaries and tools
 
@@ -194,10 +236,11 @@ Release packaging:
 - The AppDir layout places the backend at
   `usr/share/studiocast/installer/studiocast-installer-backend`, which is the
   installed path the GUI already probes relative to the installer binary.
-- The Installer component also stages `release/release_channel.py`, the strict
-  manifest schema, and `trust/keys/`. Production public keys are named
+- The Installer component stages the runtime contracts from `installer/release/`
+  as `release/release_channel.py`, the strict manifest schema, and
+  `trust/keys/`. Production public keys are named
   `<key-id>.pem` in that trust root. The initial stable key is committed as
-  `packaging/release/keys/studiocast-release-2026.pem`; test keys are never
+  `installer/release/keys/studiocast-release-2026.pem`; test keys are never
   copied there. Release-grade packaging must still pass the committed key
   explicitly as `--trusted-release-key studiocast-release-2026=<path>`.
 - The same packaging script creates `StudioCast-<version>-source.tar.gz` from
@@ -327,7 +370,7 @@ For release-equivalent local validation with preinstalled packaging tools:
 packaging/appimage/build_appimage.sh --clean --appimage-required \
   --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
   --trusted-release-key \
-  studiocast-release-2026=packaging/release/keys/studiocast-release-2026.pem
+  studiocast-release-2026=installer/release/keys/studiocast-release-2026.pem
 ```
 
 The runtime path must be a regular non-symlink file matching

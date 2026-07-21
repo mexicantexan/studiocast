@@ -2,7 +2,7 @@
 
 ## Default catalog
 
-`packaging/models/curated-model-catalog-v1.json` is the versioned,
+`installer/models/curated-model-catalog-v1.json` is the versioned,
 machine-readable model contract used by the installer. Its defaults are exactly:
 
 Open Audio:

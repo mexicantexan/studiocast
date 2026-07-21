@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 
-SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[1]))
+SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[3]))
 BACKEND = SOURCE / "installer/backend/studiocast-installer-backend"
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
@@ -404,9 +404,9 @@ class InstallerBackendCoreTests(unittest.TestCase):
         model_dir.mkdir()
         for name in ("__init__.py", "model_transactions.py"):
             shutil.copy2(SOURCE / "installer/models" / name, model_dir / name)
-        catalog_path = component / "packaging/models/curated-model-catalog-v1.json"
-        catalog_path.parent.mkdir(parents=True)
-        shutil.copy2(SOURCE / "packaging/models/curated-model-catalog-v1.json", catalog_path)
+        catalog_path = component / "installer/models/curated-model-catalog-v1.json"
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SOURCE / "installer/models/curated-model-catalog-v1.json", catalog_path)
         facts_path = self.s.root / "pure-recommend-facts.json"
         facts_path.write_text(json.dumps(base_facts()), encoding="utf-8")
 
@@ -943,8 +943,8 @@ class InstallerBackendCoreTests(unittest.TestCase):
                 "artifacts": [{"name": "model.onnx", "sha256": sha(artifact),
                     "size_bytes": len(artifact), "size_status": "known",
                     "source_paths": ["objects/model.onnx"]}]}]}
-        catalog_path = component / "packaging/models/curated-model-catalog-v1.json"
-        catalog_path.parent.mkdir(parents=True)
+        catalog_path = component / "installer/models/curated-model-catalog-v1.json"
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
         catalog_path.write_text(json.dumps(catalog))
 
         def run_for(root: Path, *, expect_success: bool,

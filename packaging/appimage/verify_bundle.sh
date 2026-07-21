@@ -177,7 +177,7 @@ verify_staged_metadata() {
   local model_launcher="${appdir}/usr/share/studiocast/installer/models/studiocast-model-transaction"
   require_executable "${model_launcher}"
   require_file "${appdir}/usr/share/studiocast/installer/models/model_transactions.py"
-  require_file "${appdir}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json"
+  require_file "${appdir}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json"
 
   local model_summary
   model_summary="$(capture_command "packaged curated model catalog" "${model_launcher}" list --json)"
@@ -652,7 +652,7 @@ main() {
     "${appdir_base}/usr/share/studiocast/installer/models/studiocast-model-transaction" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
-    "${appdir_base}/usr/share/studiocast/packaging/models/curated-model-catalog-v1.json" \
+    "${appdir_base}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/applications/studiocast-installer.desktop" \

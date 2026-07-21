@@ -20,6 +20,10 @@ project(StudioCast
 
 include(CTest)
 
+function(studiocast_set_test_labels test_name)
+    set_tests_properties("${test_name}" PROPERTIES LABELS "${ARGN}")
+endfunction()
+
 foreach (var IN ITEMS CPLUS_INCLUDE_PATH CPATH C_INCLUDE_PATH)
     if (DEFINED ENV{${var}} AND NOT "$ENV{${var}}" STREQUAL "")
         message(WARNING
@@ -37,6 +41,7 @@ include(Sanitizers)
 include(GenerateVersionHeader)
 include(OnnxRuntime)
 include(Ncnn)
+include(StudioCastArchitecture)
 
 studiocast_setup_options()
 studiocast_global_options()
@@ -117,7 +122,13 @@ endif()
 
 set(_studiocast_onnxruntime_found FALSE)
 set(_studiocast_onnxruntime_target "")
-studiocast_configure_onnxruntime(_studiocast_onnxruntime_found _studiocast_onnxruntime_target)
+set(_studiocast_ort_has_cuda_ep_v2 FALSE)
+set(_studiocast_ort_has_tensorrt_ep_v2 FALSE)
+studiocast_configure_onnxruntime(
+        _studiocast_onnxruntime_found
+        _studiocast_onnxruntime_target
+        _studiocast_ort_has_cuda_ep_v2
+        _studiocast_ort_has_tensorrt_ep_v2)
 if (STUDIOCAST_ENABLE_OPEN_CUDA)
     if (_studiocast_onnxruntime_found)
         message(STATUS "ONNX Runtime found (${_studiocast_onnxruntime_target}); Open CUDA backend enabled.")
@@ -190,237 +201,184 @@ studiocast_generate_version_header(
 )
 
 # -----------------------------
-# Core library (no Qt deps)
+# Neutral libraries and high-level compatibility core
 # -----------------------------
-add_library(studiocast_core
-        src/core/probe/probe.h
-        src/core/probe/probe.cpp
-        src/core/onnx/ort_session.h
-        src/core/onnx/ort_session.cpp
-        src/core/open_video/model_pack_registry.h
-        src/core/open_video/model_pack_registry.cpp
-        src/core/open_video/frame_analysis_cache.h
-        src/core/open_video/latest_frame_wins_worker.h
-        src/core/open_video/yunet_face_detector.h
-        src/core/open_video/yunet_face_detector.cpp
-        src/core/open_video/fastdvdnet_denoiser.h
-        src/core/open_video/fastdvdnet_denoiser.cpp
-        src/core/open_video/dlib_face_landmarks.h
-        src/core/open_video/dlib_face_landmarks.cpp
-        src/core/open_video/gaze_correction_eye_contact.h
-        src/core/open_video/gaze_correction_eye_contact.cpp
-        src/core/open_video/diagnostics.h
-        src/core/open_video/diagnostics.cpp
-        src/core/open_video/diagnose.h
-        src/core/open_video/diagnose.cpp
-        src/core/open_video/matting_session.h
-        src/core/open_video/matting_session.cpp
-        src/core/open_audio/open_audio_diagnostics.h
-        src/core/open_audio/open_audio_diagnostics.cpp
-        src/core/open_audio/open_audio_diagnose.h
-        src/core/open_audio/open_audio_diagnose.cpp
-        src/core/open_audio/model_pack_registry.h
-        src/core/open_audio/model_pack_registry.cpp
-        src/core/open_audio/open_audio_audio_processor.h
-        src/core/open_audio/open_audio_audio_processor.cpp
-        src/core/open_audio/open_audio_onnx_session.h
-        src/core/open_audio/open_audio_onnx_session.cpp
-        src/core/audio/effects/broadcast_audio_effect_contract.h
-        src/core/util/dynlib.h
+set(_studiocast_util_sources
         src/core/util/dynlib.cpp
-        src/core/util/json.h
-        src/core/util/json.cpp
-        src/core/util/exec.h
         src/core/util/exec.cpp
-        src/core/util/fs.h
         src/core/util/fs.cpp
-        src/core/util/os_release.h
+        src/core/util/json.cpp
         src/core/util/os_release.cpp
-        src/core/util/strings.h
-        src/core/util/strings.cpp
-        src/core/util/proc.h
         src/core/util/proc.cpp
-        src/core/util/xdg.h
-        src/core/util/xdg.cpp
-        src/core/config/daemon_config.h
-        src/core/config/daemon_config.cpp
-        src/core/config/settings.h
-        src/core/config/settings.cpp
-        src/core/maxine/gpu.h
-        src/core/maxine/gpu.cpp
-        src/core/maxine/gpu_selection.h
-        src/core/maxine/gpu_selection.cpp
-        src/core/maxine/availability.h
-        src/core/maxine/availability.cpp
-        src/core/maxine/reason_codes.h
-        src/core/maxine/reason_codes.cpp
-        src/core/maxine/paths.h
-        src/core/maxine/paths.cpp
-        src/core/maxine/maxine_manager.h
-        src/core/maxine/maxine_manager.cpp
-        src/core/maxine/nvcv_types.h
-        src/core/maxine/resident_frame_section.h
-        src/core/maxine/resident_frame_section.cpp
-        src/core/maxine/production_resident_frame_executor.h
-        src/core/maxine/production_resident_frame_executor.cpp
-        src/core/maxine/nvcv_api.h
-        src/core/maxine/nvcv_api.cpp
-        src/core/maxine/vfx_api.h
-        src/core/maxine/vfx_api.cpp
-        src/core/maxine/afx_api.h
-        src/core/maxine/afx_api.cpp
-        src/core/maxine/afx/afx_effect.h
-        src/core/maxine/afx/afx_effect.cpp
-        src/core/maxine/afx/afx_audio_processor.h
-        src/core/maxine/ar_api.h
-        src/core/maxine/ar_api.cpp
-        src/core/maxine/cuda_driver_api.h
-        src/core/maxine/cuda_driver_api.cpp
-        src/core/cuda/cuda_image.h
-        src/core/cuda/cuda_image.cpp
-        src/core/cuda/cuda_tensor.h
-        src/core/cuda/cuda_tensor.cpp
-        src/core/cuda/kernels/cuda_driver_cache.h
-        src/core/cuda/kernels/ptx_pitch_contract.h
-        src/core/cuda/kernels/resize_bilinear.h
-        src/core/cuda/kernels/resize_bilinear_ptx.cpp
-        src/core/cuda/kernels/preprocess_to_nchw.h
-        src/core/cuda/kernels/preprocess_to_nchw_ptx.cpp
-        src/core/cuda/kernels/open_cuda_vb_kernels.h
-        src/core/cuda/kernels/open_cuda_vb_kernels_ptx.cpp
-        src/core/maxine/cuda_crop_scale.h
-        src/core/maxine/cuda_crop_scale.cpp
-        src/core/maxine/cuda_vignette.h
-        src/core/maxine/cuda_vignette.cpp
-        src/core/maxine/effects/maxine_effect.h
-        src/core/maxine/effects/maxine_effect.cpp
-        src/core/maxine/effects/vfx_green_screen_effect.h
-        src/core/maxine/effects/vfx_green_screen_effect.cpp
-        src/core/maxine/effects/vfx_background_blur_effect.h
-        src/core/maxine/effects/vfx_background_blur_effect.cpp
-        src/core/maxine/effects/vfx_transfer_effect.h
-        src/core/maxine/effects/vfx_transfer_effect.cpp
-        src/core/maxine/effects/vfx_denoise_effect.h
-        src/core/maxine/effects/vfx_denoise_effect.cpp
-        src/core/maxine/effects/vfx_relighting_effect.h
-        src/core/maxine/effects/vfx_relighting_effect.cpp
-        src/core/maxine/effects/ar_eye_contact_effect.h
-        src/core/maxine/effects/ar_eye_contact_effect.cpp
-        src/core/maxine/effects/ar_auto_frame_tracker.h
-        src/core/maxine/effects/ar_auto_frame_tracker.cpp
-        src/core/audio/pulse/pactl.h
-        src/core/audio/pulse/pactl.cpp
-        src/core/audio/audio_consumer_detector.h
-        src/core/audio/audio_consumer_detector.cpp
-        src/core/audio/audio_device_safety.h
-        src/core/audio/audio_device_safety.cpp
-        src/core/audio/audio_backend_resolver.h
+        src/core/util/strings.cpp
+        src/core/util/xdg.cpp)
+
+set(_studiocast_contract_sources
         src/core/audio/audio_backend_resolver.cpp
-        src/core/audio/audio_processor.h
         src/core/audio/audio_processor.cpp
-        src/core/audio/dsp/post_dsp_chain.h
-        src/core/audio/dsp/post_dsp_chain.cpp
-        src/core/audio/effects/broadcast_audio_effects.h
-        src/core/audio/effects/broadcast_audio_effects_plan.h
-        src/core/audio/effects/broadcast_audio_effects_plan.cpp
-        src/core/audio/effects/broadcast_audio_effects_json.h
         src/core/audio/effects/broadcast_audio_effects_json.cpp
-        src/core/audio/virtual_mic_state.h
-        src/core/audio/virtual_mic_state.cpp
-        src/core/audio/virtual_mic.h
-        src/core/audio/virtual_mic.cpp
-        src/core/audio/virtual_speaker_state.h
-        src/core/audio/virtual_speaker_state.cpp
-        src/core/audio/virtual_speaker.h
-        src/core/audio/virtual_speaker.cpp
-        src/core/audio/virtual_audio_service.h
-        src/core/audio/virtual_audio_service.cpp
-        src/core/video/v4l2loopback.h
-        src/core/video/v4l2loopback.cpp
-        src/core/video/v4l2_writer.h
-        src/core/video/v4l2_writer.cpp
-        src/core/video/gpu_frame.h
-        src/core/video/pattern.h
-        src/core/video/pattern.cpp
-        src/core/video/image_ppm.h
-        src/core/video/image_ppm.cpp
-        src/core/video/feed.h
-        src/core/video/feed.cpp
-        src/core/video/convert.h
-        src/core/video/convert.cpp
-        src/core/video/convert_yuyv_rgb_internal.h
-        src/core/video/convert_yuyv_rgb_scalar.cpp
-        src/core/video/convert_yuyv_rgb_dispatch.cpp
-        src/core/video/convert_rgb_yuyv_internal.h
-        src/core/video/convert_rgb_yuyv_scalar.cpp
-        src/core/video/convert_rgb_yuyv_dispatch.cpp
-        src/core/video/convert_rgb_bgr_internal.h
-        src/core/video/convert_rgb_bgr_scalar.cpp
-        src/core/video/convert_rgb_bgr_dispatch.cpp
-        src/core/video/scaling_policy.h
-        src/core/video/scaling_policy.cpp
-        src/core/video/mjpeg_decode.h
-        src/core/video/mjpeg_decode.cpp
-        src/core/video/effects/effect_types.h
-        src/core/video/effects/effect_types.cpp
-        src/core/video/effects/broadcast_effect_contract.h
-        src/core/video/effects/broadcast_effect_maxine_gate.h
-        src/core/video/effects/broadcast_effect_rules.h
-        src/core/video/effects/broadcast_effect_rules.cpp
-        src/core/video/effects/broadcast_effects.h
-        src/core/video/effects/broadcast_effects.cpp
-        src/core/video/effects/broadcast_effects_json.h
-        src/core/video/effects/broadcast_effects_json.cpp
-        src/core/video/effects/effect.h
-        src/core/video/effects/effect_chain.h
-        src/core/video/effects/effect_chain.cpp
-        src/core/video/effects/effect_descriptors.h
-        src/core/video/effects/effect_descriptors.cpp
-        src/core/video/effects/mirror_effect.h
-        src/core/video/effects/mirror_effect.cpp
-        src/core/video/effects/focus_mask_plan.h
-        src/core/video/effects/focus_mask_plan.cpp
-        src/core/video/effects/box_blur.h
-        src/core/video/effects/box_blur.cpp
-        src/core/video/effects/background_blur_cpu.h
-        src/core/video/effects/background_blur_cpu.cpp
-        src/core/video/effects/background_remove_cpu.h
-        src/core/video/effects/background_remove_cpu.cpp
-        src/core/video/v4l2_capture.h
-        src/core/video/v4l2_capture.cpp
-        src/core/video/yuyv_passthrough.h
-        src/core/video/yuyv_passthrough.cpp
-        src/core/video/camera_pipeline.h
-        src/core/video/camera_pipeline.cpp
-        src/core/video/open_vulkan_matting_setup_policy.h
-        src/core/video/open_vulkan_matting_setup_policy.cpp
-        src/core/video/open_vulkan_eye_contact.h
-        src/core/video/open_vulkan_eye_contact.cpp
-        src/core/video/open_vulkan_video_noise_removal.h
-        src/core/video/open_vulkan_video_noise_removal.cpp
-        src/core/video/replace_background_cache_policy.h
-        src/core/video/replace_background_cache_policy.cpp
-        src/core/video/camera_effects_json.h
-        src/core/video/camera_effects_json.cpp
-        src/core/video/broadcast_camera_effects_json.h
+        src/core/audio/effects/broadcast_audio_effects_plan.cpp
+        src/core/maxine/reason_codes.cpp
         src/core/video/broadcast_camera_effects_json.cpp
-        src/core/video/virtual_camera_service.h
-        src/core/video/virtual_camera_service.cpp
+        src/core/video/camera_effects_json.cpp
+        src/core/video/effects/broadcast_effect_rules.cpp
+        src/core/video/effects/broadcast_effects.cpp
+        src/core/video/effects/broadcast_effects_json.cpp
+        src/core/video/effects/effect_descriptors.cpp
+        src/core/video/effects/effect_types.cpp
+        src/core/video/video_config_types.cpp
+        src/core/vulkan/frame_execution_plan.cpp)
 
-        src/core/ipc/daemon_socket.h
-        src/core/ipc/daemon_socket.cpp
-        src/core/ipc/daemon_client.h
+set(_studiocast_config_sources
+        src/core/config/daemon_config.cpp
+        src/core/config/settings.cpp)
+
+set(_studiocast_ipc_sources
         src/core/ipc/daemon_client.cpp
-        src/core/ipc/daemon_server.h
         src/core/ipc/daemon_server.cpp
+        src/core/ipc/daemon_socket.cpp)
 
-)
+set(_studiocast_cuda_support_sources
+        src/core/maxine/cuda_driver_api.cpp
+        src/core/cuda/cuda_image.cpp
+        src/core/cuda/cuda_tensor.cpp
+        src/core/cuda/kernels/open_cuda_vb_kernels_ptx.cpp
+        src/core/cuda/kernels/preprocess_to_nchw_ptx.cpp
+        src/core/cuda/kernels/resize_bilinear_ptx.cpp)
 
-set_target_properties(studiocast_core PROPERTIES
-        AUTOMOC OFF
-        AUTOUIC OFF
-        AUTORCC OFF
-)
+set(_studiocast_core_base_sources
+        src/core/audio/audio_consumer_detector.cpp
+        src/core/audio/audio_device_safety.cpp
+        src/core/audio/dsp/post_dsp_chain.cpp
+        src/core/audio/pulse/pactl.cpp
+        src/core/audio/virtual_audio_service.cpp
+        src/core/audio/virtual_mic.cpp
+        src/core/audio/virtual_mic_state.cpp
+        src/core/audio/virtual_speaker.cpp
+        src/core/audio/virtual_speaker_state.cpp
+        src/core/config/daemon_service_config_adapters.cpp
+        src/core/maxine/afx/afx_effect.cpp
+        src/core/maxine/afx_api.cpp
+        src/core/maxine/ar_api.cpp
+        src/core/maxine/availability.cpp
+        src/core/maxine/cuda_crop_scale.cpp
+        src/core/maxine/cuda_vignette.cpp
+        src/core/maxine/effects/ar_auto_frame_tracker.cpp
+        src/core/maxine/effects/ar_eye_contact_effect.cpp
+        src/core/maxine/effects/maxine_effect.cpp
+        src/core/maxine/effects/vfx_background_blur_effect.cpp
+        src/core/maxine/effects/vfx_denoise_effect.cpp
+        src/core/maxine/effects/vfx_green_screen_effect.cpp
+        src/core/maxine/effects/vfx_relighting_effect.cpp
+        src/core/maxine/effects/vfx_transfer_effect.cpp
+        src/core/maxine/gpu.cpp
+        src/core/maxine/gpu_selection.cpp
+        src/core/maxine/maxine_manager.cpp
+        src/core/maxine/nvcv_api.cpp
+        src/core/maxine/paths.cpp
+        src/core/maxine/production_resident_frame_executor.cpp
+        src/core/maxine/resident_frame_section.cpp
+        src/core/maxine/vfx_api.cpp
+        src/core/onnx/ort_session.cpp
+        src/core/open_audio/model_pack_registry.cpp
+        src/core/open_audio/open_audio_audio_processor.cpp
+        src/core/open_audio/open_audio_diagnose.cpp
+        src/core/open_audio/open_audio_diagnostics.cpp
+        src/core/open_audio/open_audio_onnx_session.cpp
+        src/core/open_video/diagnose.cpp
+        src/core/open_video/diagnostics.cpp
+        src/core/open_video/dlib_face_landmarks.cpp
+        src/core/open_video/fastdvdnet_denoiser.cpp
+        src/core/open_video/gaze_correction_eye_contact.cpp
+        src/core/open_video/matting_session.cpp
+        src/core/open_video/model_pack_registry.cpp
+        src/core/open_video/yunet_face_detector.cpp
+        src/core/probe/probe.cpp
+        src/core/video/camera_pipeline.cpp
+        src/core/video/convert.cpp
+        src/core/video/convert_rgb_bgr_dispatch.cpp
+        src/core/video/convert_rgb_bgr_scalar.cpp
+        src/core/video/convert_rgb_yuyv_dispatch.cpp
+        src/core/video/convert_rgb_yuyv_scalar.cpp
+        src/core/video/convert_yuyv_rgb_dispatch.cpp
+        src/core/video/convert_yuyv_rgb_scalar.cpp
+        src/core/video/effects/background_blur_cpu.cpp
+        src/core/video/effects/background_remove_cpu.cpp
+        src/core/video/effects/box_blur.cpp
+        src/core/video/effects/effect_chain.cpp
+        src/core/video/effects/focus_mask_plan.cpp
+        src/core/video/effects/mirror_effect.cpp
+        src/core/video/feed.cpp
+        src/core/video/image_ppm.cpp
+        src/core/video/mjpeg_decode.cpp
+        src/core/video/open_vulkan_eye_contact.cpp
+        src/core/video/open_vulkan_matting_setup_policy.cpp
+        src/core/video/open_vulkan_video_noise_removal.cpp
+        src/core/video/pattern.cpp
+        src/core/video/replace_background_cache_policy.cpp
+        src/core/video/scaling_policy.cpp
+        src/core/video/v4l2_capture.cpp
+        src/core/video/v4l2_writer.cpp
+        src/core/video/v4l2loopback.cpp
+        src/core/video/virtual_camera_service.cpp
+        src/core/video/yuyv_passthrough.cpp)
+
+set(_studiocast_core_x86_sources
+        src/core/video/convert_rgb_yuyv_ssse3.cpp
+        src/core/video/convert_rgb_yuyv_avx2.cpp
+        src/core/video/convert_yuyv_rgb_sse41.cpp
+        src/core/video/convert_yuyv_rgb_avx2.cpp
+        src/core/video/convert_rgb_bgr_ssse3.cpp
+        src/core/video/convert_rgb_bgr_avx2.cpp)
+
+set(_studiocast_core_vulkan_sources
+        src/core/open_video/vulkan_matting_runtime.cpp
+        src/core/open_video/vulkan_matting_session.cpp
+        src/core/vulkan/vulkan_loader.cpp
+        src/core/vulkan/vulkan_device.cpp
+        src/core/vulkan/vulkan_image.cpp
+        src/core/vulkan/vulkan_tensor.cpp
+        src/core/vulkan/kernels/resize_bilinear.cpp
+        src/core/vulkan/kernels/utility_kernels.cpp
+        src/core/video/open_vulkan_mirror.cpp
+        src/core/video/open_vulkan_final_resident_stage.cpp
+        src/core/video/open_vulkan_auto_frame.cpp
+        src/core/video/open_vulkan_virtual_background_blur.cpp
+        src/core/video/open_vulkan_virtual_background_remove.cpp
+        src/core/video/open_vulkan_virtual_background_replace.cpp
+        src/core/video/open_vulkan_virtual_key_light.cpp
+        src/core/video/open_vulkan_vignette.cpp)
+
+add_library(studiocast_util STATIC ${_studiocast_util_sources})
+add_library(studiocast_contracts STATIC ${_studiocast_contract_sources})
+add_library(studiocast_config STATIC ${_studiocast_config_sources})
+add_library(studiocast_ipc STATIC ${_studiocast_ipc_sources})
+add_library(studiocast_cuda_support STATIC ${_studiocast_cuda_support_sources})
+add_library(studiocast_core STATIC ${_studiocast_core_base_sources})
+
+foreach (target IN ITEMS
+        studiocast_util studiocast_contracts studiocast_config
+        studiocast_ipc studiocast_cuda_support studiocast_core)
+    set_target_properties(${target} PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_include_directories(${target} PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    studiocast_set_project_warnings(${target})
+    studiocast_enable_sanitizers(${target})
+endforeach ()
+
+target_include_directories(studiocast_core PUBLIC "${STUDIOCAST_GENERATED_DIR}")
+target_link_libraries(studiocast_util PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(studiocast_contracts PUBLIC studiocast_util)
+target_link_libraries(studiocast_config PUBLIC studiocast_contracts PRIVATE studiocast_util)
+target_link_libraries(studiocast_ipc PRIVATE studiocast_util)
+target_link_libraries(studiocast_cuda_support PUBLIC studiocast_util)
+target_link_libraries(studiocast_core PUBLIC
+        studiocast_contracts
+        studiocast_config
+        studiocast_ipc
+        studiocast_cuda_support
+        studiocast_util)
 
 set(_studiocast_x86_simd FALSE)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND
@@ -429,14 +387,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND
 endif()
 
 if (_studiocast_x86_simd)
-    target_sources(studiocast_core PRIVATE
-            src/core/video/convert_rgb_yuyv_ssse3.cpp
-            src/core/video/convert_rgb_yuyv_avx2.cpp
-            src/core/video/convert_yuyv_rgb_sse41.cpp
-            src/core/video/convert_yuyv_rgb_avx2.cpp
-            src/core/video/convert_rgb_bgr_ssse3.cpp
-            src/core/video/convert_rgb_bgr_avx2.cpp
-    )
+    target_sources(studiocast_core PRIVATE ${_studiocast_core_x86_sources})
     set_source_files_properties(src/core/video/convert_rgb_yuyv_ssse3.cpp
             PROPERTIES COMPILE_OPTIONS "-O3;-mssse3")
     set_source_files_properties(src/core/video/convert_rgb_yuyv_avx2.cpp
@@ -455,44 +406,7 @@ else()
 endif()
 
 if (STUDIOCAST_ENABLE_OPEN_VULKAN)
-    target_sources(studiocast_core PRIVATE
-            src/core/open_video/vulkan_matting_runtime.h
-            src/core/open_video/vulkan_matting_runtime.cpp
-            src/core/open_video/vulkan_matting_session.h
-            src/core/open_video/vulkan_matting_session.cpp
-            src/core/vulkan/vulkan_loader.h
-            src/core/vulkan/vulkan_loader.cpp
-            src/core/vulkan/vulkan_device.h
-            src/core/vulkan/vulkan_device.cpp
-            src/core/vulkan/vulkan_image.h
-            src/core/vulkan/vulkan_image.cpp
-            src/core/vulkan/vulkan_tensor.h
-            src/core/vulkan/vulkan_tensor.cpp
-            src/core/vulkan/frame_execution_plan.h
-            src/core/vulkan/frame_execution_plan.cpp
-            src/core/vulkan/kernels/resize_bilinear.h
-            src/core/vulkan/kernels/resize_bilinear.cpp
-            src/core/vulkan/kernels/utility_kernels.h
-            src/core/vulkan/kernels/utility_kernels.cpp
-            src/core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h
-            src/core/vulkan/kernels/shaders/utility_kernels_spv.h
-            src/core/video/open_vulkan_mirror.h
-            src/core/video/open_vulkan_mirror.cpp
-            src/core/video/open_vulkan_final_resident_stage.h
-            src/core/video/open_vulkan_final_resident_stage.cpp
-            src/core/video/open_vulkan_auto_frame.h
-            src/core/video/open_vulkan_auto_frame.cpp
-            src/core/video/open_vulkan_virtual_background_blur.h
-            src/core/video/open_vulkan_virtual_background_blur.cpp
-            src/core/video/open_vulkan_virtual_background_remove.h
-            src/core/video/open_vulkan_virtual_background_remove.cpp
-            src/core/video/open_vulkan_virtual_background_replace.h
-            src/core/video/open_vulkan_virtual_background_replace.cpp
-            src/core/video/open_vulkan_virtual_key_light.h
-            src/core/video/open_vulkan_virtual_key_light.cpp
-            src/core/video/open_vulkan_vignette.h
-            src/core/video/open_vulkan_vignette.cpp
-    )
+    target_sources(studiocast_core PRIVATE ${_studiocast_core_vulkan_sources})
 endif()
 
 # Video color conversion is extremely hot (runs every frame). In Debug builds the lack of
@@ -509,13 +423,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
                 PROPERTIES COMPILE_OPTIONS "-O3")
 endif()
 
-target_include_directories(studiocast_core PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        "${STUDIOCAST_GENERATED_DIR}"
-)
-
-target_link_libraries(studiocast_core PUBLIC ${CMAKE_DL_LIBS})
-
 if (_studiocast_have_libyuv)
     target_link_libraries(studiocast_core PRIVATE "${_studiocast_libyuv_target}")
     target_compile_definitions(studiocast_core PRIVATE STUDIOCAST_HAVE_LIBYUV=1)
@@ -524,17 +431,17 @@ else()
 endif()
 
 if (TARGET JPEG::JPEG)
-    target_link_libraries(studiocast_core PUBLIC JPEG::JPEG)
+    target_link_libraries(studiocast_core PRIVATE JPEG::JPEG)
 else()
-    target_include_directories(studiocast_core PUBLIC ${JPEG_INCLUDE_DIRS})
-    target_link_libraries(studiocast_core PUBLIC ${JPEG_LIBRARIES})
+    target_include_directories(studiocast_core PRIVATE ${JPEG_INCLUDE_DIRS})
+    target_link_libraries(studiocast_core PRIVATE ${JPEG_LIBRARIES})
 endif()
 
 if (TARGET PNG::PNG)
-    target_link_libraries(studiocast_core PUBLIC PNG::PNG)
+    target_link_libraries(studiocast_core PRIVATE PNG::PNG)
 else()
-    target_include_directories(studiocast_core PUBLIC ${PNG_INCLUDE_DIRS})
-    target_link_libraries(studiocast_core PUBLIC ${PNG_LIBRARIES})
+    target_include_directories(studiocast_core PRIVATE ${PNG_INCLUDE_DIRS})
+    target_link_libraries(studiocast_core PRIVATE ${PNG_LIBRARIES})
 endif()
 
 if (PULSE_SIMPLE_FOUND)
@@ -542,7 +449,7 @@ if (PULSE_SIMPLE_FOUND)
             src/core/audio/audio_pipeline.h
             src/core/audio/audio_pipeline.cpp
     )
-    target_link_libraries(studiocast_core PUBLIC PkgConfig::PULSE_SIMPLE)
+    target_link_libraries(studiocast_core PRIVATE PkgConfig::PULSE_SIMPLE)
     target_compile_definitions(studiocast_core PUBLIC STUDIOCAST_HAVE_PULSE_SIMPLE=1)
 else()
     target_compile_definitions(studiocast_core PUBLIC STUDIOCAST_HAVE_PULSE_SIMPLE=0)
@@ -556,6 +463,10 @@ target_compile_definitions(studiocast_core PUBLIC
     STUDIOCAST_ENABLE_OPEN_AUDIO=$<BOOL:${STUDIOCAST_ENABLE_OPEN_AUDIO}>
     STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>
 )
+target_compile_definitions(studiocast_core PRIVATE
+    STUDIOCAST_ORT_HAS_CUDA_EP_V2=$<BOOL:${_studiocast_ort_has_cuda_ep_v2}>
+    STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=$<BOOL:${_studiocast_ort_has_tensorrt_ep_v2}>
+)
 
 if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
     target_link_libraries(studiocast_core PRIVATE "${_studiocast_ncnn_target}")
@@ -563,23 +474,69 @@ endif()
 
 if (_studiocast_have_dlib)
     if (TARGET dlib::dlib)
-        target_link_libraries(studiocast_core PUBLIC dlib::dlib)
+        target_link_libraries(studiocast_core PRIVATE dlib::dlib)
     elseif (TARGET dlib)
-        target_link_libraries(studiocast_core PUBLIC dlib)
+        target_link_libraries(studiocast_core PRIVATE dlib)
     else()
         message(WARNING "dlib found but no CMake target was provided; linking may fail.")
     endif()
 endif()
 
 if ((_studiocast_onnxruntime_found) AND (STUDIOCAST_ENABLE_OPEN_CUDA OR STUDIOCAST_ENABLE_OPEN_AUDIO))
-    target_link_libraries(studiocast_core PUBLIC ${_studiocast_onnxruntime_target})
+    target_link_libraries(studiocast_core PRIVATE ${_studiocast_onnxruntime_target})
     target_compile_definitions(studiocast_core PUBLIC STUDIOCAST_HAVE_ONNXRUNTIME=1)
 else()
     target_compile_definitions(studiocast_core PUBLIC STUDIOCAST_HAVE_ONNXRUNTIME=0)
 endif()
 
-studiocast_set_project_warnings(studiocast_core)
-studiocast_enable_sanitizers(studiocast_core)
+
+studiocast_assert_direct_dependencies(studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_contracts
+        PUBLIC_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_config
+        PUBLIC_STUDIOCAST_DEPS studiocast_contracts
+        PRIVATE_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_ipc
+        PRIVATE_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_cuda_support
+        PUBLIC_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_core
+        PUBLIC_STUDIOCAST_DEPS
+        studiocast_contracts studiocast_config studiocast_ipc
+        studiocast_cuda_support studiocast_util)
+
+foreach (target IN ITEMS
+        studiocast_util studiocast_contracts studiocast_config
+        studiocast_ipc studiocast_cuda_support)
+    studiocast_assert_neutral_target(${target})
+endforeach ()
+
+set(_studiocast_expected_sources
+        ${_studiocast_util_sources}
+        ${_studiocast_contract_sources}
+        ${_studiocast_config_sources}
+        ${_studiocast_ipc_sources}
+        ${_studiocast_cuda_support_sources}
+        ${_studiocast_core_base_sources})
+set(_studiocast_expected_source_count 108)
+if (_studiocast_x86_simd)
+    list(APPEND _studiocast_expected_sources ${_studiocast_core_x86_sources})
+    math(EXPR _studiocast_expected_source_count "${_studiocast_expected_source_count} + 6")
+endif ()
+if (STUDIOCAST_ENABLE_OPEN_VULKAN)
+    list(APPEND _studiocast_expected_sources ${_studiocast_core_vulkan_sources})
+    math(EXPR _studiocast_expected_source_count "${_studiocast_expected_source_count} + 16")
+endif ()
+if (PULSE_SIMPLE_FOUND)
+    list(APPEND _studiocast_expected_sources src/core/audio/audio_pipeline.cpp)
+    math(EXPR _studiocast_expected_source_count "${_studiocast_expected_source_count} + 1")
+endif ()
+studiocast_assert_cpp_source_ownership(
+        TARGETS
+        studiocast_util studiocast_contracts studiocast_config
+        studiocast_ipc studiocast_cuda_support studiocast_core
+        EXPECTED_COUNT ${_studiocast_expected_source_count}
+        EXPECTED_SOURCES ${_studiocast_expected_sources})
 
 # -----------------------------
 # GUI executable
@@ -889,7 +846,7 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
 
     add_executable(studiocast-maxine-resident-fake-bench
             src/tools/studiocast_maxine_resident_fake_bench_main.cpp
-            src/core/maxine/testing/fake_resident_frame_executor.cpp
+            tests/support/maxine/fake_resident_frame_executor.cpp
     )
 
     target_link_libraries(studiocast-maxine-resident-fake-bench PRIVATE
@@ -898,6 +855,7 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
 
     target_include_directories(studiocast-maxine-resident-fake-bench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
             "${STUDIOCAST_GENERATED_DIR}"
     )
 
@@ -994,9 +952,9 @@ install(FILES
 )
 
 install(FILES
-        packaging/release/__init__.py
-        packaging/release/release_channel.py
-        packaging/release/release-manifest-v1.schema.json
+        installer/release/__init__.py
+        installer/release/release_channel.py
+        installer/release/release-manifest-v1.schema.json
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/release"
         COMPONENT Installer
 )
@@ -1012,12 +970,8 @@ install(PROGRAMS installer/models/studiocast-model-transaction
 install(FILES
         installer/models/__init__.py
         installer/models/model_transactions.py
+        installer/models/curated-model-catalog-v1.json
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/models"
-        COMPONENT Installer
-)
-
-install(FILES packaging/models/curated-model-catalog-v1.json
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/packaging/models"
         COMPONENT Installer
 )
 
@@ -1029,16 +983,20 @@ install(DIRECTORY resources/model_packs/
         PATTERN "LICENSE.txt"
 )
 
-# Release packaging installs explicitly selected <key-id>.pem public trust roots
-# here; committed public keys are not staged unless the packaging command names them.
-install(FILES packaging/release/keys/README.md
+# The Installer component carries the committed production trust root. Release
+# packaging still requires it explicitly and revalidates the same bytes before
+# staging the release-grade AppDir.
+install(FILES
+        installer/release/keys/README.md
+        installer/release/keys/studiocast-release-2026.pem
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/trust/keys"
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
         COMPONENT Installer
 )
 
 if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
     add_executable(studiocast-audio-tests
-            tests/audio_service_tests.cpp
+            tests/integration/audio/audio_service_tests.cpp
     )
 
     target_link_libraries(studiocast-audio-tests PRIVATE studiocast_core)
@@ -1058,17 +1016,18 @@ if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
     )
 
     add_test(NAME studiocast-audio-tests COMMAND studiocast-audio-tests)
+    studiocast_set_test_labels(studiocast-audio-tests integration audio)
 elseif (BUILD_TESTING)
     message(STATUS "Skipping studiocast-audio-tests because libpulse-simple was not found.")
 endif()
 
 if (BUILD_TESTING)
     add_library(studiocast-maxine-effect-fake-sdk SHARED
-            tests/maxine_effect_runtime_fake_sdk.cpp
+            tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )
     target_include_directories(studiocast-maxine-effect-fake-sdk PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
     )
     set_target_properties(studiocast-maxine-effect-fake-sdk PROPERTIES
             AUTOMOC OFF
@@ -1078,7 +1037,7 @@ if (BUILD_TESTING)
     studiocast_set_project_warnings(studiocast-maxine-effect-fake-sdk)
 
     add_library(studiocast-maxine-effect-fake-cudart SHARED
-            tests/maxine_effect_runtime_fake_cudart.cpp
+            tests/support/maxine/maxine_effect_runtime_fake_cudart.cpp
     )
     set_target_properties(studiocast-maxine-effect-fake-cudart PROPERTIES
             OUTPUT_NAME cudart
@@ -1089,7 +1048,7 @@ if (BUILD_TESTING)
     studiocast_set_project_warnings(studiocast-maxine-effect-fake-cudart)
 
     add_executable(studiocast-maxine-effect-binding-tests
-            tests/maxine_effect_binding_tests.cpp
+            tests/gpu/maxine/maxine_effect_binding_tests.cpp
     )
     target_link_libraries(studiocast-maxine-effect-binding-tests PRIVATE
             studiocast_core
@@ -1097,7 +1056,7 @@ if (BUILD_TESTING)
     )
     target_include_directories(studiocast-maxine-effect-binding-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
             "${STUDIOCAST_GENERATED_DIR}"
     )
     target_compile_definitions(studiocast-maxine-effect-binding-tests PRIVATE
@@ -1117,9 +1076,11 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-maxine-effect-binding-tests PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
     )
+    studiocast_set_test_labels(studiocast-maxine-effect-binding-tests
+            integration gpu maxine video)
 
     add_executable(studiocast-maxine-production-resident-tests
-            tests/maxine_production_resident_executor_tests.cpp
+            tests/gpu/maxine/maxine_production_resident_executor_tests.cpp
     )
     target_link_libraries(studiocast-maxine-production-resident-tests PRIVATE
             studiocast_core
@@ -1127,7 +1088,7 @@ if (BUILD_TESTING)
     )
     target_include_directories(studiocast-maxine-production-resident-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
             "${STUDIOCAST_GENERATED_DIR}"
     )
     target_compile_definitions(studiocast-maxine-production-resident-tests PRIVATE
@@ -1147,6 +1108,8 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-maxine-production-resident-tests PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
     )
+    studiocast_set_test_labels(studiocast-maxine-production-resident-tests
+            integration gpu maxine video)
 
     if (STUDIOCAST_BUILD_BENCHMARKS)
         add_executable(studiocast-maxine-production-resident-fake-bench
@@ -1158,7 +1121,7 @@ if (BUILD_TESTING)
         )
         target_include_directories(studiocast-maxine-production-resident-fake-bench PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
                 "${STUDIOCAST_GENERATED_DIR}"
         )
         target_compile_definitions(studiocast-maxine-production-resident-fake-bench PRIVATE
@@ -1179,24 +1142,26 @@ if (BUILD_TESTING)
     if (Python3_Interpreter_FOUND)
         add_test(NAME studiocast-embedded-ptx-freshness
                 COMMAND "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dev/validate_embedded_ptx.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/cuda/validate_embedded_ptx.py"
                         --source-root "${CMAKE_CURRENT_SOURCE_DIR}")
         set_tests_properties(studiocast-embedded-ptx-freshness PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+        studiocast_set_test_labels(studiocast-embedded-ptx-freshness unit gpu maxine)
         add_test(NAME studiocast-embedded-vulkan-spv-freshness
                 COMMAND "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dev/validate_embedded_vulkan_spv.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/vulkan/validate_embedded_vulkan_spv.py"
                         --source-root "${CMAKE_CURRENT_SOURCE_DIR}")
         set_tests_properties(studiocast-embedded-vulkan-spv-freshness PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+        studiocast_set_test_labels(studiocast-embedded-vulkan-spv-freshness unit gpu vulkan)
     else()
         message(STATUS "Skipping embedded shader freshness tests because Python3 was not found.")
     endif()
 
     add_executable(studiocast-maxine-paths-tests
-            tests/maxine_paths_tests.cpp
+            tests/gpu/maxine/maxine_paths_tests.cpp
     )
 
     target_link_libraries(studiocast-maxine-paths-tests PRIVATE studiocast_core)
@@ -1220,9 +1185,11 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-maxine-paths-tests COMMAND studiocast-maxine-paths-tests)
+    studiocast_set_test_labels(studiocast-maxine-paths-tests
+            integration gpu maxine audio video)
 
     add_executable(studiocast-nvcv-validation-tests
-            tests/nvcv_validation_tests.cpp
+            tests/gpu/maxine/nvcv_validation_tests.cpp
     )
 
     target_link_libraries(studiocast-nvcv-validation-tests PRIVATE
@@ -1245,10 +1212,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-nvcv-validation-tests
             COMMAND studiocast-nvcv-validation-tests)
+    studiocast_set_test_labels(studiocast-nvcv-validation-tests unit gpu maxine video)
 
     add_executable(studiocast-maxine-resident-frame-tests
-            tests/maxine_resident_frame_section_tests.cpp
-            src/core/maxine/testing/fake_resident_frame_executor.cpp
+            tests/gpu/maxine/maxine_resident_frame_section_tests.cpp
+            tests/support/maxine/fake_resident_frame_executor.cpp
     )
 
     target_link_libraries(studiocast-maxine-resident-frame-tests PRIVATE
@@ -1257,6 +1225,7 @@ if (BUILD_TESTING)
 
     target_include_directories(studiocast-maxine-resident-frame-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
             "${STUDIOCAST_GENERATED_DIR}"
     )
 
@@ -1271,9 +1240,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-maxine-resident-frame-tests
             COMMAND studiocast-maxine-resident-frame-tests)
+    studiocast_set_test_labels(studiocast-maxine-resident-frame-tests
+            unit gpu maxine video)
 
     add_executable(studiocast-model-registry-tests
-            tests/model_pack_registry_tests.cpp
+            tests/unit/model/model_pack_registry_tests.cpp
     )
 
     target_link_libraries(studiocast-model-registry-tests PRIVATE studiocast_core)
@@ -1296,9 +1267,11 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-model-registry-tests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
+    studiocast_set_test_labels(studiocast-model-registry-tests
+            unit model audio video gpu)
 
     add_executable(studiocast-open-audio-prepared-binding-tests
-            tests/open_audio_prepared_binding_tests.cpp
+            tests/unit/audio/open_audio_prepared_binding_tests.cpp
     )
 
     target_link_libraries(studiocast-open-audio-prepared-binding-tests PRIVATE
@@ -1321,13 +1294,15 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-open-audio-prepared-binding-tests
             COMMAND studiocast-open-audio-prepared-binding-tests)
+    studiocast_set_test_labels(studiocast-open-audio-prepared-binding-tests
+            unit audio model)
 
     add_executable(studiocast-cuda-driver-api-tests
-            tests/cuda_driver_api_tests.cpp
+            tests/gpu/cuda/cuda_driver_api_tests.cpp
     )
 
     target_link_libraries(studiocast-cuda-driver-api-tests PRIVATE
-            studiocast_core
+            studiocast_cuda_support
     )
 
     target_include_directories(studiocast-cuda-driver-api-tests PRIVATE
@@ -1346,12 +1321,13 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-cuda-driver-api-tests
             COMMAND studiocast-cuda-driver-api-tests)
+    studiocast_set_test_labels(studiocast-cuda-driver-api-tests unit gpu)
 
     add_executable(studiocast-ipc-tests
-            tests/ipc_client_tests.cpp
+            tests/integration/ipc/ipc_client_tests.cpp
     )
 
-    target_link_libraries(studiocast-ipc-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-ipc-tests PRIVATE studiocast_ipc)
 
     target_include_directories(studiocast-ipc-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -1368,9 +1344,10 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-ipc-tests COMMAND studiocast-ipc-tests)
+    studiocast_set_test_labels(studiocast-ipc-tests integration ipc core)
 
     add_executable(studiocast-gui-status-tests
-            tests/gui_status_snapshot_tests.cpp
+            tests/integration/gui/gui_status_snapshot_tests.cpp
             src/gui/text_edit_utils.h
             src/gui/text_edit_utils.cpp
             src/gui/pages/engines_models_page.h
@@ -1404,12 +1381,14 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-gui-status-tests COMMAND studiocast-gui-status-tests)
+    studiocast_set_test_labels(studiocast-gui-status-tests
+            integration gui ipc audio video model gpu vulkan)
 
     add_executable(studiocast-effect-schema-tests
-            tests/effect_schema_tests.cpp
+            tests/unit/core/effect_schema_tests.cpp
     )
 
-    target_link_libraries(studiocast-effect-schema-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-effect-schema-tests PRIVATE studiocast_contracts)
 
     target_include_directories(studiocast-effect-schema-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -1426,9 +1405,10 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-effect-schema-tests COMMAND studiocast-effect-schema-tests)
+    studiocast_set_test_labels(studiocast-effect-schema-tests unit core audio video)
 
     add_executable(studiocast-daemon-status-tests
-            tests/daemon_status_tests.cpp
+            tests/integration/core/daemon_status_tests.cpp
     )
 
     target_link_libraries(studiocast-daemon-status-tests PRIVATE studiocast_core)
@@ -1449,12 +1429,14 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-daemon-status-tests
             COMMAND studiocast-daemon-status-tests)
+    studiocast_set_test_labels(studiocast-daemon-status-tests
+            integration core audio video gpu vulkan)
 
     add_executable(studiocast-exec-tests
-            tests/exec_tests.cpp
+            tests/unit/core/exec_tests.cpp
     )
 
-    target_link_libraries(studiocast-exec-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-exec-tests PRIVATE studiocast_util)
 
     target_include_directories(studiocast-exec-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -1471,13 +1453,14 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-exec-tests COMMAND studiocast-exec-tests)
+    studiocast_set_test_labels(studiocast-exec-tests unit core)
 
     add_executable(studiocast-installer-backend-tests
-            tests/installer_backend_tests.cpp
+            tests/installer/backend/installer_backend_tests.cpp
     )
 
     target_link_libraries(studiocast-installer-backend-tests PRIVATE
-            studiocast_core
+            studiocast_util
     )
 
     target_include_directories(studiocast-installer-backend-tests PRIVATE
@@ -1504,33 +1487,70 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-installer-backend-tests
             COMMAND studiocast-installer-backend-tests)
+    studiocast_set_test_labels(studiocast-installer-backend-tests
+            system installer core)
 
     if (Python3_Interpreter_FOUND)
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_backend_core_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/backend/installer_backend_core_tests.py")
         set_tests_properties(studiocast-installer-backend-core-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-installer-backend-core-tests
+                system installer release model gpu vulkan)
         add_test(NAME studiocast-model-download-transaction-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_download_transaction_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/models/model_download_transaction_tests.py")
         set_tests_properties(studiocast-model-download-transaction-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-model-download-transaction-tests
+                integration installer model)
         add_test(NAME studiocast-installer-packaging-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_packaging_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/packaging/installer_packaging_tests.py")
         set_tests_properties(studiocast-installer-packaging-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-installer-packaging-tests
+                system installer release model)
+
+        add_test(NAME studiocast-release-channel-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/release/release_channel_tests.py")
+        set_tests_properties(studiocast-release-channel-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-release-channel-tests unit release)
+
+        add_test(NAME studiocast-release-packaging-security-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/release/release_packaging_security_tests.py")
+        set_tests_properties(studiocast-release-packaging-security-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-release-packaging-security-tests
+                integration installer release)
+
+        add_test(NAME studiocast-privileged-helper-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/privileged/privileged_helper_tests.py")
+        set_tests_properties(studiocast-privileged-helper-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-privileged-helper-tests
+                integration installer ipc)
     endif()
 
     add_executable(studiocast-installer-wizard-tests
-            tests/installer_wizard_tests.cpp
+            tests/installer/gui/installer_wizard_tests.cpp
             installer/gui/installer_wizard.h
             installer/gui/installer_wizard.cpp
     )
@@ -1561,13 +1581,15 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-installer-wizard-tests
             COMMAND studiocast-installer-wizard-tests)
+    studiocast_set_test_labels(studiocast-installer-wizard-tests
+            integration installer gui release model)
 
     add_executable(studiocast-cmake-open-backend-cache-tests
-            tests/cmake_open_backend_cache_tests.cpp
+            tests/integration/core/cmake_open_backend_cache_tests.cpp
     )
 
     target_link_libraries(studiocast-cmake-open-backend-cache-tests PRIVATE
-            studiocast_core
+            studiocast_util
     )
 
     target_include_directories(studiocast-cmake-open-backend-cache-tests PRIVATE
@@ -1591,20 +1613,22 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-cmake-open-backend-cache-tests
             COMMAND studiocast-cmake-open-backend-cache-tests)
+    studiocast_set_test_labels(studiocast-cmake-open-backend-cache-tests
+            system core gpu)
 
     add_executable(studiocast-video-tests
-            tests/video_service_tests.cpp
-            tests/camera_effects_update_tests.cpp
-            tests/latest_frame_wins_worker_tests.cpp
-            tests/open_video_denoise_contract_tests.cpp
-            tests/frame_artifact_cache_tests.cpp
-            tests/cuda_kernel_cache_tests.cpp
-            tests/open_vulkan_matting_setup_policy_tests.cpp
-            tests/replace_background_cache_policy_tests.cpp
-            tests/v4l2_capture_negotiation_tests.cpp
-            tests/video_effect_cpu_tests.cpp
-            tests/rgb_yuyv_convert_tests.cpp
-            tests/yuyv_passthrough_tests.cpp
+            tests/integration/video/video_service_tests.cpp
+            tests/unit/video/camera_effects_update_tests.cpp
+            tests/unit/video/latest_frame_wins_worker_tests.cpp
+            tests/gpu/open_video/open_video_denoise_contract_tests.cpp
+            tests/gpu/open_video/frame_artifact_cache_tests.cpp
+            tests/gpu/cuda/cuda_kernel_cache_tests.cpp
+            tests/gpu/vulkan/open_vulkan_matting_setup_policy_tests.cpp
+            tests/unit/video/replace_background_cache_policy_tests.cpp
+            tests/unit/video/v4l2_capture_negotiation_tests.cpp
+            tests/unit/video/video_effect_cpu_tests.cpp
+            tests/unit/video/rgb_yuyv_convert_tests.cpp
+            tests/unit/video/yuyv_passthrough_tests.cpp
     )
 
     target_link_libraries(studiocast-video-tests PRIVATE studiocast_core)
@@ -1624,9 +1648,11 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-video-tests COMMAND studiocast-video-tests)
+    studiocast_set_test_labels(studiocast-video-tests
+            integration video gpu vulkan maxine)
 
     add_executable(studiocast-v4l2-writer-transport-tests
-            tests/v4l2_writer_transport_tests.cpp
+            tests/integration/video/v4l2_writer_transport_tests.cpp
     )
 
     target_link_libraries(studiocast-v4l2-writer-transport-tests PRIVATE
@@ -1649,9 +1675,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-v4l2-writer-transport-tests
             COMMAND studiocast-v4l2-writer-transport-tests)
+    studiocast_set_test_labels(studiocast-v4l2-writer-transport-tests
+            integration video)
 
     add_executable(studiocast-open-video-scratch-tests
-            tests/open_video_scratch_reuse_tests.cpp
+            tests/gpu/open_video/open_video_scratch_reuse_tests.cpp
     )
 
     target_link_libraries(studiocast-open-video-scratch-tests PRIVATE
@@ -1673,9 +1701,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-open-video-scratch-tests
             COMMAND studiocast-open-video-scratch-tests)
+    studiocast_set_test_labels(studiocast-open-video-scratch-tests
+            unit video gpu model)
 
     add_executable(studiocast-video-frame-plan-tests
-            tests/video_frame_plan_tests.cpp
+            tests/unit/video/video_frame_plan_tests.cpp
     )
 
     target_link_libraries(studiocast-video-frame-plan-tests PRIVATE
@@ -1697,11 +1727,15 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-video-frame-plan-tests
             COMMAND studiocast-video-frame-plan-tests)
+    studiocast_set_test_labels(studiocast-video-frame-plan-tests
+            unit video gpu maxine)
 
     add_executable(studiocast-vulkan-frame-plan-tests
-            tests/vulkan_frame_execution_plan_tests.cpp
-            src/core/vulkan/frame_execution_plan.cpp
+            tests/gpu/vulkan/vulkan_frame_execution_plan_tests.cpp
     )
+
+    target_link_libraries(studiocast-vulkan-frame-plan-tests PRIVATE
+            studiocast_contracts)
 
     target_include_directories(studiocast-vulkan-frame-plan-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -1718,9 +1752,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-vulkan-frame-plan-tests
             COMMAND studiocast-vulkan-frame-plan-tests)
+    studiocast_set_test_labels(studiocast-vulkan-frame-plan-tests
+            unit video gpu vulkan)
 
     add_executable(studiocast-vulkan-capability-audit-tests
-            tests/vulkan_capability_audit_tests.cpp
+            tests/gpu/vulkan/vulkan_capability_audit_tests.cpp
     )
 
     target_include_directories(studiocast-vulkan-capability-audit-tests PRIVATE
@@ -1742,10 +1778,12 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-vulkan-capability-audit-tests
             COMMAND studiocast-vulkan-capability-audit-tests)
+    studiocast_set_test_labels(studiocast-vulkan-capability-audit-tests
+            unit video gpu vulkan installer)
 
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
         add_executable(studiocast-vulkan-kernel-tests
-                tests/vulkan_kernel_tests.cpp
+                tests/gpu/vulkan/vulkan_kernel_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-kernel-tests PRIVATE
@@ -1768,9 +1806,11 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-kernel-tests
                 COMMAND studiocast-vulkan-kernel-tests)
+        studiocast_set_test_labels(studiocast-vulkan-kernel-tests
+                integration video gpu vulkan)
 
         add_executable(studiocast-vulkan-final-stage-integration-tests
-                tests/vulkan_final_resident_stage_integration_tests.cpp
+                tests/gpu/vulkan/vulkan_final_resident_stage_integration_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-final-stage-integration-tests PRIVATE
@@ -1793,9 +1833,11 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-final-stage-integration-tests
                 COMMAND studiocast-vulkan-final-stage-integration-tests)
+        studiocast_set_test_labels(studiocast-vulkan-final-stage-integration-tests
+                integration video gpu vulkan)
 
         add_executable(studiocast-vulkan-matting-runtime-tests
-                tests/vulkan_matting_runtime_tests.cpp
+                tests/gpu/vulkan/vulkan_matting_runtime_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-matting-runtime-tests PRIVATE
@@ -1818,10 +1860,12 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-matting-runtime-tests
                 COMMAND studiocast-vulkan-matting-runtime-tests)
+        studiocast_set_test_labels(studiocast-vulkan-matting-runtime-tests
+                unit video gpu vulkan model)
     endif()
 
     add_executable(studiocast-v4l2loopback-diagnostics-tests
-            tests/v4l2loopback_diagnostics_tests.cpp
+            tests/integration/video/v4l2loopback_diagnostics_tests.cpp
     )
 
     target_link_libraries(studiocast-v4l2loopback-diagnostics-tests PRIVATE studiocast_core)
@@ -1842,4 +1886,13 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-v4l2loopback-diagnostics-tests
             COMMAND studiocast-v4l2loopback-diagnostics-tests)
+    studiocast_set_test_labels(studiocast-v4l2loopback-diagnostics-tests
+            integration video)
+
+    add_test(NAME studiocast-ctest-label-metadata-tests
+            COMMAND "${CMAKE_COMMAND}"
+                    "-DCTEST_EXECUTABLE=${CMAKE_CTEST_COMMAND}"
+                    "-DCTEST_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/validate_ctest_labels.cmake")
+    studiocast_set_test_labels(studiocast-ctest-label-metadata-tests unit core)
 endif()
