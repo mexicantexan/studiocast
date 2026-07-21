@@ -2,7 +2,8 @@ include_guard(GLOBAL)
 
 include(CheckCXXSourceCompiles)
 
-function(studiocast_configure_onnxruntime out_found out_target)
+function(studiocast_configure_onnxruntime
+    out_found out_target out_has_cuda_ep_v2 out_has_tensorrt_ep_v2)
   set(_found FALSE)
   set(_target "")
 
@@ -298,10 +299,8 @@ int main() {
   endif()
 
   if (_has_cuda_ep_v2)
-    add_compile_definitions(STUDIOCAST_ORT_HAS_CUDA_EP_V2=1)
     message(STATUS "ONNX Runtime CUDA EP V2 provider options: available (STUDIOCAST_ORT_HAS_CUDA_EP_V2=1)")
   else()
-    add_compile_definitions(STUDIOCAST_ORT_HAS_CUDA_EP_V2=0)
     if (_found)
       message(STATUS "ONNX Runtime CUDA EP V2 provider options: unavailable (STUDIOCAST_ORT_HAS_CUDA_EP_V2=0)")
     else()
@@ -383,10 +382,8 @@ int main() {
   endif()
 
   if (_has_tensorrt_ep_v2)
-    add_compile_definitions(STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=1)
     message(STATUS "ONNX Runtime TensorRT EP V2 provider options: available (STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=1)")
   else()
-    add_compile_definitions(STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=0)
     if (_found)
       message(STATUS "ONNX Runtime TensorRT EP V2 provider options: unavailable (STUDIOCAST_ORT_HAS_TENSORRT_EP_V2=0)")
     else()
@@ -396,4 +393,6 @@ int main() {
 
   set(${out_found} ${_found} PARENT_SCOPE)
   set(${out_target} "${_target}" PARENT_SCOPE)
+  set(${out_has_cuda_ep_v2} ${_has_cuda_ep_v2} PARENT_SCOPE)
+  set(${out_has_tensorrt_ep_v2} ${_has_tensorrt_ep_v2} PARENT_SCOPE)
 endfunction()
