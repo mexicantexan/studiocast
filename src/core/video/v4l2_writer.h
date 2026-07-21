@@ -3,20 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <string>
 
 #include <sys/types.h>
 
+#include "core/video/video_config_types.h"
+
 namespace studiocast::video {
-
-enum class PixelFormat {
-  yuyv,
-  rgb24,
-};
-
-std::string PixelFormatName(PixelFormat fmt);
-std::optional<PixelFormat> ParsePixelFormat(const std::string &s);
 
 struct ActualFormat {
   int width = 0;

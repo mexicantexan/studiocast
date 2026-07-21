@@ -77,8 +77,11 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 
 - [../CMakeLists.txt](../CMakeLists.txt): build graph, options, executable
   targets, and test targets.
-- [../src/core](../src/core): shared non-Qt core code for config, IPC, audio,
-  video, effects, CUDA, Maxine, ONNX Runtime, and utility code.
+- [../src/core](../src/core): shared non-Qt code built as neutral utility,
+  contract, configuration, IPC, and runtime-loaded CUDA-support targets plus
+  the high-level `studiocast_core` compatibility/orchestration target. Source
+  directories remain organized by subsystem; target ownership is documented in
+  [ARCHITECTURE.md](ARCHITECTURE.md).
 - [../src/daemon](../src/daemon): `studiocastd`, the background service that
   owns runtime state and device orchestration.
 - [../src/gui](../src/gui): Qt GUI controller.

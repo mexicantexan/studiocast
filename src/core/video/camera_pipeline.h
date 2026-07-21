@@ -21,6 +21,7 @@
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
+#include "core/video/video_config_types.h"
 
 namespace studiocast::video {
 
@@ -31,14 +32,6 @@ struct BroadcastEffectsPlan;
 namespace detail {
 struct CameraPipelineIssue1TestAccess;
 }
-
-enum class CaptureMode {
-  // Use the requested `width`/`height` (must be > 0).
-  requested,
-
-  // Auto-select a good capture mode. `width`/`height` may be <= 0 (sentinel).
-  auto_best,
-};
 
 enum class ScalingBackendPreference {
   auto_select,

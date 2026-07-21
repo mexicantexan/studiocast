@@ -10,6 +10,41 @@ Planned components:
 - Effects Engine abstraction layer (multiple GPU engines: Maxine + Open CUDA)
 - SDK Manager (downloads/installs user-obtained Maxine assets)
 
+## CMake dependency layers
+
+Production code is split at neutral, reusable boundaries before the high-level
+runtime composition layer:
+
+```text
+studiocast_contracts   ---> studiocast_util
+studiocast_config      ---> studiocast_contracts, studiocast_util
+studiocast_ipc         ---> studiocast_util
+studiocast_cuda_support ---> studiocast_util
+studiocast_core        ---> contracts, config, ipc, cuda_support, util
+```
+
+Each arrow points from a dependent to its dependency.
+
+- `studiocast_util` owns generic filesystem, process, JSON, string, dynamic
+  library, OS-release, and XDG helpers.
+- `studiocast_contracts` owns stable audio/video value types, effect schemas,
+  reason codes, serialization, and backend-independent execution plans.
+- `studiocast_config` owns persisted/runtime configuration parsing and
+  validation. Runtime service adapters remain in the high-level core.
+- `studiocast_ipc` owns Unix-socket protocol mechanics and has std-only public
+  headers.
+- `studiocast_cuda_support` owns runtime-loaded CUDA driver wrappers, buffer
+  value types, and embedded kernel contracts without a CUDA toolkit dependency.
+- `studiocast_core` remains the compatibility and orchestration target. It
+  composes the neutral layers with backend implementations and optional system
+  dependencies.
+
+CMake validates the allowed direct StudioCast target edges, rejects optional
+SDK or GUI dependencies on neutral targets, and verifies unique ownership of
+every configured production translation unit. New backends should link down to
+the smallest neutral layer that owns their shared concepts; sibling backends
+must not link to one another for shared types or utilities.
+
 ## Canonical effect model: `BroadcastCameraEffects`
 
 The single canonical effect schema across **config persistence**, **IPC**, **daemon pipeline**, **GUI rendering**, and
