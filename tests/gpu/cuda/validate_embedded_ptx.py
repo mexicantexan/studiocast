@@ -365,7 +365,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--source-root",
-        default=Path(__file__).resolve().parents[2],
+        default=Path(__file__).resolve().parents[3],
         type=Path,
         help="Repository source root",
     )

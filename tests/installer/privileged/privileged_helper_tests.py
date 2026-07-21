@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 HELPER_SOURCE = REPO_ROOT / "installer/privileged/studiocast_system_helper.py"
 CLIENT_SOURCE = REPO_ROOT / "installer/privileged/client_contract.py"
 

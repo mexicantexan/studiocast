@@ -86,8 +86,8 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 - [../installer/gui](../installer/gui): standalone Qt installer wizard.
 - [../installer/backend](../installer/backend): scriptable installer backend
   used by the GUI and CLI fallback.
-- [../tests](../tests): unit and integration-style tests that do not require
-  full desktop hardware workflows.
+- [../tests](../tests): automated tests organized by subsystem and test level,
+  plus reusable support code and hermetic fixtures.
 - [../scripts](../scripts): setup, install, uninstall, model, and developer
   helper scripts. See [../scripts/README.md](../scripts/README.md).
 - [../resources/model_packs](../resources/model_packs): metadata templates for
@@ -98,6 +98,45 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
   for the standalone GUI installer bundle.
 - [../docs](../docs): architecture, setup, model installation, manual testing,
   trademark, roadmap, and design notes.
+
+## Automated test taxonomy and labels
+
+Automated test sources use these directories:
+
+- `tests/unit/{core,audio,model,video}` for small deterministic components.
+- `tests/integration/{core,audio,gui,ipc,video}` for services, pipelines,
+  daemon/GUI coordination, and other multi-component contracts.
+- `tests/installer/{backend,packaging,gui,models,privileged,release}` for the
+  complete installer and signed-release surface.
+- `tests/gpu/{cuda,maxine,open_video,vulkan}` for GPU backend contracts and
+  validators. A test in this tree may still be a no-hardware contract test.
+- `tests/support/` for reusable fake SDKs, mock implementations, generators,
+  and test metadata checks. Support files are not registered as tests.
+- `tests/data/` for hermetic fixtures. This remains the fixture root.
+
+The combined `studiocast-video-tests` executable remains intact to preserve its
+public target and CTest name. It is classified as integration because its
+dominant responsibility is the assembled video pipeline, even though it also
+contains deterministic component cases.
+
+Every registered CTest test has exactly one level label: `unit`, `integration`,
+or `system`. It also has one or more domain labels from `core`, `installer`,
+`release`, `model`, `gui`, `audio`, `video`, `ipc`, `gpu`, `vulkan`, and
+`maxine`. The `gpu`, `vulkan`, and `maxine` labels describe the contract under
+test; they do not imply that unavailable hardware is mandatory. CTest validates
+the label metadata as part of the suite.
+
+Useful selections include:
+
+```bash
+ctest --test-dir <build> -L unit
+ctest --test-dir <build> -L integration
+ctest --test-dir <build> -L system
+ctest --test-dir <build> -L installer
+ctest --test-dir <build> -L release
+ctest --test-dir <build> -L model
+ctest --test-dir <build> -L gpu
+```
 
 ## Main binaries and tools
 

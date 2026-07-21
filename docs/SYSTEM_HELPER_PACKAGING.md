@@ -94,7 +94,8 @@ hash before unlinking. The legacy non-namespaced
 
 Before publishing the signed package:
 
-1. Run `python3 tests/privileged_helper_tests.py` and Python compilation.
+1. Run `python3 tests/installer/privileged/privileged_helper_tests.py` and
+   Python compilation.
 2. Build the local `.deb` and inspect it with `dpkg-deb --contents` and
    `dpkg-deb --info`; do not install it on the development host.
 3. Confirm the two paths and modes match `package-layout.json` and that the

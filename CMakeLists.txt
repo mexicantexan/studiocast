@@ -20,6 +20,10 @@ project(StudioCast
 
 include(CTest)
 
+function(studiocast_set_test_labels test_name)
+    set_tests_properties("${test_name}" PROPERTIES LABELS "${ARGN}")
+endfunction()
+
 foreach (var IN ITEMS CPLUS_INCLUDE_PATH CPATH C_INCLUDE_PATH)
     if (DEFINED ENV{${var}} AND NOT "$ENV{${var}}" STREQUAL "")
         message(WARNING
@@ -889,7 +893,7 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
 
     add_executable(studiocast-maxine-resident-fake-bench
             src/tools/studiocast_maxine_resident_fake_bench_main.cpp
-            src/core/maxine/testing/fake_resident_frame_executor.cpp
+            tests/support/maxine/fake_resident_frame_executor.cpp
     )
 
     target_link_libraries(studiocast-maxine-resident-fake-bench PRIVATE
@@ -898,6 +902,7 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
 
     target_include_directories(studiocast-maxine-resident-fake-bench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
             "${STUDIOCAST_GENERATED_DIR}"
     )
 
@@ -1038,7 +1043,7 @@ install(FILES
 
 if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
     add_executable(studiocast-audio-tests
-            tests/audio_service_tests.cpp
+            tests/integration/audio/audio_service_tests.cpp
     )
 
     target_link_libraries(studiocast-audio-tests PRIVATE studiocast_core)
@@ -1058,17 +1063,18 @@ if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
     )
 
     add_test(NAME studiocast-audio-tests COMMAND studiocast-audio-tests)
+    studiocast_set_test_labels(studiocast-audio-tests integration audio)
 elseif (BUILD_TESTING)
     message(STATUS "Skipping studiocast-audio-tests because libpulse-simple was not found.")
 endif()
 
 if (BUILD_TESTING)
     add_library(studiocast-maxine-effect-fake-sdk SHARED
-            tests/maxine_effect_runtime_fake_sdk.cpp
+            tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )
     target_include_directories(studiocast-maxine-effect-fake-sdk PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
     )
     set_target_properties(studiocast-maxine-effect-fake-sdk PROPERTIES
             AUTOMOC OFF
@@ -1078,7 +1084,7 @@ if (BUILD_TESTING)
     studiocast_set_project_warnings(studiocast-maxine-effect-fake-sdk)
 
     add_library(studiocast-maxine-effect-fake-cudart SHARED
-            tests/maxine_effect_runtime_fake_cudart.cpp
+            tests/support/maxine/maxine_effect_runtime_fake_cudart.cpp
     )
     set_target_properties(studiocast-maxine-effect-fake-cudart PROPERTIES
             OUTPUT_NAME cudart
@@ -1089,7 +1095,7 @@ if (BUILD_TESTING)
     studiocast_set_project_warnings(studiocast-maxine-effect-fake-cudart)
 
     add_executable(studiocast-maxine-effect-binding-tests
-            tests/maxine_effect_binding_tests.cpp
+            tests/gpu/maxine/maxine_effect_binding_tests.cpp
     )
     target_link_libraries(studiocast-maxine-effect-binding-tests PRIVATE
             studiocast_core
@@ -1097,7 +1103,7 @@ if (BUILD_TESTING)
     )
     target_include_directories(studiocast-maxine-effect-binding-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
             "${STUDIOCAST_GENERATED_DIR}"
     )
     target_compile_definitions(studiocast-maxine-effect-binding-tests PRIVATE
@@ -1117,9 +1123,11 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-maxine-effect-binding-tests PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
     )
+    studiocast_set_test_labels(studiocast-maxine-effect-binding-tests
+            integration gpu maxine video)
 
     add_executable(studiocast-maxine-production-resident-tests
-            tests/maxine_production_resident_executor_tests.cpp
+            tests/gpu/maxine/maxine_production_resident_executor_tests.cpp
     )
     target_link_libraries(studiocast-maxine-production-resident-tests PRIVATE
             studiocast_core
@@ -1127,7 +1135,7 @@ if (BUILD_TESTING)
     )
     target_include_directories(studiocast-maxine-production-resident-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
             "${STUDIOCAST_GENERATED_DIR}"
     )
     target_compile_definitions(studiocast-maxine-production-resident-tests PRIVATE
@@ -1147,6 +1155,8 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-maxine-production-resident-tests PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
     )
+    studiocast_set_test_labels(studiocast-maxine-production-resident-tests
+            integration gpu maxine video)
 
     if (STUDIOCAST_BUILD_BENCHMARKS)
         add_executable(studiocast-maxine-production-resident-fake-bench
@@ -1158,7 +1168,7 @@ if (BUILD_TESTING)
         )
         target_include_directories(studiocast-maxine-production-resident-fake-bench PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/maxine"
                 "${STUDIOCAST_GENERATED_DIR}"
         )
         target_compile_definitions(studiocast-maxine-production-resident-fake-bench PRIVATE
@@ -1179,24 +1189,26 @@ if (BUILD_TESTING)
     if (Python3_Interpreter_FOUND)
         add_test(NAME studiocast-embedded-ptx-freshness
                 COMMAND "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dev/validate_embedded_ptx.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/cuda/validate_embedded_ptx.py"
                         --source-root "${CMAKE_CURRENT_SOURCE_DIR}")
         set_tests_properties(studiocast-embedded-ptx-freshness PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+        studiocast_set_test_labels(studiocast-embedded-ptx-freshness unit gpu maxine)
         add_test(NAME studiocast-embedded-vulkan-spv-freshness
                 COMMAND "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dev/validate_embedded_vulkan_spv.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/vulkan/validate_embedded_vulkan_spv.py"
                         --source-root "${CMAKE_CURRENT_SOURCE_DIR}")
         set_tests_properties(studiocast-embedded-vulkan-spv-freshness PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+        studiocast_set_test_labels(studiocast-embedded-vulkan-spv-freshness unit gpu vulkan)
     else()
         message(STATUS "Skipping embedded shader freshness tests because Python3 was not found.")
     endif()
 
     add_executable(studiocast-maxine-paths-tests
-            tests/maxine_paths_tests.cpp
+            tests/gpu/maxine/maxine_paths_tests.cpp
     )
 
     target_link_libraries(studiocast-maxine-paths-tests PRIVATE studiocast_core)
@@ -1220,9 +1232,11 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-maxine-paths-tests COMMAND studiocast-maxine-paths-tests)
+    studiocast_set_test_labels(studiocast-maxine-paths-tests
+            integration gpu maxine audio video)
 
     add_executable(studiocast-nvcv-validation-tests
-            tests/nvcv_validation_tests.cpp
+            tests/gpu/maxine/nvcv_validation_tests.cpp
     )
 
     target_link_libraries(studiocast-nvcv-validation-tests PRIVATE
@@ -1245,10 +1259,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-nvcv-validation-tests
             COMMAND studiocast-nvcv-validation-tests)
+    studiocast_set_test_labels(studiocast-nvcv-validation-tests unit gpu maxine video)
 
     add_executable(studiocast-maxine-resident-frame-tests
-            tests/maxine_resident_frame_section_tests.cpp
-            src/core/maxine/testing/fake_resident_frame_executor.cpp
+            tests/gpu/maxine/maxine_resident_frame_section_tests.cpp
+            tests/support/maxine/fake_resident_frame_executor.cpp
     )
 
     target_link_libraries(studiocast-maxine-resident-frame-tests PRIVATE
@@ -1257,6 +1272,7 @@ if (BUILD_TESTING)
 
     target_include_directories(studiocast-maxine-resident-frame-tests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
             "${STUDIOCAST_GENERATED_DIR}"
     )
 
@@ -1271,9 +1287,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-maxine-resident-frame-tests
             COMMAND studiocast-maxine-resident-frame-tests)
+    studiocast_set_test_labels(studiocast-maxine-resident-frame-tests
+            unit gpu maxine video)
 
     add_executable(studiocast-model-registry-tests
-            tests/model_pack_registry_tests.cpp
+            tests/unit/model/model_pack_registry_tests.cpp
     )
 
     target_link_libraries(studiocast-model-registry-tests PRIVATE studiocast_core)
@@ -1296,9 +1314,11 @@ if (BUILD_TESTING)
     set_tests_properties(studiocast-model-registry-tests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
+    studiocast_set_test_labels(studiocast-model-registry-tests
+            unit model audio video gpu)
 
     add_executable(studiocast-open-audio-prepared-binding-tests
-            tests/open_audio_prepared_binding_tests.cpp
+            tests/unit/audio/open_audio_prepared_binding_tests.cpp
     )
 
     target_link_libraries(studiocast-open-audio-prepared-binding-tests PRIVATE
@@ -1321,9 +1341,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-open-audio-prepared-binding-tests
             COMMAND studiocast-open-audio-prepared-binding-tests)
+    studiocast_set_test_labels(studiocast-open-audio-prepared-binding-tests
+            unit audio model)
 
     add_executable(studiocast-cuda-driver-api-tests
-            tests/cuda_driver_api_tests.cpp
+            tests/gpu/cuda/cuda_driver_api_tests.cpp
     )
 
     target_link_libraries(studiocast-cuda-driver-api-tests PRIVATE
@@ -1346,9 +1368,10 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-cuda-driver-api-tests
             COMMAND studiocast-cuda-driver-api-tests)
+    studiocast_set_test_labels(studiocast-cuda-driver-api-tests unit gpu)
 
     add_executable(studiocast-ipc-tests
-            tests/ipc_client_tests.cpp
+            tests/integration/ipc/ipc_client_tests.cpp
     )
 
     target_link_libraries(studiocast-ipc-tests PRIVATE studiocast_core)
@@ -1368,9 +1391,10 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-ipc-tests COMMAND studiocast-ipc-tests)
+    studiocast_set_test_labels(studiocast-ipc-tests integration ipc core)
 
     add_executable(studiocast-gui-status-tests
-            tests/gui_status_snapshot_tests.cpp
+            tests/integration/gui/gui_status_snapshot_tests.cpp
             src/gui/text_edit_utils.h
             src/gui/text_edit_utils.cpp
             src/gui/pages/engines_models_page.h
@@ -1404,9 +1428,11 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-gui-status-tests COMMAND studiocast-gui-status-tests)
+    studiocast_set_test_labels(studiocast-gui-status-tests
+            integration gui ipc audio video model gpu vulkan)
 
     add_executable(studiocast-effect-schema-tests
-            tests/effect_schema_tests.cpp
+            tests/unit/core/effect_schema_tests.cpp
     )
 
     target_link_libraries(studiocast-effect-schema-tests PRIVATE studiocast_core)
@@ -1426,9 +1452,10 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-effect-schema-tests COMMAND studiocast-effect-schema-tests)
+    studiocast_set_test_labels(studiocast-effect-schema-tests unit core audio video)
 
     add_executable(studiocast-daemon-status-tests
-            tests/daemon_status_tests.cpp
+            tests/integration/core/daemon_status_tests.cpp
     )
 
     target_link_libraries(studiocast-daemon-status-tests PRIVATE studiocast_core)
@@ -1449,9 +1476,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-daemon-status-tests
             COMMAND studiocast-daemon-status-tests)
+    studiocast_set_test_labels(studiocast-daemon-status-tests
+            integration core audio video gpu vulkan)
 
     add_executable(studiocast-exec-tests
-            tests/exec_tests.cpp
+            tests/unit/core/exec_tests.cpp
     )
 
     target_link_libraries(studiocast-exec-tests PRIVATE studiocast_core)
@@ -1471,9 +1500,10 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-exec-tests COMMAND studiocast-exec-tests)
+    studiocast_set_test_labels(studiocast-exec-tests unit core)
 
     add_executable(studiocast-installer-backend-tests
-            tests/installer_backend_tests.cpp
+            tests/installer/backend/installer_backend_tests.cpp
     )
 
     target_link_libraries(studiocast-installer-backend-tests PRIVATE
@@ -1504,33 +1534,70 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-installer-backend-tests
             COMMAND studiocast-installer-backend-tests)
+    studiocast_set_test_labels(studiocast-installer-backend-tests
+            system installer core)
 
     if (Python3_Interpreter_FOUND)
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_backend_core_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/backend/installer_backend_core_tests.py")
         set_tests_properties(studiocast-installer-backend-core-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-installer-backend-core-tests
+                system installer release model gpu vulkan)
         add_test(NAME studiocast-model-download-transaction-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_download_transaction_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/models/model_download_transaction_tests.py")
         set_tests_properties(studiocast-model-download-transaction-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-model-download-transaction-tests
+                integration installer model)
         add_test(NAME studiocast-installer-packaging-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                         "${Python3_EXECUTABLE}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_packaging_tests.py")
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/packaging/installer_packaging_tests.py")
         set_tests_properties(studiocast-installer-packaging-tests PROPERTIES
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-installer-packaging-tests
+                system installer release model)
+
+        add_test(NAME studiocast-release-channel-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/release/release_channel_tests.py")
+        set_tests_properties(studiocast-release-channel-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-release-channel-tests unit release)
+
+        add_test(NAME studiocast-release-packaging-security-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/release/release_packaging_security_tests.py")
+        set_tests_properties(studiocast-release-packaging-security-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-release-packaging-security-tests
+                integration installer release)
+
+        add_test(NAME studiocast-privileged-helper-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                        "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer/privileged/privileged_helper_tests.py")
+        set_tests_properties(studiocast-privileged-helper-tests PROPERTIES
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-privileged-helper-tests
+                integration installer ipc)
     endif()
 
     add_executable(studiocast-installer-wizard-tests
-            tests/installer_wizard_tests.cpp
+            tests/installer/gui/installer_wizard_tests.cpp
             installer/gui/installer_wizard.h
             installer/gui/installer_wizard.cpp
     )
@@ -1561,9 +1628,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-installer-wizard-tests
             COMMAND studiocast-installer-wizard-tests)
+    studiocast_set_test_labels(studiocast-installer-wizard-tests
+            integration installer gui release model)
 
     add_executable(studiocast-cmake-open-backend-cache-tests
-            tests/cmake_open_backend_cache_tests.cpp
+            tests/integration/core/cmake_open_backend_cache_tests.cpp
     )
 
     target_link_libraries(studiocast-cmake-open-backend-cache-tests PRIVATE
@@ -1591,20 +1660,22 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-cmake-open-backend-cache-tests
             COMMAND studiocast-cmake-open-backend-cache-tests)
+    studiocast_set_test_labels(studiocast-cmake-open-backend-cache-tests
+            system core gpu)
 
     add_executable(studiocast-video-tests
-            tests/video_service_tests.cpp
-            tests/camera_effects_update_tests.cpp
-            tests/latest_frame_wins_worker_tests.cpp
-            tests/open_video_denoise_contract_tests.cpp
-            tests/frame_artifact_cache_tests.cpp
-            tests/cuda_kernel_cache_tests.cpp
-            tests/open_vulkan_matting_setup_policy_tests.cpp
-            tests/replace_background_cache_policy_tests.cpp
-            tests/v4l2_capture_negotiation_tests.cpp
-            tests/video_effect_cpu_tests.cpp
-            tests/rgb_yuyv_convert_tests.cpp
-            tests/yuyv_passthrough_tests.cpp
+            tests/integration/video/video_service_tests.cpp
+            tests/unit/video/camera_effects_update_tests.cpp
+            tests/unit/video/latest_frame_wins_worker_tests.cpp
+            tests/gpu/open_video/open_video_denoise_contract_tests.cpp
+            tests/gpu/open_video/frame_artifact_cache_tests.cpp
+            tests/gpu/cuda/cuda_kernel_cache_tests.cpp
+            tests/gpu/vulkan/open_vulkan_matting_setup_policy_tests.cpp
+            tests/unit/video/replace_background_cache_policy_tests.cpp
+            tests/unit/video/v4l2_capture_negotiation_tests.cpp
+            tests/unit/video/video_effect_cpu_tests.cpp
+            tests/unit/video/rgb_yuyv_convert_tests.cpp
+            tests/unit/video/yuyv_passthrough_tests.cpp
     )
 
     target_link_libraries(studiocast-video-tests PRIVATE studiocast_core)
@@ -1624,9 +1695,11 @@ if (BUILD_TESTING)
     )
 
     add_test(NAME studiocast-video-tests COMMAND studiocast-video-tests)
+    studiocast_set_test_labels(studiocast-video-tests
+            integration video gpu vulkan maxine)
 
     add_executable(studiocast-v4l2-writer-transport-tests
-            tests/v4l2_writer_transport_tests.cpp
+            tests/integration/video/v4l2_writer_transport_tests.cpp
     )
 
     target_link_libraries(studiocast-v4l2-writer-transport-tests PRIVATE
@@ -1649,9 +1722,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-v4l2-writer-transport-tests
             COMMAND studiocast-v4l2-writer-transport-tests)
+    studiocast_set_test_labels(studiocast-v4l2-writer-transport-tests
+            integration video)
 
     add_executable(studiocast-open-video-scratch-tests
-            tests/open_video_scratch_reuse_tests.cpp
+            tests/gpu/open_video/open_video_scratch_reuse_tests.cpp
     )
 
     target_link_libraries(studiocast-open-video-scratch-tests PRIVATE
@@ -1673,9 +1748,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-open-video-scratch-tests
             COMMAND studiocast-open-video-scratch-tests)
+    studiocast_set_test_labels(studiocast-open-video-scratch-tests
+            unit video gpu model)
 
     add_executable(studiocast-video-frame-plan-tests
-            tests/video_frame_plan_tests.cpp
+            tests/unit/video/video_frame_plan_tests.cpp
     )
 
     target_link_libraries(studiocast-video-frame-plan-tests PRIVATE
@@ -1697,9 +1774,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-video-frame-plan-tests
             COMMAND studiocast-video-frame-plan-tests)
+    studiocast_set_test_labels(studiocast-video-frame-plan-tests
+            unit video gpu maxine)
 
     add_executable(studiocast-vulkan-frame-plan-tests
-            tests/vulkan_frame_execution_plan_tests.cpp
+            tests/gpu/vulkan/vulkan_frame_execution_plan_tests.cpp
             src/core/vulkan/frame_execution_plan.cpp
     )
 
@@ -1718,9 +1797,11 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-vulkan-frame-plan-tests
             COMMAND studiocast-vulkan-frame-plan-tests)
+    studiocast_set_test_labels(studiocast-vulkan-frame-plan-tests
+            unit video gpu vulkan)
 
     add_executable(studiocast-vulkan-capability-audit-tests
-            tests/vulkan_capability_audit_tests.cpp
+            tests/gpu/vulkan/vulkan_capability_audit_tests.cpp
     )
 
     target_include_directories(studiocast-vulkan-capability-audit-tests PRIVATE
@@ -1742,10 +1823,12 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-vulkan-capability-audit-tests
             COMMAND studiocast-vulkan-capability-audit-tests)
+    studiocast_set_test_labels(studiocast-vulkan-capability-audit-tests
+            unit video gpu vulkan installer)
 
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
         add_executable(studiocast-vulkan-kernel-tests
-                tests/vulkan_kernel_tests.cpp
+                tests/gpu/vulkan/vulkan_kernel_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-kernel-tests PRIVATE
@@ -1768,9 +1851,11 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-kernel-tests
                 COMMAND studiocast-vulkan-kernel-tests)
+        studiocast_set_test_labels(studiocast-vulkan-kernel-tests
+                integration video gpu vulkan)
 
         add_executable(studiocast-vulkan-final-stage-integration-tests
-                tests/vulkan_final_resident_stage_integration_tests.cpp
+                tests/gpu/vulkan/vulkan_final_resident_stage_integration_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-final-stage-integration-tests PRIVATE
@@ -1793,9 +1878,11 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-final-stage-integration-tests
                 COMMAND studiocast-vulkan-final-stage-integration-tests)
+        studiocast_set_test_labels(studiocast-vulkan-final-stage-integration-tests
+                integration video gpu vulkan)
 
         add_executable(studiocast-vulkan-matting-runtime-tests
-                tests/vulkan_matting_runtime_tests.cpp
+                tests/gpu/vulkan/vulkan_matting_runtime_tests.cpp
         )
 
         target_link_libraries(studiocast-vulkan-matting-runtime-tests PRIVATE
@@ -1818,10 +1905,12 @@ if (BUILD_TESTING)
 
         add_test(NAME studiocast-vulkan-matting-runtime-tests
                 COMMAND studiocast-vulkan-matting-runtime-tests)
+        studiocast_set_test_labels(studiocast-vulkan-matting-runtime-tests
+                unit video gpu vulkan model)
     endif()
 
     add_executable(studiocast-v4l2loopback-diagnostics-tests
-            tests/v4l2loopback_diagnostics_tests.cpp
+            tests/integration/video/v4l2loopback_diagnostics_tests.cpp
     )
 
     target_link_libraries(studiocast-v4l2loopback-diagnostics-tests PRIVATE studiocast_core)
@@ -1842,4 +1931,13 @@ if (BUILD_TESTING)
 
     add_test(NAME studiocast-v4l2loopback-diagnostics-tests
             COMMAND studiocast-v4l2loopback-diagnostics-tests)
+    studiocast_set_test_labels(studiocast-v4l2loopback-diagnostics-tests
+            integration video)
+
+    add_test(NAME studiocast-ctest-label-metadata-tests
+            COMMAND "${CMAKE_COMMAND}"
+                    "-DCTEST_EXECUTABLE=${CMAKE_CTEST_COMMAND}"
+                    "-DCTEST_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/validate_ctest_labels.cmake")
+    studiocast_set_test_labels(studiocast-ctest-label-metadata-tests unit core)
 endif()

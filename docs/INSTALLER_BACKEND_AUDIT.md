@@ -53,7 +53,7 @@ Confirmed.
   invalid JSON are not classified.
 
 Existing coverage checks only that status text contains selected optional
-component keys (`tests/installer_backend_tests.cpp:322-350`). There are no
+component keys (`tests/installer/backend/installer_backend_tests.cpp:322-350`). There are no
 tests for valid JSON parsing, v1 migration, truncation, corrupt JSON, duplicate
 keys, unknown schema, atomic persistence, stale ownership paths, or failed
 transactions.
@@ -116,7 +116,7 @@ The defect is shared by planning and execution:
   when the general dependency bundle is deselected.
 
 The existing Vulkan-only plan test catches the analogous Vulkan case
-(`tests/installer_backend_tests.cpp:199-223`) but there is no v4l-only test.
+(`tests/installer/backend/installer_backend_tests.cpp:199-223`) but there is no v4l-only test.
 
 ### 4. CMake choices are not explicit OFF values
 
@@ -132,10 +132,10 @@ three feature variables.
   asserted by a future selection).
 
 The current negative test explicitly expects disabled features merely to omit
-the ON flags (`tests/installer_backend_tests.cpp:252-274`). The separate CMake
+the ON flags (`tests/installer/backend/installer_backend_tests.cpp:252-274`). The separate CMake
 cache suite validates CMake project behavior, but not an ON-to-OFF or OFF-to-ON
 installer reconfiguration of the same cache
-(`tests/cmake_open_backend_cache_tests.cpp:92-224`).
+(`tests/integration/core/cmake_open_backend_cache_tests.cpp:92-224`).
 
 ### 5. Manifest defaults resolve after review, and only for repair paths
 
@@ -174,7 +174,7 @@ Confirmed.
   `current` link, previous version, activation validation, or rollback.
 
 The only user-service test checks enable/restart command text
-(`tests/installer_backend_tests.cpp:471-513`). No test removes the build cache
+(`tests/installer/backend/installer_backend_tests.cpp:471-513`). No test removes the build cache
 and then executes the installed command.
 
 ### 7. Failure and partial state cannot be represented accurately
