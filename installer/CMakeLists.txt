@@ -57,6 +57,20 @@ install(PROGRAMS ${PROJECT_SOURCE_DIR}/installer/backend/studiocast-installer-ba
 )
 
 install(FILES
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/__init__.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/cli.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/contracts.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/executor.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/facts.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/manifest.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/packaged.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/plan.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/recommendation.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/studiocast_installer_backend"
+        COMPONENT Installer
+)
+
+install(FILES
         ${PROJECT_SOURCE_DIR}/installer/privileged/__init__.py
         ${PROJECT_SOURCE_DIR}/installer/privileged/client_contract.py
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/privileged"
