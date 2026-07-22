@@ -1,6 +1,7 @@
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
 #include "core/cuda/cuda_driver_api.h"
+#include "core/maxine/cuda_driver_api.h"
 
 #include <cstddef>
 #include <iostream>
@@ -11,6 +12,11 @@
 #include <vector>
 
 namespace {
+
+static_assert(std::is_same_v<studiocast::maxine::CUstream_st,
+                             studiocast::cuda::CUstream_st>);
+static_assert(std::is_same_v<studiocast::maxine::CUstream,
+                             studiocast::cuda::CUstream>);
 
 bool Expect(bool cond, const std::string &msg) {
   if (!cond) {
