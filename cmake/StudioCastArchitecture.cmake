@@ -68,6 +68,24 @@ function(studiocast_assert_neutral_target target)
     endif ()
 endfunction()
 
+function(_studiocast_normalize_project_source out_var source)
+    if (source MATCHES "\\$<")
+        set(${out_var} "" PARENT_SCOPE)
+        return()
+    endif()
+
+    set(source_path "${source}")
+    cmake_path(ABSOLUTE_PATH source_path
+            BASE_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            NORMALIZE
+            OUTPUT_VARIABLE source_absolute)
+    cmake_path(RELATIVE_PATH source_absolute
+            BASE_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            OUTPUT_VARIABLE source_relative)
+    string(REPLACE "\\" "/" source_relative "${source_relative}")
+    set(${out_var} "${source_relative}" PARENT_SCOPE)
+endfunction()
+
 function(studiocast_assert_cpp_source_ownership)
     set(one_value_args EXPECTED_COUNT)
     set(multi_value_args TARGETS EXPECTED_SOURCES)
@@ -77,24 +95,40 @@ function(studiocast_assert_cpp_source_ownership)
     foreach (target IN LISTS ARG_TARGETS)
         get_target_property(target_sources "${target}" SOURCES)
         foreach (source IN LISTS target_sources)
-            if (source MATCHES "^src/core/.+\\.cpp$")
-                if (source IN_LIST owned_sources)
+            _studiocast_normalize_project_source(normalized_source "${source}")
+            if (normalized_source MATCHES "^src/core/.+\\.cpp$")
+                if (normalized_source IN_LIST owned_sources)
                     message(FATAL_ERROR
-                            "Compiled production source has multiple owners: ${source}")
+                            "Compiled production source has multiple owners: ${normalized_source}")
                 endif ()
-                list(APPEND owned_sources "${source}")
+                list(APPEND owned_sources "${normalized_source}")
             endif ()
         endforeach ()
     endforeach ()
 
+    set(normalized_expected_sources)
+    foreach (source IN LISTS ARG_EXPECTED_SOURCES)
+        _studiocast_normalize_project_source(normalized_source "${source}")
+        if (normalized_source IN_LIST normalized_expected_sources)
+            message(FATAL_ERROR
+                    "Expected production source is listed more than once: ${normalized_source}")
+        endif ()
+        list(APPEND normalized_expected_sources "${normalized_source}")
+    endforeach ()
+
     list(SORT owned_sources)
-    list(SORT ARG_EXPECTED_SOURCES)
+    list(SORT normalized_expected_sources)
     list(LENGTH owned_sources owned_count)
+    list(LENGTH normalized_expected_sources expected_list_count)
+    if (NOT expected_list_count EQUAL ARG_EXPECTED_COUNT)
+        message(FATAL_ERROR
+                "Expected production source list count is ${expected_list_count}; expected ${ARG_EXPECTED_COUNT}.")
+    endif ()
     if (NOT owned_count EQUAL ARG_EXPECTED_COUNT)
         message(FATAL_ERROR
                 "Configured production source ownership count is ${owned_count}; expected ${ARG_EXPECTED_COUNT}.")
     endif ()
-    if (NOT "${owned_sources}" STREQUAL "${ARG_EXPECTED_SOURCES}")
+    if (NOT "${owned_sources}" STREQUAL "${normalized_expected_sources}")
         message(FATAL_ERROR
                 "Configured production source ownership is incomplete or contains an unexpected source.")
     endif ()
