@@ -1,5 +1,10 @@
 # StudioCast installer GUI audit and frozen routing contract
 
+- Status: Archived historical audit and proposal; not a current-state document
+- Applies To: StudioCast v0.2.9 plus the Wave 1 proposal baselines named below
+- Audience: Maintainers investigating installer GUI design history
+- Archived: 2026-07-22
+
 Date: 2026-07-12
 
 Audited baseline: `v0.2.9` plus the Wave 1 backend and Vulkan audit contracts
@@ -7,10 +12,14 @@ Audited baseline: `v0.2.9` plus the Wave 1 backend and Vulkan audit contracts
 Scope: `installer/gui/installer_wizard.*`, `installer/gui/main.cpp`, and
 `tests/installer/gui/installer_wizard_tests.cpp`. This document changes no production code.
 
+This document records a proposed routing contract at its audited baseline. It
+is not a description of current implementation state. Current requirements live
+in the root policies and active contracts listed by `docs/README.md`.
+
 ## Policy inputs
 
 This contract applies the repository policies in `docs/GUI_POLICY.md`,
-`docs/MODEL_POLICY.md`, `docs/INSTALLER_BACKEND_AUDIT.md`, and
+`docs/MODEL_POLICY.md`, `docs/archive/audits/INSTALLER_BACKEND_AUDIT.md`, and
 `docs/INSTALLER_VULKAN_CAPABILITIES.md`:
 
 - The GUI is a controller and presentation layer. Backend facts,

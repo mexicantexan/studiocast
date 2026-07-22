@@ -184,7 +184,7 @@ user-supplied model packs.
 
 Install/usage docs:
 
-- `docs/open_cuda_install.md`
+- `docs/open_source_video_models_install.md`
 
 On Ubuntu 22.04+, the helper script that installs ONNX Runtime is:
 

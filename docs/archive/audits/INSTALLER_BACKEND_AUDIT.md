@@ -1,5 +1,10 @@
 # StudioCast installer backend audit and contract proposal
 
+- Status: Archived historical audit and proposal; not a current-state document
+- Applies To: Baseline `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
+- Audience: Maintainers investigating installer design history
+- Archived: 2026-07-22
+
 Date: 2026-07-12
 Audited baseline: `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
 Scope: the current shell backend, its delegated install/uninstall helpers, and
@@ -7,6 +12,11 @@ the backend-, wizard-, and CMake-cache-facing tests. This is a Wave 1 contract
 document; it intentionally changes no production code.
 
 ## Policy constraints applied
+
+This document records the evidence and proposed contract at its audited
+baseline. It is not a description of current implementation state. Current
+requirements live in the root policies and active contracts listed by
+`docs/README.md`.
 
 This proposal preserves the repository's existing authority and compatibility
 rules:

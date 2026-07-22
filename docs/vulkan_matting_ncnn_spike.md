@@ -1,5 +1,10 @@
 # Vulkan Matting ncnn Spike
 
+- Status: Experimental design record; not a production capability contract
+- Applies To: Optional ncnn Vulkan matting spike and fail-closed adapter boundary
+- Audience: Vulkan and Open Video maintainers
+- Last Verified: 2026-07-22
+
 Milestone 4 evaluates ncnn Vulkan as a candidate inference runtime for a future
 Open Vulkan virtual-background backend. This is a spike only; it does not change
 the production model-pack format or runtime selection.

@@ -1,5 +1,10 @@
 # StudioCast system-helper packaging
 
+- Status: Active privilege and packaging contract
+- Applies To: `studiocast-system-helper`, its polkit policy, and installer client
+- Audience: Packaging, installer, and security maintainers
+- Last Verified: 2026-07-22
+
 ## Security boundary and prerequisite
 
 The StudioCast installer AppImage is an unprivileged application payload. It

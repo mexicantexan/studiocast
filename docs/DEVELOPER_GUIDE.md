@@ -704,7 +704,7 @@ distribution packaging and polished non-developer install flows as future work.
   availability notes.
 - [MANUAL_TESTING.md](MANUAL_TESTING.md): hardware and GUI manual regression
   plan.
-- [ROADMAP.md](ROADMAP.md): project direction and planned work.
+- [README.md](README.md): documentation status, ownership, and lifecycle index.
 - [TRADEMARKS.md](TRADEMARKS.md): affiliation and trademark note.
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): contribution conventions.
 - [../SECURITY.md](../SECURITY.md): security reporting.

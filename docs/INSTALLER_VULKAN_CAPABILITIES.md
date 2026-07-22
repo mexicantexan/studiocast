@@ -1,5 +1,10 @@
 # Installer Vulkan Capability Audit
 
+- Status: Active cross-subsystem capability contract
+- Applies To: StudioCast v0.2.9 installer recommendation and runtime evidence
+- Audience: Installer, runtime, packaging, and test maintainers
+- Last Verified: 2026-07-22
+
 This document is the per-effect installer policy input for StudioCast `v0.2.9`.
 It describes the canonical live pipeline after the Vulkan production program,
 not what a loader, source filename, utility kernel, benchmark, synthetic test

@@ -1,5 +1,10 @@
 # StudioCast GUI Weaknesses Audit
 
+- Status: Archived historical UX audit
+- Applies To: GUI and screenshots reviewed on 2026-07-03
+- Audience: Designers and maintainers investigating GUI history
+- Archived: 2026-07-22
+
 Date: 2026-07-03
 
 Purpose: document weaknesses, UX risks, visual/design problems, information
@@ -7,16 +12,11 @@ architecture issues, and modernization opportunities in the current StudioCast
 GUI before a full reface/reskin. This is not a redesign proposal and does not
 prescribe a final layout.
 
-Sources:
-
-- `README.md`
-- `docs/GUI_FUNCTIONALITY_AUDIT.md`
-- `docs/GUI_END_USER_FUNCTIONALITY_SUGGESTIONS.md`
-- Screenshots captured 2026-07-03:
-  - Microphone page: `Screenshot from 2026-07-03 09-59-53.png`
-  - Speakers page: `Screenshot from 2026-07-03 10-00-06.png`
-  - Camera page top: `Screenshot from 2026-07-03 10-01-49.png`
-  - Camera page bottom: `Screenshot from 2026-07-03 10-02-00.png`
+Historical evidence note: the predecessor functionality/suggestion audits and
+four 2026-07-03 screenshots cited by the original report were not retained in
+this repository. The observations below are preserved as historical context,
+not as current product requirements. Current GUI authority is
+`docs/GUI_POLICY.md`; current manual coverage is `docs/MANUAL_TESTING.md`.
 
 ## 1. Executive Summary
 

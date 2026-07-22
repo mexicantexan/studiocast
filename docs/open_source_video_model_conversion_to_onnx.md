@@ -21,7 +21,7 @@ This doc explains how to:
 
 If you only want to understand the directory layout and schema, start with:
 
-- `docs/open_video_model_packs.md`
+- `docs/how_to_add_your_own_model.md`
 
 ---
 

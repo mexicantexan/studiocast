@@ -1,5 +1,10 @@
 # Installer curated-model catalog and transactions
 
+- Status: Active installer/model transaction contract
+- Applies To: StudioCast v0.2.9 curated catalog and installer packaging
+- Audience: Installer, model, packaging, and release maintainers
+- Last Verified: 2026-07-22
+
 ## Default catalog
 
 `installer/models/curated-model-catalog-v1.json` is the versioned,

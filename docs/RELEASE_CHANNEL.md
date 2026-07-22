@@ -1,5 +1,10 @@
 # StudioCast stable release channel
 
+- Status: Active release and trust contract
+- Applies To: Stable-channel manifests, packaging, signing, and installer updates
+- Audience: Release, installer, packaging, and security maintainers
+- Last Verified: 2026-07-22
+
 ## Outcome and trust model
 
 The initial stable channel uses GitHub Releases as transport, but it does not

@@ -1,6 +1,9 @@
 /cmake-build-debug/
 /.idea
 /.junie
+__pycache__/
+*.py[cod]
+.pytest_cache/
 /*.zip
 /build/
 /build-ncnn/
