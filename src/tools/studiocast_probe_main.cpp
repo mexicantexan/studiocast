@@ -1073,7 +1073,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
 
   // GPU buffer roundtrip (CUDA driver only; no Maxine/NvCV dependencies).
   {
-    studiocast::maxine::CudaDriverApi cuda;
+    studiocast::cuda::CudaDriverApi cuda;
     std::string err;
     if (!cuda.Initialize(&err)) {
       reportCudaSmokeSkip("CudaImageRoundtrip", "CUDA unavailable", err);
@@ -1081,7 +1081,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
       reportCudaSmokeSkip("CudaImageRoundtrip", "no CUDA context/device",
                           err);
     } else {
-      studiocast::maxine::CUstream stream = nullptr;
+      studiocast::cuda::CUstream stream = nullptr;
       if (!cuda.CreateStream(&stream, &err)) {
         ++failures;
         std::printf("[FAIL] CudaImageRoundtrip\n  CreateStream failed: %s\n",
@@ -1147,7 +1147,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
 
   // Open CUDA VB kernels smoke test (CUDA driver only; no ORT required).
   {
-    studiocast::maxine::CudaDriverApi cuda;
+    studiocast::cuda::CudaDriverApi cuda;
     std::string err;
     if (!cuda.Initialize(&err)) {
       reportCudaSmokeSkip("OpenCudaVbKernelsSmoke", "CUDA unavailable", err);
@@ -1155,7 +1155,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
       reportCudaSmokeSkip("OpenCudaVbKernelsSmoke", "no CUDA context/device",
                           err);
     } else {
-      studiocast::maxine::CUstream stream = nullptr;
+      studiocast::cuda::CUstream stream = nullptr;
       if (!cuda.CreateStream(&stream, &err)) {
         ++failures;
         std::printf(
@@ -1479,7 +1479,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
   // EP).
   {
 #if STUDIOCAST_HAVE_ONNXRUNTIME
-    studiocast::maxine::CudaDriverApi cuda;
+    studiocast::cuda::CudaDriverApi cuda;
     std::string err;
     if (!cuda.Initialize(&err)) {
       reportCudaSmokeSkip("OpenCudaMattingSessionSmoke", "CUDA unavailable",
@@ -1488,7 +1488,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
       reportCudaSmokeSkip("OpenCudaMattingSessionSmoke",
                           "no CUDA context/device", err);
     } else {
-      studiocast::maxine::CUstream stream = nullptr;
+      studiocast::cuda::CUstream stream = nullptr;
       if (!cuda.CreateStream(&stream, &err)) {
         reportCudaSmokeSkip("OpenCudaMattingSessionSmoke",
                             "CreateStream failed", err);
@@ -1681,14 +1681,14 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
 
   // CUDA kernels (optional build): bilinear resize + preprocess-to-NCHW.
   {
-    studiocast::maxine::CudaDriverApi cuda;
+    studiocast::cuda::CudaDriverApi cuda;
     std::string err;
     if (!cuda.Initialize(&err)) {
       reportCudaSmokeSkip("CudaKernels", "CUDA unavailable", err);
     } else if (!cuda.EnsureContext(&err)) {
       reportCudaSmokeSkip("CudaKernels", "no CUDA context/device", err);
     } else {
-      studiocast::maxine::CUstream stream = nullptr;
+      studiocast::cuda::CUstream stream = nullptr;
       if (!cuda.CreateStream(&stream, &err)) {
         ++failures;
         std::printf("[FAIL] CudaKernels\n  CreateStream failed: %s\n",

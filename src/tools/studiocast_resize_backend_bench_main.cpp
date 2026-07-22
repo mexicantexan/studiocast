@@ -1,6 +1,6 @@
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/kernels/resize_bilinear.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/video/image_ppm.h"
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -45,8 +45,8 @@ struct Stats {
 };
 
 struct CudaBenchRuntime {
-  studiocast::maxine::CudaDriverApi cuda;
-  studiocast::maxine::CUstream stream = nullptr;
+  studiocast::cuda::CudaDriverApi cuda;
+  studiocast::cuda::CUstream stream = nullptr;
   bool initialized = false;
   bool available = false;
   std::string error;

@@ -6,7 +6,7 @@
 #include <string>
 
 #include "core/cuda/cuda_image.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 namespace studiocast::cuda::kernels {
 
@@ -61,7 +61,7 @@ SolidBackgroundMemoryChannels(PixelFormatGpu format, std::uint8_t bg_r,
 // weights are computed. Samples outside the source image therefore use
 // edge/replicate border semantics with no extrapolation.
 bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
-                         studiocast::maxine::CUstream stream,
+                         studiocast::cuda::CUstream stream,
                          std::string *error_out);
 
 // Separable box blur for interleaved u8x3 pitched device images.
@@ -71,7 +71,7 @@ bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
 // - radius is clamped to >= 0 and must not exceed detail::kBoxBlurMaxRadius.
 bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
                           const CudaImage &dst, int radius,
-                          studiocast::maxine::CUstream stream,
+                          studiocast::cuda::CUstream stream,
                           std::string *error_out);
 
 // Separable box blur for f32_1 pitched device images.
@@ -79,7 +79,7 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
 // - radius is clamped to >= 0 and must not exceed detail::kBoxBlurMaxRadius.
 bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
                            const CudaImage &dst, int radius,
-                           studiocast::maxine::CUstream stream,
+                           studiocast::cuda::CUstream stream,
                            std::string *error_out);
 
 // out = alpha * fg + (1 - alpha) * bg
@@ -89,7 +89,7 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
 // [0..1], and non-finite values are treated as 0.
 bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
                         const CudaImage &alpha, const CudaImage &out,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string *error_out);
 
 // out = alpha * fg + (1 - alpha) * solid_color
@@ -99,7 +99,7 @@ bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
 bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
                              std::uint8_t bg_r, std::uint8_t bg_g,
                              std::uint8_t bg_b, const CudaImage &out,
-                             studiocast::maxine::CUstream stream,
+                             studiocast::cuda::CUstream stream,
                              std::string *error_out);
 
 // out = key-light blend over src, masked by a frame-sized f32 alpha matte.
@@ -111,7 +111,7 @@ bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
 bool ApplyKeyLightU8x3(const CudaImage &src, const CudaImage &alpha,
                        float target_r, float target_g, float target_b,
                        float intensity01, float direction, const CudaImage &out,
-                       studiocast::maxine::CUstream stream,
+                       studiocast::cuda::CUstream stream,
                        std::string *error_out);
 
 } // namespace studiocast::cuda::kernels

@@ -103,7 +103,7 @@ std::size_t CudaTensor::ElementCount() const {
   return size.elements;
 }
 
-bool CudaTensor::AllocateNchwF32(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaTensor::AllocateNchwF32(studiocast::cuda::CudaDriverApi *cuda,
                                  int n_in, int c_in, int h_in, int w_in,
                                  std::string *error_out) {
   if (error_out)
@@ -120,7 +120,7 @@ bool CudaTensor::AllocateNchwF32(studiocast::maxine::CudaDriverApi *cuda,
     return false;
   }
 
-  studiocast::maxine::CudaDriverApi::PitchAllocation alloc{};
+  studiocast::cuda::CudaDriverApi::PitchAllocation alloc{};
   // Allocate as a single row (Height=1) so the active tensor bytes are
   // contiguous.
   const bool ok = cuda->AllocatePitch(size.bytes, 1, &alloc, error_out,
@@ -139,7 +139,7 @@ bool CudaTensor::AllocateNchwF32(studiocast::maxine::CudaDriverApi *cuda,
   return true;
 }
 
-bool CudaTensor::Free(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaTensor::Free(studiocast::cuda::CudaDriverApi *cuda,
                       std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -180,7 +180,7 @@ bool CudaTensor::Free(studiocast::maxine::CudaDriverApi *cuda,
   return true;
 }
 
-bool CudaTensor::ReallocIfNeededNchwF32(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaTensor::ReallocIfNeededNchwF32(studiocast::cuda::CudaDriverApi *cuda,
                                         int n_in, int c_in, int h_in, int w_in,
                                         std::string *error_out) {
   if (error_out)
@@ -203,9 +203,9 @@ bool CudaTensor::ReallocIfNeededNchwF32(studiocast::maxine::CudaDriverApi *cuda,
   return AllocateNchwF32(cuda, n_in, c_in, h_in, w_in, error_out);
 }
 
-bool CudaTensor::UploadFromCpuF32(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaTensor::UploadFromCpuF32(studiocast::cuda::CudaDriverApi *cuda,
                                   const float *src, std::size_t src_floats,
-                                  studiocast::maxine::CUstream stream,
+                                  studiocast::cuda::CUstream stream,
                                   std::string *error_out) const {
   if (error_out)
     error_out->clear();
@@ -238,9 +238,9 @@ bool CudaTensor::UploadFromCpuF32(studiocast::maxine::CudaDriverApi *cuda,
                                  stream, error_out);
 }
 
-bool CudaTensor::DownloadToCpuF32(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaTensor::DownloadToCpuF32(studiocast::cuda::CudaDriverApi *cuda,
                                   std::vector<float> *out,
-                                  studiocast::maxine::CUstream stream,
+                                  studiocast::cuda::CUstream stream,
                                   std::string *error_out) const {
   if (error_out)
     error_out->clear();

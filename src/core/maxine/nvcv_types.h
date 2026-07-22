@@ -11,12 +11,13 @@
 #include <cstdint>
 #include <limits>
 
+#include "core/cuda/cuda_driver_api.h"
+
 namespace studiocast::maxine {
 
-// CUDA stream forward declaration.
-// CUDA defines: typedef struct CUstream_st* CUstream;
-struct CUstream_st;
-using CUstream = CUstream_st *;
+// Preserve the Maxine SDK-facing name while sharing the neutral runtime-loaded
+// CUDA ABI declaration.
+using CUstream = studiocast::cuda::CUstream;
 
 // In NVIDIA headers this is a signed integer type (often an enum).
 using NvCV_Status = int32_t;

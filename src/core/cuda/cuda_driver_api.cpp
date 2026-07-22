@@ -1,9 +1,9 @@
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 #include <filesystem>
 #include <utility>
 
-namespace studiocast::maxine {
+namespace studiocast::cuda {
 
 CudaDriverApi::CudaDriverApi() = default;
 
@@ -539,4 +539,4 @@ bool CudaDriverApi::StreamSynchronize(CUstream stream, std::string *error_out) {
   return true;
 }
 
-} // namespace studiocast::maxine
+} // namespace studiocast::cuda

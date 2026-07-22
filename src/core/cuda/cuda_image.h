@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 namespace studiocast::cuda {
 
@@ -32,7 +32,7 @@ struct CudaImage {
   CudaImage(CudaImage &&other) noexcept;
   CudaImage &operator=(CudaImage &&other) = delete;
 
-  studiocast::maxine::CUdeviceptr ptr = 0;
+  studiocast::cuda::CUdeviceptr ptr = 0;
   std::size_t pitch = 0;
   int w = 0;
   int h = 0;
@@ -42,26 +42,26 @@ struct CudaImage {
   std::size_t RowBytes() const;
   bool Valid() const;
 
-  bool Allocate(studiocast::maxine::CudaDriverApi *cuda, int width, int height,
+  bool Allocate(studiocast::cuda::CudaDriverApi *cuda, int width, int height,
                 PixelFormatGpu fmt, std::string *error_out);
 
-  bool Free(studiocast::maxine::CudaDriverApi *cuda, std::string *error_out);
+  bool Free(studiocast::cuda::CudaDriverApi *cuda, std::string *error_out);
 
-  bool ReallocIfNeeded(studiocast::maxine::CudaDriverApi *cuda, int width,
+  bool ReallocIfNeeded(studiocast::cuda::CudaDriverApi *cuda, int width,
                        int height, PixelFormatGpu fmt, std::string *error_out);
 
   // Upload/download helpers for CPU-side RGB24 interop.
   //
   // These perform 2D copies and keep the operation on the provided stream.
   // The caller decides when to synchronize.
-  bool UploadFromCpuRgb24(studiocast::maxine::CudaDriverApi *cuda,
+  bool UploadFromCpuRgb24(studiocast::cuda::CudaDriverApi *cuda,
                           const std::uint8_t *src, std::size_t src_stride_bytes,
-                          studiocast::maxine::CUstream stream,
+                          studiocast::cuda::CUstream stream,
                           std::string *error_out) const;
 
-  bool DownloadToCpuRgb24(studiocast::maxine::CudaDriverApi *cuda,
+  bool DownloadToCpuRgb24(studiocast::cuda::CudaDriverApi *cuda,
                           std::uint8_t *dst, std::size_t dst_stride_bytes,
-                          studiocast::maxine::CUstream stream,
+                          studiocast::cuda::CUstream stream,
                           std::string *error_out) const;
 
   // Clears only this wrapper's metadata. It does not free device memory; call

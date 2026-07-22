@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "core/cuda/cuda_tensor.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/onnx/ort_session.h"
 #include "core/open_video/model_pack_registry.h"
 
@@ -222,8 +222,8 @@ private:
 
   // Optional CUDA ORT IoBinding buffers. These only cover ONNX tensor I/O;
   // frame preprocessing and output postprocess remain CPU-side in this class.
-  studiocast::maxine::CudaDriverApi cuda_;
-  studiocast::maxine::CUstream cuda_stream_ = nullptr;
+  studiocast::cuda::CudaDriverApi cuda_;
+  studiocast::cuda::CUstream cuda_stream_ = nullptr;
   bool cuda_stream_owned_ = false;
   bool cuda_tensor_io_ready_ = false;
   studiocast::cuda::CudaTensor cuda_noisy_tensor_;

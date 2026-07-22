@@ -5,7 +5,9 @@ add_executable(studiocastd
         ${PROJECT_SOURCE_DIR}/src/daemon/studiocastd_main.cpp
 )
 
-target_link_libraries(studiocastd PRIVATE studiocast_core)
+target_link_libraries(studiocastd PRIVATE
+        studiocast_ipc
+        studiocast_runtime_config)
 
 target_include_directories(studiocastd PRIVATE
         "${PROJECT_SOURCE_DIR}/src"

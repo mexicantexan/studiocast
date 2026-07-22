@@ -1202,28 +1202,28 @@ $L__BB7_6:
 
 )ptx";
 
-bool EnsureCudaReady(studiocast::maxine::CudaDriverApi **out_cuda,
+bool EnsureCudaReady(studiocast::cuda::CudaDriverApi **out_cuda,
                      std::string *error_out) {
   return detail::EnsureCudaReady(out_cuda, error_out);
 }
 
 struct KernelFunctions {
-  studiocast::maxine::CUfunction resize_f32 = nullptr;
-  studiocast::maxine::CUfunction blur_h_u8x3 = nullptr;
-  studiocast::maxine::CUfunction blur_v_u8x3 = nullptr;
-  studiocast::maxine::CUfunction blur_h_f32 = nullptr;
-  studiocast::maxine::CUfunction blur_v_f32 = nullptr;
-  studiocast::maxine::CUfunction comp_bg = nullptr;
-  studiocast::maxine::CUfunction comp_solid = nullptr;
-  studiocast::maxine::CUfunction key_light = nullptr;
+  studiocast::cuda::CUfunction resize_f32 = nullptr;
+  studiocast::cuda::CUfunction blur_h_u8x3 = nullptr;
+  studiocast::cuda::CUfunction blur_v_u8x3 = nullptr;
+  studiocast::cuda::CUfunction blur_h_f32 = nullptr;
+  studiocast::cuda::CUfunction blur_v_f32 = nullptr;
+  studiocast::cuda::CUfunction comp_bg = nullptr;
+  studiocast::cuda::CUfunction comp_solid = nullptr;
+  studiocast::cuda::CUfunction key_light = nullptr;
 };
 
 struct KernelState {
   // CUDA module/function handles are context-bound; keep this cache thread-local
   // with the thread-local driver/context owner in cuda_driver_cache.h.
   bool loaded = false;
-  studiocast::maxine::CUcontext loaded_ctx = nullptr;
-  studiocast::maxine::CUmodule module = nullptr;
+  studiocast::cuda::CUcontext loaded_ctx = nullptr;
+  studiocast::cuda::CUmodule module = nullptr;
   KernelFunctions functions;
 };
 
@@ -1232,9 +1232,9 @@ KernelState &k() {
   return s;
 }
 
-studiocast::maxine::CUresult
-LoadPtxModule(studiocast::maxine::CudaDriverApi *cuda, const char *ptx,
-              studiocast::maxine::CUmodule *module, std::string *jit_log) {
+studiocast::cuda::CUresult
+LoadPtxModule(studiocast::cuda::CudaDriverApi *cuda, const char *ptx,
+              studiocast::cuda::CUmodule *module, std::string *jit_log) {
   if (jit_log)
     jit_log->clear();
   if (module)
@@ -1245,12 +1245,12 @@ LoadPtxModule(studiocast::maxine::CudaDriverApi *cuda, const char *ptx,
     char info[8192] = {0};
     char err[8192] = {0};
 
-    studiocast::maxine::CUjit_option opts[] = {
-        studiocast::maxine::CU_JIT_INFO_LOG_BUFFER,
-        studiocast::maxine::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
-        studiocast::maxine::CU_JIT_ERROR_LOG_BUFFER,
-        studiocast::maxine::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
-        studiocast::maxine::CU_JIT_LOG_VERBOSE,
+    studiocast::cuda::CUjit_option opts[] = {
+        studiocast::cuda::CU_JIT_INFO_LOG_BUFFER,
+        studiocast::cuda::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+        studiocast::cuda::CU_JIT_ERROR_LOG_BUFFER,
+        studiocast::cuda::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        studiocast::cuda::CU_JIT_LOG_VERBOSE,
     };
     void *vals[] = {
         info,
@@ -1284,7 +1284,7 @@ std::string OpenCudaVbPtxCompat82() {
   return ptx;
 }
 
-bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
+bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
                          KernelFunctions *out,
                          std::string *error_out) {
   if (error_out)
@@ -1292,7 +1292,7 @@ bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
   if (out)
     *out = {};
 
-  studiocast::maxine::CUcontext cur = nullptr;
+  studiocast::cuda::CUcontext cur = nullptr;
   if (!detail::GetCurrentContext(cuda, &cur, error_out))
     return false;
 
@@ -1304,11 +1304,11 @@ bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
   }
 
   const auto &f = cuda->f();
-  studiocast::maxine::CUmodule module = nullptr;
+  studiocast::cuda::CUmodule module = nullptr;
   KernelFunctions functions;
   std::string jit_log;
   auto rc = LoadPtxModule(cuda, kOpenCudaVbPtx, &module, &jit_log);
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     const std::string primary_error =
         "primary PTX 8.5 load failed: " + cuda->StatusToString(rc) +
         (jit_log.empty() ? std::string() : "\n" + jit_log);
@@ -1318,7 +1318,7 @@ bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
       std::string compat_jit_log;
       const auto compat_rc =
           LoadPtxModule(cuda, compat_ptx.c_str(), &module, &compat_jit_log);
-      if (compat_rc == studiocast::maxine::CUDA_SUCCESS) {
+      if (compat_rc == studiocast::cuda::CUDA_SUCCESS) {
         rc = compat_rc;
       } else if (error_out) {
         *error_out = "cuModuleLoadData(open_cuda_vb_kernels) failed: " +
@@ -1331,7 +1331,7 @@ bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
       }
     }
   }
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out) {
       if (error_out->empty()) {
         *error_out = "cuModuleLoadData(open_cuda_vb_kernels) failed: " +
@@ -1343,11 +1343,11 @@ bool EnsureKernelsLoaded(studiocast::maxine::CudaDriverApi *cuda,
     return false;
   }
 
-  auto get_fn = [&](studiocast::maxine::CUfunction *fn_out,
+  auto get_fn = [&](studiocast::cuda::CUfunction *fn_out,
                     const char *name) {
-    const studiocast::maxine::CUresult st_rc =
+    const studiocast::cuda::CUresult st_rc =
         f.cuModuleGetFunction(fn_out, module, name);
-    if (st_rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (st_rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = std::string("cuModuleGetFunction(") + name +
                      ") failed: " + cuda->StatusToString(st_rc);
@@ -1394,7 +1394,7 @@ constexpr unsigned int kBlockY = 16;
 } // namespace
 
 bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
-                         studiocast::maxine::CUstream stream,
+                         studiocast::cuda::CUstream stream,
                          std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1414,7 +1414,7 @@ bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
   if (!CheckSignedPtxPitch(dst, "ResizeBilinearF32_1(dst)", error_out))
     return false;
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
   KernelFunctions kernels;
@@ -1448,10 +1448,10 @@ bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
   const unsigned int grid_y =
       (static_cast<unsigned int>(dst.h) + kBlockY - 1u) / kBlockY;
 
-  const studiocast::maxine::CUresult rc =
+  const studiocast::cuda::CUresult rc =
       f.cuLaunchKernel(kernels.resize_f32, grid_x, grid_y, 1, kBlockX, kBlockY,
                        1, 0, stream, args, nullptr);
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(resize_bilinear_f32_1) failed: " +
                    cuda->StatusToString(rc);
@@ -1462,7 +1462,7 @@ bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
 
 bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
                           const CudaImage &dst, int radius,
-                          studiocast::maxine::CUstream stream,
+                          studiocast::cuda::CUstream stream,
                           std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1500,7 +1500,7 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
     return false;
   radius = detail::NormalizeBoxBlurRadius(radius);
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
 
@@ -1508,17 +1508,17 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
   // kernel edge cases.
   if (radius == 0) {
     const auto &f = cuda->f();
-    studiocast::maxine::CUDA_MEMCPY2D cp{};
-    cp.srcMemoryType = studiocast::maxine::CU_MEMORYTYPE_DEVICE;
+    studiocast::cuda::CUDA_MEMCPY2D cp{};
+    cp.srcMemoryType = studiocast::cuda::CU_MEMORYTYPE_DEVICE;
     cp.srcDevice = src.ptr;
     cp.srcPitch = src.pitch;
-    cp.dstMemoryType = studiocast::maxine::CU_MEMORYTYPE_DEVICE;
+    cp.dstMemoryType = studiocast::cuda::CU_MEMORYTYPE_DEVICE;
     cp.dstDevice = dst.ptr;
     cp.dstPitch = dst.pitch;
     cp.WidthInBytes = src.RowBytes();
     cp.Height = static_cast<std::size_t>(src.h);
     const auto rc = f.cuMemcpy2DAsync(&cp, stream);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuMemcpy2DAsync(BoxBlurSeparableU8x3 copy) failed: " +
                      cuda->StatusToString(rc);
@@ -1561,7 +1561,7 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
     const auto rc = f.cuLaunchKernel(kernels.blur_h_u8x3, grid_x, grid_y, 1,
                                      kBlockX, kBlockY, 1, 0, stream, args,
                                      nullptr);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuLaunchKernel(box_blur_h_u8x3) failed: " +
                      cuda->StatusToString(rc);
@@ -1581,7 +1581,7 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
     const auto rc = f.cuLaunchKernel(kernels.blur_v_u8x3, grid_x, grid_y, 1,
                                      kBlockX, kBlockY, 1, 0, stream, args,
                                      nullptr);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuLaunchKernel(box_blur_v_u8x3) failed: " +
                      cuda->StatusToString(rc);
@@ -1593,7 +1593,7 @@ bool BoxBlurSeparableU8x3(const CudaImage &src, const CudaImage &tmp,
 
 bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
                            const CudaImage &dst, int radius,
-                           studiocast::maxine::CUstream stream,
+                           studiocast::cuda::CUstream stream,
                            std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1626,7 +1626,7 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
     return false;
   radius = detail::NormalizeBoxBlurRadius(radius);
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
 
@@ -1634,17 +1634,17 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
   // kernel edge cases.
   if (radius == 0) {
     const auto &f = cuda->f();
-    studiocast::maxine::CUDA_MEMCPY2D cp{};
-    cp.srcMemoryType = studiocast::maxine::CU_MEMORYTYPE_DEVICE;
+    studiocast::cuda::CUDA_MEMCPY2D cp{};
+    cp.srcMemoryType = studiocast::cuda::CU_MEMORYTYPE_DEVICE;
     cp.srcDevice = src.ptr;
     cp.srcPitch = src.pitch;
-    cp.dstMemoryType = studiocast::maxine::CU_MEMORYTYPE_DEVICE;
+    cp.dstMemoryType = studiocast::cuda::CU_MEMORYTYPE_DEVICE;
     cp.dstDevice = dst.ptr;
     cp.dstPitch = dst.pitch;
     cp.WidthInBytes = src.RowBytes();
     cp.Height = static_cast<std::size_t>(src.h);
     const auto rc = f.cuMemcpy2DAsync(&cp, stream);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuMemcpy2DAsync(BoxBlurSeparableF32_1 copy) failed: " +
                      cuda->StatusToString(rc);
@@ -1687,7 +1687,7 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
     const auto rc = f.cuLaunchKernel(kernels.blur_h_f32, grid_x, grid_y, 1,
                                      kBlockX, kBlockY, 1, 0, stream, args,
                                      nullptr);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuLaunchKernel(box_blur_h_f32_1) failed: " +
                      cuda->StatusToString(rc);
@@ -1707,7 +1707,7 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
     const auto rc = f.cuLaunchKernel(kernels.blur_v_f32, grid_x, grid_y, 1,
                                      kBlockX, kBlockY, 1, 0, stream, args,
                                      nullptr);
-    if (rc != studiocast::maxine::CUDA_SUCCESS) {
+    if (rc != studiocast::cuda::CUDA_SUCCESS) {
       if (error_out)
         *error_out = "cuLaunchKernel(box_blur_v_f32_1) failed: " +
                      cuda->StatusToString(rc);
@@ -1719,7 +1719,7 @@ bool BoxBlurSeparableF32_1(const CudaImage &src, const CudaImage &tmp,
 
 bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
                         const CudaImage &alpha, const CudaImage &out,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1759,7 +1759,7 @@ bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
   if (!CheckSignedPtxPitch(out, "CompositeAlphaU8x3(out)", error_out))
     return false;
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
   KernelFunctions kernels;
@@ -1799,7 +1799,7 @@ bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
 
   const auto rc = f.cuLaunchKernel(kernels.comp_bg, grid_x, grid_y, 1, kBlockX,
                                    kBlockY, 1, 0, stream, args, nullptr);
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(composite_alpha_u8x3_bg) failed: " +
                    cuda->StatusToString(rc);
@@ -1811,7 +1811,7 @@ bool CompositeAlphaU8x3(const CudaImage &fg, const CudaImage &bg,
 bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
                              std::uint8_t bg_r, std::uint8_t bg_g,
                              std::uint8_t bg_b, const CudaImage &out,
-                             studiocast::maxine::CUstream stream,
+                             studiocast::cuda::CUstream stream,
                              std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1848,7 +1848,7 @@ bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
   if (!CheckSignedPtxPitch(out, "CompositeAlphaSolidU8x3(out)", error_out))
     return false;
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
   KernelFunctions kernels;
@@ -1893,7 +1893,7 @@ bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
   const auto rc = f.cuLaunchKernel(kernels.comp_solid, grid_x, grid_y, 1,
                                    kBlockX, kBlockY, 1, 0, stream, args,
                                    nullptr);
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(composite_alpha_u8x3_solid) failed: " +
                    cuda->StatusToString(rc);
@@ -1905,7 +1905,7 @@ bool CompositeAlphaSolidU8x3(const CudaImage &fg, const CudaImage &alpha,
 bool ApplyKeyLightU8x3(const CudaImage &src, const CudaImage &alpha,
                        float target_r, float target_g, float target_b,
                        float intensity01, float direction, const CudaImage &out,
-                       studiocast::maxine::CUstream stream,
+                       studiocast::cuda::CUstream stream,
                        std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -1938,7 +1938,7 @@ bool ApplyKeyLightU8x3(const CudaImage &src, const CudaImage &alpha,
   if (!CheckSignedPtxPitch(out, "ApplyKeyLightU8x3(out)", error_out))
     return false;
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   if (!EnsureCudaReady(&cuda, error_out))
     return false;
   KernelFunctions kernels;
@@ -1985,7 +1985,7 @@ bool ApplyKeyLightU8x3(const CudaImage &src, const CudaImage &alpha,
   const auto rc = f.cuLaunchKernel(kernels.key_light, grid_x, grid_y, 1,
                                    kBlockX, kBlockY, 1, 0, stream, args,
                                    nullptr);
-  if (rc != studiocast::maxine::CUDA_SUCCESS) {
+  if (rc != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out =
           "cuLaunchKernel(key_light_u8x3) failed: " + cuda->StatusToString(rc);

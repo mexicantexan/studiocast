@@ -75,12 +75,15 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 
 ## Repo layout
 
-- [../CMakeLists.txt](../CMakeLists.txt): build graph, options, executable
-  targets, and test targets.
+- [../CMakeLists.txt](../CMakeLists.txt): project setup, options, dependency
+  discovery, and subsystem orchestration. Target declarations live in the
+  local `CMakeLists.txt` files under `src/core`, `src/gui`,
+  `src/daemon`, `src/tools`, `installer`, and `tests`.
 - [../src/core](../src/core): shared non-Qt code built as neutral utility,
-  contract, configuration, IPC, and runtime-loaded CUDA-support targets plus
-  the high-level `studiocast_core` compatibility/orchestration target. Source
-  directories remain organized by subsystem; target ownership is documented in
+  contract, configuration, IPC, model, audio/video support, runtime-loaded
+  CUDA, optional backend, and runtime-composition targets. The high-level
+  `studiocast_core` name remains an interface compatibility aggregate.
+  Source ownership and exact allowed edges are documented in
   [ARCHITECTURE.md](ARCHITECTURE.md).
 - [../src/daemon](../src/daemon): `studiocastd`, the background service that
   owns runtime state and device orchestration.
@@ -474,6 +477,29 @@ config.
 Video code lives mainly under [../src/core/video](../src/core/video), with
 backend-specific code under [../src/core/open_video](../src/core/open_video),
 [../src/core/maxine](../src/core/maxine), and [../src/core/cuda](../src/core/cuda).
+
+The runtime-loaded CUDA Driver API is backend-neutral. Include
+`core/cuda/cuda_driver_api.h` and use `studiocast::cuda` in new code.
+`core/maxine/cuda_driver_api.h` is a compatibility forwarding header retained
+only for the protected camera-pipeline source; other consumers must not use it.
+
+When adding code, link the smallest owning CMake target:
+
+- contracts/config/IPC/utilities: `studiocast_contracts`,
+  `studiocast_config`, `studiocast_ipc`, or `studiocast_util`;
+- CUDA and ONNX support: `studiocast_cuda_support` or
+  `studiocast_onnx_support`;
+- platform support: `studiocast_audio_support`,
+  `studiocast_video_support`, or `studiocast_video_io`;
+- optional backends: `studiocast_maxine_backend`,
+  `studiocast_open_audio_backend`, `studiocast_open_video_backend`, or
+  `studiocast_vulkan_backend`;
+- service composition: `studiocast_audio_runtime`,
+  `studiocast_video_runtime`, and `studiocast_runtime_config`.
+
+Use `studiocast_core` only where compatibility or genuine full-runtime
+aggregation is required. Configure-time assertions reject unreviewed
+StudioCast target edges and duplicate production-source ownership.
 
 Key concepts:
 

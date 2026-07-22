@@ -4,7 +4,7 @@
 #include <string>
 
 #include "core/cuda/cuda_image.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 namespace studiocast::cuda::kernels {
 
@@ -42,7 +42,7 @@ bool IsResizeBilinearAvailable(std::string *error_out);
 //
 // The operation is enqueued on the provided stream and does not synchronize.
 bool ResizeBilinear(const CudaImage &src, const CudaImage &dst,
-                    studiocast::maxine::CUstream stream,
+                    studiocast::cuda::CUstream stream,
                     std::string *error_out);
 
 // Bilinear crop+resize for interleaved RGB/BGR U8 pitched device images.
@@ -51,7 +51,7 @@ bool ResizeBilinear(const CudaImage &src, const CudaImage &dst,
 // enqueued on the provided stream and does not synchronize.
 bool CropResizeBilinear(const CudaImage &src, const CudaImage &dst,
                         float crop_x, float crop_y, float crop_w, float crop_h,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string *error_out);
 
 } // namespace studiocast::cuda::kernels

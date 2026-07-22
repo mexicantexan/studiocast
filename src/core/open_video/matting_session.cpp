@@ -42,7 +42,7 @@ FindMainOnnxFile(const studiocast::open_video::ModelPack &p) {
 } // namespace
 
 struct OpenCudaMattingSession::Impl {
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
   studiocast::open_video::ModelPack pack;
   std::filesystem::path onnx_path;
   Options opts;
@@ -58,7 +58,7 @@ struct OpenCudaMattingSession::Impl {
 
   // The CUDA stream the ORT session was created for (when using
   // user_compute_stream).
-  studiocast::maxine::CUstream ort_stream = nullptr;
+  studiocast::cuda::CUstream ort_stream = nullptr;
 
   bool ort_needs_stream_sync = false;
 
@@ -75,7 +75,7 @@ struct OpenCudaMattingSession::Impl {
   bool ort_latched_failure = false;
   std::string ort_latched_error;
 
-  bool CreateOrtSession(studiocast::maxine::CUstream stream,
+  bool CreateOrtSession(studiocast::cuda::CUstream stream,
                         std::string *error_out) {
     if (error_out)
       error_out->clear();
@@ -256,7 +256,7 @@ struct OpenCudaMattingSession::Impl {
 };
 
 OpenCudaMattingSession::OpenCudaMattingSession(
-    studiocast::maxine::CudaDriverApi *cuda,
+    studiocast::cuda::CudaDriverApi *cuda,
     studiocast::open_video::ModelPack pack, Options opts)
     : impl_(std::make_unique<Impl>()) {
   impl_->cuda = cuda;
@@ -265,7 +265,7 @@ OpenCudaMattingSession::OpenCudaMattingSession(
 }
 
 OpenCudaMattingSession::OpenCudaMattingSession(
-    studiocast::maxine::CudaDriverApi *cuda,
+    studiocast::cuda::CudaDriverApi *cuda,
     studiocast::open_video::ModelPack pack)
     : OpenCudaMattingSession(cuda, std::move(pack), Options{}) {}
 
@@ -422,7 +422,7 @@ bool OpenCudaMattingSession::EnsureInitialized(int frame_w, int frame_h,
 }
 
 bool OpenCudaMattingSession::Run(
-    studiocast::maxine::CUstream stream,
+    studiocast::cuda::CUstream stream,
     const studiocast::cuda::CudaImage &input_rgb_gpu,
     studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {
   if (error_out)
