@@ -10,6 +10,7 @@ namespace studiocast::maxine {
 using CUctx_st = studiocast::cuda::CUctx_st;
 using CUmod_st = studiocast::cuda::CUmod_st;
 using CUfunc_st = studiocast::cuda::CUfunc_st;
+using CUstream_st = studiocast::cuda::CUstream_st;
 using CUarray_st = studiocast::cuda::CUarray_st;
 
 using CUcontext = studiocast::cuda::CUcontext;
