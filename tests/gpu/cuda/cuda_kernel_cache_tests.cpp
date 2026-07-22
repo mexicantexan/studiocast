@@ -127,15 +127,15 @@ bool TestCudaContextClassifierPrefersCurrentContext() {
   using studiocast::cuda::kernels::detail::ClassifyCurrentContext;
   using studiocast::cuda::kernels::detail::CurrentContextState;
 
-  const auto fake_context = reinterpret_cast<studiocast::maxine::CUcontext>(
+  const auto fake_context = reinterpret_cast<studiocast::cuda::CUcontext>(
       static_cast<std::uintptr_t>(0x1));
 
   bool ok = true;
-  ok &= Require(ClassifyCurrentContext(studiocast::maxine::CUDA_SUCCESS,
+  ok &= Require(ClassifyCurrentContext(studiocast::cuda::CUDA_SUCCESS,
                                        fake_context) ==
                     CurrentContextState::current,
                 "CUDA context classifier should preserve a current context");
-  ok &= Require(ClassifyCurrentContext(studiocast::maxine::CUDA_SUCCESS,
+  ok &= Require(ClassifyCurrentContext(studiocast::cuda::CUDA_SUCCESS,
                                        nullptr) == CurrentContextState::none,
                 "CUDA context classifier should distinguish no current context");
   ok &= Require(ClassifyCurrentContext(/*result=*/1, fake_context) ==

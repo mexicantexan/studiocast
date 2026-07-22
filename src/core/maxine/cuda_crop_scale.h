@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/maxine/nvcv_types.h"
 
 namespace studiocast::maxine {
@@ -28,7 +28,7 @@ inline std::uint8_t RoundClampBgrResizeBilinearU8(float v) {
 // improved later (e.g. bilinear, lanczos, etc.).
 class CudaBgrCropScale {
 public:
-  bool Initialize(CudaDriverApi *cuda, std::string *error_out);
+  bool Initialize(studiocast::cuda::CudaDriverApi *cuda, std::string *error_out);
 
   // Crop rectangle is expressed in source pixel coordinates.
   // Destination image must already be allocated and be BGR/U8/GPU.
@@ -39,9 +39,9 @@ public:
 private:
   bool EnsureKernelLoaded(std::string *error_out);
 
-  CudaDriverApi *cuda_ = nullptr; // non-owning
-  CUmodule module_ = nullptr;
-  CUfunction fn_ = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda_ = nullptr; // non-owning
+  studiocast::cuda::CUmodule module_ = nullptr;
+  studiocast::cuda::CUfunction fn_ = nullptr;
   bool loaded_ = false;
 };
 
@@ -50,7 +50,7 @@ private:
 // The kernel uses image pitch (bytes per row) from the NvCVImage plane.
 class CudaBgrResizeBilinear {
 public:
-  bool Initialize(CudaDriverApi *cuda, std::string *error_out);
+  bool Initialize(studiocast::cuda::CudaDriverApi *cuda, std::string *error_out);
 
   // Source/destination images must already be allocated and be BGR/U8/GPU.
   bool Resize(const NvCVImage &src_bgr_gpu, NvCVImage *dst_bgr_gpu,
@@ -59,9 +59,9 @@ public:
 private:
   bool EnsureKernelLoaded(std::string *error_out);
 
-  CudaDriverApi *cuda_ = nullptr; // non-owning
-  CUmodule module_ = nullptr;
-  CUfunction fn_ = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda_ = nullptr; // non-owning
+  studiocast::cuda::CUmodule module_ = nullptr;
+  studiocast::cuda::CUfunction fn_ = nullptr;
   bool loaded_ = false;
 };
 

@@ -173,7 +173,7 @@ extern "C" __global__ void preprocess_to_nchw_f32(
 bool PreprocessToTensor(const CudaImage& src,
                         const CudaTensor& dst,
                         const ModelPreprocessSpec& spec,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string* error_out) {
   if (error_out) error_out->clear();
   if (!src.Valid() || !dst.Valid()) {

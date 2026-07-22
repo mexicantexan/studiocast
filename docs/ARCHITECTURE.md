@@ -23,15 +23,36 @@ Implemented components include:
 
 ## CMake dependency layers
 
-Production code is split at neutral, reusable boundaries before the high-level
-runtime composition layer:
+Production code is split at neutral, reusable boundaries before backend and
+runtime composition layers:
 
 ```text
-studiocast_contracts   ---> studiocast_util
-studiocast_config      ---> studiocast_contracts, studiocast_util
-studiocast_ipc         ---> studiocast_util
-studiocast_cuda_support ---> studiocast_util
-studiocast_core        ---> contracts, config, ipc, cuda_support, util
+neutral/support:
+  contracts ---> util       config ---> contracts, util
+  ipc -------> util         cuda_support ---> util
+  probe_support ---> config, util
+  model_support ---> util   audio_support
+
+platform:
+  video_support ---> contracts, util
+  video_io ------> contracts, video_support, util
+  onnx_support --> ONNX Runtime when enabled
+
+backends:
+  maxine_backend -----> audio_support, config, contracts, cuda_support,
+                        probe_support, video_support, util
+  open_audio_backend -> audio_support, contracts, model_support,
+                        onnx_support, util
+  open_video_backend -> contracts, cuda_support, model_support,
+                        onnx_support, video_support, util
+  vulkan_backend -----> contracts, model_support, video_support, util
+
+runtime:
+  audio_runtime ---> audio_support, config, contracts, Maxine, Open Audio
+  video_runtime ---> contracts, CUDA, Maxine, Open Video, Vulkan,
+                     video I/O and support
+  runtime_config --> audio_runtime, config, video_runtime
+  studiocast_core --> runtime_config, ipc, probe_support
 ```
 
 Each arrow points from a dependent to its dependency.
@@ -44,17 +65,39 @@ Each arrow points from a dependent to its dependency.
   validation. Runtime service adapters remain in the high-level core.
 - `studiocast_ipc` owns Unix-socket protocol mechanics and has std-only public
   headers.
-- `studiocast_cuda_support` owns runtime-loaded CUDA driver wrappers, buffer
-  value types, and embedded kernel contracts without a CUDA toolkit dependency.
-- `studiocast_core` remains the compatibility and orchestration target. It
-  composes the neutral layers with backend implementations and optional system
-  dependencies.
+- `studiocast_audio_support` owns dependency-free DSP shared by audio
+  backends, while `studiocast_audio_runtime` owns Pulse/device/service
+  composition.
+- `studiocast_video_support` owns conversion and CPU effect primitives;
+  `studiocast_video_io` owns capture, decoding, v4l2loopback, and writer
+  support; and `studiocast_video_runtime` owns the existing camera pipeline
+  and virtual-camera composition.
+- `studiocast_cuda_support` owns the runtime-loaded CUDA driver wrapper,
+  buffers, and embedded kernels without a CUDA toolkit dependency. Its
+  canonical API is `core/cuda/cuda_driver_api.h` in namespace
+  `studiocast::cuda`.
+- `studiocast_model_support` owns the Open Video model catalog and the shared
+  model-integrity implementation consumed by both open backends.
+- `studiocast_onnx_support`, `studiocast_maxine_backend`,
+  `studiocast_open_audio_backend`, `studiocast_open_video_backend`, and
+  `studiocast_vulkan_backend` isolate optional runtime ownership.
+- `studiocast_runtime_config` adapts persisted configuration to the audio and
+  video services.
+- `studiocast_core` remains an interface compatibility aggregate. New
+  executables and tests should link the narrowest owning targets instead.
 
-CMake validates the allowed direct StudioCast target edges, rejects optional
+The historical `core/maxine/cuda_driver_api.h` path remains a forwarding
+alias surface only because the protected camera-pipeline source still includes
+that path. All other consumers use the neutral CUDA header and namespace; new
+code must not add dependencies on the forwarding path.
+
+CMake validates every allowed direct StudioCast target edge, rejects optional
 SDK or GUI dependencies on neutral targets, and verifies unique ownership of
-every configured production translation unit. New backends should link down to
-the smallest neutral layer that owns their shared concepts; sibling backends
-must not link to one another for shared types or utilities.
+every configured production translation unit. Because every production edge
+is asserted exactly, an unreviewed dependency or cycle fails during configure.
+New backends should link down to the smallest neutral layer that owns their
+shared concepts; sibling backends must not link to one another for shared types
+or utilities.
 
 ## Canonical effect model: `BroadcastCameraEffects`
 

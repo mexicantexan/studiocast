@@ -1,6 +1,6 @@
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 #include <cstddef>
 #include <iostream>
@@ -42,7 +42,7 @@ bool Contains(const std::string &s, const std::string &needle) {
 }
 
 bool TestDeviceOrdinalConfiguration() {
-  studiocast::maxine::CudaDriverApi cuda;
+  studiocast::cuda::CudaDriverApi cuda;
   std::string err;
 
   bool ok = true;
@@ -65,12 +65,12 @@ bool TestDeviceOrdinalConfiguration() {
                 cuda.device_ordinal(), 2) &&
        ok;
 
-  studiocast::maxine::CudaDriverApi moved(std::move(cuda));
+  studiocast::cuda::CudaDriverApi moved(std::move(cuda));
   ok = ExpectEq("move constructor preserves CUDA device ordinal",
                 moved.device_ordinal(), 2) &&
        ok;
 
-  studiocast::maxine::CudaDriverApi assigned;
+  studiocast::cuda::CudaDriverApi assigned;
   ok = Expect(assigned.SetDeviceOrdinal(1, &err),
               "pre-assignment SetDeviceOrdinal should succeed") &&
        ok;

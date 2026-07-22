@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/maxine/ar_api.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/maxine/nvcv_api.h"
 #include "core/maxine/resident_frame_section.h"
 #include "core/maxine/vfx_api.h"
@@ -112,7 +112,7 @@ struct ProductionResidentRuntime {
   vfx::VfxApi *vfx = nullptr;
   NvcvApi *nvcv = nullptr;
   ar::ArApi *ar = nullptr;
-  CudaDriverApi *cuda = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda = nullptr;
 };
 
 struct HostBgrOutputView {
@@ -133,7 +133,7 @@ struct HostBgrOutputView {
 class IResidentDeviceOps {
 public:
   virtual ~IResidentDeviceOps() = default;
-  virtual bool Initialize(CudaDriverApi *cuda, uintptr_t runtime_identity,
+  virtual bool Initialize(studiocast::cuda::CudaDriverApi *cuda, uintptr_t runtime_identity,
                           uint32_t required_ops_mask, std::string *error) = 0;
   virtual bool CropScale(const NvCVImage &source, NvCVImage *destination,
                          float crop_x, float crop_y, float crop_width,

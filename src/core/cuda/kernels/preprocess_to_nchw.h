@@ -4,7 +4,7 @@
 
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 namespace studiocast::cuda::kernels {
 
@@ -35,7 +35,7 @@ struct ModelPreprocessSpec {
 // The operation is enqueued on the provided stream and does not synchronize.
 bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
                         const ModelPreprocessSpec &spec,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string *error_out);
 
 } // namespace studiocast::cuda::kernels

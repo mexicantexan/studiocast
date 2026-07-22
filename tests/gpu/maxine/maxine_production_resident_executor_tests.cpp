@@ -51,7 +51,7 @@ uint32_t Mask(std::initializer_list<ResidentStageKind> stages) {
 
 class FakeDeviceOps final : public IResidentDeviceOps {
 public:
-  bool Initialize(CudaDriverApi *, uintptr_t runtime_identity,
+  bool Initialize(studiocast::cuda::CudaDriverApi *, uintptr_t runtime_identity,
                   uint32_t required_ops_mask, std::string *) override {
     ++initialize_calls;
     if (last_runtime_identity != 0 && last_runtime_identity != runtime_identity)

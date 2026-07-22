@@ -134,7 +134,7 @@ bool SameEffectiveSetup(const ProductionResidentSetup &a,
 
 class DefaultResidentDeviceOps final : public IResidentDeviceOps {
 public:
-  bool Initialize(CudaDriverApi *cuda, uintptr_t runtime_identity,
+  bool Initialize(studiocast::cuda::CudaDriverApi *cuda, uintptr_t runtime_identity,
                   uint32_t required_ops_mask, std::string *error) override {
     if (runtime_identity_ != 0 && runtime_identity_ != runtime_identity) {
       crop_ = {};
@@ -187,7 +187,7 @@ public:
   }
 
 private:
-  CudaDriverApi *cuda_ = nullptr;
+  studiocast::cuda::CudaDriverApi *cuda_ = nullptr;
   uintptr_t runtime_identity_ = 0;
   CudaBgrCropScale crop_{};
   CudaBgrResizeBilinear resize_{};

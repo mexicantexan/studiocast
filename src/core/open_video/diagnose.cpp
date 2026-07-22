@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <set>
 
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/onnx/ort_session.h"
 #include "core/open_video/model_pack_registry.h"
 #include "core/util/xdg.h"
@@ -184,7 +184,7 @@ OpenCudaDiagnostics DiagnoseOpenCudaDefault() {
   bool cuda_ok = false;
   std::string cuda_err;
   {
-    studiocast::maxine::CudaDriverApi cuda;
+    studiocast::cuda::CudaDriverApi cuda;
     std::string e;
     if (!cuda.Initialize(&e)) {
       cuda_err = e.empty() ? std::string("CUDA driver API not available.") : e;
@@ -194,7 +194,7 @@ OpenCudaDiagnostics DiagnoseOpenCudaDefault() {
       if (cuda.f().cuDriverGetVersion) {
         int version = 0;
         const auto st = cuda.f().cuDriverGetVersion(&version);
-        if (st == studiocast::maxine::CUDA_SUCCESS) {
+        if (st == studiocast::cuda::CUDA_SUCCESS) {
           od.cuda_driver_version = version;
         } else if (od.cuda_driver_error.empty()) {
           od.cuda_driver_error =
@@ -205,7 +205,7 @@ OpenCudaDiagnostics DiagnoseOpenCudaDefault() {
       if (cuda.f().cuDeviceGetCount) {
         int count = 0;
         const auto st = cuda.f().cuDeviceGetCount(&count);
-        if (st == studiocast::maxine::CUDA_SUCCESS) {
+        if (st == studiocast::cuda::CUDA_SUCCESS) {
           od.cuda_device_count = count;
         } else if (od.cuda_driver_error.empty()) {
           od.cuda_driver_error =

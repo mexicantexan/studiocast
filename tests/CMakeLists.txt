@@ -3,7 +3,8 @@ if (BUILD_TESTING AND PULSE_SIMPLE_FOUND)
             ${PROJECT_SOURCE_DIR}/tests/integration/audio/audio_service_tests.cpp
     )
 
-    target_link_libraries(studiocast-audio-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-audio-tests PRIVATE
+            studiocast_audio_runtime)
 
     target_include_directories(studiocast-audio-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -54,7 +55,7 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_effect_binding_tests.cpp
     )
     target_link_libraries(studiocast-maxine-effect-binding-tests PRIVATE
-            studiocast_core
+            studiocast_maxine_backend
             studiocast-maxine-effect-fake-sdk
     )
     target_include_directories(studiocast-maxine-effect-binding-tests PRIVATE
@@ -86,7 +87,7 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_production_resident_executor_tests.cpp
     )
     target_link_libraries(studiocast-maxine-production-resident-tests PRIVATE
-            studiocast_core
+            studiocast_maxine_backend
             studiocast-maxine-effect-fake-sdk
     )
     target_include_directories(studiocast-maxine-production-resident-tests PRIVATE
@@ -119,7 +120,7 @@ if (BUILD_TESTING)
                 ${PROJECT_SOURCE_DIR}/src/tools/studiocast_maxine_production_resident_fake_bench_main.cpp
         )
         target_link_libraries(studiocast-maxine-production-resident-fake-bench PRIVATE
-                studiocast_core
+                studiocast_maxine_backend
                 studiocast-maxine-effect-fake-sdk
         )
         target_include_directories(studiocast-maxine-production-resident-fake-bench PRIVATE
@@ -167,7 +168,8 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_paths_tests.cpp
     )
 
-    target_link_libraries(studiocast-maxine-paths-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-maxine-paths-tests PRIVATE
+            studiocast_maxine_backend)
 
     target_include_directories(studiocast-maxine-paths-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -196,7 +198,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-nvcv-validation-tests PRIVATE
-            studiocast_core
+            studiocast_maxine_backend
     )
 
     target_include_directories(studiocast-nvcv-validation-tests PRIVATE
@@ -223,7 +225,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-maxine-resident-frame-tests PRIVATE
-            studiocast_core
+            studiocast_maxine_backend
     )
 
     target_include_directories(studiocast-maxine-resident-frame-tests PRIVATE
@@ -250,7 +252,9 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/unit/model/model_pack_registry_tests.cpp
     )
 
-    target_link_libraries(studiocast-model-registry-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-model-registry-tests PRIVATE
+            studiocast_open_audio_backend
+            studiocast_open_video_backend)
 
     target_include_directories(studiocast-model-registry-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -278,7 +282,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-open-audio-prepared-binding-tests PRIVATE
-            studiocast_core
+            studiocast_open_audio_backend
     )
 
     target_include_directories(studiocast-open-audio-prepared-binding-tests PRIVATE
@@ -366,7 +370,11 @@ if (BUILD_TESTING)
 
     target_link_libraries(studiocast-gui-status-tests PRIVATE
             Qt${QT_VERSION_MAJOR}::Widgets
-            studiocast_core
+            studiocast_audio_runtime
+            studiocast_contracts
+            studiocast_ipc
+            studiocast_video_io
+            studiocast_video_support
     )
 
     target_include_directories(studiocast-gui-status-tests PRIVATE
@@ -414,7 +422,9 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/integration/core/daemon_status_tests.cpp
     )
 
-    target_link_libraries(studiocast-daemon-status-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-daemon-status-tests PRIVATE
+            studiocast_ipc
+            studiocast_runtime_config)
 
     target_include_directories(studiocast-daemon-status-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -494,6 +504,15 @@ if (BUILD_TESTING)
             system installer core)
 
     if (Python3_Interpreter_FOUND)
+        add_test(NAME studiocast-documentation-validation-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/docs/validate_documentation.py"
+                        --source-root "${PROJECT_SOURCE_DIR}")
+        set_tests_properties(studiocast-documentation-validation-tests PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+        studiocast_set_test_labels(studiocast-documentation-validation-tests
+                unit core)
+
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
@@ -634,7 +653,8 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/unit/video/yuyv_passthrough_tests.cpp
     )
 
-    target_link_libraries(studiocast-video-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-video-tests PRIVATE
+            studiocast_video_runtime)
 
     target_include_directories(studiocast-video-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -659,7 +679,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-v4l2-writer-transport-tests PRIVATE
-            studiocast_core
+            studiocast_video_io
     )
 
     target_include_directories(studiocast-v4l2-writer-transport-tests PRIVATE
@@ -686,7 +706,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-open-video-scratch-tests PRIVATE
-            studiocast_core)
+            studiocast_open_video_backend)
 
     target_include_directories(studiocast-open-video-scratch-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -712,7 +732,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-video-frame-plan-tests PRIVATE
-            studiocast_core)
+            studiocast_video_runtime)
 
     target_include_directories(studiocast-video-frame-plan-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
@@ -790,7 +810,7 @@ if (BUILD_TESTING)
         )
 
         target_link_libraries(studiocast-vulkan-kernel-tests PRIVATE
-                studiocast_core
+                studiocast_vulkan_backend
         )
 
         target_include_directories(studiocast-vulkan-kernel-tests PRIVATE
@@ -817,7 +837,7 @@ if (BUILD_TESTING)
         )
 
         target_link_libraries(studiocast-vulkan-final-stage-integration-tests PRIVATE
-                studiocast_core
+                studiocast_vulkan_backend
         )
 
         target_include_directories(studiocast-vulkan-final-stage-integration-tests PRIVATE
@@ -844,7 +864,7 @@ if (BUILD_TESTING)
         )
 
         target_link_libraries(studiocast-vulkan-matting-runtime-tests PRIVATE
-                studiocast_core
+                studiocast_vulkan_backend
         )
 
         target_include_directories(studiocast-vulkan-matting-runtime-tests PRIVATE
@@ -871,7 +891,8 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/integration/video/v4l2loopback_diagnostics_tests.cpp
     )
 
-    target_link_libraries(studiocast-v4l2loopback-diagnostics-tests PRIVATE studiocast_core)
+    target_link_libraries(studiocast-v4l2loopback-diagnostics-tests PRIVATE
+            studiocast_video_io)
 
     target_include_directories(studiocast-v4l2loopback-diagnostics-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"

@@ -1,5 +1,5 @@
 #include "core/cuda/cuda_image.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 #include <algorithm>
 #include <chrono>
@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  studiocast::maxine::CudaDriverApi cuda;
+  studiocast::cuda::CudaDriverApi cuda;
   std::string err;
   if (!cuda.Initialize(&err)) {
     if (opts.csv) {
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
     return 77;
   }
 
-  studiocast::maxine::CUstream stream = nullptr;
+  studiocast::cuda::CUstream stream = nullptr;
   if (!cuda.CreateStream(&stream, &err)) {
     std::cerr << "ERROR: CreateStream failed: " << err << "\n";
     return 1;

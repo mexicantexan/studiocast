@@ -54,7 +54,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
 
 class FakeDeviceOps final : public IResidentDeviceOps {
 public:
-  bool Initialize(CudaDriverApi *, uintptr_t, uint32_t,
+  bool Initialize(studiocast::cuda::CudaDriverApi *, uintptr_t, uint32_t,
                   std::string *) override {
     return true;
   }

@@ -5,7 +5,7 @@
 
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 #include "core/open_video/model_pack_registry.h"
 
 namespace studiocast::open_cuda {
@@ -22,9 +22,9 @@ public:
     bool enable_tensorrt = false;
   };
 
-  OpenCudaMattingSession(studiocast::maxine::CudaDriverApi *cuda,
+  OpenCudaMattingSession(studiocast::cuda::CudaDriverApi *cuda,
                          studiocast::open_video::ModelPack pack);
-  OpenCudaMattingSession(studiocast::maxine::CudaDriverApi *cuda,
+  OpenCudaMattingSession(studiocast::cuda::CudaDriverApi *cuda,
                          studiocast::open_video::ModelPack pack, Options opts);
   ~OpenCudaMattingSession();
 
@@ -44,7 +44,7 @@ public:
   // The operation is enqueued on the given stream. If the ONNX Runtime CUDA EP
   // cannot be configured to use the provided stream, the function may
   // synchronize the stream for correctness.
-  bool Run(studiocast::maxine::CUstream stream,
+  bool Run(studiocast::cuda::CUstream stream,
            const studiocast::cuda::CudaImage &input_rgb_gpu,
            studiocast::cuda::CudaTensor *output_alpha_gpu,
            std::string *error_out);

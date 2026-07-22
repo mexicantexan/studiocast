@@ -33,7 +33,11 @@ add_executable(studiocast
 
 target_link_libraries(studiocast PRIVATE
         Qt${QT_VERSION_MAJOR}::Widgets
-        studiocast_core
+        studiocast_audio_runtime
+        studiocast_contracts
+        studiocast_ipc
+        studiocast_video_io
+        studiocast_video_support
 )
 
 target_include_directories(studiocast PRIVATE
