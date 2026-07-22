@@ -1,5 +1,10 @@
 # V4L2 Writer Latency Measurements
 
+- Status: Historical measurement record
+- Applies To: The baseline and candidate identified below
+- Audience: Video runtime and performance maintainers
+- Last Verified: 2026-07-22 for archival classification
+
 ## Comparison
 
 - Audit comparison baseline: `d2a6f112811297243043f633404fede820f4073b`

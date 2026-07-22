@@ -1,5 +1,10 @@
 # Open Video shared inference contract
 
+- Status: Design note with an implemented cache/worker contract
+- Applies To: Open Video shared analysis and latest-frame scheduling primitives
+- Audience: Video runtime and model-backend maintainers
+- Last Verified: 2026-07-22
+
 StudioCast’s open-source video effects can require **multiple ML inferences per frame**:
 
 - segmentation / matting (for virtual background, auto-frame fallback)

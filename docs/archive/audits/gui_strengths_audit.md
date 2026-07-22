@@ -1,5 +1,10 @@
 # StudioCast GUI Strengths Audit
 
+- Status: Archived historical UX audit
+- Applies To: GUI and screenshots reviewed on 2026-07-03
+- Audience: Designers and maintainers investigating GUI history
+- Archived: 2026-07-22
+
 Date: 2026-07-03
 
 Purpose: identify what is working well in the current StudioCast GUI and what
@@ -8,17 +13,11 @@ report focuses on functional clarity, interaction patterns, affordances, safety
 behaviors, and information architecture choices that support users. It does not
 argue for preserving the current visual layout.
 
-Primary source of truth:
-
-- `docs/GUI_FUNCTIONALITY_AUDIT.md`
-
-Context and visual evidence:
-
-- `README.md`
-- `Screenshot from 2026-07-03 09-59-53.png` - Microphone page
-- `Screenshot from 2026-07-03 10-00-06.png` - Speakers page
-- `Screenshot from 2026-07-03 10-01-49.png` - Camera page, top
-- `Screenshot from 2026-07-03 10-02-00.png` - Camera page, lower portion
+Historical evidence note: the predecessor functionality audit and four
+2026-07-03 screenshots cited by the original report were not retained in this
+repository. The observations below are preserved as historical context, not as
+current product requirements. Current GUI authority is `docs/GUI_POLICY.md`;
+current manual coverage is `docs/MANUAL_TESTING.md`.
 
 ## 1. Executive Summary
 
@@ -75,7 +74,7 @@ Preserve, adapt, or hide:
 - Adapt presentation from raw text-first diagnostics into concise health states
   with expandable details.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - `GET_STATUS` is used by audio and video pages.
 - Camera polls every 500 ms; Microphone and Speakers poll every 1500 ms.
@@ -105,7 +104,7 @@ Preserve, adapt, or hide:
 - Adapt. The exact tab layout does not need to remain, but the three device
   concepts should remain first-class and easy to distinguish.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Main window has three pages: Microphone, Speakers, Camera.
 - README positions StudioCast around a virtual camera, virtual microphone, and
@@ -134,7 +133,7 @@ Preserve, adapt, or hide:
 - Preserve directly, but adapt the copy into more polished, contextual guidance.
 - Keep exact virtual-device names visible wherever they are needed.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Microphone and Speakers pages include pass-through/effects tips.
 - README instructs users to select StudioCast virtual camera, microphone, and
@@ -161,7 +160,7 @@ Preserve, adapt, or hide:
 - Preserve conceptually and make the distinction more visually legible.
 - Do not collapse preference and active runtime state into one label.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Microphone and Speakers support backend preference choices: Auto, Maxine, Open
   Source, Off.
@@ -191,7 +190,7 @@ Preserve, adapt, or hide:
 - Adapt language so the default message is plain-language and the technical
   daemon text is available as details.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Audio pages display daemon notes/fallback notes and unavailable errors.
 - Camera displays engine-blocking warnings and backend notes.
@@ -223,7 +222,7 @@ Preserve, adapt, or hide:
   available for support and power users.
 - Keep v4l2loopback setup guidance accessible, likely under setup/support UI.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Audio source/sink lists use `pactl`.
 - Unsafe input and speaker candidates are filtered with audio device safety
@@ -253,7 +252,7 @@ Preserve, adapt, or hide:
 - Preserve directly and make it a first-class camera test/verification affordance.
 - Keep the preview-consumer consequence visible near the preview control.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - `VideoPreviewWidget` displays status messages or rendered frames.
 - Preview starts only when daemon video is enabled.
@@ -284,7 +283,7 @@ Preserve, adapt, or hide:
 
 - Preserve directly as a normal status concept, not only as raw diagnostics.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - README states heavy processing should avoid running when no app consumes
   virtual devices.
@@ -315,7 +314,7 @@ Preserve, adapt, or hide:
 - Adapt the layout and visual controls to reduce density and group effects by
   user intent, while retaining clear current values and off states.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Microphone effects: Off, Noise removal, Room echo removal, Noise + echo
   combined, Studio voice, plus strength.
@@ -347,7 +346,7 @@ Preserve, adapt, or hide:
 - If changed, the new behavior must be explicit because it alters a core
   interaction contract.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Audio controls send `SET_AUDIO_CONFIG`.
 - Camera effect controls send `SET_VIDEO_EFFECTS_JSON`.
@@ -376,7 +375,7 @@ Preserve, adapt, or hide:
 - The new UI can change the shape of the controls, but should keep the same
   operational safety.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Start sends `SET_VIDEO_CONFIG`, `SET_VIDEO_EFFECTS_JSON`, and then
   `SET_ENABLED enabled=1`.
@@ -407,7 +406,7 @@ Preserve, adapt, or hide:
 - Adapt detailed model selection and install hints into a cleaner model/backend
   management or diagnostics surface.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Audio model selectors include `<auto>`, installed models, unavailable states,
   and `<missing: ...>` configured IDs.
@@ -440,7 +439,7 @@ Preserve, adapt, or hide:
 - Hide or de-emphasize these controls under Advanced/System/Device Management
   for a wide-audience UI, while keeping status and repair paths easy to find.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Virtual mic create/destroy is daemon-managed via `SET_AUDIO_CONFIG`.
 - Speakers can enable the virtual speakers device, stop routing, and destroy the
@@ -471,7 +470,7 @@ Preserve, adapt, or hide:
 - Do not make raw JSON/status the default experience, but keep it copyable and
   complete.
 
-Relevant functionality from `GUI_FUNCTIONALITY_AUDIT.md`:
+Historical functionality notes retained by this audit:
 
 - Microphone status combines local audio status with daemon audio status.
 - Speaker status includes presence, consumers, routing, target sink, pipeline

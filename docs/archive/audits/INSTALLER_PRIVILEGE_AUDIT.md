@@ -1,7 +1,17 @@
 # Installer Privilege and AppImage Trust-Boundary Audit
 
+- Status: Archived historical audit; active boundary is documented separately
+- Applies To: Baseline `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
+- Audience: Security reviewers and maintainers investigating installer history
+- Archived: 2026-07-22
+
 Date: 2026-07-12
 Audited baseline: `5f3bc485a4dbb2d3a463945591f910fbab53c9a6`
+
+This document records findings at its audited baseline. It is not a description
+of current implementation state. The active packaging and privilege boundary is
+`docs/SYSTEM_HELPER_PACKAGING.md`, together with the root policies and contracts
+listed by `docs/README.md`.
 
 ## Outcome
 

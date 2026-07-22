@@ -4,8 +4,8 @@
 `studiocast-system-helper` OS package. It is not installed from, or trusted from,
 the AppImage, selected source tree, archive, build cache, or user data roots.
 
-The helper accepts only `--json-stdin` and the five versioned operations frozen
-in `docs/INSTALLER_PRIVILEGE_AUDIT.md`. Requests are bounded and fully validated
+The helper accepts only `--json-stdin` and the five versioned operations defined
+by `docs/SYSTEM_HELPER_PACKAGING.md`. Requests are bounded and fully validated
 before the first operation. Unknown schema versions, operations, and fields are
 rejected. Commands use fixed absolute argument arrays and a fixed environment;
 there is no shell, arbitrary executable, caller path, caller content, or sudo

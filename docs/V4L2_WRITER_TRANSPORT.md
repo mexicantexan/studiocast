@@ -1,5 +1,10 @@
 # V4L2 Writer Transport Contract
 
+- Status: Active latency-sensitive transport contract
+- Applies To: Camera pipeline, test-pattern feed, and video tool V4L2 output
+- Audience: Video runtime, performance, and test maintainers
+- Last Verified: 2026-07-22
+
 This contract governs the latency-sensitive V4L2 output boundary used by the
 camera pipeline, test-pattern feed, and video tool. It supplements
 `LATENCY_POLICY.md` and `PIPELINE_POLICY.md`; those policies remain

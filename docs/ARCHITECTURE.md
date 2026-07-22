@@ -1,14 +1,25 @@
-# Architecture (draft)
+# StudioCast Architecture
 
-Phase 0 is mostly scaffolding, but there are already some hard “single source of truth” decisions that new
-contributors should follow.
+- Status: Active architecture contract
+- Applies To: StudioCast v0.2.9 and the current source tree
+- Audience: Contributors and maintainers
+- Last Verified: 2026-07-22
 
-Planned components:
-- GUI (Qt)
-- Audio Service (PipeWire graph node)
-- Video Service (V4L2 input + v4l2loopback output)
-- Effects Engine abstraction layer (multiple GPU engines: Maxine + Open CUDA)
-- SDK Manager (downloads/installs user-obtained Maxine assets)
+StudioCast is a daemon-owned Linux audio/video processing application. The Qt
+GUI and command-line clients control `studiocastd`; they do not own production
+pipelines. The daemon coordinates V4L2 camera capture and v4l2loopback output,
+Pulse-based virtual audio services, persisted configuration, optional effect
+backends, model discovery, and status reporting.
+
+Implemented components include:
+
+- A Qt controller GUI and standalone Qt installer wizard.
+- `studiocastd`, which owns the production video and audio services.
+- Neutral contracts, configuration, IPC, utilities, and runtime-loaded CUDA
+  support beneath the runtime composition layer.
+- Optional Maxine, Open CUDA/Open Video, Open Audio, and Open Vulkan backends.
+- Scriptable installer, trusted system-helper protocol, model transactions, and
+  signed release-channel support.
 
 ## CMake dependency layers
 
@@ -91,7 +102,7 @@ Accepted JSON values:
 Installation docs:
 
 - Maxine: `docs/maxine_install.md`
-- Open CUDA: `docs/open_cuda_install.md`
+- Open CUDA: `docs/open_source_video_models_install.md`
 
 ## Availability: daemon diagnostics are authoritative
 

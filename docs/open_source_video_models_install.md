@@ -81,7 +81,7 @@ To print the authoritative path on your machine:
 
 For a general overview of the open-source video model pack taxonomy (face detection, eye contact, etc.), see:
 
-- `docs/open_video_model_packs.md`
+- `docs/how_to_add_your_own_model.md`
 
 For sourcing/conversion/hosting of the actual model binaries (ONNX / dlib files), see:
 
