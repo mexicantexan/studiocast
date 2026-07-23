@@ -1,6 +1,7 @@
 #include "core/cuda/kernels/open_cuda_vb_kernels.h"
 
 #include "core/cuda/kernels/cuda_driver_cache.h"
+#include "core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.h"
 #include "core/cuda/kernels/ptx_pitch_contract.h"
 
 #include <algorithm>
@@ -1225,6 +1226,8 @@ struct KernelState {
   studiocast::cuda::CUcontext loaded_ctx = nullptr;
   studiocast::cuda::CUmodule module = nullptr;
   KernelFunctions functions;
+  studiocast::cuda::CudaDriverApi *owner = nullptr;
+  studiocast::cuda::CudaContextIdentity context_identity{};
 };
 
 KernelState &k() {
@@ -1286,7 +1289,10 @@ std::string OpenCudaVbPtxCompat82() {
 
 bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
                          KernelFunctions *out,
-                         std::string *error_out) {
+                         std::string *error_out,
+                         const studiocast::cuda::CudaContextIdentity
+                             *expected_context = nullptr,
+                         PreparedOpenCudaVbKernelStatus *setup_status = nullptr) {
   if (error_out)
     error_out->clear();
   if (out)
@@ -1296,8 +1302,24 @@ bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
   if (!detail::GetCurrentContext(cuda, &cur, error_out))
     return false;
 
+  const auto *current_identity = cuda ? cuda->context_identity() : nullptr;
+  if (expected_context &&
+      (!current_identity || !current_identity->Valid() ||
+       *current_identity != *expected_context)) {
+    if (error_out) {
+      *error_out =
+          "Open CUDA VB kernel setup context generation is foreign or stale.";
+    }
+    if (setup_status)
+      *setup_status =
+          PreparedOpenCudaVbKernelStatus::stale_context_generation;
+    return false;
+  }
+
   KernelState &st = k();
-  if (st.loaded && st.loaded_ctx == cur) {
+  if (st.loaded && st.loaded_ctx == cur && st.owner == cuda &&
+      (!expected_context ||
+       st.context_identity == *expected_context)) {
     if (out)
       *out = st.functions;
     return true;
@@ -1332,6 +1354,8 @@ bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
     }
   }
   if (rc != studiocast::cuda::CUDA_SUCCESS) {
+    if (setup_status)
+      *setup_status = PreparedOpenCudaVbKernelStatus::module_load_failed;
     if (error_out) {
       if (error_out->empty()) {
         *error_out = "cuModuleLoadData(open_cuda_vb_kernels) failed: " +
@@ -1348,6 +1372,10 @@ bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
     const studiocast::cuda::CUresult st_rc =
         f.cuModuleGetFunction(fn_out, module, name);
     if (st_rc != studiocast::cuda::CUDA_SUCCESS) {
+      if (setup_status) {
+        *setup_status =
+            PreparedOpenCudaVbKernelStatus::function_resolution_failed;
+      }
       if (error_out)
         *error_out = std::string("cuModuleGetFunction(") + name +
                      ") failed: " + cuda->StatusToString(st_rc);
@@ -1376,9 +1404,15 @@ bool EnsureKernelsLoaded(studiocast::cuda::CudaDriverApi *cuda,
   st.module = module;
   st.functions = functions;
   st.loaded_ctx = cur;
+  st.owner = cuda;
+  st.context_identity =
+      current_identity ? *current_identity
+                       : studiocast::cuda::CudaContextIdentity{};
   st.loaded = true;
   if (out)
     *out = st.functions;
+  if (setup_status)
+    *setup_status = PreparedOpenCudaVbKernelStatus::ready;
   return true;
 }
 
@@ -1392,6 +1426,74 @@ constexpr unsigned int kBlockX = 16;
 constexpr unsigned int kBlockY = 16;
 
 } // namespace
+
+bool PrepareOpenCudaVbKernelHandles(
+    CudaDriverApi *driver, const CudaContextIdentity &expected_context,
+    PreparedOpenCudaVbKernelHandles *out,
+    PreparedOpenCudaVbKernelStatus *status_out, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (out)
+    *out = {};
+  if (status_out)
+    *status_out = PreparedOpenCudaVbKernelStatus::invalid;
+  if (!driver || !driver->IsInitialized() || !expected_context.Valid() ||
+      !out) {
+    if (status_out)
+      *status_out = PreparedOpenCudaVbKernelStatus::invalid_argument;
+    if (error_out)
+      *error_out = "Open CUDA VB kernel setup binding is invalid.";
+    return false;
+  }
+  if (!driver->EnsureContext(error_out)) {
+    if (status_out)
+      *status_out = PreparedOpenCudaVbKernelStatus::unavailable;
+    return false;
+  }
+
+  const auto *current = driver->context_identity();
+  if (!current || !current->Valid()) {
+    if (status_out)
+      *status_out = PreparedOpenCudaVbKernelStatus::unavailable;
+    if (error_out)
+      *error_out = "Open CUDA VB kernel setup context identity is unavailable.";
+    return false;
+  }
+  if (current->physical_device != expected_context.physical_device ||
+      current->retained_context_id != expected_context.retained_context_id) {
+    if (status_out)
+      *status_out = PreparedOpenCudaVbKernelStatus::foreign_context;
+    if (error_out)
+      *error_out = "Open CUDA VB kernel setup context is foreign.";
+    return false;
+  }
+  if (current->logical_generation != expected_context.logical_generation) {
+    if (status_out)
+      *status_out = PreparedOpenCudaVbKernelStatus::stale_context_generation;
+    if (error_out)
+      *error_out = "Open CUDA VB kernel setup context generation is stale.";
+    return false;
+  }
+
+  KernelFunctions functions;
+  if (!EnsureKernelsLoaded(driver, &functions, error_out, &expected_context,
+                           status_out)) {
+    if (status_out && *status_out == PreparedOpenCudaVbKernelStatus::invalid)
+      *status_out = PreparedOpenCudaVbKernelStatus::unavailable;
+    return false;
+  }
+
+  out->context = k().loaded_ctx;
+  out->module = k().module;
+  out->functions = {
+      functions.resize_f32, functions.blur_h_u8x3, functions.blur_v_u8x3,
+      functions.blur_h_f32, functions.blur_v_f32, functions.comp_bg,
+      functions.comp_solid, functions.key_light,
+  };
+  if (status_out)
+    *status_out = PreparedOpenCudaVbKernelStatus::ready;
+  return true;
+}
 
 bool ResizeBilinearF32_1(const CudaImage &src, const CudaImage &dst,
                          studiocast::cuda::CUstream stream,
