@@ -33,7 +33,9 @@ void *operator new[](std::size_t size) {
 
 void operator delete(void *pointer) noexcept { std::free(pointer); }
 void operator delete[](void *pointer) noexcept { std::free(pointer); }
-void operator delete(void *pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
 void operator delete[](void *pointer, std::size_t) noexcept {
   std::free(pointer);
 }
@@ -43,10 +45,14 @@ namespace {
 using studiocast::hal::AliasingPermission;
 using studiocast::hal::BackendId;
 using studiocast::hal::ChannelOrder;
+using studiocast::hal::CircuitBreakerAction;
 using studiocast::hal::ColorRange;
 using studiocast::hal::ColorSpace;
 using studiocast::hal::FailureAction;
 using studiocast::hal::HostCoherence;
+using studiocast::hal::HostFrameBinding;
+using studiocast::hal::HostFrameOutputResolution;
+using studiocast::hal::HostFrameTokens;
 using studiocast::hal::ImageDescriptor;
 using studiocast::hal::MemoryHandleFamily;
 using studiocast::hal::Mutability;
@@ -103,9 +109,9 @@ ImageDescriptor FrameDescriptor(Mutability mutability) {
   return descriptor;
 }
 
-studiocast::hal::ExecutionDomainId Domain(
-    std::uint64_t adapter_id = kAdapterId,
-    std::uint64_t context_generation = 7) {
+studiocast::hal::ExecutionDomainId
+Domain(std::uint64_t adapter_id = kAdapterId,
+       std::uint64_t context_generation = 7) {
   studiocast::hal::ExecutionDomainId domain;
   domain.backend = BackendId::vulkan;
   domain.api_family = studiocast::hal::ApiFamily::vulkan;
@@ -118,15 +124,13 @@ studiocast::hal::ExecutionDomainId Domain(
   domain.memory_handle_family = MemoryHandleFamily::vulkan_image;
   domain.queue_or_stream_identity = 99;
   domain.ownership_model = OwnershipModel::adapter_exclusive;
-  domain.synchronization_protocol =
-      SynchronizationProtocol::vulkan_queue_fence;
+  domain.synchronization_protocol = SynchronizationProtocol::vulkan_queue_fence;
   domain.adapter_instance_id = adapter_id;
   return domain;
 }
 
-PreparedProgram Program(std::uint64_t program_id = 100,
-                        bool vignette = true, bool mirror = true,
-                        bool required = false) {
+PreparedProgram Program(std::uint64_t program_id = 100, bool vignette = true,
+                        bool mirror = true, bool required = false) {
   PreparedProgram program;
   program.program_id = program_id;
   program.owner_adapter_instance_id = kAdapterId;
@@ -156,42 +160,42 @@ PreparedProgram Program(std::uint64_t program_id = 100,
     auto &stage = program.stages[program.stage_count++];
     stage.stage_id = 1;
     stage.semantic = SemanticEffectId::vignette;
-    stage.provider =
-        SemanticEffectProviderId::open_vulkan_production_kernels;
+    stage.provider = SemanticEffectProviderId::open_vulkan_production_kernels;
     stage.backend = BackendId::vulkan;
     stage.execution_domain = program.execution_domain;
     stage.input.image = input;
     stage.output.image = output;
     stage.required = required;
-    stage.failure_action =
-        required ? FailureAction::fail_closed
-                 : FailureAction::fail_open_preserve_input;
+    stage.failure_action = required ? FailureAction::fail_closed
+                                    : FailureAction::fail_open_preserve_input;
+    stage.circuit_breaker.action =
+        required ? CircuitBreakerAction::quarantine_program
+                 : CircuitBreakerAction::disable_stage;
   }
   if (mirror) {
     auto &stage = program.stages[program.stage_count++];
     stage.stage_id = vignette ? 2 : 1;
     stage.semantic = SemanticEffectId::mirror;
-    stage.provider =
-        SemanticEffectProviderId::open_vulkan_production_kernels;
+    stage.provider = SemanticEffectProviderId::open_vulkan_production_kernels;
     stage.backend = BackendId::vulkan;
     stage.execution_domain = program.execution_domain;
     stage.input.image = input;
     stage.output.image = output;
     stage.required = required;
-    stage.failure_action =
-        required ? FailureAction::fail_closed
-                 : FailureAction::fail_open_preserve_input;
+    stage.failure_action = required ? FailureAction::fail_closed
+                                    : FailureAction::fail_open_preserve_input;
+    stage.circuit_breaker.action =
+        required ? CircuitBreakerAction::quarantine_program
+                 : CircuitBreakerAction::disable_stage;
   }
   return program;
 }
 
 VulkanResidentProgramOptions Options(const PreparedProgram &program,
-                                     bool vignette = true,
-                                     bool mirror = true) {
+                                     bool vignette = true, bool mirror = true) {
   VulkanResidentProgramOptions options;
   options.program_id = program.program_id;
-  options.canonical_plan_hash =
-      program.invalidation_key.canonical_plan_hash;
+  options.canonical_plan_hash = program.invalidation_key.canonical_plan_hash;
   options.request_vignette = vignette;
   options.request_mirror = mirror;
   options.vignette_center = VulkanVignetteCenterMode::fixed_frame_center;
@@ -199,8 +203,7 @@ VulkanResidentProgramOptions Options(const PreparedProgram &program,
   return options;
 }
 
-class FakeQualifiedExecutor final
-    : public IQualifiedVulkanResidentExecutor {
+class FakeQualifiedExecutor final : public IQualifiedVulkanResidentExecutor {
 public:
   explicit FakeQualifiedExecutor(
       studiocast::hal::ExecutionDomainId domain = Domain()) noexcept {
@@ -246,12 +249,17 @@ public:
     return StatusId::ready;
   }
 
-  VulkanExecutorResult
-  Execute(const VulkanExecutorPreparedProgram &, const PreparedProgram &program,
-          const VulkanResidentProgramOptions &,
-          const VulkanHostFrameBinding &binding,
-          std::uint64_t) noexcept override {
+  VulkanExecutorResult Execute(const VulkanExecutorPreparedProgram &,
+                               const PreparedProgram &program,
+                               const VulkanResidentProgramOptions &options,
+                               const VulkanHostFrameBinding &binding,
+                               std::uint64_t) noexcept override {
     ++execute_calls;
+    last_stage_count = program.stage_count;
+    last_semantics.fill(SemanticEffectId::invalid);
+    for (std::size_t index = 0; index < program.stage_count; ++index)
+      last_semantics[index] = program.stages[index].semantic;
+    last_options = options;
     VulkanExecutorResult result;
     result.status = StatusId::executed;
     result.stage_count = program.stage_count;
@@ -264,8 +272,9 @@ public:
     for (std::size_t index = 0; index < program.stage_count; ++index) {
       result.stages[index].succeeded =
           fail_stage_index != static_cast<int>(index);
-      result.stages[index].reason =
-          result.stages[index].succeeded ? ReasonId::none : stage_failure_reason;
+      result.stages[index].reason = result.stages[index].succeeded
+                                        ? ReasonId::none
+                                        : stage_failure_reason;
       result.stages[index].elapsed_ns = 100'000 + index;
     }
     if (report_device_loss) {
@@ -275,9 +284,9 @@ public:
       return result;
     }
     if (write_output) {
-      std::memcpy(binding.output, binding.input,
-                  std::min(binding.input_size_bytes,
-                           binding.output_size_bytes));
+      std::memcpy(
+          binding.output, binding.input,
+          std::min(binding.input_size_bytes, binding.output_size_bytes));
       result.output_written = true;
     }
     return result;
@@ -309,6 +318,10 @@ public:
   std::uint64_t destroy_calls = 0;
   std::uint64_t shutdown_calls = 0;
   std::uint64_t next_state_id = 1;
+  std::size_t last_stage_count = 0;
+  std::array<SemanticEffectId, studiocast::hal::kMaxPreparedStages>
+      last_semantics{};
+  VulkanResidentProgramOptions last_options{};
 };
 
 VulkanHostFrameBinding Binding(std::array<std::uint8_t, kFrameBytes> &input,
@@ -320,6 +333,30 @@ VulkanHostFrameBinding Binding(std::array<std::uint8_t, kFrameBytes> &input,
   binding.output = output.data();
   binding.output_size_bytes = output.size();
   binding.output_row_stride_bytes = 6;
+  return binding;
+}
+
+HostFrameBinding CommonBinding(const PreparedProgram &program,
+                               std::array<std::uint8_t, kFrameBytes> &input,
+                               std::array<std::uint8_t, kFrameBytes> &output,
+                               std::uint64_t capture_sequence) {
+  HostFrameBinding binding;
+  binding.input_descriptor = program.stages[0].input.image;
+  binding.output_descriptor =
+      program.stages[program.stage_count - 1].output.image;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.input_planes[0].read_data =
+      reinterpret_cast<const std::byte *>(input.data());
+  binding.input_planes[0].span_bytes = input.size();
+  binding.input_planes[0].row_stride_bytes = 6;
+  binding.output_planes[0].write_data =
+      reinterpret_cast<std::byte *>(output.data());
+  binding.output_planes[0].span_bytes = output.size();
+  binding.output_planes[0].row_stride_bytes = 6;
+  binding.capture_sequence = capture_sequence;
+  binding.ownership = OwnershipModel::borrowed_until_completion;
+  binding.lifetime = studiocast::hal::ResourceLifetime::frame_borrowed;
   return binding;
 }
 
@@ -343,9 +380,8 @@ bool Configure(PreparedProgramSession *session,
     return false;
   ReasonId reason = ReasonId::none;
   ReadinessSnapshot local;
-  const StatusId status =
-      session->Configure(program, *adapter, readiness ? readiness : &local,
-                         &reason);
+  const StatusId status = session->Configure(
+      program, *adapter, readiness ? readiness : &local, &reason);
   return status == StatusId::ready && reason == ReasonId::none;
 }
 
@@ -355,47 +391,62 @@ bool TestPreparedExecutionAndCommittedAttribution() {
   PreparedProgramSession session;
   const PreparedProgram program = Program();
   ReadinessSnapshot readiness;
-  bool ok = Require(Configure(&session, &adapter, program, Options(program),
-                              &readiness),
-                    "qualified mirror/vignette program should prepare");
-  ok &= Require(readiness.available && readiness.status == StatusId::ready &&
-                    readiness.ready_stage_mask == 3 &&
-                    readiness.provider ==
-                        SemanticEffectProviderId::
-                            open_vulkan_production_kernels &&
-                    executor.capability_calls == 1 &&
-                    executor.prepare_calls == 1,
-                "prepare must consume exact cached evidence exactly once");
+  bool ok = Require(
+      Configure(&session, &adapter, program, Options(program), &readiness),
+      "qualified mirror/vignette program should prepare");
+  ok &= Require(
+      readiness.available && readiness.status == StatusId::ready &&
+          readiness.ready_stage_mask == 3 &&
+          readiness.provider ==
+              SemanticEffectProviderId::open_vulkan_production_kernels &&
+          executor.capability_calls == 1 && executor.prepare_calls == 1,
+      "prepare must consume exact cached evidence exactly once");
 
-  std::array<std::uint8_t, kFrameBytes> input{0, 1, 2, 3, 4, 5,
+  std::array<std::uint8_t, kFrameBytes> input{0, 1, 2, 3, 4,  5,
                                               6, 7, 8, 9, 10, 11};
   std::array<std::uint8_t, kFrameBytes> output{};
-  ResourceHandle resource;
+  HostFrameTokens tokens;
   ReasonId reason = ReasonId::none;
-  ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                  Binding(input, output), &resource,
-                                  &reason) == StatusId::ready,
-                "frame binding should be accepted");
-  const auto result = session.Execute(Request(program, resource, 1));
-  ok &= Require(result.status == StatusId::executed && result.output_valid &&
-                    result.completion.complete && result.stage_count == 2 &&
-                    result.stages[0].status ==
-                        StageExecutionStatus::succeeded &&
-                    result.stages[1].status ==
-                        StageExecutionStatus::succeeded &&
-                    result.transfers.uploads == 1 &&
-                    result.transfers.final_readbacks == 1 &&
-                    result.transfers.intermediate_readbacks == 0 &&
-                    result.transfers.intermediate_uploads == 0 &&
-                    result.transfers.synchronizations == 3 &&
-                    output == input,
-                "execution should expose one upload, one readback, no hidden "
-                "crossing, and exact stage/sync evidence");
+  ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
+                                      &tokens, &reason) == StatusId::ready &&
+                    tokens.input.memory_domain ==
+                        studiocast::hal::MemoryDomain::upload_staging &&
+                    tokens.output.memory_domain ==
+                        studiocast::hal::MemoryDomain::readback_staging &&
+                    tokens.input.resource_id != tokens.output.resource_id,
+                "neutral frame binding should issue exact distinct boundary "
+                "tokens");
+  const auto result = session.Execute(Request(program, tokens.input, 1));
+  ok &=
+      Require(result.status == StatusId::executed && result.output_valid &&
+                  result.completion.complete && result.stage_count == 2 &&
+                  result.stages[0].status == StageExecutionStatus::succeeded &&
+                  result.stages[1].status == StageExecutionStatus::succeeded &&
+                  result.transfers.uploads == 1 &&
+                  result.transfers.final_readbacks == 1 &&
+                  result.transfers.intermediate_readbacks == 0 &&
+                  result.transfers.intermediate_uploads == 0 &&
+                  result.transfers.synchronizations == 3 && output == input,
+              "execution should expose one upload, one readback, no hidden "
+              "crossing, and exact stage/sync evidence");
   ok &= Require(
       session.telemetry().active_backend == BackendId::invalid &&
           session.telemetry().active_backend_frames == 0 &&
           session.telemetry().committed_output_frames == 0,
       "active Vulkan attribution must remain uncommitted before output write");
+  HostFrameOutputResolution resolution;
+  ok &= Require(
+      session.ResolveHostFrameOutput(result.completion, result.output,
+                                     &resolution, &reason) == StatusId::ready &&
+          resolution.output_ready && resolution.capture_sequence == 1 &&
+          resolution.descriptor.width == 2 &&
+          resolution.descriptor.height == 2 &&
+          resolution.descriptor.mutability == Mutability::read_write &&
+          resolution.plane_count == 1 &&
+          resolution.planes[0].write_data ==
+              reinterpret_cast<std::byte *>(output.data()) &&
+          resolution.planes[0].span_bytes == output.size(),
+      "neutral output resolution should return the exact writer binding");
   ok &= Require(session.CommitOutput(OutputCommit{result.completion, true},
                                      &reason) == StatusId::ready &&
                     session.telemetry().active_backend == BackendId::vulkan &&
@@ -404,21 +455,20 @@ bool TestPreparedExecutionAndCommittedAttribution() {
                 "successful output write should commit Vulkan attribution");
 
   output.fill(0);
-  ok &= Require(adapter.BindFrame(program.program_id, 2,
-                                  Binding(input, output), &resource,
-                                  &reason) == StatusId::ready,
-                "second frame binding should be accepted");
+  ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 2),
+                                      &tokens, &reason) == StatusId::ready,
+                "second neutral frame binding should be accepted");
   const auto failed_commit_frame =
-      session.Execute(Request(program, resource, 2));
-  ok &= Require(failed_commit_frame.status == StatusId::executed &&
-                    session.CommitOutput(
-                        {failed_commit_frame.completion, false},
-                        &reason) == StatusId::failed &&
-                    reason == ReasonId::output_write_failed &&
-                    session.telemetry().active_backend_frames == 1 &&
-                    session.telemetry().committed_output_frames == 1,
-                "failed output write must not commit additional active "
-                "backend attribution");
+      session.Execute(Request(program, tokens.input, 2));
+  ok &=
+      Require(failed_commit_frame.status == StatusId::executed &&
+                  session.CommitOutput({failed_commit_frame.completion, false},
+                                       &reason) == StatusId::failed &&
+                  reason == ReasonId::output_write_failed &&
+                  session.telemetry().active_backend_frames == 1 &&
+                  session.telemetry().committed_output_frames == 1,
+              "failed output write must not commit additional active "
+              "backend attribution");
   return ok;
 }
 
@@ -527,8 +577,7 @@ bool TestCapabilityAndSemanticGates() {
     ReadinessSnapshot readiness;
     ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
                           StatusId::blocked &&
-                      reason ==
-                          ReasonId::cross_adapter_residency_forbidden &&
+                      reason == ReasonId::cross_adapter_residency_forbidden &&
                       executor.prepare_calls == 0,
                   "cross-adapter Vulkan residency must fail closed");
   }
@@ -549,10 +598,10 @@ bool TestOptionalAndRequiredFailure() {
     std::array<std::uint8_t, kFrameBytes> output{};
     ResourceHandle resource;
     ReasonId reason = ReasonId::none;
-    ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                    Binding(input, output), &resource,
-                                    &reason) == StatusId::ready,
-                  "optional-failure frame should bind");
+    ok &=
+        Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
+                "optional-failure frame should bind");
     const auto result = session.Execute(Request(program, resource, 1));
     ok &= Require(
         result.status == StatusId::degraded && result.output_valid &&
@@ -576,26 +625,265 @@ bool TestOptionalAndRequiredFailure() {
     PreparedProgramSession session;
     const PreparedProgram program =
         Program(301, /*vignette=*/true, /*mirror=*/false, /*required=*/true);
-    ok &= Require(Configure(&session, &adapter, program,
-                            Options(program, true, false)),
-                  "required-failure program should prepare");
+    ok &= Require(
+        Configure(&session, &adapter, program, Options(program, true, false)),
+        "required-failure program should prepare");
     std::array<std::uint8_t, kFrameBytes> input{};
     std::array<std::uint8_t, kFrameBytes> output{};
     ResourceHandle resource;
     ReasonId reason = ReasonId::none;
-    ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                    Binding(input, output), &resource,
-                                    &reason) == StatusId::ready,
-                  "required-failure frame should bind");
+    ok &=
+        Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
+                "required-failure frame should bind");
     const auto result = session.Execute(Request(program, resource, 1));
     ok &= Require(result.status == StatusId::failed &&
                       result.reason == ReasonId::required_stage_failed &&
                       result.stage_count == 1 &&
                       result.stages[0].status ==
                           StageExecutionStatus::required_failed &&
-                      session.telemetry().required_stage_failures == 1,
+                      session.telemetry().required_stage_failures == 1 &&
+                      session.quarantined(),
                   "required Vulkan stage failure must fail closed with typed "
-                  "telemetry");
+                  "telemetry and a valid required-stage quarantine policy");
+  }
+  return ok;
+}
+
+bool TestNeutralBindingAdversarialValidation() {
+  FakeQualifiedExecutor executor;
+  VulkanHalResidentAdapter adapter(kAdapterId, executor);
+  PreparedProgramSession session;
+  const PreparedProgram program = Program(350);
+  bool ok = Require(Configure(&session, &adapter, program, Options(program)),
+                    "neutral adversarial program should prepare");
+  std::array<std::uint8_t, kFrameBytes> input{};
+  std::array<std::uint8_t, kFrameBytes> output{};
+  ReasonId reason = ReasonId::none;
+
+  auto malformed = CommonBinding(program, input, output, 1);
+  ++malformed.input_descriptor.planes[0].row_stride_bytes;
+  HostFrameTokens tokens;
+  ok &= Require(session.BindHostFrame(malformed, &tokens, &reason) ==
+                        StatusId::blocked &&
+                    reason == ReasonId::host_frame_binding_invalid &&
+                    executor.execute_calls == 0,
+                "neutral descriptor mutation must fail before adapter "
+                "execution");
+
+  ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
+                                      &tokens, &reason) == StatusId::ready,
+                "valid neutral adversarial binding should arm");
+  auto wrong_generation = tokens.input;
+  --wrong_generation.lifetime_generation;
+  ok &= Require(session.Execute(Request(program, wrong_generation, 1)).reason ==
+                        ReasonId::wrong_generation &&
+                    executor.execute_calls == 0,
+                "neutral input generation mutation must fail closed");
+  auto wrong_domain = tokens.input;
+  ++wrong_domain.execution_domain.queue_or_stream_identity;
+  ok &= Require(session.Execute(Request(program, wrong_domain, 1)).reason ==
+                        ReasonId::wrong_execution_domain &&
+                    executor.execute_calls == 0,
+                "neutral input domain mutation must fail closed");
+  auto forged_input = tokens.input;
+  ++forged_input.adapter_opaque[2];
+  ok &= Require(session.Execute(Request(program, forged_input, 1)).reason ==
+                        ReasonId::invalid_resource &&
+                    executor.execute_calls == 0,
+                "neutral input token mutation must fail before executor "
+                "entry");
+  ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
+                                      &tokens, &reason) == StatusId::ready,
+                "adapter-side token rejection must release the neutral "
+                "binding for exact replay");
+
+  const auto result = session.Execute(Request(program, tokens.input, 1));
+  ok &= Require(result.status == StatusId::executed &&
+                    executor.execute_calls == 1,
+                "exact neutral input token should execute once");
+
+  HostFrameOutputResolution resolution;
+  auto forged_completion = result.completion;
+  ++forged_completion.token_id;
+  ok &= Require(session.ResolveHostFrameOutput(forged_completion, result.output,
+                                               &resolution,
+                                               &reason) == StatusId::blocked &&
+                    reason == ReasonId::output_not_committed,
+                "neutral completion mutation must fail closed");
+  auto forged_output = result.output;
+  ++forged_output.adapter_opaque[2];
+  const StatusId forged_output_status = session.ResolveHostFrameOutput(
+      result.completion, forged_output, &resolution, &reason);
+  ok &= Require(forged_output_status == StatusId::blocked &&
+                    reason == ReasonId::host_frame_binding_invalid,
+                "neutral output token mutation must fail closed");
+  const StatusId exact_output_status = session.ResolveHostFrameOutput(
+      result.completion, result.output, &resolution, &reason);
+  ok &= Require(exact_output_status == StatusId::ready &&
+                    resolution.output_ready && resolution.capture_sequence == 1,
+                "exact neutral completion and output token should resolve");
+  ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                    StatusId::ready,
+                "neutral adversarial frame should commit");
+  ok &= Require(session.Execute(Request(program, tokens.input, 1)).reason ==
+                        ReasonId::frame_order_violated &&
+                    executor.execute_calls == 1,
+                "neutral replay must fail at the frozen frame-order boundary");
+  return ok;
+}
+
+bool TestDisabledStageMaskExecution() {
+  bool ok = true;
+  {
+    FakeQualifiedExecutor executor;
+    executor.fail_stage_index = 0;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    PreparedProgramSession session;
+    PreparedProgram program = Program(375);
+    program.stages[0].circuit_breaker.cooldown_frames = 1;
+    ok &= Require(Configure(&session, &adapter, program, Options(program)),
+                  "optional disabled-stage program should prepare");
+    std::array<std::uint8_t, kFrameBytes> input{0, 1, 2, 3, 4,  5,
+                                                6, 7, 8, 9, 10, 11};
+    std::array<std::uint8_t, kFrameBytes> output{};
+    HostFrameTokens tokens;
+    ReasonId reason = ReasonId::none;
+    ok &=
+        Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
+                                      &tokens, &reason) == StatusId::ready,
+                "breaker-opening neutral frame should bind");
+    const auto first = session.Execute(Request(program, tokens.input, 1));
+    ok &= Require(first.status == StatusId::degraded &&
+                      first.stages[0].status ==
+                          StageExecutionStatus::optional_failed_open &&
+                      session.disabled_stage_mask() == 1,
+                  "optional vignette failure should open its stage breaker");
+    ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "breaker-opening output should commit");
+
+    executor.fail_stage_index = -1;
+    output.fill(0);
+    ok &=
+        Require(session.BindHostFrame(CommonBinding(program, input, output, 2),
+                                      &tokens, &reason) == StatusId::ready,
+                "disabled-stage neutral frame should bind");
+    const auto disabled = session.Execute(Request(program, tokens.input, 2));
+    ok &= Require(
+        disabled.status == StatusId::executed && disabled.output_valid &&
+            disabled.stage_count == 2 &&
+            disabled.stages[0].status ==
+                StageExecutionStatus::disabled_preserved &&
+            disabled.stages[0].reason == ReasonId::circuit_breaker_open &&
+            disabled.stages[0].valid_output_preserved &&
+            disabled.stages[0].elapsed_ns == 0 &&
+            disabled.stages[1].status == StageExecutionStatus::succeeded &&
+            executor.last_stage_count == 1 &&
+            executor.last_semantics[0] == SemanticEffectId::mirror &&
+            !executor.last_options.request_vignette &&
+            executor.last_options.request_mirror && output == input,
+        "disabled optional vignette must be omitted while mirror executes "
+        "with zero-time valid preservation");
+    ok &= Require(session.CommitOutput({disabled.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "disabled-stage output should commit");
+  }
+  {
+    FakeQualifiedExecutor executor;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    const PreparedProgram program =
+        Program(376, /*vignette=*/true, /*mirror=*/false, /*required=*/true);
+    ok &= Require(adapter.SetProgramOptions(
+                      Options(program, /*vignette=*/true, /*mirror=*/false)),
+                  "required disabled-stage options should bind");
+    PreparedProgramHandle handle;
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &= Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                      StatusId::ready,
+                  "required disabled-stage direct program should prepare");
+    std::array<std::uint8_t, kFrameBytes> input{};
+    std::array<std::uint8_t, kFrameBytes> output{};
+    HostFrameTokens tokens;
+    auto malformed = CommonBinding(program, input, output, 1);
+    ++malformed.output_descriptor.planes[0].size_bytes;
+    ok &= Require(adapter.BindHostFrame(handle, malformed, &tokens, &reason) ==
+                          StatusId::blocked &&
+                      reason == ReasonId::host_frame_binding_invalid,
+                  "adapter must reject a directly mutated neutral descriptor");
+    ok &= Require(
+        adapter.BindHostFrame(handle, CommonBinding(program, input, output, 1),
+                              &tokens, &reason) == StatusId::ready,
+        "required disabled-stage direct frame should bind");
+    auto request = Request(program, tokens.input, 1);
+    request.disabled_stage_mask = 1;
+    const auto blocked = adapter.Execute(handle, request);
+    ok &= Require(blocked.status == StatusId::failed &&
+                      blocked.reason == ReasonId::required_stage_failed &&
+                      executor.execute_calls == 0,
+                  "required disabled bit must fail closed without executor "
+                  "entry");
+    adapter.DestroyPrepared(&handle);
+  }
+  {
+    FakeQualifiedExecutor executor;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    const PreparedProgram program = Program(377);
+    ok &= Require(adapter.SetProgramOptions(Options(program)),
+                  "all-disabled options should bind");
+    PreparedProgramHandle handle;
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &= Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                      StatusId::ready,
+                  "all-disabled direct program should prepare");
+    std::array<std::uint8_t, kFrameBytes> input{0, 1, 2, 3, 4,  5,
+                                                6, 7, 8, 9, 10, 11};
+    std::array<std::uint8_t, kFrameBytes> output{};
+    HostFrameTokens tokens;
+    ok &= Require(
+        adapter.BindHostFrame(handle, CommonBinding(program, input, output, 1),
+                              &tokens, &reason) == StatusId::ready,
+        "all-disabled direct frame should bind");
+    auto request = Request(program, tokens.input, 1);
+    request.disabled_stage_mask = 3;
+    const auto preserved = adapter.Execute(handle, request);
+    ok &= Require(
+        preserved.status == StatusId::executed && preserved.output_valid &&
+            preserved.stage_count == 2 &&
+            preserved.stages[0].status ==
+                StageExecutionStatus::disabled_preserved &&
+            preserved.stages[1].status ==
+                StageExecutionStatus::disabled_preserved &&
+            preserved.stages[0].elapsed_ns == 0 &&
+            preserved.stages[1].elapsed_ns == 0 &&
+            executor.last_stage_count == 0 &&
+            !executor.last_options.request_vignette &&
+            !executor.last_options.request_mirror && output == input,
+        "all optional disabled stages must produce a zero-stage transport "
+        "plan with exact preserved output");
+    HostFrameOutputResolution resolution;
+    auto wrong_generation = preserved.output;
+    --wrong_generation.lifetime_generation;
+    ok &= Require(adapter.ResolveHostFrameOutput(
+                      handle, preserved.completion, wrong_generation,
+                      &resolution, &reason) == StatusId::blocked &&
+                      reason == ReasonId::wrong_generation,
+                  "direct output generation mutation must fail closed");
+    auto wrong_domain = preserved.output;
+    ++wrong_domain.execution_domain.queue_or_stream_identity;
+    ok &= Require(adapter.ResolveHostFrameOutput(
+                      handle, preserved.completion, wrong_domain, &resolution,
+                      &reason) == StatusId::blocked &&
+                      reason == ReasonId::wrong_execution_domain,
+                  "direct output domain mutation must fail closed");
+    ok &= Require(adapter.ResolveHostFrameOutput(handle, preserved.completion,
+                                                 preserved.output, &resolution,
+                                                 &reason) == StatusId::ready &&
+                      resolution.output_ready,
+                  "all-disabled preserved output should resolve");
+    adapter.DestroyPrepared(&handle);
   }
   return ok;
 }
@@ -611,9 +899,8 @@ bool TestForeignStaleAndHiddenCrossingRejection() {
   std::array<std::uint8_t, kFrameBytes> output{};
   ResourceHandle resource;
   ReasonId reason = ReasonId::none;
-  ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                  Binding(input, output), &resource,
-                                  &reason) == StatusId::ready,
+  ok &= Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
                 "validation frame should bind");
 
   auto wrong_generation = resource;
@@ -749,18 +1036,18 @@ bool TestImageSequenceAndBoundaryBudgetValidation() {
                       executor.execute_calls == 1,
                   "matching capture sequence should execute exactly once");
     ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
-                          StatusId::ready,
+                      StatusId::ready,
                   "sequence-validation output should commit");
     ok &= Require(session.Execute(Request(program, resource, 11)).reason ==
-                          ReasonId::invalid_resource &&
+                          ReasonId::frame_order_violated &&
                       executor.execute_calls == 1,
-                  "consumed frame binding must reject replay");
+                  "consumed frame binding replay must fail at the frozen "
+                  "frame-order boundary");
     ResourceHandle zero_sequence_resource;
-    ok &= Require(adapter.BindFrame(program.program_id, 0,
-                                    Binding(input, output),
-                                    &zero_sequence_resource,
-                                    &reason) == StatusId::blocked &&
-                      reason == ReasonId::invalid_resource,
+    ok &= Require(adapter.BindFrame(
+                      program.program_id, 0, Binding(input, output),
+                      &zero_sequence_resource, &reason) == StatusId::blocked &&
+                      reason == ReasonId::host_frame_binding_invalid,
                   "zero capture sequence must fail binding");
   }
   return ok;
@@ -771,8 +1058,8 @@ bool TestRollbackExhaustionDeviceLossAndShutdown() {
   {
     FakeQualifiedExecutor executor;
     VulkanHalResidentAdapter adapter(kAdapterId, executor);
-    PreparedProgramHandle handles[studiocast::vulkan::
-                                      kMaxVulkanPreparedPrograms]{};
+    PreparedProgramHandle
+        handles[studiocast::vulkan::kMaxVulkanPreparedPrograms]{};
     for (std::size_t index = 0;
          index < studiocast::vulkan::kMaxVulkanPreparedPrograms; ++index) {
       const PreparedProgram program = Program(500 + index);
@@ -822,16 +1109,15 @@ bool TestRollbackExhaustionDeviceLossAndShutdown() {
     std::array<std::uint8_t, kFrameBytes> input{};
     std::array<std::uint8_t, kFrameBytes> output{};
     ResourceHandle resource;
-    ok &= Require(
-        adapter.BindFrame(old_program.program_id, 1, Binding(input, output),
-                          &resource, &reason) == StatusId::ready,
-        "retained old program frame should bind");
-    const auto result =
-        session.Execute(Request(old_program, resource, 1));
+    ok &= Require(adapter.BindFrame(old_program.program_id, 1,
+                                    Binding(input, output), &resource,
+                                    &reason) == StatusId::ready,
+                  "retained old program frame should bind");
+    const auto result = session.Execute(Request(old_program, resource, 1));
     ok &= Require(result.status == StatusId::executed,
                   "retained old program must remain executable");
     ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
-                          StatusId::ready,
+                      StatusId::ready,
                   "retained old program output should commit");
   }
   {
@@ -846,10 +1132,10 @@ bool TestRollbackExhaustionDeviceLossAndShutdown() {
     std::array<std::uint8_t, kFrameBytes> output{};
     ResourceHandle resource;
     ReasonId reason = ReasonId::none;
-    ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                    Binding(input, output), &resource,
-                                    &reason) == StatusId::ready,
-                  "device-loss frame should bind");
+    ok &=
+        Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
+                "device-loss frame should bind");
     const auto lost = session.Execute(Request(program, resource, 1));
     ok &= Require(lost.status == StatusId::quarantined &&
                       lost.reason == ReasonId::device_lost &&
@@ -917,10 +1203,10 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
     std::array<std::uint8_t, kFrameBytes> output{};
     ResourceHandle resource;
     ReasonId reason = ReasonId::none;
-    ok &= Require(adapter.BindFrame(program.program_id, 1,
-                                    Binding(input, output), &resource,
-                                    &reason) == StatusId::ready,
-                  "reconfiguration frame should bind");
+    ok &=
+        Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
+                "reconfiguration frame should bind");
     const auto result = session.Execute(Request(program, resource, 1));
     const PreparedProgram replacement = Program(803);
     ok &= Require(adapter.SetProgramOptions(Options(replacement)),
@@ -932,7 +1218,7 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
                   "reconfiguration must not replace a program with an "
                   "uncommitted completion");
     ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
-                          StatusId::ready,
+                      StatusId::ready,
                   "pending output should commit before reconfiguration");
   }
   {
@@ -947,16 +1233,20 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
     ReasonId reason = ReasonId::none;
     const std::uint64_t allocations_before = g_allocations.load();
     for (std::uint64_t frame = 1; frame <= 128; ++frame) {
-      ResourceHandle resource;
-      const StatusId bound =
-          adapter.BindFrame(program.program_id, frame, Binding(input, output),
-                            &resource, &reason);
+      HostFrameTokens tokens;
+      const StatusId bound = session.BindHostFrame(
+          CommonBinding(program, input, output, frame), &tokens, &reason);
       if (bound != StatusId::ready) {
         ok = false;
         break;
       }
-      const auto result = session.Execute(Request(program, resource, frame));
+      const auto result =
+          session.Execute(Request(program, tokens.input, frame));
+      HostFrameOutputResolution resolution;
       if (result.status != StatusId::executed ||
+          session.ResolveHostFrameOutput(result.completion, result.output,
+                                         &resolution,
+                                         &reason) != StatusId::ready ||
           session.CommitOutput({result.completion, true}, &reason) !=
               StatusId::ready) {
         ok = false;
@@ -981,6 +1271,8 @@ int main() {
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestCapabilityAndSemanticGates();
   ok &= TestOptionalAndRequiredFailure();
+  ok &= TestNeutralBindingAdversarialValidation();
+  ok &= TestDisabledStageMaskExecution();
   ok &= TestForeignStaleAndHiddenCrossingRejection();
   ok &= TestImageSequenceAndBoundaryBudgetValidation();
   ok &= TestRollbackExhaustionDeviceLossAndShutdown();

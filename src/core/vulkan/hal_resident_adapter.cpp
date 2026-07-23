@@ -38,15 +38,13 @@ bool BudgetContains(const ResourceBudget &available,
 bool CommonEvidenceReady(
     const VulkanResidentCapabilityEvidence &evidence) noexcept {
   return evidence.build_enabled && evidence.runtime_loaded &&
-         evidence.non_cpu_physical_device &&
-         evidence.compute_queue_available && evidence.owned_context_healthy &&
-         evidence.utility_kernels_ready &&
+         evidence.non_cpu_physical_device && evidence.compute_queue_available &&
+         evidence.owned_context_healthy && evidence.utility_kernels_ready &&
          evidence.exact_device_and_queue_shared &&
          evidence.persistent_device_local_resources &&
          evidence.bounded_reusable_allocations &&
          evidence.no_host_intermediate_storage &&
-         evidence.one_upload_transport &&
-         evidence.one_final_readback_transport;
+         evidence.one_upload_transport && evidence.one_final_readback_transport;
 }
 
 bool IsZeroModelIdentity(const hal::ModelArtifactIdentity &identity) noexcept {
@@ -78,8 +76,7 @@ bool IsExactProductionRgbImage(const hal::ImageDescriptor &descriptor,
   const auto &plane = descriptor.planes[0];
   if (plane.offset_bytes != 0 || plane.width != descriptor.width ||
       plane.height != descriptor.height ||
-      descriptor.width >
-          std::numeric_limits<std::uint64_t>::max() / 3u) {
+      descriptor.width > std::numeric_limits<std::uint64_t>::max() / 3u) {
     return false;
   }
   const std::uint64_t minimum_stride =
@@ -89,8 +86,7 @@ bool IsExactProductionRgbImage(const hal::ImageDescriptor &descriptor,
           std::numeric_limits<std::uint64_t>::max() / descriptor.height) {
     return false;
   }
-  return plane.size_bytes ==
-             plane.row_stride_bytes * descriptor.height &&
+  return plane.size_bytes == plane.row_stride_bytes * descriptor.height &&
          plane.alignment_bytes <= descriptor.base_alignment_bytes;
 }
 
@@ -99,7 +95,8 @@ bool SameImageStorage(const hal::ImageDescriptor &lhs,
   if (lhs.width != rhs.width || lhs.height != rhs.height ||
       lhs.plane_count != rhs.plane_count || lhs.format != rhs.format ||
       lhs.channel_order != rhs.channel_order ||
-      lhs.color_space != rhs.color_space || lhs.color_range != rhs.color_range ||
+      lhs.color_space != rhs.color_space ||
+      lhs.color_range != rhs.color_range ||
       lhs.alpha_meaning != rhs.alpha_meaning ||
       lhs.orientation != rhs.orientation ||
       lhs.host_coherence != rhs.host_coherence ||
@@ -122,7 +119,8 @@ bool SameImageStorage(const hal::ImageDescriptor &lhs,
   return true;
 }
 
-std::uint64_t RequiredImageSpan(const hal::ImageDescriptor &descriptor) noexcept {
+std::uint64_t
+RequiredImageSpan(const hal::ImageDescriptor &descriptor) noexcept {
   std::uint64_t required = 0;
   for (std::size_t index = 0; index < descriptor.plane_count; ++index) {
     const auto &plane = descriptor.planes[index];
@@ -316,15 +314,14 @@ StatusId VulkanHalResidentAdapter::Prepare(
       has_vignette != pending_options_.request_vignette) {
     return fail(StatusId::blocked, ReasonId::malformed_contract);
   }
-  if (has_vignette &&
-      pending_options_.vignette_center !=
-          VulkanVignetteCenterMode::fixed_frame_center) {
+  if (has_vignette && pending_options_.vignette_center !=
+                          VulkanVignetteCenterMode::fixed_frame_center) {
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   }
   const std::uint64_t required_upload =
       RequiredImageSpan(program.stages[0].input.image);
-  const std::uint64_t required_readback = RequiredImageSpan(
-      program.stages[program.stage_count - 1].output.image);
+  const std::uint64_t required_readback =
+      RequiredImageSpan(program.stages[program.stage_count - 1].output.image);
   if (required_upload == 0 || required_readback == 0 ||
       required_upload > program.budget.upload_staging_bytes ||
       required_readback > program.budget.readback_staging_bytes) {
@@ -336,8 +333,7 @@ StatusId VulkanHalResidentAdapter::Prepare(
   if (evidence.execution_domain != program.execution_domain ||
       !CommonEvidenceReady(evidence) ||
       (has_mirror && !evidence.mirror_production_ready) ||
-      (has_vignette &&
-       !evidence.vignette_fixed_center_production_ready)) {
+      (has_vignette && !evidence.vignette_fixed_center_production_ready)) {
     return fail(StatusId::blocked,
                 evidence.blocker == ReasonId::none
                     ? ReasonId::capability_evidence_incomplete
@@ -361,15 +357,13 @@ StatusId VulkanHalResidentAdapter::Prepare(
   if (executor_status != StatusId::ready) {
     if (executor_candidate.state_id != 0)
       executor_->DestroyPrepared(&executor_candidate);
-    return fail(executor_status,
-                executor_reason == ReasonId::none
-                    ? ReasonId::capability_evidence_incomplete
-                    : executor_reason);
+    return fail(executor_status, executor_reason == ReasonId::none
+                                     ? ReasonId::capability_evidence_incomplete
+                                     : executor_reason);
   }
   if (executor_candidate.state_id == 0 ||
       executor_candidate.reserved_budget.in_flight_slots != 1 ||
-      !BudgetContains(program.budget,
-                      executor_candidate.reserved_budget)) {
+      !BudgetContains(program.budget, executor_candidate.reserved_budget)) {
     if (executor_candidate.state_id != 0)
       executor_->DestroyPrepared(&executor_candidate);
     return fail(StatusId::resource_exhausted, ReasonId::resource_exhausted);
@@ -404,9 +398,8 @@ StatusId VulkanHalResidentAdapter::Prepare(
     readiness->available = true;
     readiness->degraded = degraded;
     readiness->ready_stage_mask =
-        program.stage_count == 32
-            ? std::numeric_limits<std::uint32_t>::max()
-            : ((1u << program.stage_count) - 1u);
+        program.stage_count == 32 ? std::numeric_limits<std::uint32_t>::max()
+                                  : ((1u << program.stage_count) - 1u);
   }
   SetReason(reason, degraded ? degraded_reason : ReasonId::none);
   return degraded ? StatusId::degraded : StatusId::ready;
@@ -428,94 +421,201 @@ StatusId VulkanHalResidentAdapter::BindFrame(
     SetReason(reason, ReasonId::stale_program);
     return StatusId::stale;
   }
-  if (!input || capture_sequence == 0 || slot->quarantined || slot->executing ||
-      slot->binding_armed) {
-    const ReasonId why =
-        slot->quarantined
-            ? ReasonId::device_lost
-            : (capture_sequence == 0 ? ReasonId::invalid_resource
-                                     : ReasonId::output_not_committed);
-    SetReason(reason, why);
-    return slot->quarantined ? StatusId::quarantined : StatusId::blocked;
-  }
-
-  const auto &input_descriptor = slot->program.stages[0].input.image;
-  const auto &output_descriptor =
-      slot->program.stages[slot->program.stage_count - 1].output.image;
-  const std::uint64_t required_input = RequiredImageSpan(input_descriptor);
-  const std::uint64_t required_output = RequiredImageSpan(output_descriptor);
-  if (required_input == 0 || required_output == 0 ||
-      required_input > slot->program.budget.upload_staging_bytes ||
-      required_output > slot->program.budget.readback_staging_bytes ||
-      binding.input_size_bytes < required_input ||
-      binding.output_size_bytes < required_output ||
-      binding.input_row_stride_bytes !=
-          input_descriptor.planes[0].row_stride_bytes ||
-      binding.output_row_stride_bytes !=
-          output_descriptor.planes[0].row_stride_bytes ||
-      !PointerSpanValid(binding.input, required_input) ||
-      !PointerSpanValid(binding.output, required_output) ||
-      reinterpret_cast<std::uintptr_t>(binding.input) %
-              input_descriptor.base_alignment_bytes !=
-          0 ||
-      reinterpret_cast<std::uintptr_t>(binding.output) %
-              output_descriptor.base_alignment_bytes !=
-          0) {
+  if (!input) {
     SetReason(reason, ReasonId::invalid_resource);
     return StatusId::blocked;
   }
-  const bool exact_alias = binding.input == binding.output &&
-                           required_input == required_output;
+
+  hal::HostFrameBinding host_binding;
+  host_binding.input_descriptor = slot->program.stages[0].input.image;
+  host_binding.output_descriptor =
+      slot->program.stages[slot->program.stage_count - 1].output.image;
+  host_binding.input_plane_count = 1;
+  host_binding.output_plane_count = 1;
+  host_binding.capture_sequence = capture_sequence;
+  host_binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+  host_binding.lifetime = ResourceLifetime::frame_borrowed;
+  host_binding.input_planes[0].read_data =
+      reinterpret_cast<const std::byte *>(binding.input);
+  host_binding.input_planes[0].span_bytes = binding.input_size_bytes;
+  host_binding.input_planes[0].row_stride_bytes =
+      binding.input_row_stride_bytes;
+  host_binding.output_planes[0].write_data =
+      reinterpret_cast<std::byte *>(binding.output);
+  host_binding.output_planes[0].span_bytes = binding.output_size_bytes;
+  host_binding.output_planes[0].row_stride_bytes =
+      binding.output_row_stride_bytes;
+
+  hal::HostFrameTokens tokens;
+  const StatusId status =
+      ArmHostFrame(slot, host_binding, false, &tokens, reason);
+  if (status == StatusId::ready)
+    *input = tokens.input;
+  return status;
+}
+
+StatusId VulkanHalResidentAdapter::BindHostFrame(
+    const hal::PreparedProgramHandle &program,
+    const hal::HostFrameBinding &binding, hal::HostFrameTokens *tokens,
+    ReasonId *reason) noexcept {
+  if (tokens)
+    *tokens = {};
+  SetReason(reason, ReasonId::none);
+  if (shutdown_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  PreparedSlot *slot = FindSlot(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  return ArmHostFrame(slot, binding, true, tokens, reason);
+}
+
+StatusId VulkanHalResidentAdapter::ArmHostFrame(
+    PreparedSlot *slot, const hal::HostFrameBinding &binding,
+    bool neutral_binding, hal::HostFrameTokens *tokens,
+    ReasonId *reason) noexcept {
+  if (tokens)
+    *tokens = {};
+  SetReason(reason, ReasonId::none);
+  if (!slot || !tokens) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (slot->executing || slot->binding_armed) {
+    SetReason(reason, ReasonId::output_not_committed);
+    return StatusId::blocked;
+  }
+
+  ReasonId validation_reason = ReasonId::none;
+  if (!hal::ValidateHostFrameBinding(binding, slot->program,
+                                     &validation_reason)) {
+    SetReason(reason, validation_reason);
+    return StatusId::blocked;
+  }
+
+  const auto &input_descriptor = binding.input_descriptor;
+  const auto &output_descriptor = binding.output_descriptor;
+  const std::uint64_t required_input = RequiredImageSpan(input_descriptor);
+  const std::uint64_t required_output = RequiredImageSpan(output_descriptor);
+  const auto *input_pointer = binding.input_planes[0].read_data;
+  auto *output_pointer = binding.output_planes[0].write_data;
+  if (required_input == 0 || required_output == 0 ||
+      required_input > slot->program.budget.upload_staging_bytes ||
+      required_output > slot->program.budget.readback_staging_bytes ||
+      required_input > std::numeric_limits<std::size_t>::max() ||
+      required_output > std::numeric_limits<std::size_t>::max() ||
+      binding.input_planes[0].row_stride_bytes >
+          std::numeric_limits<std::size_t>::max() ||
+      binding.output_planes[0].row_stride_bytes >
+          std::numeric_limits<std::size_t>::max() ||
+      !PointerSpanValid(input_pointer, required_input) ||
+      !PointerSpanValid(output_pointer, required_output) ||
+      reinterpret_cast<std::uintptr_t>(input_pointer) %
+              input_descriptor.base_alignment_bytes !=
+          0 ||
+      reinterpret_cast<std::uintptr_t>(output_pointer) %
+              output_descriptor.base_alignment_bytes !=
+          0) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  const bool exact_alias =
+      input_pointer == output_pointer && required_input == required_output;
   const bool alias_allowed =
       exact_alias && input_descriptor.in_place_permitted &&
       output_descriptor.in_place_permitted &&
       input_descriptor.aliasing != hal::AliasingPermission::forbidden &&
       output_descriptor.aliasing != hal::AliasingPermission::forbidden;
-  if (SpansOverlap(binding.input, required_input, binding.output,
+  if (SpansOverlap(input_pointer, required_input, output_pointer,
                    required_output) &&
       !alias_allowed) {
-    SetReason(reason, ReasonId::invalid_resource);
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
     return StatusId::blocked;
   }
 
-  ResourceHandle resource;
-  resource.resource_id = NextNonzero(&next_resource_id_);
-  resource.allocator_owner_id = adapter_instance_id_;
-  resource.lifetime_generation =
+  const std::uint64_t binding_id = NextNonzero(&next_binding_id_);
+  ResourceHandle input;
+  input.resource_id = NextNonzero(&next_resource_id_);
+  input.allocator_owner_id = adapter_instance_id_;
+  input.lifetime_generation =
       slot->program.execution_domain.logical_context_generation;
-  resource.memory_domain = MemoryDomain::upload_staging;
-  resource.lifetime = ResourceLifetime::frame_borrowed;
-  resource.synchronization_state = SynchronizationState::ready;
-  resource.execution_domain = slot->program.execution_domain;
-  resource.size_bytes = required_input;
-  resource.alignment_bytes = input_descriptor.base_alignment_bytes;
-  resource.mutable_resource = false;
-  resource.aliasable = alias_allowed;
-  resource.adapter_opaque = {
-      slot->handle.handle_id, capture_sequence,
-      static_cast<std::uint64_t>(
-          reinterpret_cast<std::uintptr_t>(binding.input)),
-      static_cast<std::uint64_t>(
-          reinterpret_cast<std::uintptr_t>(binding.output))};
+  input.memory_domain = MemoryDomain::upload_staging;
+  input.lifetime = ResourceLifetime::frame_borrowed;
+  input.synchronization_state = SynchronizationState::ready;
+  input.execution_domain = slot->program.execution_domain;
+  input.size_bytes = required_input;
+  input.alignment_bytes = input_descriptor.base_alignment_bytes;
+  input.mutable_resource = false;
+  input.aliasable = alias_allowed;
+  input.adapter_opaque = {slot->handle.handle_id, binding.capture_sequence,
+                          binding_id, 1};
+
+  ResourceHandle output;
+  output.resource_id = NextNonzero(&next_resource_id_);
+  output.allocator_owner_id = adapter_instance_id_;
+  output.lifetime_generation =
+      slot->program.execution_domain.logical_context_generation;
+  output.memory_domain = MemoryDomain::readback_staging;
+  output.lifetime = ResourceLifetime::frame_borrowed;
+  output.synchronization_state = SynchronizationState::ready;
+  output.execution_domain = slot->program.execution_domain;
+  output.size_bytes = required_output;
+  output.alignment_bytes = output_descriptor.base_alignment_bytes;
+  output.mutable_resource = true;
+  output.aliasable = alias_allowed;
+  output.adapter_opaque = {slot->handle.handle_id, binding.capture_sequence,
+                           binding_id, 2};
+
   if (!hal::ValidateResourceHandle(
-          resource, slot->program.execution_domain,
+          input, slot->program.execution_domain,
+          slot->program.execution_domain.logical_context_generation,
+          slot->program.budget) ||
+      !hal::ValidateResourceHandle(
+          output, slot->program.execution_domain,
           slot->program.execution_domain.logical_context_generation,
           slot->program.budget)) {
     SetReason(reason, ReasonId::resource_exhausted);
     return StatusId::resource_exhausted;
   }
 
-  slot->binding = binding;
-  slot->binding_resource = resource;
-  slot->binding_capture_sequence = capture_sequence;
+  VulkanHostFrameBinding executor_binding;
+  executor_binding.input =
+      reinterpret_cast<const std::uint8_t *>(input_pointer);
+  executor_binding.input_size_bytes = static_cast<std::size_t>(required_input);
+  executor_binding.input_row_stride_bytes =
+      static_cast<std::size_t>(binding.input_planes[0].row_stride_bytes);
+  executor_binding.output = reinterpret_cast<std::uint8_t *>(output_pointer);
+  executor_binding.output_size_bytes =
+      static_cast<std::size_t>(required_output);
+  executor_binding.output_row_stride_bytes =
+      static_cast<std::size_t>(binding.output_planes[0].row_stride_bytes);
+
+  slot->binding = executor_binding;
+  slot->host_binding = binding;
+  slot->binding_resource = input;
+  slot->binding_output_resource = output;
+  slot->binding_capture_sequence = binding.capture_sequence;
+  slot->binding_id = binding_id;
+  slot->completed_token = {};
+  slot->output_ready = false;
+  slot->neutral_binding = neutral_binding;
   slot->binding_armed = true;
-  *input = resource;
+  tokens->input = input;
+  tokens->output = output;
   return StatusId::ready;
 }
 
-hal::ExecuteResult VulkanHalResidentAdapter::Execute(
-    const hal::PreparedProgramHandle &program,
-    const hal::ExecuteRequest &request) noexcept {
+hal::ExecuteResult
+VulkanHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
+                                  const hal::ExecuteRequest &request) noexcept {
   if (shutdown_)
     return Failed(StatusId::stopped, ReasonId::shutdown_requested);
   PreparedSlot *slot = FindSlot(program);
@@ -523,52 +623,83 @@ hal::ExecuteResult VulkanHalResidentAdapter::Execute(
     return Failed(StatusId::stale, ReasonId::stale_program);
   if (slot->quarantined)
     return Failed(StatusId::quarantined, ReasonId::device_lost);
-  if (!slot->binding_armed ||
-      !ResourceMatches(request.input, slot->binding_resource)) {
+  if (!slot->binding_armed)
     return Failed(StatusId::blocked, ReasonId::invalid_resource);
+  const auto reject_bound_frame = [slot](StatusId status,
+                                         ReasonId why) noexcept {
+    if (slot->neutral_binding) {
+      slot->binding_armed = false;
+      slot->output_ready = false;
+      slot->completed_token = {};
+    }
+    return Failed(status, why);
+  };
+  if (request.input.execution_domain != slot->program.execution_domain)
+    return reject_bound_frame(StatusId::blocked,
+                              ReasonId::wrong_execution_domain);
+  if (request.input.lifetime_generation !=
+      slot->program.execution_domain.logical_context_generation) {
+    return reject_bound_frame(StatusId::blocked, ReasonId::wrong_generation);
   }
+  if (!ResourceMatches(request.input, slot->binding_resource))
+    return reject_bound_frame(StatusId::blocked, ReasonId::invalid_resource);
   if (request.capture_sequence == 0 ||
       request.capture_sequence != slot->binding_capture_sequence) {
-    return Failed(StatusId::stale, ReasonId::stale_program);
+    return reject_bound_frame(StatusId::stale, ReasonId::stale_program);
   }
   if (request.invalidation_key != slot->program.invalidation_key)
-    return Failed(StatusId::stale, ReasonId::reconfiguration_required);
+    return reject_bound_frame(StatusId::stale,
+                              ReasonId::reconfiguration_required);
   if (request.execution_domain != slot->program.execution_domain)
-    return Failed(StatusId::blocked, ReasonId::wrong_execution_domain);
+    return reject_bound_frame(StatusId::blocked,
+                              ReasonId::wrong_execution_domain);
+
+  const std::uint32_t valid_stage_mask =
+      slot->program.stage_count == 32
+          ? std::numeric_limits<std::uint32_t>::max()
+          : ((std::uint32_t{1} << slot->program.stage_count) - 1u);
+  if ((request.disabled_stage_mask & ~valid_stage_mask) != 0)
+    return reject_bound_frame(StatusId::blocked, ReasonId::malformed_contract);
+  for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & bit) != 0 &&
+        slot->program.stages[index].required) {
+      return reject_bound_frame(StatusId::failed,
+                                ReasonId::required_stage_failed);
+    }
+  }
+
+  hal::PreparedProgram execution_program = slot->program;
+  VulkanResidentProgramOptions execution_options = slot->options;
+  execution_program.stages = {};
+  execution_program.stage_count = 0;
+  for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & bit) != 0) {
+      if (slot->program.stages[index].semantic == SemanticEffectId::mirror)
+        execution_options.request_mirror = false;
+      if (slot->program.stages[index].semantic == SemanticEffectId::vignette)
+        execution_options.request_vignette = false;
+      continue;
+    }
+    execution_program.stages[execution_program.stage_count++] =
+        slot->program.stages[index];
+  }
 
   slot->executing = true;
   const VulkanExecutorResult executor_result = executor_->Execute(
-      slot->executor_program, slot->program, slot->options, slot->binding,
-      request.capture_sequence);
+      slot->executor_program, execution_program, execution_options,
+      slot->binding, request.capture_sequence);
   slot->executing = false;
   slot->binding_armed = false;
+  slot->output_ready = false;
+  slot->completed_token = {};
 
   hal::ExecuteResult result;
   result.reason = executor_result.reason;
   result.transfers = executor_result.transfers;
   result.transfers.cpu_tail_boundaries += slot->program.cpu_tail_count;
   result.frame_elapsed_ns = executor_result.frame_elapsed_ns;
-  result.stage_count =
-      std::min(executor_result.stage_count, result.stages.size());
-  for (std::size_t index = 0; index < result.stage_count; ++index) {
-    result.stages[index].stage_id = slot->program.stages[index].stage_id;
-    result.stages[index].semantic = slot->program.stages[index].semantic;
-    result.stages[index].reason = executor_result.stages[index].reason;
-    result.stages[index].elapsed_ns =
-        executor_result.stages[index].elapsed_ns;
-    if (executor_result.stages[index].succeeded) {
-      result.stages[index].status = StageExecutionStatus::succeeded;
-      result.stages[index].valid_output_preserved = true;
-    } else if (slot->program.stages[index].required) {
-      result.stages[index].status = StageExecutionStatus::required_failed;
-    } else {
-      result.stages[index].status =
-          StageExecutionStatus::optional_failed_open;
-      result.stages[index].valid_output_preserved =
-          executor_result.output_written;
-    }
-  }
-
   if (executor_result.device_lost ||
       executor_result.reason == ReasonId::device_lost) {
     slot->quarantined = true;
@@ -576,11 +707,42 @@ hal::ExecuteResult VulkanHalResidentAdapter::Execute(
     result.reason = ReasonId::device_lost;
     return result;
   }
-  if (executor_result.stage_count != slot->program.stage_count) {
+  if (executor_result.stage_count != execution_program.stage_count ||
+      executor_result.stage_count > executor_result.stages.size()) {
     result.status = StatusId::failed;
     result.reason = ReasonId::malformed_contract;
     return result;
   }
+
+  result.stage_count = slot->program.stage_count;
+  std::size_t executed_index = 0;
+  for (std::size_t index = 0; index < result.stage_count; ++index) {
+    result.stages[index].stage_id = slot->program.stages[index].stage_id;
+    result.stages[index].semantic = slot->program.stages[index].semantic;
+    result.stages[index].primitive = slot->program.stages[index].primitive;
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & bit) != 0) {
+      result.stages[index].status = StageExecutionStatus::disabled_preserved;
+      result.stages[index].reason = ReasonId::circuit_breaker_open;
+      result.stages[index].valid_output_preserved = true;
+      result.stages[index].elapsed_ns = 0;
+      continue;
+    }
+    const auto &executor_stage = executor_result.stages[executed_index++];
+    result.stages[index].reason = executor_stage.reason;
+    result.stages[index].elapsed_ns = executor_stage.elapsed_ns;
+    if (executor_stage.succeeded) {
+      result.stages[index].status = StageExecutionStatus::succeeded;
+      result.stages[index].valid_output_preserved = true;
+    } else if (slot->program.stages[index].required) {
+      result.stages[index].status = StageExecutionStatus::required_failed;
+    } else {
+      result.stages[index].status = StageExecutionStatus::optional_failed_open;
+      result.stages[index].valid_output_preserved =
+          executor_result.output_written;
+    }
+  }
+
   if (executor_result.status != StatusId::executed) {
     result.status = executor_result.status;
     result.reason = executor_result.reason;
@@ -614,53 +776,108 @@ hal::ExecuteResult VulkanHalResidentAdapter::Execute(
     return result;
   }
 
-  const auto &output_descriptor =
-      slot->program.stages[slot->program.stage_count - 1].output.image;
-  ResourceHandle output;
-  output.resource_id = NextNonzero(&next_resource_id_);
-  output.allocator_owner_id = adapter_instance_id_;
-  output.lifetime_generation =
-      slot->program.execution_domain.logical_context_generation;
-  output.memory_domain = MemoryDomain::readback_staging;
-  output.lifetime = ResourceLifetime::frame_borrowed;
-  output.synchronization_state = SynchronizationState::ready;
-  output.execution_domain = slot->program.execution_domain;
-  output.size_bytes = RequiredImageSpan(output_descriptor);
-  if (output.size_bytes == 0 ||
-      output.size_bytes > slot->program.budget.readback_staging_bytes) {
-    result.status = StatusId::resource_exhausted;
-    result.reason = ReasonId::resource_exhausted;
-    return result;
-  }
-  output.alignment_bytes = output_descriptor.base_alignment_bytes;
-  output.mutable_resource = true;
-  output.aliasable = slot->binding_resource.aliasable;
-  output.adapter_opaque = {
-      slot->handle.handle_id, output.resource_id,
-      static_cast<std::uint64_t>(
-          reinterpret_cast<std::uintptr_t>(slot->binding.input)),
-      static_cast<std::uint64_t>(
-          reinterpret_cast<std::uintptr_t>(slot->binding.output))};
   if (!hal::ValidateResourceHandle(
-          output, slot->program.execution_domain,
+          slot->binding_output_resource, slot->program.execution_domain,
           slot->program.execution_domain.logical_context_generation,
-          slot->program.budget)) {
+          slot->program.budget) ||
+      slot->binding_output_resource.memory_domain !=
+          MemoryDomain::readback_staging ||
+      slot->binding_output_resource.lifetime !=
+          ResourceLifetime::frame_borrowed ||
+      slot->binding_output_resource.adapter_opaque[0] !=
+          slot->handle.handle_id ||
+      slot->binding_output_resource.adapter_opaque[1] !=
+          request.capture_sequence ||
+      slot->binding_output_resource.adapter_opaque[2] != slot->binding_id ||
+      slot->binding_output_resource.adapter_opaque[3] != 2) {
     result.status = StatusId::failed;
     result.reason = ReasonId::invalid_resource;
     return result;
   }
 
   result.status = optional_failed ? StatusId::degraded : StatusId::executed;
-  result.reason = optional_failed ? ReasonId::optional_stage_failed_open
-                                  : ReasonId::none;
-  result.output = output;
+  result.reason =
+      optional_failed ? ReasonId::optional_stage_failed_open : ReasonId::none;
+  result.output = slot->binding_output_resource;
   result.output_valid = true;
   result.completion.token_id = NextNonzero(&next_completion_id_);
   result.completion.program_id = slot->program.program_id;
   result.completion.adapter_instance_id = adapter_instance_id_;
   result.completion.capture_sequence = request.capture_sequence;
   result.completion.complete = true;
+  slot->completed_token = result.completion;
+  slot->output_ready = true;
   return result;
+}
+
+StatusId VulkanHalResidentAdapter::ResolveHostFrameOutput(
+    const hal::PreparedProgramHandle &program,
+    const hal::CompletionToken &completion, const ResourceHandle &output,
+    hal::HostFrameOutputResolution *resolution, ReasonId *reason) noexcept {
+  if (resolution)
+    *resolution = {};
+  SetReason(reason, ReasonId::none);
+  if (shutdown_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  PreparedSlot *slot = FindSlot(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (!resolution || !slot->output_ready) {
+    SetReason(reason, resolution ? ReasonId::output_not_committed
+                                 : ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  if (completion.token_id == 0 || !completion.complete ||
+      completion.token_id != slot->completed_token.token_id ||
+      completion.program_id != slot->completed_token.program_id ||
+      completion.adapter_instance_id !=
+          slot->completed_token.adapter_instance_id ||
+      completion.capture_sequence != slot->completed_token.capture_sequence) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  if (output.execution_domain != slot->program.execution_domain) {
+    SetReason(reason, ReasonId::wrong_execution_domain);
+    return StatusId::blocked;
+  }
+  if (output.lifetime_generation !=
+      slot->program.execution_domain.logical_context_generation) {
+    SetReason(reason, ReasonId::wrong_generation);
+    return StatusId::blocked;
+  }
+  if (!ResourceMatches(output, slot->binding_output_resource) ||
+      output.memory_domain != MemoryDomain::readback_staging ||
+      output.lifetime != ResourceLifetime::frame_borrowed ||
+      output.adapter_opaque[0] != slot->handle.handle_id ||
+      output.adapter_opaque[1] != completion.capture_sequence ||
+      output.adapter_opaque[2] != slot->binding_id ||
+      output.adapter_opaque[3] != 2) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  ReasonId validation_reason = ReasonId::none;
+  if (!hal::ValidateHostFrameBinding(slot->host_binding, slot->program,
+                                     &validation_reason) ||
+      slot->host_binding.capture_sequence != completion.capture_sequence) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  resolution->descriptor = slot->host_binding.output_descriptor;
+  resolution->planes = slot->host_binding.output_planes;
+  resolution->plane_count = slot->host_binding.output_plane_count;
+  resolution->capture_sequence = slot->host_binding.capture_sequence;
+  resolution->output_ready = true;
+  return StatusId::ready;
 }
 
 StatusId VulkanHalResidentAdapter::ResetTemporalState(
@@ -693,8 +910,7 @@ void VulkanHalResidentAdapter::Shutdown() noexcept {
   shutdown_ = true;
 }
 
-VulkanHalResidentAdapter::PreparedSlot *
-VulkanHalResidentAdapter::FindSlot(
+VulkanHalResidentAdapter::PreparedSlot *VulkanHalResidentAdapter::FindSlot(
     const hal::PreparedProgramHandle &program) noexcept {
   for (auto &slot : slots_) {
     if (slot.occupied && slot.handle.handle_id == program.handle_id &&

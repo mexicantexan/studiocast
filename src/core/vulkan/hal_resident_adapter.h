@@ -93,11 +93,14 @@ public:
 
   [[nodiscard]] virtual VulkanResidentCapabilityEvidence
   CapabilityEvidence() const noexcept = 0;
-  virtual hal::StatusId
-  Prepare(const hal::PreparedProgram &program,
-          const VulkanResidentProgramOptions &options,
-          VulkanExecutorPreparedProgram *prepared,
-          hal::ReasonId *reason) noexcept = 0;
+  virtual hal::StatusId Prepare(const hal::PreparedProgram &program,
+                                const VulkanResidentProgramOptions &options,
+                                VulkanExecutorPreparedProgram *prepared,
+                                hal::ReasonId *reason) noexcept = 0;
+  // `program` is the ordered active-stage subset for this frame. Circuit
+  // breakers may omit optional stages, including all stages; the executor must
+  // still perform the prepared upload/final-readback preservation transport
+  // for a zero-stage program without rebuilding or allocating.
   virtual VulkanExecutorResult
   Execute(const VulkanExecutorPreparedProgram &prepared,
           const hal::PreparedProgram &program,
@@ -133,10 +136,11 @@ public:
   // Creates an adapter-owned, one-in-flight frame binding without allocation.
   // The returned resource is the explicit upload boundary consumed by
   // PreparedProgramSession::Execute.
-  [[nodiscard]] hal::StatusId
-  BindFrame(std::uint64_t program_id, std::uint64_t capture_sequence,
-            const VulkanHostFrameBinding &binding, hal::ResourceHandle *input,
-            hal::ReasonId *reason) noexcept;
+  [[nodiscard]] hal::StatusId BindFrame(std::uint64_t program_id,
+                                        std::uint64_t capture_sequence,
+                                        const VulkanHostFrameBinding &binding,
+                                        hal::ResourceHandle *input,
+                                        hal::ReasonId *reason) noexcept;
 
   hal::StatusId Prepare(const hal::PreparedProgram &program,
                         hal::PreparedProgramHandle *candidate,
@@ -145,11 +149,19 @@ public:
   hal::ExecuteResult
   Execute(const hal::PreparedProgramHandle &program,
           const hal::ExecuteRequest &request) noexcept override;
+  hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &program,
+                                   hal::ReasonId reason) noexcept override;
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override;
   hal::StatusId
-  ResetTemporalState(const hal::PreparedProgramHandle &program,
-                     hal::ReasonId reason) noexcept override;
-  void
-  DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override;
+  ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &output,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override;
+  void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override;
   void Shutdown() noexcept override;
 
 private:
@@ -157,19 +169,30 @@ private:
     bool occupied = false;
     bool quarantined = false;
     bool binding_armed = false;
+    bool neutral_binding = false;
     bool executing = false;
     hal::PreparedProgram program{};
     hal::PreparedProgramHandle handle{};
     VulkanResidentProgramOptions options{};
     VulkanExecutorPreparedProgram executor_program{};
     VulkanHostFrameBinding binding{};
+    hal::HostFrameBinding host_binding{};
     hal::ResourceHandle binding_resource{};
+    hal::ResourceHandle binding_output_resource{};
+    hal::CompletionToken completed_token{};
     std::uint64_t binding_capture_sequence = 0;
+    std::uint64_t binding_id = 0;
+    bool output_ready = false;
   };
 
   [[nodiscard]] PreparedSlot *
   FindSlot(const hal::PreparedProgramHandle &program) noexcept;
   [[nodiscard]] PreparedSlot *FindSlot(std::uint64_t program_id) noexcept;
+  [[nodiscard]] hal::StatusId ArmHostFrame(PreparedSlot *slot,
+                                           const hal::HostFrameBinding &binding,
+                                           bool neutral_binding,
+                                           hal::HostFrameTokens *tokens,
+                                           hal::ReasonId *reason) noexcept;
   void ReleaseSlot(PreparedSlot *slot) noexcept;
 
   std::uint64_t adapter_instance_id_ = 0;
@@ -181,6 +204,7 @@ private:
   std::uint64_t next_handle_id_ = 1;
   std::uint64_t next_resource_id_ = 1;
   std::uint64_t next_completion_id_ = 1;
+  std::uint64_t next_binding_id_ = 1;
 };
 
 } // namespace studiocast::vulkan
