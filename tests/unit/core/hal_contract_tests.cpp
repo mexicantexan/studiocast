@@ -78,6 +78,15 @@ ImageDescriptor RgbDescriptor() {
   return descriptor;
 }
 
+ImageDescriptor HostRgbDescriptor(Mutability mutability) {
+  ImageDescriptor descriptor = RgbDescriptor();
+  descriptor.host_coherence = HostCoherence::coherent;
+  descriptor.mutability = mutability;
+  descriptor.base_alignment_bytes = 256;
+  descriptor.planes[0].alignment_bytes = 256;
+  return descriptor;
+}
+
 PreparedProgram Program(std::uint64_t program_id = 100,
                         std::uint64_t adapter = 77,
                         std::uint64_t config_generation = 1) {
@@ -85,6 +94,8 @@ PreparedProgram Program(std::uint64_t program_id = 100,
   program.program_id = program_id;
   program.owner_adapter_instance_id = adapter;
   program.execution_domain = Domain(adapter);
+  program.host_input = HostRgbDescriptor(Mutability::read_only);
+  program.host_output = HostRgbDescriptor(Mutability::write_only);
   program.invalidation_key.generations.configuration = config_generation;
   program.invalidation_key.generations.geometry = 1;
   program.invalidation_key.generations.model = 1;
@@ -456,6 +467,34 @@ bool TestMalformedCrossAdapterAndExhaustion() {
                     reason == ReasonId::resource_exhausted,
                 "stage scratch exhaustion was not rejected");
 
+  auto missing_host_boundary = program;
+  missing_host_boundary.host_input = {};
+  ok &= Require(!ValidatePreparedProgram(missing_host_boundary, &reason) &&
+                    reason == ReasonId::malformed_descriptor,
+                "missing host input boundary was accepted");
+
+  auto resident_as_host = program;
+  resident_as_host.host_input = program.stages[0].input.image;
+  resident_as_host.host_input.mutability = Mutability::read_only;
+  ok &= Require(!ValidatePreparedProgram(resident_as_host, &reason) &&
+                    reason == ReasonId::malformed_descriptor,
+                "device-resident descriptor was accepted as a host boundary");
+
+  auto wrong_host_geometry = program;
+  ++wrong_host_geometry.host_output.width;
+  ++wrong_host_geometry.host_output.planes[0].width;
+  ok &= Require(
+      !ValidatePreparedProgram(wrong_host_geometry, &reason) &&
+          reason == ReasonId::malformed_descriptor,
+      "host boundary geometry unrelated to the resident edge was accepted");
+
+  auto exhausted_host_boundary = program;
+  exhausted_host_boundary.budget.upload_staging_bytes =
+      exhausted_host_boundary.host_input.planes[0].size_bytes - 1;
+  ok &= Require(!ValidatePreparedProgram(exhausted_host_boundary, &reason) &&
+                    reason == ReasonId::resource_exhausted,
+                "host boundary exceeded its transport budget");
+
   auto primitive = program;
   primitive.stages[1].semantic = SemanticEffectId::invalid;
   primitive.stages[1].primitive = PrimitiveOperationId::mirror;
@@ -646,9 +685,8 @@ bool TestNeutralHostBindingAndTransportZeros() {
   bool ok = Configure(&session, &adapter, program);
 
   HostFrameBinding binding;
-  binding.input_descriptor = program.stages[0].input.image;
-  binding.output_descriptor =
-      program.stages[program.stage_count - 1].output.image;
+  binding.input_descriptor = program.host_input;
+  binding.output_descriptor = program.host_output;
   binding.input_plane_count = 1;
   binding.output_plane_count = 1;
   binding.capture_sequence = 1;
@@ -667,6 +705,14 @@ bool TestNeutralHostBindingAndTransportZeros() {
                         StatusId::blocked &&
                     reason == ReasonId::host_frame_binding_invalid,
                 "malformed host stride was accepted");
+  auto resident_descriptor = binding;
+  resident_descriptor.input_descriptor = program.stages[0].input.image;
+  resident_descriptor.input_descriptor.mutability = Mutability::read_only;
+  ok &=
+      Require(session.BindHostFrame(resident_descriptor, &tokens, &reason) ==
+                      StatusId::blocked &&
+                  reason == ReasonId::host_frame_binding_invalid,
+              "resident descriptor was accepted at the host binding boundary");
   ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
                     StatusId::ready,
                 "valid bounded host binding was rejected");

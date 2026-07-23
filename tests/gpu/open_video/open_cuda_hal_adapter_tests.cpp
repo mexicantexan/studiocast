@@ -58,6 +58,13 @@ hal::ImageDescriptor Image() {
   return descriptor;
 }
 
+hal::ImageDescriptor HostImage(hal::Mutability mutability) {
+  hal::ImageDescriptor descriptor = Image();
+  descriptor.host_coherence = hal::HostCoherence::coherent;
+  descriptor.mutability = mutability;
+  return descriptor;
+}
+
 hal::ModelArtifactIdentity Model(std::uint8_t key = 1) {
   hal::ModelArtifactIdentity model;
   model.model_id_hash[0] = key;
@@ -78,6 +85,7 @@ Stage(std::uint32_t stage_id, hal::SemanticEffectId semantic,
   stage.execution_domain = Domain();
   stage.input.kind = hal::StageIoKind::image;
   stage.input.image = Image();
+  stage.input.image.mutability = hal::Mutability::read_only;
   stage.output.kind = hal::StageIoKind::image;
   stage.output.image = Image();
   stage.model = Model(static_cast<std::uint8_t>(stage_id));
@@ -97,6 +105,8 @@ hal::PreparedProgram Program(std::uint64_t id = 101) {
   program.program_id = id;
   program.owner_adapter_instance_id = 81;
   program.execution_domain = Domain();
+  program.host_input = HostImage(hal::Mutability::read_only);
+  program.host_output = HostImage(hal::Mutability::write_only);
   program.invalidation_key.generations = {
       .configuration = 1,
       .geometry = 2,
@@ -162,9 +172,8 @@ hal::HostFrameBinding HostBinding(const hal::PreparedProgram &program,
                                   const std::byte *input, std::byte *output,
                                   std::uint64_t sequence) {
   hal::HostFrameBinding binding;
-  binding.input_descriptor = program.stages[0].input.image;
-  binding.output_descriptor =
-      program.stages[program.stage_count - 1].output.image;
+  binding.input_descriptor = program.host_input;
+  binding.output_descriptor = program.host_output;
   binding.input_plane_count = 1;
   binding.output_plane_count = 1;
   binding.capture_sequence = sequence;
@@ -639,6 +648,21 @@ bool TestMalformedAndForeignProgramsFailClosed() {
   }
   {
     auto program = Program();
+    program.host_input = program.stages[0].input.image;
+    program.host_input.mutability = hal::Mutability::read_only;
+    const std::uint64_t prepare_calls_before = executor.prepare_calls;
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
+                          hal::StatusId::blocked &&
+                      reason == hal::ReasonId::malformed_descriptor &&
+                      executor.prepare_calls == prepare_calls_before,
+                  "device-local CUDA descriptor must not qualify as a host "
+                  "transport boundary");
+  }
+  {
+    auto program = Program();
     program.stages[1] = Stage(2, hal::SemanticEffectId::virtual_key_light);
     program.stages[1].model = Model(9);
     program.stage_count = 2;
@@ -941,6 +965,14 @@ bool TestHostBindingRejectsMalformedForeignAndExhaustedTokens() {
                     reason == hal::ReasonId::host_frame_binding_invalid &&
                     executor.bind_calls == 0,
                 "malformed host descriptors must fail before executor binding");
+  malformed = binding;
+  malformed.input_descriptor = program.stages[0].input.image;
+  malformed.input_descriptor.mutability = hal::Mutability::read_only;
+  ok &= Require(adapter.BindHostFrame(handle, malformed, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::host_frame_binding_invalid &&
+                    executor.bind_calls == 0,
+                "resident CUDA descriptor must not bind borrowed host storage");
 
   executor.bind_wrong_domain = true;
   ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==

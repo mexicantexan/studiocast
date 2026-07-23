@@ -109,6 +109,12 @@ ImageDescriptor FrameDescriptor(Mutability mutability) {
   return descriptor;
 }
 
+ImageDescriptor HostFrameDescriptor(Mutability mutability) {
+  ImageDescriptor descriptor = FrameDescriptor(mutability);
+  descriptor.host_coherence = HostCoherence::coherent;
+  return descriptor;
+}
+
 studiocast::hal::ExecutionDomainId
 Domain(std::uint64_t adapter_id = kAdapterId,
        std::uint64_t context_generation = 7) {
@@ -135,6 +141,8 @@ PreparedProgram Program(std::uint64_t program_id = 100, bool vignette = true,
   program.program_id = program_id;
   program.owner_adapter_instance_id = kAdapterId;
   program.execution_domain = Domain();
+  program.host_input = HostFrameDescriptor(Mutability::read_only);
+  program.host_output = HostFrameDescriptor(Mutability::write_only);
   program.requested_backend = BackendId::vulkan;
   program.strict_backend_selection = true;
   program.invalidation_key.generations.configuration = program_id;
@@ -341,9 +349,8 @@ HostFrameBinding CommonBinding(const PreparedProgram &program,
                                std::array<std::uint8_t, kFrameBytes> &output,
                                std::uint64_t capture_sequence) {
   HostFrameBinding binding;
-  binding.input_descriptor = program.stages[0].input.image;
-  binding.output_descriptor =
-      program.stages[program.stage_count - 1].output.image;
+  binding.input_descriptor = program.host_input;
+  binding.output_descriptor = program.host_output;
   binding.input_plane_count = 1;
   binding.output_plane_count = 1;
   binding.input_planes[0].read_data =
@@ -441,7 +448,7 @@ bool TestPreparedExecutionAndCommittedAttribution() {
           resolution.output_ready && resolution.capture_sequence == 1 &&
           resolution.descriptor.width == 2 &&
           resolution.descriptor.height == 2 &&
-          resolution.descriptor.mutability == Mutability::read_write &&
+          resolution.descriptor.mutability == Mutability::write_only &&
           resolution.plane_count == 1 &&
           resolution.planes[0].write_data ==
               reinterpret_cast<std::byte *>(output.data()) &&
@@ -670,6 +677,13 @@ bool TestNeutralBindingAdversarialValidation() {
                     executor.execute_calls == 0,
                 "neutral descriptor mutation must fail before adapter "
                 "execution");
+  malformed = CommonBinding(program, input, output, 1);
+  malformed.input_descriptor = program.stages[0].input.image;
+  ok &= Require(
+      session.BindHostFrame(malformed, &tokens, &reason) == StatusId::blocked &&
+          reason == ReasonId::host_frame_binding_invalid &&
+          executor.execute_calls == 0,
+      "resident Vulkan descriptor must not bind borrowed host storage");
 
   ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
                                       &tokens, &reason) == StatusId::ready,
@@ -954,6 +968,24 @@ bool TestImageSequenceAndBoundaryBudgetValidation() {
                       executor.prepare_calls == 0,
                   "Vulkan production adapter must reject non-RGB image "
                   "contracts even when generically valid");
+  }
+  {
+    FakeQualifiedExecutor executor;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    PreparedProgramSession session;
+    PreparedProgram program = Program(4501);
+    program.host_input = program.stages[0].input.image;
+    program.host_input.mutability = Mutability::read_only;
+    ok &= Require(adapter.SetProgramOptions(Options(program)),
+                  "host-boundary rejection options should bind");
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
+                          StatusId::blocked &&
+                      reason == ReasonId::malformed_descriptor &&
+                      executor.prepare_calls == 0,
+                  "device-local Vulkan descriptor must not qualify as a host "
+                  "transport boundary");
   }
   {
     FakeQualifiedExecutor executor;

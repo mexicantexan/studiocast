@@ -137,6 +137,28 @@ bool SameImageDescriptor(const ImageDescriptor &left,
          left.in_place_permitted == right.in_place_permitted;
 }
 
+bool ValidHostBoundaryDescriptor(const ImageDescriptor &descriptor,
+                                 Mutability mutability) noexcept {
+  return ValidateImageDescriptor(descriptor) &&
+         descriptor.host_coherence == HostCoherence::coherent &&
+         descriptor.mutability == mutability &&
+         descriptor.aliasing == AliasingPermission::forbidden &&
+         !descriptor.in_place_permitted;
+}
+
+std::uint64_t RequiredImageSpan(const ImageDescriptor &descriptor) noexcept {
+  std::uint64_t required = 0;
+  for (std::size_t index = 0; index < descriptor.plane_count; ++index) {
+    const auto &plane = descriptor.planes[index];
+    if (plane.offset_bytes >
+        std::numeric_limits<std::uint64_t>::max() - plane.size_bytes) {
+      return 0;
+    }
+    required = std::max(required, plane.offset_bytes + plane.size_bytes);
+  }
+  return required;
+}
+
 bool SameResourceToken(const ResourceHandle &left,
                        const ResourceHandle &right) noexcept {
   return left.resource_id == right.resource_id &&
@@ -358,6 +380,28 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
     return false;
   }
 
+  const std::uint64_t host_input_bytes = RequiredImageSpan(program.host_input);
+  const std::uint64_t host_output_bytes =
+      RequiredImageSpan(program.host_output);
+  const std::uint64_t input_boundary_budget =
+      program.requires_upload ? program.budget.upload_staging_bytes
+                              : program.budget.persistent_bytes;
+  const std::uint64_t output_boundary_budget =
+      program.requires_final_readback ? program.budget.readback_staging_bytes
+                                      : program.budget.persistent_bytes;
+  if (!ValidHostBoundaryDescriptor(program.host_input, Mutability::read_only) ||
+      !ValidHostBoundaryDescriptor(program.host_output,
+                                   Mutability::write_only) ||
+      host_input_bytes == 0 || host_output_bytes == 0 ||
+      host_input_bytes > input_boundary_budget ||
+      host_output_bytes > output_boundary_budget) {
+    SetReason(reason, host_input_bytes > input_boundary_budget ||
+                              host_output_bytes > output_boundary_budget
+                          ? ReasonId::resource_exhausted
+                          : ReasonId::malformed_descriptor);
+    return false;
+  }
+
   std::uint32_t previous_stage_id = 0;
   std::uint64_t stage_scratch = 0;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
@@ -429,6 +473,19 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
     SetReason(reason, ReasonId::resource_exhausted);
     return false;
   }
+  const auto &first_input = program.stages[0].input;
+  const auto &last_output = program.stages[program.stage_count - 1].output;
+  if ((first_input.kind == StageIoKind::image &&
+       (program.host_input.width != first_input.image.width ||
+        program.host_input.height != first_input.image.height ||
+        program.host_input.orientation != first_input.image.orientation)) ||
+      (last_output.kind == StageIoKind::image &&
+       (program.host_output.width != last_output.image.width ||
+        program.host_output.height != last_output.image.height ||
+        program.host_output.orientation != last_output.image.orientation))) {
+    SetReason(reason, ReasonId::malformed_descriptor);
+    return false;
+  }
   std::uint32_t previous_boundary_index = 0;
   bool have_boundary = false;
   std::uint64_t cpu_tail_scratch = 0;
@@ -478,22 +535,15 @@ bool ValidateHostFrameBinding(const HostFrameBinding &binding,
                               const PreparedProgram &program,
                               ReasonId *reason) noexcept {
   SetReason(reason, ReasonId::none);
-  if (program.stage_count == 0 ||
-      program.stages[0].input.kind != StageIoKind::image ||
-      program.stages[program.stage_count - 1].output.kind !=
-          StageIoKind::image ||
-      binding.capture_sequence == 0 ||
+  if (program.stage_count == 0 || binding.capture_sequence == 0 ||
       binding.ownership != OwnershipModel::borrowed_until_completion ||
       binding.lifetime != ResourceLifetime::frame_borrowed ||
       binding.input_plane_count != binding.input_descriptor.plane_count ||
       binding.output_plane_count != binding.output_descriptor.plane_count ||
       binding.input_plane_count > binding.input_planes.size() ||
       binding.output_plane_count > binding.output_planes.size() ||
-      !SameImageDescriptor(binding.input_descriptor,
-                           program.stages[0].input.image) ||
-      !SameImageDescriptor(
-          binding.output_descriptor,
-          program.stages[program.stage_count - 1].output.image)) {
+      !SameImageDescriptor(binding.input_descriptor, program.host_input) ||
+      !SameImageDescriptor(binding.output_descriptor, program.host_output)) {
     SetReason(reason, ReasonId::host_frame_binding_invalid);
     return false;
   }

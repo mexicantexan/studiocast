@@ -83,6 +83,17 @@ hal::ImageDescriptor ResidentImageDescriptor() {
   return image;
 }
 
+hal::ImageDescriptor HostImageDescriptor(hal::PixelFormat format,
+                                         hal::ChannelOrder channel_order,
+                                         hal::Mutability mutability) {
+  hal::ImageDescriptor image = ResidentImageDescriptor();
+  image.format = format;
+  image.channel_order = channel_order;
+  image.host_coherence = hal::HostCoherence::coherent;
+  image.mutability = mutability;
+  return image;
+}
+
 hal::PreparedStage Stage(std::uint32_t id, hal::SemanticEffectId semantic,
                          hal::SemanticEffectProviderId provider,
                          bool required) {
@@ -94,7 +105,9 @@ hal::PreparedStage Stage(std::uint32_t id, hal::SemanticEffectId semantic,
   stage.execution_domain = Domain();
   stage.input.kind = hal::StageIoKind::image;
   stage.input.image = ResidentImageDescriptor();
+  stage.input.image.mutability = hal::Mutability::read_only;
   stage.output = stage.input;
+  stage.output.image.mutability = hal::Mutability::read_write;
   stage.required = required;
   stage.failure_action =
       required ? hal::FailureAction::fail_closed
@@ -114,6 +127,12 @@ hal::PreparedProgram Program() {
   program.program_id = 71;
   program.owner_adapter_instance_id = kAdapterId;
   program.execution_domain = Domain();
+  program.host_input =
+      HostImageDescriptor(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+                          hal::Mutability::read_only);
+  program.host_output =
+      HostImageDescriptor(hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+                          hal::Mutability::write_only);
   program.requested_backend = hal::BackendId::maxine;
   program.strict_backend_selection = true;
   program.invalidation_key.generations =
@@ -243,9 +262,8 @@ struct NeutralHostFixture {
   hal::HostFrameBinding Binding(const hal::PreparedProgram &program,
                                 std::uint64_t capture_sequence) {
     hal::HostFrameBinding binding{};
-    binding.input_descriptor = program.stages[0].input.image;
-    binding.output_descriptor =
-        program.stages[program.stage_count - 1].output.image;
+    binding.input_descriptor = program.host_input;
+    binding.output_descriptor = program.host_output;
     binding.input_planes[0].read_data =
         reinterpret_cast<const std::byte *>(input.data());
     binding.input_planes[0].span_bytes =
@@ -544,6 +562,21 @@ bool StrictBackendProviderDomainAndGenerationReject() {
   auto malformed_descriptor = Program();
   malformed_descriptor.stages[0].input.image.planes[0].size_bytes = 1;
   CHECK(adapter.Prepare(malformed_descriptor, &handle, &readiness, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::malformed_descriptor);
+
+  auto resident_host_boundary = Program();
+  resident_host_boundary.host_input =
+      resident_host_boundary.stages[0].input.image;
+  resident_host_boundary.host_input.mutability = hal::Mutability::read_only;
+  CHECK(adapter.Prepare(resident_host_boundary, &handle, &readiness, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::malformed_descriptor);
+
+  auto wrong_host_output = Program();
+  wrong_host_output.host_output.format = hal::PixelFormat::rgb_u8;
+  wrong_host_output.host_output.channel_order = hal::ChannelOrder::rgb;
+  CHECK(adapter.Prepare(wrong_host_output, &handle, &readiness, &reason) ==
         hal::StatusId::blocked);
   CHECK(reason == hal::ReasonId::malformed_descriptor);
 
@@ -877,6 +910,12 @@ bool NeutralHostBindingExecutesAndResolvesExactOutput() {
 
   auto malformed = host.Binding(program, 18);
   ++malformed.input_descriptor.width;
+  CHECK(session.BindHostFrame(malformed, &tokens, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::host_frame_binding_invalid);
+  malformed = host.Binding(program, 18);
+  malformed.input_descriptor = program.stages[0].input.image;
+  malformed.input_descriptor.mutability = hal::Mutability::read_only;
   CHECK(session.BindHostFrame(malformed, &tokens, &reason) ==
         hal::StatusId::blocked);
   CHECK(reason == hal::ReasonId::host_frame_binding_invalid);

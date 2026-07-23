@@ -110,6 +110,53 @@ bool ExactCudaDomain(const ExecutionDomainId &domain,
          domain.adapter_instance_id == adapter_id;
 }
 
+bool ExactRgbImage(const ImageDescriptor &descriptor, HostCoherence coherence,
+                   Mutability mutability) noexcept {
+  if (!ValidateImageDescriptor(descriptor) || descriptor.plane_count != 1 ||
+      descriptor.format != PixelFormat::rgb_u8 ||
+      descriptor.channel_order != ChannelOrder::rgb ||
+      descriptor.color_space != ColorSpace::srgb ||
+      descriptor.color_range != ColorRange::full ||
+      descriptor.alpha_meaning != AlphaMeaning::none ||
+      descriptor.orientation != Orientation::top_left ||
+      descriptor.host_coherence != coherence ||
+      descriptor.mutability != mutability ||
+      descriptor.aliasing != AliasingPermission::forbidden ||
+      descriptor.in_place_permitted) {
+    return false;
+  }
+  const auto &plane = descriptor.planes[0];
+  return plane.offset_bytes == 0 && plane.width == descriptor.width &&
+         plane.height == descriptor.height &&
+         plane.row_stride_bytes >=
+             static_cast<std::uint64_t>(descriptor.width) * 3u &&
+         plane.row_stride_bytes <=
+             std::numeric_limits<std::uint64_t>::max() / plane.height &&
+         plane.size_bytes ==
+             plane.row_stride_bytes * static_cast<std::uint64_t>(plane.height);
+}
+
+bool ExactCudaProgramImages(const PreparedProgram &program) noexcept {
+  if (!ExactRgbImage(program.host_input, HostCoherence::coherent,
+                     Mutability::read_only) ||
+      !ExactRgbImage(program.host_output, HostCoherence::coherent,
+                     Mutability::write_only)) {
+    return false;
+  }
+  for (std::size_t index = 0; index < program.stage_count; ++index) {
+    const auto &stage = program.stages[index];
+    if (stage.input.kind != StageIoKind::image ||
+        stage.output.kind != StageIoKind::image ||
+        !ExactRgbImage(stage.input.image, HostCoherence::not_host_visible,
+                       Mutability::read_only) ||
+        !ExactRgbImage(stage.output.image, HostCoherence::not_host_visible,
+                       Mutability::read_write)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool CompleteCapability(const ResidentCapabilityFacts &facts) noexcept {
   return facts.cuda_driver_ready && facts.stable_device_identity &&
          facts.exact_context_generation && facts.adapter_owned_allocator &&
@@ -496,6 +543,10 @@ StatusId ResidentAdapter::Prepare(const PreparedProgram &program,
     return validation_reason == ReasonId::resource_exhausted
                ? StatusId::resource_exhausted
                : StatusId::blocked;
+  }
+  if (!ExactCudaProgramImages(program)) {
+    SetReason(reason, ReasonId::malformed_descriptor);
+    return StatusId::blocked;
   }
   if (!ExactCudaDomain(program.execution_domain, adapter_instance_id_) ||
       program.owner_adapter_instance_id != adapter_instance_id_) {

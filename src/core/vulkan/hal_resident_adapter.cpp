@@ -90,6 +90,33 @@ bool IsExactProductionRgbImage(const hal::ImageDescriptor &descriptor,
          plane.alignment_bytes <= descriptor.base_alignment_bytes;
 }
 
+bool IsExactHostRgbImage(const hal::ImageDescriptor &descriptor,
+                         hal::Mutability mutability) noexcept {
+  if (!hal::ValidateImageDescriptor(descriptor) ||
+      descriptor.plane_count != 1 ||
+      descriptor.format != hal::PixelFormat::rgb_u8 ||
+      descriptor.channel_order != hal::ChannelOrder::rgb ||
+      descriptor.color_space != hal::ColorSpace::srgb ||
+      descriptor.color_range != hal::ColorRange::full ||
+      descriptor.alpha_meaning != hal::AlphaMeaning::none ||
+      descriptor.orientation != hal::Orientation::top_left ||
+      descriptor.host_coherence != hal::HostCoherence::coherent ||
+      descriptor.mutability != mutability ||
+      descriptor.aliasing != hal::AliasingPermission::forbidden ||
+      descriptor.in_place_permitted) {
+    return false;
+  }
+  const auto &plane = descriptor.planes[0];
+  return plane.offset_bytes == 0 && plane.width == descriptor.width &&
+         plane.height == descriptor.height &&
+         plane.row_stride_bytes >=
+             static_cast<std::uint64_t>(descriptor.width) * 3u &&
+         plane.row_stride_bytes <=
+             std::numeric_limits<std::uint64_t>::max() / plane.height &&
+         plane.size_bytes ==
+             plane.row_stride_bytes * static_cast<std::uint64_t>(plane.height);
+}
+
 bool SameImageStorage(const hal::ImageDescriptor &lhs,
                       const hal::ImageDescriptor &rhs) noexcept {
   if (lhs.width != rhs.width || lhs.height != rhs.height ||
@@ -258,6 +285,10 @@ StatusId VulkanHalResidentAdapter::Prepare(
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   if (program.cpu_tail_count != 0)
     return fail(StatusId::blocked, ReasonId::cpu_tail_required);
+  if (!IsExactHostRgbImage(program.host_input, hal::Mutability::read_only) ||
+      !IsExactHostRgbImage(program.host_output, hal::Mutability::write_only)) {
+    return fail(StatusId::blocked, ReasonId::malformed_descriptor);
+  }
   if (!pending_options_valid_ ||
       pending_options_.program_id != program.program_id ||
       pending_options_.canonical_plan_hash !=
@@ -318,10 +349,9 @@ StatusId VulkanHalResidentAdapter::Prepare(
                           VulkanVignetteCenterMode::fixed_frame_center) {
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   }
-  const std::uint64_t required_upload =
-      RequiredImageSpan(program.stages[0].input.image);
+  const std::uint64_t required_upload = RequiredImageSpan(program.host_input);
   const std::uint64_t required_readback =
-      RequiredImageSpan(program.stages[program.stage_count - 1].output.image);
+      RequiredImageSpan(program.host_output);
   if (required_upload == 0 || required_readback == 0 ||
       required_upload > program.budget.upload_staging_bytes ||
       required_readback > program.budget.readback_staging_bytes) {
@@ -427,9 +457,8 @@ StatusId VulkanHalResidentAdapter::BindFrame(
   }
 
   hal::HostFrameBinding host_binding;
-  host_binding.input_descriptor = slot->program.stages[0].input.image;
-  host_binding.output_descriptor =
-      slot->program.stages[slot->program.stage_count - 1].output.image;
+  host_binding.input_descriptor = slot->program.host_input;
+  host_binding.output_descriptor = slot->program.host_output;
   host_binding.input_plane_count = 1;
   host_binding.output_plane_count = 1;
   host_binding.capture_sequence = capture_sequence;

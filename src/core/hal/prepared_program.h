@@ -205,6 +205,13 @@ struct PreparedProgram {
   std::uint64_t program_id = 0;
   std::uint64_t owner_adapter_instance_id = 0;
   ExecutionDomainId execution_domain{};
+  // Host transport boundaries are distinct from resident stage I/O. They
+  // describe the borrowed CPU-visible frames bound by BindHostFrame, while
+  // PreparedStage descriptors continue to describe adapter-resident storage.
+  // A format or coherence transition between either boundary and the adjacent
+  // resident stage is therefore explicit in the immutable prepared contract.
+  ImageDescriptor host_input{};
+  ImageDescriptor host_output{};
   ProgramInvalidationKey invalidation_key{};
   TemporalContract temporal{};
   ResourceBudget budget{};

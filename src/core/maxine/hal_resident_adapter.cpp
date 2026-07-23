@@ -72,8 +72,8 @@ bool SameResource(const hal::ResourceHandle &left,
          left.destroy == right.destroy;
 }
 
-bool SameImageDescriptor(const hal::ImageDescriptor &left,
-                         const hal::ImageDescriptor &right) noexcept {
+bool SameImageStorage(const hal::ImageDescriptor &left,
+                      const hal::ImageDescriptor &right) noexcept {
   if (left.width != right.width || left.height != right.height ||
       left.plane_count != right.plane_count || left.format != right.format ||
       left.channel_order != right.channel_order ||
@@ -82,7 +82,7 @@ bool SameImageDescriptor(const hal::ImageDescriptor &left,
       left.alpha_meaning != right.alpha_meaning ||
       left.orientation != right.orientation ||
       left.host_coherence != right.host_coherence ||
-      left.mutability != right.mutability || left.aliasing != right.aliasing ||
+      left.aliasing != right.aliasing ||
       left.base_alignment_bytes != right.base_alignment_bytes ||
       left.in_place_permitted != right.in_place_permitted) {
     return false;
@@ -100,6 +100,11 @@ bool SameImageDescriptor(const hal::ImageDescriptor &left,
     }
   }
   return true;
+}
+
+bool SameImageDescriptor(const hal::ImageDescriptor &left,
+                         const hal::ImageDescriptor &right) noexcept {
+  return SameImageStorage(left, right) && left.mutability == right.mutability;
 }
 
 std::uint32_t StageMask(std::size_t stage_count) noexcept {
@@ -169,7 +174,8 @@ bool TelemetryDelta(const MaxineAuthoritativeTelemetrySnapshot &before,
 }
 
 bool ValidResidentIo(const hal::StageIoDescriptor &io,
-                     const ResidentFrameKey &key) noexcept {
+                     const ResidentFrameKey &key,
+                     hal::Mutability mutability) noexcept {
   if (io.kind != hal::StageIoKind::image)
     return false;
   const auto &image = io.image;
@@ -181,8 +187,33 @@ bool ValidResidentIo(const hal::StageIoDescriptor &io,
          image.channel_order == hal::ChannelOrder::bgr &&
          image.orientation == hal::Orientation::top_left &&
          image.host_coherence == hal::HostCoherence::not_host_visible &&
-         plane.offset_bytes == 0 && plane.width == key.width &&
-         plane.height == key.height &&
+         image.mutability == mutability &&
+         image.aliasing == hal::AliasingPermission::forbidden &&
+         !image.in_place_permitted && plane.offset_bytes == 0 &&
+         plane.width == key.width && plane.height == key.height &&
+         plane.row_stride_bytes >= static_cast<std::uint64_t>(key.width) * 3u &&
+         Multiply(plane.row_stride_bytes, plane.height, &minimum_size) &&
+         plane.size_bytes >= minimum_size;
+}
+
+bool ValidHostBoundary(const hal::ImageDescriptor &image,
+                       const ResidentFrameKey &key, hal::PixelFormat format,
+                       hal::ChannelOrder channel_order,
+                       hal::Mutability mutability) noexcept {
+  const auto &plane = image.planes[0];
+  std::uint64_t minimum_size = 0;
+  return hal::ValidateImageDescriptor(image) && image.width == key.width &&
+         image.height == key.height && image.plane_count == 1 &&
+         image.format == format && image.channel_order == channel_order &&
+         image.color_space == hal::ColorSpace::srgb &&
+         image.color_range == hal::ColorRange::full &&
+         image.alpha_meaning == hal::AlphaMeaning::none &&
+         image.orientation == hal::Orientation::top_left &&
+         image.host_coherence == hal::HostCoherence::coherent &&
+         image.mutability == mutability &&
+         image.aliasing == hal::AliasingPermission::forbidden &&
+         !image.in_place_permitted && plane.offset_bytes == 0 &&
+         plane.width == key.width && plane.height == key.height &&
          plane.row_stride_bytes >= static_cast<std::uint64_t>(key.width) * 3u &&
          Multiply(plane.row_stride_bytes, plane.height, &minimum_size) &&
          plane.size_bytes >= minimum_size;
@@ -510,15 +541,29 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
     SetReason(reason, ReasonId::malformed_contract);
     return false;
   }
+  if (!ValidHostBoundary(program.host_input, configuration_.resident_key,
+                         hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+                         hal::Mutability::read_only) ||
+      !ValidHostBoundary(program.host_output, configuration_.resident_key,
+                         hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+                         hal::Mutability::write_only)) {
+    SetReason(reason, ReasonId::malformed_descriptor);
+    return false;
+  }
+  // RGB host input -> BGR resident input is the declared upload-boundary
+  // transport conversion. It is covered by the single upload accounting and
+  // is not an effect-level CPU fallback or an undeclared CPU tail.
 
   bool has_auto_frame = false;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
     if (stage.backend != BackendId::maxine ||
         stage.execution_domain != configuration_.execution_domain ||
-        !ValidResidentIo(stage.input, configuration_.resident_key) ||
-        !ValidResidentIo(stage.output, configuration_.resident_key) ||
-        !SameImageDescriptor(stage.input.image, stage.output.image)) {
+        !ValidResidentIo(stage.input, configuration_.resident_key,
+                         hal::Mutability::read_only) ||
+        !ValidResidentIo(stage.output, configuration_.resident_key,
+                         hal::Mutability::read_write) ||
+        !SameImageStorage(stage.input.image, stage.output.image)) {
       SetReason(reason,
                 stage.execution_domain != configuration_.execution_domain
                     ? ReasonId::wrong_execution_domain
@@ -783,10 +828,9 @@ StatusId MaxineHalResidentAdapter::BindHostFrame(
       !hal::ValidateHostFrameBinding(binding, slot->program, &binding_reason) ||
       binding.input_plane_count != 1 || binding.output_plane_count != 1 ||
       !SameImageDescriptor(binding.input_descriptor,
-                           slot->program.stages[0].input.image) ||
-      !SameImageDescriptor(
-          binding.output_descriptor,
-          slot->program.stages[slot->program.stage_count - 1].output.image)) {
+                           slot->program.host_input) ||
+      !SameImageDescriptor(binding.output_descriptor,
+                           slot->program.host_output)) {
     SetReason(reason, binding_reason == ReasonId::none
                           ? ReasonId::host_frame_binding_invalid
                           : binding_reason);
@@ -1402,9 +1446,8 @@ StatusId MaxineHalResidentAdapter::ResolveHostFrameOutput(
       (slot->output.boundary != MaxineOutputBoundary::final_readback &&
        slot->output.boundary != MaxineOutputBoundary::cpu_tail_readback) ||
       !slot->output.ValidHost() ||
-      !SameImageDescriptor(
-          slot->host_frame.binding.output_descriptor,
-          slot->program.stages[slot->program.stage_count - 1].output.image)) {
+      !SameImageDescriptor(slot->host_frame.binding.output_descriptor,
+                           slot->program.host_output)) {
     SetReason(reason, ReasonId::host_frame_binding_invalid);
     return StatusId::blocked;
   }
