@@ -245,7 +245,7 @@ target_link_libraries(studiocast_probe_support
 target_include_directories(studiocast_probe_support PRIVATE
         "${STUDIOCAST_GENERATED_DIR}")
 target_link_libraries(studiocast_video_support
-        PUBLIC studiocast_contracts
+        PUBLIC studiocast_contracts studiocast_hal_contracts
         PRIVATE studiocast_util)
 target_link_libraries(studiocast_video_io
         PUBLIC studiocast_contracts studiocast_video_support
@@ -488,7 +488,7 @@ studiocast_assert_direct_dependencies(studiocast_audio_support)
 studiocast_assert_direct_dependencies(studiocast_probe_support
         PRIVATE_STUDIOCAST_DEPS studiocast_config studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_video_support
-        PUBLIC_STUDIOCAST_DEPS studiocast_contracts
+        PUBLIC_STUDIOCAST_DEPS studiocast_contracts studiocast_hal_contracts
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_video_io
         PUBLIC_STUDIOCAST_DEPS studiocast_contracts studiocast_video_support
