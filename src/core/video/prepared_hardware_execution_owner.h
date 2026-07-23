@@ -67,11 +67,24 @@ struct PreparedHardwareFrameResult {
   bool completion_pending = false;
 };
 
+// Cached setup identity used by control-plane consumers to prove that a
+// committed output belongs to the program that is still prepared. It contains
+// no backend handle or borrowed resource.
+struct PreparedHardwareProgramIdentity {
+  bool valid = false;
+  std::uint64_t program_id = 0;
+  std::uint64_t owner_adapter_instance_id = 0;
+  hal::ProgramInvalidationKey invalidation_key{};
+  hal::ExecutionDomainId execution_domain{};
+  std::size_t stage_count = 0;
+};
+
 struct PreparedHardwareExecutionSnapshot {
   PreparedHardwareRoute route = PreparedHardwareRoute::legacy_shadow;
   PreparedHardwareEligibility eligibility =
       PreparedHardwareEligibility::unavailable;
   HardwareExecutionSetupSnapshot setup{};
+  PreparedHardwareProgramIdentity active_program{};
   hal::ReadinessSnapshot readiness{};
   hal::ExecutionTelemetry telemetry{};
   hal::CommittedFrameSnapshot latest_committed_frame{};

@@ -259,6 +259,7 @@ struct PreparedHardwareExecutionOwner::Impl {
   std::unique_ptr<HardwareExecutionRuntime> runtime;
   hal::AdapterRegistration registration{};
   PreparedFinalHardwareRequest active_request{};
+  PreparedHardwareProgramIdentity active_program{};
   PreparedHardwareExecutionSnapshot snapshot{};
   std::uint64_t next_program_id = 1;
   hal::StatusId initialization_status = hal::StatusId::unavailable;
@@ -405,6 +406,7 @@ struct PreparedHardwareExecutionOwner::Impl {
     snapshot.eligibility = eligibility;
     if (!runtime) {
       snapshot.prepared = false;
+      snapshot.active_program = {};
       return;
     }
     snapshot.setup = runtime->latest_setup();
@@ -412,6 +414,8 @@ struct PreparedHardwareExecutionOwner::Impl {
     snapshot.telemetry = runtime->telemetry();
     snapshot.latest_committed_frame = runtime->latest_committed_frame();
     snapshot.prepared = runtime->prepared();
+    snapshot.active_program = snapshot.prepared ? active_program
+                                                : PreparedHardwareProgramIdentity{};
   }
 
   ~Impl() {
@@ -573,6 +577,13 @@ PreparedHardwareSetupResult PreparedHardwareExecutionOwner::ConfigureFinal(
     impl_->active_request = request;
     impl_->active_request.generations.context =
         impl_->registration.execution_domain.logical_context_generation;
+    impl_->active_program.valid = true;
+    impl_->active_program.program_id = program.program_id;
+    impl_->active_program.owner_adapter_instance_id =
+        program.owner_adapter_instance_id;
+    impl_->active_program.invalidation_key = program.invalidation_key;
+    impl_->active_program.execution_domain = program.execution_domain;
+    impl_->active_program.stage_count = program.stage_count;
     result.route = PreparedHardwareRoute::hal_live;
   } else if (impl_->runtime->prepared() &&
              SameLiveProgram(impl_->active_request, request)) {

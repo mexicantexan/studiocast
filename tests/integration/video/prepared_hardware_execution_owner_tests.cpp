@@ -335,7 +335,12 @@ bool TestExecutionCommitAndTelemetry() {
                     hal::StatusId::ready,
                 "successful writer commit was rejected");
   auto snapshot = owner.Snapshot();
-  ok &= Require(snapshot.telemetry.committed_output_frames == 1 &&
+  ok &= Require(snapshot.prepared && snapshot.active_program.valid &&
+                    snapshot.active_program.program_id != 0 &&
+                    snapshot.active_program.stage_count == 2 &&
+                    snapshot.active_program.execution_domain ==
+                        snapshot.readiness.execution_domain &&
+                    snapshot.telemetry.committed_output_frames == 1 &&
                     snapshot.telemetry.active_backend_frames == 1 &&
                     snapshot.telemetry.transfers.uploads == 1 &&
                     snapshot.telemetry.transfers.final_readbacks == 1 &&
@@ -343,7 +348,11 @@ bool TestExecutionCommitAndTelemetry() {
                     snapshot.telemetry.transfers.intermediate_uploads == 0 &&
                     snapshot.telemetry.transfers.cpu_tail_boundaries == 0 &&
                     snapshot.latest_committed_frame.valid &&
-                    snapshot.latest_committed_frame.stage_count == 2,
+                    snapshot.latest_committed_frame.stage_count == 2 &&
+                    snapshot.latest_committed_frame.program_id ==
+                        snapshot.active_program.program_id &&
+                    snapshot.latest_committed_frame.invalidation_key ==
+                        snapshot.active_program.invalidation_key,
                 "committed telemetry or exact transfer counts were wrong");
   const auto compatibility =
       video::ProjectPreparedHardwareCompatibilityTelemetry(snapshot);
@@ -380,14 +389,19 @@ bool TestRollbackAndDomainFailure() {
   auto same = Request();
   same.generations.configuration = 2;
   const auto retained = owner.ConfigureFinal(same);
+  const auto retained_snapshot = owner.Snapshot();
   ok &= Require(retained.route == video::PreparedHardwareRoute::hal_live &&
-                    retained.retained_previous_live_program,
+                    retained.retained_previous_live_program &&
+                    retained_snapshot.active_program.valid &&
+                    retained_snapshot.active_program.invalidation_key
+                            .generations.configuration == 1,
                 "same-semantics setup failure did not retain old program");
   auto changed = same;
   changed.output_width = 8;
   const auto rejected = owner.ConfigureFinal(changed);
   ok &= Require(rejected.route == video::PreparedHardwareRoute::legacy_shadow &&
-                    !owner.Snapshot().prepared,
+                    !owner.Snapshot().prepared &&
+                    !owner.Snapshot().active_program.valid,
                 "geometry-changing setup failure retained stale resources");
 
   auto tracked = Request();
