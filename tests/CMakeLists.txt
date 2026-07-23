@@ -298,6 +298,35 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-maxine-resident-frame-tests
             unit gpu maxine video)
 
+    add_executable(studiocast-maxine-hal-resident-adapter-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_hal_resident_adapter_tests.cpp
+            ${PROJECT_SOURCE_DIR}/tests/support/maxine/fake_resident_frame_executor.cpp
+    )
+
+    target_link_libraries(studiocast-maxine-hal-resident-adapter-tests PRIVATE
+            studiocast_maxine_backend
+    )
+
+    target_include_directories(studiocast-maxine-hal-resident-adapter-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${PROJECT_SOURCE_DIR}/tests/support"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-maxine-hal-resident-adapter-tests)
+    studiocast_enable_sanitizers(studiocast-maxine-hal-resident-adapter-tests)
+
+    set_target_properties(studiocast-maxine-hal-resident-adapter-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-maxine-hal-resident-adapter-tests
+            COMMAND studiocast-maxine-hal-resident-adapter-tests)
+    studiocast_set_test_labels(studiocast-maxine-hal-resident-adapter-tests
+            unit gpu maxine video)
+
     add_executable(studiocast-model-registry-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/model/model_pack_registry_tests.cpp
     )

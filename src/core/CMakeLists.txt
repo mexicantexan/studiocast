@@ -75,6 +75,7 @@ set(_studiocast_maxine_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/maxine/effects/vfx_relighting_effect.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/effects/vfx_transfer_effect.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/gpu_selection.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/maxine/hal_resident_adapter.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/maxine_manager.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/nvcv_api.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/paths.cpp
@@ -258,6 +259,7 @@ target_link_libraries(studiocast_maxine_backend
         studiocast_config
         studiocast_contracts
         studiocast_cuda_support
+        studiocast_hal_contracts
         studiocast_probe_support
         studiocast_video_support
         PRIVATE studiocast_util)
@@ -499,7 +501,7 @@ studiocast_assert_direct_dependencies(studiocast_model_support
 studiocast_assert_direct_dependencies(studiocast_maxine_backend
         PUBLIC_STUDIOCAST_DEPS
         studiocast_audio_support studiocast_config studiocast_contracts
-        studiocast_cuda_support studiocast_probe_support
+        studiocast_cuda_support studiocast_hal_contracts studiocast_probe_support
         studiocast_video_support
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_open_audio_backend
@@ -572,7 +574,7 @@ set(_studiocast_expected_sources
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 112)
+set(_studiocast_expected_source_count 113)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
