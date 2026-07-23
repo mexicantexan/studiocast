@@ -100,6 +100,10 @@ struct OrtSessionInfo {
   // caller's stream (e.g., user_compute_stream unavailable). Callers
   // integrating with an explicit stream must synchronize for correctness.
   bool cuda_needs_stream_sync = false;
+  int cuda_device_id = 0;
+  bool cuda_user_compute_stream_requested = false;
+  bool cuda_user_compute_stream_bound = false;
+  std::uintptr_t cuda_user_compute_stream_identity = 0;
 
   // Provider/status diagnostics for tools and engine JSON.
   std::string active_provider;
@@ -300,6 +304,24 @@ public:
                                 std::size_t input_count,
                                 const CudaBindingOutput *outputs,
                                 std::size_t output_count, std::string *error);
+
+  // Construct and bind all CUDA external-buffer wrappers during setup without
+  // issuing inference. This operation is transactional: an existing prepared
+  // slot remains usable if replacement construction fails.
+  bool PrepareCudaIoBinding(std::size_t binding_slot,
+                            const CudaBindingInput *inputs,
+                            std::size_t input_count,
+                            const CudaBindingOutput *outputs,
+                            std::size_t output_count, std::string *error);
+
+  // Execute only an exactly matching setup-prepared CUDA binding. This method
+  // never constructs a binding, tensor wrapper, or StudioCast-owned container.
+  bool ExecutePreparedCudaIoBinding(std::size_t binding_slot,
+                                    const CudaBindingInput *inputs,
+                                    std::size_t input_count,
+                                    const CudaBindingOutput *outputs,
+                                    std::size_t output_count,
+                                    std::string *error);
 
   // Release all retained CPU/CUDA tensor wrappers and IoBindings before a
   // caller replaces or frees their backing storage. Rebuilding a session for a

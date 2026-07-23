@@ -1,16 +1,37 @@
 #include "core/cuda/cuda_driver_api.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <utility>
 
 namespace studiocast::cuda {
 
+namespace {
+
+std::atomic<std::uint64_t> g_cuda_context_generation{1};
+std::atomic<std::uint64_t> g_cuda_context_instance{1};
+
+std::uint64_t NextNonzero(std::atomic<std::uint64_t> *counter) noexcept {
+  std::uint64_t value = counter->fetch_add(1, std::memory_order_relaxed);
+  if (value == 0) {
+    value = counter->fetch_add(1, std::memory_order_relaxed);
+  }
+  return value;
+}
+
+} // namespace
+
+bool CudaPhysicalDeviceIdentity::Valid() const noexcept {
+  return std::any_of(uuid.begin(), uuid.end(),
+                     [](std::uint8_t byte) { return byte != 0; });
+}
+
 CudaDriverApi::CudaDriverApi() = default;
 
 CudaDriverApi::~CudaDriverApi() {
-  if (retained_primary_ctx_ && f_.cuDevicePrimaryCtxRelease) {
-    (void)f_.cuDevicePrimaryCtxRelease(primary_dev_);
-  }
+  ReleaseRetainedContext();
   lib_.Close();
 }
 
@@ -20,7 +41,8 @@ CudaDriverApi::CudaDriverApi(CudaDriverApi &&other) noexcept
       retained_primary_ctx_(other.retained_primary_ctx_),
       device_ordinal_(other.device_ordinal_),
       primary_dev_(other.primary_dev_), primary_ctx_(other.primary_ctx_),
-      primary_ctx_validated_(other.primary_ctx_validated_) {
+      primary_ctx_validated_(other.primary_ctx_validated_),
+      context_identity_(other.context_identity_) {
   other.initialized_ = false;
   other.f_ = Functions{};
   other.error_.clear();
@@ -29,15 +51,14 @@ CudaDriverApi::CudaDriverApi(CudaDriverApi &&other) noexcept
   other.primary_dev_ = 0;
   other.primary_ctx_ = nullptr;
   other.primary_ctx_validated_ = false;
+  other.context_identity_ = {};
 }
 
 CudaDriverApi &CudaDriverApi::operator=(CudaDriverApi &&other) noexcept {
   if (this == &other)
     return *this;
 
-  if (retained_primary_ctx_ && f_.cuDevicePrimaryCtxRelease) {
-    (void)f_.cuDevicePrimaryCtxRelease(primary_dev_);
-  }
+  ReleaseRetainedContext();
   lib_.Close();
 
   initialized_ = other.initialized_;
@@ -49,6 +70,7 @@ CudaDriverApi &CudaDriverApi::operator=(CudaDriverApi &&other) noexcept {
   primary_dev_ = other.primary_dev_;
   primary_ctx_ = other.primary_ctx_;
   primary_ctx_validated_ = other.primary_ctx_validated_;
+  context_identity_ = other.context_identity_;
 
   other.initialized_ = false;
   other.f_ = Functions{};
@@ -58,6 +80,7 @@ CudaDriverApi &CudaDriverApi::operator=(CudaDriverApi &&other) noexcept {
   other.primary_dev_ = 0;
   other.primary_ctx_ = nullptr;
   other.primary_ctx_validated_ = false;
+  other.context_identity_ = {};
   return *this;
 }
 
@@ -91,6 +114,65 @@ bool CudaDriverApi::Initialize(std::string *error_out) {
   }
 
   initialized_ = true;
+  return true;
+}
+
+bool CudaDriverApi::InitializeForTesting(const Functions &functions,
+                                         std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (initialized_)
+    return true;
+  if (!ValidateRequiredFunctions(functions, error_out))
+    return false;
+  f_ = functions;
+  const CUresult st = f_.cuInit(0);
+  if (st != CUDA_SUCCESS) {
+    if (error_out)
+      *error_out = "cuInit failed: " + StatusToString(st);
+    f_ = {};
+    return false;
+  }
+  initialized_ = true;
+  return true;
+}
+
+bool CudaDriverApi::ValidateRequiredFunctions(const Functions &functions,
+                                              std::string *error_out) {
+  struct Required {
+    const char *name;
+    bool present;
+  };
+  const Required required[] = {
+      {"cuInit", functions.cuInit != nullptr},
+      {"cuModuleLoadData", functions.cuModuleLoadData != nullptr},
+      {"cuModuleGetFunction", functions.cuModuleGetFunction != nullptr},
+      {"cuLaunchKernel", functions.cuLaunchKernel != nullptr},
+      {"cuMemAllocPitch", functions.cuMemAllocPitch != nullptr},
+      {"cuMemFree", functions.cuMemFree != nullptr},
+      {"cuMemcpy2DAsync", functions.cuMemcpy2DAsync != nullptr},
+      {"cuStreamCreate", functions.cuStreamCreate != nullptr},
+      {"cuStreamDestroy", functions.cuStreamDestroy != nullptr},
+      {"cuStreamSynchronize", functions.cuStreamSynchronize != nullptr},
+      {"cuDeviceGetCount", functions.cuDeviceGetCount != nullptr},
+      {"cuDeviceGet", functions.cuDeviceGet != nullptr},
+      {"cuDeviceGetUuid", functions.cuDeviceGetUuid != nullptr},
+      {"cuDevicePrimaryCtxRetain",
+       functions.cuDevicePrimaryCtxRetain != nullptr},
+      {"cuDevicePrimaryCtxRelease",
+       functions.cuDevicePrimaryCtxRelease != nullptr},
+      {"cuCtxSetCurrent", functions.cuCtxSetCurrent != nullptr},
+      {"cuCtxGetCurrent", functions.cuCtxGetCurrent != nullptr},
+      {"cuCtxGetDevice", functions.cuCtxGetDevice != nullptr},
+  };
+  for (const auto &entry : required) {
+    if (!entry.present) {
+      if (error_out)
+        *error_out = std::string("CUDA required symbol unavailable: ") +
+                     entry.name;
+      return false;
+    }
+  }
   return true;
 }
 
@@ -131,13 +213,20 @@ bool CudaDriverApi::LoadSymbols(std::string *error_out) {
       !load_req("cuStreamSynchronize", &f_.cuStreamSynchronize) ||
       !load_req("cuDeviceGetCount", &f_.cuDeviceGetCount) ||
       !load_req("cuDeviceGet", &f_.cuDeviceGet) ||
+      !load_req_any("cuDeviceGetUuid_v2", "cuDeviceGetUuid",
+                    &f_.cuDeviceGetUuid) ||
       !load_req("cuDevicePrimaryCtxRetain", &f_.cuDevicePrimaryCtxRetain) ||
       !load_req_any("cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxRelease",
                     &f_.cuDevicePrimaryCtxRelease) ||
       !load_req("cuCtxSetCurrent", &f_.cuCtxSetCurrent) ||
-      !load_req("cuCtxGetCurrent", &f_.cuCtxGetCurrent)) {
+      !load_req("cuCtxGetCurrent", &f_.cuCtxGetCurrent) ||
+      !load_req("cuCtxGetDevice", &f_.cuCtxGetDevice)) {
     return false;
   }
+
+  // Optional corroborating stable identity. UUID remains mandatory.
+  (void)lib_.GetSymbol("cuDeviceGetPCIBusId", &f_.cuDeviceGetPCIBusId,
+                       nullptr);
 
   // Optional: cuGetErrorString.
   (void)lib_.GetSymbol("cuGetErrorString", &f_.cuGetErrorString, nullptr);
@@ -148,6 +237,16 @@ bool CudaDriverApi::LoadSymbols(std::string *error_out) {
   // Optional: cuModuleLoadDataEx (used for PTX JIT diagnostics when available).
   (void)lib_.GetSymbol("cuModuleLoadDataEx", &f_.cuModuleLoadDataEx, nullptr);
   return true;
+}
+
+void CudaDriverApi::ReleaseRetainedContext() noexcept {
+  if (retained_primary_ctx_ && f_.cuDevicePrimaryCtxRelease)
+    (void)f_.cuDevicePrimaryCtxRelease(primary_dev_);
+  retained_primary_ctx_ = false;
+  primary_dev_ = 0;
+  primary_ctx_ = nullptr;
+  primary_ctx_validated_ = false;
+  context_identity_ = {};
 }
 
 std::string CudaDriverApi::StatusToString(CUresult code) const {
@@ -201,7 +300,8 @@ bool CudaDriverApi::EnsureContext(std::string *error_out) {
     return false;
   }
   if (!f_.cuCtxGetCurrent || !f_.cuDeviceGetCount || !f_.cuDeviceGet ||
-      !f_.cuDevicePrimaryCtxRetain || !f_.cuCtxSetCurrent) {
+      !f_.cuDeviceGetUuid || !f_.cuDevicePrimaryCtxRetain ||
+      !f_.cuCtxSetCurrent || !f_.cuCtxGetDevice) {
     if (error_out)
       *error_out = "CUDA context functions not loaded.";
     return false;
@@ -215,6 +315,8 @@ bool CudaDriverApi::EnsureContext(std::string *error_out) {
   // mismatches that manifest as cuLaunchKernel errors like "invalid resource
   // handle". Binding the configured primary context keeps Driver API kernels,
   // streams, allocations, and ORT CUDA provider work on the same selected GPU.
+  bool retained_during_call = false;
+  CUcontext previous_ctx = nullptr;
   if (!retained_primary_ctx_ || !primary_ctx_) {
     int count = 0;
     CUresult st = f_.cuDeviceGetCount(&count);
@@ -256,17 +358,21 @@ bool CudaDriverApi::EnsureContext(std::string *error_out) {
     }
 
     retained_primary_ctx_ = true;
+    retained_during_call = true;
     primary_dev_ = dev;
     primary_ctx_ = ctx;
     primary_ctx_validated_ = false;
   }
 
+  (void)f_.cuCtxGetCurrent(&previous_ctx);
   CUresult st = f_.cuCtxSetCurrent(primary_ctx_);
   if (st != CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuCtxSetCurrent(primary device " +
                    std::to_string(device_ordinal_) +
                    ") failed: " + StatusToString(st);
+    if (retained_during_call)
+      ReleaseRetainedContext();
     return false;
   }
 
@@ -279,7 +385,74 @@ bool CudaDriverApi::EnsureContext(std::string *error_out) {
     if (error_out)
       *error_out = "Failed to validate current CUDA context after set: " +
                    StatusToString(st);
+    if (retained_during_call) {
+      (void)f_.cuCtxSetCurrent(previous_ctx);
+      ReleaseRetainedContext();
+    }
     return false;
+  }
+
+  CUdevice context_dev = 0;
+  st = f_.cuCtxGetDevice(&context_dev);
+  if (st != CUDA_SUCCESS || context_dev != primary_dev_) {
+    if (error_out)
+      *error_out = "CUDA retained context device identity mismatch.";
+    if (retained_during_call) {
+      (void)f_.cuCtxSetCurrent(previous_ctx);
+      ReleaseRetainedContext();
+    }
+    return false;
+  }
+
+  CUuuid uuid{};
+  st = f_.cuDeviceGetUuid(&uuid, context_dev);
+  if (st != CUDA_SUCCESS) {
+    if (error_out)
+      *error_out = "cuDeviceGetUuid failed: " + StatusToString(st);
+    if (retained_during_call) {
+      (void)f_.cuCtxSetCurrent(previous_ctx);
+      ReleaseRetainedContext();
+    }
+    return false;
+  }
+  CudaPhysicalDeviceIdentity physical;
+  std::memcpy(physical.uuid.data(), uuid.bytes, physical.uuid.size());
+  if (!physical.Valid()) {
+    if (error_out)
+      *error_out = "CUDA device UUID is unavailable or invalid.";
+    if (retained_during_call) {
+      (void)f_.cuCtxSetCurrent(previous_ctx);
+      ReleaseRetainedContext();
+    }
+    return false;
+  }
+  if (f_.cuDeviceGetPCIBusId) {
+    char pci[32]{};
+    st = f_.cuDeviceGetPCIBusId(pci, static_cast<int>(sizeof(pci)),
+                                context_dev);
+    if (st != CUDA_SUCCESS) {
+      if (error_out)
+        *error_out = "cuDeviceGetPCIBusId failed: " + StatusToString(st);
+      if (retained_during_call) {
+        (void)f_.cuCtxSetCurrent(previous_ctx);
+        ReleaseRetainedContext();
+      }
+      return false;
+    }
+    const auto nul = std::find(std::begin(pci), std::end(pci), '\0');
+    const std::size_t length =
+        static_cast<std::size_t>(std::distance(std::begin(pci), nul));
+    if (length == 0 || nul == std::end(pci)) {
+      if (error_out)
+        *error_out = "CUDA PCI bus identity is invalid.";
+      if (retained_during_call) {
+        (void)f_.cuCtxSetCurrent(previous_ctx);
+        ReleaseRetainedContext();
+      }
+      return false;
+    }
+    std::copy_n(pci, length + 1, physical.pci_bus_id.begin());
+    physical.pci_bus_id_length = static_cast<std::uint8_t>(length);
   }
 
   // Best-effort functional validation.
@@ -290,11 +463,22 @@ bool CudaDriverApi::EnsureContext(std::string *error_out) {
       if (error_out)
         *error_out = "cuStreamCreate failed (context validation): " +
                      StatusToString(st_stream);
+      if (retained_during_call) {
+        (void)f_.cuCtxSetCurrent(previous_ctx);
+        ReleaseRetainedContext();
+      }
       return false;
     }
     (void)f_.cuStreamDestroy(tmp);
   }
 
+  const std::uint64_t generation =
+      NextNonzero(&g_cuda_context_generation);
+  const std::uint64_t context_id =
+      NextNonzero(&g_cuda_context_instance);
+  context_identity_.physical_device = physical;
+  context_identity_.logical_generation = generation;
+  context_identity_.retained_context_id = context_id;
   primary_ctx_validated_ = true;
   return true;
 }

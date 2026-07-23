@@ -918,6 +918,42 @@ bool TestOnnxProviderWarningPropagation() {
                 "append warning should propagate to session info");
 }
 
+bool TestOnnxCudaStreamAndDeviceEvidence() {
+  FakeOnnxProviderBackend fake;
+  fake.runtime = MakeRuntime({"CPUExecutionProvider", "CUDAExecutionProvider"});
+  fake.cuda_append.appended = true;
+  fake.cuda_append.status = "appended";
+  fake.cuda_append.needs_stream_sync = false;
+
+  studiocast::onnx::OrtSessionOptions opts;
+  opts.prefer_cuda = true;
+  opts.cuda_device_id = 5;
+  opts.user_compute_stream = reinterpret_cast<void *>(0xCAFE);
+  const auto bound = RunFakeOnnxProviderPlan(opts, &fake);
+  if (!Expect(bound.created, "bound CUDA provider plan should create"))
+    return false;
+  if (!Expect(bound.info.cuda_device_id == 5,
+              "CUDA provider evidence should retain exact device id") ||
+      !Expect(bound.info.cuda_user_compute_stream_requested,
+              "CUDA provider evidence should record requested stream") ||
+      !Expect(bound.info.cuda_user_compute_stream_bound,
+              "CUDA provider evidence should record exact stream binding") ||
+      !Expect(bound.info.cuda_user_compute_stream_identity == 0xCAFE,
+              "CUDA provider evidence should retain stream identity"))
+    return false;
+
+  fake.cuda_append.needs_stream_sync = true;
+  const auto synchronized = RunFakeOnnxProviderPlan(opts, &fake);
+  return Expect(synchronized.created,
+                "explicit-sync CUDA provider plan should create") &&
+         Expect(synchronized.info.cuda_needs_stream_sync,
+                "provider evidence should require explicit synchronization") &&
+         Expect(!synchronized.info.cuda_user_compute_stream_bound,
+                "explicit-sync provider must not claim user-stream binding") &&
+         Expect(synchronized.info.cuda_user_compute_stream_identity == 0xCAFE,
+                "explicit-sync evidence should retain requested stream");
+}
+
 bool TestOpenAudioUsesSharedOnnxProviderInfo() {
 #if !STUDIOCAST_HAVE_ONNXRUNTIME
   return true;
@@ -987,6 +1023,9 @@ int main() {
        ok;
   ok = RunNamedTest("onnx_provider_warning_propagation",
                     TestOnnxProviderWarningPropagation) &&
+       ok;
+  ok = RunNamedTest("onnx_cuda_stream_device_evidence",
+                    TestOnnxCudaStreamAndDeviceEvidence) &&
        ok;
   ok = RunNamedTest("open_audio_shared_onnx",
                     TestOpenAudioUsesSharedOnnxProviderInfo, true) &&

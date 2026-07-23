@@ -68,6 +68,12 @@ struct OpenCudaMattingSession::Impl {
   std::string output_name;
   std::vector<int64_t> input_shape;
   std::vector<int64_t> output_shape;
+  bool execution_prepared = false;
+  int prepared_frame_w = 0;
+  int prepared_frame_h = 0;
+  studiocast::cuda::CUstream prepared_stream = nullptr;
+  studiocast::cuda::CUdeviceptr prepared_output_ptr = 0;
+  OpenCudaMattingSession::PreparationEvidence preparation_evidence;
 
   // When the GPU runs out of memory, ORT can spam errors every frame.
   // Latch the first failure so we can return a clear, human-friendly message
@@ -255,6 +261,28 @@ struct OpenCudaMattingSession::Impl {
   }
 };
 
+bool ValidateOutputTensor(
+    const studiocast::open_video::ModelPack &pack,
+    const studiocast::cuda::CudaTensor *output_alpha_gpu,
+    std::string *error_out) {
+  if (!output_alpha_gpu || !output_alpha_gpu->Valid()) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession: output alpha tensor is not "
+                   "allocated/valid.";
+    return false;
+  }
+  if (!pack.matting || output_alpha_gpu->n != 1 ||
+      output_alpha_gpu->c != 1 ||
+      output_alpha_gpu->h != pack.matting->input.height ||
+      output_alpha_gpu->w != pack.matting->input.width) {
+    if (error_out)
+      *error_out =
+          "OpenCudaMattingSession: output alpha tensor shape mismatch.";
+    return false;
+  }
+  return true;
+}
+
 OpenCudaMattingSession::OpenCudaMattingSession(
     studiocast::cuda::CudaDriverApi *cuda,
     studiocast::open_video::ModelPack pack, Options opts)
@@ -421,6 +449,132 @@ bool OpenCudaMattingSession::EnsureInitialized(int frame_w, int frame_h,
   return true;
 }
 
+bool OpenCudaMattingSession::Prepare(
+    int frame_w, int frame_h, studiocast::cuda::CUstream stream,
+    studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (!EnsureInitialized(frame_w, frame_h, error_out) ||
+      !ValidateOutputTensor(impl_->pack, output_alpha_gpu, error_out))
+    return false;
+
+  const auto *context = impl_->cuda->context_identity();
+  if (!context || !context->Valid()) {
+    if (error_out)
+      *error_out =
+          "OpenCudaMattingSession: exact CUDA context identity unavailable.";
+    return false;
+  }
+  if (!studiocast::cuda::kernels::PreparePreprocessKernel(impl_->cuda,
+                                                           error_out))
+    return false;
+
+  if (impl_->execution_prepared && impl_->prepared_frame_w == frame_w &&
+      impl_->prepared_frame_h == frame_h &&
+      impl_->prepared_stream == stream &&
+      impl_->prepared_output_ptr == output_alpha_gpu->ptr &&
+      impl_->preparation_evidence.context == *context) {
+    return true;
+  }
+
+#if !STUDIOCAST_HAVE_ONNXRUNTIME
+  (void)stream;
+  if (error_out)
+    *error_out = "OpenCudaMattingSession: built without ONNX Runtime support.";
+  return false;
+#else
+  // Build a replacement session and binding in isolation. Nothing below
+  // mutates the live preparation until every evidence check and binding step
+  // has succeeded.
+  Impl candidate;
+  candidate.cuda = impl_->cuda;
+  candidate.pack = impl_->pack;
+  candidate.onnx_path = impl_->onnx_path;
+  candidate.opts = impl_->opts;
+  candidate.validated_pack = true;
+  candidate.preprocess = impl_->preprocess;
+
+  std::string setup_error;
+  if (!candidate.CreateOrtSession(stream, &setup_error)) {
+    if (!impl_->execution_prepared && candidate.ort_latched_failure) {
+      impl_->ort_latched_failure = true;
+      impl_->ort_latched_error = candidate.ort_latched_error;
+    }
+    if (error_out)
+      *error_out = std::move(setup_error);
+    return false;
+  }
+
+  const auto &info = candidate.ort_info;
+  const std::uintptr_t requested_stream =
+      reinterpret_cast<std::uintptr_t>(stream);
+  if (info.cuda_device_id != impl_->opts.device_id ||
+      info.cuda_user_compute_stream_requested != (stream != nullptr) ||
+      info.cuda_user_compute_stream_identity != requested_stream ||
+      (stream != nullptr && !info.cuda_needs_stream_sync &&
+       !info.cuda_user_compute_stream_bound) ||
+      (info.cuda_user_compute_stream_bound &&
+       info.cuda_user_compute_stream_identity != requested_stream)) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession: ORT provider/device/user-stream "
+                   "evidence does not match the requested setup.";
+    return false;
+  }
+
+  studiocast::onnx::OrtSession::CudaBindingInput in;
+  in.name = candidate.input_name.c_str();
+  in.device_ptr = reinterpret_cast<float *>(
+      static_cast<std::uintptr_t>(impl_->input_tensor.ptr));
+  in.num_floats = impl_->input_tensor.ElementCount();
+  in.shape = candidate.input_shape.data();
+  in.shape_rank = candidate.input_shape.size();
+
+  studiocast::onnx::OrtSession::CudaBindingOutput out;
+  out.name = candidate.output_name.c_str();
+  out.device_ptr = reinterpret_cast<float *>(
+      static_cast<std::uintptr_t>(output_alpha_gpu->ptr));
+  out.num_floats = output_alpha_gpu->ElementCount();
+  out.shape = candidate.output_shape.data();
+  out.shape_rank = candidate.output_shape.size();
+
+  candidate.ort_session->ReserveRunScratch(1, 1);
+  if (!candidate.ort_session->PrepareCudaIoBinding(0, &in, 1, &out, 1,
+                                                   &setup_error)) {
+    if (error_out)
+      *error_out = std::move(setup_error);
+    return false;
+  }
+
+  impl_->ort_session = std::move(candidate.ort_session);
+  impl_->ort_info = std::move(candidate.ort_info);
+  impl_->input_name = std::move(candidate.input_name);
+  impl_->output_name = std::move(candidate.output_name);
+  impl_->input_shape = std::move(candidate.input_shape);
+  impl_->output_shape = std::move(candidate.output_shape);
+  impl_->ort_stream = candidate.ort_stream;
+  impl_->ort_needs_stream_sync = candidate.ort_needs_stream_sync;
+  impl_->ort_latched_failure = false;
+  impl_->ort_latched_error.clear();
+  impl_->execution_prepared = true;
+  impl_->prepared_frame_w = frame_w;
+  impl_->prepared_frame_h = frame_h;
+  impl_->prepared_stream = stream;
+  impl_->prepared_output_ptr = output_alpha_gpu->ptr;
+  impl_->preparation_evidence.cuda_device_id = impl_->opts.device_id;
+  impl_->preparation_evidence.context = *context;
+  impl_->preparation_evidence.requested_stream_identity = requested_stream;
+  impl_->preparation_evidence.ort_user_stream_bound =
+      impl_->ort_info.cuda_user_compute_stream_bound;
+  impl_->preparation_evidence.explicit_stream_synchronization =
+      impl_->ort_info.cuda_needs_stream_sync;
+  impl_->preparation_evidence.active_provider = impl_->ort_info.active_provider;
+  impl_->preparation_evidence.model_id = impl_->pack.id;
+  if (const auto *model = FindMainOnnxFile(impl_->pack))
+    impl_->preparation_evidence.model_artifact_sha256 = model->sha256;
+  return true;
+#endif
+}
+
 bool OpenCudaMattingSession::Run(
     studiocast::cuda::CUstream stream,
     const studiocast::cuda::CudaImage &input_rgb_gpu,
@@ -434,14 +588,11 @@ bool OpenCudaMattingSession::Run(
     return false;
   }
 
-  if (!EnsureInitialized(input_rgb_gpu.w, input_rgb_gpu.h, error_out)) {
-    return false;
-  }
-
-  if (!impl_->buffers_ready) {
+  if (!impl_->buffers_ready || !impl_->execution_prepared) {
     if (error_out)
       *error_out =
-          "OpenCudaMattingSession::Run: internal buffers not initialized.";
+          "OpenCudaMattingSession::Run: exact execution contract was not "
+          "prepared during setup.";
     return false;
   }
 
@@ -451,35 +602,28 @@ bool OpenCudaMattingSession::Run(
     return false;
   }
 
-  // Validate output tensor shape.
-  if (output_alpha_gpu->ptr == 0 || !output_alpha_gpu->Valid()) {
-    if (error_out)
-      *error_out = "OpenCudaMattingSession::Run: output alpha tensor is not "
-                   "allocated/valid.";
+  if (!ValidateOutputTensor(impl_->pack, output_alpha_gpu, error_out))
     return false;
-  }
-  if (output_alpha_gpu->n != 1 || output_alpha_gpu->c != 1 ||
-      output_alpha_gpu->h != impl_->pack.matting->input.height ||
-      output_alpha_gpu->w != impl_->pack.matting->input.width) {
-    if (error_out) {
-      *error_out = "OpenCudaMattingSession::Run: output alpha tensor shape "
-                   "mismatch (expected 1x1x" +
-                   std::to_string(impl_->pack.matting->input.height) + "x" +
-                   std::to_string(impl_->pack.matting->input.width) + ")";
-    }
+  const auto *context = impl_->cuda ? impl_->cuda->context_identity() : nullptr;
+  if (impl_->prepared_frame_w != input_rgb_gpu.w ||
+      impl_->prepared_frame_h != input_rgb_gpu.h ||
+      impl_->prepared_stream != stream ||
+      impl_->prepared_output_ptr != output_alpha_gpu->ptr || !context ||
+      *context != impl_->preparation_evidence.context) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession::Run: geometry, stream, output, or "
+                   "CUDA context generation differs from setup.";
     return false;
   }
 
   // Preprocess RGB/BGR u8 image to NCHW f32 model input.
   {
-    std::string pp_err;
-    if (!studiocast::cuda::kernels::PreprocessToTensor(
-            input_rgb_gpu, impl_->input_tensor, impl_->preprocess, stream,
-            &pp_err)) {
+    if (!studiocast::cuda::kernels::PreprocessToTensorPrepared(
+            impl_->cuda, impl_->preparation_evidence.context, input_rgb_gpu,
+            impl_->input_tensor, impl_->preprocess, stream, error_out)) {
       if (error_out)
-        *error_out =
-            std::string("OpenCudaMattingSession::Run: preprocess failed: ") +
-            pp_err;
+        error_out->insert(0,
+                          "OpenCudaMattingSession::Run: preprocess failed: ");
       return false;
     }
   }
@@ -490,23 +634,14 @@ bool OpenCudaMattingSession::Run(
     *error_out = "OpenCudaMattingSession: built without ONNX Runtime support.";
   return false;
 #else
-  // Lazily create the ORT session so we can attempt stream interop.
   if (impl_->ort_latched_failure) {
     if (error_out)
       *error_out = impl_->ort_latched_error;
     return false;
   }
 
-  if (!impl_->ort_session) {
-    std::string ort_err;
-    if (!impl_->CreateOrtSession(stream, &ort_err)) {
-      if (error_out)
-        *error_out = std::move(ort_err);
-      return false;
-    }
-  }
-
-  if (impl_->ort_stream != nullptr && impl_->ort_stream != stream) {
+  if (!impl_->ort_session ||
+      (impl_->ort_stream != nullptr && impl_->ort_stream != stream)) {
     if (error_out) {
       *error_out = "OpenCudaMattingSession::Run: ORT session was created for a "
                    "different CUDA stream. Create one session per stream.";
@@ -517,13 +652,10 @@ bool OpenCudaMattingSession::Run(
   // If we could not configure ORT to use the caller stream, synchronize before
   // inference so ORT sees fully-written inputs.
   if (impl_->ort_needs_stream_sync) {
-    std::string sync_err;
-    if (!impl_->cuda->StreamSynchronize(stream, &sync_err)) {
+    if (!impl_->cuda->StreamSynchronize(stream, error_out)) {
       if (error_out)
-        *error_out =
-            std::string(
-                "OpenCudaMattingSession::Run: StreamSynchronize failed: ") +
-            sync_err;
+        error_out->insert(
+            0, "OpenCudaMattingSession::Run: StreamSynchronize failed: ");
       return false;
     }
   }
@@ -544,15 +676,19 @@ bool OpenCudaMattingSession::Run(
   out.shape = impl_->output_shape.data();
   out.shape_rank = impl_->output_shape.size();
 
-  std::string ort_err;
-  if (!impl_->ort_session->RunCudaIoBinding(&in, 1, &out, 1, &ort_err)) {
-    if (error_out)
-      *error_out = std::move(ort_err);
+  if (!impl_->ort_session->ExecutePreparedCudaIoBinding(0, &in, 1, &out, 1,
+                                                        error_out)) {
     return false;
   }
 
   return true;
 #endif
+}
+
+const OpenCudaMattingSession::PreparationEvidence *
+OpenCudaMattingSession::preparation_evidence() const noexcept {
+  return impl_ && impl_->execution_prepared ? &impl_->preparation_evidence
+                                            : nullptr;
 }
 
 } // namespace studiocast::open_cuda

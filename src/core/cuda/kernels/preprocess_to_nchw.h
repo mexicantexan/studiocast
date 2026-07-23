@@ -24,6 +24,12 @@ struct ModelPreprocessSpec {
   ChannelOrder dst_order = ChannelOrder::rgb;
 };
 
+// Resolve/JIT the preprocess kernel on the resident execution thread during
+// setup and bind the thread-local cached function to this exact driver wrapper
+// and retained CUDA context generation.
+bool PreparePreprocessKernel(studiocast::cuda::CudaDriverApi *cuda,
+                             std::string *error_out);
+
 // Convert an interleaved RGB/BGR U8 pitched device image to an NCHW float32
 // tensor (N=1, C=3) with normalization:
 //   v = (u8 / 255)
@@ -37,5 +43,15 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
                         const ModelPreprocessSpec &spec,
                         studiocast::cuda::CUstream stream,
                         std::string *error_out);
+
+// Strict resident-frame entry point. It performs no CUDA initialization,
+// current-context query, module load, or symbol resolution. Missing, foreign,
+// or stale setup evidence fails closed before launch.
+bool PreprocessToTensorPrepared(
+    studiocast::cuda::CudaDriverApi *cuda,
+    const studiocast::cuda::CudaContextIdentity &context_identity,
+    const CudaImage &src, const CudaTensor &dst,
+    const ModelPreprocessSpec &spec, studiocast::cuda::CUstream stream,
+    std::string *error_out);
 
 } // namespace studiocast::cuda::kernels

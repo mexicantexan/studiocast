@@ -228,6 +228,12 @@ OrtSessionInfo PlanOrtProviderAttempt(const OrtRuntimeInfo &runtime,
   info.using_tensorrt = false;
   info.using_cuda = false;
   info.cuda_needs_stream_sync = false;
+  info.cuda_device_id = opts.cuda_device_id;
+  info.cuda_user_compute_stream_requested =
+      opts.user_compute_stream != nullptr;
+  info.cuda_user_compute_stream_bound = false;
+  info.cuda_user_compute_stream_identity =
+      reinterpret_cast<std::uintptr_t>(opts.user_compute_stream);
   info.advertised_providers.clear();
   info.cuda_provider_advertised = false;
   info.tensorrt_provider_advertised = false;
@@ -322,6 +328,10 @@ OrtSessionInfo PlanOrtProviderAttempt(const OrtRuntimeInfo &runtime,
   info.cuda_needs_stream_sync =
       (info.using_tensorrt && tensor_rt_needs_sync) ||
       (info.using_cuda && cuda_needs_sync);
+  info.cuda_user_compute_stream_bound =
+      info.cuda_user_compute_stream_requested &&
+      (info.using_tensorrt || info.using_cuda) &&
+      !info.cuda_needs_stream_sync;
   return info;
 }
 
@@ -1352,6 +1362,17 @@ bool OrtSession::RunCudaIoBindingPrepared(
     std::size_t binding_slot, const CudaBindingInput *inputs,
     std::size_t input_count, const CudaBindingOutput *outputs,
     std::size_t output_count, std::string *error) {
+  if (!PrepareCudaIoBinding(binding_slot, inputs, input_count, outputs,
+                            output_count, error))
+    return false;
+  return ExecutePreparedCudaIoBinding(binding_slot, inputs, input_count,
+                                      outputs, output_count, error);
+}
+
+bool OrtSession::PrepareCudaIoBinding(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
   if (error)
     error->clear();
 
@@ -1384,13 +1405,14 @@ bool OrtSession::RunCudaIoBindingPrepared(
   }
   if (!inputs || !outputs) {
     if (error)
-      *error = "null inputs/outputs passed to ORT RunCudaIoBinding().";
+      *error = "null inputs/outputs passed to ORT PrepareCudaIoBinding().";
     return false;
   }
   if (input_count == 0 || output_count == 0) {
     if (error)
       *error =
-          "ORT RunCudaIoBinding() requires at least one input and one output.";
+          "ORT PrepareCudaIoBinding() requires at least one input and one "
+          "output.";
     return false;
   }
   if (binding_slot >= kPreparedBindingSlots) {
@@ -1410,18 +1432,18 @@ bool OrtSession::RunCudaIoBindingPrepared(
       const auto &in = inputs[i];
       if (!in.name || !*in.name) {
         if (error)
-          *error = "ORT RunCudaIoBinding() input has empty name.";
+          *error = "ORT PrepareCudaIoBinding() input has empty name.";
         return false;
       }
       if (!in.device_ptr || in.num_floats == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() input '") + in.name +
+          *error = std::string("ORT PrepareCudaIoBinding() input '") + in.name +
                    "' has empty buffer.";
         return false;
       }
       if (!in.shape || in.shape_rank == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() input '") + in.name +
+          *error = std::string("ORT PrepareCudaIoBinding() input '") + in.name +
                    "' has empty shape.";
         return false;
       }
@@ -1431,18 +1453,18 @@ bool OrtSession::RunCudaIoBindingPrepared(
       const auto &out = outputs[i];
       if (!out.name || !*out.name) {
         if (error)
-          *error = "ORT RunCudaIoBinding() output has empty name.";
+          *error = "ORT PrepareCudaIoBinding() output has empty name.";
         return false;
       }
       if (!out.device_ptr || out.num_floats == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() output '") + out.name +
+          *error = std::string("ORT PrepareCudaIoBinding() output '") + out.name +
                    "' has empty buffer.";
         return false;
       }
       if (!out.shape || out.shape_rank == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() output '") + out.name +
+          *error = std::string("ORT PrepareCudaIoBinding() output '") + out.name +
                    "' has empty shape.";
         return false;
       }
@@ -1539,37 +1561,123 @@ bool OrtSession::RunCudaIoBindingPrepared(
       ++impl_->prepared_run_stats.io_binding_constructions;
       impl_->prepared_run_stats.application_binding_allocation_requests +=
           allocation_requests;
-    } else {
-      ++impl_->prepared_run_stats.cache_hits;
     }
-
-    impl_->session->Run(Ort::RunOptions{nullptr}, *prepared.binding);
-
-    if (impl_->info.cuda_needs_stream_sync) {
-      // Ensure outputs are ready before downstream consumers access the GPU
-      // buffers.
-      prepared.binding->SynchronizeOutputs();
-    }
-
-    ++impl_->prepared_run_stats.runs;
     return true;
 
   } catch (const Ort::Exception &e) {
     const std::string msg = e.what();
     const std::string human = HumanizeOrtError(msg, impl_->model_path);
-
-    if (OrtErrorLooksLikeVramOom(msg)) {
-      impl_->LatchFailure(human);
-    }
-
     if (error) {
       *error = human;
     }
     return false;
   } catch (const std::exception &e) {
     if (error) {
-      *error = std::string("ORT RunCudaIoBinding() failed: ") + e.what();
+      *error = std::string("ORT PrepareCudaIoBinding() failed: ") + e.what();
     }
+    return false;
+  }
+#endif
+}
+
+bool OrtSession::ExecutePreparedCudaIoBinding(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
+  if (error)
+    error->clear();
+
+#if !STUDIOCAST_HAVE_ONNXRUNTIME
+  (void)inputs;
+  (void)input_count;
+  (void)outputs;
+  (void)output_count;
+  (void)binding_slot;
+  if (error)
+    *error = "ONNX Runtime is not available in this build "
+             "(STUDIOCAST_HAVE_ONNXRUNTIME=0).";
+  return false;
+#else
+  if (!impl_ || impl_->latched_failure) {
+    if (error)
+      *error = impl_ ? impl_->latched_error : "ORT session is not initialized.";
+    return false;
+  }
+  if (!impl_->session || (!impl_->info.using_cuda &&
+                          !impl_->info.using_tensorrt)) {
+    if (error)
+      *error = "ORT CUDA-capable session is not initialized.";
+    return false;
+  }
+  if (!inputs || !outputs || input_count == 0 || output_count == 0 ||
+      binding_slot >= kPreparedBindingSlots) {
+    if (error)
+      *error = "ORT prepared CUDA execution contract is invalid.";
+    return false;
+  }
+
+  auto &prepared = impl_->cuda_bindings[binding_slot];
+  const auto contracts_match = [&]() {
+    if (!prepared.binding ||
+        prepared.session_identity != impl_->session.get() ||
+        prepared.provider_identity != impl_->info.active_provider ||
+        prepared.input_contracts.size() != input_count ||
+        prepared.output_contracts.size() != output_count)
+      return false;
+    for (std::size_t i = 0; i < input_count; ++i) {
+      const auto &in = inputs[i];
+      if (!prepared.input_contracts[i].Matches(
+              in.name, in.device_ptr, in.num_floats, in.shape, in.shape_rank))
+        return false;
+    }
+    for (std::size_t i = 0; i < output_count; ++i) {
+      const auto &out = outputs[i];
+      if (!prepared.output_contracts[i].Matches(
+              out.name, out.device_ptr, out.num_floats, out.shape,
+              out.shape_rank))
+        return false;
+    }
+    return true;
+  };
+  if (!contracts_match()) {
+    if (error)
+      *error = "ORT CUDA IoBinding was not prepared for this exact "
+               "session/provider/buffer/shape contract.";
+    return false;
+  }
+
+  try {
+    const PreparedRunStats before = impl_->prepared_run_stats;
+    impl_->session->Run(Ort::RunOptions{nullptr}, *prepared.binding);
+    if (impl_->info.cuda_needs_stream_sync)
+      prepared.binding->SynchronizeOutputs();
+    ++impl_->prepared_run_stats.runs;
+    ++impl_->prepared_run_stats.cache_hits;
+    // Guard the StudioCast-owned construction counters at the frame boundary.
+    if (impl_->prepared_run_stats.binding_rebuilds != before.binding_rebuilds ||
+        impl_->prepared_run_stats.tensor_wrapper_constructions !=
+            before.tensor_wrapper_constructions ||
+        impl_->prepared_run_stats.io_binding_constructions !=
+            before.io_binding_constructions ||
+        impl_->prepared_run_stats.application_binding_allocation_requests !=
+            before.application_binding_allocation_requests) {
+      if (error)
+        *error = "ORT prepared CUDA execution mutated setup-only resources.";
+      return false;
+    }
+    return true;
+  } catch (const Ort::Exception &e) {
+    const std::string msg = e.what();
+    const std::string human = HumanizeOrtError(msg, impl_->model_path);
+    if (OrtErrorLooksLikeVramOom(msg))
+      impl_->LatchFailure(human);
+    if (error)
+      *error = human;
+    return false;
+  } catch (const std::exception &e) {
+    if (error)
+      *error = std::string("ORT ExecutePreparedCudaIoBinding() failed: ") +
+               e.what();
     return false;
   }
 #endif

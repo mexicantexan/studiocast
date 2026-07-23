@@ -1,10 +1,12 @@
 #include "core/open_video/open_cuda_hal_adapter.h"
+#include "core/open_video/matting_session.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -1422,6 +1424,37 @@ bool TestReconfigurationWaitsForOutputCommit() {
   return ok;
 }
 
+bool TestMattingExecutionRequiresExactSetupPreparation() {
+  open_video::ModelPack pack;
+  pack.id = "fake-matting";
+  pack.task = "matting";
+  pack.matting.emplace();
+  pack.matting->input.width = 4;
+  pack.matting->input.height = 4;
+
+  open_cuda::OpenCudaMattingSession session(nullptr, std::move(pack));
+  cuda::CudaImage input;
+  input.ptr = 0x1000;
+  input.pitch = 12;
+  input.w = 4;
+  input.h = 4;
+  input.format = cuda::PixelFormatGpu::rgb_u8;
+  cuda::CudaTensor output;
+  output.ptr = 0x2000;
+  output.pitch = 16 * sizeof(float);
+  output.bytes = 16 * sizeof(float);
+  output.n = 1;
+  output.c = 1;
+  output.h = 4;
+  output.w = 4;
+
+  return Require(!session.Run(nullptr, input, &output, nullptr),
+                 "matting Run must not lazily construct setup resources") &&
+         Require(session.preparation_evidence() == nullptr,
+                 "rejected frame execution must not fabricate preparation "
+                 "evidence");
+}
+
 } // namespace
 
 int main() {
@@ -1442,6 +1475,7 @@ int main() {
   ok &= TestTemporalDiscontinuityDeviceLossAndShutdown();
   ok &= TestAdapterLatchesDeviceLossPerSlot();
   ok &= TestReconfigurationWaitsForOutputCommit();
+  ok &= TestMattingExecutionRequiresExactSetupPreparation();
   if (!ok)
     return 1;
   std::cout << "OPEN CUDA HAL ADAPTER TESTS OK\n";

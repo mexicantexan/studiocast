@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <string>
 
 #include "core/cuda/cuda_image.h"
@@ -22,6 +23,17 @@ public:
     bool enable_tensorrt = false;
   };
 
+  struct PreparationEvidence {
+    int cuda_device_id = 0;
+    studiocast::cuda::CudaContextIdentity context;
+    std::uintptr_t requested_stream_identity = 0;
+    bool ort_user_stream_bound = false;
+    bool explicit_stream_synchronization = false;
+    std::string active_provider;
+    std::string model_id;
+    std::string model_artifact_sha256;
+  };
+
   OpenCudaMattingSession(studiocast::cuda::CudaDriverApi *cuda,
                          studiocast::open_video::ModelPack pack);
   OpenCudaMattingSession(studiocast::cuda::CudaDriverApi *cuda,
@@ -35,6 +47,13 @@ public:
   // Safe to call repeatedly.
   bool EnsureInitialized(int frame_w, int frame_h, std::string *error_out);
 
+  // Complete setup for an exact geometry, context, stream, model/provider, and
+  // caller-owned output tensor. Session and IoBinding construction happen
+  // here, never in Run(). Failed replacement setup retains the old plan.
+  bool Prepare(int frame_w, int frame_h, studiocast::cuda::CUstream stream,
+               studiocast::cuda::CudaTensor *output_alpha_gpu,
+               std::string *error_out);
+
   // Run matting inference.
   //
   // - input_rgb_gpu must be a GPU image in rgb_u8 or bgr_u8.
@@ -43,7 +62,11 @@ public:
   //
   // The operation is enqueued on the given stream. If the ONNX Runtime CUDA EP
   // cannot be configured to use the provided stream, the function may
-  // synchronize the stream for correctness.
+  // synchronize the stream for correctness. With error_out == nullptr, the
+  // successful StudioCast-owned path performs no diagnostic string work and
+  // ExecutePreparedCudaIoBinding verifies that no binding/wrapper/container
+  // construction occurred. Opaque allocation inside ORT providers is outside
+  // this counter and must be qualified on hardware.
   bool Run(studiocast::cuda::CUstream stream,
            const studiocast::cuda::CudaImage &input_rgb_gpu,
            studiocast::cuda::CudaTensor *output_alpha_gpu,
@@ -51,6 +74,7 @@ public:
 
   const studiocast::open_video::ModelPack &pack() const;
   const Options &options() const;
+  const PreparationEvidence *preparation_evidence() const noexcept;
 
 private:
   struct Impl;

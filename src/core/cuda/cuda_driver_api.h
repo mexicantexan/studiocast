@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -28,6 +29,11 @@ using CUstream = CUstream_st *;
 using CUarray = CUarray_st *;
 using CUdeviceptr = unsigned long long;
 using CUdevice = int;
+
+// Minimal CUDA UUID ABI surface. CUDA defines this as 16 opaque bytes.
+struct CUuuid {
+  char bytes[16];
+};
 
 // Minimal CUDA Driver API memcopy ABI surface.
 //
@@ -71,6 +77,29 @@ inline constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER = 5;
 inline constexpr CUjit_option CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
 inline constexpr CUjit_option CU_JIT_LOG_VERBOSE = 12;
 
+struct CudaPhysicalDeviceIdentity {
+  std::array<std::uint8_t, 16> uuid{};
+  std::array<char, 32> pci_bus_id{};
+  std::uint8_t pci_bus_id_length = 0;
+
+  bool Valid() const noexcept;
+  bool operator==(const CudaPhysicalDeviceIdentity &) const noexcept = default;
+};
+
+// Process-local identity for one retained CUDA primary-context generation.
+// No CUDA object address is exposed or used as identity.
+struct CudaContextIdentity {
+  CudaPhysicalDeviceIdentity physical_device;
+  std::uint64_t retained_context_id = 0;
+  std::uint64_t logical_generation = 0;
+
+  bool Valid() const noexcept {
+    return physical_device.Valid() && retained_context_id != 0 &&
+           logical_generation != 0;
+  }
+  bool operator==(const CudaContextIdentity &) const noexcept = default;
+};
+
 class CudaDriverApi {
 public:
   using cuInit_t = CUresult (*)(unsigned int flags);
@@ -98,11 +127,15 @@ public:
   using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
   using cuDeviceGetCount_t = CUresult (*)(int *count);
   using cuDeviceGet_t = CUresult (*)(CUdevice *device, int ordinal);
+  using cuDeviceGetUuid_t = CUresult (*)(CUuuid *uuid, CUdevice dev);
+  using cuDeviceGetPCIBusId_t = CUresult (*)(char *pciBusId, int len,
+                                             CUdevice dev);
   using cuDevicePrimaryCtxRetain_t = CUresult (*)(CUcontext *pctx,
                                                   CUdevice dev);
   using cuDevicePrimaryCtxRelease_t = CUresult (*)(CUdevice dev);
   using cuCtxSetCurrent_t = CUresult (*)(CUcontext ctx);
   using cuCtxGetCurrent_t = CUresult (*)(CUcontext *pctx);
+  using cuCtxGetDevice_t = CUresult (*)(CUdevice *device);
   using cuGetErrorString_t = CUresult (*)(CUresult error, const char **pStr);
   using cuDriverGetVersion_t = CUresult (*)(int *driverVersion);
 
@@ -120,10 +153,13 @@ public:
     cuStreamSynchronize_t cuStreamSynchronize = nullptr;
     cuDeviceGetCount_t cuDeviceGetCount = nullptr;
     cuDeviceGet_t cuDeviceGet = nullptr;
+    cuDeviceGetUuid_t cuDeviceGetUuid = nullptr;
+    cuDeviceGetPCIBusId_t cuDeviceGetPCIBusId = nullptr;
     cuDevicePrimaryCtxRetain_t cuDevicePrimaryCtxRetain = nullptr;
     cuDevicePrimaryCtxRelease_t cuDevicePrimaryCtxRelease = nullptr;
     cuCtxSetCurrent_t cuCtxSetCurrent = nullptr;
     cuCtxGetCurrent_t cuCtxGetCurrent = nullptr;
+    cuCtxGetDevice_t cuCtxGetDevice = nullptr;
     cuGetErrorString_t cuGetErrorString = nullptr;
     cuDriverGetVersion_t cuDriverGetVersion = nullptr;
   };
@@ -138,6 +174,12 @@ public:
   CudaDriverApi &operator=(CudaDriverApi &&) noexcept;
 
   bool Initialize(std::string *error_out);
+
+  // Hermetic test seam for the runtime-loaded ABI surface. Production callers
+  // must use Initialize(), which resolves the same required functions from
+  // libcuda.so.1.
+  bool InitializeForTesting(const Functions &functions,
+                            std::string *error_out);
   bool IsInitialized() const { return initialized_; }
 
   const Functions &f() const { return f_; }
@@ -145,6 +187,9 @@ public:
   std::string StatusToString(CUresult code) const;
   const std::string &error() const { return error_; }
   int device_ordinal() const { return device_ordinal_; }
+  const CudaContextIdentity *context_identity() const noexcept {
+    return context_identity_.Valid() ? &context_identity_ : nullptr;
+  }
 
   // Configure the CUDA device ordinal used when retaining a primary context.
   // This must be set before context-dependent work starts for this instance.
@@ -188,6 +233,9 @@ public:
 
 private:
   bool LoadSymbols(std::string *error_out);
+  static bool ValidateRequiredFunctions(const Functions &functions,
+                                        std::string *error_out);
+  void ReleaseRetainedContext() noexcept;
 
   bool initialized_ = false;
   util::DynLib lib_{std::filesystem::path("libcuda.so.1")};
@@ -199,6 +247,7 @@ private:
   CUdevice primary_dev_ = 0;
   CUcontext primary_ctx_ = nullptr;
   bool primary_ctx_validated_ = false;
+  CudaContextIdentity context_identity_{};
 };
 
 } // namespace studiocast::cuda
