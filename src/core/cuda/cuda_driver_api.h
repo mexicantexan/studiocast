@@ -21,12 +21,14 @@ struct CUmod_st;
 struct CUfunc_st;
 struct CUstream_st;
 struct CUarray_st;
+struct CUevent_st;
 
 using CUcontext = CUctx_st *;
 using CUmodule = CUmod_st *;
 using CUfunction = CUfunc_st *;
 using CUstream = CUstream_st *;
 using CUarray = CUarray_st *;
+using CUevent = CUevent_st *;
 using CUdeviceptr = unsigned long long;
 using CUdevice = int;
 
@@ -68,6 +70,28 @@ struct CUDA_MEMCPY2D {
 
 using CUresult = int;
 inline constexpr CUresult CUDA_SUCCESS = 0;
+inline constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY = 2;
+inline constexpr CUresult CUDA_ERROR_DEINITIALIZED = 4;
+inline constexpr CUresult CUDA_ERROR_INVALID_CONTEXT = 201;
+inline constexpr CUresult CUDA_ERROR_ECC_UNCORRECTABLE = 214;
+inline constexpr CUresult CUDA_ERROR_NOT_READY = 600;
+inline constexpr CUresult CUDA_ERROR_ILLEGAL_ADDRESS = 700;
+inline constexpr CUresult CUDA_ERROR_LAUNCH_TIMEOUT = 702;
+inline constexpr CUresult CUDA_ERROR_CONTEXT_IS_DESTROYED = 709;
+inline constexpr CUresult CUDA_ERROR_ASSERT = 710;
+inline constexpr CUresult CUDA_ERROR_HARDWARE_STACK_ERROR = 714;
+inline constexpr CUresult CUDA_ERROR_ILLEGAL_INSTRUCTION = 715;
+inline constexpr CUresult CUDA_ERROR_MISALIGNED_ADDRESS = 716;
+inline constexpr CUresult CUDA_ERROR_INVALID_ADDRESS_SPACE = 717;
+inline constexpr CUresult CUDA_ERROR_INVALID_PC = 718;
+inline constexpr CUresult CUDA_ERROR_LAUNCH_FAILED = 719;
+inline constexpr CUresult CUDA_ERROR_SYSTEM_NOT_READY = 802;
+inline constexpr CUresult CUDA_ERROR_UNKNOWN = 999;
+
+inline constexpr unsigned int CU_EVENT_DEFAULT = 0;
+inline constexpr unsigned int CU_MEMHOSTALLOC_DEFAULT = 0;
+
+[[nodiscard]] bool IsCudaDeviceLossResult(CUresult result) noexcept;
 
 // Minimal CUDA JIT option ABI surface (for cuModuleLoadDataEx diagnostics).
 using CUjit_option = unsigned int;
@@ -136,6 +160,15 @@ public:
   using cuStreamCreate_t = CUresult (*)(CUstream *phStream, unsigned int Flags);
   using cuStreamDestroy_t = CUresult (*)(CUstream hStream);
   using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
+  using cuMemHostAlloc_t = CUresult (*)(void **pp, std::size_t bytesize,
+                                        unsigned int flags);
+  using cuMemFreeHost_t = CUresult (*)(void *p);
+  using cuEventCreate_t = CUresult (*)(CUevent *phEvent, unsigned int flags);
+  using cuEventDestroy_t = CUresult (*)(CUevent hEvent);
+  using cuEventRecord_t = CUresult (*)(CUevent hEvent, CUstream hStream);
+  using cuEventQuery_t = CUresult (*)(CUevent hEvent);
+  using cuEventElapsedTime_t = CUresult (*)(float *pMilliseconds,
+                                            CUevent hStart, CUevent hEnd);
   using cuDeviceGetCount_t = CUresult (*)(int *count);
   using cuDeviceGet_t = CUresult (*)(CUdevice *device, int ordinal);
   using cuDeviceGetUuid_t = CUresult (*)(CUuuid *uuid, CUdevice dev);
@@ -163,6 +196,15 @@ public:
     cuStreamCreate_t cuStreamCreate = nullptr;
     cuStreamDestroy_t cuStreamDestroy = nullptr;
     cuStreamSynchronize_t cuStreamSynchronize = nullptr;
+    // Optional prepared-execution capabilities. These are deliberately not
+    // part of the legacy initialization gate.
+    cuMemHostAlloc_t cuMemHostAlloc = nullptr;
+    cuMemFreeHost_t cuMemFreeHost = nullptr;
+    cuEventCreate_t cuEventCreate = nullptr;
+    cuEventDestroy_t cuEventDestroy = nullptr;
+    cuEventRecord_t cuEventRecord = nullptr;
+    cuEventQuery_t cuEventQuery = nullptr;
+    cuEventElapsedTime_t cuEventElapsedTime = nullptr;
     cuDeviceGetCount_t cuDeviceGetCount = nullptr;
     cuDeviceGet_t cuDeviceGet = nullptr;
     cuDeviceGetUuid_t cuDeviceGetUuid = nullptr;
@@ -193,6 +235,7 @@ public:
   bool InitializeForTesting(const Functions &functions,
                             std::string *error_out);
   bool IsInitialized() const { return initialized_; }
+  [[nodiscard]] bool HasPreparedTransferCompletionSupport() const noexcept;
 
   const Functions &f() const { return f_; }
 
@@ -236,6 +279,12 @@ public:
                     unsigned int flags = 0);
   bool DestroyStream(CUstream stream, std::string *error_out);
   bool StreamSynchronize(CUstream stream, std::string *error_out);
+
+  // Rebinds the already-retained context without probing devices or creating
+  // resources. Prepared hot paths use this after validating their immutable
+  // context-generation binding.
+  CUresult
+  BindPreparedContext(const CudaContextIdentity &expected) noexcept;
 
   // Ensures there is a current CUDA context for subsequent Driver API calls.
   //

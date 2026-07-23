@@ -28,6 +28,28 @@ bool CudaPhysicalDeviceIdentity::Valid() const noexcept {
                      [](std::uint8_t byte) { return byte != 0; });
 }
 
+bool IsCudaDeviceLossResult(CUresult result) noexcept {
+  switch (result) {
+  case CUDA_ERROR_DEINITIALIZED:
+  case CUDA_ERROR_ECC_UNCORRECTABLE:
+  case CUDA_ERROR_ILLEGAL_ADDRESS:
+  case CUDA_ERROR_LAUNCH_TIMEOUT:
+  case CUDA_ERROR_CONTEXT_IS_DESTROYED:
+  case CUDA_ERROR_ASSERT:
+  case CUDA_ERROR_HARDWARE_STACK_ERROR:
+  case CUDA_ERROR_ILLEGAL_INSTRUCTION:
+  case CUDA_ERROR_MISALIGNED_ADDRESS:
+  case CUDA_ERROR_INVALID_ADDRESS_SPACE:
+  case CUDA_ERROR_INVALID_PC:
+  case CUDA_ERROR_LAUNCH_FAILED:
+  case CUDA_ERROR_SYSTEM_NOT_READY:
+  case CUDA_ERROR_UNKNOWN:
+    return true;
+  default:
+    return false;
+  }
+}
+
 CudaDriverApi::CudaDriverApi() = default;
 
 CudaDriverApi::~CudaDriverApi() {
@@ -238,7 +260,35 @@ bool CudaDriverApi::LoadSymbols(std::string *error_out) {
 
   // Optional: cuModuleLoadDataEx (used for PTX JIT diagnostics when available).
   (void)lib_.GetSymbol("cuModuleLoadDataEx", &f_.cuModuleLoadDataEx, nullptr);
+
+  // Optional prepared-execution surface. Older drivers and legacy fake
+  // function tables remain valid, but prepared transfer support fails closed.
+  (void)lib_.GetSymbol("cuMemHostAlloc", &f_.cuMemHostAlloc, nullptr);
+  (void)lib_.GetSymbol("cuMemFreeHost", &f_.cuMemFreeHost, nullptr);
+  (void)lib_.GetSymbol("cuEventCreate", &f_.cuEventCreate, nullptr);
+  (void)lib_.GetSymbol("cuEventDestroy_v2", &f_.cuEventDestroy, nullptr);
+  if (!f_.cuEventDestroy) {
+    (void)lib_.GetSymbol("cuEventDestroy", &f_.cuEventDestroy, nullptr);
+  }
+  (void)lib_.GetSymbol("cuEventRecord", &f_.cuEventRecord, nullptr);
+  (void)lib_.GetSymbol("cuEventQuery", &f_.cuEventQuery, nullptr);
+  (void)lib_.GetSymbol("cuEventElapsedTime", &f_.cuEventElapsedTime, nullptr);
   return true;
+}
+
+bool CudaDriverApi::HasPreparedTransferCompletionSupport() const noexcept {
+  return initialized_ && f_.cuMemHostAlloc && f_.cuMemFreeHost &&
+         f_.cuEventCreate && f_.cuEventDestroy && f_.cuEventRecord &&
+         f_.cuEventQuery && f_.cuEventElapsedTime;
+}
+
+CUresult CudaDriverApi::BindPreparedContext(
+    const CudaContextIdentity &expected) noexcept {
+  if (!initialized_ || !expected.Valid() || !context_identity_.Valid() ||
+      expected != context_identity_ || !primary_ctx_ || !f_.cuCtxSetCurrent) {
+    return CUDA_ERROR_INVALID_CONTEXT;
+  }
+  return f_.cuCtxSetCurrent(primary_ctx_);
 }
 
 void CudaDriverApi::ReleaseRetainedContext() noexcept {
