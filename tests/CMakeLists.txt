@@ -26,6 +26,31 @@ elseif (BUILD_TESTING)
     message(STATUS "Skipping studiocast-audio-tests because libpulse-simple was not found.")
 endif()
 if (BUILD_TESTING)
+    add_executable(studiocast-hal-contract-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/hal_contract_tests.cpp
+    )
+
+    target_link_libraries(studiocast-hal-contract-tests PRIVATE
+            studiocast_hal_contracts)
+
+    target_include_directories(studiocast-hal-contract-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(studiocast-hal-contract-tests)
+    studiocast_enable_sanitizers(studiocast-hal-contract-tests)
+
+    set_target_properties(studiocast-hal-contract-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-hal-contract-tests
+            COMMAND studiocast-hal-contract-tests)
+    studiocast_set_test_labels(studiocast-hal-contract-tests
+            unit core video gpu)
+
     add_library(studiocast-maxine-effect-fake-sdk SHARED
             ${PROJECT_SOURCE_DIR}/tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )

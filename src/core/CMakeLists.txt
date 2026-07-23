@@ -27,6 +27,9 @@ set(_studiocast_contract_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/video_config_types.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/frame_execution_plan.cpp)
 
+set(_studiocast_hal_contract_sources
+        ${PROJECT_SOURCE_DIR}/src/core/hal/prepared_program.cpp)
+
 set(_studiocast_config_sources
         ${PROJECT_SOURCE_DIR}/src/core/config/daemon_config.cpp
         ${PROJECT_SOURCE_DIR}/src/core/config/settings.cpp)
@@ -174,6 +177,7 @@ set(_studiocast_runtime_config_sources
 
 add_library(studiocast_util STATIC ${_studiocast_util_sources})
 add_library(studiocast_contracts STATIC ${_studiocast_contract_sources})
+add_library(studiocast_hal_contracts STATIC ${_studiocast_hal_contract_sources})
 add_library(studiocast_config STATIC ${_studiocast_config_sources})
 add_library(studiocast_ipc STATIC ${_studiocast_ipc_sources})
 add_library(studiocast_cuda_support STATIC ${_studiocast_cuda_support_sources})
@@ -194,6 +198,7 @@ add_library(studiocast_runtime_config STATIC ${_studiocast_runtime_config_source
 set(_studiocast_production_targets
         studiocast_util
         studiocast_contracts
+        studiocast_hal_contracts
         studiocast_config
         studiocast_ipc
         studiocast_cuda_support
@@ -461,6 +466,7 @@ target_link_libraries(studiocast_core INTERFACE
 studiocast_assert_direct_dependencies(studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_contracts
         PUBLIC_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_hal_contracts)
 studiocast_assert_direct_dependencies(studiocast_config
         PUBLIC_STUDIOCAST_DEPS studiocast_contracts
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
@@ -524,6 +530,7 @@ studiocast_assert_direct_dependencies(studiocast_core
 foreach (target IN ITEMS
         studiocast_util
         studiocast_contracts
+        studiocast_hal_contracts
         studiocast_config
         studiocast_ipc
         studiocast_cuda_support
@@ -536,6 +543,7 @@ endforeach ()
 set(_studiocast_expected_sources
         ${_studiocast_util_sources}
         ${_studiocast_contract_sources}
+        ${_studiocast_hal_contract_sources}
         ${_studiocast_config_sources}
         ${_studiocast_ipc_sources}
         ${_studiocast_cuda_support_sources}
@@ -552,7 +560,7 @@ set(_studiocast_expected_sources
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 108)
+set(_studiocast_expected_source_count 109)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
