@@ -147,11 +147,22 @@ public:
   virtual bool Synchronize(CUstream stream, std::string *error) noexcept = 0;
 };
 
+enum class ResidentStreamCreationPolicy : std::uint8_t {
+  // Compatibility behavior for the existing camera pipeline.
+  sdk_preferred = 1,
+  // The HAL production owner requires the runtime-loaded CUDA driver to create
+  // the stream on its proven retained context. No SDK-created fallback is
+  // accepted under this policy.
+  cuda_driver_required,
+};
+
 class ProductionResidentFrameExecutor final : public IResidentFrameExecutor {
 public:
   explicit ProductionResidentFrameExecutor(
       ProductionResidentRuntime runtime,
-      IResidentDeviceOps *device_ops = nullptr);
+      IResidentDeviceOps *device_ops = nullptr,
+      ResidentStreamCreationPolicy stream_creation_policy =
+          ResidentStreamCreationPolicy::sdk_preferred);
   ~ProductionResidentFrameExecutor() override;
 
   ProductionResidentFrameExecutor(const ProductionResidentFrameExecutor &) =

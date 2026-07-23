@@ -1,0 +1,683 @@
+#include "core/maxine/production_hal_owner.h"
+#include "maxine_effect_runtime_fake_control.h"
+
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <new>
+#include <utility>
+
+namespace {
+
+using namespace studiocast;
+using namespace studiocast::maxine;
+
+std::atomic<std::uint64_t> g_allocations{0};
+thread_local bool g_count_allocations = false;
+
+void *Allocate(std::size_t size) {
+  if (void *memory = std::malloc(size == 0 ? 1 : size)) {
+    if (g_count_allocations)
+      g_allocations.fetch_add(1, std::memory_order_relaxed);
+    return memory;
+  }
+  throw std::bad_alloc();
+}
+
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      std::cerr << __func__ << ':' << __LINE__                                 \
+                << ": CHECK failed: " << #condition << '\n';                   \
+      return false;                                                            \
+    }                                                                          \
+  } while (false)
+
+struct FakeCudaState {
+  cuda::CUcontext current = nullptr;
+  int context_device = 0;
+};
+
+FakeCudaState *g_cuda = nullptr;
+
+cuda::CUresult CudaInit(unsigned int) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult CudaModuleLoad(cuda::CUmodule *module, const void *) {
+  *module = reinterpret_cast<cuda::CUmodule>(0x21);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaModuleGetFunction(cuda::CUfunction *function,
+                                     cuda::CUmodule, const char *) {
+  *function = reinterpret_cast<cuda::CUfunction>(0x22);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaLaunch(cuda::CUfunction, unsigned int, unsigned int,
+                          unsigned int, unsigned int, unsigned int,
+                          unsigned int, unsigned int, cuda::CUstream, void **,
+                          void **) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaAlloc(cuda::CUdeviceptr *pointer, std::size_t *pitch,
+                         std::size_t width, std::size_t, unsigned int) {
+  *pointer = 0x1000;
+  *pitch = width;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaFree(cuda::CUdeviceptr) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult CudaCopy(const cuda::CUDA_MEMCPY2D *, cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaMemset(cuda::CUdeviceptr, unsigned char, std::size_t,
+                          cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamCreate(cuda::CUstream *stream, unsigned int) {
+  *stream = reinterpret_cast<cuda::CUstream>(0x30);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamDestroy(cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamSynchronize(cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceCount(int *count) {
+  *count = 1;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceGet(cuda::CUdevice *device, int ordinal) {
+  *device = ordinal;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceUuid(cuda::CUuuid *uuid, cuda::CUdevice device) {
+  std::memset(uuid->bytes, 0, sizeof(uuid->bytes));
+  uuid->bytes[0] = 0x42;
+  uuid->bytes[15] = static_cast<char>(device + 1);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDevicePci(char *pci, int length, cuda::CUdevice) {
+  constexpr char value[] = "0000:01:00.0";
+  if (length < static_cast<int>(sizeof(value)))
+    return 1;
+  std::memcpy(pci, value, sizeof(value));
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaPrimaryRetain(cuda::CUcontext *context,
+                                 cuda::CUdevice device) {
+  *context = reinterpret_cast<cuda::CUcontext>(
+      static_cast<std::uintptr_t>(0x100 + device));
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaPrimaryRelease(cuda::CUdevice) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxSet(cuda::CUcontext context) {
+  if (g_cuda)
+    g_cuda->current = context;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxGet(cuda::CUcontext *context) {
+  *context = g_cuda ? g_cuda->current : nullptr;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxDevice(cuda::CUdevice *device) {
+  *device = g_cuda ? g_cuda->context_device : -1;
+  return cuda::CUDA_SUCCESS;
+}
+
+cuda::CudaDriverApi::Functions CudaFunctions() {
+  cuda::CudaDriverApi::Functions functions{};
+  functions.cuInit = CudaInit;
+  functions.cuModuleLoadData = CudaModuleLoad;
+  functions.cuModuleGetFunction = CudaModuleGetFunction;
+  functions.cuLaunchKernel = CudaLaunch;
+  functions.cuMemAllocPitch = CudaAlloc;
+  functions.cuMemFree = CudaFree;
+  functions.cuMemcpy2DAsync = CudaCopy;
+  functions.cuMemsetD8Async = CudaMemset;
+  functions.cuStreamCreate = CudaStreamCreate;
+  functions.cuStreamDestroy = CudaStreamDestroy;
+  functions.cuStreamSynchronize = CudaStreamSynchronize;
+  functions.cuDeviceGetCount = CudaDeviceCount;
+  functions.cuDeviceGet = CudaDeviceGet;
+  functions.cuDeviceGetUuid = CudaDeviceUuid;
+  functions.cuDeviceGetPCIBusId = CudaDevicePci;
+  functions.cuDevicePrimaryCtxRetain = CudaPrimaryRetain;
+  functions.cuDevicePrimaryCtxRelease = CudaPrimaryRelease;
+  functions.cuCtxSetCurrent = CudaCtxSet;
+  functions.cuCtxGetCurrent = CudaCtxGet;
+  functions.cuCtxGetDevice = CudaCtxDevice;
+  return functions;
+}
+
+class FakeDeviceOps final : public IResidentDeviceOps {
+public:
+  bool Initialize(cuda::CudaDriverApi *, std::uintptr_t, std::uint32_t,
+                  std::string *) override {
+    return !fail_initialize;
+  }
+  bool CropScale(const NvCVImage &, NvCVImage *, float, float, float, float,
+                 CUstream, std::string *) noexcept override {
+    return true;
+  }
+  bool Resize(const NvCVImage &, NvCVImage *, CUstream,
+              std::string *) noexcept override {
+    return true;
+  }
+  bool Vignette(NvCVImage *, float, float, float, CUstream,
+                std::string *) noexcept override {
+    return !fail_vignette;
+  }
+  bool Synchronize(CUstream, std::string *) noexcept override { return true; }
+
+  bool fail_initialize = false;
+  bool fail_vignette = false;
+};
+
+struct RuntimeFixture {
+  vfx::VfxApi vfx;
+  NvcvApi nvcv;
+  ar::ArApi ar;
+  cuda::CudaDriverApi cuda;
+  FakeCudaState cuda_state;
+
+  bool Initialize() {
+    std::string error;
+    const std::filesystem::path sdk(STUDIOCAST_FAKE_MAXINE_SDK_PATH);
+    CHECK(vfx.InitializeFromLibraryPath(sdk, &error));
+    CHECK(nvcv.InitializeFromLibraryPath(NvcvApi::Requirement::VfxCompat, sdk,
+                                         &error));
+    CHECK(ar.InitializeFromLibraryPath(sdk, &error));
+    g_cuda = &cuda_state;
+    CHECK(cuda.InitializeForTesting(CudaFunctions(), &error));
+    CHECK(cuda.EnsureContextForDevice(0, &error));
+    return true;
+  }
+
+  ProductionResidentRuntime Runtime() {
+    return ProductionResidentRuntime{&vfx, &nvcv, &ar, &cuda};
+  }
+};
+
+std::uint32_t Mask(std::initializer_list<ResidentStageKind> stages) {
+  std::uint32_t mask = 0;
+  for (const auto stage : stages)
+    mask |= ProductionResidentStageBit(stage);
+  return mask;
+}
+
+ProductionResidentSetup Setup(std::uint32_t mask,
+                              std::uint64_t generation = 7) {
+  ProductionResidentSetup setup{};
+  setup.configuration_generation = generation;
+  setup.width = 8;
+  setup.height = 6;
+  setup.output_width = 8;
+  setup.output_height = 6;
+  setup.enabled_maxine_stage_mask = mask;
+  setup.vfx_model_directory = "/fake/models";
+  setup.vignette_center_x_px = 4.0f;
+  setup.vignette_center_y_px = 3.0f;
+  setup.effects.engine =
+      video::effects::EffectsEnginePreference::maxine;
+  setup.effects.virtual_background.greenscreen_temporal = false;
+  setup.effects.virtual_background.mode =
+      (mask & ProductionResidentStageBit(
+                  ResidentStageKind::background_blur)) != 0
+          ? video::effects::VirtualBackgroundMode::blur
+          : video::effects::VirtualBackgroundMode::none;
+  setup.effects.virtual_background.strength = 50;
+  setup.effects.virtual_key_light.enabled =
+      (mask & ProductionResidentStageBit(ResidentStageKind::relighting)) != 0;
+  setup.effects.virtual_key_light.intensity = 100;
+  setup.effects.virtual_key_light.hdri_path = "/fake/light.hdr";
+  setup.effects.video_noise_removal.enabled = true;
+  setup.effects.eye_contact.enabled = true;
+  setup.effects.auto_frame.enabled = true;
+  setup.effects.vignette.enabled = true;
+  return setup;
+}
+
+hal::ResourceBudget Capacity() {
+  return hal::ResourceBudget{1u << 20, 1u << 20, 1u << 20, 1u << 20, 64, 1};
+}
+
+hal::ImageDescriptor Image(std::uint32_t width, std::uint32_t height,
+                           hal::PixelFormat format,
+                           hal::ChannelOrder channel_order,
+                           hal::HostCoherence coherence,
+                           hal::Mutability mutability) {
+  hal::ImageDescriptor image{};
+  image.width = width;
+  image.height = height;
+  image.plane_count = 1;
+  image.format = format;
+  image.channel_order = channel_order;
+  image.color_space = hal::ColorSpace::srgb;
+  image.color_range = hal::ColorRange::full;
+  image.orientation = hal::Orientation::top_left;
+  image.host_coherence = coherence;
+  image.mutability = mutability;
+  image.aliasing = hal::AliasingPermission::forbidden;
+  image.base_alignment_bytes = 1;
+  const std::uint64_t row = static_cast<std::uint64_t>(width) * 3u;
+  image.planes[0] =
+      hal::PlaneDescriptor{0, row, row * height, width, height, 1};
+  return image;
+}
+
+hal::PreparedStage Stage(const hal::ExecutionDomainId &domain,
+                         std::uint32_t id,
+                         hal::SemanticEffectId semantic,
+                         hal::SemanticEffectProviderId provider,
+                         bool required) {
+  hal::PreparedStage stage{};
+  stage.stage_id = id;
+  stage.semantic = semantic;
+  stage.provider = provider;
+  stage.backend = hal::BackendId::maxine;
+  stage.execution_domain = domain;
+  stage.input.kind = hal::StageIoKind::image;
+  stage.input.image =
+      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::HostCoherence::not_host_visible, hal::Mutability::read_only);
+  stage.output = stage.input;
+  stage.output.image.mutability = hal::Mutability::read_write;
+  stage.required = required;
+  stage.failure_action =
+      required ? hal::FailureAction::fail_closed
+               : hal::FailureAction::fail_open_preserve_last_valid;
+  stage.circuit_breaker.consecutive_failure_limit = 1;
+  stage.circuit_breaker.action =
+      required ? hal::CircuitBreakerAction::quarantine_program
+               : hal::CircuitBreakerAction::disable_stage;
+  stage.model.model_id_hash[0] = 0x31;
+  stage.model.artifact_set_hash[0] = 0x57;
+  stage.model.artifact_generation = 1;
+  return stage;
+}
+
+hal::PreparedProgram CombinedProgram(const MaxineProductionHalOwner &owner) {
+  hal::PreparedProgram program{};
+  program.program_id = 71;
+  program.owner_adapter_instance_id =
+      owner.execution_domain().adapter_instance_id;
+  program.execution_domain = owner.execution_domain();
+  program.host_input =
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+            hal::HostCoherence::coherent, hal::Mutability::read_only);
+  program.host_output =
+      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::HostCoherence::coherent, hal::Mutability::write_only);
+  program.requested_backend = hal::BackendId::maxine;
+  program.strict_backend_selection = true;
+  program.invalidation_key.generations = hal::ProgramGenerations{
+      owner.resident_key().configuration_generation,
+      1,
+      1,
+      1,
+      1,
+      owner.execution_domain().logical_context_generation};
+  program.invalidation_key.canonical_plan_hash = 0xAA;
+  program.invalidation_key.model_artifact_hash = 0xBB;
+  program.invalidation_key.execution_domain_hash = 0xCC;
+  program.budget = Capacity();
+  program.stages[0] =
+      Stage(program.execution_domain, 1,
+            hal::SemanticEffectId::virtual_background_blur,
+            hal::SemanticEffectProviderId::maxine_vfx, true);
+  program.stages[1] =
+      Stage(program.execution_domain, 2,
+            hal::SemanticEffectId::virtual_key_light,
+            hal::SemanticEffectProviderId::maxine_vfx, true);
+  program.stage_count = 2;
+  return program;
+}
+
+struct HostFrames {
+  std::array<std::uint8_t, 8 * 6 * 3> input{};
+  std::array<std::uint8_t, 8 * 6 * 3> output{};
+
+  hal::HostFrameBinding Binding(const hal::PreparedProgram &program,
+                                std::uint64_t sequence) {
+    hal::HostFrameBinding binding{};
+    binding.input_descriptor = program.host_input;
+    binding.output_descriptor = program.host_output;
+    binding.input_planes[0].read_data =
+        reinterpret_cast<const std::byte *>(input.data());
+    binding.input_planes[0].span_bytes = input.size();
+    binding.input_planes[0].row_stride_bytes = 8 * 3;
+    binding.output_planes[0].write_data =
+        reinterpret_cast<std::byte *>(output.data());
+    binding.output_planes[0].span_bytes = output.size();
+    binding.output_planes[0].row_stride_bytes = 8 * 3;
+    binding.input_plane_count = 1;
+    binding.output_plane_count = 1;
+    binding.capture_sequence = sequence;
+    binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+    binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+    return binding;
+  }
+};
+
+std::unique_ptr<MaxineProductionHalOwner>
+CreateOwner(RuntimeFixture &runtime, FakeDeviceOps &ops,
+            const ProductionResidentSetup &setup,
+            MaxineProductionPreparationResult *result,
+            hal::ResourceBudget capacity = Capacity()) {
+  MaxineProductionBackendRequest request{};
+  request.adapter_instance_id = 41;
+  request.runtime = runtime.Runtime();
+  request.setup = setup;
+  request.capacity = capacity;
+  request.device_ops = &ops;
+  return MaxineProductionHalOwner::CreateBackend(request, result);
+}
+
+bool ExactDomainAndPreparedExecutionAreAllocationFree() {
+  RuntimeFixture runtime{};
+  CHECK(runtime.Initialize());
+  FakeDeviceOps ops{};
+  MaxineProductionPreparationResult preparation{};
+  auto owner = CreateOwner(
+      runtime, ops,
+      Setup(Mask({ResidentStageKind::background_blur,
+                  ResidentStageKind::relighting})),
+      &preparation);
+  if (!owner)
+    std::cerr << "owner preparation failed: status="
+              << static_cast<unsigned>(preparation.status)
+              << " reason=" << static_cast<unsigned>(preparation.reason)
+              << " diagnostic=" << preparation.diagnostic << '\n';
+  CHECK(owner);
+  CHECK(preparation.status == hal::StatusId::ready);
+  CHECK(hal::ValidateExecutionDomain(owner->execution_domain()));
+  CHECK(owner->execution_domain().backend == hal::BackendId::maxine);
+  CHECK(owner->execution_domain().api_family ==
+        hal::ApiFamily::maxine_nvcv);
+  CHECK(owner->execution_domain().physical_device.stable_id[0] == 0x42);
+  CHECK(owner->execution_domain().logical_context_generation ==
+        runtime.cuda.context_identity()->logical_generation);
+  CHECK(owner->execution_domain().queue_or_stream_identity ==
+        owner->executor()->stream_identity());
+  CHECK(owner->execution_domain().queue_or_stream_identity == 0x30);
+  CHECK(owner->execution_domain().adapter_instance_id == 41);
+
+  auto program = CombinedProgram(*owner);
+  CHECK(owner->ConfigureProgram(program, &preparation) ==
+        hal::StatusId::ready);
+  HostFrames frames{};
+  frames.input.fill(0x5A);
+
+  // Warm every path before allocation accounting.
+  hal::HostFrameTokens tokens{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(owner->session()->BindHostFrame(frames.Binding(program, 1), &tokens,
+                                        &reason) == hal::StatusId::ready);
+  hal::ExecuteRequest request{};
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = tokens.input;
+  auto warm = owner->session()->Execute(request);
+  CHECK(warm.status == hal::StatusId::executed);
+  hal::HostFrameOutputResolution resolution{};
+  CHECK(owner->session()->ResolveHostFrameOutput(
+            warm.completion, warm.output, &resolution, &reason) ==
+        hal::StatusId::ready);
+  CHECK(owner->session()->CommitOutput({warm.completion, true}, &reason) ==
+        hal::StatusId::ready);
+
+  owner->executor()->ResetTelemetry();
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations = true;
+  bool ok = true;
+  for (std::uint64_t sequence = 2; sequence != 130; ++sequence) {
+    if (owner->session()->BindHostFrame(frames.Binding(program, sequence),
+                                        &tokens, &reason) !=
+        hal::StatusId::ready) {
+      ok = false;
+      break;
+    }
+    request.capture_sequence = sequence;
+    request.input = tokens.input;
+    const auto result = owner->session()->Execute(request);
+    if (result.status != hal::StatusId::executed ||
+        result.transfers.uploads != 1 ||
+        result.transfers.final_readbacks != 1 ||
+        result.transfers.intermediate_uploads != 0 ||
+        result.transfers.intermediate_readbacks != 0 ||
+        owner->session()->ResolveHostFrameOutput(
+            result.completion, result.output, &resolution, &reason) !=
+            hal::StatusId::ready ||
+        owner->session()->CommitOutput({result.completion, true}, &reason) !=
+            hal::StatusId::ready) {
+      ok = false;
+      break;
+    }
+  }
+  g_count_allocations = false;
+  CHECK(ok);
+  CHECK(g_allocations.load(std::memory_order_relaxed) == 0);
+  const auto &telemetry = owner->executor()->telemetry();
+  CHECK(telemetry
+            .transfers[static_cast<std::size_t>(
+                ProductionTransferKind::host_upload)]
+            .successes == 128);
+  CHECK(telemetry
+            .transfers[static_cast<std::size_t>(
+                ProductionTransferKind::final_download)]
+            .successes == 128);
+  CHECK(telemetry.matte_inferences.successes == 128);
+  CHECK(telemetry.shared_matte_reuses == 128);
+  CHECK(owner->session()->latest_committed_frame().valid);
+  CHECK(owner->session()->latest_committed_frame().stage_count == 2);
+  CHECK(owner->session()->latest_committed_frame().stages[0].backend ==
+        hal::BackendId::maxine);
+
+  const auto retained_program_id = owner->session()->program().program_id;
+  auto reversed = program;
+  ++reversed.program_id;
+  std::swap(reversed.stages[0], reversed.stages[1]);
+  CHECK(owner->ConfigureProgram(reversed, &preparation) ==
+        hal::StatusId::blocked);
+  CHECK(preparation.reason == hal::ReasonId::frame_order_violated);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+
+  auto mutually_exclusive = program;
+  ++mutually_exclusive.program_id;
+  mutually_exclusive.stages[2] = mutually_exclusive.stages[1];
+  mutually_exclusive.stages[2].stage_id = 3;
+  mutually_exclusive.stages[1] =
+      Stage(program.execution_domain, 2,
+            hal::SemanticEffectId::virtual_background_remove,
+            hal::SemanticEffectProviderId::maxine_vfx, true);
+  mutually_exclusive.stage_count = 3;
+  CHECK(owner->ConfigureProgram(mutually_exclusive, &preparation) ==
+        hal::StatusId::blocked);
+  CHECK(preparation.reason == hal::ReasonId::malformed_contract);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+  return true;
+}
+
+bool IdentityStageBudgetAndRollbackFailuresAreTyped() {
+  RuntimeFixture runtime{};
+  CHECK(runtime.Initialize());
+  FakeDeviceOps ops{};
+  MaxineProductionPreparationResult result{};
+  const auto setup = Setup(Mask({ResidentStageKind::vignette}));
+  hal::ResourceBudget minimum{};
+  CHECK(KnownMinimumMaxineBudget(setup, &minimum));
+  auto exhausted = minimum;
+  --exhausted.persistent_bytes;
+  CHECK(!CreateOwner(runtime, ops, setup, &result, exhausted));
+  CHECK(result.status == hal::StatusId::resource_exhausted);
+  CHECK(result.reason == hal::ReasonId::resource_exhausted);
+
+  auto wrong_identity = setup;
+  wrong_identity.runtime_identity = 999;
+  CHECK(!CreateOwner(runtime, ops, wrong_identity, &result));
+  CHECK(result.reason == hal::ReasonId::wrong_generation);
+
+  auto owner = CreateOwner(runtime, ops, setup, &result);
+  CHECK(owner);
+  auto program = CombinedProgram(*owner);
+  program.stage_count = 1;
+  program.stages[0] =
+      Stage(program.execution_domain, 1, hal::SemanticEffectId::vignette,
+            hal::SemanticEffectProviderId::maxine_cuda_utility, true);
+  CHECK(owner->ConfigureProgram(program, &result) == hal::StatusId::ready);
+  const auto retained_program_id = owner->session()->program().program_id;
+
+  auto wrong_stream = program;
+  ++wrong_stream.program_id;
+  ++wrong_stream.execution_domain.queue_or_stream_identity;
+  wrong_stream.stages[0].execution_domain = wrong_stream.execution_domain;
+  CHECK(owner->ConfigureProgram(wrong_stream, &result) ==
+        hal::StatusId::blocked);
+  CHECK(result.reason == hal::ReasonId::wrong_execution_domain);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+
+  auto wrong_generation = program;
+  ++wrong_generation.program_id;
+  ++wrong_generation.invalidation_key.generations.configuration;
+  CHECK(owner->ConfigureProgram(wrong_generation, &result) ==
+        hal::StatusId::blocked);
+  CHECK(result.reason == hal::ReasonId::wrong_generation);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+
+  auto unsupported = program;
+  ++unsupported.program_id;
+  unsupported.stages[0] =
+      Stage(program.execution_domain, 1, hal::SemanticEffectId::mirror,
+            hal::SemanticEffectProviderId::maxine_cuda_utility, true);
+  CHECK(owner->ConfigureProgram(unsupported, &result) ==
+        hal::StatusId::blocked);
+  CHECK(result.reason == hal::ReasonId::semantic_effect_unsupported);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+
+  auto wrong_provider = program;
+  ++wrong_provider.program_id;
+  wrong_provider.stages[0].provider =
+      hal::SemanticEffectProviderId::maxine_vfx;
+  CHECK(owner->ConfigureProgram(wrong_provider, &result) ==
+        hal::StatusId::blocked);
+  CHECK(result.reason == hal::ReasonId::semantic_provider_unavailable);
+  CHECK(owner->session()->program().program_id == retained_program_id);
+
+  return true;
+}
+
+bool OptionalFailureCommitDeviceLossAndShutdownAreSafe() {
+  RuntimeFixture runtime{};
+  CHECK(runtime.Initialize());
+  FakeDeviceOps ops{};
+  MaxineProductionPreparationResult result{};
+  auto owner =
+      CreateOwner(runtime, ops, Setup(Mask({ResidentStageKind::vignette})),
+                  &result);
+  CHECK(owner);
+  auto program = CombinedProgram(*owner);
+  program.stage_count = 1;
+  program.stages[0] =
+      Stage(program.execution_domain, 1, hal::SemanticEffectId::vignette,
+            hal::SemanticEffectProviderId::maxine_cuda_utility, false);
+  CHECK(owner->ConfigureProgram(program, &result) == hal::StatusId::ready);
+
+  HostFrames frames{};
+  frames.input.fill(0x33);
+  hal::HostFrameTokens tokens{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(owner->session()->BindHostFrame(frames.Binding(program, 1), &tokens,
+                                        &reason) == hal::StatusId::ready);
+  hal::ExecuteRequest request{};
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = tokens.input;
+  ops.fail_vignette = true;
+  const auto degraded = owner->session()->Execute(request);
+  if (degraded.status != hal::StatusId::degraded)
+    std::cerr << "optional execution failed: status="
+              << static_cast<unsigned>(degraded.status)
+              << " reason=" << static_cast<unsigned>(degraded.reason)
+              << " stage_status="
+              << static_cast<unsigned>(degraded.stages[0].status)
+              << " stage_reason="
+              << static_cast<unsigned>(degraded.stages[0].reason) << '\n';
+  CHECK(degraded.status == hal::StatusId::degraded);
+  CHECK(degraded.reason == hal::ReasonId::optional_stage_failed_open);
+  CHECK(degraded.output_valid);
+  CHECK(degraded.stages[0].valid_output_preserved);
+  CHECK(!owner->session()->latest_committed_frame().valid);
+  hal::HostFrameOutputResolution resolution{};
+  CHECK(owner->session()->ResolveHostFrameOutput(
+            degraded.completion, degraded.output, &resolution, &reason) ==
+        hal::StatusId::ready);
+  CHECK(owner->session()->CommitOutput({degraded.completion, false}, &reason) ==
+        hal::StatusId::failed);
+  CHECK(reason == hal::ReasonId::output_write_failed);
+  CHECK(!owner->session()->latest_committed_frame().valid);
+
+  owner->NotifyDeviceLost();
+  CHECK(owner->device_lost());
+  CHECK(owner->session()->quarantined());
+  CHECK(owner->session()->Execute(request).status ==
+        hal::StatusId::quarantined);
+  owner->Shutdown();
+  CHECK(owner->stopped());
+  CHECK(owner->session()->stopped());
+  CHECK(owner->session()->Execute(request).status == hal::StatusId::stopped);
+  CHECK(owner->adapter() == nullptr);
+  CHECK(owner->executor() == nullptr);
+  return true;
+}
+
+bool TemporalConfigurationsFailClosedWithoutResetEvidence() {
+  RuntimeFixture runtime{};
+  CHECK(runtime.Initialize());
+  FakeDeviceOps ops{};
+  MaxineProductionPreparationResult result{};
+  auto setup = Setup(Mask({ResidentStageKind::background_blur}));
+  setup.effects.virtual_background.greenscreen_temporal = true;
+  auto owner = CreateOwner(runtime, ops, setup, &result);
+  CHECK(owner);
+  auto program = CombinedProgram(*owner);
+  program.stage_count = 1;
+  program.stages[0] =
+      Stage(program.execution_domain, 1,
+            hal::SemanticEffectId::virtual_background_blur,
+            hal::SemanticEffectProviderId::maxine_vfx, true);
+  program.temporal.temporal = true;
+  program.temporal.requires_contiguous_capture_sequence = true;
+  program.temporal.history_frames = 1;
+  CHECK(owner->ConfigureProgram(program, &result) ==
+        hal::StatusId::blocked);
+  CHECK(result.reason == hal::ReasonId::capability_evidence_incomplete);
+  CHECK(!owner->prepared());
+  return true;
+}
+
+} // namespace
+
+void *operator new(std::size_t size) { return Allocate(size); }
+void *operator new[](std::size_t size) { return Allocate(size); }
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
+
+int main() {
+  if (!ExactDomainAndPreparedExecutionAreAllocationFree() ||
+      !IdentityStageBudgetAndRollbackFailuresAreTyped() ||
+      !OptionalFailureCommitDeviceLossAndShutdownAreSafe() ||
+      !TemporalConfigurationsFailClosedWithoutResetEvidence()) {
+    return EXIT_FAILURE;
+  }
+  g_cuda = nullptr;
+  std::cout << "Maxine production HAL owner tests passed\n";
+  return EXIT_SUCCESS;
+}

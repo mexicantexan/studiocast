@@ -221,10 +221,12 @@ bool DecodedBackgroundRgbView::Valid() const noexcept {
 
 class ProductionResidentFrameExecutor::Impl {
 public:
-  Impl(ProductionResidentRuntime runtime, IResidentDeviceOps *injected_ops)
+  Impl(ProductionResidentRuntime runtime, IResidentDeviceOps *injected_ops,
+       ResidentStreamCreationPolicy stream_creation_policy)
       : runtime_(runtime),
         device_ops_(injected_ops ? injected_ops : &default_device_ops_),
-        using_injected_device_ops_(injected_ops != nullptr) {}
+        using_injected_device_ops_(injected_ops != nullptr),
+        stream_creation_policy_(stream_creation_policy) {}
 
   ~Impl() { DestroyAll(); }
 
@@ -600,6 +602,17 @@ private:
   }
 
   bool CreateSharedStream(std::string *error) {
+    if (stream_creation_policy_ ==
+        ResidentStreamCreationPolicy::cuda_driver_required) {
+      if (runtime_.cuda && runtime_.cuda->IsInitialized() &&
+          runtime_.cuda->CreateStream(&stream_, error)) {
+        stream_owner_ = StreamOwner::cuda;
+        return true;
+      }
+      return SetSetupError(
+          "Unable to create the required CUDA-driver-owned Maxine stream.",
+          error);
+    }
     if (runtime_.vfx && runtime_.vfx->IsInitialized() &&
         runtime_.vfx->f().NvVFX_CudaStreamCreate) {
       const auto status = runtime_.vfx->f().NvVFX_CudaStreamCreate(&stream_);
@@ -1192,6 +1205,8 @@ private:
   DefaultResidentDeviceOps default_device_ops_{};
   IResidentDeviceOps *device_ops_ = nullptr;
   bool using_injected_device_ops_ = false;
+  ResidentStreamCreationPolicy stream_creation_policy_ =
+      ResidentStreamCreationPolicy::sdk_preferred;
   ProductionResidentSetup setup_{};
   ProductionResidentTelemetry telemetry_{};
   std::string last_error_;
@@ -1243,8 +1258,10 @@ private:
 };
 
 ProductionResidentFrameExecutor::ProductionResidentFrameExecutor(
-    ProductionResidentRuntime runtime, IResidentDeviceOps *device_ops)
-    : impl_(std::make_unique<Impl>(runtime, device_ops)) {}
+    ProductionResidentRuntime runtime, IResidentDeviceOps *device_ops,
+    ResidentStreamCreationPolicy stream_creation_policy)
+    : impl_(
+          std::make_unique<Impl>(runtime, device_ops, stream_creation_policy)) {}
 
 ProductionResidentFrameExecutor::~ProductionResidentFrameExecutor() = default;
 
