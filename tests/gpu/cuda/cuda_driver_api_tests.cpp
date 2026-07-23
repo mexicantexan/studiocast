@@ -56,6 +56,7 @@ struct FakeCudaDriver {
   int module_loads = 0;
   int function_resolutions = 0;
   int launches = 0;
+  int memsets = 0;
   studiocast::cuda::CUcontext current = nullptr;
 };
 
@@ -98,6 +99,13 @@ studiocast::cuda::CUresult FakeFree(studiocast::cuda::CUdeviceptr) {
 studiocast::cuda::CUresult
 FakeCopy(const studiocast::cuda::CUDA_MEMCPY2D *,
          studiocast::cuda::CUstream) {
+  return 0;
+}
+studiocast::cuda::CUresult
+FakeMemset(studiocast::cuda::CUdeviceptr, unsigned char, std::size_t,
+           studiocast::cuda::CUstream) {
+  if (g_fake_cuda)
+    ++g_fake_cuda->memsets;
   return 0;
 }
 studiocast::cuda::CUresult
@@ -178,6 +186,7 @@ studiocast::cuda::CudaDriverApi::Functions CompleteFakeFunctions() {
   f.cuMemAllocPitch = FakeAlloc;
   f.cuMemFree = FakeFree;
   f.cuMemcpy2DAsync = FakeCopy;
+  f.cuMemsetD8Async = FakeMemset;
   f.cuStreamCreate = FakeStreamCreate;
   f.cuStreamDestroy = FakeStreamDestroy;
   f.cuStreamSynchronize = FakeStreamSync;
@@ -239,6 +248,11 @@ bool TestPreprocessKernelIsSetupOnlyAndGenerationBound() {
 
   ok = Expect(studiocast::cuda::kernels::PreparePreprocessKernel(&cuda, &err),
               "preprocess PTX should prepare during setup") &&
+       ok;
+  ok = Expect(cuda.MemsetD8Async(0x5000, 0, tensor.bytes, nullptr, &err) &&
+                  state.memsets == 1,
+              "setup should support bounded initialization of prepared CUDA "
+              "buffers") &&
        ok;
   ok = Expect(state.module_loads == 1 && state.function_resolutions == 1,
               "setup should load and resolve preprocess exactly once") &&

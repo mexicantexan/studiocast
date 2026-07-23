@@ -545,6 +545,52 @@ bool OpenCudaMattingSession::Prepare(
     return false;
   }
 
+  // Execute one bounded, real inference during setup so provider workspaces,
+  // kernels, and graph initialization cannot be deferred to frame 1. Both
+  // external buffers are already allocated and bound; zero is a valid finite
+  // model input and the caller explicitly lends the output tensor to Prepare.
+  if (!impl_->cuda->MemsetD8Async(impl_->input_tensor.ptr, 0,
+                                  impl_->input_tensor.bytes, stream,
+                                  &setup_error) ||
+      !impl_->cuda->MemsetD8Async(output_alpha_gpu->ptr, 0,
+                                  output_alpha_gpu->bytes, stream,
+                                  &setup_error)) {
+    if (error_out)
+      *error_out = std::move(setup_error);
+    return false;
+  }
+  if (candidate.ort_needs_stream_sync &&
+      !impl_->cuda->StreamSynchronize(stream, &setup_error)) {
+    if (error_out)
+      *error_out = std::move(setup_error);
+    return false;
+  }
+  const auto stats_before_warmup =
+      candidate.ort_session->prepared_run_stats();
+  if (!candidate.ort_session->ExecutePreparedCudaIoBinding(
+          0, &in, 1, &out, 1, &setup_error) ||
+      !impl_->cuda->StreamSynchronize(stream, &setup_error)) {
+    if (error_out)
+      *error_out = std::move(setup_error);
+    return false;
+  }
+  const auto stats_after_warmup =
+      candidate.ort_session->prepared_run_stats();
+  if (stats_after_warmup.runs != stats_before_warmup.runs + 1 ||
+      stats_after_warmup.binding_rebuilds !=
+          stats_before_warmup.binding_rebuilds ||
+      stats_after_warmup.tensor_wrapper_constructions !=
+          stats_before_warmup.tensor_wrapper_constructions ||
+      stats_after_warmup.io_binding_constructions !=
+          stats_before_warmup.io_binding_constructions ||
+      stats_after_warmup.application_binding_allocation_requests !=
+          stats_before_warmup.application_binding_allocation_requests) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession: setup warmup mutated prepared "
+                   "binding resources.";
+    return false;
+  }
+
   impl_->ort_session = std::move(candidate.ort_session);
   impl_->ort_info = std::move(candidate.ort_info);
   impl_->input_name = std::move(candidate.input_name);
@@ -567,6 +613,8 @@ bool OpenCudaMattingSession::Prepare(
       impl_->ort_info.cuda_user_compute_stream_bound;
   impl_->preparation_evidence.explicit_stream_synchronization =
       impl_->ort_info.cuda_needs_stream_sync;
+  impl_->preparation_evidence.inference_warmup_complete = true;
+  impl_->preparation_evidence.setup_warmup_inferences = 1;
   impl_->preparation_evidence.active_provider = impl_->ort_info.active_provider;
   impl_->preparation_evidence.model_id = impl_->pack.id;
   if (const auto *model = FindMainOnnxFile(impl_->pack))
@@ -576,6 +624,16 @@ bool OpenCudaMattingSession::Prepare(
 }
 
 bool OpenCudaMattingSession::Run(
+    studiocast::cuda::CUstream stream,
+    const studiocast::cuda::CudaImage &input_rgb_gpu,
+    studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {
+  if (!Prepare(input_rgb_gpu.w, input_rgb_gpu.h, stream, output_alpha_gpu,
+               error_out))
+    return false;
+  return RunPrepared(stream, input_rgb_gpu, output_alpha_gpu, error_out);
+}
+
+bool OpenCudaMattingSession::RunPrepared(
     studiocast::cuda::CUstream stream,
     const studiocast::cuda::CudaImage &input_rgb_gpu,
     studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {

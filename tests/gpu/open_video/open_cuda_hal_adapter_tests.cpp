@@ -1448,11 +1448,13 @@ bool TestMattingExecutionRequiresExactSetupPreparation() {
   output.h = 4;
   output.w = 4;
 
-  return Require(!session.Run(nullptr, input, &output, nullptr),
-                 "matting Run must not lazily construct setup resources") &&
+  return Require(!session.RunPrepared(nullptr, input, &output, nullptr),
+                 "strict matting RunPrepared must reject missing setup") &&
          Require(session.preparation_evidence() == nullptr,
                  "rejected frame execution must not fabricate preparation "
-                 "evidence");
+                 "evidence") &&
+         Require(!session.Run(nullptr, input, &output, nullptr),
+                 "legacy matting Run must preserve fail-safe setup failure");
 }
 
 } // namespace

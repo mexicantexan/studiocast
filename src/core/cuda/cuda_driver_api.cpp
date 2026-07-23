@@ -151,6 +151,7 @@ bool CudaDriverApi::ValidateRequiredFunctions(const Functions &functions,
       {"cuMemAllocPitch", functions.cuMemAllocPitch != nullptr},
       {"cuMemFree", functions.cuMemFree != nullptr},
       {"cuMemcpy2DAsync", functions.cuMemcpy2DAsync != nullptr},
+      {"cuMemsetD8Async", functions.cuMemsetD8Async != nullptr},
       {"cuStreamCreate", functions.cuStreamCreate != nullptr},
       {"cuStreamDestroy", functions.cuStreamDestroy != nullptr},
       {"cuStreamSynchronize", functions.cuStreamSynchronize != nullptr},
@@ -207,6 +208,7 @@ bool CudaDriverApi::LoadSymbols(std::string *error_out) {
       !load_req_any("cuMemFree_v2", "cuMemFree", &f_.cuMemFree) ||
       !load_req_any("cuMemcpy2DAsync_v2", "cuMemcpy2DAsync",
                     &f_.cuMemcpy2DAsync) ||
+      !load_req("cuMemsetD8Async", &f_.cuMemsetD8Async) ||
       !load_req("cuStreamCreate", &f_.cuStreamCreate) ||
       !load_req_any("cuStreamDestroy_v2", "cuStreamDestroy",
                     &f_.cuStreamDestroy) ||
@@ -636,6 +638,27 @@ bool CudaDriverApi::MemcpyDtoH2DAsync(void *dst, std::size_t dst_pitch,
   if (st != CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuMemcpy2DAsync (DtoH) failed: " + StatusToString(st);
+    return false;
+  }
+  return true;
+}
+
+bool CudaDriverApi::MemsetD8Async(CUdeviceptr dst, std::uint8_t value,
+                                  std::size_t byte_count, CUstream stream,
+                                  std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (!initialized_ || !EnsureContext(error_out))
+    return false;
+  if (!f_.cuMemsetD8Async || dst == 0 || byte_count == 0) {
+    if (error_out)
+      *error_out = "cuMemsetD8Async setup contract is invalid.";
+    return false;
+  }
+  const CUresult st = f_.cuMemsetD8Async(dst, value, byte_count, stream);
+  if (st != CUDA_SUCCESS) {
+    if (error_out)
+      *error_out = "cuMemsetD8Async failed: " + StatusToString(st);
     return false;
   }
   return true;

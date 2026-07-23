@@ -122,6 +122,10 @@ public:
   using cuMemFree_t = CUresult (*)(CUdeviceptr dptr);
   using cuMemcpy2DAsync_t = CUresult (*)(const CUDA_MEMCPY2D *pCopy,
                                          CUstream hStream);
+  using cuMemsetD8Async_t = CUresult (*)(CUdeviceptr dstDevice,
+                                         unsigned char value,
+                                         std::size_t count,
+                                         CUstream hStream);
   using cuStreamCreate_t = CUresult (*)(CUstream *phStream, unsigned int Flags);
   using cuStreamDestroy_t = CUresult (*)(CUstream hStream);
   using cuStreamSynchronize_t = CUresult (*)(CUstream hStream);
@@ -148,6 +152,7 @@ public:
     cuMemAllocPitch_t cuMemAllocPitch = nullptr;
     cuMemFree_t cuMemFree = nullptr;
     cuMemcpy2DAsync_t cuMemcpy2DAsync = nullptr;
+    cuMemsetD8Async_t cuMemsetD8Async = nullptr;
     cuStreamCreate_t cuStreamCreate = nullptr;
     cuStreamDestroy_t cuStreamDestroy = nullptr;
     cuStreamSynchronize_t cuStreamSynchronize = nullptr;
@@ -215,6 +220,10 @@ public:
                          std::size_t src_pitch, std::size_t width_bytes,
                          std::size_t height, CUstream stream,
                          std::string *error_out);
+
+  bool MemsetD8Async(CUdeviceptr dst, std::uint8_t value,
+                     std::size_t byte_count, CUstream stream,
+                     std::string *error_out);
 
   bool CreateStream(CUstream *out, std::string *error_out,
                     unsigned int flags = 0);

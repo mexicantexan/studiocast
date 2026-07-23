@@ -276,6 +276,11 @@ DONE:
 }
 )ptx";
 
+bool EnsureCudaReady(studiocast::cuda::CudaDriverApi **out_cuda,
+                     std::string *error_out) {
+  return detail::EnsureCudaReady(out_cuda, error_out);
+}
+
 struct KernelState {
   // CUDA module/function handles are context-bound; keep this cache thread-local
   // with the thread-local driver/context owner in cuda_driver_cache.h.
@@ -292,8 +297,8 @@ KernelState &kernel() {
   return s;
 }
 
-bool LoadKernelForSetup(studiocast::cuda::CudaDriverApi *cuda,
-                        std::string *error_out) {
+bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
+                bool require_exact_identity, std::string *error_out) {
   if (error_out)
     error_out->clear();
   studiocast::cuda::CUcontext cur = nullptr;
@@ -304,14 +309,15 @@ bool LoadKernelForSetup(studiocast::cuda::CudaDriverApi *cuda,
   const auto &f = cuda->f();
 
   const auto *identity = cuda ? cuda->context_identity() : nullptr;
-  if (!identity || !identity->Valid()) {
+  if (require_exact_identity && (!identity || !identity->Valid())) {
     if (error_out)
       *error_out = "PreparePreprocessKernel: CUDA context identity unavailable.";
     return false;
   }
 
   if (k.loaded && k.loaded_ctx == cur && k.owner == cuda &&
-      k.context_identity == *identity) {
+      (!require_exact_identity ||
+       (identity && k.context_identity == *identity))) {
     return true;
   }
 
@@ -368,7 +374,8 @@ bool LoadKernelForSetup(studiocast::cuda::CudaDriverApi *cuda,
   k.loaded = true;
   k.loaded_ctx = cur;
   k.owner = cuda;
-  k.context_identity = *identity;
+  k.context_identity = identity ? *identity
+                                : studiocast::cuda::CudaContextIdentity{};
   return true;
 }
 
@@ -406,7 +413,7 @@ bool PreparePreprocessKernel(studiocast::cuda::CudaDriverApi *cuda,
   }
   if (!cuda->EnsureContext(error_out))
     return false;
-  return LoadKernelForSetup(cuda, error_out);
+  return LoadKernel(cuda, /*require_exact_identity=*/true, error_out);
 }
 
 namespace {
@@ -414,6 +421,7 @@ namespace {
 bool PreprocessToTensorImpl(
     studiocast::cuda::CudaDriverApi *cuda,
     const studiocast::cuda::CudaContextIdentity *expected_context,
+    bool legacy_compatibility,
     const CudaImage &src, const CudaTensor &dst,
     const ModelPreprocessSpec &spec, studiocast::cuda::CUstream stream,
     std::string *error_out) {
@@ -462,8 +470,14 @@ bool PreprocessToTensorImpl(
   }
 
   studiocast::cuda::CUfunction fn = nullptr;
-  if (!ValidatePreparedKernel(cuda, expected_context, &fn, error_out))
+  if (legacy_compatibility) {
+    if (!EnsureCudaReady(&cuda, error_out) ||
+        !LoadKernel(cuda, /*require_exact_identity=*/false, error_out))
+      return false;
+    fn = kernel().fn;
+  } else if (!ValidatePreparedKernel(cuda, expected_context, &fn, error_out)) {
     return false;
+  }
 
   const auto &f = cuda->f();
 
@@ -527,9 +541,9 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
                         const ModelPreprocessSpec &spec,
                         studiocast::cuda::CUstream stream,
                         std::string *error_out) {
-  KernelState &k = kernel();
-  return PreprocessToTensorImpl(k.owner, nullptr, src, dst, spec, stream,
-                                error_out);
+  return PreprocessToTensorImpl(nullptr, nullptr,
+                                /*legacy_compatibility=*/true, src, dst, spec,
+                                stream, error_out);
 }
 
 bool PreprocessToTensorPrepared(
@@ -538,8 +552,9 @@ bool PreprocessToTensorPrepared(
     const CudaImage &src, const CudaTensor &dst,
     const ModelPreprocessSpec &spec, studiocast::cuda::CUstream stream,
     std::string *error_out) {
-  return PreprocessToTensorImpl(cuda, &context_identity, src, dst, spec, stream,
-                                error_out);
+  return PreprocessToTensorImpl(cuda, &context_identity,
+                                /*legacy_compatibility=*/false, src, dst, spec,
+                                stream, error_out);
 }
 
 } // namespace studiocast::cuda::kernels
