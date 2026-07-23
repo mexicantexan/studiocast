@@ -1,6 +1,7 @@
 #include "core/open_video/matting_session.h"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,79 @@
 namespace studiocast::open_cuda {
 
 namespace {
+
+std::atomic<std::uint64_t> g_matting_preparation_generation{1};
+
+[[maybe_unused]] std::uint64_t NextMattingPreparationGeneration() noexcept {
+  std::uint64_t value =
+      g_matting_preparation_generation.fetch_add(1, std::memory_order_relaxed);
+  if (value != 0)
+    return value;
+  value =
+      g_matting_preparation_generation.fetch_add(1, std::memory_order_relaxed);
+  return value == 0 ? 1 : value;
+}
+
+void SetCompatibilityError(std::string *error, const char *message) noexcept {
+  if (!error)
+    return;
+  try {
+    *error = message ? message : "";
+  } catch (...) {
+    error->clear();
+  }
+}
+
+const char *
+MattingPreparedRunStatusMessage(MattingPreparedRunStatus status) noexcept {
+  switch (status) {
+  case MattingPreparedRunStatus::success:
+    return "";
+  case MattingPreparedRunStatus::not_prepared:
+    return "OpenCudaMattingSession: exact execution contract is not prepared.";
+  case MattingPreparedRunStatus::invalid_input_contract:
+    return "OpenCudaMattingSession: input contract is invalid.";
+  case MattingPreparedRunStatus::invalid_output_contract:
+    return "OpenCudaMattingSession: output contract is invalid.";
+  case MattingPreparedRunStatus::foreign_evidence:
+    return "OpenCudaMattingSession: prepared-run evidence is invalid.";
+  case MattingPreparedRunStatus::stale_preparation_generation:
+    return "OpenCudaMattingSession: preparation generation is stale.";
+  case MattingPreparedRunStatus::wrong_device:
+    return "OpenCudaMattingSession: CUDA device identity differs from setup.";
+  case MattingPreparedRunStatus::stale_context_generation:
+    return "OpenCudaMattingSession: CUDA context generation differs from setup.";
+  case MattingPreparedRunStatus::stale_stream:
+    return "OpenCudaMattingSession: CUDA stream differs from setup.";
+  case MattingPreparedRunStatus::stale_artifact:
+    return "OpenCudaMattingSession: model artifact evidence is stale.";
+  case MattingPreparedRunStatus::stale_ort_session:
+    return "OpenCudaMattingSession: ORT session generation is stale.";
+  case MattingPreparedRunStatus::stale_binding:
+    return "OpenCudaMattingSession: prepared binding contract is stale.";
+  case MattingPreparedRunStatus::provider_unavailable:
+    return "OpenCudaMattingSession: CUDA provider is unavailable.";
+  case MattingPreparedRunStatus::provider_mismatch:
+    return "OpenCudaMattingSession: provider evidence does not match.";
+  case MattingPreparedRunStatus::cpu_fallback_forbidden:
+    return "OpenCudaMattingSession: CPU provider fallback is forbidden.";
+  case MattingPreparedRunStatus::tensorrt_forbidden:
+    return "OpenCudaMattingSession: TensorRT provider is forbidden.";
+  case MattingPreparedRunStatus::resource_exhausted:
+    return "OpenCudaMattingSession: prepared execution exhausted resources.";
+  case MattingPreparedRunStatus::preprocess_failure:
+    return "OpenCudaMattingSession: prepared preprocessing failed.";
+  case MattingPreparedRunStatus::inference_failure:
+    return "OpenCudaMattingSession: prepared inference failed.";
+  case MattingPreparedRunStatus::provider_failure_quarantine:
+    return "OpenCudaMattingSession: provider failed and was quarantined.";
+  case MattingPreparedRunStatus::cancelled_or_shutdown:
+    return "OpenCudaMattingSession: execution was cancelled or is shutting down.";
+  case MattingPreparedRunStatus::setup_resource_mutation:
+    return "OpenCudaMattingSession: execution mutated setup-only resources.";
+  }
+  return "OpenCudaMattingSession: prepared execution failed.";
+}
 
 bool FileExists(const std::filesystem::path &p) {
   std::error_code ec;
@@ -53,6 +127,197 @@ DigestToHex(const std::array<std::uint8_t, 32> &digest) {
 
 } // namespace
 
+bool MattingPreparedRunEvidence::Valid() const noexcept {
+  return schema_version == kSchemaVersion && preparation_generation != 0 &&
+         cuda_device_id >= 0 && context.Valid() &&
+         input_tensor_ptr != 0 && output_tensor_ptr != 0 && frame_width > 0 &&
+         frame_height > 0 && ort.Valid() &&
+         (!strict_cuda_only ||
+          (stream_identity != 0 && artifact.Valid()));
+}
+
+namespace internal {
+
+MattingPreparedRunResult ClassifyMattingPreparedRunContract(
+    const MattingPreparedRunContract &contract) noexcept {
+  MattingPreparedRunResult result;
+  result.preparation_generation = contract.active.preparation_generation;
+  if (contract.shutdown_requested) {
+    result.status = MattingPreparedRunStatus::cancelled_or_shutdown;
+    return result;
+  }
+  if (!contract.buffers_ready || !contract.execution_prepared) {
+    result.status = MattingPreparedRunStatus::not_prepared;
+    return result;
+  }
+  if (!contract.input_valid) {
+    result.status = MattingPreparedRunStatus::invalid_input_contract;
+    return result;
+  }
+  if (!contract.output_valid) {
+    result.status = MattingPreparedRunStatus::invalid_output_contract;
+    return result;
+  }
+  if (!contract.requested.Valid()) {
+    result.status = MattingPreparedRunStatus::foreign_evidence;
+    return result;
+  }
+  if (!contract.active.Valid()) {
+    result.status = MattingPreparedRunStatus::provider_unavailable;
+    return result;
+  }
+  if (contract.requested.preparation_generation !=
+      contract.active.preparation_generation) {
+    result.status = MattingPreparedRunStatus::stale_preparation_generation;
+    return result;
+  }
+  if (contract.requested.cuda_device_id != contract.active.cuda_device_id) {
+    result.status = MattingPreparedRunStatus::wrong_device;
+    return result;
+  }
+  if (!(contract.requested.context == contract.active.context)) {
+    result.status = MattingPreparedRunStatus::stale_context_generation;
+    return result;
+  }
+  if (contract.requested.stream_identity != contract.active.stream_identity) {
+    result.status = MattingPreparedRunStatus::stale_stream;
+    return result;
+  }
+  if (!(contract.requested.artifact == contract.active.artifact)) {
+    result.status = MattingPreparedRunStatus::stale_artifact;
+    return result;
+  }
+  if (contract.requested.ort.session_generation !=
+      contract.active.ort.session_generation) {
+    result.status = MattingPreparedRunStatus::stale_ort_session;
+    return result;
+  }
+  if (!(contract.requested.ort.provider ==
+        contract.active.ort.provider)) {
+    result.status = MattingPreparedRunStatus::provider_mismatch;
+    return result;
+  }
+  if (contract.strict_cuda_only) {
+    if (!contract.requested.strict_cuda_only ||
+        !contract.active.strict_cuda_only ||
+        !contract.active.artifact.Valid()) {
+      result.status = MattingPreparedRunStatus::provider_mismatch;
+      return result;
+    }
+    if (contract.active.ort.provider.provider ==
+        studiocast::onnx::OrtExecutionProviderId::cpu) {
+      result.status = MattingPreparedRunStatus::cpu_fallback_forbidden;
+      return result;
+    }
+    if (contract.active.ort.provider.provider ==
+        studiocast::onnx::OrtExecutionProviderId::tensorrt) {
+      result.status = MattingPreparedRunStatus::tensorrt_forbidden;
+      return result;
+    }
+    if (!contract.active.ort.provider.ValidStrictCuda()) {
+      result.status = MattingPreparedRunStatus::provider_mismatch;
+      return result;
+    }
+  }
+  if (!contract.binding_matches ||
+      contract.requested.input_tensor_ptr !=
+          contract.active.input_tensor_ptr ||
+      contract.requested.output_tensor_ptr !=
+          contract.active.output_tensor_ptr ||
+      contract.requested.frame_width != contract.active.frame_width ||
+      contract.requested.frame_height != contract.active.frame_height) {
+    result.status = MattingPreparedRunStatus::stale_binding;
+    return result;
+  }
+  result.status = MattingPreparedRunStatus::success;
+  return result;
+}
+
+MattingPreparedRunResult ProjectOrtPreparedRunResult(
+    const studiocast::onnx::OrtPreparedRunResult &ort) noexcept {
+  MattingPreparedRunResult result;
+  result.inference = ort;
+  if (ort.schema_version !=
+      studiocast::onnx::OrtPreparedRunResult::kSchemaVersion) {
+    result.status = MattingPreparedRunStatus::foreign_evidence;
+    return result;
+  }
+  switch (ort.status) {
+  case studiocast::onnx::OrtPreparedRunStatus::success:
+    result.status = MattingPreparedRunStatus::success;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::not_prepared:
+    result.status = MattingPreparedRunStatus::not_prepared;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::invalid_input_output_contract:
+    result.status = MattingPreparedRunStatus::invalid_output_contract;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::foreign_provider_evidence:
+    result.status = MattingPreparedRunStatus::foreign_evidence;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::stale_session_generation:
+    result.status = MattingPreparedRunStatus::stale_ort_session;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::wrong_device:
+    result.status = MattingPreparedRunStatus::wrong_device;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::stale_context_generation:
+    result.status = MattingPreparedRunStatus::stale_context_generation;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::stale_stream:
+    result.status = MattingPreparedRunStatus::stale_stream;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::stale_binding:
+    result.status = MattingPreparedRunStatus::stale_binding;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::provider_unavailable:
+    result.status = MattingPreparedRunStatus::provider_unavailable;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::provider_mismatch:
+    result.status = MattingPreparedRunStatus::provider_mismatch;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::cpu_fallback_forbidden:
+    result.status = MattingPreparedRunStatus::cpu_fallback_forbidden;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::tensorrt_forbidden:
+    result.status = MattingPreparedRunStatus::tensorrt_forbidden;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::resource_exhausted:
+    result.status = MattingPreparedRunStatus::resource_exhausted;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::inference_failure:
+    result.status = MattingPreparedRunStatus::inference_failure;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::provider_failure_quarantine:
+    result.status = MattingPreparedRunStatus::provider_failure_quarantine;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::cancelled_or_shutdown:
+    result.status = MattingPreparedRunStatus::cancelled_or_shutdown;
+    break;
+  case studiocast::onnx::OrtPreparedRunStatus::setup_resource_mutation:
+    result.status = MattingPreparedRunStatus::setup_resource_mutation;
+    break;
+  default:
+    result.status = MattingPreparedRunStatus::foreign_evidence;
+    break;
+  }
+  if (ort.quarantine == studiocast::onnx::OrtPreparedRunQuarantine::provider)
+    result.quarantine = MattingPreparedRunQuarantine::provider;
+  else if (ort.quarantine ==
+           studiocast::onnx::OrtPreparedRunQuarantine::session)
+    result.quarantine = MattingPreparedRunQuarantine::session;
+  return result;
+}
+
+MattingPreparedRunEvidence ResolveMattingReplacementEvidence(
+    const MattingPreparedRunEvidence &current,
+    const MattingPreparedRunEvidence &candidate,
+    bool replacement_complete) noexcept {
+  return replacement_complete && candidate.Valid() ? candidate : current;
+}
+
+} // namespace internal
+
 struct OpenCudaMattingSession::Impl {
   studiocast::cuda::CudaDriverApi *cuda = nullptr;
   studiocast::open_video::ModelPack pack;
@@ -87,6 +352,10 @@ struct OpenCudaMattingSession::Impl {
   studiocast::cuda::CUdeviceptr prepared_output_ptr = 0;
   OpenCudaMattingSession::PreparationEvidence preparation_evidence;
   studiocast::open_video::ValidatedModelArtifactIdentity artifact_identity;
+  MattingPreparedRunEvidence run_evidence;
+  MattingPreparedInputTensorView input_tensor_view;
+  OpenCudaMattingSession::PreparedRunStats prepared_run_stats;
+  std::atomic<bool> shutdown_requested{false};
 
   // When the GPU runs out of memory, ORT can spam errors every frame.
   // Latch the first failure so we can return a clear, human-friendly message
@@ -504,6 +773,17 @@ bool OpenCudaMattingSession::EnsureInitialized(int frame_w, int frame_h,
 bool OpenCudaMattingSession::Prepare(
     int frame_w, int frame_h, studiocast::cuda::CUstream stream,
     studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {
+  struct SetupAttempt {
+    PreparedRunStats &stats;
+    bool succeeded = false;
+    explicit SetupAttempt(PreparedRunStats &value) : stats(value) {
+      ++stats.setup_attempts;
+    }
+    ~SetupAttempt() {
+      if (!succeeded)
+        ++stats.setup_failures;
+    }
+  } setup_attempt(impl_->prepared_run_stats);
   if (error_out)
     error_out->clear();
   if (!EnsureInitialized(frame_w, frame_h, error_out) ||
@@ -533,6 +813,7 @@ bool OpenCudaMattingSession::Prepare(
       impl_->prepared_stream == stream &&
       impl_->prepared_output_ptr == output_alpha_gpu->ptr &&
       impl_->preparation_evidence.context == *context) {
+    setup_attempt.succeeded = true;
     return true;
   }
 
@@ -687,6 +968,28 @@ bool OpenCudaMattingSession::Prepare(
     return false;
   }
 
+  MattingPreparedRunEvidence candidate_run_evidence;
+  candidate_run_evidence.preparation_generation =
+      NextMattingPreparationGeneration();
+  candidate_run_evidence.cuda_device_id = impl_->opts.device_id;
+  candidate_run_evidence.strict_cuda_only =
+      impl_->opts.strict_cuda_provider;
+  candidate_run_evidence.context = *context;
+  candidate_run_evidence.stream_identity = requested_stream;
+  candidate_run_evidence.input_tensor_ptr = impl_->input_tensor.ptr;
+  candidate_run_evidence.output_tensor_ptr = output_alpha_gpu->ptr;
+  candidate_run_evidence.frame_width = frame_w;
+  candidate_run_evidence.frame_height = frame_h;
+  candidate_run_evidence.artifact = candidate.artifact_identity;
+  candidate_run_evidence.ort =
+      candidate.ort_session->prepared_cuda_run_evidence();
+  if (!candidate_run_evidence.Valid()) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession: prepared execution evidence is "
+                   "incomplete.";
+    return false;
+  }
+
   impl_->ort_session = std::move(candidate.ort_session);
   impl_->ort_info = std::move(candidate.ort_info);
   impl_->input_name = std::move(candidate.input_name);
@@ -723,6 +1026,20 @@ bool OpenCudaMattingSession::Prepare(
     impl_->preparation_evidence.model_artifact_sha256 =
         DigestToHex(impl_->artifact_identity.artifact_sha256);
   }
+  impl_->run_evidence = internal::ResolveMattingReplacementEvidence(
+      impl_->run_evidence, candidate_run_evidence, true);
+  impl_->input_tensor_view = {};
+  impl_->input_tensor_view.ptr = impl_->input_tensor.ptr;
+  impl_->input_tensor_view.bytes = impl_->input_tensor.bytes;
+  impl_->input_tensor_view.n = impl_->input_tensor.n;
+  impl_->input_tensor_view.c = impl_->input_tensor.c;
+  impl_->input_tensor_view.h = impl_->input_tensor.h;
+  impl_->input_tensor_view.w = impl_->input_tensor.w;
+  impl_->input_tensor_view.evidence = impl_->run_evidence;
+  impl_->prepared_run_stats.preparation_generation =
+      impl_->run_evidence.preparation_generation;
+  ++impl_->prepared_run_stats.setup_commits;
+  setup_attempt.succeeded = true;
   return true;
 #endif
 }
@@ -741,98 +1058,140 @@ bool OpenCudaMattingSession::RunPrepared(
     studiocast::cuda::CUstream stream,
     const studiocast::cuda::CudaImage &input_rgb_gpu,
     studiocast::cuda::CudaTensor *output_alpha_gpu, std::string *error_out) {
-  if (error_out)
-    error_out->clear();
+  const auto expected = prepared_run_evidence();
+  return RunPreparedTypedImpl(stream, &input_rgb_gpu, output_alpha_gpu,
+                              expected, true, false, error_out)
+      .ok();
+}
 
-  if (!output_alpha_gpu) {
-    if (error_out)
-      *error_out = "OpenCudaMattingSession::Run: output_alpha_gpu is null.";
-    return false;
+MattingPreparedRunResult OpenCudaMattingSession::RunPreparedTyped(
+    studiocast::cuda::CUstream stream,
+    const studiocast::cuda::CudaImage &input_rgb_gpu,
+    studiocast::cuda::CudaTensor *output_alpha_gpu,
+    const MattingPreparedRunEvidence &expected,
+    bool cancellation_requested) noexcept {
+  return RunPreparedTypedImpl(stream, &input_rgb_gpu, output_alpha_gpu,
+                              expected, true, cancellation_requested, nullptr);
+}
+
+MattingPreparedRunResult
+OpenCudaMattingSession::RunPreparedInferenceTyped(
+    studiocast::cuda::CUstream stream,
+    studiocast::cuda::CudaTensor *output_alpha_gpu,
+    const MattingPreparedRunEvidence &expected,
+    bool cancellation_requested) noexcept {
+  return RunPreparedTypedImpl(stream, nullptr, output_alpha_gpu, expected,
+                              false, cancellation_requested, nullptr);
+}
+
+MattingPreparedRunResult OpenCudaMattingSession::RunPreparedTypedImpl(
+    studiocast::cuda::CUstream stream,
+    const studiocast::cuda::CudaImage *input_rgb_gpu,
+    studiocast::cuda::CudaTensor *output_alpha_gpu,
+    const MattingPreparedRunEvidence &expected, bool run_preprocess,
+    bool cancellation_requested, std::string *compatibility_error) noexcept {
+  if (compatibility_error)
+    compatibility_error->clear();
+  MattingPreparedRunResult result;
+  if (!impl_) {
+    SetCompatibilityError(
+        compatibility_error,
+        MattingPreparedRunStatusMessage(MattingPreparedRunStatus::not_prepared));
+    return result;
   }
 
-  if (!impl_->buffers_ready || !impl_->execution_prepared) {
-    if (error_out)
-      *error_out =
-          "OpenCudaMattingSession::Run: exact execution contract was not "
-          "prepared during setup.";
-    return false;
-  }
+  auto &stats = impl_->prepared_run_stats;
+  result.preparation_generation = impl_->run_evidence.preparation_generation;
+  result.attempt_sequence = ++stats.run_attempts;
+  result.completed_runs = stats.run_successes;
+  const auto fail = [&](MattingPreparedRunResult failed) noexcept {
+    failed.preparation_generation =
+        impl_->run_evidence.preparation_generation;
+    failed.attempt_sequence = result.attempt_sequence;
+    failed.completed_runs = stats.run_successes;
+    ++stats.run_failures;
+    if (failed.quarantine != MattingPreparedRunQuarantine::none)
+      ++stats.quarantine_events;
+    if (compatibility_error && compatibility_error->empty())
+      SetCompatibilityError(
+          compatibility_error,
+          MattingPreparedRunStatusMessage(failed.status));
+    return failed;
+  };
 
-  if (!input_rgb_gpu.Valid()) {
-    if (error_out)
-      *error_out = "OpenCudaMattingSession::Run: invalid input image.";
-    return false;
-  }
+  const auto *context =
+      impl_->cuda ? impl_->cuda->context_identity() : nullptr;
+  const bool output_valid =
+      ValidateOutputTensor(impl_->pack, output_alpha_gpu, nullptr);
+  const bool input_valid =
+      !run_preprocess || (input_rgb_gpu && input_rgb_gpu->Valid());
+  const bool binding_matches =
+      context && impl_->prepared_frame_w == impl_->run_evidence.frame_width &&
+      impl_->prepared_frame_h == impl_->run_evidence.frame_height &&
+      (!run_preprocess ||
+       (input_rgb_gpu->w == impl_->prepared_frame_w &&
+        input_rgb_gpu->h == impl_->prepared_frame_h)) &&
+      impl_->prepared_stream == stream && output_alpha_gpu &&
+      impl_->prepared_output_ptr == output_alpha_gpu->ptr &&
+      *context == impl_->preparation_evidence.context &&
+      impl_->ort_session &&
+      (impl_->ort_stream == nullptr || impl_->ort_stream == stream);
 
-  if (!ValidateOutputTensor(impl_->pack, output_alpha_gpu, error_out))
-    return false;
-  const auto *context = impl_->cuda ? impl_->cuda->context_identity() : nullptr;
-  if (impl_->prepared_frame_w != input_rgb_gpu.w ||
-      impl_->prepared_frame_h != input_rgb_gpu.h ||
-      impl_->prepared_stream != stream ||
-      impl_->prepared_output_ptr != output_alpha_gpu->ptr || !context ||
-      *context != impl_->preparation_evidence.context) {
-    if (error_out)
-      *error_out = "OpenCudaMattingSession::Run: geometry, stream, output, or "
-                   "CUDA context generation differs from setup.";
-    return false;
-  }
-  if (impl_->opts.strict_cuda_provider &&
-      (!studiocast::onnx::OrtPreparedProviderEvidenceMatches(
-           impl_->preparation_evidence.provider, impl_->opts.device_id,
-           context->logical_generation,
-           reinterpret_cast<std::uintptr_t>(stream)) ||
-       !impl_->preparation_evidence.provider.user_stream_bound ||
-       impl_->preparation_evidence.provider.explicit_stream_synchronization ||
-       !impl_->preparation_evidence.model_artifact.Valid())) {
-    if (error_out)
-      *error_out = "OpenCudaMattingSession::Run: strict provider, device, "
-                   "context, stream, or artifact evidence is stale.";
-    return false;
-  }
+  internal::MattingPreparedRunContract contract;
+  contract.buffers_ready = impl_->buffers_ready;
+  contract.execution_prepared = impl_->execution_prepared;
+  contract.input_valid = input_valid;
+  contract.output_valid = output_valid;
+  contract.binding_matches = binding_matches;
+  contract.strict_cuda_only = impl_->opts.strict_cuda_provider;
+  contract.shutdown_requested =
+      cancellation_requested ||
+      impl_->shutdown_requested.load(std::memory_order_acquire);
+  contract.active = impl_->run_evidence;
+  contract.requested = expected;
+  auto classified =
+      internal::ClassifyMattingPreparedRunContract(contract);
+  if (!classified.ok())
+    return fail(classified);
 
-  // Preprocess RGB/BGR u8 image to NCHW f32 model input.
-  {
+  if (run_preprocess) {
+    ++stats.preprocess_attempts;
     if (!studiocast::cuda::kernels::PreprocessToTensorPrepared(
-            impl_->cuda, impl_->preparation_evidence.context, input_rgb_gpu,
-            impl_->input_tensor, impl_->preprocess, stream, error_out)) {
-      if (error_out)
-        error_out->insert(0,
-                          "OpenCudaMattingSession::Run: preprocess failed: ");
-      return false;
+            impl_->cuda, impl_->preparation_evidence.context, *input_rgb_gpu,
+            impl_->input_tensor, impl_->preprocess, stream,
+            compatibility_error)) {
+      if (compatibility_error) {
+        try {
+          compatibility_error->insert(
+              0, "OpenCudaMattingSession::Run: preprocess failed: ");
+        } catch (...) {
+          SetCompatibilityError(
+              compatibility_error,
+              "OpenCudaMattingSession::Run: preprocess failed.");
+        }
+      }
+      MattingPreparedRunResult failed;
+      failed.status = MattingPreparedRunStatus::preprocess_failure;
+      return fail(failed);
     }
   }
 
-#if !STUDIOCAST_HAVE_ONNXRUNTIME
-  (void)stream;
-  if (error_out)
-    *error_out = "OpenCudaMattingSession: built without ONNX Runtime support.";
-  return false;
-#else
-  if (impl_->ort_latched_failure) {
-    if (error_out)
-      *error_out = impl_->ort_latched_error;
-    return false;
-  }
-
-  if (!impl_->ort_session ||
-      (impl_->ort_stream != nullptr && impl_->ort_stream != stream)) {
-    if (error_out) {
-      *error_out = "OpenCudaMattingSession::Run: ORT session was created for a "
-                   "different CUDA stream. Create one session per stream.";
-    }
-    return false;
-  }
-
-  // If we could not configure ORT to use the caller stream, synchronize before
-  // inference so ORT sees fully-written inputs.
-  if (impl_->ort_needs_stream_sync) {
-    if (!impl_->cuda->StreamSynchronize(stream, error_out)) {
-      if (error_out)
-        error_out->insert(
+  if (impl_->ort_needs_stream_sync &&
+      !impl_->cuda->StreamSynchronize(stream, compatibility_error)) {
+    if (compatibility_error) {
+      try {
+        compatibility_error->insert(
             0, "OpenCudaMattingSession::Run: StreamSynchronize failed: ");
-      return false;
+      } catch (...) {
+        SetCompatibilityError(
+            compatibility_error,
+            "OpenCudaMattingSession::Run: StreamSynchronize failed.");
+      }
     }
+    MattingPreparedRunResult failed;
+    failed.status = MattingPreparedRunStatus::inference_failure;
+    failed.quarantine = MattingPreparedRunQuarantine::session;
+    return fail(failed);
   }
 
   studiocast::onnx::OrtSession::CudaBindingInput in;
@@ -851,19 +1210,53 @@ bool OpenCudaMattingSession::RunPrepared(
   out.shape = impl_->output_shape.data();
   out.shape_rank = impl_->output_shape.size();
 
-  if (!impl_->ort_session->ExecutePreparedCudaIoBinding(0, &in, 1, &out, 1,
-                                                        error_out)) {
-    return false;
-  }
+  ++stats.inference_attempts;
+  const auto ort_result = impl_->ort_session->ExecutePreparedCudaIoBindingTyped(
+      0, &in, 1, &out, 1, expected.ort, cancellation_requested,
+      compatibility_error);
+  auto projected = internal::ProjectOrtPreparedRunResult(ort_result);
+  if (!projected.ok())
+    return fail(projected);
 
-  return true;
-#endif
+  ++stats.run_successes;
+  projected.preparation_generation =
+      impl_->run_evidence.preparation_generation;
+  projected.attempt_sequence = result.attempt_sequence;
+  projected.completed_runs = stats.run_successes;
+  return projected;
 }
 
 const OpenCudaMattingSession::PreparationEvidence *
 OpenCudaMattingSession::preparation_evidence() const noexcept {
   return impl_ && impl_->execution_prepared ? &impl_->preparation_evidence
                                             : nullptr;
+}
+
+MattingPreparedRunEvidence
+OpenCudaMattingSession::prepared_run_evidence() const noexcept {
+  return impl_ && impl_->execution_prepared ? impl_->run_evidence
+                                            : MattingPreparedRunEvidence{};
+}
+
+MattingPreparedInputTensorView
+OpenCudaMattingSession::prepared_input_tensor_view() const noexcept {
+  return impl_ && impl_->execution_prepared &&
+                 impl_->input_tensor_view.Valid()
+             ? impl_->input_tensor_view
+             : MattingPreparedInputTensorView{};
+}
+
+OpenCudaMattingSession::PreparedRunStats
+OpenCudaMattingSession::prepared_run_stats() const noexcept {
+  return impl_ ? impl_->prepared_run_stats : PreparedRunStats{};
+}
+
+void OpenCudaMattingSession::RequestShutdown() noexcept {
+  if (!impl_)
+    return;
+  impl_->shutdown_requested.store(true, std::memory_order_release);
+  if (impl_->ort_session)
+    impl_->ort_session->RequestShutdown();
 }
 
 } // namespace studiocast::open_cuda

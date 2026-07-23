@@ -81,6 +81,87 @@ bool OrtPreparedProviderEvidenceMatches(
     std::uint64_t cuda_context_generation,
     std::uintptr_t requested_stream_identity) noexcept;
 
+enum class OrtPreparedRunStatus : std::uint16_t {
+  success = 0,
+  not_prepared = 1,
+  invalid_input_output_contract = 2,
+  foreign_provider_evidence = 3,
+  stale_session_generation = 4,
+  wrong_device = 5,
+  stale_context_generation = 6,
+  stale_stream = 7,
+  stale_binding = 8,
+  provider_unavailable = 9,
+  provider_mismatch = 10,
+  cpu_fallback_forbidden = 11,
+  tensorrt_forbidden = 12,
+  resource_exhausted = 13,
+  inference_failure = 14,
+  provider_failure_quarantine = 15,
+  cancelled_or_shutdown = 16,
+  setup_resource_mutation = 17,
+};
+
+enum class OrtPreparedRunQuarantine : std::uint8_t {
+  none = 0,
+  session = 1,
+  provider = 2,
+};
+
+// Stable mirror of OrtErrorCode values used at the catch boundary. Keeping the
+// values local makes the public header independent of ONNX Runtime headers.
+enum class OrtStableErrorCode : std::int32_t {
+  none = 0,
+  fail = 1,
+  invalid_argument = 2,
+  no_such_file = 3,
+  no_model = 4,
+  engine_error = 5,
+  runtime_exception = 6,
+  invalid_protobuf = 7,
+  model_loaded = 8,
+  not_implemented = 9,
+  invalid_graph = 10,
+  execution_provider_failure = 11,
+  model_load_cancelled = 12,
+  model_requires_compilation = 13,
+  not_found = 14,
+  allocation_failure = 1000,
+  unknown_exception = 1001,
+};
+
+struct OrtPreparedCudaRunEvidence {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtPreparedProviderEvidence provider{};
+  std::uint64_t session_generation = 0;
+
+  bool Valid() const noexcept {
+    return schema_version == kSchemaVersion && session_generation != 0 &&
+           provider.schema_version ==
+               OrtPreparedProviderEvidence::kSchemaVersion &&
+           provider.provider != OrtExecutionProviderId::invalid;
+  }
+};
+
+struct OrtPreparedRunResult {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtPreparedRunStatus status = OrtPreparedRunStatus::not_prepared;
+  OrtPreparedRunQuarantine quarantine = OrtPreparedRunQuarantine::none;
+  OrtStableErrorCode error_code = OrtStableErrorCode::none;
+  std::uint64_t session_generation = 0;
+  std::uint64_t attempt_sequence = 0;
+  std::uint64_t completed_runs = 0;
+
+  bool ok() const noexcept {
+    return schema_version == kSchemaVersion &&
+           status == OrtPreparedRunStatus::success;
+  }
+};
+
 // Options for creating an ONNX Runtime session.
 struct OrtSessionOptions {
   OrtProviderPolicy provider_policy = OrtProviderPolicy::compatibility;
@@ -191,6 +272,23 @@ struct OrtSessionInfo {
 
 namespace internal {
 
+struct OrtPreparedRunContract {
+  bool session_present = false;
+  bool binding_present = false;
+  bool binding_contract_matches = false;
+  bool shutdown_requested = false;
+  OrtPreparedCudaRunEvidence active{};
+  OrtPreparedCudaRunEvidence requested{};
+  bool strict_cuda_only = false;
+};
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunContract(const OrtPreparedRunContract &contract) noexcept;
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunFailure(OrtStableErrorCode code,
+                              bool exact_cuda_provider) noexcept;
+
 // Internal seam for session-creation-time provider planning. It is intentionally
 // limited to provider append/session-create outcomes so tests can cover fallback
 // behavior without loading real CUDA/TensorRT ORT providers.
@@ -267,6 +365,11 @@ public:
   static constexpr std::size_t kPreparedBindingSlots = 2;
 
   struct PreparedRunStats {
+    std::uint64_t session_generation = 0;
+    std::uint64_t execute_attempts = 0;
+    std::uint64_t execute_successes = 0;
+    std::uint64_t execute_failures = 0;
+    std::uint64_t quarantine_events = 0;
     std::uint64_t runs = 0;
     std::uint64_t cache_hits = 0;
     std::uint64_t binding_rebuilds = 0;
@@ -383,6 +486,17 @@ public:
                                     std::size_t output_count,
                                     std::string *error);
 
+  OrtPreparedRunResult ExecutePreparedCudaIoBindingTyped(
+      std::size_t binding_slot, const CudaBindingInput *inputs,
+      std::size_t input_count, const CudaBindingOutput *outputs,
+      std::size_t output_count,
+      const OrtPreparedCudaRunEvidence &expected,
+      bool cancellation_requested = false,
+      std::string *compatibility_error = nullptr) noexcept;
+
+  OrtPreparedCudaRunEvidence prepared_cuda_run_evidence() const noexcept;
+  void RequestShutdown() noexcept;
+
   // Release all retained CPU/CUDA tensor wrappers and IoBindings before a
   // caller replaces or frees their backing storage. Rebuilding a session for a
   // provider/model change naturally invalidates the old session's bindings.
@@ -402,6 +516,13 @@ private:
   std::unique_ptr<Impl> impl_;
 
   explicit OrtSession(std::unique_ptr<Impl> impl);
+
+  OrtPreparedRunResult ExecutePreparedCudaIoBindingTypedImpl(
+      std::size_t binding_slot, const CudaBindingInput *inputs,
+      std::size_t input_count, const CudaBindingOutput *outputs,
+      std::size_t output_count,
+      const OrtPreparedCudaRunEvidence &expected,
+      bool cancellation_requested, std::string *compatibility_error) noexcept;
 };
 
 } // namespace studiocast::onnx
