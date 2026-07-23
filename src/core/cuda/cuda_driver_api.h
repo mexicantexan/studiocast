@@ -83,7 +83,10 @@ struct CudaPhysicalDeviceIdentity {
   std::uint8_t pci_bus_id_length = 0;
 
   bool Valid() const noexcept;
-  bool operator==(const CudaPhysicalDeviceIdentity &) const noexcept = default;
+  bool operator==(const CudaPhysicalDeviceIdentity &other) const noexcept {
+    return uuid == other.uuid && pci_bus_id == other.pci_bus_id &&
+           pci_bus_id_length == other.pci_bus_id_length;
+  }
 };
 
 // Process-local identity for one retained CUDA primary-context generation.
@@ -97,7 +100,11 @@ struct CudaContextIdentity {
     return physical_device.Valid() && retained_context_id != 0 &&
            logical_generation != 0;
   }
-  bool operator==(const CudaContextIdentity &) const noexcept = default;
+  bool operator==(const CudaContextIdentity &other) const noexcept {
+    return physical_device == other.physical_device &&
+           retained_context_id == other.retained_context_id &&
+           logical_generation == other.logical_generation;
+  }
 };
 
 class CudaDriverApi {

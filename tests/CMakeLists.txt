@@ -125,7 +125,7 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-prepared-hardware-execution-owner-tests
             COMMAND studiocast-prepared-hardware-execution-owner-tests)
     studiocast_set_test_labels(studiocast-prepared-hardware-execution-owner-tests
-            integration core video gpu vulkan hal)
+            integration core video gpu vulkan)
 
     add_executable(studiocast-prepared-maxine-hardware-execution-owner-tests
             ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_maxine_hardware_execution_owner_tests.cpp
@@ -151,7 +151,7 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-prepared-maxine-hardware-execution-owner-tests
             COMMAND studiocast-prepared-maxine-hardware-execution-owner-tests)
     studiocast_set_test_labels(studiocast-prepared-maxine-hardware-execution-owner-tests
-            integration core video gpu maxine hal)
+            integration core video gpu maxine)
 
     add_executable(studiocast-video-runtime-status-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
@@ -205,7 +205,7 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-daemon-status-json-tests
             COMMAND studiocast-daemon-status-json-tests)
     studiocast_set_test_labels(studiocast-daemon-status-json-tests
-            unit core daemon video gpu)
+            unit core video gpu)
 
     add_library(studiocast-maxine-effect-fake-sdk SHARED
             ${PROJECT_SOURCE_DIR}/tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
@@ -1186,7 +1186,7 @@ if (BUILD_TESTING)
         add_test(NAME studiocast-vulkan-qualified-final-executor-tests
                 COMMAND studiocast-vulkan-qualified-final-executor-tests)
         studiocast_set_test_labels(studiocast-vulkan-qualified-final-executor-tests
-                integration video gpu vulkan hardware)
+                integration video gpu vulkan)
 
         add_executable(studiocast-vulkan-matting-runtime-tests
                 ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_matting_runtime_tests.cpp
