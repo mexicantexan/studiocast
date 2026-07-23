@@ -126,6 +126,35 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-video-runtime-status-tests
             unit core video gpu)
 
+    add_executable(studiocast-daemon-status-json-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/daemon/status_json_tests.cpp
+    )
+
+    target_link_libraries(studiocast-daemon-status-json-tests PRIVATE
+            studiocast_daemon_status
+            studiocast_util)
+
+    target_include_directories(studiocast-daemon-status-json-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    target_compile_definitions(studiocast-daemon-status-json-tests PRIVATE
+            STUDIOCAST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    studiocast_set_project_warnings(studiocast-daemon-status-json-tests)
+    studiocast_enable_sanitizers(studiocast-daemon-status-json-tests)
+
+    set_target_properties(studiocast-daemon-status-json-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-daemon-status-json-tests
+            COMMAND studiocast-daemon-status-json-tests)
+    studiocast_set_test_labels(studiocast-daemon-status-json-tests
+            unit core daemon video gpu)
+
     add_library(studiocast-maxine-effect-fake-sdk SHARED
             ${PROJECT_SOURCE_DIR}/tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )

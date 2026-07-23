@@ -328,12 +328,12 @@ bool IsSubset(const Value &expected, const Value &actual,
   bool equal = false;
   if (expected.IsNull())
     equal = actual.IsNull();
-  else if (const auto *value = expected.AsBool())
-    equal = actual.AsBool() && *actual.AsBool() == *value;
-  else if (const auto *value = expected.AsNumber())
-    equal = actual.AsNumber() && *actual.AsNumber() == *value;
-  else if (const auto *value = expected.AsString())
-    equal = actual.AsString() && *actual.AsString() == *value;
+  else if (const auto *expected_bool = expected.AsBool())
+    equal = actual.AsBool() && *actual.AsBool() == *expected_bool;
+  else if (const auto *expected_number = expected.AsNumber())
+    equal = actual.AsNumber() && *actual.AsNumber() == *expected_number;
+  else if (const auto *expected_string = expected.AsString())
+    equal = actual.AsString() && *actual.AsString() == *expected_string;
   if (!equal)
     std::cerr << "FAIL: scalar mismatch at " << path << '\n';
   return equal;
