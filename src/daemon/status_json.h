@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/video/prepared_hardware_execution_owner.h"
 #include "core/video/video_runtime_status.h"
 
 #include <string>
@@ -15,6 +16,14 @@ struct ProductCapabilityJsonResult {
 struct VideoRuntimeStatusJsonResult {
   bool ok = false;
   video::RuntimeStatusValidationResult validation{};
+  std::string json;
+};
+
+struct PreparedHardwareExecutionJsonResult {
+  bool ok = false;
+  bool snapshot_valid = false;
+  bool active_attribution_valid = false;
+  std::string validation_code;
   std::string json;
 };
 
@@ -35,5 +44,16 @@ struct VideoRuntimeStatusJsonResult {
 // success-looking legacy facts from escaping.
 [[nodiscard]] VideoRuntimeStatusJsonResult SerializeVideoRuntimeStatusJson(
     const video::VideoRuntimeStatusSnapshot &snapshot);
+
+// Serializes the bounded prepared-hardware migration snapshot directly from
+// typed structures. supervisor_pipeline_running is an authority gate: cached
+// setup, telemetry, or an old commit never imply live activity after stop or
+// while a start is still in progress. Malformed snapshots still produce a
+// bounded fail-closed diagnostics object, but never active attribution.
+[[nodiscard]] PreparedHardwareExecutionJsonResult
+SerializePreparedHardwareExecutionJson(
+    const video::PreparedHardwareExecutionSnapshot &snapshot,
+    bool supervisor_pipeline_running,
+    bool supervisor_pipeline_starting = false);
 
 } // namespace studiocast::daemon

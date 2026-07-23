@@ -284,6 +284,145 @@ VideoRuntimeStatusSnapshot InactiveTelemetrySnapshot() {
   return value;
 }
 
+studiocast::hal::ExecutionDomainId PreparedVulkanDomain() {
+  studiocast::hal::ExecutionDomainId domain;
+  domain.backend = BackendId::vulkan;
+  domain.api_family = studiocast::hal::ApiFamily::vulkan;
+  domain.physical_device.vendor_id = 0x10de;
+  domain.physical_device.device_id = 0x1cb1;
+  domain.physical_device.stable_id[0] = 0xca;
+  domain.logical_context_generation = 17;
+  domain.allocator_family = studiocast::hal::AllocatorFamily::vulkan;
+  domain.memory_handle_family =
+      studiocast::hal::MemoryHandleFamily::vulkan_buffer;
+  domain.queue_or_stream_identity = 19;
+  domain.ownership_model = studiocast::hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      studiocast::hal::SynchronizationProtocol::vulkan_queue_fence;
+  domain.adapter_instance_id = 23;
+  return domain;
+}
+
+void SetSingleLatencySample(studiocast::hal::LatencyHistogram *histogram,
+                            std::uint64_t elapsed_ns) {
+  if (!histogram)
+    std::abort();
+  histogram->samples = 1;
+  histogram->total_ns = elapsed_ns;
+  histogram->maximum_ns = elapsed_ns;
+  histogram->p95_ns = 250'000;
+  histogram->p99_ns = 250'000;
+  histogram->bucket_upper_ns[0] = 250'000;
+  histogram->bucket_counts[0] = 1;
+}
+
+studiocast::video::PreparedHardwareExecutionSnapshot
+LivePreparedHardwareSnapshot() {
+  using namespace studiocast;
+  video::PreparedHardwareExecutionSnapshot snapshot;
+  snapshot.route = video::PreparedHardwareRoute::hal_live;
+  snapshot.eligibility = video::PreparedHardwareEligibility::eligible;
+  snapshot.prepared = true;
+  snapshot.setup.mode = video::HardwareExecutionSetupMode::hal_live;
+  snapshot.setup.status = hal::StatusId::ready;
+  snapshot.setup.reason = hal::ReasonId::none;
+  snapshot.setup.shadow_compared = false;
+
+  const auto domain = PreparedVulkanDomain();
+  auto &resolution = snapshot.setup.resolution;
+  resolution.request_mode = hal::BackendRequestMode::explicit_backend;
+  resolution.strict_backend_selection = true;
+  resolution.status = hal::StatusId::ready;
+  resolution.requested_backend = hal::BackendId::vulkan;
+  resolution.selected_backend = hal::BackendId::vulkan;
+  resolution.selected_provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  resolution.available = true;
+  auto &resolved = resolution.stages[resolution.stage_count++];
+  resolved.intent.stage_id = 9;
+  resolved.intent.semantic = hal::SemanticEffectId::mirror;
+  resolved.status = hal::StatusId::ready;
+  resolved.selected_backend = hal::BackendId::vulkan;
+  resolved.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  resolved.adapter_instance_id = domain.adapter_instance_id;
+  resolved.execution_domain = domain;
+
+  auto &plan = snapshot.setup.domain_plan;
+  plan.status = hal::StatusId::ready;
+  plan.expected_transfers.uploads = 1;
+  plan.expected_transfers.final_readbacks = 1;
+  plan.expected_transfers.synchronizations = 1;
+  auto &island = plan.islands[plan.island_count++];
+  island.adapter_instance_id = domain.adapter_instance_id;
+  island.execution_domain = domain;
+  island.resolved_stage_indices[island.stage_count++] = 0;
+  island.requires_upload = true;
+  island.requires_final_readback = true;
+
+  snapshot.readiness.status = hal::StatusId::ready;
+  snapshot.readiness.requested_backend = hal::BackendId::vulkan;
+  snapshot.readiness.selected_backend = hal::BackendId::vulkan;
+  snapshot.readiness.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  snapshot.readiness.execution_domain = domain;
+  snapshot.readiness.ready_stage_mask = 1;
+  snapshot.readiness.available = true;
+
+  snapshot.active_program.valid = true;
+  snapshot.active_program.program_id = 29;
+  snapshot.active_program.owner_adapter_instance_id =
+      domain.adapter_instance_id;
+  snapshot.active_program.execution_domain = domain;
+  snapshot.active_program.stage_count = 1;
+  snapshot.active_program.invalidation_key.generations.configuration = 31;
+  snapshot.active_program.invalidation_key.generations.geometry = 32;
+  snapshot.active_program.invalidation_key.generations.provider = 33;
+  snapshot.active_program.invalidation_key.generations.device = 34;
+  snapshot.active_program.invalidation_key.generations.context =
+      domain.logical_context_generation;
+  snapshot.active_program.invalidation_key.canonical_plan_hash = 35;
+  snapshot.active_program.invalidation_key.execution_domain_hash = 36;
+
+  auto &telemetry = snapshot.telemetry;
+  telemetry.requested_backend = hal::BackendId::vulkan;
+  telemetry.selected_backend = hal::BackendId::vulkan;
+  telemetry.active_backend = hal::BackendId::vulkan;
+  telemetry.active_provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  telemetry.execution_attempts = 1;
+  telemetry.execution_successes = 1;
+  telemetry.committed_output_frames = 1;
+  telemetry.active_backend_frames = 1;
+  telemetry.setup_attempts = 1;
+  telemetry.setup_successes = 1;
+  telemetry.runtime_status = hal::StatusId::executed;
+  telemetry.transfers.uploads = 1;
+  telemetry.transfers.final_readbacks = 1;
+  telemetry.transfers.synchronizations = 1;
+  SetSingleLatencySample(&telemetry.frame_latency, 100'000);
+  SetSingleLatencySample(&telemetry.stage_latency[0], 80'000);
+  telemetry.committed_stage_successes[0] = 1;
+
+  auto &commit = snapshot.latest_committed_frame;
+  commit.valid = true;
+  commit.program_id = 29;
+  commit.execution_domain = domain;
+  commit.invalidation_key = snapshot.active_program.invalidation_key;
+  commit.capture_sequence = 37;
+  commit.output_commit_sequence = 1;
+  commit.stages[commit.stage_count++] = {
+      9,
+      hal::SemanticEffectId::mirror,
+      hal::PrimitiveOperationId::invalid,
+      hal::BackendId::vulkan,
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels,
+      hal::StageExecutionStatus::succeeded,
+      hal::ReasonId::none,
+  };
+  return snapshot;
+}
+
 bool ParseJson(const std::string &text, Value *value,
                std::string_view context) {
   std::string error;
@@ -460,6 +599,141 @@ bool TestActivityRequiresGenerationValidSuccessfulCommit() {
   return ok;
 }
 
+bool TestPreparedHardwareLiveCommittedSuccess() {
+  const auto result =
+      studiocast::daemon::SerializePreparedHardwareExecutionJson(
+          LivePreparedHardwareSnapshot(), true, false);
+  bool ok = true;
+  ok &= Expect(result.ok && result.snapshot_valid &&
+                   result.active_attribution_valid,
+               "live committed prepared snapshot must expose attribution");
+  Value parsed;
+  ok &= ParseJson(result.json, &parsed, "prepared hardware status");
+  ok &= Expect(result.json.find("\"token\":\"hal_live\"") != std::string::npos,
+               "live route token must be serialized");
+  ok &= Expect(
+      result.json.find("\"active_backend\":{\"id\":5,\"token\":\"vulkan\"}") !=
+          std::string::npos,
+      "successful committed effect must attribute Vulkan");
+  ok &= Expect(
+      result.json.find("\"uploads\":1") != std::string::npos &&
+          result.json.find("\"final_readbacks\":1") != std::string::npos &&
+          result.json.find("\"synchronizations\":1") != std::string::npos,
+      "exact cumulative transfer counters must be serialized");
+  ok &= Expect(result.json.find("\"p95_ns\":250000") != std::string::npos &&
+                   result.json.find("\"p99_ns\":250000") != std::string::npos &&
+                   result.json.find("\"stage_timing\"") != std::string::npos,
+               "tail latency and stage timing must be serialized");
+  ok &= Expect(
+      result.json.find("\"shadow_compared\":false") != std::string::npos &&
+          result.json.find("\"shadow_comparison\"") == std::string::npos,
+      "unperformed shadow comparison must not claim a result");
+  ok &= Expect(result.json.size() < 64u * 1024u,
+               "prepared hardware status payload must remain bounded");
+  return ok;
+}
+
+bool TestPreparedHardwareActivityFailsClosed() {
+  bool ok = true;
+  auto snapshot = LivePreparedHardwareSnapshot();
+  auto result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, false, false);
+  ok &= Expect(
+      result.ok && !result.active_attribution_valid &&
+          result.json.find("\"active_backend\":{\"id\":0,\"token\":\"\"}") !=
+              std::string::npos,
+      "stopped-after-commit snapshot must not remain active");
+
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, true);
+  ok &= Expect(!result.active_attribution_valid,
+               "starting supervisor must not expose active attribution");
+
+  snapshot = {};
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(
+      result.ok && result.snapshot_valid && !result.active_attribution_valid &&
+          result.json.find("\"token\":\"legacy_shadow\"") !=
+              std::string::npos &&
+          result.json.find("\"token\":\"unavailable\"") != std::string::npos,
+      "legacy unprepared route must retain fail-closed route diagnostics");
+
+  snapshot = LivePreparedHardwareSnapshot();
+  snapshot.latest_committed_frame = {};
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(!result.active_attribution_valid,
+               "uncommitted execution must not become active");
+
+  snapshot = LivePreparedHardwareSnapshot();
+  ++snapshot.latest_committed_frame.invalidation_key.generations.configuration;
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(!result.snapshot_valid && !result.active_attribution_valid &&
+                   result.validation_code == "stale_committed_output",
+               "stale invalidation generation must fail closed");
+
+  snapshot = LivePreparedHardwareSnapshot();
+  ++snapshot.latest_committed_frame.execution_domain.queue_or_stream_identity;
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(!result.snapshot_valid && !result.active_attribution_valid &&
+                   result.validation_code == "wrong_execution_domain",
+               "wrong committed execution domain must fail closed");
+
+  snapshot = LivePreparedHardwareSnapshot();
+  snapshot.telemetry.runtime_status = StatusId::quarantined;
+  snapshot.telemetry.runtime_reason = ReasonId::device_lost;
+  snapshot.telemetry.device_losses = 1;
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(!result.active_attribution_valid &&
+                   result.json.find("\"token\":\"device_lost\"") !=
+                       std::string::npos,
+               "device loss quarantine must clear active attribution");
+  return ok;
+}
+
+bool TestPreparedHardwareOptionalFailOpenAndMalformedCounts() {
+  bool ok = true;
+  auto snapshot = LivePreparedHardwareSnapshot();
+  auto &commit_stage = snapshot.latest_committed_frame.stages[0];
+  commit_stage.status = StageExecutionStatus::optional_failed_open;
+  commit_stage.reason = ReasonId::optional_stage_failed_open;
+  snapshot.telemetry.active_backend = BackendId::invalid;
+  snapshot.telemetry.active_provider = SemanticEffectProviderId::invalid;
+  snapshot.telemetry.active_backend_frames = 0;
+  snapshot.telemetry.optional_fail_open_stages = 1;
+  snapshot.telemetry.committed_stage_successes[0] = 0;
+  snapshot.telemetry.runtime_status = StatusId::degraded;
+  snapshot.telemetry.runtime_reason = ReasonId::optional_stage_failed_open;
+  auto result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(
+      result.ok && result.snapshot_valid && !result.active_attribution_valid &&
+          result.json.find("\"committed_stages\":[]") != std::string::npos,
+      "fail-open preserved output may remain committed but failed "
+      "stage must not receive active attribution");
+  ok &= Expect(result.json.find("\"optional_fail_open_stages\":1") !=
+                   std::string::npos,
+               "fail-open evidence must remain explicit");
+
+  snapshot = LivePreparedHardwareSnapshot();
+  snapshot.latest_committed_frame.stage_count =
+      snapshot.latest_committed_frame.stages.size() + 1;
+  result = studiocast::daemon::SerializePreparedHardwareExecutionJson(
+      snapshot, true, false);
+  ok &= Expect(result.ok && !result.snapshot_valid &&
+                   !result.active_attribution_valid &&
+                   result.validation_code == "malformed_count",
+               "malformed counts must serialize bounded diagnostics and fail "
+               "closed");
+  Value parsed;
+  ok &= ParseJson(result.json, &parsed, "malformed prepared hardware status");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -468,6 +742,9 @@ int main() {
   ok &= TestCompleteTypedCapabilityProjection();
   ok &= TestMalformedSnapshotsFailClosed();
   ok &= TestActivityRequiresGenerationValidSuccessfulCommit();
+  ok &= TestPreparedHardwareLiveCommittedSuccess();
+  ok &= TestPreparedHardwareActivityFailsClosed();
+  ok &= TestPreparedHardwareOptionalFailOpenAndMalformedCounts();
   if (ok)
     std::cout << "All status JSON projector tests passed.\n";
   return ok ? 0 : 1;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <ostream>
 #include <sstream>
 #include <string_view>
@@ -422,6 +423,165 @@ CpuTailToken(hal::CpuTailId value) noexcept {
     return "provider_postprocess";
   case hal::CpuTailId::writer_copy:
     return "writer_copy";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view
+PreparedRouteToken(video::PreparedHardwareRoute value) noexcept {
+  switch (value) {
+  case video::PreparedHardwareRoute::legacy_shadow:
+    return "legacy_shadow";
+  case video::PreparedHardwareRoute::hal_live:
+    return "hal_live";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+PreparedEligibilityToken(video::PreparedHardwareEligibility value) noexcept {
+  switch (value) {
+  case video::PreparedHardwareEligibility::eligible:
+    return "eligible";
+  case video::PreparedHardwareEligibility::not_strict_explicit_vulkan:
+    return "not_strict_explicit_vulkan";
+  case video::PreparedHardwareEligibility::no_qualified_final_stage:
+    return "no_qualified_final_stage";
+  case video::PreparedHardwareEligibility::contains_unqualified_stage:
+    return "contains_unqualified_stage";
+  case video::PreparedHardwareEligibility::tracked_vignette_center:
+    return "tracked_vignette_center";
+  case video::PreparedHardwareEligibility::unsupported_host_layout:
+    return "unsupported_host_layout";
+  case video::PreparedHardwareEligibility::invalid_generation:
+    return "invalid_generation";
+  case video::PreparedHardwareEligibility::unavailable:
+    return "unavailable";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+SetupModeToken(video::HardwareExecutionSetupMode value) noexcept {
+  switch (value) {
+  case video::HardwareExecutionSetupMode::hal_live:
+    return "hal_live";
+  case video::HardwareExecutionSetupMode::shadow_only:
+    return "shadow_only";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+ApiFamilyToken(hal::ApiFamily value) noexcept {
+  switch (value) {
+  case hal::ApiFamily::invalid:
+    return "invalid";
+  case hal::ApiFamily::host:
+    return "host";
+  case hal::ApiFamily::cuda_driver:
+    return "cuda_driver";
+  case hal::ApiFamily::maxine_nvcv:
+    return "maxine_nvcv";
+  case hal::ApiFamily::onnxruntime:
+    return "onnxruntime";
+  case hal::ApiFamily::vulkan:
+    return "vulkan";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+AllocatorFamilyToken(hal::AllocatorFamily value) noexcept {
+  switch (value) {
+  case hal::AllocatorFamily::invalid:
+    return "invalid";
+  case hal::AllocatorFamily::host:
+    return "host";
+  case hal::AllocatorFamily::cuda_driver:
+    return "cuda_driver";
+  case hal::AllocatorFamily::maxine_nvcv:
+    return "maxine_nvcv";
+  case hal::AllocatorFamily::onnxruntime:
+    return "onnxruntime";
+  case hal::AllocatorFamily::vulkan:
+    return "vulkan";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+MemoryHandleFamilyToken(hal::MemoryHandleFamily value) noexcept {
+  switch (value) {
+  case hal::MemoryHandleFamily::invalid:
+    return "invalid";
+  case hal::MemoryHandleFamily::host_pointer:
+    return "host_pointer";
+  case hal::MemoryHandleFamily::cuda_device_pointer:
+    return "cuda_device_pointer";
+  case hal::MemoryHandleFamily::nvcv_image:
+    return "nvcv_image";
+  case hal::MemoryHandleFamily::ort_value:
+    return "ort_value";
+  case hal::MemoryHandleFamily::vulkan_buffer:
+    return "vulkan_buffer";
+  case hal::MemoryHandleFamily::vulkan_image:
+    return "vulkan_image";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+OwnershipModelToken(hal::OwnershipModel value) noexcept {
+  switch (value) {
+  case hal::OwnershipModel::invalid:
+    return "invalid";
+  case hal::OwnershipModel::adapter_exclusive:
+    return "adapter_exclusive";
+  case hal::OwnershipModel::borrowed_until_completion:
+    return "borrowed_until_completion";
+  case hal::OwnershipModel::externally_owned:
+    return "externally_owned";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+SynchronizationProtocolToken(hal::SynchronizationProtocol value) noexcept {
+  switch (value) {
+  case hal::SynchronizationProtocol::invalid:
+    return "invalid";
+  case hal::SynchronizationProtocol::host_synchronous:
+    return "host_synchronous";
+  case hal::SynchronizationProtocol::cuda_stream_ordered:
+    return "cuda_stream_ordered";
+  case hal::SynchronizationProtocol::maxine_bound_cuda_stream:
+    return "maxine_bound_cuda_stream";
+  case hal::SynchronizationProtocol::ort_provider_synchronous:
+    return "ort_provider_synchronous";
+  case hal::SynchronizationProtocol::vulkan_queue_fence:
+    return "vulkan_queue_fence";
+  }
+  return "invalid";
+}
+
+[[nodiscard]] constexpr std::string_view
+PrimitiveToken(hal::PrimitiveOperationId value) noexcept {
+  switch (value) {
+  case hal::PrimitiveOperationId::invalid:
+    return {};
+  case hal::PrimitiveOperationId::convert_pixel_format:
+    return "convert_pixel_format";
+  case hal::PrimitiveOperationId::resize:
+    return "resize";
+  case hal::PrimitiveOperationId::mirror:
+    return "mirror";
+  case hal::PrimitiveOperationId::box_blur:
+    return "box_blur";
+  case hal::PrimitiveOperationId::composite:
+    return "composite";
+  case hal::PrimitiveOperationId::alpha_feather:
+    return "alpha_feather";
   }
   return {};
 }
@@ -1479,6 +1639,481 @@ void AppendTypedRuntime(std::ostream &out,
   out << '}';
 }
 
+void AppendPreparedExecutionDomain(std::ostream &out,
+                                   const hal::ExecutionDomainId &value) {
+  out << "{\"backend\":{\"id\":" << static_cast<std::uint32_t>(value.backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(value.backend));
+  out << "},\"api_family\":{\"id\":"
+      << static_cast<std::uint32_t>(value.api_family) << ",\"token\":";
+  AppendJsonString(out, ApiFamilyToken(value.api_family));
+  out << "},\"physical_device\":{\"vendor_id\":"
+      << value.physical_device.vendor_id
+      << ",\"device_id\":" << value.physical_device.device_id
+      << ",\"stable_id\":\"";
+  const auto flags = out.flags();
+  const auto fill = out.fill();
+  for (const std::uint8_t byte : value.physical_device.stable_id) {
+    out << std::hex << std::setw(2) << std::setfill('0')
+        << static_cast<unsigned int>(byte);
+  }
+  out.flags(flags);
+  out.fill(fill);
+  out << "\"},\"logical_context_generation\":"
+      << value.logical_context_generation << ",\"allocator_family\":{\"id\":"
+      << static_cast<std::uint32_t>(value.allocator_family) << ",\"token\":";
+  AppendJsonString(out, AllocatorFamilyToken(value.allocator_family));
+  out << "},\"memory_handle_family\":{\"id\":"
+      << static_cast<std::uint32_t>(value.memory_handle_family)
+      << ",\"token\":";
+  AppendJsonString(out, MemoryHandleFamilyToken(value.memory_handle_family));
+  out << "},\"queue_or_stream_identity\":" << value.queue_or_stream_identity
+      << ",\"ownership_model\":{\"id\":"
+      << static_cast<std::uint32_t>(value.ownership_model) << ",\"token\":";
+  AppendJsonString(out, OwnershipModelToken(value.ownership_model));
+  out << "},\"synchronization_protocol\":{\"id\":"
+      << static_cast<std::uint32_t>(value.synchronization_protocol)
+      << ",\"token\":";
+  AppendJsonString(
+      out, SynchronizationProtocolToken(value.synchronization_protocol));
+  out << "},\"adapter_instance_id\":" << value.adapter_instance_id << '}';
+}
+
+[[nodiscard]] bool
+HistogramIsWellFormed(const hal::LatencyHistogram &histogram) noexcept {
+  std::uint64_t bucket_samples = 0;
+  for (const std::uint64_t count : histogram.bucket_counts) {
+    if (count > std::numeric_limits<std::uint64_t>::max() - bucket_samples)
+      return false;
+    bucket_samples += count;
+  }
+  if (bucket_samples != histogram.samples)
+    return false;
+  if (histogram.samples == 0) {
+    return histogram.total_ns == 0 && histogram.maximum_ns == 0 &&
+           histogram.p95_ns == 0 && histogram.p99_ns == 0;
+  }
+  return histogram.maximum_ns <= histogram.total_ns &&
+         histogram.p95_ns <= histogram.p99_ns;
+}
+
+struct PreparedSnapshotValidation {
+  bool valid = true;
+  std::string_view code = "valid";
+};
+
+[[nodiscard]] constexpr std::uint32_t
+PreparedValidationId(std::string_view code) noexcept {
+  if (code == "valid")
+    return 0;
+  if (code == "malformed_count")
+    return 1;
+  if (code == "inconsistent_telemetry")
+    return 2;
+  if (code == "inconsistent_live_setup")
+    return 3;
+  if (code == "wrong_execution_domain")
+    return 4;
+  if (code == "stale_committed_output")
+    return 5;
+  if (code == "malformed_committed_output")
+    return 6;
+  return std::numeric_limits<std::uint32_t>::max();
+}
+
+void FailPreparedValidation(PreparedSnapshotValidation *validation,
+                            std::string_view code) noexcept {
+  if (validation && validation->valid) {
+    validation->valid = false;
+    validation->code = code;
+  }
+}
+
+PreparedSnapshotValidation ValidatePreparedSnapshot(
+    const video::PreparedHardwareExecutionSnapshot &snapshot) noexcept {
+  PreparedSnapshotValidation validation;
+  const auto &setup = snapshot.setup;
+  if (setup.resolution.stage_count > setup.resolution.stages.size() ||
+      setup.domain_plan.island_count > setup.domain_plan.islands.size() ||
+      setup.domain_plan.boundary_count > setup.domain_plan.boundaries.size() ||
+      setup.shadow_comparison.discrepancy_count >
+          setup.shadow_comparison.discrepancies.size() ||
+      snapshot.readiness.evidence_count > snapshot.readiness.evidence.size() ||
+      snapshot.latest_committed_frame.stage_count >
+          snapshot.latest_committed_frame.stages.size()) {
+    FailPreparedValidation(&validation, "malformed_count");
+    return validation;
+  }
+  for (std::size_t index = 0; index < setup.resolution.stage_count; ++index) {
+    if (setup.resolution.stages[index].evidence_count >
+        setup.resolution.stages[index].evidence.size()) {
+      FailPreparedValidation(&validation, "malformed_count");
+      return validation;
+    }
+  }
+  for (std::size_t index = 0; index < setup.domain_plan.island_count; ++index) {
+    if (setup.domain_plan.islands[index].stage_count >
+        setup.domain_plan.islands[index].resolved_stage_indices.size()) {
+      FailPreparedValidation(&validation, "malformed_count");
+      return validation;
+    }
+  }
+  const auto &telemetry = snapshot.telemetry;
+  if (telemetry.execution_successes > telemetry.execution_attempts ||
+      telemetry.committed_output_frames > telemetry.execution_successes ||
+      telemetry.active_backend_frames > telemetry.committed_output_frames ||
+      telemetry.setup_successes > telemetry.setup_attempts ||
+      !HistogramIsWellFormed(telemetry.frame_latency)) {
+    FailPreparedValidation(&validation, "inconsistent_telemetry");
+    return validation;
+  }
+  for (std::size_t index = 0; index < setup.resolution.stage_count; ++index) {
+    if (!HistogramIsWellFormed(telemetry.stage_latency[index]) ||
+        telemetry.committed_stage_successes[index] >
+            telemetry.committed_output_frames) {
+      FailPreparedValidation(&validation, "inconsistent_telemetry");
+      return validation;
+    }
+  }
+
+  if (snapshot.route != video::PreparedHardwareRoute::hal_live)
+    return validation;
+  if (snapshot.eligibility != video::PreparedHardwareEligibility::eligible ||
+      !snapshot.prepared || !snapshot.active_program.valid ||
+      snapshot.active_program.program_id == 0 ||
+      snapshot.active_program.stage_count == 0 ||
+      snapshot.active_program.stage_count >
+          snapshot.setup.resolution.stages.size() ||
+      setup.mode != video::HardwareExecutionSetupMode::hal_live ||
+      setup.status != hal::StatusId::ready ||
+      setup.resolution.status != hal::StatusId::ready ||
+      !setup.resolution.available || setup.resolution.passthrough ||
+      setup.resolution.stage_count == 0 ||
+      setup.domain_plan.status != hal::StatusId::ready ||
+      setup.domain_plan.passthrough || setup.domain_plan.island_count != 1 ||
+      snapshot.readiness.status != hal::StatusId::ready ||
+      !snapshot.readiness.available) {
+    FailPreparedValidation(&validation, "inconsistent_live_setup");
+    return validation;
+  }
+  const auto &island = setup.domain_plan.islands[0];
+  if (!hal::ValidateExecutionDomain(island.execution_domain) ||
+      snapshot.active_program.execution_domain != island.execution_domain ||
+      snapshot.active_program.owner_adapter_instance_id !=
+          island.adapter_instance_id ||
+      snapshot.active_program.invalidation_key.canonical_plan_hash == 0 ||
+      snapshot.active_program.invalidation_key.execution_domain_hash == 0 ||
+      snapshot.active_program.invalidation_key.generations.context !=
+          island.execution_domain.logical_context_generation ||
+      snapshot.active_program.stage_count != setup.resolution.stage_count ||
+      snapshot.readiness.execution_domain != island.execution_domain ||
+      snapshot.readiness.selected_backend !=
+          setup.resolution.selected_backend ||
+      island.adapter_instance_id !=
+          island.execution_domain.adapter_instance_id ||
+      island.stage_count != setup.resolution.stage_count) {
+    FailPreparedValidation(&validation, "wrong_execution_domain");
+    return validation;
+  }
+  for (std::size_t index = 0; index < setup.resolution.stage_count; ++index) {
+    const auto &stage = setup.resolution.stages[index];
+    if (stage.execution_domain != island.execution_domain ||
+        stage.adapter_instance_id != island.adapter_instance_id ||
+        stage.selected_backend != setup.resolution.selected_backend) {
+      FailPreparedValidation(&validation, "wrong_execution_domain");
+      return validation;
+    }
+  }
+  const auto &commit = snapshot.latest_committed_frame;
+  if (!commit.valid)
+    return validation;
+  if (commit.program_id != snapshot.active_program.program_id ||
+      commit.invalidation_key != snapshot.active_program.invalidation_key) {
+    FailPreparedValidation(&validation, "stale_committed_output");
+    return validation;
+  }
+  if (commit.execution_domain != snapshot.active_program.execution_domain ||
+      commit.execution_domain != snapshot.readiness.execution_domain) {
+    FailPreparedValidation(&validation, "wrong_execution_domain");
+    return validation;
+  }
+  if (commit.stage_count != snapshot.active_program.stage_count ||
+      commit.stage_count != setup.resolution.stage_count) {
+    FailPreparedValidation(&validation, "malformed_committed_output");
+    return validation;
+  }
+  for (std::size_t index = 0; index < commit.stage_count; ++index) {
+    const auto &activity = commit.stages[index];
+    const auto &resolved = setup.resolution.stages[index];
+    if (activity.stage_id != resolved.intent.stage_id ||
+        activity.semantic != resolved.intent.semantic ||
+        activity.backend != resolved.selected_backend ||
+        activity.provider != resolved.provider) {
+      FailPreparedValidation(&validation, "malformed_committed_output");
+      return validation;
+    }
+  }
+  return validation;
+}
+
+[[nodiscard]] bool CommitMatchesPreparedSetup(
+    const video::PreparedHardwareExecutionSnapshot &snapshot) noexcept {
+  const auto &commit = snapshot.latest_committed_frame;
+  if (!commit.valid || commit.program_id == 0 || commit.capture_sequence == 0 ||
+      commit.output_commit_sequence == 0 || commit.stage_count == 0 ||
+      !snapshot.active_program.valid ||
+      commit.program_id != snapshot.active_program.program_id ||
+      commit.invalidation_key != snapshot.active_program.invalidation_key ||
+      commit.execution_domain != snapshot.active_program.execution_domain ||
+      commit.stage_count != snapshot.active_program.stage_count ||
+      commit.execution_domain != snapshot.readiness.execution_domain ||
+      commit.invalidation_key.canonical_plan_hash == 0 ||
+      commit.invalidation_key.execution_domain_hash == 0 ||
+      commit.invalidation_key.generations.configuration == 0 ||
+      commit.invalidation_key.generations.geometry == 0 ||
+      commit.invalidation_key.generations.context !=
+          commit.execution_domain.logical_context_generation ||
+      commit.stage_count != snapshot.setup.resolution.stage_count) {
+    return false;
+  }
+  for (std::size_t index = 0; index < commit.stage_count; ++index) {
+    const auto &activity = commit.stages[index];
+    const auto &resolved = snapshot.setup.resolution.stages[index];
+    if (activity.stage_id != resolved.intent.stage_id ||
+        activity.semantic != resolved.intent.semantic ||
+        activity.backend != resolved.selected_backend ||
+        activity.provider != resolved.provider) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ClampPreparedCounts(
+    video::PreparedHardwareExecutionSnapshot *snapshot) noexcept {
+  if (!snapshot)
+    return;
+  auto &setup = snapshot->setup;
+  setup.resolution.stage_count =
+      std::min(setup.resolution.stage_count, setup.resolution.stages.size());
+  setup.domain_plan.island_count = std::min(setup.domain_plan.island_count,
+                                            setup.domain_plan.islands.size());
+  setup.domain_plan.boundary_count = std::min(
+      setup.domain_plan.boundary_count, setup.domain_plan.boundaries.size());
+  setup.shadow_comparison.discrepancy_count =
+      std::min(setup.shadow_comparison.discrepancy_count,
+               setup.shadow_comparison.discrepancies.size());
+  snapshot->readiness.evidence_count = std::min(
+      snapshot->readiness.evidence_count, snapshot->readiness.evidence.size());
+  snapshot->latest_committed_frame.stage_count =
+      std::min(snapshot->latest_committed_frame.stage_count,
+               snapshot->latest_committed_frame.stages.size());
+  for (std::size_t index = 0; index < setup.resolution.stage_count; ++index) {
+    auto &stage = setup.resolution.stages[index];
+    stage.evidence_count =
+        std::min(stage.evidence_count, stage.evidence.size());
+  }
+  for (std::size_t index = 0; index < setup.domain_plan.island_count; ++index) {
+    auto &island = setup.domain_plan.islands[index];
+    island.stage_count =
+        std::min(island.stage_count, island.resolved_stage_indices.size());
+  }
+}
+
+void AppendPreparedReadiness(std::ostream &out,
+                             const hal::ReadinessSnapshot &readiness) {
+  out << "{\"status\":{\"id\":" << static_cast<std::uint32_t>(readiness.status)
+      << ",\"token\":";
+  AppendJsonString(out, StatusToken(readiness.status));
+  out << "},\"reason\":{\"id\":" << static_cast<std::uint32_t>(readiness.reason)
+      << ",\"token\":";
+  AppendJsonString(out, ReasonToken(readiness.reason));
+  out << "},\"requested_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(readiness.requested_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(readiness.requested_backend));
+  out << "},\"selected_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(readiness.selected_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(readiness.selected_backend));
+  out << "},\"provider\":{\"id\":"
+      << static_cast<std::uint32_t>(readiness.provider) << ",\"token\":";
+  AppendJsonString(out, ProviderToken(readiness.provider));
+  out << "},\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, readiness.execution_domain);
+  out << ",\"ready_stage_mask\":" << readiness.ready_stage_mask
+      << ",\"blocked_stage_mask\":" << readiness.blocked_stage_mask
+      << ",\"disabled_stage_mask\":" << readiness.disabled_stage_mask
+      << ",\"available\":" << (readiness.available ? "true" : "false")
+      << ",\"degraded\":" << (readiness.degraded ? "true" : "false")
+      << ",\"rebuild_requested\":"
+      << (readiness.rebuild_requested ? "true" : "false") << ",\"evidence\":";
+  AppendEvidenceArray(out, readiness.evidence, readiness.evidence_count);
+  out << '}';
+}
+
+void AppendPreparedDomainPlan(std::ostream &out, const hal::DomainPlan &plan) {
+  out << "{\"status\":{\"id\":" << static_cast<std::uint32_t>(plan.status)
+      << ",\"token\":";
+  AppendJsonString(out, StatusToken(plan.status));
+  out << "},\"reason\":{\"id\":" << static_cast<std::uint32_t>(plan.reason)
+      << ",\"token\":";
+  AppendJsonString(out, ReasonToken(plan.reason));
+  out << "},\"passthrough\":" << (plan.passthrough ? "true" : "false")
+      << ",\"expected_transfers\":";
+  AppendTransferCounters(out, plan.expected_transfers);
+  out << ",\"islands\":[";
+  for (std::size_t index = 0; index < plan.island_count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &island = plan.islands[index];
+    out << "{\"adapter_instance_id\":" << island.adapter_instance_id
+        << ",\"execution_domain\":";
+    AppendPreparedExecutionDomain(out, island.execution_domain);
+    out << ",\"stage_count\":" << island.stage_count << ",\"requires_upload\":"
+        << (island.requires_upload ? "true" : "false")
+        << ",\"requires_final_readback\":"
+        << (island.requires_final_readback ? "true" : "false") << '}';
+  }
+  out << "],\"boundaries\":[";
+  for (std::size_t index = 0; index < plan.boundary_count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &boundary = plan.boundaries[index];
+    out << "{\"kind\":{\"id\":" << static_cast<unsigned int>(boundary.kind)
+        << ",\"token\":";
+    AppendJsonString(out, boundary.kind ==
+                                  hal::ExecutionBoundaryKind::adapter_transfer
+                              ? std::string_view{"adapter_transfer"}
+                              : std::string_view{"cpu_tail"});
+    out << "},\"after_stage_id\":" << boundary.after_stage_id
+        << ",\"before_stage_id\":" << boundary.before_stage_id
+        << ",\"boundary_index\":" << boundary.boundary_index
+        << ",\"cpu_tail\":";
+    AppendJsonString(out, CpuTailToken(boundary.cpu_tail));
+    out << ",\"scratch_bytes\":" << boundary.scratch_bytes
+        << ",\"readback_required\":"
+        << (boundary.readback_required ? "true" : "false")
+        << ",\"following_upload_required\":"
+        << (boundary.following_upload_required ? "true" : "false")
+        << ",\"source_domain\":";
+    AppendPreparedExecutionDomain(out, boundary.source_domain);
+    out << ",\"destination_domain\":";
+    AppendPreparedExecutionDomain(out, boundary.destination_domain);
+    out << '}';
+  }
+  out << "]}";
+}
+
+void AppendPreparedCommittedFrame(std::ostream &out,
+                                  const hal::CommittedFrameSnapshot &commit,
+                                  bool current_program_match,
+                                  bool expose_active) {
+  out << "{\"valid\":" << (commit.valid ? "true" : "false")
+      << ",\"current_program_match\":"
+      << (current_program_match ? "true" : "false")
+      << ",\"active_attribution_valid\":" << (expose_active ? "true" : "false")
+      << ",\"program_id\":" << commit.program_id << ",\"invalidation_key\":";
+  AppendInvalidationKey(out, commit.invalidation_key);
+  out << ",\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, commit.execution_domain);
+  out << ",\"capture_sequence\":" << commit.capture_sequence
+      << ",\"output_commit_sequence\":" << commit.output_commit_sequence
+      << ",\"stages\":[";
+  for (std::size_t index = 0; index < commit.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &stage = commit.stages[index];
+    out << "{\"stage_id\":" << stage.stage_id
+        << ",\"effect\":{\"id\":" << static_cast<std::uint32_t>(stage.semantic)
+        << ",\"token\":";
+    AppendJsonString(out, hal::StableEffectId(stage.semantic));
+    out << "},\"primitive\":{\"id\":"
+        << static_cast<std::uint32_t>(stage.primitive) << ",\"token\":";
+    AppendJsonString(out, PrimitiveToken(stage.primitive));
+    out << "},\"backend\":{\"id\":" << static_cast<std::uint32_t>(stage.backend)
+        << ",\"token\":";
+    AppendJsonString(out, BackendToken(stage.backend));
+    out << "},\"provider\":{\"id\":"
+        << static_cast<std::uint32_t>(stage.provider) << ",\"token\":";
+    AppendJsonString(out, ProviderToken(stage.provider));
+    out << "},\"status\":{\"id\":" << static_cast<unsigned int>(stage.status)
+        << ",\"token\":";
+    AppendJsonString(out, StageExecutionToken(stage.status));
+    out << "},\"reason\":{\"id\":" << static_cast<std::uint32_t>(stage.reason)
+        << ",\"token\":";
+    AppendJsonString(out, ReasonToken(stage.reason));
+    out << "}}";
+  }
+  out << "]}";
+}
+
+void AppendPreparedTelemetry(std::ostream &out,
+                             const hal::ExecutionTelemetry &telemetry,
+                             const hal::ResolutionResult &resolution) {
+  out << "{\"requested_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.requested_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(telemetry.requested_backend));
+  out << "},\"selected_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.selected_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(telemetry.selected_backend));
+  out << "},\"cumulative_active_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.active_backend) << ",\"token\":";
+  AppendJsonString(out, BackendToken(telemetry.active_backend));
+  out << "},\"cumulative_active_provider\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.active_provider) << ",\"token\":";
+  AppendJsonString(out, ProviderToken(telemetry.active_provider));
+  out << "},\"execution_attempts\":" << telemetry.execution_attempts
+      << ",\"execution_successes\":" << telemetry.execution_successes
+      << ",\"committed_output_frames\":" << telemetry.committed_output_frames
+      << ",\"active_backend_frames\":" << telemetry.active_backend_frames
+      << ",\"fallback_frames\":" << telemetry.fallback_frames
+      << ",\"optional_fail_open_stages\":"
+      << telemetry.optional_fail_open_stages
+      << ",\"required_stage_failures\":" << telemetry.required_stage_failures
+      << ",\"temporal_resets\":" << telemetry.temporal_resets
+      << ",\"device_losses\":" << telemetry.device_losses
+      << ",\"setup_attempts\":" << telemetry.setup_attempts
+      << ",\"setup_successes\":" << telemetry.setup_successes
+      << ",\"setup_rollbacks\":" << telemetry.setup_rollbacks
+      << ",\"setup_retention_rejections\":"
+      << telemetry.setup_retention_rejections
+      << ",\"circuit_breaker_opens\":" << telemetry.circuit_breaker_opens
+      << ",\"disabled_stage_frames\":" << telemetry.disabled_stage_frames
+      << ",\"rebuild_requests\":" << telemetry.rebuild_requests
+      << ",\"frame_drop_events\":" << telemetry.frame_drop_events
+      << ",\"dropped_capture_frames\":" << telemetry.dropped_capture_frames
+      << ",\"preserve_order_failures\":" << telemetry.preserve_order_failures
+      << ",\"latest_frame_wins_events\":" << telemetry.latest_frame_wins_events
+      << ",\"disabled_stage_mask\":" << telemetry.disabled_stage_mask
+      << ",\"runtime_status\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.runtime_status) << ",\"token\":";
+  AppendJsonString(out, StatusToken(telemetry.runtime_status));
+  out << "},\"runtime_reason\":{\"id\":"
+      << static_cast<std::uint32_t>(telemetry.runtime_reason) << ",\"token\":";
+  AppendJsonString(out, ReasonToken(telemetry.runtime_reason));
+  out << "},\"transfers\":";
+  AppendTransferCounters(out, telemetry.transfers);
+  out << ",\"frame_latency\":";
+  AppendLatencyHistogram(out, telemetry.frame_latency);
+  out << ",\"stage_timing\":[";
+  for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    out << "{\"stage_id\":" << resolution.stages[index].intent.stage_id
+        << ",\"effect\":";
+    AppendJsonString(
+        out, hal::StableEffectId(resolution.stages[index].intent.semantic));
+    out << ",\"latency\":";
+    AppendLatencyHistogram(out, telemetry.stage_latency[index]);
+    out << ",\"committed_successes\":"
+        << telemetry.committed_stage_successes[index] << '}';
+  }
+  out << "]}";
+}
+
 } // namespace
 
 ProductCapabilityJsonResult SerializeProductCapabilityStatusJson(
@@ -1537,6 +2172,170 @@ VideoRuntimeStatusJsonResult SerializeVideoRuntimeStatusJson(
   out << "\"}}}";
   result.json = out.str();
   result.ok = true;
+  return result;
+}
+
+PreparedHardwareExecutionJsonResult SerializePreparedHardwareExecutionJson(
+    const video::PreparedHardwareExecutionSnapshot &snapshot,
+    bool supervisor_pipeline_running, bool supervisor_pipeline_starting) {
+  PreparedHardwareExecutionJsonResult result;
+  const PreparedSnapshotValidation validation =
+      ValidatePreparedSnapshot(snapshot);
+  auto safe = snapshot;
+  ClampPreparedCounts(&safe);
+
+  const bool live_runtime_status =
+      safe.telemetry.runtime_status != hal::StatusId::quarantined &&
+      safe.telemetry.runtime_status != hal::StatusId::stale &&
+      safe.telemetry.runtime_status != hal::StatusId::stopped &&
+      safe.telemetry.runtime_status != hal::StatusId::failed &&
+      safe.telemetry.runtime_reason != hal::ReasonId::device_lost &&
+      safe.telemetry.runtime_reason != hal::ReasonId::shutdown_requested;
+  const bool current_commit =
+      validation.valid && supervisor_pipeline_running &&
+      !supervisor_pipeline_starting &&
+      safe.route == video::PreparedHardwareRoute::hal_live &&
+      safe.eligibility == video::PreparedHardwareEligibility::eligible &&
+      safe.prepared && live_runtime_status && CommitMatchesPreparedSetup(safe);
+  bool successful_effect_committed = false;
+  if (current_commit) {
+    for (std::size_t index = 0; index < safe.latest_committed_frame.stage_count;
+         ++index) {
+      if (safe.latest_committed_frame.stages[index].status ==
+          hal::StageExecutionStatus::succeeded) {
+        successful_effect_committed = true;
+        break;
+      }
+    }
+  }
+  const bool expose_active = current_commit && successful_effect_committed;
+
+  std::ostringstream out;
+  out << "{\"valid\":" << (validation.valid ? "true" : "false")
+      << ",\"schema_version\":1,\"hal_contract_version\":"
+      << hal::kContractVersion
+      << ",\"validation\":{\"id\":" << PreparedValidationId(validation.code)
+      << ",\"code\":";
+  AppendJsonString(out, validation.code);
+  out << "},\"route\":{\"id\":" << static_cast<unsigned int>(safe.route)
+      << ",\"token\":";
+  AppendJsonString(out, PreparedRouteToken(safe.route));
+  out << "},\"eligibility\":{\"id\":"
+      << static_cast<unsigned int>(safe.eligibility) << ",\"token\":";
+  AppendJsonString(out, PreparedEligibilityToken(safe.eligibility));
+  out << "},\"prepared\":" << (safe.prepared ? "true" : "false")
+      << ",\"supervisor\":{\"pipeline_running\":"
+      << (supervisor_pipeline_running ? "true" : "false")
+      << ",\"pipeline_starting\":"
+      << (supervisor_pipeline_starting ? "true" : "false")
+      << "},\"setup\":{\"mode\":{\"id\":"
+      << static_cast<unsigned int>(safe.setup.mode) << ",\"token\":";
+  AppendJsonString(out, SetupModeToken(safe.setup.mode));
+  out << "},\"status\":{\"id\":"
+      << static_cast<std::uint32_t>(safe.setup.status) << ",\"token\":";
+  AppendJsonString(out, StatusToken(safe.setup.status));
+  out << "},\"reason\":{\"id\":"
+      << static_cast<std::uint32_t>(safe.setup.reason) << ",\"token\":";
+  AppendJsonString(out, ReasonToken(safe.setup.reason));
+  out << "},\"legacy_path_retained_for_setup_rollback\":"
+      << (safe.setup.legacy_path_retained_for_setup_rollback ? "true" : "false")
+      << ",\"shadow_compared\":"
+      << (safe.setup.shadow_compared ? "true" : "false");
+  if (safe.setup.shadow_compared) {
+    out << ",\"shadow_comparison\":{\"exact_match\":"
+        << (safe.setup.shadow_comparison.exact_match ? "true" : "false")
+        << ",\"truncated\":"
+        << (safe.setup.shadow_comparison.truncated ? "true" : "false")
+        << ",\"discrepancy_count\":"
+        << safe.setup.shadow_comparison.discrepancy_count << '}';
+  }
+  out << ",\"resolution\":";
+  AppendResolution(out, safe.setup.resolution);
+  out << ",\"domain_plan\":";
+  AppendPreparedDomainPlan(out, safe.setup.domain_plan);
+  out << "},\"active_program\":{\"valid\":"
+      << (safe.active_program.valid ? "true" : "false")
+      << ",\"program_id\":" << safe.active_program.program_id
+      << ",\"owner_adapter_instance_id\":"
+      << safe.active_program.owner_adapter_instance_id
+      << ",\"stage_count\":" << safe.active_program.stage_count
+      << ",\"invalidation_key\":";
+  AppendInvalidationKey(out, safe.active_program.invalidation_key);
+  out << ",\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, safe.active_program.execution_domain);
+  out << "},\"readiness\":";
+  AppendPreparedReadiness(out, safe.readiness);
+  out << ",\"attribution\":{\"requested_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(safe.setup.resolution.requested_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(safe.setup.resolution.requested_backend));
+  out << "},\"selected_backend\":{\"id\":"
+      << static_cast<std::uint32_t>(safe.setup.resolution.selected_backend)
+      << ",\"token\":";
+  AppendJsonString(out, BackendToken(safe.setup.resolution.selected_backend));
+  out << "},\"active_backend\":{\"id\":";
+  hal::BackendId active_backend = hal::BackendId::invalid;
+  hal::SemanticEffectProviderId active_provider =
+      hal::SemanticEffectProviderId::invalid;
+  bool provider_initialized = false;
+  bool mixed_providers = false;
+  if (expose_active) {
+    for (std::size_t index = 0; index < safe.latest_committed_frame.stage_count;
+         ++index) {
+      const auto &stage = safe.latest_committed_frame.stages[index];
+      if (stage.status != hal::StageExecutionStatus::succeeded)
+        continue;
+      active_backend = stage.backend;
+      if (!provider_initialized) {
+        active_provider = stage.provider;
+        provider_initialized = true;
+      } else if (active_provider != stage.provider) {
+        mixed_providers = true;
+      }
+    }
+  }
+  if (mixed_providers)
+    active_provider = hal::SemanticEffectProviderId::invalid;
+  out << static_cast<std::uint32_t>(active_backend) << ",\"token\":";
+  AppendJsonString(out, BackendToken(active_backend));
+  out << "},\"active_provider\":{\"id\":"
+      << static_cast<std::uint32_t>(active_provider) << ",\"token\":";
+  AppendJsonString(out, ProviderToken(active_provider));
+  out << "},\"committed_stages\":[";
+  bool first_active_stage = true;
+  if (expose_active) {
+    for (std::size_t index = 0; index < safe.latest_committed_frame.stage_count;
+         ++index) {
+      const auto &stage = safe.latest_committed_frame.stages[index];
+      if (stage.status != hal::StageExecutionStatus::succeeded)
+        continue;
+      if (!first_active_stage)
+        out << ',';
+      first_active_stage = false;
+      out << "{\"stage_id\":" << stage.stage_id << ",\"effect\":{\"id\":"
+          << static_cast<std::uint32_t>(stage.semantic) << ",\"token\":";
+      AppendJsonString(out, hal::StableEffectId(stage.semantic));
+      out << "},\"backend\":{\"id\":"
+          << static_cast<std::uint32_t>(stage.backend) << ",\"token\":";
+      AppendJsonString(out, BackendToken(stage.backend));
+      out << "},\"provider\":{\"id\":"
+          << static_cast<std::uint32_t>(stage.provider) << ",\"token\":";
+      AppendJsonString(out, ProviderToken(stage.provider));
+      out << "}}";
+    }
+  }
+  out << "]},\"telemetry\":";
+  AppendPreparedTelemetry(out, safe.telemetry, safe.setup.resolution);
+  out << ",\"latest_committed_frame\":";
+  AppendPreparedCommittedFrame(out, safe.latest_committed_frame, current_commit,
+                               expose_active);
+  out << '}';
+
+  result.ok = true;
+  result.snapshot_valid = validation.valid;
+  result.active_attribution_valid = expose_active;
+  result.validation_code = validation.code;
+  result.json = out.str();
   return result;
 }
 

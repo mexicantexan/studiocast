@@ -37,6 +37,7 @@
 #include "core/video/effects/broadcast_effect_rules.h"
 #include "core/video/v4l2loopback.h"
 #include "core/video/virtual_camera_service.h"
+#include "daemon/status_json.h"
 #include "studiocast/version.h"
 
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -2431,6 +2432,11 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   oss << "\"virtual_key_light_hdri\":\""
       << JsonEscape(cfg.pipeline.effects.virtual_key_light.hdri_path) << "\",";
 
+  const auto preparedHardwareJson =
+      studiocast::daemon::SerializePreparedHardwareExecutionJson(
+          st.pipeline.prepared_hardware_execution,
+          HasAuthoritativeRunningVideoFrame(st), st.pipeline.starting);
+
   oss << "\"pipeline\":{";
   oss << "\"running\":" << BoolJson(st.pipeline.running) << ",";
   oss << "\"starting\":" << BoolJson(st.pipeline.starting) << ",";
@@ -2443,6 +2449,10 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   oss << "\"frame_index\":" << st.pipeline.frame_index << ",";
   oss << "\"effects_backends\":\"" << JsonEscape(liveEffectBackends) << "\",";
   oss << "\"effects_note\":\"" << JsonEscape(st.pipeline.effects_note) << "\",";
+  oss << "\"hardware_execution\":"
+      << (preparedHardwareJson.ok ? preparedHardwareJson.json
+                                  : std::string("{\"valid\":false}"))
+      << ",";
   if (st.pipeline.degraded_effect.active) {
     const auto &fx = st.pipeline.degraded_effect;
     oss << "\"degraded_effect\":{";
