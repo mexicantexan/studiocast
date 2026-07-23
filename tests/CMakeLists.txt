@@ -574,7 +574,13 @@ if (BUILD_TESTING)
     add_executable(studiocast-installer-wizard-tests
             ${PROJECT_SOURCE_DIR}/tests/installer/gui/installer_wizard_tests.cpp
             ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard.h
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_internal.h
             ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard.cpp
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_support.cpp
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_intro_pages.cpp
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_setup_pages.cpp
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_review_pages.cpp
+            ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_progress.cpp
     )
 
     target_link_libraries(studiocast-installer-wizard-tests PRIVATE
