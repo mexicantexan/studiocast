@@ -519,6 +519,38 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-model-registry-tests
             unit model audio video gpu)
 
+    add_executable(studiocast-open-video-strict-provider-artifact-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/open_video_strict_provider_artifact_tests.cpp
+    )
+
+    target_link_libraries(studiocast-open-video-strict-provider-artifact-tests PRIVATE
+            studiocast_onnx_support
+            studiocast_model_support
+    )
+
+    target_include_directories(studiocast-open-video-strict-provider-artifact-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-open-video-strict-provider-artifact-tests)
+    studiocast_enable_sanitizers(
+            studiocast-open-video-strict-provider-artifact-tests)
+
+    set_target_properties(
+            studiocast-open-video-strict-provider-artifact-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-open-video-strict-provider-artifact-tests
+            COMMAND studiocast-open-video-strict-provider-artifact-tests)
+    studiocast_set_test_labels(
+            studiocast-open-video-strict-provider-artifact-tests
+            unit gpu video model)
+
     add_executable(studiocast-open-audio-prepared-binding-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/audio/open_audio_prepared_binding_tests.cpp
     )
