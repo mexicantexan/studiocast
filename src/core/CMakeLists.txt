@@ -30,6 +30,11 @@ set(_studiocast_contract_sources
 set(_studiocast_hal_contract_sources
         ${PROJECT_SOURCE_DIR}/src/core/hal/prepared_program.cpp)
 
+set(_studiocast_hal_runtime_sources
+        ${PROJECT_SOURCE_DIR}/src/core/hal/domain_planner.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/hal/resolver.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/hal/static_registry.cpp)
+
 set(_studiocast_config_sources
         ${PROJECT_SOURCE_DIR}/src/core/config/daemon_config.cpp
         ${PROJECT_SOURCE_DIR}/src/core/config/settings.cpp)
@@ -178,6 +183,7 @@ set(_studiocast_runtime_config_sources
 add_library(studiocast_util STATIC ${_studiocast_util_sources})
 add_library(studiocast_contracts STATIC ${_studiocast_contract_sources})
 add_library(studiocast_hal_contracts STATIC ${_studiocast_hal_contract_sources})
+add_library(studiocast_hal_runtime STATIC ${_studiocast_hal_runtime_sources})
 add_library(studiocast_config STATIC ${_studiocast_config_sources})
 add_library(studiocast_ipc STATIC ${_studiocast_ipc_sources})
 add_library(studiocast_cuda_support STATIC ${_studiocast_cuda_support_sources})
@@ -199,6 +205,7 @@ set(_studiocast_production_targets
         studiocast_util
         studiocast_contracts
         studiocast_hal_contracts
+        studiocast_hal_runtime
         studiocast_config
         studiocast_ipc
         studiocast_cuda_support
@@ -227,6 +234,7 @@ endforeach ()
 
 target_link_libraries(studiocast_util PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(studiocast_contracts PUBLIC studiocast_util)
+target_link_libraries(studiocast_hal_runtime PUBLIC studiocast_hal_contracts)
 target_link_libraries(studiocast_config
         PUBLIC studiocast_contracts
         PRIVATE studiocast_util)
@@ -467,6 +475,8 @@ studiocast_assert_direct_dependencies(studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_contracts
         PUBLIC_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_hal_contracts)
+studiocast_assert_direct_dependencies(studiocast_hal_runtime
+        PUBLIC_STUDIOCAST_DEPS studiocast_hal_contracts)
 studiocast_assert_direct_dependencies(studiocast_config
         PUBLIC_STUDIOCAST_DEPS studiocast_contracts
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
@@ -531,6 +541,7 @@ foreach (target IN ITEMS
         studiocast_util
         studiocast_contracts
         studiocast_hal_contracts
+        studiocast_hal_runtime
         studiocast_config
         studiocast_ipc
         studiocast_cuda_support
@@ -544,6 +555,7 @@ set(_studiocast_expected_sources
         ${_studiocast_util_sources}
         ${_studiocast_contract_sources}
         ${_studiocast_hal_contract_sources}
+        ${_studiocast_hal_runtime_sources}
         ${_studiocast_config_sources}
         ${_studiocast_ipc_sources}
         ${_studiocast_cuda_support_sources}
@@ -560,7 +572,7 @@ set(_studiocast_expected_sources
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 109)
+set(_studiocast_expected_source_count 112)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

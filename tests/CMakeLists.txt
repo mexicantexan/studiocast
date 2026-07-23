@@ -51,6 +51,31 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-hal-contract-tests
             unit core video gpu)
 
+    add_executable(studiocast-hal-resolver-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/hal_resolver_tests.cpp
+    )
+
+    target_link_libraries(studiocast-hal-resolver-tests PRIVATE
+            studiocast_hal_runtime)
+
+    target_include_directories(studiocast-hal-resolver-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(studiocast-hal-resolver-tests)
+    studiocast_enable_sanitizers(studiocast-hal-resolver-tests)
+
+    set_target_properties(studiocast-hal-resolver-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-hal-resolver-tests
+            COMMAND studiocast-hal-resolver-tests)
+    studiocast_set_test_labels(studiocast-hal-resolver-tests
+            unit core video gpu)
+
     add_library(studiocast-maxine-effect-fake-sdk SHARED
             ${PROJECT_SOURCE_DIR}/tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )
