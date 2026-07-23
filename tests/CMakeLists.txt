@@ -572,6 +572,32 @@ if (BUILD_TESTING)
             COMMAND studiocast-cuda-driver-api-tests)
     studiocast_set_test_labels(studiocast-cuda-driver-api-tests unit gpu)
 
+    add_executable(studiocast-cuda-prepared-vb-kernel-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_open_cuda_vb_kernel_bundle_tests.cpp
+    )
+
+    target_link_libraries(studiocast-cuda-prepared-vb-kernel-tests PRIVATE
+            studiocast_cuda_support
+    )
+
+    target_include_directories(studiocast-cuda-prepared-vb-kernel-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-cuda-prepared-vb-kernel-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-vb-kernel-tests)
+
+    set_target_properties(studiocast-cuda-prepared-vb-kernel-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-cuda-prepared-vb-kernel-tests
+            COMMAND studiocast-cuda-prepared-vb-kernel-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-vb-kernel-tests unit gpu)
+
     add_executable(studiocast-ipc-tests
             ${PROJECT_SOURCE_DIR}/tests/integration/ipc/ipc_client_tests.cpp
     )
