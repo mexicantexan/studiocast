@@ -61,6 +61,22 @@ hal::ImageDescriptor Image(bool alias = false) {
   return image;
 }
 
+hal::ImageDescriptor ResidentImage() {
+  auto image = Image();
+  image.host_coherence = hal::HostCoherence::not_host_visible;
+  image.mutability = hal::Mutability::read_write;
+  return image;
+}
+
+hal::ImageDescriptor HostImage(hal::Mutability mutability) {
+  auto image = Image();
+  image.host_coherence = hal::HostCoherence::coherent;
+  image.mutability = mutability;
+  image.aliasing = hal::AliasingPermission::forbidden;
+  image.in_place_permitted = false;
+  return image;
+}
+
 hal::CanonicalStageIntent
 Intent(std::uint32_t id, hal::SemanticEffectId semantic, bool required) {
   hal::CanonicalStageIntent intent;
@@ -97,6 +113,8 @@ hal::PreparedProgram Program(std::uint64_t adapter = 41,
   program.owner_adapter_instance_id = adapter;
   program.execution_domain =
       Domain(adapter, static_cast<std::uint8_t>(adapter));
+  program.host_input = HostImage(hal::Mutability::read_only);
+  program.host_output = HostImage(hal::Mutability::write_only);
   program.invalidation_key.generations.configuration = configuration;
   program.invalidation_key.generations.geometry = 1;
   program.invalidation_key.generations.model = 1;
@@ -135,9 +153,9 @@ hal::PreparedProgram Program(std::uint64_t adapter = 41,
     stage.backend = hal::BackendId::cuda;
     stage.execution_domain = program.execution_domain;
     stage.input.kind = hal::StageIoKind::image;
-    stage.input.image = Image();
+    stage.input.image = ResidentImage();
     stage.output.kind = hal::StageIoKind::image;
-    stage.output.image = Image();
+    stage.output.image = ResidentImage();
     stage.required = index == 0;
     stage.failure_action = stage.required
                                ? hal::FailureAction::fail_closed
@@ -405,8 +423,10 @@ hal::HostFrameBinding Binding(std::uint64_t sequence,
                               std::array<std::byte, 24> *output,
                               bool passthrough = false) {
   hal::HostFrameBinding binding;
-  binding.input_descriptor = Image(passthrough);
-  binding.output_descriptor = Image(passthrough);
+  binding.input_descriptor =
+      passthrough ? Image(true) : HostImage(hal::Mutability::read_only);
+  binding.output_descriptor =
+      passthrough ? Image(true) : HostImage(hal::Mutability::write_only);
   binding.input_plane_count = 1;
   binding.output_plane_count = 1;
   binding.input_planes[0].read_data = input->data();
