@@ -588,6 +588,8 @@ bool TestExecutionValidationAndNoAllocation() {
                     result.transfers.final_readbacks == 1 &&
                     result.transfers.intermediate_readbacks == 0,
                 "successful full-domain transfer contract changed");
+  ok &= Require(!session.latest_committed_frame().valid,
+                "execution claimed committed activity before output write");
 
   const auto blocked_pending = session.Execute(Request(program, 2));
   ok &= Require(blocked_pending.reason == ReasonId::output_not_committed,
@@ -611,6 +613,25 @@ bool TestExecutionValidationAndNoAllocation() {
                     session.telemetry().frame_latency.samples == 1 &&
                     session.telemetry().stage_latency[0].samples == 1,
                 "active attribution or transfer telemetry was not committed");
+  const auto &committed = session.latest_committed_frame();
+  ok &= Require(committed.valid &&
+                    committed.program_id == program.program_id &&
+                    committed.invalidation_key == program.invalidation_key &&
+                    committed.execution_domain == program.execution_domain &&
+                    committed.capture_sequence == 1 &&
+                    committed.output_commit_sequence == 1 &&
+                    committed.stage_count == program.stage_count &&
+                    committed.stages[0].stage_id ==
+                        program.stages[0].stage_id &&
+                    committed.stages[0].semantic ==
+                        program.stages[0].semantic &&
+                    committed.stages[0].backend ==
+                        program.stages[0].backend &&
+                    committed.stages[0].provider ==
+                        program.stages[0].provider &&
+                    committed.stages[0].status ==
+                        StageExecutionStatus::succeeded,
+                "latest committed-frame attribution is incomplete");
   return ok;
 }
 
@@ -706,7 +727,8 @@ bool TestOptionalFailureAndOutputCommitAttribution() {
   ok &= Require(session.CommitOutput({result.completion, false}, &reason) ==
                         StatusId::failed &&
                     reason == ReasonId::output_write_failed &&
-                    session.telemetry().active_backend_frames == 0,
+                    session.telemetry().active_backend_frames == 0 &&
+                    !session.latest_committed_frame().valid,
                 "failed output write incorrectly committed attribution");
 
   const auto retry = session.Execute(Request(program, 2));
@@ -718,6 +740,13 @@ bool TestOptionalFailureAndOutputCommitAttribution() {
                     session.telemetry().committed_stage_successes[0] == 1 &&
                     session.telemetry().committed_stage_successes[1] == 0,
                 "optional breaker disable or attribution changed");
+  ok &= Require(session.latest_committed_frame().valid &&
+                    session.latest_committed_frame().stage_count == 2 &&
+                    session.latest_committed_frame().stages[0].status ==
+                        StageExecutionStatus::succeeded &&
+                    session.latest_committed_frame().stages[1].status ==
+                        StageExecutionStatus::disabled_preserved,
+                "committed snapshot hid optional-stage degradation");
   return ok;
 }
 
@@ -946,7 +975,8 @@ bool TestRollbackReconfigurationTemporalAndShutdown() {
   ok &= Require(session.Configure(replacement, adapter, &readiness, &reason) ==
                         StatusId::blocked &&
                     session.prepared() && session.program().program_id == 100 &&
-                    session.telemetry().setup_rollbacks == 1,
+                    session.telemetry().setup_rollbacks == 1 &&
+                    !session.latest_committed_frame().valid,
                 "failed setup did not retain the old plan");
 
   const auto after_rollback = session.Execute(Request(first, 3));
@@ -971,6 +1001,7 @@ bool TestRollbackReconfigurationTemporalAndShutdown() {
   session.Shutdown();
   ok &= Require(
       session.stopped() && !session.prepared() && adapter.shutdown_calls == 1 &&
+          !session.latest_committed_frame().valid &&
           session.Execute(Request(replacement, 1)).status == StatusId::stopped,
       "shutdown did not stop execution and release the plan");
   ok &= Require(session.Configure(replacement, adapter, &readiness, &reason) ==

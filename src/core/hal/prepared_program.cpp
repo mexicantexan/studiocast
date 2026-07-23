@@ -563,6 +563,10 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
                                            ReadinessSnapshot *readiness,
                                            ReasonId *reason) noexcept {
   SetReason(reason, ReasonId::none);
+  // A setup attempt establishes a new authority boundary even when the old
+  // program is retained. The old committed frame must not be presented as
+  // evidence for the candidate configuration.
+  latest_committed_frame_ = {};
   if (stopped_) {
     SetReason(reason, ReasonId::shutdown_requested);
     return StatusId::stopped;
@@ -1030,6 +1034,31 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
   }
 
   ++telemetry_.committed_output_frames;
+  CommittedFrameSnapshot committed;
+  committed.valid = true;
+  committed.program_id = program_.program_id;
+  committed.invalidation_key = program_.invalidation_key;
+  committed.execution_domain = program_.execution_domain;
+  committed.capture_sequence = commit.completion.capture_sequence;
+  committed.output_commit_sequence = telemetry_.committed_output_frames;
+  committed.stage_count = pending_stage_count_;
+  for (std::size_t index = 0; index < pending_stage_count_; ++index) {
+    const auto &execution = pending_stages_[index];
+    const auto *stage = FindStage(program_, execution.stage_id);
+    if (stage == nullptr) {
+      // Execute validated this mapping before arming the completion. Keep the
+      // guard fail-closed in case future contract code changes that ordering.
+      latest_committed_frame_ = {};
+      pending_stage_count_ = 0;
+      SetReason(reason, ReasonId::malformed_contract);
+      return StatusId::failed;
+    }
+    committed.stages[index] = {
+        execution.stage_id, execution.semantic, execution.primitive,
+        stage->backend,      stage->provider,    execution.status,
+        execution.reason};
+  }
+  latest_committed_frame_ = committed;
   const bool effect_succeeded = std::any_of(
       pending_stages_.begin(), pending_stages_.begin() + pending_stage_count_,
       [](const StageExecutionResult &stage) {
@@ -1200,6 +1229,7 @@ void PreparedProgramSession::Invalidate(ReasonId reason) noexcept {
   completion_pending_ = false;
   host_binding_pending_ = false;
   pending_stage_count_ = 0;
+  latest_committed_frame_ = {};
   have_capture_sequence_ = false;
   if (reason == ReasonId::device_lost) {
     quarantined_ = true;
@@ -1214,6 +1244,7 @@ void PreparedProgramSession::Shutdown() noexcept {
   completion_pending_ = false;
   host_binding_pending_ = false;
   pending_stage_count_ = 0;
+  latest_committed_frame_ = {};
   IResidentAdapter *adapter = adapter_;
   DestroyActive();
   if (adapter)

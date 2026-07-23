@@ -371,6 +371,31 @@ struct OutputCommit {
   bool output_write_succeeded = false;
 };
 
+// This snapshot is distinct from cumulative telemetry. It is replaced only
+// after the caller confirms that the completed output was published
+// successfully, so status consumers cannot infer live activity from setup,
+// resolution, or an execution that never reached the writer.
+struct CommittedStageActivity {
+  std::uint32_t stage_id = 0;
+  SemanticEffectId semantic = SemanticEffectId::invalid;
+  PrimitiveOperationId primitive = PrimitiveOperationId::invalid;
+  BackendId backend = BackendId::invalid;
+  SemanticEffectProviderId provider = SemanticEffectProviderId::invalid;
+  StageExecutionStatus status = StageExecutionStatus::not_run;
+  ReasonId reason = ReasonId::none;
+};
+
+struct CommittedFrameSnapshot {
+  bool valid = false;
+  std::uint64_t program_id = 0;
+  ProgramInvalidationKey invalidation_key{};
+  ExecutionDomainId execution_domain{};
+  std::uint64_t capture_sequence = 0;
+  std::uint64_t output_commit_sequence = 0;
+  std::array<CommittedStageActivity, kMaxPreparedStages> stages{};
+  std::size_t stage_count = 0;
+};
+
 struct HostPlaneBinding {
   const std::byte *read_data = nullptr;
   std::byte *write_data = nullptr;
@@ -494,6 +519,10 @@ public:
   [[nodiscard]] const ExecutionTelemetry &telemetry() const noexcept {
     return telemetry_;
   }
+  [[nodiscard]] const CommittedFrameSnapshot &
+  latest_committed_frame() const noexcept {
+    return latest_committed_frame_;
+  }
 
 private:
   void DestroyActive() noexcept;
@@ -508,6 +537,7 @@ private:
   PreparedProgram program_{};
   PreparedProgramHandle handle_{};
   ExecutionTelemetry telemetry_{};
+  CommittedFrameSnapshot latest_committed_frame_{};
   CompletionToken pending_completion_{};
   ReadinessSnapshot readiness_{};
   ReadinessSnapshot configured_readiness_{};
