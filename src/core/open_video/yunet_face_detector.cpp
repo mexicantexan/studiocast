@@ -747,9 +747,11 @@ YunetFaceDetector::Letterbox YunetFaceDetector::ComputeLetterbox(int src_w,
   lb.scale = std::min(sx, sy);
 
   const int resized_w =
-      std::max(1, static_cast<int>(std::lround(src_w * lb.scale)));
+      std::max(1, static_cast<int>(
+                      std::lround(static_cast<float>(src_w) * lb.scale)));
   const int resized_h =
-      std::max(1, static_cast<int>(std::lround(src_h * lb.scale)));
+      std::max(1, static_cast<int>(
+                      std::lround(static_cast<float>(src_h) * lb.scale)));
   lb.pad_x = (dst_w - resized_w) / 2;
   lb.pad_y = (dst_h - resized_h) / 2;
   return lb;
@@ -769,9 +771,11 @@ void YunetFaceDetector::FillInputTensorBgr(const std::uint8_t *rgb, int src_w,
 
   const float inv_scale = (lb.scale > 0.0f) ? (1.0f / lb.scale) : 1.0f;
   const int content_w =
-      std::max(1, static_cast<int>(std::lround(src_w * lb.scale)));
+      std::max(1, static_cast<int>(
+                      std::lround(static_cast<float>(src_w) * lb.scale)));
   const int content_h =
-      std::max(1, static_cast<int>(std::lround(src_h * lb.scale)));
+      std::max(1, static_cast<int>(
+                      std::lround(static_cast<float>(src_h) * lb.scale)));
   const int x0 = std::max(0, lb.pad_x);
   const int y0 = std::max(0, lb.pad_y);
   const int x1 = std::min(out_w, lb.pad_x + content_w);

@@ -655,7 +655,7 @@ CreateOrtSessionWithProviderFallbacks(const OrtSessionOptions &opts,
     if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only) {
       std::string strict_error;
       if (!FinalizeStrictCudaProviderEvidence(opts, &info, &strict_error)) {
-        plan.error = std::move(strict_error);
+        plan.error.swap(strict_error);
         return plan;
       }
     }
