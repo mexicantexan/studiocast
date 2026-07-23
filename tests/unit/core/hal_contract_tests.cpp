@@ -344,6 +344,19 @@ bool TestIdsDescriptorsAndDomain() {
   domain.queue_or_stream_identity = 0;
   ok &= Require(!ValidateExecutionDomain(domain),
                 "domain without queue/stream identity accepted");
+  domain = Domain();
+  domain.allocator_family = AllocatorFamily::vulkan;
+  ok &= Require(!ValidateExecutionDomain(domain),
+                "cross-family allocator evidence was accepted");
+  domain = Domain();
+  domain.memory_handle_family = MemoryHandleFamily::vulkan_buffer;
+  ok &= Require(!ValidateExecutionDomain(domain),
+                "cross-family memory handle evidence was accepted");
+  domain = Domain();
+  domain.synchronization_protocol =
+      SynchronizationProtocol::vulkan_queue_fence;
+  ok &= Require(!ValidateExecutionDomain(domain),
+                "cross-family synchronization evidence was accepted");
   return ok;
 }
 

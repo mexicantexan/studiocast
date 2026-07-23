@@ -15,6 +15,41 @@ bool HasStableDeviceId(const PhysicalDeviceIdentity &device) noexcept {
                      [](std::uint8_t value) { return value != 0; });
 }
 
+bool HasConsistentExecutionFamilies(const ExecutionDomainId &domain) noexcept {
+  switch (domain.api_family) {
+  case ApiFamily::host:
+    return domain.allocator_family == AllocatorFamily::host &&
+           domain.memory_handle_family == MemoryHandleFamily::host_pointer &&
+           domain.synchronization_protocol ==
+               SynchronizationProtocol::host_synchronous;
+  case ApiFamily::cuda_driver:
+    return domain.allocator_family == AllocatorFamily::cuda_driver &&
+           domain.memory_handle_family ==
+               MemoryHandleFamily::cuda_device_pointer &&
+           domain.synchronization_protocol ==
+               SynchronizationProtocol::cuda_stream_ordered;
+  case ApiFamily::maxine_nvcv:
+    return domain.allocator_family == AllocatorFamily::maxine_nvcv &&
+           domain.memory_handle_family == MemoryHandleFamily::nvcv_image &&
+           domain.synchronization_protocol ==
+               SynchronizationProtocol::maxine_bound_cuda_stream;
+  case ApiFamily::onnxruntime:
+    return domain.allocator_family == AllocatorFamily::onnxruntime &&
+           domain.memory_handle_family == MemoryHandleFamily::ort_value &&
+           domain.synchronization_protocol ==
+               SynchronizationProtocol::ort_provider_synchronous;
+  case ApiFamily::vulkan:
+    return domain.allocator_family == AllocatorFamily::vulkan &&
+           (domain.memory_handle_family == MemoryHandleFamily::vulkan_buffer ||
+            domain.memory_handle_family == MemoryHandleFamily::vulkan_image) &&
+           domain.synchronization_protocol ==
+               SynchronizationProtocol::vulkan_queue_fence;
+  case ApiFamily::invalid:
+    return false;
+  }
+  return false;
+}
+
 bool BudgetContains(const ResourceBudget &available,
                     const ResourceBudget &required) noexcept {
   return available.persistent_bytes >= required.persistent_bytes &&
@@ -102,7 +137,8 @@ bool ValidateExecutionDomain(const ExecutionDomainId &domain) noexcept {
          domain.queue_or_stream_identity != 0 &&
          domain.ownership_model != OwnershipModel::invalid &&
          domain.synchronization_protocol != SynchronizationProtocol::invalid &&
-         domain.adapter_instance_id != 0;
+         domain.adapter_instance_id != 0 &&
+         HasConsistentExecutionFamilies(domain);
 }
 
 bool ValidateResourceHandle(const ResourceHandle &resource,
