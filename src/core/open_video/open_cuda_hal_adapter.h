@@ -30,7 +30,9 @@ struct ResidentCapabilityFacts {
   std::uint32_t completion_synchronizations_per_frame = 0;
   bool device_preprocess = false;
   bool device_postprocess = false;
-  bool virtual_background_composite = false;
+  bool virtual_background_blur = false;
+  bool virtual_background_remove = false;
+  bool virtual_background_replace = false;
   bool virtual_key_light = false;
 };
 

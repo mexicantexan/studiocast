@@ -494,9 +494,28 @@ EvaluateResidentCapability(SemanticEffectId semantic,
     return capability;
   }
 
-  const bool semantic_ready = IsVirtualBackground(semantic)
-                                  ? facts.virtual_background_composite
-                                  : facts.virtual_key_light;
+  bool semantic_ready = false;
+  switch (semantic) {
+  case SemanticEffectId::virtual_background_blur:
+    semantic_ready = facts.virtual_background_blur;
+    break;
+  case SemanticEffectId::virtual_background_remove:
+    semantic_ready = facts.virtual_background_remove;
+    break;
+  case SemanticEffectId::virtual_background_replace:
+    semantic_ready = facts.virtual_background_replace;
+    break;
+  case SemanticEffectId::virtual_key_light:
+    semantic_ready = facts.virtual_key_light;
+    break;
+  case SemanticEffectId::video_noise_removal:
+  case SemanticEffectId::eye_contact:
+  case SemanticEffectId::auto_frame:
+  case SemanticEffectId::vignette:
+  case SemanticEffectId::mirror:
+  case SemanticEffectId::invalid:
+    break;
+  }
   if (!facts.cuda_driver_ready || !facts.ort_cuda_provider_ready ||
       !facts.ort_cuda_iobinding_ready) {
     capability.reason = ReasonId::semantic_provider_unavailable;

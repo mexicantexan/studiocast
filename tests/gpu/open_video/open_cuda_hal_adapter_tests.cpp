@@ -208,7 +208,9 @@ open_cuda::ResidentCapabilityFacts CompleteFacts() {
   facts.completion_synchronizations_per_frame = 1;
   facts.device_preprocess = true;
   facts.device_postprocess = true;
-  facts.virtual_background_composite = true;
+  facts.virtual_background_blur = true;
+  facts.virtual_background_remove = true;
+  facts.virtual_background_replace = true;
   facts.virtual_key_light = true;
   return facts;
 }
@@ -589,6 +591,30 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
                     hal::SemanticEffectId::virtual_background_blur, facts)
                         .reason == hal::ReasonId::semantic_provider_unavailable,
                 "missing ORT CUDA provider must use the typed provider reason");
+  facts = CompleteFacts();
+  facts.virtual_background_replace = false;
+  ok &= Require(
+      open_cuda::EvaluateResidentCapability(
+          hal::SemanticEffectId::virtual_background_replace, facts)
+              .reason == hal::ReasonId::capability_evidence_incomplete,
+      "replace must remain blocked without its own exact resident evidence");
+  ok &= Require(
+      open_cuda::EvaluateResidentCapability(
+          hal::SemanticEffectId::virtual_background_blur, facts)
+              .production_eligible,
+      "missing replace evidence must not demote independently proven blur");
+  facts = CompleteFacts();
+  facts.virtual_key_light = false;
+  ok &= Require(
+      open_cuda::EvaluateResidentCapability(
+          hal::SemanticEffectId::virtual_key_light, facts)
+              .reason == hal::ReasonId::capability_evidence_incomplete,
+      "key light must remain blocked without its own exact resident evidence");
+  ok &= Require(
+      open_cuda::EvaluateResidentCapability(
+          hal::SemanticEffectId::virtual_background_remove, facts)
+              .production_eligible,
+      "missing key-light evidence must not demote independently proven remove");
   return ok;
 }
 
