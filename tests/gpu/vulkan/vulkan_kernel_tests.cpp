@@ -3882,6 +3882,12 @@ int main() {
     VulkanDevice lost_device;
     if (!lost_device.Initialize(&error))
       return OptionalSkip("device-loss test context init failed: " + error);
+    const auto healthy_state = lost_device.health_state();
+    ok &= Require(healthy_state.healthy() &&
+                      healthy_state.health == VulkanContextHealth::healthy &&
+                      !healthy_state.poisoned,
+                  "typed frame-path health state must report a healthy "
+                  "initialized context without string diagnostics");
     const auto fake_command =
         reinterpret_cast<studiocast::vulkan::VkCommandBuffer>(
             std::uintptr_t{1});
@@ -3891,8 +3897,15 @@ int main() {
                       error.find("[vulkan_device_lost]") != std::string::npos,
                   "injected Vulkan device loss should produce a stable reason");
     const auto lost = lost_device.health();
+    const auto lost_state = lost_device.health_state();
     ok &= Require(lost.health == VulkanContextHealth::device_lost &&
-                      lost.poisoned && lost.reason_code == "vulkan_device_lost",
+                      lost.poisoned && lost.reason_code == "vulkan_device_lost" &&
+                      lost_state.health == lost.health &&
+                      lost_state.poisoned == lost.poisoned &&
+                      lost_state.last_result == lost.last_result &&
+                      lost_state.submitted_serial == lost.submitted_serial &&
+                      lost_state.completed_serial == lost.completed_serial &&
+                      !lost_state.healthy(),
                   "Vulkan device loss should poison and latch the context");
     const std::uint64_t submitted_after_loss = lost.submitted_serial;
     ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&

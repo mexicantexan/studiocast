@@ -23,6 +23,11 @@ struct OpenVulkanFinalResidentStageResources {
   OpenVulkanVignetteCounters *vignette_counters = nullptr;
   OpenVulkanMirror *mirror = nullptr;
   OpenVulkanMirrorCounters *mirror_counters = nullptr;
+  // Prepared executors set this after setup has allocated and initialized
+  // every possible resource for the immutable plan. The frame path then
+  // validates exact reuse and fails closed instead of allocating or invoking
+  // setup-time initialization.
+  bool require_prepared_resources = false;
 };
 
 struct OpenVulkanFinalResidentStageInput {
@@ -67,6 +72,11 @@ struct OpenVulkanFinalResidentStageResult {
   bool vignette_initialization_failed = false;
   bool mirror_initialization_failed = false;
   std::uint64_t synchronous_completion_count = 0;
+  // Host-observed duration of each canonical resident dispatch. When
+  // vignette+mirror share one command batch, both fields carry the same
+  // non-additive shared-batch duration.
+  std::uint64_t vignette_elapsed_ns = 0;
+  std::uint64_t mirror_elapsed_ns = 0;
   std::size_t resident_stage_count = 0;
   std::string_view vignette_backend;
   std::string_view mirror_backend;

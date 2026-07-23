@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -46,6 +47,21 @@ struct VulkanHealthSnapshot {
   std::string message;
   std::uint64_t submitted_serial = 0;
   std::uint64_t completed_serial = 0;
+};
+
+// Allocation-free frame-path view of the latched context state. Rich string
+// diagnostics remain available through VulkanHealthSnapshot for setup and
+// control-plane reporting.
+struct VulkanHealthState {
+  VulkanContextHealth health = VulkanContextHealth::uninitialized;
+  bool poisoned = false;
+  VkResult last_result = VK_SUCCESS;
+  std::uint64_t submitted_serial = 0;
+  std::uint64_t completed_serial = 0;
+
+  [[nodiscard]] bool healthy() const noexcept {
+    return health == VulkanContextHealth::healthy && !poisoned;
+  }
 };
 
 struct VulkanAllocationStats {
@@ -102,6 +118,7 @@ public:
   VulkanFunctions &f() { return loader->f(); }
   bool Active() const;
   bool Healthy() const;
+  VulkanHealthState HealthState() const noexcept;
   bool SafeToDestroyChildren() const;
   VulkanHealthSnapshot HealthSnapshot() const;
   VulkanAllocationStats AllocationStats() const;
@@ -145,6 +162,8 @@ struct VulkanDeviceSelection {
 
 struct VulkanDeviceIdentity {
   std::string stable_id;
+  std::array<std::uint8_t, VK_UUID_SIZE> device_uuid{};
+  bool device_uuid_valid = false;
   std::uint32_t vendor_id = 0;
   std::uint32_t device_id = 0;
   std::uint32_t device_type = 0;
@@ -159,6 +178,8 @@ struct VulkanDeviceCandidateInfo {
   std::uint32_t device_id = 0;
   std::uint32_t device_type = 0;
   std::string stable_id;
+  std::array<std::uint8_t, VK_UUID_SIZE> device_uuid{};
+  bool device_uuid_valid = false;
   std::string vendor_name;
   std::string device_name;
   int compute_queue_family_index = -1;
@@ -398,6 +419,7 @@ public:
   }
   bool OwnsContext(const VulkanContextIdentity &identity) const;
   VulkanHealthSnapshot health() const;
+  VulkanHealthState health_state() const noexcept;
   VulkanAllocationStats allocation_stats() const;
   bool SafeToDestroyResources() const;
 

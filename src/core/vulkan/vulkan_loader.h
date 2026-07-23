@@ -69,6 +69,9 @@ constexpr VkResult VK_ERROR_FEATURE_NOT_PRESENT = -8;
 constexpr VkResult VK_ERROR_INCOMPATIBLE_DRIVER = -9;
 
 constexpr std::uint32_t VK_API_VERSION_1_0 = (1u << 22);
+constexpr std::uint32_t VK_API_VERSION_1_1 = (1u << 22) | (1u << 12);
+constexpr std::size_t VK_UUID_SIZE = 16;
+constexpr std::size_t VK_LUID_SIZE = 8;
 constexpr std::uint64_t VK_WHOLE_SIZE = ~std::uint64_t{0};
 constexpr std::uint32_t VK_QUEUE_FAMILY_IGNORED = ~std::uint32_t{0};
 constexpr std::uint64_t VK_DEFAULT_FENCE_TIMEOUT_NS = 10'000'000'000ull;
@@ -95,6 +98,8 @@ enum VkStructureType : std::int32_t {
   VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40,
   VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 42,
   VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER = 44,
+  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001,
+  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES = 1000071004,
 };
 
 enum VkPhysicalDeviceType : std::int32_t {
@@ -207,7 +212,26 @@ struct VkPhysicalDeviceProperties {
   VkPhysicalDeviceType deviceType = VK_PHYSICAL_DEVICE_TYPE_OTHER;
   char deviceName[256] = {};
   std::uint8_t pipelineCacheUUID[16] = {};
-  std::uint8_t reserved_limits_and_sparse_properties[2048] = {};
+  // Oversized ABI storage for VkPhysicalDeviceLimits followed by
+  // VkPhysicalDeviceSparseProperties. StudioCast does not inspect these
+  // fields; alignment preserves Properties2 chaining across supported ABIs.
+  alignas(8) std::uint8_t reserved_limits_and_sparse_properties[2048] = {};
+};
+
+struct VkPhysicalDeviceIDProperties {
+  VkStructureType sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+  void *pNext = nullptr;
+  std::uint8_t deviceUUID[VK_UUID_SIZE] = {};
+  std::uint8_t driverUUID[VK_UUID_SIZE] = {};
+  std::uint8_t deviceLUID[VK_LUID_SIZE] = {};
+  std::uint32_t deviceNodeMask = 0;
+  VkBool32 deviceLUIDValid = 0;
+};
+
+struct VkPhysicalDeviceProperties2 {
+  VkStructureType sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  void *pNext = nullptr;
+  VkPhysicalDeviceProperties properties{};
 };
 
 struct VkQueueFamilyProperties {
@@ -438,6 +462,8 @@ using PFN_vkEnumeratePhysicalDevices =
     VkResult (*)(VkInstance, std::uint32_t *, VkPhysicalDevice *);
 using PFN_vkGetPhysicalDeviceProperties =
     void (*)(VkPhysicalDevice, VkPhysicalDeviceProperties *);
+using PFN_vkGetPhysicalDeviceProperties2 =
+    void (*)(VkPhysicalDevice, VkPhysicalDeviceProperties2 *);
 using PFN_vkGetPhysicalDeviceQueueFamilyProperties =
     void (*)(VkPhysicalDevice, std::uint32_t *, VkQueueFamilyProperties *);
 using PFN_vkGetPhysicalDeviceMemoryProperties =
@@ -611,6 +637,8 @@ struct VulkanFunctions {
   PFN_vkCmdDispatch vkCmdDispatch = nullptr;
   PFN_vkCmdCopyBuffer vkCmdCopyBuffer = nullptr;
   PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
+  // Appended to preserve the existing function-table layout.
+  PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2 = nullptr;
 };
 
 std::string VkResultName(VkResult result);

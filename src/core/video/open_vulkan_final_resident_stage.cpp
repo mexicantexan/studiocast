@@ -1,5 +1,6 @@
 #include "core/video/open_vulkan_final_resident_stage.h"
 
+#include <chrono>
 #include <utility>
 
 namespace studiocast::video {
@@ -11,6 +12,7 @@ using studiocast::vulkan::VulkanPixelFormat;
 bool EnsureReusableImage(studiocast::vulkan::kernels::UtilityKernels *kernels,
                          VulkanImage *image, int width, int height,
                          VulkanPixelFormat format, const char *label,
+                         bool require_prepared,
                          OpenVulkanFinalResidentStageCounters *counters,
                          std::string *error_out) {
   if (!kernels || !kernels->device() || !image) {
@@ -22,6 +24,12 @@ bool EnsureReusableImage(studiocast::vulkan::kernels::UtilityKernels *kernels,
       image->width() == width && image->height() == height &&
       image->format() == format && !image->mapped() && image->device_local()) {
     return true;
+  }
+  if (require_prepared) {
+    if (error_out)
+      *error_out = std::string("Open Vulkan final stage: prepared ") + label +
+                   " is missing, foreign, or incompatible";
+    return false;
   }
 
   std::string detail;
@@ -210,7 +218,8 @@ bool ExecuteOpenVulkanFinalResidentStage(
     std::string resize_error;
     resize_ready = EnsureReusableImage(
         kernels, resources.resize_scratch, input.output_width,
-        input.output_height, format, "resize scratch", counters, &resize_error);
+        input.output_height, format, "resize scratch",
+        resources.require_prepared_resources, counters, &resize_error);
     if (!resize_ready) {
       result->fatal_error = resize_error;
       if (vignette_eligible) {
@@ -231,15 +240,27 @@ bool ExecuteOpenVulkanFinalResidentStage(
   if (vignette_eligible && resize_ready) {
     std::string detail;
     vignette_ready = resources.vignette && resources.vignette_counters &&
-                     resources.vignette_output &&
-                     resources.vignette->EnsureInitialized(
-                         kernels, input.output_width, input.output_height,
-                         input.vignette_intensity_percent,
-                         resources.vignette_counters, &detail);
+                     resources.vignette_output;
+    if (vignette_ready && resources.require_prepared_resources) {
+      const auto &mask = resources.vignette->attenuation_factor_mask();
+      vignette_ready = resources.vignette->initialized() &&
+                       resources.vignette->width() == input.output_width &&
+                       resources.vignette->height() == input.output_height &&
+                       mask.Valid() && mask.BelongsTo(*kernels->device()) &&
+                       !mask.mapped() && mask.device_local();
+      if (!vignette_ready)
+        detail = "prepared vignette state is missing, foreign, or incompatible";
+    } else if (vignette_ready) {
+      vignette_ready = resources.vignette->EnsureInitialized(
+          kernels, input.output_width, input.output_height,
+          input.vignette_intensity_percent, resources.vignette_counters,
+          &detail);
+    }
     if (vignette_ready) {
       vignette_ready = EnsureReusableImage(
           kernels, resources.vignette_output, input.output_width,
-          input.output_height, format, "vignette output", counters, &detail);
+          input.output_height, format, "vignette output",
+          resources.require_prepared_resources, counters, &detail);
     }
     if (!vignette_ready) {
       result->vignette_failed = true;
@@ -255,15 +276,23 @@ bool ExecuteOpenVulkanFinalResidentStage(
   bool mirror_ready = false;
   if (mirror_eligible && resize_ready) {
     std::string detail;
-    mirror_ready =
-        resources.mirror && resources.mirror_counters &&
-        resources.mirror_output &&
-        resources.mirror->EnsureInitialized(kernels, input.output_width,
-                                            input.output_height, &detail);
+    mirror_ready = resources.mirror && resources.mirror_counters &&
+                   resources.mirror_output;
+    if (mirror_ready && resources.require_prepared_resources) {
+      mirror_ready = resources.mirror->initialized() &&
+                     resources.mirror->width() == input.output_width &&
+                     resources.mirror->height() == input.output_height;
+      if (!mirror_ready)
+        detail = "prepared mirror state is missing or incompatible";
+    } else if (mirror_ready) {
+      mirror_ready = resources.mirror->EnsureInitialized(
+          kernels, input.output_width, input.output_height, &detail);
+    }
     if (mirror_ready) {
       mirror_ready = EnsureReusableImage(
           kernels, resources.mirror_output, input.output_width,
-          input.output_height, format, "mirror output", counters, &detail);
+          input.output_height, format, "mirror output",
+          resources.require_prepared_resources, counters, &detail);
     }
     if (!mirror_ready) {
       result->mirror_failed = true;
@@ -281,8 +310,17 @@ bool ExecuteOpenVulkanFinalResidentStage(
     stage.preceding_effects_complete = input.preceding_effects_complete;
     stage.intensity_percent = input.vignette_intensity_percent;
     std::string detail;
-    if (resources.vignette->ApplyFinal(stage, resources.vignette_counters,
-                                       &detail)) {
+    const auto dispatch_started = std::chrono::steady_clock::now();
+    const bool applied = resources.vignette->ApplyFinal(
+        stage, resources.vignette_counters, &detail);
+    const auto dispatch_elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - dispatch_started)
+            .count());
+    result->vignette_elapsed_ns = dispatch_elapsed;
+    if (mirror_ready)
+      result->mirror_elapsed_ns = dispatch_elapsed;
+    if (applied) {
       result->resize_applied = resize_needed;
       result->vignette_applied = true;
       result->vignette_backend = "open_vulkan";
@@ -308,6 +346,7 @@ bool ExecuteOpenVulkanFinalResidentStage(
   if (!result->mirror_applied && mirror_ready) {
     std::string detail;
     bool applied = false;
+    const auto dispatch_started = std::chrono::steady_clock::now();
     if (resize_needed) {
       OpenVulkanMirrorResizeFinalStageInput stage;
       stage.src = input.source;
@@ -325,6 +364,10 @@ bool ExecuteOpenVulkanFinalResidentStage(
       applied = resources.mirror->ApplyFinal(stage, resources.mirror_counters,
                                              &detail);
     }
+    result->mirror_elapsed_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - dispatch_started)
+            .count());
     if (applied) {
       result->resize_applied = resize_needed;
       result->mirror_applied = true;

@@ -353,6 +353,12 @@ bool VulkanContextState::Healthy() const {
   return health.health == VulkanContextHealth::healthy && !health.poisoned;
 }
 
+VulkanHealthState VulkanContextState::HealthState() const noexcept {
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return {health.health, health.poisoned, health.last_result,
+          health.submitted_serial, health.completed_serial};
+}
+
 bool VulkanContextState::SafeToDestroyChildren() const {
   std::lock_guard<std::mutex> lock(health_mutex);
   const bool fatal_wait_completion_unknown =
@@ -1079,6 +1085,13 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
   app.pEngineName = "StudioCast Open Vulkan";
   app.engineVersion = 1;
   app.apiVersion = VK_API_VERSION_1_0;
+  if (lf.vkEnumerateInstanceVersion) {
+    std::uint32_t runtime_api_version = VK_API_VERSION_1_0;
+    if (lf.vkEnumerateInstanceVersion(&runtime_api_version) == VK_SUCCESS &&
+        runtime_api_version >= VK_API_VERSION_1_1) {
+      app.apiVersion = VK_API_VERSION_1_1;
+    }
+  }
 
   VkInstanceCreateInfo create{};
   create.pApplicationInfo = &app;
@@ -1197,21 +1210,30 @@ void VulkanDevice::DestroyUnownedHandles() noexcept {
 
 bool VulkanDevice::LoadInstanceFunctions(std::string *error_out) {
   VulkanFunctions &vf = loader_->f();
-  return LoadInstanceProc(vf, instance_, "vkDestroyInstance",
-                          &vf.vkDestroyInstance, error_out) &&
-         LoadInstanceProc(vf, instance_, "vkEnumeratePhysicalDevices",
-                          &vf.vkEnumeratePhysicalDevices, error_out) &&
-         LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceProperties",
-                          &vf.vkGetPhysicalDeviceProperties, error_out) &&
-         LoadInstanceProc(
-             vf, instance_, "vkGetPhysicalDeviceQueueFamilyProperties",
-             &vf.vkGetPhysicalDeviceQueueFamilyProperties, error_out) &&
-         LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceMemoryProperties",
-                          &vf.vkGetPhysicalDeviceMemoryProperties, error_out) &&
-         LoadInstanceProc(vf, instance_, "vkCreateDevice", &vf.vkCreateDevice,
-                          error_out) &&
-         LoadInstanceProc(vf, instance_, "vkGetDeviceProcAddr",
-                          &vf.vkGetDeviceProcAddr, error_out);
+  const bool required =
+      LoadInstanceProc(vf, instance_, "vkDestroyInstance",
+                       &vf.vkDestroyInstance, error_out) &&
+      LoadInstanceProc(vf, instance_, "vkEnumeratePhysicalDevices",
+                       &vf.vkEnumeratePhysicalDevices, error_out) &&
+      LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceProperties",
+                       &vf.vkGetPhysicalDeviceProperties, error_out) &&
+      LoadInstanceProc(
+          vf, instance_, "vkGetPhysicalDeviceQueueFamilyProperties",
+          &vf.vkGetPhysicalDeviceQueueFamilyProperties, error_out) &&
+      LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceMemoryProperties",
+                       &vf.vkGetPhysicalDeviceMemoryProperties, error_out) &&
+      LoadInstanceProc(vf, instance_, "vkCreateDevice", &vf.vkCreateDevice,
+                       error_out) &&
+      LoadInstanceProc(vf, instance_, "vkGetDeviceProcAddr",
+                       &vf.vkGetDeviceProcAddr, error_out);
+  if (!required)
+    return false;
+  // Vulkan 1.1 core identity query. Its absence does not disable the legacy
+  // Vulkan backend, but HAL production readiness will fail closed because a
+  // name/index-derived selector cannot prove physical-device identity.
+  LoadInstanceProc(vf, instance_, "vkGetPhysicalDeviceProperties2",
+                   &vf.vkGetPhysicalDeviceProperties2, nullptr);
+  return true;
 }
 
 bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
@@ -1251,6 +1273,18 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
         static_cast<std::uint32_t>(props.deviceType), props.deviceName);
     candidate.vendor_name = VendorName(props.vendorID);
     candidate.device_name = props.deviceName;
+    if (vf.vkGetPhysicalDeviceProperties2) {
+      VkPhysicalDeviceIDProperties id_properties;
+      VkPhysicalDeviceProperties2 properties2;
+      properties2.pNext = &id_properties;
+      vf.vkGetPhysicalDeviceProperties2(dev, &properties2);
+      std::copy(std::begin(id_properties.deviceUUID),
+                std::end(id_properties.deviceUUID),
+                candidate.device_uuid.begin());
+      candidate.device_uuid_valid = std::any_of(
+          candidate.device_uuid.begin(), candidate.device_uuid.end(),
+          [](std::uint8_t byte) { return byte != 0; });
+    }
     candidate.score = DeviceScore(props);
     std::uint32_t q_count = 0;
     vf.vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, nullptr);
@@ -1297,6 +1331,8 @@ bool VulkanDevice::PickPhysicalDevice(std::string *error_out) {
   diagnostics_.selected_device_index = static_cast<int>(best.enumeration_index);
   diagnostics_.selected_device_stable_id = best.stable_id;
   identity_.stable_id = best.stable_id;
+  identity_.device_uuid = best.device_uuid;
+  identity_.device_uuid_valid = best.device_uuid_valid;
   identity_.vendor_id = best.vendor_id;
   identity_.device_id = best.device_id;
   identity_.device_type = best.device_type;
@@ -1504,10 +1540,11 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
   }
 
   std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
-  const auto before = context_->HealthSnapshot();
-  if (before.poisoned || before.health != VulkanContextHealth::healthy) {
+  const auto before = context_->HealthState();
+  if (!before.healthy()) {
     if (error_out) {
-      *error_out = "[" + before.reason_code +
+      const auto diagnostics = context_->HealthSnapshot();
+      *error_out = "[" + diagnostics.reason_code +
                    "] Vulkan submission rejected because the context is "
                    "latched unhealthy.";
     }
@@ -1603,11 +1640,12 @@ bool VulkanDevice::RecordBufferBarrier(
                    "a resource from a foreign context/generation.";
     return false;
   }
-  const auto snapshot = context_->HealthSnapshot();
   if (!context_->Healthy()) {
-    if (error_out)
+    if (error_out) {
+      const auto snapshot = context_->HealthSnapshot();
       *error_out = "[" + snapshot.reason_code +
                    "] Vulkan buffer barrier rejected an unhealthy context.";
+    }
     return false;
   }
 
@@ -1673,6 +1711,12 @@ VulkanHealthSnapshot VulkanDevice::health() const {
   if (!context_)
     return {};
   return context_->HealthSnapshot();
+}
+
+VulkanHealthState VulkanDevice::health_state() const noexcept {
+  if (!context_)
+    return {};
+  return context_->HealthState();
 }
 
 VulkanAllocationStats VulkanDevice::allocation_stats() const {
@@ -1804,11 +1848,12 @@ bool VulkanCommandBatch::Begin(std::string *error_out) {
                    "already in use.";
     return false;
   }
-  const auto health = context_->HealthSnapshot();
   if (!context_->Healthy()) {
-    if (error_out)
+    if (error_out) {
+      const auto health = context_->HealthSnapshot();
       *error_out = "[" + health.reason_code +
                    "] Vulkan command batch rejected an unhealthy context.";
+    }
     return false;
   }
 
@@ -1877,11 +1922,12 @@ bool VulkanCommandBatch::RecordBufferBarrier(
   std::lock_guard<std::mutex> lock(mutex_);
   if (!CheckRecordingOwner(error_out))
     return false;
-  const auto health = context_->HealthSnapshot();
   if (!context_->Healthy()) {
-    if (error_out)
+    if (error_out) {
+      const auto health = context_->HealthSnapshot();
       *error_out = "[" + health.reason_code +
                    "] Vulkan batch barrier rejected an unhealthy context.";
+    }
     return false;
   }
   if (!buffer || size == 0 || resource_context != context_identity_) {
@@ -1924,11 +1970,12 @@ bool VulkanCommandBatch::Complete(std::string *error_out) {
   }
 
   std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
-  const auto before = context_->HealthSnapshot();
   if (!context_->Healthy()) {
-    if (error_out)
+    if (error_out) {
+      const auto before = context_->HealthSnapshot();
       *error_out = "[" + before.reason_code +
                    "] Vulkan batch completion rejected an unhealthy context.";
+    }
     recording_ = false;
     recording_owner_ = {};
     return false;
