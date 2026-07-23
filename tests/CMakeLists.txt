@@ -604,6 +604,60 @@ if (BUILD_TESTING)
             COMMAND studiocast-cuda-driver-api-tests)
     studiocast_set_test_labels(studiocast-cuda-driver-api-tests unit gpu)
 
+    add_executable(studiocast-cuda-prepared-transfer-completion-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/cuda_prepared_transfer_completion_tests.cpp
+    )
+
+    target_link_libraries(studiocast-cuda-prepared-transfer-completion-tests PRIVATE
+            studiocast_cuda_support
+    )
+
+    target_include_directories(studiocast-cuda-prepared-transfer-completion-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-cuda-prepared-transfer-completion-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-transfer-completion-tests)
+
+    set_target_properties(studiocast-cuda-prepared-transfer-completion-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-cuda-prepared-transfer-completion-tests
+            COMMAND studiocast-cuda-prepared-transfer-completion-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-transfer-completion-tests
+            unit gpu)
+
+    add_executable(studiocast-cuda-prepared-preprocess-kernel-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_preprocess_kernel_bundle_tests.cpp
+    )
+
+    target_link_libraries(studiocast-cuda-prepared-preprocess-kernel-tests PRIVATE
+            studiocast_cuda_support
+    )
+
+    target_include_directories(studiocast-cuda-prepared-preprocess-kernel-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-cuda-prepared-preprocess-kernel-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-preprocess-kernel-tests)
+
+    set_target_properties(studiocast-cuda-prepared-preprocess-kernel-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-cuda-prepared-preprocess-kernel-tests
+            COMMAND studiocast-cuda-prepared-preprocess-kernel-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-preprocess-kernel-tests
+            unit gpu)
+
     add_executable(studiocast-cuda-prepared-vb-kernel-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_open_cuda_vb_kernel_bundle_tests.cpp
     )

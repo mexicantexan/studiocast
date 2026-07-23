@@ -47,9 +47,11 @@ set(_studiocast_ipc_sources
 set(_studiocast_cuda_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/cuda/cuda_driver_api.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/cuda_image.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/cuda_prepared_transfer_completion.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/cuda_tensor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/open_cuda_vb_kernels_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_preprocess_kernel_bundle.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/preprocess_to_nchw_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/resize_bilinear_ptx.cpp)
 
@@ -600,7 +602,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 122)
+set(_studiocast_expected_source_count 124)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
