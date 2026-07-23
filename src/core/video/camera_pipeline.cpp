@@ -8536,6 +8536,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::unique_ptr<studiocast::maxine::ProductionResidentFrameExecutor>
       maxine_resident_executor;
   studiocast::maxine::ResidentFrameSection maxine_resident_section;
+  PreparedMaxineHardwareExecutionOwner prepared_maxine_hardware_owner;
+  bool prepared_maxine_hardware_live = false;
+  bool prepared_maxine_hardware_suspended = false;
+  std::vector<std::uint8_t> prepared_maxine_bgr_output;
   std::vector<std::uint8_t> maxine_resident_background_rgb;
   studiocast::maxine::ProductionResidentTelemetry
       maxine_resident_telemetry_snapshot{};
@@ -9966,6 +9970,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         prepared_frame_plan, resolved_maxine_stage_mask, matte_fingerprint);
     maxine_resident_executor.reset();
     maxine_resident_section.ResetSessionStateAndCounters();
+    if (prepared_maxine_hardware_live) {
+      prepared_maxine_hardware_owner.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+    }
+    prepared_maxine_hardware_live = false;
+    prepared_maxine_hardware_suspended = false;
+    prepared_maxine_bgr_output.clear();
     maxine_resident_background_rgb.clear();
     maxine_resident_telemetry_snapshot = {};
 
@@ -10055,7 +10066,133 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       }
 
+      prepared_maxine_hardware_live = false;
+      prepared_maxine_hardware_suspended = false;
       if (resident_error.empty() && resident_runtime.nvcv &&
+          resident_runtime.cuda &&
+          prepared_maxine_resident_islands.count == 1) {
+        PreparedMaxineHardwareRequest request;
+        request.requested_backend = hal::BackendId::maxine;
+        request.strict_backend_selection = true;
+        request.single_resident_island = true;
+        // V1 never chains two prepared adapters, even across an explicit CPU
+        // readback/upload boundary. The retained Maxine executor remains the
+        // compatibility route when the qualified Vulkan final owner is live.
+        request.contains_other_execution_domain =
+            prepared_hardware_final_live;
+        request.width = resident_setup.width;
+        request.height = resident_setup.height;
+        request.vignette_center_x_px =
+            resident_setup.vignette_center_x_px;
+        request.vignette_center_y_px =
+            resident_setup.vignette_center_y_px;
+        request.effects = resident_setup.effects;
+        request.generations.configuration = effects_generation;
+        request.host_input_is_tight_rgb24 =
+            rgbStride == static_cast<std::size_t>(capA.width) * 3u &&
+            rgb.size() ==
+                rgbStride * static_cast<std::size_t>(capA.height);
+        const std::size_t bgr_stride =
+            static_cast<std::size_t>(capA.width) * 3u;
+        const std::size_t bgr_bytes =
+            bgr_stride * static_cast<std::size_t>(capA.height);
+        prepared_maxine_bgr_output.resize(bgr_bytes);
+        request.host_output_is_tight_bgr24 =
+            prepared_maxine_bgr_output.size() == bgr_bytes;
+        request.runtime.vfx =
+            reinterpret_cast<std::uintptr_t>(resident_runtime.vfx);
+        request.runtime.nvcv =
+            reinterpret_cast<std::uintptr_t>(resident_runtime.nvcv);
+        request.runtime.ar =
+            reinterpret_cast<std::uintptr_t>(resident_runtime.ar);
+        request.runtime.cuda =
+            reinterpret_cast<std::uintptr_t>(resident_runtime.cuda);
+        request.vfx_model_directory = resident_model_dir.string();
+        request.replacement = {
+            resident_setup.replacement_background.data,
+            resident_setup.replacement_background.width,
+            resident_setup.replacement_background.height,
+            resident_setup.replacement_background.stride_bytes,
+            resident_setup.replacement_background.asset_generation,
+        };
+
+        constexpr std::uint32_t temporal_stage_mask =
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::denoise) |
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::eye_contact) |
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::auto_frame);
+        constexpr std::uint32_t matte_stage_mask =
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::background_blur) |
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::background_remove) |
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::background_replace) |
+            studiocast::maxine::ProductionResidentStageBit(
+                studiocast::maxine::ResidentStageKind::relighting);
+        request.temporal_reset_required =
+            (resident_setup.enabled_maxine_stage_mask &
+             temporal_stage_mask) != 0 ||
+            (fx.virtual_background.greenscreen_temporal &&
+             (resident_setup.enabled_maxine_stage_mask &
+              matte_stage_mask) != 0);
+
+        const auto semantic_for_kind =
+            [](studiocast::maxine::ResidentStageKind kind) {
+              using Kind = studiocast::maxine::ResidentStageKind;
+              switch (kind) {
+              case Kind::background_blur:
+                return hal::SemanticEffectId::virtual_background_blur;
+              case Kind::background_remove:
+                return hal::SemanticEffectId::virtual_background_remove;
+              case Kind::background_replace:
+                return hal::SemanticEffectId::virtual_background_replace;
+              case Kind::relighting:
+                return hal::SemanticEffectId::virtual_key_light;
+              case Kind::vignette:
+                return hal::SemanticEffectId::vignette;
+              case Kind::denoise:
+                return hal::SemanticEffectId::video_noise_removal;
+              case Kind::eye_contact:
+                return hal::SemanticEffectId::eye_contact;
+              case Kind::auto_frame:
+                return hal::SemanticEffectId::auto_frame;
+              case Kind::transfer:
+              case Kind::count:
+                return hal::SemanticEffectId::invalid;
+              }
+              return hal::SemanticEffectId::invalid;
+            };
+        const auto &only_island =
+            prepared_maxine_resident_islands.islands[0];
+        for (std::size_t index = 0;
+             index < only_island.plan.stage_count; ++index) {
+          const auto semantic =
+              semantic_for_kind(only_island.plan.stages[index].kind);
+          request.stages[request.stage_count++] = {
+              static_cast<std::uint32_t>(semantic),
+              semantic,
+              !only_island.plan.stages[index].optional,
+          };
+        }
+        const auto hal_setup =
+            prepared_maxine_hardware_owner.Configure(request);
+        prepared_maxine_hardware_live =
+            hal_setup.route == PreparedMaxineHardwareRoute::hal_live;
+        if (prepared_maxine_hardware_live) {
+          if (!note.empty())
+            note += "\n";
+          note +=
+              "Maxine HAL: one prepared adapter owns the qualified resident "
+              "island, one upload, qualified resident stages, explicit RGB "
+              "output tail, and one readback.";
+        }
+      }
+
+      if (!prepared_maxine_hardware_live && resident_error.empty() &&
+          resident_runtime.nvcv &&
           resident_runtime.cuda) {
         maxine_resident_executor = std::make_unique<
             studiocast::maxine::ProductionResidentFrameExecutor>(
@@ -10085,7 +10222,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       } else if (resident_error.empty()) {
         resident_error = "Resolved Maxine runtime is incomplete.";
       }
-      if (!maxine_resident_executor) {
+      if (!maxine_resident_executor && !prepared_maxine_hardware_live) {
         // A stage resolved to Maxine must never silently fall back to the old
         // stage-isolated upload/download path. Keep the CPU frame unchanged
         // and publish the disabled generation authoritatively instead.
@@ -10101,7 +10238,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         note += "Maxine resident section unavailable; resolved Maxine effects "
                 "are disabled for this configuration: " +
                 resident_error;
-      } else {
+      } else if (maxine_resident_executor) {
         if (!note.empty())
           note += "\n";
         note += "Maxine: compatible stages share one prepared resident frame "
@@ -10726,6 +10863,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool have_deferred_gpu_out = false;
     hal::CompletionToken prepared_hardware_completion{};
     bool prepared_hardware_completion_pending = false;
+    hal::CompletionToken prepared_maxine_completion{};
+    bool prepared_maxine_completion_pending = false;
     bool open_cuda_gpu_frame_pending_cpu_readback = false;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     bool open_vulkan_vignette_attempt_this_frame = false;
@@ -12498,6 +12637,227 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       };
 
+      auto execute_prepared_maxine_resident_island =
+          [&](const PreparedMaxineResidentIsland &) {
+            const auto slot_for_semantic =
+                [&](hal::SemanticEffectId semantic) {
+                  switch (semantic) {
+                  case hal::SemanticEffectId::video_noise_removal:
+                    return OptionalEffectSlot::denoise;
+                  case hal::SemanticEffectId::eye_contact:
+                    return OptionalEffectSlot::eye_contact;
+                  case hal::SemanticEffectId::virtual_background_blur:
+                  case hal::SemanticEffectId::virtual_background_remove:
+                  case hal::SemanticEffectId::virtual_background_replace:
+                    return OptionalEffectSlot::virtual_background;
+                  case hal::SemanticEffectId::virtual_key_light:
+                    return OptionalEffectSlot::relight;
+                  case hal::SemanticEffectId::auto_frame:
+                    return OptionalEffectSlot::auto_frame;
+                  case hal::SemanticEffectId::vignette:
+                    return OptionalEffectSlot::vignette;
+                  case hal::SemanticEffectId::mirror:
+                  case hal::SemanticEffectId::invalid:
+                    return OptionalEffectSlot::count;
+                  }
+                  return OptionalEffectSlot::count;
+                };
+            const auto effect_id_for_semantic =
+                [](hal::SemanticEffectId semantic) {
+                  using namespace
+                      studiocast::video::effects::contract;
+                  switch (semantic) {
+                  case hal::SemanticEffectId::video_noise_removal:
+                    return kEffectIdVideoNoiseRemoval;
+                  case hal::SemanticEffectId::eye_contact:
+                    return kEffectIdEyeContact;
+                  case hal::SemanticEffectId::virtual_background_blur:
+                    return kEffectIdVirtualBackgroundBlur;
+                  case hal::SemanticEffectId::virtual_background_remove:
+                    return kEffectIdVirtualBackgroundRemove;
+                  case hal::SemanticEffectId::virtual_background_replace:
+                    return kEffectIdVirtualBackgroundReplace;
+                  case hal::SemanticEffectId::virtual_key_light:
+                    return kEffectIdVirtualKeyLight;
+                  case hal::SemanticEffectId::auto_frame:
+                    return kEffectIdAutoFrame;
+                  case hal::SemanticEffectId::vignette:
+                    return kEffectIdVignette;
+                  case hal::SemanticEffectId::mirror:
+                    return kEffectIdMirror;
+                  case hal::SemanticEffectId::invalid:
+                    return std::string_view{};
+                  }
+                  return std::string_view{};
+                };
+            const auto backend_for_semantic =
+                [](hal::SemanticEffectId semantic) {
+                  if (semantic == hal::SemanticEffectId::vignette)
+                    return std::string_view{"cuda"};
+                  return std::string_view{"maxine"};
+                };
+            const auto resident_kind_for_semantic =
+                [](hal::SemanticEffectId semantic) {
+                  using Kind = studiocast::maxine::ResidentStageKind;
+                  switch (semantic) {
+                  case hal::SemanticEffectId::video_noise_removal:
+                    return Kind::denoise;
+                  case hal::SemanticEffectId::eye_contact:
+                    return Kind::eye_contact;
+                  case hal::SemanticEffectId::virtual_background_blur:
+                    return Kind::background_blur;
+                  case hal::SemanticEffectId::virtual_background_remove:
+                    return Kind::background_remove;
+                  case hal::SemanticEffectId::virtual_background_replace:
+                    return Kind::background_replace;
+                  case hal::SemanticEffectId::virtual_key_light:
+                    return Kind::relighting;
+                  case hal::SemanticEffectId::auto_frame:
+                    return Kind::auto_frame;
+                  case hal::SemanticEffectId::vignette:
+                    return Kind::vignette;
+                  case hal::SemanticEffectId::mirror:
+                  case hal::SemanticEffectId::invalid:
+                    return Kind::count;
+                  }
+                  return Kind::count;
+                };
+
+            const auto &active =
+                prepared_maxine_hardware_owner.active_request();
+            const std::size_t tight_stride =
+                static_cast<std::size_t>(capA.width) * 3u;
+            const std::size_t tight_bytes =
+                tight_stride * static_cast<std::size_t>(capA.height);
+            const auto frame =
+                prepared_maxine_hardware_owner.ExecuteHostFrame(
+                    rgb.data(), rgb.size(), rgbStride,
+                    prepared_maxine_bgr_output.data(),
+                    prepared_maxine_bgr_output.size(), tight_stride,
+                    capture_sequence);
+
+            maxine_rgb_to_bgr_calls +=
+                frame.compatibility.rgb_to_bgr_calls;
+            maxine_upload_attempts +=
+                frame.compatibility.upload_attempts;
+            maxine_upload_calls += frame.compatibility.upload_calls;
+            maxine_final_download_attempts +=
+                frame.compatibility.final_download_attempts;
+            maxine_final_download_calls +=
+                frame.compatibility.final_download_calls;
+            maxine_cpu_continuation_download_attempts +=
+                frame.compatibility.cpu_continuation_download_attempts;
+            maxine_cpu_continuation_download_calls +=
+                frame.compatibility.cpu_continuation_download_calls;
+            maxine_download_calls +=
+                frame.compatibility.final_download_calls +
+                frame.compatibility.cpu_continuation_download_calls;
+            maxine_device_bridge_attempts +=
+                frame.compatibility.device_bridge_attempts;
+            maxine_device_bridge_calls +=
+                frame.compatibility.device_bridge_calls;
+            maxine_matte_inference_attempts +=
+                frame.compatibility.matte_inference_attempts;
+            maxine_green_screen_calls +=
+                frame.compatibility.matte_inference_calls;
+            maxine_shared_green_screen_matte_reuse_calls +=
+                frame.compatibility.shared_matte_reuses;
+            maxine_forced_sync_attempts +=
+                frame.compatibility.sync_attempts;
+            maxine_forced_sync_calls += frame.compatibility.sync_calls;
+            maxine_composite_attempts +=
+                frame.compatibility.composite_attempts;
+            maxine_composite_calls += frame.compatibility.composite_calls;
+            maxine_synchronous_sdk_run_attempts +=
+                frame.compatibility.synchronous_sdk_run_attempts;
+            maxine_synchronous_sdk_run_calls +=
+                frame.compatibility.synchronous_sdk_run_calls;
+            maxine_asynchronous_sdk_run_attempts +=
+                frame.compatibility.asynchronous_sdk_run_attempts;
+            maxine_asynchronous_sdk_run_calls +=
+                frame.compatibility.asynchronous_sdk_run_calls;
+            for (std::size_t index = 0; index < active.stage_count; ++index) {
+              const auto kind =
+                  resident_kind_for_semantic(active.stages[index].semantic);
+              if (kind >=
+                  studiocast::maxine::ResidentStageKind::count) {
+                continue;
+              }
+              const auto kind_index = static_cast<std::size_t>(kind);
+              maxine_stage_attempts[kind_index] +=
+                  frame.compatibility.stage_attempts[index];
+              maxine_stage_successes[kind_index] +=
+                  frame.compatibility.stage_successes[index];
+            }
+
+            prepared_maxine_completion = frame.completion;
+            prepared_maxine_completion_pending =
+                frame.completion_pending;
+            if (!frame.output_ready || frame.output == nullptr ||
+                frame.output_size_bytes != tight_bytes ||
+                frame.output_row_stride_bytes != tight_stride) {
+              ++maxine_runtime_failure_frames;
+              if (prepared_maxine_completion_pending) {
+                hal::ReasonId commit_reason = hal::ReasonId::none;
+                (void)prepared_maxine_hardware_owner.CommitOutput(
+                    prepared_maxine_completion, false, &commit_reason);
+                prepared_maxine_completion_pending = false;
+              }
+              if (frame.reason == hal::ReasonId::device_lost) {
+                prepared_maxine_hardware_owner.NotifyDeviceLost();
+                prepared_maxine_hardware_suspended = true;
+              }
+              for (std::size_t index = 0; index < active.stage_count;
+                   ++index) {
+                const auto slot =
+                    slot_for_semantic(active.stages[index].semantic);
+                const auto effect_id =
+                    effect_id_for_semantic(active.stages[index].semantic);
+                if (slot == OptionalEffectSlot::count ||
+                    effect_id.empty()) {
+                  continue;
+                }
+                block_optional_effect(
+                    slot, effect_id,
+                    backend_for_semantic(active.stages[index].semantic),
+                    OptionalEffectFailureReason(
+                        "Prepared Maxine HAL frame boundary failed",
+                        std::string(PreparedMaxineHardwareReasonCode(
+                            frame.reason))),
+                    capture_sequence);
+              }
+              return;
+            }
+
+            studiocast::video::Bgr24ToRgb24(
+                frame.output, rgb.data(), capA.width, capA.height,
+                frame.output_row_stride_bytes, rgbStride);
+            ++maxine_bgr_to_rgb_calls;
+            ++maxine_cpu_tail_stage_calls;
+
+            for (std::size_t index = 0; index < frame.stage_count; ++index) {
+              const auto &stage = frame.stages[index];
+              if (stage.status !=
+                  hal::StageExecutionStatus::optional_failed_open) {
+                continue;
+              }
+              const auto slot = slot_for_semantic(stage.semantic);
+              const auto effect_id =
+                  effect_id_for_semantic(stage.semantic);
+              if (slot == OptionalEffectSlot::count ||
+                  effect_id.empty()) {
+                continue;
+              }
+              block_optional_effect(
+                  slot, effect_id, backend_for_semantic(stage.semantic),
+                  OptionalEffectFailureReason(
+                      "Prepared Maxine HAL optional stage failed open",
+                      std::string(
+                          PreparedMaxineHardwareReasonCode(stage.reason))),
+                  capture_sequence);
+            }
+          };
+
       auto execute_maxine_resident_island =
           [&](const PreparedMaxineResidentIsland &island) {
             using studiocast::maxine::ResidentExecutionStatus;
@@ -12669,6 +13029,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       std::size_t maxine_island_index = 0;
       for (std::size_t i = 0; i < frame_plan.size; ++i) {
+        if (prepared_maxine_hardware_live &&
+            maxine_island_index < prepared_maxine_resident_islands.count &&
+            i == prepared_maxine_resident_islands
+                     .islands[maxine_island_index]
+                     .first_frame_stage) {
+          const auto &island =
+              prepared_maxine_resident_islands.islands[maxine_island_index++];
+          if (!prepared_maxine_hardware_suspended)
+            execute_prepared_maxine_resident_island(island);
+          i = island.end_frame_stage - 1;
+          continue;
+        }
         if (maxine_resident_executor &&
             maxine_island_index < prepared_maxine_resident_islands.count &&
             i == prepared_maxine_resident_islands
@@ -13760,14 +14132,27 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     const auto finish_prepared_hardware_frame =
         [&](bool output_write_succeeded) {
-          if (!prepared_hardware_completion_pending)
-            return true;
-          hal::ReasonId reason = hal::ReasonId::none;
-          const hal::StatusId status = prepared_hardware_owner.CommitOutput(
-              prepared_hardware_completion, output_write_succeeded, &reason);
-          prepared_hardware_completion_pending = false;
-          publish_prepared_hardware_status();
-          return output_write_succeeded && status == hal::StatusId::ready;
+          bool committed = output_write_succeeded;
+          if (prepared_hardware_completion_pending) {
+            hal::ReasonId reason = hal::ReasonId::none;
+            const hal::StatusId status =
+                prepared_hardware_owner.CommitOutput(
+                    prepared_hardware_completion, output_write_succeeded,
+                    &reason);
+            prepared_hardware_completion_pending = false;
+            publish_prepared_hardware_status();
+            committed &= status == hal::StatusId::ready;
+          }
+          if (prepared_maxine_completion_pending) {
+            hal::ReasonId reason = hal::ReasonId::none;
+            const hal::StatusId status =
+                prepared_maxine_hardware_owner.CommitOutput(
+                    prepared_maxine_completion, output_write_succeeded,
+                    &reason);
+            prepared_maxine_completion_pending = false;
+            committed &= status == hal::StatusId::ready;
+          }
+          return committed;
         };
 
     // Output pacing: enforce negotiated output FPS when we're ahead of
@@ -13894,7 +14279,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       break;
     }
 
-    if (prepared_hardware_completion_pending) {
+    const bool had_prepared_vulkan_completion =
+        prepared_hardware_completion_pending;
+    const bool had_prepared_maxine_completion =
+        prepared_maxine_completion_pending;
+    if (had_prepared_vulkan_completion ||
+        had_prepared_maxine_completion) {
       if (!finish_prepared_hardware_frame(true)) {
         live_effect_attribution.DiscardFrame();
         std::lock_guard<std::mutex> lock(mu_);
@@ -13903,42 +14293,125 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             "success.";
         break;
       }
-      const auto committed =
-          prepared_hardware_owner.Snapshot().latest_committed_frame;
-      for (std::size_t index = 0; index < committed.stage_count; ++index) {
-        const auto &stage = committed.stages[index];
-        if (stage.status != hal::StageExecutionStatus::succeeded) {
-          if (stage.status ==
-              hal::StageExecutionStatus::optional_failed_open) {
-            const std::string failure =
-                "Prepared Vulkan HAL optional stage failed open [" +
-                std::string(PreparedHardwareReasonCode(stage.reason)) + "].";
-            if (stage.semantic == hal::SemanticEffectId::vignette) {
-              block_optional_effect(
-                  OptionalEffectSlot::vignette,
-                  studiocast::video::effects::contract::kEffectIdVignette,
-                  "open_vulkan", failure, f.sequence);
-            } else if (stage.semantic == hal::SemanticEffectId::mirror) {
-              block_optional_effect(
-                  OptionalEffectSlot::mirror,
-                  studiocast::video::effects::contract::kEffectIdMirror,
-                  "open_vulkan", failure, f.sequence);
+      if (had_prepared_vulkan_completion) {
+        const auto committed =
+            prepared_hardware_owner.Snapshot().latest_committed_frame;
+        for (std::size_t index = 0; index < committed.stage_count; ++index) {
+          const auto &stage = committed.stages[index];
+          if (stage.status != hal::StageExecutionStatus::succeeded) {
+            if (stage.status ==
+                hal::StageExecutionStatus::optional_failed_open) {
+              const std::string failure =
+                  "Prepared Vulkan HAL optional stage failed open [" +
+                  std::string(PreparedHardwareReasonCode(stage.reason)) +
+                  "].";
+              if (stage.semantic == hal::SemanticEffectId::vignette) {
+                block_optional_effect(
+                    OptionalEffectSlot::vignette,
+                    studiocast::video::effects::contract::kEffectIdVignette,
+                    "open_vulkan", failure, f.sequence);
+              } else if (stage.semantic == hal::SemanticEffectId::mirror) {
+                block_optional_effect(
+                    OptionalEffectSlot::mirror,
+                    studiocast::video::effects::contract::kEffectIdMirror,
+                    "open_vulkan", failure, f.sequence);
+              }
             }
+            continue;
           }
-          continue;
+          if (stage.semantic == hal::SemanticEffectId::vignette) {
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::vignette), f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::kEffectIdVignette,
+                "open_vulkan");
+          } else if (stage.semantic == hal::SemanticEffectId::mirror) {
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::mirror), f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::kEffectIdMirror,
+                "open_vulkan");
+          }
         }
-        if (stage.semantic == hal::SemanticEffectId::vignette) {
-          clear_optional_effect_on_success(
-              optional_breaker(OptionalEffectSlot::vignette), f.sequence);
-          mark_live_effect_success(
-              studiocast::video::effects::contract::kEffectIdVignette,
-              "open_vulkan");
-        } else if (stage.semantic == hal::SemanticEffectId::mirror) {
-          clear_optional_effect_on_success(
-              optional_breaker(OptionalEffectSlot::mirror), f.sequence);
-          mark_live_effect_success(
-              studiocast::video::effects::contract::kEffectIdMirror,
-              "open_vulkan");
+      }
+      if (had_prepared_maxine_completion) {
+        const auto maxine_snapshot =
+            prepared_maxine_hardware_owner.Snapshot();
+        const auto &committed =
+            maxine_snapshot.latest_committed_frame;
+        const auto &active_program = maxine_snapshot.active_program;
+        if (!committed.valid ||
+            committed.program_id != active_program.program_id ||
+            committed.invalidation_key !=
+                active_program.invalidation_key ||
+            committed.execution_domain !=
+                active_program.execution_domain) {
+          live_effect_attribution.DiscardFrame();
+          std::lock_guard<std::mutex> lock(mu_);
+          last_error_ =
+              "Prepared Maxine HAL committed attribution is stale.";
+          break;
+        }
+        bool maxine_effect_succeeded = false;
+        for (std::size_t index = 0; index < committed.stage_count; ++index) {
+          const auto &stage = committed.stages[index];
+          if (stage.status != hal::StageExecutionStatus::succeeded)
+            continue;
+          maxine_effect_succeeded = true;
+          switch (stage.semantic) {
+          case hal::SemanticEffectId::virtual_background_blur:
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::virtual_background),
+                f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::
+                    kEffectIdVirtualBackgroundBlur,
+                "maxine");
+            break;
+          case hal::SemanticEffectId::virtual_background_remove:
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::virtual_background),
+                f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::
+                    kEffectIdVirtualBackgroundRemove,
+                "maxine");
+            break;
+          case hal::SemanticEffectId::virtual_background_replace:
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::virtual_background),
+                f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::
+                    kEffectIdVirtualBackgroundReplace,
+                "maxine");
+            break;
+          case hal::SemanticEffectId::virtual_key_light:
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::relight), f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::
+                    kEffectIdVirtualKeyLight,
+                "maxine");
+            break;
+          case hal::SemanticEffectId::vignette:
+            clear_optional_effect_on_success(
+                optional_breaker(OptionalEffectSlot::vignette), f.sequence);
+            mark_live_effect_success(
+                studiocast::video::effects::contract::kEffectIdVignette,
+                "cuda");
+            break;
+          case hal::SemanticEffectId::video_noise_removal:
+          case hal::SemanticEffectId::eye_contact:
+          case hal::SemanticEffectId::auto_frame:
+          case hal::SemanticEffectId::mirror:
+          case hal::SemanticEffectId::invalid:
+            break;
+          }
+        }
+        if (maxine_effect_succeeded) {
+          (void)MarkGpuBackendActiveFrame(maxine_active_this_frame,
+                                          maxine_active_frames);
         }
       }
     }

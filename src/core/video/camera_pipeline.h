@@ -19,6 +19,7 @@
 #include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/prepared_hardware_execution_owner.h"
+#include "core/video/prepared_maxine_hardware_execution_owner.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
