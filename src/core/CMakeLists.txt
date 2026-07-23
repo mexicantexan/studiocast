@@ -175,6 +175,11 @@ set(_studiocast_audio_runtime_sources
         ${PROJECT_SOURCE_DIR}/src/core/audio/virtual_speaker.cpp
         ${PROJECT_SOURCE_DIR}/src/core/audio/virtual_speaker_state.cpp)
 
+set(_studiocast_video_execution_runtime_sources
+        ${PROJECT_SOURCE_DIR}/src/core/video/effects/capability_reason_codes.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/hardware_execution_runtime.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/video_runtime_status.cpp)
+
 set(_studiocast_video_runtime_sources
         # Protected implementation: source ownership only; contents remain unchanged.
         ${PROJECT_SOURCE_DIR}/src/core/video/camera_pipeline.cpp
@@ -201,6 +206,8 @@ add_library(studiocast_open_audio_backend STATIC ${_studiocast_open_audio_backen
 add_library(studiocast_open_video_backend STATIC ${_studiocast_open_video_backend_sources})
 add_library(studiocast_vulkan_backend STATIC ${_studiocast_vulkan_backend_sources})
 add_library(studiocast_audio_runtime STATIC ${_studiocast_audio_runtime_sources})
+add_library(studiocast_video_execution_runtime STATIC
+        ${_studiocast_video_execution_runtime_sources})
 add_library(studiocast_video_runtime STATIC ${_studiocast_video_runtime_sources})
 add_library(studiocast_runtime_config STATIC ${_studiocast_runtime_config_sources})
 
@@ -223,6 +230,7 @@ set(_studiocast_production_targets
         studiocast_open_video_backend
         studiocast_vulkan_backend
         studiocast_audio_runtime
+        studiocast_video_execution_runtime
         studiocast_video_runtime
         studiocast_runtime_config)
 
@@ -296,10 +304,13 @@ target_link_libraries(studiocast_audio_runtime
         studiocast_maxine_backend
         studiocast_open_audio_backend
         PRIVATE studiocast_util)
+target_link_libraries(studiocast_video_execution_runtime
+        PUBLIC studiocast_hal_runtime)
 target_link_libraries(studiocast_video_runtime
         PUBLIC
         studiocast_contracts
         studiocast_cuda_support
+        studiocast_video_execution_runtime
         studiocast_maxine_backend
         studiocast_open_video_backend
         studiocast_video_io
@@ -529,11 +540,14 @@ studiocast_assert_direct_dependencies(studiocast_audio_runtime
         studiocast_audio_support studiocast_config studiocast_contracts
         studiocast_maxine_backend studiocast_open_audio_backend
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
+studiocast_assert_direct_dependencies(studiocast_video_execution_runtime
+        PUBLIC_STUDIOCAST_DEPS studiocast_hal_runtime)
 studiocast_assert_direct_dependencies(studiocast_video_runtime
         PUBLIC_STUDIOCAST_DEPS
         studiocast_contracts studiocast_cuda_support
         studiocast_maxine_backend studiocast_open_video_backend
-        studiocast_video_io studiocast_video_support
+        studiocast_video_execution_runtime studiocast_video_io
+        studiocast_video_support
         studiocast_vulkan_backend
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_runtime_config
@@ -554,7 +568,8 @@ foreach (target IN ITEMS
         studiocast_cuda_support
         studiocast_audio_support
         studiocast_probe_support
-        studiocast_model_support)
+        studiocast_model_support
+        studiocast_video_execution_runtime)
     studiocast_assert_neutral_target(${target})
 endforeach ()
 
@@ -577,9 +592,10 @@ set(_studiocast_expected_sources
         ${_studiocast_video_io_sources}
         ${_studiocast_vulkan_backend_sources}
         ${_studiocast_audio_runtime_sources}
+        ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 115)
+set(_studiocast_expected_source_count 118)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

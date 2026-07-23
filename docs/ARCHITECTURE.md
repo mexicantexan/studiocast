@@ -3,7 +3,7 @@
 - Status: Active architecture contract
 - Applies To: StudioCast v0.2.9 and the current source tree
 - Audience: Contributors and maintainers
-- Last Verified: 2026-07-22
+- Last Verified: 2026-07-23
 
 StudioCast is a daemon-owned Linux audio/video processing application. The Qt
 GUI and command-line clients control `studiocastd`; they do not own production
@@ -28,13 +28,15 @@ runtime composition layers:
 
 ```text
 neutral/support:
-  contracts ---> util       config ---> contracts, util
-  ipc -------> util         cuda_support ---> util
-  probe_support ---> config, util
-  model_support ---> util   audio_support
+  contracts ------> util    hal_contracts
+  hal_runtime ----> hal_contracts
+  config ---------> contracts, util
+  ipc ------------> util    cuda_support ---> util
+  probe_support --> config, util
+  model_support --> util    audio_support
 
 platform:
-  video_support ---> contracts, util
+  video_support ---> contracts, hal_contracts, util
   video_io ------> contracts, video_support, util
   onnx_support --> ONNX Runtime when enabled
 
@@ -49,8 +51,9 @@ backends:
 
 runtime:
   audio_runtime ---> audio_support, config, contracts, Maxine, Open Audio
+  video_execution_runtime ---> hal_runtime
   video_runtime ---> contracts, CUDA, Maxine, Open Video, Vulkan,
-                     video I/O and support
+                     video_execution_runtime, video I/O and support
   runtime_config --> audio_runtime, config, video_runtime
   studiocast_core --> runtime_config, ipc, probe_support
 ```
@@ -61,6 +64,12 @@ Each arrow points from a dependent to its dependency.
   library, OS-release, and XDG helpers.
 - `studiocast_contracts` owns stable audio/video value types, effect schemas,
   reason codes, serialization, and backend-independent execution plans.
+- `studiocast_hal_contracts` owns the versioned primitive, descriptor,
+  resource, execution-domain, prepared-program, completion, telemetry, and
+  committed-frame contracts. `studiocast_hal_runtime` owns the deterministic
+  static registry, resolver, shadow comparison, and execution-domain planner.
+  Both targets are neutral: they contain no optional SDK headers, feature
+  definitions, provider discovery, or backend libraries.
 - `studiocast_config` owns persisted/runtime configuration parsing and
   validation. Runtime service adapters remain in the high-level core.
 - `studiocast_ipc` owns Unix-socket protocol mechanics and has std-only public
@@ -70,8 +79,12 @@ Each arrow points from a dependent to its dependency.
   composition.
 - `studiocast_video_support` owns conversion and CPU effect primitives;
   `studiocast_video_io` owns capture, decoding, v4l2loopback, and writer
-  support; and `studiocast_video_runtime` owns the existing camera pipeline
-  and virtual-camera composition.
+  support; `studiocast_video_execution_runtime` owns the fixed-capacity
+  backend-neutral prepared execution facade and typed capability/live-status
+  snapshots; and `studiocast_video_runtime` owns the existing camera pipeline
+  and virtual-camera composition. During staged migration the latter retains
+  its legacy backend composition dependencies; those edges may be removed only
+  after each live family passes parity and rollback gates.
 - `studiocast_cuda_support` owns the runtime-loaded CUDA driver wrapper,
   buffers, and embedded kernels without a CUDA toolkit dependency. Its
   canonical API is `core/cuda/cuda_driver_api.h` in namespace

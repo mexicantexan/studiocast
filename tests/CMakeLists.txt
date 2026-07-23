@@ -76,6 +76,56 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-hal-resolver-tests
             unit core video gpu)
 
+    add_executable(studiocast-hardware-execution-runtime-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/hardware_execution_runtime_tests.cpp
+    )
+
+    target_link_libraries(studiocast-hardware-execution-runtime-tests PRIVATE
+            studiocast_video_execution_runtime)
+
+    target_include_directories(studiocast-hardware-execution-runtime-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(studiocast-hardware-execution-runtime-tests)
+    studiocast_enable_sanitizers(studiocast-hardware-execution-runtime-tests)
+
+    set_target_properties(studiocast-hardware-execution-runtime-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-hardware-execution-runtime-tests
+            COMMAND studiocast-hardware-execution-runtime-tests)
+    studiocast_set_test_labels(studiocast-hardware-execution-runtime-tests
+            unit core video gpu)
+
+    add_executable(studiocast-video-runtime-status-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
+    )
+
+    target_link_libraries(studiocast-video-runtime-status-tests PRIVATE
+            studiocast_video_execution_runtime)
+
+    target_include_directories(studiocast-video-runtime-status-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(studiocast-video-runtime-status-tests)
+    studiocast_enable_sanitizers(studiocast-video-runtime-status-tests)
+
+    set_target_properties(studiocast-video-runtime-status-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-video-runtime-status-tests
+            COMMAND studiocast-video-runtime-status-tests)
+    studiocast_set_test_labels(studiocast-video-runtime-status-tests
+            unit core video gpu)
+
     add_library(studiocast-maxine-effect-fake-sdk SHARED
             ${PROJECT_SOURCE_DIR}/tests/support/maxine/maxine_effect_runtime_fake_sdk.cpp
     )
