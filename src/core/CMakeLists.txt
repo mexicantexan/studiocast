@@ -102,6 +102,7 @@ set(_studiocast_open_video_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/dlib_face_landmarks.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/fastdvdnet_denoiser.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/gaze_correction_eye_contact.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_hal_adapter.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/matting_session.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/yunet_face_detector.cpp)
 
@@ -275,6 +276,7 @@ target_link_libraries(studiocast_open_video_backend
         PUBLIC
         studiocast_contracts
         studiocast_cuda_support
+        studiocast_hal_contracts
         studiocast_onnx_support
         studiocast_model_support
         studiocast_video_support
@@ -513,7 +515,8 @@ studiocast_assert_direct_dependencies(studiocast_open_audio_backend
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_open_video_backend
         PUBLIC_STUDIOCAST_DEPS
-        studiocast_contracts studiocast_cuda_support studiocast_onnx_support
+        studiocast_contracts studiocast_cuda_support studiocast_hal_contracts
+        studiocast_onnx_support
         studiocast_model_support studiocast_video_support
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_vulkan_backend
@@ -576,7 +579,7 @@ set(_studiocast_expected_sources
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 114)
+set(_studiocast_expected_source_count 115)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
