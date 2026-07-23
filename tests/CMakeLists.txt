@@ -244,6 +244,38 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-maxine-production-resident-tests
             integration gpu maxine video)
 
+    add_executable(studiocast-maxine-production-hal-owner-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_production_hal_owner_tests.cpp
+    )
+    target_link_libraries(studiocast-maxine-production-hal-owner-tests PRIVATE
+            studiocast_maxine_backend
+            studiocast-maxine-effect-fake-sdk
+    )
+    target_include_directories(studiocast-maxine-production-hal-owner-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${PROJECT_SOURCE_DIR}/tests/support/maxine"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+    target_compile_definitions(studiocast-maxine-production-hal-owner-tests PRIVATE
+            STUDIOCAST_FAKE_MAXINE_SDK_PATH="$<TARGET_FILE:studiocast-maxine-effect-fake-sdk>"
+    )
+    studiocast_set_project_warnings(studiocast-maxine-production-hal-owner-tests)
+    studiocast_enable_sanitizers(studiocast-maxine-production-hal-owner-tests)
+    set_target_properties(studiocast-maxine-production-hal-owner-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+    add_dependencies(studiocast-maxine-production-hal-owner-tests
+            studiocast-maxine-effect-fake-cudart)
+    add_test(NAME studiocast-maxine-production-hal-owner-tests
+            COMMAND studiocast-maxine-production-hal-owner-tests)
+    set_tests_properties(studiocast-maxine-production-hal-owner-tests PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:studiocast-maxine-effect-fake-cudart>"
+    )
+    studiocast_set_test_labels(studiocast-maxine-production-hal-owner-tests
+            integration gpu maxine video)
+
     if (STUDIOCAST_BUILD_BENCHMARKS)
         add_executable(studiocast-maxine-production-resident-fake-bench
                 ${PROJECT_SOURCE_DIR}/src/tools/studiocast_maxine_production_resident_fake_bench_main.cpp

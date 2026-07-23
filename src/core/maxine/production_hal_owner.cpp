@@ -214,8 +214,10 @@ bool KnownMinimumMaxineBudget(const ProductionResidentSetup &setup,
     resources += 3;
   }
 
+  if (resources > std::numeric_limits<std::uint32_t>::max())
+    return false;
   budget->persistent_bytes = persistent;
-  budget->resource_count = resources;
+  budget->resource_count = static_cast<std::uint32_t>(resources);
   return persistent != 0 && resources != 0;
 }
 
