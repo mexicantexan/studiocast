@@ -62,6 +62,11 @@ struct ResourceHandle {
   std::uint32_t alignment_bytes = 0;
   bool mutable_resource = false;
   bool aliasable = false;
+  // Adapter-private payload for the underlying host pointer, SDK object,
+  // buffer identifier, or registry key. Neutral consumers must never infer
+  // interoperability from these values; execution_domain and ownership
+  // evidence remain authoritative.
+  std::array<std::uint64_t, 4> adapter_opaque{};
   void *destruction_owner = nullptr;
   ResourceDestroyFn destroy = nullptr;
 };

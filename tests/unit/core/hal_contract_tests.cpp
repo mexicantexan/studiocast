@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <new>
+#include <type_traits>
 
 namespace {
 
@@ -16,6 +17,7 @@ static_assert(static_cast<std::uint32_t>(
 static_assert(static_cast<std::uint32_t>(
                   studiocast::hal::ReasonId::capability_evidence_incomplete) ==
               28);
+static_assert(std::is_standard_layout_v<studiocast::hal::ResourceHandle>);
 
 std::atomic<std::size_t> g_allocations{0};
 std::atomic<bool> g_count_allocations{false};
