@@ -6,12 +6,36 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <new>
 #include <string>
 #include <vector>
+
+namespace {
+std::atomic<std::size_t> g_cpu_primitive_allocations{0};
+std::atomic<bool> g_count_cpu_primitive_allocations{false};
+} // namespace
+
+void *operator new(std::size_t size) {
+  if (g_count_cpu_primitive_allocations.load(std::memory_order_relaxed))
+    g_cpu_primitive_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void *memory = std::malloc(size))
+    return memory;
+  throw std::bad_alloc();
+}
+
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 
 namespace studiocast::tests {
 namespace {
@@ -539,7 +563,185 @@ bool TestRgb24ToYuyvBackendsMatchScalarReference() {
   return true;
 }
 
+bool TestCpuPrimitiveTableContractAndConversionSafety() {
+  using hal::BackendId;
+  using hal::PrimitiveOperationId;
+  using hal::SemanticEffectProviderId;
+  using video::CpuPrimitiveResult;
+
+  const video::CpuPrimitiveTable &first = video::GetCpuPrimitiveTable();
+  const video::CpuPrimitiveTable &second = video::GetCpuPrimitiveTable();
+  const std::uint64_t expected_capabilities =
+      video::CpuPrimitiveCapabilityBit(
+          PrimitiveOperationId::convert_pixel_format) |
+      video::CpuPrimitiveCapabilityBit(PrimitiveOperationId::resize) |
+      video::CpuPrimitiveCapabilityBit(PrimitiveOperationId::mirror);
+  if (&first != &second ||
+      first.table_version != video::kCpuPrimitiveTableVersion ||
+      first.struct_size != sizeof(video::CpuPrimitiveTable) ||
+      first.backend != BackendId::cpu ||
+      first.semantic_effect_provider != SemanticEffectProviderId::invalid ||
+      first.capability_bits != expected_capabilities ||
+      !video::CpuPrimitiveTableSupports(
+          first, PrimitiveOperationId::convert_pixel_format) ||
+      !video::CpuPrimitiveTableSupports(first, PrimitiveOperationId::resize) ||
+      !video::CpuPrimitiveTableSupports(first, PrimitiveOperationId::mirror) ||
+      video::CpuPrimitiveTableSupports(first, PrimitiveOperationId::box_blur) ||
+      video::CpuPrimitiveTableSupports(first,
+                                       PrimitiveOperationId::composite) ||
+      !first.yuyv_to_rgb24 || !first.rgb24_to_yuyv_scratch_bytes ||
+      !first.rgb24_to_yuyv || !first.rgb24_bgr24 ||
+      !first.mirror_rgb24_in_place ||
+      !first.resize_rgb24_bilinear_plan_scratch_bytes ||
+      !first.prepare_resize_rgb24_bilinear ||
+      !first.apply_resize_rgb24_bilinear ||
+      !first.yuyv_to_rgb24_implementation ||
+      !first.rgb24_to_yuyv_implementation ||
+      !first.rgb24_bgr24_implementation || !first.mirror_rgb24_implementation ||
+      !first.resize_rgb24_bilinear_implementation) {
+    std::cerr << "CPU primitive table metadata, pointer stability, or "
+                 "primitive-only capability contract failed\n";
+    return false;
+  }
+
+  constexpr int width = 7;
+  constexpr int height = 3;
+  constexpr std::size_t rgb_stride = ActiveRgbBytes(width) + 5u;
+  constexpr std::size_t yuyv_stride = ActiveYuyvBytes(width) + 7u;
+  std::vector<std::uint8_t> rgb(rgb_stride * height, 0xa5u);
+  FillDeterministicRgb(&rgb, width, height, rgb_stride, 0x71ab39e2u);
+  std::vector<std::uint8_t> expected_yuyv(yuyv_stride * height, 0xcdu);
+  video::internal::Rgb24ToYuyvScalar(rgb.data(), width, height, rgb_stride,
+                                     expected_yuyv.data(), yuyv_stride);
+
+  const std::size_t scratch_size =
+      first.rgb24_to_yuyv_scratch_bytes(width, height);
+  if (scratch_size != video::Rgb24ToYuyvScratchBytes(width, height)) {
+    std::cerr << "CPU primitive RGB->YUYV scratch query diverged from "
+                 "compatibility API\n";
+    return false;
+  }
+  std::vector<std::uint8_t> scratch(scratch_size);
+  std::vector<std::uint8_t> actual_yuyv(yuyv_stride * height, 0xcdu);
+  if (first.rgb24_to_yuyv(rgb.data(), width, height, rgb_stride,
+                          actual_yuyv.data(), yuyv_stride,
+                          scratch.empty() ? nullptr : scratch.data(),
+                          scratch.size()) != CpuPrimitiveResult::success) {
+    std::cerr << "CPU primitive RGB->YUYV rejected sized setup scratch\n";
+    return false;
+  }
+  const int chroma_tolerance =
+      video::internal::Rgb24ToYuyvSelectedBackend() ==
+              video::internal::Rgb24ToYuyvBackend::libyuv
+          ? 1
+          : 0;
+  if (!CompareYuyvToReference(actual_yuyv, expected_yuyv, width, height,
+                              yuyv_stride, chroma_tolerance,
+                              "CPU primitive table")) {
+    return false;
+  }
+
+  std::vector<std::uint8_t> actual_rgb(rgb_stride * height, 0xcdu);
+  if (first.yuyv_to_rgb24(actual_yuyv.data(), width, height, yuyv_stride,
+                          actual_rgb.data(),
+                          rgb_stride) != CpuPrimitiveResult::success) {
+    std::cerr << "CPU primitive YUYV->RGB rejected valid buffers\n";
+    return false;
+  }
+
+  std::array<std::uint8_t, 128> overlap{};
+  if (first.yuyv_to_rgb24(overlap.data(), 2, 1, 4, overlap.data() + 1, 6) !=
+          CpuPrimitiveResult::invalid_argument ||
+      first.rgb24_to_yuyv(overlap.data(), 2, 1, 6, overlap.data() + 1, 4,
+                          nullptr, 0) != CpuPrimitiveResult::invalid_argument ||
+      first.yuyv_to_rgb24(
+          overlap.data(), 1, 2, std::numeric_limits<std::size_t>::max(),
+          overlap.data() + 32, 3) != CpuPrimitiveResult::invalid_argument ||
+      first.rgb24_to_yuyv(nullptr, 2, 1, 6, overlap.data(), 4, nullptr, 0) !=
+          CpuPrimitiveResult::invalid_argument) {
+    std::cerr << "CPU primitive conversion malformed/overlap/span checks "
+                 "failed\n";
+    return false;
+  }
+
+  if (scratch_size != 0) {
+    std::fill(actual_yuyv.begin(), actual_yuyv.end(), 0xcdu);
+    std::vector<std::uint8_t> overlapping_scratch(
+        std::max(scratch_size, rgb_stride * height), 0xa5u);
+    if (first.rgb24_to_yuyv(rgb.data(), width, height, rgb_stride,
+                            actual_yuyv.data(), yuyv_stride, scratch.data(),
+                            scratch.size() - 1u) !=
+            CpuPrimitiveResult::insufficient_scratch ||
+        first.rgb24_to_yuyv(overlapping_scratch.data(), width, height,
+                            rgb_stride, actual_yuyv.data(), yuyv_stride,
+                            overlapping_scratch.data(), scratch_size) !=
+            CpuPrimitiveResult::invalid_argument ||
+        actual_yuyv != std::vector<std::uint8_t>(yuyv_stride * height, 0xcdu)) {
+      std::cerr << "CPU primitive RGB->YUYV did not fail closed for "
+                   "undersized setup scratch\n";
+      return false;
+    }
+  }
+
+  std::array<std::uint8_t, 8> rgb_bgr{{1, 2, 3, 4, 5, 6, 0xa5, 0xa5}};
+  if (first.rgb24_bgr24(rgb_bgr.data(), rgb_bgr.data(), 2, 1, 8, 8) !=
+          CpuPrimitiveResult::success ||
+      rgb_bgr != std::array<std::uint8_t, 8>{{3, 2, 1, 6, 5, 4, 0xa5, 0xa5}} ||
+      first.rgb24_bgr24(overlap.data(), overlap.data() + 1, 2, 1, 6, 6) !=
+          CpuPrimitiveResult::invalid_argument) {
+    std::cerr << "CPU primitive RGB/BGR exact-alias or partial-overlap "
+                 "contract failed\n";
+    return false;
+  }
+
+  std::array<std::uint8_t, 8> mirror{{1, 2, 3, 4, 5, 6, 0xa5, 0xa5}};
+  if (first.mirror_rgb24_in_place(mirror.data(), 2, 1, 8) !=
+          CpuPrimitiveResult::success ||
+      mirror != std::array<std::uint8_t, 8>{{4, 5, 6, 1, 2, 3, 0xa5, 0xa5}} ||
+      first.mirror_rgb24_in_place(mirror.data(), 1, 2,
+                                  std::numeric_limits<std::size_t>::max()) !=
+          CpuPrimitiveResult::invalid_argument) {
+    std::cerr << "CPU primitive mirror parity or span validation failed\n";
+    return false;
+  }
+
+  g_cpu_primitive_allocations.store(0, std::memory_order_relaxed);
+  g_count_cpu_primitive_allocations.store(true, std::memory_order_relaxed);
+  bool steady_state_ok = true;
+  for (int iteration = 0; iteration < 64; ++iteration) {
+    steady_state_ok =
+        first.rgb24_to_yuyv(rgb.data(), width, height, rgb_stride,
+                            actual_yuyv.data(), yuyv_stride,
+                            scratch.empty() ? nullptr : scratch.data(),
+                            scratch.size()) == CpuPrimitiveResult::success &&
+        first.yuyv_to_rgb24(actual_yuyv.data(), width, height, yuyv_stride,
+                            actual_rgb.data(),
+                            rgb_stride) == CpuPrimitiveResult::success &&
+        first.rgb24_bgr24(rgb_bgr.data(), rgb_bgr.data(), 2, 1, 8, 8) ==
+            CpuPrimitiveResult::success &&
+        first.rgb24_bgr24(rgb_bgr.data(), rgb_bgr.data(), 2, 1, 8, 8) ==
+            CpuPrimitiveResult::success &&
+        first.mirror_rgb24_in_place(mirror.data(), 2, 1, 8) ==
+            CpuPrimitiveResult::success &&
+        first.mirror_rgb24_in_place(mirror.data(), 2, 1, 8) ==
+            CpuPrimitiveResult::success &&
+        steady_state_ok;
+  }
+  g_count_cpu_primitive_allocations.store(false, std::memory_order_relaxed);
+  if (!steady_state_ok ||
+      g_cpu_primitive_allocations.load(std::memory_order_relaxed) != 0) {
+    std::cerr << "CPU primitive conversion/mirror invocation allocated or "
+                 "failed during reuse\n";
+    return false;
+  }
+
+  return true;
+}
+
 bool TestRgb24ToYuyvPublicPathMatchesScalarWithScratchVariants() {
+  if (!TestCpuPrimitiveTableContractAndConversionSafety())
+    return false;
+
   constexpr int width = 31;
   constexpr int height = 9;
   constexpr std::size_t src_stride = width * 3 + 7;
@@ -841,6 +1043,84 @@ bool TestResizeRgb24BilinearPreservesActivePixelsAndZerosPadding() {
       std::cerr << "Rgb24BilinearResizePlan mismatch at byte " << i << "\n";
       return false;
     }
+  }
+
+  using video::CpuPrimitiveResult;
+  const video::CpuPrimitiveTable &primitives = video::GetCpuPrimitiveTable();
+  const std::size_t plan_scratch_size =
+      primitives.resize_rgb24_bilinear_plan_scratch_bytes(
+          src_width, src_height, dst_width, dst_height);
+  if (plan_scratch_size == 0 ||
+      primitives.resize_rgb24_bilinear_plan_scratch_bytes(
+          0, src_height, dst_width, dst_height) != 0) {
+    std::cerr << "CPU primitive resize scratch sizing contract failed\n";
+    return false;
+  }
+  std::vector<std::uint8_t> plan_scratch(plan_scratch_size);
+  video::CpuRgb24BilinearResizePlan primitive_plan;
+  if (primitives.prepare_resize_rgb24_bilinear(
+          src_width, src_height, dst_width, dst_height, plan_scratch.data(),
+          plan_scratch.size() - 1u,
+          &primitive_plan) != CpuPrimitiveResult::insufficient_scratch ||
+      primitive_plan.table_version != 0 ||
+      primitives.prepare_resize_rgb24_bilinear(
+          src_width, src_height, dst_width, dst_height, plan_scratch.data(),
+          plan_scratch.size(),
+          &primitive_plan) != CpuPrimitiveResult::success) {
+    std::cerr << "CPU primitive resize setup did not enforce caller scratch\n";
+    return false;
+  }
+
+  const void *const initial_x_samples = primitive_plan.x_samples;
+  const void *const initial_y_samples = primitive_plan.y_samples;
+  std::fill(actual.begin(), actual.end(), 0xeeu);
+  const auto *const initial_output = actual.data();
+  if (primitives.apply_resize_rgb24_bilinear(
+          &primitive_plan, src.data(), src_stride, actual.data(), dst_stride) !=
+          CpuPrimitiveResult::success ||
+      actual != expected) {
+    std::cerr << "CPU primitive prepared resize diverged from legacy parity\n";
+    return false;
+  }
+
+  video::CpuRgb24BilinearResizePlan malformed_plan = primitive_plan;
+  malformed_plan.validation_tag ^= 1u;
+  if (primitives.apply_resize_rgb24_bilinear(
+          &malformed_plan, src.data(), src_stride, actual.data(), dst_stride) !=
+          CpuPrimitiveResult::unprepared_plan ||
+      primitives.apply_resize_rgb24_bilinear(
+          &primitive_plan, actual.data(), src_stride, actual.data(),
+          dst_stride) != CpuPrimitiveResult::invalid_argument ||
+      primitives.apply_resize_rgb24_bilinear(
+          &primitive_plan, plan_scratch.data(), src_stride, actual.data(),
+          dst_stride) != CpuPrimitiveResult::invalid_argument ||
+      primitives.apply_resize_rgb24_bilinear(
+          &primitive_plan, src.data(), std::numeric_limits<std::size_t>::max(),
+          actual.data(), dst_stride) != CpuPrimitiveResult::invalid_argument) {
+    std::cerr << "CPU primitive resize malformed, alias, or span checks "
+                 "failed\n";
+    return false;
+  }
+
+  g_cpu_primitive_allocations.store(0, std::memory_order_relaxed);
+  g_count_cpu_primitive_allocations.store(true, std::memory_order_relaxed);
+  bool steady_state_ok = true;
+  for (int iteration = 0; iteration < 128; ++iteration) {
+    steady_state_ok =
+        primitives.apply_resize_rgb24_bilinear(
+            &primitive_plan, src.data(), src_stride, actual.data(),
+            dst_stride) == CpuPrimitiveResult::success &&
+        steady_state_ok;
+  }
+  g_count_cpu_primitive_allocations.store(false, std::memory_order_relaxed);
+  if (!steady_state_ok ||
+      g_cpu_primitive_allocations.load(std::memory_order_relaxed) != 0 ||
+      actual.data() != initial_output || actual != expected ||
+      primitive_plan.x_samples != initial_x_samples ||
+      primitive_plan.y_samples != initial_y_samples) {
+    std::cerr << "CPU primitive prepared resize allocated or failed resource "
+                 "reuse\n";
+    return false;
   }
 
   return true;
