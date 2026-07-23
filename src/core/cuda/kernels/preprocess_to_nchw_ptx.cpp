@@ -1,6 +1,7 @@
 #include "core/cuda/kernels/preprocess_to_nchw.h"
 
 #include "core/cuda/kernels/cuda_driver_cache.h"
+#include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
 #include "core/cuda/kernels/ptx_pitch_contract.h"
 
 #include <cstdint>
@@ -298,18 +299,29 @@ KernelState &kernel() {
 }
 
 bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
-                bool require_exact_identity, std::string *error_out) {
+                bool require_exact_identity, std::string *error_out,
+                PreparedPreprocessKernelHandles *handles_out = nullptr,
+                PreparedPreprocessKernelStatus *status_out = nullptr) {
   if (error_out)
     error_out->clear();
+  if (handles_out)
+    *handles_out = {};
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::invalid;
   studiocast::cuda::CUcontext cur = nullptr;
-  if (!detail::GetCurrentContext(cuda, &cur, error_out))
+  if (!detail::GetCurrentContext(cuda, &cur, error_out)) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
     return false;
+  }
 
   KernelState &k = kernel();
   const auto &f = cuda->f();
 
   const auto *identity = cuda ? cuda->context_identity() : nullptr;
   if (require_exact_identity && (!identity || !identity->Valid())) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
     if (error_out)
       *error_out = "PreparePreprocessKernel: CUDA context identity unavailable.";
     return false;
@@ -318,6 +330,13 @@ bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
   if (k.loaded && k.loaded_ctx == cur && k.owner == cuda &&
       (!require_exact_identity ||
        (identity && k.context_identity == *identity))) {
+    if (handles_out) {
+      handles_out->context = k.loaded_ctx;
+      handles_out->module = k.module;
+      handles_out->function = k.fn;
+    }
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::ready;
     return true;
   }
 
@@ -354,6 +373,8 @@ bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
     st = f.cuModuleLoadData(&module, kPreprocessPtx);
   }
   if (st != studiocast::cuda::CUDA_SUCCESS) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::module_load_failed;
     if (error_out) {
       *error_out = "cuModuleLoadData(preprocess_to_nchw_f32) failed: " +
                    cuda->StatusToString(st);
@@ -364,6 +385,9 @@ bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
   }
   st = f.cuModuleGetFunction(&fn, module, "preprocess_to_nchw_f32");
   if (st != studiocast::cuda::CUDA_SUCCESS) {
+    if (status_out)
+      *status_out =
+          PreparedPreprocessKernelStatus::function_resolution_failed;
     if (error_out)
       *error_out = "cuModuleGetFunction(preprocess_to_nchw_f32) failed: " +
                    cuda->StatusToString(st);
@@ -376,6 +400,13 @@ bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
   k.owner = cuda;
   k.context_identity = identity ? *identity
                                 : studiocast::cuda::CudaContextIdentity{};
+  if (handles_out) {
+    handles_out->context = k.loaded_ctx;
+    handles_out->module = k.module;
+    handles_out->function = k.fn;
+  }
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::ready;
   return true;
 }
 
@@ -414,6 +445,57 @@ bool PreparePreprocessKernel(studiocast::cuda::CudaDriverApi *cuda,
   if (!cuda->EnsureContext(error_out))
     return false;
   return LoadKernel(cuda, /*require_exact_identity=*/true, error_out);
+}
+
+bool PreparePreprocessKernelHandles(
+    CudaDriverApi *driver, const CudaContextIdentity &expected_context,
+    PreparedPreprocessKernelHandles *out,
+    PreparedPreprocessKernelStatus *status_out, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (out)
+    *out = {};
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::invalid;
+  if (!driver || !driver->IsInitialized() || !expected_context.Valid() ||
+      !out) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::invalid_argument;
+    if (error_out)
+      *error_out = "Prepared preprocess kernel setup binding is invalid.";
+    return false;
+  }
+  if (!driver->EnsureContext(error_out)) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
+    return false;
+  }
+
+  const auto *current = driver->context_identity();
+  if (!current || !current->Valid()) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
+    if (error_out)
+      *error_out = "Prepared preprocess context identity is unavailable.";
+    return false;
+  }
+  if (current->physical_device != expected_context.physical_device ||
+      current->retained_context_id != expected_context.retained_context_id) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::foreign_context;
+    if (error_out)
+      *error_out = "Prepared preprocess setup context is foreign.";
+    return false;
+  }
+  if (current->logical_generation != expected_context.logical_generation) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::stale_context_generation;
+    if (error_out)
+      *error_out = "Prepared preprocess setup context generation is stale.";
+    return false;
+  }
+  return LoadKernel(driver, /*require_exact_identity=*/true, error_out, out,
+                    status_out);
 }
 
 namespace {
