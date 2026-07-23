@@ -46,6 +46,17 @@ struct SemanticCapabilityEvidence {
   bool supports_tracked_vignette_center = false;
 };
 
+// Shared by setup-time resolution and typed status projection. Keeping this
+// predicate in the contract prevents daemon/installer consumers from
+// reinterpreting partial capability evidence as selectable production support.
+[[nodiscard]] constexpr bool IsSelectableSemanticCapability(
+    const SemanticCapabilityEvidence &capability) noexcept {
+  return capability.live_stage && capability.production_eligible &&
+         capability.exact_evidence &&
+         (capability.status == StatusId::ready ||
+          capability.status == StatusId::degraded);
+}
+
 struct AdapterRegistration {
   std::uint64_t adapter_instance_id = 0;
   BackendId backend = BackendId::invalid;

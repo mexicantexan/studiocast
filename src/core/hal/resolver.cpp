@@ -19,13 +19,6 @@ struct CandidateSearch {
   bool requested_backend_evidence_exists = false;
 };
 
-bool IsSelectable(const SemanticCapabilityEvidence &capability) noexcept {
-  return capability.live_stage && capability.production_eligible &&
-         capability.exact_evidence &&
-         (capability.status == StatusId::ready ||
-          capability.status == StatusId::degraded);
-}
-
 bool ComputeFamilyAllows(ComputeFamilyAllowance allowance,
                          BackendId backend) noexcept {
   switch (allowance) {
@@ -166,7 +159,8 @@ FindCandidate(const StaticAdapterRegistry &registry,
           capability.supports_tracked_vignette_center;
       if (request.mode == BackendRequestMode::explicit_backend &&
           registration->backend == request.backend &&
-          (!IsSelectable(capability) || !configuration_supported) &&
+          (!IsSelectableSemanticCapability(capability) ||
+           !configuration_supported) &&
           (registration->selection_priority < requested_unavailable_priority ||
            (registration->selection_priority ==
                 requested_unavailable_priority &&
@@ -183,7 +177,8 @@ FindCandidate(const StaticAdapterRegistry &registry,
                                 registration->backend)) {
         continue;
       }
-      if (IsSelectable(capability) && configuration_supported) {
+      if (IsSelectableSemanticCapability(capability) &&
+          configuration_supported) {
         const Candidate candidate{registration, &capability};
         if (BetterCandidate(candidate, search.selected, request, preferences))
           search.selected = candidate;

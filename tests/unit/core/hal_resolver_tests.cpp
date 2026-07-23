@@ -142,6 +142,27 @@ bool Register(StaticAdapterRegistry *registry,
                  "valid registration was rejected");
 }
 
+bool TestSharedCapabilitySelectabilityPredicate() {
+  auto capability =
+      Capability(SemanticEffectId::mirror,
+                 SemanticEffectProviderId::open_vulkan_production_kernels);
+  bool ok = Require(IsSelectableSemanticCapability(capability),
+                    "complete production evidence was not selectable");
+  capability.exact_evidence = false;
+  ok &= Require(!IsSelectableSemanticCapability(capability),
+                "partial evidence was exposed as selectable");
+  capability.exact_evidence = true;
+  capability.live_stage = false;
+  ok &= Require(!IsSelectableSemanticCapability(capability),
+                "diagnostic-only capability was exposed as selectable");
+  capability.live_stage = true;
+  capability.status = StatusId::blocked;
+  capability.reason = ReasonId::semantic_effect_unsupported;
+  ok &= Require(!IsSelectableSemanticCapability(capability),
+                "blocked capability was exposed as selectable");
+  return ok;
+}
+
 CanonicalStageIntent Stage(std::uint32_t id, SemanticEffectId semantic,
                            bool required = true) {
   CanonicalStageIntent stage;
@@ -831,6 +852,7 @@ void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
 
 int main() {
   bool ok = true;
+  ok &= TestSharedCapabilitySelectabilityPredicate();
   ok &= TestPrimitiveAndSemanticEvidenceRemainSeparate();
   ok &= TestDeterministicPrecedenceAndStrictSelection();
   ok &= TestExplicitSemanticCpuProviderDoesNotLeakIntoStrictGpuSelection();
