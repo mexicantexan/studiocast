@@ -175,6 +175,22 @@ bool ResourceFitsBoundaryBudget(const ResourceHandle &resource,
          resource.size_bytes <= budget.persistent_bytes;
 }
 
+bool ResourceCoversImage(const ResourceHandle &resource,
+                         const ImageDescriptor &descriptor) noexcept {
+  std::uint64_t required_bytes = 0;
+  for (std::size_t index = 0; index < descriptor.plane_count; ++index) {
+    const auto &plane = descriptor.planes[index];
+    if (plane.offset_bytes >
+        std::numeric_limits<std::uint64_t>::max() - plane.size_bytes) {
+      return false;
+    }
+    required_bytes =
+        std::max(required_bytes, plane.offset_bytes + plane.size_bytes);
+  }
+  return required_bytes != 0 && resource.size_bytes >= required_bytes &&
+         resource.alignment_bytes >= descriptor.base_alignment_bytes;
+}
+
 bool SameResource(const ResourceHandle &lhs,
                   const ResourceHandle &rhs) noexcept {
   return lhs.resource_id == rhs.resource_id &&
@@ -199,6 +215,87 @@ bool MonotonicDelta(std::uint64_t before, std::uint64_t after,
     return false;
   if (delta)
     *delta = after - before;
+  return true;
+}
+
+bool SameTelemetry(const ExecutorTelemetrySnapshot &lhs,
+                   const ExecutorTelemetrySnapshot &rhs) noexcept {
+  return lhs.allocation_requests == rhs.allocation_requests &&
+         lhs.provider_probes == rhs.provider_probes &&
+         lhs.model_scans == rhs.model_scans &&
+         lhs.manifest_parses == rhs.manifest_parses &&
+         lhs.session_constructions == rhs.session_constructions &&
+         lhs.json_serializations == rhs.json_serializations &&
+         lhs.uploads == rhs.uploads &&
+         lhs.final_readbacks == rhs.final_readbacks &&
+         lhs.intermediate_readbacks == rhs.intermediate_readbacks &&
+         lhs.intermediate_uploads == rhs.intermediate_uploads &&
+         lhs.synchronizations == rhs.synchronizations &&
+         lhs.cpu_tail_boundaries == rhs.cpu_tail_boundaries &&
+         lhs.shared_analysis_runs == rhs.shared_analysis_runs;
+}
+
+std::uint32_t StageMask(std::size_t stage_count) noexcept {
+  return stage_count >= 32 ? std::numeric_limits<std::uint32_t>::max()
+                           : ((std::uint32_t{1} << stage_count) - 1u);
+}
+
+bool AnyStageRan(const ExecuteResult &result) noexcept {
+  for (std::size_t index = 0;
+       index < result.stage_count && index < result.stages.size(); ++index) {
+    const auto status = result.stages[index].status;
+    if (status != StageExecutionStatus::not_run &&
+        status != StageExecutionStatus::disabled_preserved) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ReasonId ResourceFailureReason(const ResourceHandle &resource,
+                               const PreparedProgram &program) noexcept {
+  if (resource.execution_domain != program.execution_domain)
+    return ReasonId::wrong_execution_domain;
+  if (resource.lifetime_generation !=
+      program.execution_domain.logical_context_generation) {
+    return ReasonId::wrong_generation;
+  }
+  return ReasonId::invalid_resource;
+}
+
+bool ExactCompletion(const CompletionToken &actual,
+                     const CompletionToken &expected) noexcept {
+  return actual.token_id == expected.token_id &&
+         actual.program_id == expected.program_id &&
+         actual.adapter_instance_id == expected.adapter_instance_id &&
+         actual.capture_sequence == expected.capture_sequence &&
+         actual.complete == expected.complete;
+}
+
+bool SameHostPlane(const HostPlaneBinding &lhs,
+                   const HostPlaneBinding &rhs) noexcept {
+  return lhs.read_data == rhs.read_data && lhs.write_data == rhs.write_data &&
+         lhs.span_bytes == rhs.span_bytes &&
+         lhs.row_stride_bytes == rhs.row_stride_bytes;
+}
+
+bool OneHostResourceAllowed(const HostFrameBinding &binding) noexcept {
+  if (!binding.input_descriptor.in_place_permitted ||
+      !binding.output_descriptor.in_place_permitted ||
+      binding.input_descriptor.aliasing == AliasingPermission::forbidden ||
+      binding.output_descriptor.aliasing == AliasingPermission::forbidden ||
+      binding.input_plane_count != binding.output_plane_count) {
+    return false;
+  }
+  for (std::size_t index = 0; index < binding.input_plane_count; ++index) {
+    const auto &input = binding.input_planes[index];
+    const auto &output = binding.output_planes[index];
+    if (input.read_data != output.write_data ||
+        input.span_bytes != output.span_bytes ||
+        input.row_stride_bytes != output.row_stride_bytes) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -282,8 +379,8 @@ bool ValidateTelemetry(const ExecutorTelemetrySnapshot &before,
                        const ExecutorTelemetrySnapshot &after,
                        const ExecuteResult &result,
                        std::size_t declared_cpu_tails,
-                       std::uint32_t expected_synchronizations,
-                       bool completed) noexcept {
+                       std::uint32_t expected_synchronizations, bool completed,
+                       bool analysis_ran) noexcept {
   std::uint64_t allocation_delta = 0;
   std::uint64_t probe_delta = 0;
   std::uint64_t scan_delta = 0;
@@ -324,7 +421,7 @@ bool ValidateTelemetry(const ExecutorTelemetrySnapshot &before,
                      &analyses);
   if (!monotonic || allocation_delta != 0 || probe_delta != 0 ||
       scan_delta != 0 || parse_delta != 0 || session_delta != 0 ||
-      json_delta != 0 || analyses != (completed ? 1u : 0u)) {
+      json_delta != 0 || analyses != (analysis_ran ? 1u : 0u)) {
     return false;
   }
   return uploads == result.transfers.uploads &&
@@ -462,10 +559,7 @@ StatusId ResidentAdapter::Prepare(const PreparedProgram &program,
   readiness->execution_domain = program.execution_domain;
   readiness->available = true;
   readiness->degraded = readiness->status == StatusId::degraded;
-  readiness->ready_stage_mask =
-      program.stage_count >= 32
-          ? std::numeric_limits<std::uint32_t>::max()
-          : ((std::uint32_t{1} << program.stage_count) - 1u);
+  readiness->ready_stage_mask = StageMask(program.stage_count);
   SetReason(reason, readiness->reason);
   return readiness->status;
 }
@@ -483,6 +577,15 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
     return Failed(StatusId::stale, ReasonId::reconfiguration_required);
   if (request.execution_domain != slot->program.execution_domain)
     return Failed(StatusId::blocked, ReasonId::wrong_execution_domain);
+  const std::uint32_t valid_stage_mask = StageMask(slot->program.stage_count);
+  if ((request.disabled_stage_mask & ~valid_stage_mask) != 0)
+    return Failed(StatusId::blocked, ReasonId::malformed_contract);
+  for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
+    if ((request.disabled_stage_mask & (std::uint32_t{1} << index)) != 0 &&
+        slot->program.stages[index].required) {
+      return Failed(StatusId::failed, ReasonId::required_stage_failed);
+    }
+  }
   if (!ValidateResourceHandle(
           request.input, slot->program.execution_domain,
           slot->program.execution_domain.logical_context_generation,
@@ -490,14 +593,16 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
       !ResourceFitsBoundaryBudget(request.input, slot->program,
                                   slot->executor_handle.reserved_budget,
                                   true)) {
-    const ReasonId resource_reason =
-        request.input.execution_domain != slot->program.execution_domain
-            ? ReasonId::wrong_execution_domain
-            : (request.input.lifetime_generation !=
-                       slot->program.execution_domain.logical_context_generation
-                   ? ReasonId::wrong_generation
-                   : ReasonId::invalid_resource);
-    return Failed(StatusId::blocked, resource_reason);
+    return Failed(StatusId::blocked,
+                  ResourceFailureReason(request.input, slot->program));
+  }
+  if (slot->host_binding_active &&
+      (slot->host_execution_completed ||
+       request.capture_sequence != slot->host_binding.capture_sequence ||
+       !SameResource(request.input, slot->host_tokens.input))) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
+    return Failed(StatusId::blocked, ReasonId::host_frame_binding_invalid);
   }
 
   const ExecutorTelemetrySnapshot before = executor_->Telemetry();
@@ -507,20 +612,75 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
                          result.status == StatusId::degraded;
 
   if (!ValidateTelemetry(before, after, result, slot->program.cpu_tail_count,
-                         slot->completion_synchronizations_per_frame,
-                         completed)) {
+                         slot->completion_synchronizations_per_frame, completed,
+                         AnyStageRan(result))) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::synchronization_failed);
   }
-  if (result.status != StatusId::executed &&
-      result.status != StatusId::degraded) {
+  if (result.transfers.intermediate_readbacks != 0 ||
+      result.transfers.intermediate_uploads != 0 ||
+      result.transfers.uploads > (slot->program.requires_upload ? 1u : 0u) ||
+      result.transfers.final_readbacks >
+          (slot->program.requires_final_readback ? 1u : 0u) ||
+      result.transfers.synchronizations >
+          slot->completion_synchronizations_per_frame ||
+      result.transfers.cpu_tail_boundaries > slot->program.cpu_tail_count) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
+    return Failed(StatusId::failed, ReasonId::synchronization_failed);
+  }
+
+  if (result.stage_count > slot->program.stage_count) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
+    return Failed(StatusId::failed, ReasonId::malformed_contract);
+  }
+  for (std::size_t index = 0; index < result.stage_count; ++index) {
+    const auto &expected = slot->program.stages[index];
+    const auto &actual = result.stages[index];
+    const bool disabled =
+        (request.disabled_stage_mask & (std::uint32_t{1} << index)) != 0;
+    if (actual.stage_id != expected.stage_id ||
+        actual.semantic != expected.semantic ||
+        actual.primitive != expected.primitive ||
+        (completed && actual.status == StageExecutionStatus::not_run) ||
+        (disabled &&
+         (actual.status != StageExecutionStatus::disabled_preserved ||
+          actual.reason != ReasonId::circuit_breaker_open ||
+          !actual.valid_output_preserved || actual.elapsed_ns != 0)) ||
+        (!disabled &&
+         actual.status == StageExecutionStatus::disabled_preserved) ||
+        (actual.status == StageExecutionStatus::optional_failed_open &&
+         (expected.required || !actual.valid_output_preserved)) ||
+        (actual.status == StageExecutionStatus::required_failed &&
+         !expected.required)) {
+      slot->host_binding_active = false;
+      slot->host_execution_completed = false;
+      return Failed(StatusId::failed, ReasonId::required_stage_failed);
+    }
+  }
+
+  if (!completed) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
     if (result.reason == ReasonId::device_lost) {
       slot->quarantined = true;
       result.status = StatusId::quarantined;
     }
     return result;
   }
-  if (result.stage_count != slot->program.stage_count || !result.output_valid ||
-      !SameResource(result.output, slot->executor_handle.prepared_output)) {
+  if (result.stage_count != slot->program.stage_count || !result.output_valid) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
+    return Failed(StatusId::failed, ReasonId::invalid_resource);
+  }
+  const ResourceHandle &expected_output =
+      slot->host_binding_active ? slot->host_tokens.output
+                                : slot->executor_handle.prepared_output;
+  if (!SameResource(result.output, expected_output)) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::invalid_resource);
   }
   if ((slot->program.requires_upload && result.transfers.uploads != 1) ||
@@ -533,20 +693,9 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
       result.transfers.intermediate_uploads != 0 ||
       (slot->requires_explicit_provider_sync &&
        result.transfers.synchronizations == 0)) {
+    slot->host_binding_active = false;
+    slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::synchronization_failed);
-  }
-
-  for (std::size_t index = 0; index < result.stage_count; ++index) {
-    const auto &expected = slot->program.stages[index];
-    const auto &actual = result.stages[index];
-    if (actual.stage_id != expected.stage_id ||
-        actual.semantic != expected.semantic ||
-        actual.status == StageExecutionStatus::not_run ||
-        (actual.status == StageExecutionStatus::optional_failed_open &&
-         (expected.required || !actual.valid_output_preserved)) ||
-        actual.status == StageExecutionStatus::required_failed) {
-      return Failed(StatusId::failed, ReasonId::required_stage_failed);
-    }
   }
 
   result.completion.token_id = next_completion_id_++;
@@ -556,7 +705,171 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
   result.completion.adapter_instance_id = adapter_instance_id_;
   result.completion.capture_sequence = request.capture_sequence;
   result.completion.complete = true;
+  if (slot->host_binding_active) {
+    slot->host_completion = result.completion;
+    slot->host_execution_completed = true;
+  }
   return result;
+}
+
+StatusId ResidentAdapter::BindHostFrame(const PreparedProgramHandle &program,
+                                        const HostFrameBinding &binding,
+                                        HostFrameTokens *tokens,
+                                        ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (tokens)
+    *tokens = {};
+  if (stopped_ || !executor_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  Slot *slot = Find(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (!tokens) {
+    SetReason(reason, ReasonId::malformed_contract);
+    return StatusId::blocked;
+  }
+  ReasonId validation_reason = ReasonId::none;
+  if (!ValidateHostFrameBinding(binding, slot->program, &validation_reason)) {
+    SetReason(reason, validation_reason);
+    return StatusId::blocked;
+  }
+  if (slot->host_binding_active && !slot->host_execution_completed) {
+    SetReason(reason, ReasonId::output_not_committed);
+    return StatusId::blocked;
+  }
+
+  HostFrameTokens candidate;
+  const ExecutorTelemetrySnapshot before = executor_->Telemetry();
+  const StatusId status = executor_->BindHostFrame(slot->executor_handle,
+                                                   binding, &candidate, reason);
+  const ExecutorTelemetrySnapshot after = executor_->Telemetry();
+  if (!SameTelemetry(before, after)) {
+    SetReason(reason, ReasonId::synchronization_failed);
+    return StatusId::failed;
+  }
+  if (status != StatusId::ready)
+    return status;
+
+  const bool input_valid =
+      ValidateResourceHandle(
+          candidate.input, slot->program.execution_domain,
+          slot->program.execution_domain.logical_context_generation,
+          slot->executor_handle.reserved_budget) &&
+      candidate.input.lifetime == ResourceLifetime::frame_borrowed &&
+      ResourceFitsBoundaryBudget(candidate.input, slot->program,
+                                 slot->executor_handle.reserved_budget, true) &&
+      ResourceCoversImage(candidate.input, binding.input_descriptor);
+  const bool output_valid =
+      ValidateResourceHandle(
+          candidate.output, slot->program.execution_domain,
+          slot->program.execution_domain.logical_context_generation,
+          slot->executor_handle.reserved_budget) &&
+      candidate.output.lifetime == ResourceLifetime::frame_borrowed &&
+      ResourceFitsBoundaryBudget(candidate.output, slot->program,
+                                 slot->executor_handle.reserved_budget,
+                                 false) &&
+      ResourceCoversImage(candidate.output, binding.output_descriptor);
+  if (!input_valid || !output_valid ||
+      (SameResource(candidate.input, candidate.output) &&
+       !OneHostResourceAllowed(binding))) {
+    const ReasonId token_reason =
+        !input_valid
+            ? ResourceFailureReason(candidate.input, slot->program)
+            : (!output_valid
+                   ? ResourceFailureReason(candidate.output, slot->program)
+                   : ReasonId::host_frame_binding_invalid);
+    SetReason(reason, token_reason);
+    return StatusId::blocked;
+  }
+
+  slot->host_binding = binding;
+  slot->host_tokens = candidate;
+  slot->host_completion = {};
+  slot->host_binding_active = true;
+  slot->host_execution_completed = false;
+  *tokens = candidate;
+  SetReason(reason, ReasonId::none);
+  return StatusId::ready;
+}
+
+StatusId ResidentAdapter::ResolveHostFrameOutput(
+    const PreparedProgramHandle &program, const CompletionToken &completion,
+    const ResourceHandle &output, HostFrameOutputResolution *resolution,
+    ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (resolution)
+    *resolution = {};
+  if (stopped_ || !executor_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  Slot *slot = Find(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (!resolution || !slot->host_binding_active ||
+      !slot->host_execution_completed ||
+      !ExactCompletion(completion, slot->host_completion)) {
+    SetReason(reason, ReasonId::output_not_committed);
+    return StatusId::blocked;
+  }
+  if (!ValidateResourceHandle(
+          output, slot->program.execution_domain,
+          slot->program.execution_domain.logical_context_generation,
+          slot->executor_handle.reserved_budget) ||
+      output.lifetime != ResourceLifetime::frame_borrowed ||
+      !ResourceFitsBoundaryBudget(output, slot->program,
+                                  slot->executor_handle.reserved_budget,
+                                  false)) {
+    SetReason(reason, ResourceFailureReason(output, slot->program));
+    return StatusId::blocked;
+  }
+  if (!SameResource(output, slot->host_tokens.output)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  HostFrameOutputResolution candidate;
+  const ExecutorTelemetrySnapshot before = executor_->Telemetry();
+  const StatusId status = executor_->ResolveHostFrameOutput(
+      slot->executor_handle, completion, output, &candidate, reason);
+  const ExecutorTelemetrySnapshot after = executor_->Telemetry();
+  if (!SameTelemetry(before, after)) {
+    SetReason(reason, ReasonId::synchronization_failed);
+    return StatusId::failed;
+  }
+  if (status != StatusId::ready)
+    return status;
+  if (!candidate.output_ready ||
+      candidate.capture_sequence != slot->host_binding.capture_sequence ||
+      candidate.plane_count != slot->host_binding.output_plane_count ||
+      !SameImage(candidate.descriptor, slot->host_binding.output_descriptor)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  for (std::size_t index = 0; index < candidate.plane_count; ++index) {
+    if (!SameHostPlane(candidate.planes[index],
+                       slot->host_binding.output_planes[index])) {
+      SetReason(reason, ReasonId::host_frame_binding_invalid);
+      return StatusId::blocked;
+    }
+  }
+  *resolution = candidate;
+  SetReason(reason, ReasonId::none);
+  return StatusId::ready;
 }
 
 StatusId

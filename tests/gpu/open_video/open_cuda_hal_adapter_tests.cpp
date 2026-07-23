@@ -85,6 +85,9 @@ Stage(std::uint32_t stage_id, hal::SemanticEffectId semantic,
   stage.failure_action = failure_action;
   stage.circuit_breaker.consecutive_failure_limit = 2;
   stage.circuit_breaker.cooldown_frames = 5;
+  stage.circuit_breaker.action =
+      required ? hal::CircuitBreakerAction::quarantine_program
+               : hal::CircuitBreakerAction::disable_stage;
   stage.scratch_bytes = 1024;
   return stage;
 }
@@ -136,7 +139,7 @@ hal::ResourceHandle Resource(const hal::PreparedProgram &program,
   resource.lifetime = hal::ResourceLifetime::prepared_program;
   resource.synchronization_state = hal::SynchronizationState::ready;
   resource.execution_domain = program.execution_domain;
-  resource.size_bytes = 4096;
+  resource.size_bytes = program.stages[0].input.image.planes[0].size_bytes;
   resource.alignment_bytes = 256;
   resource.mutable_resource = true;
   resource.adapter_opaque[0] = resource_id + 1000;
@@ -151,6 +154,27 @@ hal::ExecuteRequest Request(const hal::PreparedProgram &program,
   request.capture_sequence = sequence;
   request.input = Resource(program, 500);
   return request;
+}
+
+constexpr std::size_t kHostFrameBytes = 256 * 48;
+
+hal::HostFrameBinding HostBinding(const hal::PreparedProgram &program,
+                                  const std::byte *input, std::byte *output,
+                                  std::uint64_t sequence) {
+  hal::HostFrameBinding binding;
+  binding.input_descriptor = program.stages[0].input.image;
+  binding.output_descriptor =
+      program.stages[program.stage_count - 1].output.image;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.capture_sequence = sequence;
+  binding.input_planes[0].read_data = input;
+  binding.input_planes[0].span_bytes = kHostFrameBytes;
+  binding.input_planes[0].row_stride_bytes = 256;
+  binding.output_planes[0].write_data = output;
+  binding.output_planes[0].span_bytes = kHostFrameBytes;
+  binding.output_planes[0].row_stride_bytes = 256;
+  return binding;
 }
 
 open_cuda::ResidentCapabilityFacts CompleteFacts() {
@@ -184,6 +208,9 @@ public:
     bool active = false;
     open_cuda::PreparedExecutorHandle handle{};
     hal::PreparedProgram program{};
+    hal::HostFrameBinding binding{};
+    hal::HostFrameTokens tokens{};
+    bool host_bound = false;
   };
 
   bool fail_prepare = false;
@@ -199,8 +226,20 @@ public:
   bool required_failure = false;
   bool mutate_output = false;
   bool reset_fails = false;
+  bool bind_wrong_domain = false;
+  bool bind_wrong_generation = false;
+  bool bind_foreign_allocator = false;
+  bool bind_oversized = false;
+  bool allocate_during_bind = false;
+  bool allocate_during_resolve = false;
+  bool mutate_resolution_descriptor = false;
+  bool mutate_resolution_plane = false;
   std::uint64_t prepare_calls = 0;
   std::uint64_t execute_calls = 0;
+  std::uint64_t bind_calls = 0;
+  std::uint64_t resolve_calls = 0;
+  std::uint64_t executed_stage_calls = 0;
+  std::uint32_t last_disabled_stage_mask = 0;
   std::uint64_t reset_calls = 0;
   std::uint64_t destroy_calls = 0;
   std::uint64_t shutdown_calls = 0;
@@ -273,12 +312,14 @@ public:
     return result;
   }
 
-  hal::ExecuteResult Execute(const open_cuda::PreparedExecutorHandle &handle,
-                             const hal::ExecuteRequest &) noexcept override {
+  hal::ExecuteResult
+  Execute(const open_cuda::PreparedExecutorHandle &handle,
+          const hal::ExecuteRequest &request) noexcept override {
     ++execute_calls;
     const Slot *slot = Find(handle);
     if (!slot)
       return {};
+    last_disabled_stage_mask = request.disabled_stage_mask;
     if (allocate_during_execute)
       ++telemetry.allocation_requests;
     if (device_lost) {
@@ -289,42 +330,67 @@ public:
     }
 
     hal::ExecuteResult result;
-    result.status =
-        optional_failure ? hal::StatusId::degraded : hal::StatusId::executed;
+    const bool required_stage_failed =
+        required_failure && (request.disabled_stage_mask & 1u) == 0;
+    const bool optional_stage_failed =
+        optional_failure && (request.disabled_stage_mask & 1u) == 0;
+    result.status = required_stage_failed
+                        ? hal::StatusId::failed
+                        : (optional_stage_failed ? hal::StatusId::degraded
+                                                 : hal::StatusId::executed);
     result.reason =
-        optional_failure
+        optional_stage_failed
             ? hal::ReasonId::optional_stage_failed_open
-            : (required_failure ? hal::ReasonId::required_stage_failed
-                                : hal::ReasonId::none);
-    result.output = handle.prepared_output;
+            : (required_stage_failed ? hal::ReasonId::required_stage_failed
+                                     : hal::ReasonId::none);
+    result.output =
+        slot->host_bound ? slot->tokens.output : handle.prepared_output;
     if (mutate_output)
       ++result.output.size_bytes;
-    result.output_valid = true;
+    result.output_valid = !required_stage_failed;
     result.stage_count = slot->program.stage_count;
+    bool any_stage_ran = false;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
       const auto &stage = slot->program.stages[index];
       result.stages[index].stage_id = stage.stage_id;
       result.stages[index].semantic = stage.semantic;
-      result.stages[index].status =
-          required_failure && index == 0
-              ? hal::StageExecutionStatus::required_failed
-              : (optional_failure && index == 0
-                     ? hal::StageExecutionStatus::optional_failed_open
-                     : hal::StageExecutionStatus::succeeded);
-      result.stages[index].reason =
-          required_failure && index == 0
-              ? hal::ReasonId::required_stage_failed
-              : (optional_failure && index == 0
-                     ? hal::ReasonId::optional_stage_failed_open
-                     : hal::ReasonId::none);
-      result.stages[index].valid_output_preserved =
-          optional_failure && index == 0;
-      result.stages[index].elapsed_ns = 100 + index;
+      result.stages[index].primitive = stage.primitive;
+      const bool disabled =
+          (request.disabled_stage_mask & (std::uint32_t{1} << index)) != 0;
+      if (disabled) {
+        result.stages[index].status =
+            hal::StageExecutionStatus::disabled_preserved;
+        result.stages[index].reason = hal::ReasonId::circuit_breaker_open;
+        result.stages[index].valid_output_preserved = true;
+        result.stages[index].elapsed_ns = 0;
+      } else if (required_stage_failed && index == 0) {
+        result.stages[index].status =
+            hal::StageExecutionStatus::required_failed;
+        result.stages[index].reason = hal::ReasonId::required_stage_failed;
+        result.stages[index].elapsed_ns = 100 + index;
+        any_stage_ran = true;
+        ++executed_stage_calls;
+      } else if (required_stage_failed) {
+        result.stages[index].status = hal::StageExecutionStatus::not_run;
+      } else if (optional_stage_failed && index == 0) {
+        result.stages[index].status =
+            hal::StageExecutionStatus::optional_failed_open;
+        result.stages[index].reason = hal::ReasonId::optional_stage_failed_open;
+        result.stages[index].valid_output_preserved = true;
+        result.stages[index].elapsed_ns = 100 + index;
+        any_stage_ran = true;
+        ++executed_stage_calls;
+      } else {
+        result.stages[index].status = hal::StageExecutionStatus::succeeded;
+        result.stages[index].elapsed_ns = 100 + index;
+        any_stage_ran = true;
+        ++executed_stage_calls;
+      }
     }
     result.frame_elapsed_ns = 1000;
     result.transfers.uploads = slot->program.requires_upload ? 1 : 0;
     result.transfers.final_readbacks =
-        slot->program.requires_final_readback ? 1 : 0;
+        slot->program.requires_final_readback && !required_stage_failed ? 1 : 0;
     result.transfers.intermediate_readbacks = add_intermediate_transfer ? 1 : 0;
     result.transfers.cpu_tail_boundaries = slot->program.cpu_tail_count;
     if (!hide_upload)
@@ -336,8 +402,72 @@ public:
       ++telemetry.synchronizations;
       result.transfers.synchronizations = 1;
     }
-    ++telemetry.shared_analysis_runs;
+    if (any_stage_ran)
+      ++telemetry.shared_analysis_runs;
     return result;
+  }
+
+  hal::StatusId BindHostFrame(const open_cuda::PreparedExecutorHandle &handle,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override {
+    ++bind_calls;
+    Slot *slot = FindMutable(handle);
+    if (!slot || !tokens) {
+      if (reason)
+        *reason = hal::ReasonId::stale_program;
+      return hal::StatusId::stale;
+    }
+    if (allocate_during_bind)
+      ++telemetry.allocation_requests;
+    tokens->input = Resource(slot->program, 800 + handle.handle_id);
+    tokens->output = Resource(slot->program, 900 + handle.handle_id, true);
+    tokens->input.lifetime = hal::ResourceLifetime::frame_borrowed;
+    tokens->output.lifetime = hal::ResourceLifetime::frame_borrowed;
+    if (bind_wrong_domain)
+      ++tokens->input.execution_domain.queue_or_stream_identity;
+    if (bind_wrong_generation)
+      --tokens->output.lifetime_generation;
+    if (bind_foreign_allocator)
+      ++tokens->input.allocator_owner_id;
+    if (bind_oversized)
+      tokens->output.size_bytes =
+          handle.reserved_budget.readback_staging_bytes + 1;
+    slot->binding = binding;
+    slot->tokens = *tokens;
+    slot->host_bound = true;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::StatusId
+  ResolveHostFrameOutput(const open_cuda::PreparedExecutorHandle &handle,
+                         const hal::CompletionToken &,
+                         const hal::ResourceHandle &,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override {
+    ++resolve_calls;
+    const Slot *slot = Find(handle);
+    if (!slot || !slot->host_bound || !resolution) {
+      if (reason)
+        *reason = hal::ReasonId::output_not_committed;
+      return hal::StatusId::blocked;
+    }
+    if (allocate_during_resolve)
+      ++telemetry.allocation_requests;
+    resolution->descriptor = slot->binding.output_descriptor;
+    resolution->planes = slot->binding.output_planes;
+    resolution->plane_count = slot->binding.output_plane_count;
+    resolution->capture_sequence = slot->binding.capture_sequence;
+    resolution->output_ready = true;
+    if (mutate_resolution_descriptor)
+      resolution->descriptor.channel_order = hal::ChannelOrder::bgr;
+    if (mutate_resolution_plane)
+      ++resolution->planes[0].span_bytes;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
   }
 
   hal::StatusId
@@ -369,6 +499,17 @@ public:
   }
 
 private:
+  Slot *FindMutable(const open_cuda::PreparedExecutorHandle &handle) noexcept {
+    for (auto &slot : slots_) {
+      if (slot.active && slot.handle.handle_id == handle.handle_id &&
+          slot.handle.program_id == handle.program_id &&
+          slot.handle.execution_domain == handle.execution_domain) {
+        return &slot;
+      }
+    }
+    return nullptr;
+  }
+
   const Slot *
   Find(const open_cuda::PreparedExecutorHandle &handle) const noexcept {
     for (const auto &slot : slots_) {
@@ -573,6 +714,32 @@ bool TestMalformedAndForeignProgramsFailClosed() {
                       hal::StatusId::blocked,
                   "CUDA and ORT domains must not be assumed interoperable");
   }
+  {
+    auto program = Program();
+    program.strict_provider_selection = true;
+    program.requested_provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
+                          hal::StatusId::blocked &&
+                      reason == hal::ReasonId::semantic_provider_unavailable,
+                  "strict provider selection must never fall back");
+  }
+  {
+    auto program = Program();
+    program.strict_execution_domain = true;
+    program.requested_execution_domain = program.execution_domain;
+    ++program.requested_execution_domain.queue_or_stream_identity;
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
+                          hal::StatusId::blocked &&
+                      reason == hal::ReasonId::wrong_execution_domain,
+                  "strict execution-domain selection must never fall back");
+  }
   return ok;
 }
 
@@ -678,6 +845,174 @@ bool TestResourceExhaustionAndOldPlanRetention() {
   return ok;
 }
 
+bool TestCommonHostBindingAndOutputResolution() {
+  alignas(256) static std::array<std::byte, kHostFrameBytes> input{};
+  alignas(256) static std::array<std::byte, kHostFrameBytes> output{};
+  FakeExecutor executor;
+  open_cuda::ResidentAdapter adapter(81, executor);
+  hal::PreparedProgramSession session;
+  const auto program = Program(350);
+  if (!Configure(&session, &adapter, program))
+    return false;
+
+  auto binding = HostBinding(program, input.data(), output.data(), 1);
+  hal::HostFrameTokens tokens;
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Require(
+      session.BindHostFrame(binding, &tokens, &reason) == hal::StatusId::ready,
+      "common host binding should use the prepared CUDA executor");
+  ok &= Require(
+      tokens.input.lifetime == hal::ResourceLifetime::frame_borrowed &&
+          tokens.output.lifetime == hal::ResourceLifetime::frame_borrowed &&
+          executor.bind_calls == 1 &&
+          executor.telemetry.allocation_requests == 0,
+      "host tokens must be exact borrowed preprepared resources");
+
+  auto request = Request(program, 1);
+  request.input = tokens.input;
+  const auto result = session.Execute(request);
+  ok &=
+      Require(result.status == hal::StatusId::executed &&
+                  result.output.resource_id == tokens.output.resource_id,
+              "host-bound execution must return the exact bound output token");
+
+  auto foreign_completion = result.completion;
+  ++foreign_completion.adapter_instance_id;
+  hal::HostFrameOutputResolution resolution;
+  ok &= Require(session.ResolveHostFrameOutput(
+                    foreign_completion, result.output, &resolution, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::output_not_committed &&
+                    executor.resolve_calls == 0,
+                "foreign completion tokens must not reach the executor");
+  ok &=
+      Require(session.ResolveHostFrameOutput(result.completion, result.output,
+                                             &resolution,
+                                             &reason) == hal::StatusId::ready &&
+                  resolution.output_ready && resolution.capture_sequence == 1 &&
+                  resolution.planes[0].write_data == output.data() &&
+                  executor.resolve_calls == 1,
+              "host output must resolve to the exact borrowed output plane");
+  ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                    hal::StatusId::ready,
+                "resolved host output should commit");
+
+  binding.capture_sequence = 2;
+  ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                    hal::StatusId::ready,
+                "prepared binding state must be reusable without allocation");
+  request = Request(program, 2);
+  request.input = tokens.input;
+  const auto second = session.Execute(request);
+  executor.mutate_resolution_plane = true;
+  ok &= Require(session.ResolveHostFrameOutput(second.completion, second.output,
+                                               &resolution, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::host_frame_binding_invalid,
+                "mutated output-plane resolution must fail closed");
+  ok &= Require(session.CommitOutput({second.completion, false}, &reason) ==
+                    hal::StatusId::failed,
+                "invalid host output must not be committed");
+  return ok;
+}
+
+bool TestHostBindingRejectsMalformedForeignAndExhaustedTokens() {
+  alignas(256) static std::array<std::byte, kHostFrameBytes> input{};
+  alignas(256) static std::array<std::byte, kHostFrameBytes> output{};
+  FakeExecutor executor;
+  open_cuda::ResidentAdapter adapter(81, executor);
+  const auto program = Program(360);
+  hal::PreparedProgramHandle handle;
+  hal::ReadinessSnapshot readiness;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                   hal::StatusId::ready,
+               "direct host-binding prepare should succeed")) {
+    return false;
+  }
+
+  auto binding = HostBinding(program, input.data(), output.data(), 1);
+  hal::HostFrameTokens tokens;
+  bool ok = true;
+  auto malformed = binding;
+  ++malformed.input_descriptor.planes[0].row_stride_bytes;
+  ok &= Require(adapter.BindHostFrame(handle, malformed, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::host_frame_binding_invalid &&
+                    executor.bind_calls == 0,
+                "malformed host descriptors must fail before executor binding");
+
+  executor.bind_wrong_domain = true;
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::wrong_execution_domain,
+                "foreign host-token domains must be rejected");
+  executor.bind_wrong_domain = false;
+  executor.bind_wrong_generation = true;
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::wrong_generation,
+                "stale host-token generations must be rejected");
+  executor.bind_wrong_generation = false;
+  executor.bind_foreign_allocator = true;
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::invalid_resource,
+                "foreign host-token ownership must be rejected");
+  executor.bind_foreign_allocator = false;
+  executor.bind_oversized = true;
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::invalid_resource,
+                "host-token budget exhaustion must fail closed");
+  executor.bind_oversized = false;
+  executor.allocate_during_bind = true;
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                        hal::StatusId::failed &&
+                    reason == hal::ReasonId::synchronization_failed,
+                "per-frame binding allocation must be rejected");
+  executor.allocate_during_bind = false;
+
+  ok &= Require(adapter.BindHostFrame(handle, binding, &tokens, &reason) ==
+                    hal::StatusId::ready,
+                "valid host binding should remain possible after rejection");
+  auto request = Request(program, 1);
+  request.input = tokens.input;
+  const auto result = adapter.Execute(handle, request);
+  auto wrong_output = result.output;
+  ++wrong_output.execution_domain.queue_or_stream_identity;
+  hal::HostFrameOutputResolution resolution;
+  ok &= Require(adapter.ResolveHostFrameOutput(
+                    handle, result.completion, wrong_output, &resolution,
+                    &reason) == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::wrong_execution_domain &&
+                    executor.resolve_calls == 0,
+                "foreign output domains must fail before resolution");
+  auto wrong_generation = result.output;
+  --wrong_generation.lifetime_generation;
+  ok &= Require(adapter.ResolveHostFrameOutput(
+                    handle, result.completion, wrong_generation, &resolution,
+                    &reason) == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::wrong_generation &&
+                    executor.resolve_calls == 0,
+                "stale output generations must fail before resolution");
+  executor.mutate_resolution_descriptor = true;
+  ok &= Require(adapter.ResolveHostFrameOutput(
+                    handle, result.completion, result.output, &resolution,
+                    &reason) == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::host_frame_binding_invalid,
+                "mutated output descriptors must fail closed");
+  executor.mutate_resolution_descriptor = false;
+  executor.allocate_during_resolve = true;
+  ok &= Require(adapter.ResolveHostFrameOutput(
+                    handle, result.completion, result.output, &resolution,
+                    &reason) == hal::StatusId::failed &&
+                    reason == hal::ReasonId::synchronization_failed,
+                "per-frame resolution allocation must be rejected");
+  adapter.DestroyPrepared(&handle);
+  return ok;
+}
+
 bool TestOptionalFailurePreservesValidOutput() {
   FakeExecutor executor;
   executor.optional_failure = true;
@@ -695,6 +1030,55 @@ bool TestOptionalFailurePreservesValidOutput() {
           result.reason == hal::ReasonId::optional_stage_failed_open &&
           result.output_valid && result.stages[0].valid_output_preserved,
       "optional failure must preserve a valid resident frame");
+}
+
+bool TestDisabledOptionalStageIsSkippedAndPreserved() {
+  FakeExecutor executor;
+  executor.optional_failure = true;
+  open_cuda::ResidentAdapter adapter(81, executor);
+  auto program = Program(370);
+  program.stages[0] =
+      Stage(1, hal::SemanticEffectId::virtual_background_blur, false,
+            hal::FailureAction::fail_open_preserve_input);
+  program.stages[0].circuit_breaker.consecutive_failure_limit = 2;
+  program.stages[0].circuit_breaker.cooldown_frames = 0;
+  hal::PreparedProgramSession session;
+  if (!Configure(&session, &adapter, program))
+    return false;
+
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = true;
+  for (std::uint64_t sequence = 1; sequence <= 2; ++sequence) {
+    const auto failed = session.Execute(Request(program, sequence));
+    ok &= Require(failed.status == hal::StatusId::degraded &&
+                      failed.stages[0].status ==
+                          hal::StageExecutionStatus::optional_failed_open,
+                  "optional stage should fail open before breaker activation");
+    ok &= Require(session.CommitOutput({failed.completion, true}, &reason) ==
+                      hal::StatusId::ready,
+                  "preserved optional-failure output should commit");
+  }
+  ok &= Require(session.disabled_stage_mask() == 1u,
+                "optional circuit breaker should disable the failed stage");
+  const auto stage_calls_before = executor.executed_stage_calls;
+  const auto analyses_before = executor.telemetry.shared_analysis_runs;
+  executor.optional_failure = false;
+  const auto disabled = session.Execute(Request(program, 3));
+  ok &= Require(
+      disabled.status == hal::StatusId::executed && disabled.stage_count == 1 &&
+          disabled.stages[0].status ==
+              hal::StageExecutionStatus::disabled_preserved &&
+          disabled.stages[0].reason == hal::ReasonId::circuit_breaker_open &&
+          disabled.stages[0].valid_output_preserved &&
+          disabled.stages[0].elapsed_ns == 0 &&
+          executor.last_disabled_stage_mask == 1u &&
+          executor.executed_stage_calls == stage_calls_before &&
+          executor.telemetry.shared_analysis_runs == analyses_before,
+      "disabled optional stage must be zero-time preserved and skipped");
+  ok &= Require(session.CommitOutput({disabled.completion, true}, &reason) ==
+                    hal::StatusId::ready,
+                "disabled preserved output should remain valid");
+  return ok;
 }
 
 bool TestRequiredFailureFailsClosedInsideAdapter() {
@@ -715,6 +1099,82 @@ bool TestRequiredFailureFailsClosedInsideAdapter() {
   return Require(result.status == hal::StatusId::failed &&
                      result.reason == hal::ReasonId::required_stage_failed,
                  "required-stage failure must fail closed in the adapter");
+}
+
+bool TestRequiredStagesQuarantineOrRequestRebuild() {
+  bool ok = true;
+  {
+    FakeExecutor executor;
+    executor.required_failure = true;
+    open_cuda::ResidentAdapter adapter(81, executor);
+    auto program = Program(380);
+    program.stages[0].circuit_breaker.consecutive_failure_limit = 1;
+    program.stages[0].circuit_breaker.action =
+        hal::CircuitBreakerAction::quarantine_program;
+    hal::PreparedProgramSession session;
+    if (!Configure(&session, &adapter, program))
+      return false;
+    const auto failed = session.Execute(Request(program, 1));
+    ok &= Require(failed.status == hal::StatusId::failed &&
+                      failed.reason == hal::ReasonId::required_stage_failed &&
+                      session.quarantined(),
+                  "required failure must quarantine under fail-closed policy");
+    const auto execute_calls = executor.execute_calls;
+    const auto quarantined = session.Execute(Request(program, 2));
+    ok &= Require(quarantined.status == hal::StatusId::quarantined &&
+                      executor.execute_calls == execute_calls,
+                  "quarantined required stage must not re-enter the executor");
+  }
+  {
+    FakeExecutor executor;
+    executor.required_failure = true;
+    open_cuda::ResidentAdapter adapter(81, executor);
+    auto program = Program(381);
+    program.stages[0].circuit_breaker.consecutive_failure_limit = 1;
+    program.stages[0].circuit_breaker.action =
+        hal::CircuitBreakerAction::request_rebuild;
+    hal::PreparedProgramSession session;
+    if (!Configure(&session, &adapter, program))
+      return false;
+    const auto failed = session.Execute(Request(program, 1));
+    ok &= Require(failed.status == hal::StatusId::failed &&
+                      session.rebuild_requested(),
+                  "required failure must request rebuild under rebuild policy");
+    const auto execute_calls = executor.execute_calls;
+    const auto stale = session.Execute(Request(program, 2));
+    ok &= Require(stale.status == hal::StatusId::stale &&
+                      stale.reason == hal::ReasonId::reconfiguration_required &&
+                      executor.execute_calls == execute_calls,
+                  "rebuild-requested program must not re-enter the executor");
+  }
+  {
+    FakeExecutor executor;
+    open_cuda::ResidentAdapter adapter(81, executor);
+    const auto program = Program(382);
+    hal::PreparedProgramHandle handle;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                     hal::StatusId::ready,
+                 "required-mask direct prepare should succeed")) {
+      return false;
+    }
+    auto request = Request(program, 1);
+    request.disabled_stage_mask = 1;
+    const auto rejected = adapter.Execute(handle, request);
+    ok &= Require(rejected.status == hal::StatusId::failed &&
+                      rejected.reason == hal::ReasonId::required_stage_failed &&
+                      executor.execute_calls == 0,
+                  "required disabled bits must fail closed before execution");
+    request.disabled_stage_mask = 2;
+    const auto malformed = adapter.Execute(handle, request);
+    ok &= Require(malformed.status == hal::StatusId::blocked &&
+                      malformed.reason == hal::ReasonId::malformed_contract &&
+                      executor.execute_calls == 0,
+                  "out-of-range disabled bits must fail closed");
+    adapter.DestroyPrepared(&handle);
+  }
+  return ok;
 }
 
 bool TestHiddenWorkAndOutputMutationAreRejected() {
@@ -939,8 +1399,12 @@ int main() {
   ok &= TestMalformedAndForeignProgramsFailClosed();
   ok &= TestStaleDomainGenerationAndResourceChecks();
   ok &= TestResourceExhaustionAndOldPlanRetention();
+  ok &= TestCommonHostBindingAndOutputResolution();
+  ok &= TestHostBindingRejectsMalformedForeignAndExhaustedTokens();
   ok &= TestOptionalFailurePreservesValidOutput();
+  ok &= TestDisabledOptionalStageIsSkippedAndPreserved();
   ok &= TestRequiredFailureFailsClosedInsideAdapter();
+  ok &= TestRequiredStagesQuarantineOrRequestRebuild();
   ok &= TestHiddenWorkAndOutputMutationAreRejected();
   ok &= TestCpuTailTelemetryAndStrictFallback();
   ok &= TestTemporalDiscontinuityDeviceLossAndShutdown();

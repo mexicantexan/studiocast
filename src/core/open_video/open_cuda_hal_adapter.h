@@ -121,6 +121,19 @@ public:
   virtual hal::ExecuteResult
   Execute(const PreparedExecutorHandle &program,
           const hal::ExecuteRequest &request) noexcept = 0;
+  // These calls bind already-created upload/readback resources to borrowed
+  // host storage. Implementations must not allocate, probe, rebuild a session,
+  // or inspect model metadata here.
+  virtual hal::StatusId BindHostFrame(const PreparedExecutorHandle &program,
+                                      const hal::HostFrameBinding &binding,
+                                      hal::HostFrameTokens *tokens,
+                                      hal::ReasonId *reason) noexcept = 0;
+  virtual hal::StatusId
+  ResolveHostFrameOutput(const PreparedExecutorHandle &program,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &output,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept = 0;
   virtual hal::StatusId
   ResetTemporalState(const PreparedExecutorHandle &program,
                      hal::ReasonId reason) noexcept = 0;
@@ -155,6 +168,16 @@ public:
   hal::ExecuteResult
   Execute(const hal::PreparedProgramHandle &program,
           const hal::ExecuteRequest &request) noexcept override;
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override;
+  hal::StatusId
+  ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &output,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override;
   hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &program,
                                    hal::ReasonId reason) noexcept override;
   void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override;
@@ -169,6 +192,11 @@ private:
     bool requires_explicit_provider_sync = false;
     std::uint32_t completion_synchronizations_per_frame = 0;
     bool quarantined = false;
+    hal::HostFrameBinding host_binding{};
+    hal::HostFrameTokens host_tokens{};
+    hal::CompletionToken host_completion{};
+    bool host_binding_active = false;
+    bool host_execution_completed = false;
   };
 
   [[nodiscard]] Slot *Find(const hal::PreparedProgramHandle &program) noexcept;
