@@ -108,8 +108,14 @@ bool TestAuditCoversCanonicalEffects() {
 
 bool TestInstallerRecommendationConsumesExactPerEffectEvidence() {
   const fs::path root(STUDIOCAST_SOURCE_DIR);
-  const std::string backend = ReadFile(
+  const std::string backend_entrypoint = ReadFile(
       root / "installer" / "backend" / "studiocast-installer-backend");
+  const std::string facts =
+      ReadFile(root / "installer" / "backend" /
+               "studiocast_installer_backend" / "facts.py");
+  const std::string recommendation =
+      ReadFile(root / "installer" / "backend" /
+               "studiocast_installer_backend" / "recommendation.py");
   const std::string diagnostics =
       ReadFile(root / "src" / "core" / "vulkan" / "kernels" /
                "resize_bilinear.cpp");
@@ -117,35 +123,44 @@ bool TestInstallerRecommendationConsumesExactPerEffectEvidence() {
       ReadFile(root / "src" / "core" / "vulkan" / "vulkan_device.h");
   const std::string daemon =
       ReadFile(root / "src" / "daemon" / "studiocastd_main.cpp");
-  bool ok = Require(!backend.empty() && !diagnostics.empty() &&
+  bool ok = Require(!backend_entrypoint.empty() && !facts.empty() &&
+                        !recommendation.empty() && !diagnostics.empty() &&
                         !device_header.empty() && !daemon.empty(),
                     "installer/Vulkan capability sources are missing");
   ok &= Require(
-      Contains(backend, "def common_vulkan_effect_evidence") &&
-          Contains(backend, "runtime_diagnostics_available") &&
-          Contains(backend, "non_cpu_device_selected") &&
-          Contains(backend, "compute_queue_available") &&
-          Contains(backend, "context_healthy") &&
-          Contains(backend, "utility_kernels_ready") &&
-          Contains(backend, "def engine_capability_usable") &&
-          Contains(backend,
+      Contains(facts, "def common_vulkan_effect_evidence") &&
+          Contains(facts, "runtime_diagnostics_available") &&
+          Contains(facts, "non_cpu_device_selected") &&
+          Contains(facts, "compute_queue_available") &&
+          Contains(facts, "context_healthy") &&
+          Contains(facts, "utility_kernels_ready") &&
+          Contains(recommendation, "def engine_capability_usable") &&
+          Contains(recommendation,
                    "all(evidence.get(key) is True for key in common_keys)") &&
-          Contains(backend, "expected_success in successes.get") &&
-          !Contains(backend,
+          Contains(recommendation, "expected_success in successes.get") &&
+          !Contains(facts,
+                    "v0.2.9 Vulkan has no production-recommendable canonical "
+                    "effect") &&
+          !Contains(recommendation,
                     "v0.2.9 Vulkan has no production-recommendable canonical "
                     "effect"),
       "recommendation must require common and exact per-effect Vulkan proof");
   ok &= Require(
-      Contains(backend, "mirror_production_ready") &&
-          Contains(backend, "mirror_readiness_code") &&
-          Contains(backend, "vignette_fixed_center_production_ready") &&
-          Contains(backend, "vignette_parameter_contract") &&
-          Contains(backend, "auto_frame_production_ready") &&
-          Contains(backend, "auto_frame_cpu_tail") &&
-          Contains(backend, "success_reason_codes") &&
-          Contains(backend, "blocker_reason_codes") &&
-          Contains(backend, "selectable_production_path") &&
-          Contains(backend, "effect.{effect}.cpu.no_selectable_production_path"),
+      Contains(facts, "mirror_production_ready") &&
+          Contains(facts, "mirror_readiness_code") &&
+          Contains(facts, "vignette_fixed_center_production_ready") &&
+          Contains(facts, "vignette_parameter_contract") &&
+          Contains(facts, "auto_frame_production_ready") &&
+          Contains(facts, "auto_frame_cpu_tail") &&
+          Contains(facts, "success_reason_codes") &&
+          Contains(facts, "blocker_reason_codes") &&
+          Contains(facts, "selectable_production_path") &&
+          Contains(facts,
+                   "effect.{effect}.cpu.no_selectable_production_path") &&
+          Contains(recommendation, "success_reason_codes") &&
+          Contains(recommendation, "blocker_reason_codes") &&
+          Contains(recommendation,
+                   "cpu_evidence.get(\"selectable_production_path\") is True"),
       "per-effect success/blocker/evidence/CPU facts are incomplete");
   ok &= Require(
       Contains(diagnostics, "ApplyOpenVulkanPixelEffectReadiness") &&
