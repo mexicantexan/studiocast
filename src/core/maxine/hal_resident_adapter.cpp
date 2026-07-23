@@ -2,6 +2,7 @@
 #include "core/maxine/production_resident_frame_executor.h"
 
 #include <chrono>
+#include <cstring>
 #include <limits>
 
 namespace studiocast::maxine {
@@ -16,6 +17,9 @@ using hal::StatusId;
 
 constexpr std::uint64_t kInputCookieSalt = 0x4d4158494e45494eULL;
 constexpr std::uint64_t kOutputCookieSalt = 0x4d4158494e454f55ULL;
+constexpr std::uint64_t kHostBindingCookieSalt = 0x4d4158494e454842ULL;
+constexpr std::uint64_t kHostInputTokenSalt = 0x4d4158494e454849ULL;
+constexpr std::uint64_t kHostOutputTokenSalt = 0x4d4158494e45484fULL;
 
 void SetReason(ReasonId *reason, ReasonId value) noexcept {
   if (reason)
@@ -66,6 +70,41 @@ bool SameResource(const hal::ResourceHandle &left,
          left.adapter_opaque == right.adapter_opaque &&
          left.destruction_owner == right.destruction_owner &&
          left.destroy == right.destroy;
+}
+
+bool SameImageDescriptor(const hal::ImageDescriptor &left,
+                         const hal::ImageDescriptor &right) noexcept {
+  if (left.width != right.width || left.height != right.height ||
+      left.plane_count != right.plane_count || left.format != right.format ||
+      left.channel_order != right.channel_order ||
+      left.color_space != right.color_space ||
+      left.color_range != right.color_range ||
+      left.alpha_meaning != right.alpha_meaning ||
+      left.orientation != right.orientation ||
+      left.host_coherence != right.host_coherence ||
+      left.mutability != right.mutability || left.aliasing != right.aliasing ||
+      left.base_alignment_bytes != right.base_alignment_bytes ||
+      left.in_place_permitted != right.in_place_permitted) {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.plane_count; ++index) {
+    if (left.planes[index].offset_bytes != right.planes[index].offset_bytes ||
+        left.planes[index].row_stride_bytes !=
+            right.planes[index].row_stride_bytes ||
+        left.planes[index].size_bytes != right.planes[index].size_bytes ||
+        left.planes[index].width != right.planes[index].width ||
+        left.planes[index].height != right.planes[index].height ||
+        left.planes[index].alignment_bytes !=
+            right.planes[index].alignment_bytes) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::uint32_t StageMask(std::size_t stage_count) noexcept {
+  return stage_count == 32 ? std::numeric_limits<std::uint32_t>::max()
+                           : (std::uint32_t{1} << stage_count) - 1u;
 }
 
 bool HasEvidence(const std::array<std::uint8_t, 32> &identity) noexcept {
@@ -134,11 +173,19 @@ bool ValidResidentIo(const hal::StageIoDescriptor &io,
   if (io.kind != hal::StageIoKind::image)
     return false;
   const auto &image = io.image;
+  std::uint64_t minimum_size = 0;
+  const auto &plane = image.planes[0];
   return hal::ValidateImageDescriptor(image) && image.width == key.width &&
          image.height == key.height && image.plane_count == 1 &&
          image.format == hal::PixelFormat::bgr_u8 &&
          image.channel_order == hal::ChannelOrder::bgr &&
-         image.orientation == hal::Orientation::top_left;
+         image.orientation == hal::Orientation::top_left &&
+         image.host_coherence == hal::HostCoherence::not_host_visible &&
+         plane.offset_bytes == 0 && plane.width == key.width &&
+         plane.height == key.height &&
+         plane.row_stride_bytes >= static_cast<std::uint64_t>(key.width) * 3u &&
+         Multiply(plane.row_stride_bytes, plane.height, &minimum_size) &&
+         plane.size_bytes >= minimum_size;
 }
 
 bool MapStage(const hal::PreparedStage &stage, ResidentStageKind *kind,
@@ -470,7 +517,8 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
     if (stage.backend != BackendId::maxine ||
         stage.execution_domain != configuration_.execution_domain ||
         !ValidResidentIo(stage.input, configuration_.resident_key) ||
-        !ValidResidentIo(stage.output, configuration_.resident_key)) {
+        !ValidResidentIo(stage.output, configuration_.resident_key) ||
+        !SameImageDescriptor(stage.input.image, stage.output.image)) {
       SetReason(reason,
                 stage.execution_domain != configuration_.execution_domain
                     ? ReasonId::wrong_execution_domain
@@ -713,6 +761,114 @@ MaxineHalResidentAdapter::ClassifyFailure(ResidentBoundaryResult boundary,
   return fallback;
 }
 
+StatusId MaxineHalResidentAdapter::BindHostFrame(
+    const hal::PreparedProgramHandle &program,
+    const hal::HostFrameBinding &binding, hal::HostFrameTokens *tokens,
+    ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (tokens)
+    *tokens = {};
+  if (stopped_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  PreparedSlot *slot = FindSlot(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  ReasonId binding_reason = ReasonId::none;
+  if (!tokens || !slot->program.requires_upload ||
+      !slot->program.requires_final_readback ||
+      !hal::ValidateHostFrameBinding(binding, slot->program, &binding_reason) ||
+      binding.input_plane_count != 1 || binding.output_plane_count != 1 ||
+      !SameImageDescriptor(binding.input_descriptor,
+                           slot->program.stages[0].input.image) ||
+      !SameImageDescriptor(
+          binding.output_descriptor,
+          slot->program.stages[slot->program.stage_count - 1].output.image)) {
+    SetReason(reason, binding_reason == ReasonId::none
+                          ? ReasonId::host_frame_binding_invalid
+                          : binding_reason);
+    return StatusId::blocked;
+  }
+
+  const auto &input_plane = binding.input_planes[0];
+  const auto &output_plane = binding.output_planes[0];
+  HostRgbFrameView input_view{
+      reinterpret_cast<const std::uint8_t *>(input_plane.read_data),
+      binding.input_descriptor.width, binding.input_descriptor.height,
+      static_cast<std::size_t>(input_plane.row_stride_bytes)};
+  if (!input_view.ValidFor(configuration_.resident_key) ||
+      input_plane.span_bytes < binding.input_descriptor.planes[0].size_bytes ||
+      output_plane.span_bytes <
+          binding.output_descriptor.planes[0].size_bytes ||
+      binding.input_descriptor.planes[0].size_bytes >
+          slot->program.budget.upload_staging_bytes ||
+      binding.output_descriptor.planes[0].size_bytes >
+          slot->program.budget.readback_staging_bytes) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  std::uint64_t input_id = next_host_resource_id_++;
+  if (input_id == 0)
+    input_id = next_host_resource_id_++;
+  std::uint64_t output_id = next_host_resource_id_++;
+  if (output_id == 0)
+    output_id = next_host_resource_id_++;
+  const std::uint64_t cookie = kHostBindingCookieSalt ^ slot->slot_nonce ^
+                               binding.capture_sequence ^ input_id ^ output_id ^
+                               adapter_instance_id();
+
+  hal::HostFrameTokens candidate{};
+  candidate.input.resource_id = input_id;
+  candidate.input.allocator_owner_id = adapter_instance_id();
+  candidate.input.lifetime_generation =
+      configuration_.execution_domain.logical_context_generation;
+  candidate.input.memory_domain = hal::MemoryDomain::upload_staging;
+  candidate.input.lifetime = hal::ResourceLifetime::frame_borrowed;
+  candidate.input.synchronization_state = hal::SynchronizationState::ready;
+  candidate.input.execution_domain = configuration_.execution_domain;
+  candidate.input.size_bytes = binding.input_descriptor.planes[0].size_bytes;
+  candidate.input.alignment_bytes =
+      binding.input_descriptor.planes[0].alignment_bytes;
+  candidate.input.mutable_resource = false;
+  candidate.input.aliasable = false;
+  candidate.input.adapter_opaque[0] =
+      static_cast<std::uint64_t>(slot - slots_.data()) + 1;
+  candidate.input.adapter_opaque[1] = binding.capture_sequence;
+  candidate.input.adapter_opaque[2] = cookie;
+  candidate.input.adapter_opaque[3] = kHostInputTokenSalt;
+
+  candidate.output.resource_id = output_id;
+  candidate.output.allocator_owner_id = adapter_instance_id();
+  candidate.output.lifetime_generation =
+      configuration_.execution_domain.logical_context_generation;
+  candidate.output.memory_domain = hal::MemoryDomain::readback_staging;
+  candidate.output.lifetime = hal::ResourceLifetime::frame_borrowed;
+  candidate.output.synchronization_state = hal::SynchronizationState::ready;
+  candidate.output.execution_domain = configuration_.execution_domain;
+  candidate.output.size_bytes = binding.output_descriptor.planes[0].size_bytes;
+  candidate.output.alignment_bytes =
+      binding.output_descriptor.planes[0].alignment_bytes;
+  candidate.output.mutable_resource = true;
+  candidate.output.aliasable = false;
+  candidate.output.adapter_opaque[0] =
+      static_cast<std::uint64_t>(slot - slots_.data()) + 1;
+  candidate.output.adapter_opaque[1] = binding.capture_sequence;
+  candidate.output.adapter_opaque[2] = cookie;
+  candidate.output.adapter_opaque[3] = kHostOutputTokenSalt;
+
+  slot->host_frame = HostFrameState{true, binding, candidate, cookie};
+  slot->output = {};
+  slot->output_resource = {};
+  slot->output_resource_id = 0;
+  slot->output_cookie = 0;
+  *tokens = candidate;
+  return StatusId::ready;
+}
+
 StatusId MaxineHalResidentAdapter::BindHostFrame(const HostRgbFrameView &frame,
                                                  std::uint64_t capture_sequence,
                                                  std::uint64_t resource_id,
@@ -769,7 +925,7 @@ StatusId MaxineHalResidentAdapter::BindHostFrame(const HostRgbFrameView &frame,
 
 bool MaxineHalResidentAdapter::PopulateOutput(
     PreparedSlot &slot, std::uint64_t capture_sequence,
-    const ResidentFrameExecutionResult &execution,
+    const ResidentFrameExecutionResult &execution, bool use_neutral_binding,
     hal::ResourceHandle *resource) noexcept {
   if (!resource)
     return false;
@@ -814,14 +970,27 @@ bool MaxineHalResidentAdapter::PopulateOutput(
   if (size_bytes == 0 || size_bytes > available)
     return false;
 
+  slot.output = output;
+  if (use_neutral_binding) {
+    if (!slot.host_frame.bound ||
+        slot.host_frame.binding.capture_sequence != capture_sequence ||
+        slot.host_frame.tokens.output.memory_domain != memory_domain ||
+        slot.host_frame.tokens.output.size_bytes != size_bytes) {
+      return false;
+    }
+    slot.output_resource = slot.host_frame.tokens.output;
+    slot.output_resource_id = slot.output_resource.resource_id;
+    slot.output_cookie = slot.host_frame.token_cookie;
+    *resource = slot.output_resource;
+    return true;
+  }
+
   std::uint64_t output_id = next_output_resource_id_++;
   if (output_id == 0)
     output_id = next_output_resource_id_++;
-  slot.output = output;
   slot.output_resource_id = output_id;
   slot.output_cookie = kOutputCookieSalt ^ output_id ^ capture_sequence ^
                        slot.slot_nonce ^ adapter_instance_id();
-
   resource->resource_id = output_id;
   resource->allocator_owner_id = adapter_instance_id();
   resource->lifetime_generation =
@@ -860,6 +1029,8 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
           request.input, configuration_.execution_domain,
           configuration_.execution_domain.logical_context_generation,
           slot->program.budget)) {
+    if (request.input.allocator_owner_id != adapter_instance_id())
+      return Failed(StatusId::blocked, ReasonId::foreign_adapter);
     if (request.input.execution_domain != configuration_.execution_domain)
       return Failed(StatusId::blocked, ReasonId::wrong_execution_domain);
     if (request.input.lifetime_generation !=
@@ -868,16 +1039,79 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
     }
     return Failed(StatusId::blocked, ReasonId::invalid_resource);
   }
+  const bool use_neutral_binding =
+      slot->host_frame.bound &&
+      slot->host_frame.binding.capture_sequence == request.capture_sequence &&
+      SameResource(request.input, slot->host_frame.tokens.input) &&
+      request.input.adapter_opaque[0] ==
+          static_cast<std::uint64_t>(slot - slots_.data()) + 1 &&
+      request.input.adapter_opaque[1] == request.capture_sequence &&
+      request.input.adapter_opaque[2] == slot->host_frame.token_cookie &&
+      request.input.adapter_opaque[3] == kHostInputTokenSalt;
+  const bool use_compatibility_binding =
+      request.capture_sequence != 0 &&
+      request.input.resource_id == input_resource_id_ &&
+      request.input.adapter_opaque[0] == input_cookie_ &&
+      request.input.adapter_opaque[1] == request.capture_sequence &&
+      request.input.adapter_opaque[2] == kInputCookieSalt &&
+      input_binding_.version == kMaxineHalBindingVersion &&
+      input_binding_.capture_sequence == request.capture_sequence &&
+      input_binding_.rgb.ValidFor(configuration_.resident_key) &&
+      SameResource(request.input, input_resource_);
   if (request.capture_sequence == 0 ||
-      request.input.resource_id != input_resource_id_ ||
-      request.input.adapter_opaque[0] != input_cookie_ ||
-      request.input.adapter_opaque[1] != request.capture_sequence ||
-      request.input.adapter_opaque[2] != kInputCookieSalt ||
-      input_binding_.version != kMaxineHalBindingVersion ||
-      input_binding_.capture_sequence != request.capture_sequence ||
-      !input_binding_.rgb.ValidFor(configuration_.resident_key) ||
-      !SameResource(request.input, input_resource_)) {
+      (!use_neutral_binding && !use_compatibility_binding)) {
     return Failed(StatusId::blocked, ReasonId::invalid_resource);
+  }
+  const HostRgbFrameView input_view =
+      use_neutral_binding
+          ? HostRgbFrameView{reinterpret_cast<const std::uint8_t *>(
+                                 slot->host_frame.binding.input_planes[0]
+                                     .read_data),
+                             slot->host_frame.binding.input_descriptor.width,
+                             slot->host_frame.binding.input_descriptor.height,
+                             static_cast<std::size_t>(
+                                 slot->host_frame.binding.input_planes[0]
+                                     .row_stride_bytes)}
+          : input_binding_.rgb;
+  if (!input_view.ValidFor(configuration_.resident_key))
+    return Failed(StatusId::blocked, ReasonId::host_frame_binding_invalid);
+
+  const std::uint32_t valid_stage_mask = StageMask(slot->program.stage_count);
+  if ((request.disabled_stage_mask & ~valid_stage_mask) != 0)
+    return Failed(StatusId::blocked, ReasonId::malformed_contract);
+  for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & bit) != 0 &&
+        slot->program.stages[index].required) {
+      hal::ExecuteResult result =
+          Failed(StatusId::failed, ReasonId::circuit_breaker_open);
+      result.stage_count = slot->program.stage_count;
+      for (std::size_t stage_index = 0; stage_index < slot->program.stage_count;
+           ++stage_index) {
+        result.stages[stage_index].stage_id =
+            slot->program.stages[stage_index].stage_id;
+        result.stages[stage_index].semantic =
+            slot->program.stages[stage_index].semantic;
+        result.stages[stage_index].primitive =
+            slot->program.stages[stage_index].primitive;
+      }
+      result.stages[index].status = StageExecutionStatus::required_failed;
+      result.stages[index].reason = ReasonId::circuit_breaker_open;
+      return result;
+    }
+  }
+
+  ResidentFramePlan effective_plan = slot->resident_plan;
+  effective_plan.stage_count = 0;
+  std::array<std::size_t, kMaxResidentFrameStages> original_to_effective{};
+  original_to_effective.fill(kMaxResidentFrameStages);
+  for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & bit) != 0)
+      continue;
+    const std::size_t effective_index = effective_plan.stage_count++;
+    effective_plan.stages[effective_index] = slot->resident_plan.stages[index];
+    original_to_effective[index] = effective_index;
   }
 
   MaxineAuthoritativeTelemetrySnapshot authoritative_before{};
@@ -893,9 +1127,53 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   const auto started = std::chrono::steady_clock::now();
   const auto counters_before = slot->section.counters();
   PrevalidatedExecutor prevalidated(*executor_, configuration_.resident_key);
-  const ResidentFrameExecutionResult execution = slot->section.Execute(
-      slot->resident_plan, configuration_.resident_key,
-      request.capture_sequence, input_binding_.rgb, prevalidated);
+  ResidentFrameExecutionResult execution{};
+  bool boundary_only_upload_succeeded = false;
+  bool boundary_only_readback_succeeded = false;
+  bool boundary_only_sync_succeeded = false;
+  const bool boundary_only = effective_plan.stage_count == 0;
+  if (!boundary_only) {
+    execution = slot->section.Execute(
+        effective_plan, configuration_.resident_key, request.capture_sequence,
+        input_view, prevalidated);
+  } else {
+    execution.boundary_result =
+        prevalidated.StageRgbToBgr(input_view, configuration_.resident_key);
+    if (execution.boundary_result == ResidentBoundaryResult::success) {
+      ResidentImage uploaded{};
+      execution.boundary_result =
+          prevalidated.UploadStagedBgr(configuration_.resident_key, uploaded);
+      if (execution.boundary_result == ResidentBoundaryResult::success &&
+          uploaded.ValidFor(configuration_.resident_key)) {
+        boundary_only_upload_succeeded = true;
+        execution.current = uploaded;
+        if (effective_plan.has_cpu_tail || effective_plan.require_cpu_output) {
+          const auto boundary = effective_plan.has_cpu_tail
+                                    ? ResidentReadbackBoundary::cpu_continuation
+                                    : ResidentReadbackBoundary::final_output;
+          execution.boundary_result =
+              prevalidated.DownloadToHost(boundary, execution.current);
+          if (execution.boundary_result == ResidentBoundaryResult::success) {
+            boundary_only_readback_succeeded = true;
+            execution.boundary_result =
+                prevalidated.Synchronize(boundary, configuration_.resident_key);
+            if (execution.boundary_result == ResidentBoundaryResult::success) {
+              boundary_only_sync_succeeded = true;
+              execution.status =
+                  effective_plan.has_cpu_tail
+                      ? ResidentExecutionStatus::cpu_tail_required
+                      : ResidentExecutionStatus::cpu_visible_output;
+              execution.cpu_tail = effective_plan.cpu_tail;
+            }
+          }
+        } else {
+          execution.status = ResidentExecutionStatus::resident_output;
+        }
+      } else if (execution.boundary_result == ResidentBoundaryResult::success) {
+        execution.boundary_result = ResidentBoundaryResult::incompatible_output;
+      }
+    }
+  }
   const auto finished = std::chrono::steady_clock::now();
   const auto &counters_after = slot->section.counters();
   MaxineAuthoritativeTelemetrySnapshot authoritative_after{};
@@ -916,23 +1194,37 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
     auto &stage = result.stages[index];
     stage.stage_id = slot->program.stages[index].stage_id;
     stage.semantic = slot->program.stages[index].semantic;
-    const std::uint32_t bit = std::uint32_t{1} << index;
+    stage.primitive = slot->program.stages[index].primitive;
+    const std::uint32_t original_bit = std::uint32_t{1} << index;
+    if ((request.disabled_stage_mask & original_bit) != 0) {
+      stage.status = StageExecutionStatus::disabled_preserved;
+      stage.reason = ReasonId::circuit_breaker_open;
+      stage.valid_output_preserved = true;
+      continue;
+    }
+    const std::size_t effective_index = original_to_effective[index];
+    if (effective_index >= effective_plan.stage_count) {
+      result.status = StatusId::failed;
+      result.reason = ReasonId::malformed_contract;
+      return result;
+    }
+    const std::uint32_t effective_bit = std::uint32_t{1} << effective_index;
     bool failed_at_matte = false;
     for (std::size_t failure_index = 0;
          failure_index < execution.stage_failure_count; ++failure_index) {
       const auto &failure = execution.stage_failures[failure_index];
-      if (failure.plan_stage_index == index &&
+      if (failure.plan_stage_index == effective_index &&
           failure.point == ResidentStageFailurePoint::shared_matte) {
         failed_at_matte = true;
         break;
       }
     }
-    if ((execution.optional_fail_open_plan_stage_mask & bit) != 0) {
+    if ((execution.optional_fail_open_plan_stage_mask & effective_bit) != 0) {
       stage.status = StageExecutionStatus::optional_failed_open;
       stage.reason = ReasonId::optional_stage_failed_open;
       stage.valid_output_preserved = true;
-    } else if ((execution.failed_plan_stage_mask & bit) != 0 ||
-               index >= execution.resident_stages_consumed) {
+    } else if ((execution.failed_plan_stage_mask & effective_bit) != 0 ||
+               effective_index >= execution.resident_stages_consumed) {
       stage.status = StageExecutionStatus::required_failed;
       stage.reason = ReasonId::required_stage_failed;
     } else {
@@ -946,10 +1238,10 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
         stage.elapsed_ns = prevalidated.matte_elapsed_ns();
         matte_time_attributed = true;
       }
-    } else if ((execution.failed_plan_stage_mask & bit) != 0 ||
-               index < execution.resident_stages_consumed) {
+    } else if ((execution.failed_plan_stage_mask & effective_bit) != 0 ||
+               effective_index < execution.resident_stages_consumed) {
       stage.elapsed_ns = prevalidated.stage_elapsed_ns(executor_stage_index++);
-      if (slot->resident_plan.stages[index].requires_shared_matte &&
+      if (effective_plan.stages[effective_index].requires_shared_matte &&
           !matte_time_attributed) {
         stage.elapsed_ns += prevalidated.matte_elapsed_ns();
         matte_time_attributed = true;
@@ -961,19 +1253,34 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
                       &result.transfers)) {
     return Failed(StatusId::failed, ReasonId::synchronization_failed);
   }
-  for (std::size_t index = 0;
-       index < static_cast<std::size_t>(CpuTailKind::count); ++index) {
-    result.transfers.cpu_tail_boundaries +=
-        counters_after.cpu_tail_boundaries[index] -
-        counters_before.cpu_tail_boundaries[index];
+  if (boundary_only) {
+    result.transfers.cpu_tail_boundaries =
+        effective_plan.has_cpu_tail && boundary_only_readback_succeeded &&
+                boundary_only_sync_succeeded
+            ? 1
+            : 0;
+  } else {
+    for (std::size_t index = 0;
+         index < static_cast<std::size_t>(CpuTailKind::count); ++index) {
+      result.transfers.cpu_tail_boundaries +=
+          counters_after.cpu_tail_boundaries[index] -
+          counters_before.cpu_tail_boundaries[index];
+    }
   }
 
   const std::uint64_t expected_uploads =
-      counters_after.upload_successes - counters_before.upload_successes;
+      boundary_only
+          ? static_cast<std::uint64_t>(boundary_only_upload_succeeded)
+          : counters_after.upload_successes - counters_before.upload_successes;
   const std::uint64_t expected_readbacks =
-      counters_after.download_successes - counters_before.download_successes;
+      boundary_only
+          ? static_cast<std::uint64_t>(boundary_only_readback_succeeded)
+          : counters_after.download_successes -
+                counters_before.download_successes;
   const std::uint64_t expected_synchronizations =
-      counters_after.sync_successes - counters_before.sync_successes;
+      boundary_only
+          ? static_cast<std::uint64_t>(boundary_only_sync_succeeded)
+          : counters_after.sync_successes - counters_before.sync_successes;
   if (result.transfers.uploads != expected_uploads ||
       result.transfers.final_readbacks != expected_readbacks ||
       result.transfers.synchronizations != expected_synchronizations ||
@@ -992,7 +1299,7 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   if (!IsSuccessful(execution.status)) {
     const ReasonId failure = ClassifyFailure(
         execution.boundary_result,
-        execution.resident_stages_consumed < slot->program.stage_count
+        execution.resident_stages_consumed < effective_plan.stage_count
             ? ReasonId::required_stage_failed
             : ReasonId::synchronization_failed);
     result.status = failure == ReasonId::device_lost ? StatusId::quarantined
@@ -1002,7 +1309,7 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   }
 
   if (!PopulateOutput(*slot, request.capture_sequence, execution,
-                      &result.output)) {
+                      use_neutral_binding, &result.output)) {
     result.status = StatusId::failed;
     result.reason = ReasonId::invalid_resource;
     return result;
@@ -1037,6 +1344,92 @@ StatusId MaxineHalResidentAdapter::ResetTemporalState(
     return StatusId::failed;
   }
   slot->section.Invalidate(ResidentInvalidationReason::provider_transition);
+  return StatusId::ready;
+}
+
+StatusId MaxineHalResidentAdapter::ResolveHostFrameOutput(
+    const hal::PreparedProgramHandle &program,
+    const hal::CompletionToken &completion, const hal::ResourceHandle &resource,
+    hal::HostFrameOutputResolution *resolution, ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (resolution)
+    *resolution = {};
+  if (stopped_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  const PreparedSlot *slot = FindSlot(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (!resolution || !slot->host_frame.bound) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  if (resource.allocator_owner_id != adapter_instance_id()) {
+    SetReason(reason, ReasonId::foreign_adapter);
+    return StatusId::blocked;
+  }
+  if (resource.execution_domain != configuration_.execution_domain) {
+    SetReason(reason, ReasonId::wrong_execution_domain);
+    return StatusId::blocked;
+  }
+  if (resource.lifetime_generation !=
+      configuration_.execution_domain.logical_context_generation) {
+    SetReason(reason, ReasonId::wrong_generation);
+    return StatusId::blocked;
+  }
+  if (!completion.complete || completion.token_id == 0 ||
+      completion.token_id != slot->output_resource_id ||
+      completion.program_id != slot->program.program_id ||
+      completion.adapter_instance_id != adapter_instance_id() ||
+      completion.capture_sequence !=
+          slot->host_frame.binding.capture_sequence) {
+    SetReason(reason, ReasonId::output_not_committed);
+    return StatusId::blocked;
+  }
+  if (!SameResource(resource, slot->host_frame.tokens.output) ||
+      !SameResource(resource, slot->output_resource) ||
+      resource.lifetime != hal::ResourceLifetime::frame_borrowed ||
+      resource.memory_domain != hal::MemoryDomain::readback_staging ||
+      resource.adapter_opaque[0] !=
+          static_cast<std::uint64_t>(slot - slots_.data()) + 1 ||
+      resource.adapter_opaque[1] != completion.capture_sequence ||
+      resource.adapter_opaque[2] != slot->host_frame.token_cookie ||
+      resource.adapter_opaque[3] != kHostOutputTokenSalt ||
+      slot->output.capture_sequence != completion.capture_sequence ||
+      (slot->output.boundary != MaxineOutputBoundary::final_readback &&
+       slot->output.boundary != MaxineOutputBoundary::cpu_tail_readback) ||
+      !slot->output.ValidHost() ||
+      !SameImageDescriptor(
+          slot->host_frame.binding.output_descriptor,
+          slot->program.stages[slot->program.stage_count - 1].output.image)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+
+  const auto &descriptor = slot->host_frame.binding.output_descriptor;
+  const auto &plane = slot->host_frame.binding.output_planes[0];
+  if (slot->output.width != descriptor.width ||
+      slot->output.height != descriptor.height ||
+      plane.row_stride_bytes != descriptor.planes[0].row_stride_bytes) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  const std::size_t row_bytes = static_cast<std::size_t>(descriptor.width) * 3u;
+  auto *destination = reinterpret_cast<std::uint8_t *>(plane.write_data);
+  for (std::uint32_t row = 0; row < descriptor.height; ++row) {
+    std::memmove(destination + row * plane.row_stride_bytes,
+                 slot->output.host_bgr + row * slot->output.stride_bytes,
+                 row_bytes);
+  }
+
+  resolution->descriptor = descriptor;
+  resolution->planes = slot->host_frame.binding.output_planes;
+  resolution->plane_count = slot->host_frame.binding.output_plane_count;
+  resolution->capture_sequence = completion.capture_sequence;
+  resolution->output_ready = true;
   return StatusId::ready;
 }
 
@@ -1078,12 +1471,20 @@ bool MaxineHalResidentAdapter::ResolveOutput(
       resource.adapter_opaque[0] > slots_.size())
     return false;
   const auto &slot = slots_[resource.adapter_opaque[0] - 1];
+  const bool neutral_output =
+      slot.host_frame.bound &&
+      SameResource(resource, slot.host_frame.tokens.output) &&
+      resource.adapter_opaque[1] == slot.output.capture_sequence &&
+      resource.adapter_opaque[2] == slot.host_frame.token_cookie &&
+      resource.adapter_opaque[3] == kHostOutputTokenSalt;
+  const bool compatibility_output =
+      resource.adapter_opaque[1] == slot.output.capture_sequence &&
+      resource.adapter_opaque[2] == slot.output_cookie &&
+      resource.adapter_opaque[3] ==
+          static_cast<std::uint64_t>(slot.output.boundary);
   if (!slot.occupied || !SameResource(resource, slot.output_resource) ||
       resource.resource_id != slot.output_resource_id ||
-      resource.adapter_opaque[1] != slot.output.capture_sequence ||
-      resource.adapter_opaque[2] != slot.output_cookie ||
-      resource.adapter_opaque[3] !=
-          static_cast<std::uint64_t>(slot.output.boundary)) {
+      (!neutral_output && !compatibility_output)) {
     return false;
   }
   *output = slot.output;

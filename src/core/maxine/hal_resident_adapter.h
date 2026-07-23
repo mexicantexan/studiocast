@@ -130,6 +130,16 @@ public:
           const hal::ExecuteRequest &request) noexcept override;
   hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &program,
                                    hal::ReasonId reason) noexcept override;
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override;
+  hal::StatusId
+  ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &resource,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override;
   void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override;
   void Shutdown() noexcept override;
 
@@ -148,6 +158,13 @@ public:
                 MaxineFrameOutputBinding *output) const noexcept;
 
 private:
+  struct HostFrameState {
+    bool bound = false;
+    hal::HostFrameBinding binding{};
+    hal::HostFrameTokens tokens{};
+    std::uint64_t token_cookie = 0;
+  };
+
   struct PreparedSlot {
     bool occupied = false;
     std::uint64_t handle_id = 0;
@@ -159,6 +176,7 @@ private:
     hal::ResourceHandle output_resource{};
     std::uint64_t output_resource_id = 0;
     std::uint64_t output_cookie = 0;
+    HostFrameState host_frame{};
   };
 
   [[nodiscard]] PreparedSlot *
@@ -176,6 +194,7 @@ private:
   [[nodiscard]] bool
   PopulateOutput(PreparedSlot &slot, std::uint64_t capture_sequence,
                  const ResidentFrameExecutionResult &execution,
+                 bool use_neutral_binding,
                  hal::ResourceHandle *resource) noexcept;
 
   MaxineHalAdapterConfiguration configuration_{};
@@ -187,6 +206,7 @@ private:
   std::uint64_t input_resource_id_ = 0;
   std::uint64_t input_cookie_ = 0;
   std::uint64_t next_nonce_ = 1;
+  std::uint64_t next_host_resource_id_ = 1;
   std::uint64_t next_output_resource_id_ = 1;
   bool stopped_ = false;
 };

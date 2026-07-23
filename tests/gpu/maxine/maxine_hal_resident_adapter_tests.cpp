@@ -236,6 +236,37 @@ struct HostFixture {
   }
 };
 
+struct NeutralHostFixture {
+  std::array<std::uint8_t, 64> input{};
+  std::array<std::uint8_t, 64> output{};
+
+  hal::HostFrameBinding Binding(const hal::PreparedProgram &program,
+                                std::uint64_t capture_sequence) {
+    hal::HostFrameBinding binding{};
+    binding.input_descriptor = program.stages[0].input.image;
+    binding.output_descriptor =
+        program.stages[program.stage_count - 1].output.image;
+    binding.input_planes[0].read_data =
+        reinterpret_cast<const std::byte *>(input.data());
+    binding.input_planes[0].span_bytes =
+        binding.input_descriptor.planes[0].size_bytes;
+    binding.input_planes[0].row_stride_bytes =
+        binding.input_descriptor.planes[0].row_stride_bytes;
+    binding.output_planes[0].write_data =
+        reinterpret_cast<std::byte *>(output.data());
+    binding.output_planes[0].span_bytes =
+        binding.output_descriptor.planes[0].size_bytes;
+    binding.output_planes[0].row_stride_bytes =
+        binding.output_descriptor.planes[0].row_stride_bytes;
+    binding.input_plane_count = 1;
+    binding.output_plane_count = 1;
+    binding.capture_sequence = capture_sequence;
+    binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+    binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+    return binding;
+  }
+};
+
 bool Configure(hal::PreparedProgramSession &session,
                MaxineHalResidentAdapter &adapter,
                const hal::PreparedProgram &program) {
@@ -509,6 +540,12 @@ bool StrictBackendProviderDomainAndGenerationReject() {
   CHECK(adapter.Prepare(missing_model, &handle, &readiness, &reason) ==
         hal::StatusId::blocked);
   CHECK(reason == hal::ReasonId::capability_evidence_incomplete);
+
+  auto malformed_descriptor = Program();
+  malformed_descriptor.stages[0].input.image.planes[0].size_bytes = 1;
+  CHECK(adapter.Prepare(malformed_descriptor, &handle, &readiness, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::malformed_descriptor);
 
   auto cross_adapter = Program();
   cross_adapter.stages[1].execution_domain.adapter_instance_id = 99;
@@ -789,6 +826,316 @@ bool MatteFingerprintTracksPreparedInvalidationIdentity() {
   return true;
 }
 
+bool NeutralHostBindingExecutesAndResolvesExactOutput() {
+  FakeResidentFrameExecutor executor{};
+  HooksFixture hooks{};
+  for (std::size_t index = 0; index < hooks.output.size(); ++index)
+    hooks.output[index] = static_cast<std::uint8_t>(index + 1);
+  MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                   hooks.Hooks(executor));
+  hal::PreparedProgramSession session{};
+  auto program = Program();
+  CHECK(Configure(session, adapter, program));
+
+  NeutralHostFixture host{};
+  const auto binding = host.Binding(program, 17);
+  hal::HostFrameTokens tokens{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(session.BindHostFrame(binding, &tokens, &reason) ==
+        hal::StatusId::ready);
+  CHECK(tokens.input.lifetime == hal::ResourceLifetime::frame_borrowed);
+  CHECK(tokens.output.lifetime == hal::ResourceLifetime::frame_borrowed);
+  CHECK(tokens.input.memory_domain == hal::MemoryDomain::upload_staging);
+  CHECK(tokens.output.memory_domain == hal::MemoryDomain::readback_staging);
+
+  hal::ExecuteRequest request{};
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = binding.capture_sequence;
+  request.input = tokens.input;
+  const auto result = session.Execute(request);
+  CHECK(result.status == hal::StatusId::executed);
+  CHECK(result.output_valid);
+  CHECK(result.output.resource_id == tokens.output.resource_id);
+  CHECK(result.transfers.uploads == 1);
+  CHECK(result.transfers.final_readbacks == 1);
+  CHECK(result.transfers.intermediate_uploads == 0);
+  CHECK(result.transfers.intermediate_readbacks == 0);
+
+  hal::HostFrameOutputResolution resolution{};
+  CHECK(session.ResolveHostFrameOutput(result.completion, result.output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::ready);
+  CHECK(resolution.output_ready);
+  CHECK(resolution.capture_sequence == binding.capture_sequence);
+  CHECK(resolution.plane_count == 1);
+  CHECK(resolution.planes[0].write_data == binding.output_planes[0].write_data);
+  for (std::size_t index = 0; index < 12; ++index)
+    CHECK(host.output[index] == hooks.output[index]);
+  CHECK(session.CommitOutput({result.completion, true}, &reason) ==
+        hal::StatusId::ready);
+
+  auto malformed = host.Binding(program, 18);
+  ++malformed.input_descriptor.width;
+  CHECK(session.BindHostFrame(malformed, &tokens, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::host_frame_binding_invalid);
+
+  auto reconfigured = program;
+  ++reconfigured.program_id;
+  ++reconfigured.invalidation_key.canonical_plan_hash;
+  CHECK(Configure(session, adapter, reconfigured));
+  CHECK(session.ResolveHostFrameOutput(result.completion, result.output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::output_not_committed);
+  session.Shutdown();
+  CHECK(session.BindHostFrame(host.Binding(reconfigured, 19), &tokens,
+                              &reason) == hal::StatusId::stopped);
+  CHECK(reason == hal::ReasonId::shutdown_requested);
+  return true;
+}
+
+bool NeutralHostTokensRejectStaleForeignGenerationAndDomain() {
+  FakeResidentFrameExecutor executor{};
+  HooksFixture hooks{};
+  MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                   hooks.Hooks(executor));
+  auto program = Program();
+  hal::PreparedProgramHandle handle{};
+  hal::ReadinessSnapshot readiness{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
+        hal::StatusId::ready);
+  NeutralHostFixture first_host{};
+  NeutralHostFixture second_host{};
+  hal::HostFrameTokens first{};
+  hal::HostFrameTokens second{};
+  CHECK(adapter.BindHostFrame(handle, first_host.Binding(program, 1), &first,
+                              &reason) == hal::StatusId::ready);
+  CHECK(adapter.BindHostFrame(handle, second_host.Binding(program, 2), &second,
+                              &reason) == hal::StatusId::ready);
+
+  hal::ExecuteRequest request{};
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = first.input;
+  CHECK(adapter.Execute(handle, request).reason ==
+        hal::ReasonId::invalid_resource);
+
+  request.capture_sequence = 2;
+  request.input = second.input;
+  auto malformed = request;
+  malformed.input.allocator_owner_id = 99;
+  CHECK(adapter.Execute(handle, malformed).reason ==
+        hal::ReasonId::foreign_adapter);
+  malformed = request;
+  --malformed.input.lifetime_generation;
+  CHECK(adapter.Execute(handle, malformed).reason ==
+        hal::ReasonId::wrong_generation);
+  malformed = request;
+  malformed.input.execution_domain.queue_or_stream_identity = 99;
+  CHECK(adapter.Execute(handle, malformed).reason ==
+        hal::ReasonId::wrong_execution_domain);
+  malformed = request;
+  malformed.input.adapter_opaque[2] ^= 1;
+  CHECK(adapter.Execute(handle, malformed).reason ==
+        hal::ReasonId::invalid_resource);
+
+  const auto result = adapter.Execute(handle, request);
+  CHECK(result.status == hal::StatusId::executed);
+  hal::HostFrameOutputResolution resolution{};
+  auto forged_output = result.output;
+  forged_output.allocator_owner_id = 99;
+  CHECK(adapter.ResolveHostFrameOutput(handle, result.completion, forged_output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::foreign_adapter);
+  forged_output = result.output;
+  --forged_output.lifetime_generation;
+  CHECK(adapter.ResolveHostFrameOutput(handle, result.completion, forged_output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::wrong_generation);
+  forged_output = result.output;
+  forged_output.execution_domain.queue_or_stream_identity = 99;
+  CHECK(adapter.ResolveHostFrameOutput(handle, result.completion, forged_output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::wrong_execution_domain);
+  forged_output = result.output;
+  forged_output.adapter_opaque[2] ^= 1;
+  CHECK(adapter.ResolveHostFrameOutput(handle, result.completion, forged_output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::host_frame_binding_invalid);
+
+  auto stale_completion = result.completion;
+  ++stale_completion.capture_sequence;
+  CHECK(adapter.ResolveHostFrameOutput(handle, stale_completion, result.output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::output_not_committed);
+  adapter.DestroyPrepared(&handle);
+  CHECK(adapter.ResolveHostFrameOutput(handle, result.completion, result.output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::stale);
+  CHECK(reason == hal::ReasonId::stale_program);
+  adapter.Shutdown();
+  CHECK(adapter.BindHostFrame(handle, first_host.Binding(program, 3), &first,
+                              &reason) == hal::StatusId::stopped);
+  return true;
+}
+
+bool DisabledOptionalStagesArePreservedWithoutExecution() {
+  HostFixture host{};
+  {
+    FakeResidentFrameExecutor executor{};
+    executor.FailStage(ResidentStageKind::denoise,
+                       ResidentBoundaryResult::runtime_failure);
+    HooksFixture hooks{};
+    MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                     hooks.Hooks(executor));
+    hal::PreparedProgramSession session{};
+    auto program = Program();
+    program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
+                              hal::SemanticEffectProviderId::maxine_vfx, false);
+    program.stages[1] =
+        Stage(2, hal::SemanticEffectId::vignette,
+              hal::SemanticEffectProviderId::maxine_cuda_utility, true);
+    CHECK(Configure(session, adapter, program));
+    auto first = session.Execute(Request(adapter, program, host.View(), 1));
+    CHECK(first.status == hal::StatusId::degraded);
+    hal::ReasonId reason = hal::ReasonId::none;
+    CHECK(session.CommitOutput({first.completion, true}, &reason) ==
+          hal::StatusId::ready);
+    CHECK(session.disabled_stage_mask() == 0x1);
+    const std::size_t calls_before = executor.calls().stage_count;
+    const auto second =
+        session.Execute(Request(adapter, program, host.View(), 2, 102));
+    CHECK(second.status == hal::StatusId::executed);
+    CHECK(second.stages[0].status ==
+          hal::StageExecutionStatus::disabled_preserved);
+    CHECK(second.stages[0].reason == hal::ReasonId::circuit_breaker_open);
+    CHECK(second.stages[0].valid_output_preserved);
+    CHECK(second.stages[0].elapsed_ns == 0);
+    CHECK(second.stages[1].status == hal::StageExecutionStatus::succeeded);
+    CHECK(executor.calls().stage_count == calls_before + 1);
+    CHECK(executor.calls().stage_kinds[calls_before] ==
+          ResidentStageKind::vignette);
+    CHECK(second.transfers.uploads == 1);
+    CHECK(second.transfers.final_readbacks == 1);
+    CHECK(second.output_valid);
+  }
+  {
+    FakeResidentFrameExecutor executor{};
+    executor.FailStage(ResidentStageKind::denoise,
+                       ResidentBoundaryResult::runtime_failure);
+    HooksFixture hooks{};
+    MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                     hooks.Hooks(executor));
+    hal::PreparedProgramSession session{};
+    auto program = Program();
+    program.stage_count = 1;
+    program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
+                              hal::SemanticEffectProviderId::maxine_vfx, false);
+    CHECK(Configure(session, adapter, program));
+    auto first = session.Execute(Request(adapter, program, host.View(), 1));
+    hal::ReasonId reason = hal::ReasonId::none;
+    CHECK(first.status == hal::StatusId::degraded);
+    CHECK(session.CommitOutput({first.completion, true}, &reason) ==
+          hal::StatusId::ready);
+    const std::size_t calls_before = executor.calls().stage_count;
+    const auto second =
+        session.Execute(Request(adapter, program, host.View(), 2, 102));
+    CHECK(second.status == hal::StatusId::executed);
+    CHECK(second.stages[0].status ==
+          hal::StageExecutionStatus::disabled_preserved);
+    CHECK(second.stages[0].elapsed_ns == 0);
+    CHECK(executor.calls().stage_count == calls_before);
+    CHECK(second.transfers.uploads == 1);
+    CHECK(second.transfers.final_readbacks == 1);
+    CHECK(second.output_valid);
+  }
+  return true;
+}
+
+bool RequiredDisableFailsClosedAndBreakerActionsAreTyped() {
+  HostFixture host{};
+  {
+    FakeResidentFrameExecutor executor{};
+    HooksFixture hooks{};
+    MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                     hooks.Hooks(executor));
+    auto program = Program();
+    program.stage_count = 1;
+    hal::PreparedProgramHandle handle{};
+    hal::ReadinessSnapshot readiness{};
+    hal::ReasonId reason = hal::ReasonId::none;
+    CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
+          hal::StatusId::ready);
+    auto request = Request(adapter, program, host.View(), 1);
+    auto malformed_mask = request;
+    malformed_mask.disabled_stage_mask = std::uint32_t{1} << 31;
+    CHECK(adapter.Execute(handle, malformed_mask).reason ==
+          hal::ReasonId::malformed_contract);
+    request.disabled_stage_mask = 0x1;
+    const auto result = adapter.Execute(handle, request);
+    CHECK(result.status == hal::StatusId::failed);
+    CHECK(result.reason == hal::ReasonId::circuit_breaker_open);
+    CHECK(!result.output_valid);
+    CHECK(executor.calls().upload == 0);
+    CHECK(executor.calls().stage_count == 0);
+    adapter.DestroyPrepared(&handle);
+  }
+  {
+    FakeResidentFrameExecutor executor{};
+    executor.FailStage(ResidentStageKind::denoise,
+                       ResidentBoundaryResult::runtime_failure);
+    HooksFixture hooks{};
+    MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                     hooks.Hooks(executor));
+    hal::PreparedProgramSession session{};
+    auto program = Program();
+    program.stage_count = 1;
+    program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
+                              hal::SemanticEffectProviderId::maxine_vfx, true);
+    program.stages[0].circuit_breaker.action =
+        hal::CircuitBreakerAction::quarantine_program;
+    CHECK(Configure(session, adapter, program));
+    const auto result =
+        session.Execute(Request(adapter, program, host.View(), 1));
+    CHECK(result.status == hal::StatusId::failed);
+    CHECK(session.quarantined());
+    CHECK(!session.rebuild_requested());
+  }
+  {
+    FakeResidentFrameExecutor executor{};
+    executor.FailStage(ResidentStageKind::denoise,
+                       ResidentBoundaryResult::runtime_failure);
+    HooksFixture hooks{};
+    MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                     hooks.Hooks(executor));
+    hal::PreparedProgramSession session{};
+    auto program = Program();
+    program.stage_count = 1;
+    program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
+                              hal::SemanticEffectProviderId::maxine_vfx, true);
+    program.stages[0].circuit_breaker.action =
+        hal::CircuitBreakerAction::request_rebuild;
+    CHECK(Configure(session, adapter, program));
+    const auto result =
+        session.Execute(Request(adapter, program, host.View(), 1));
+    CHECK(result.status == hal::StatusId::failed);
+    CHECK(session.rebuild_requested());
+    CHECK(!session.quarantined());
+    CHECK(session.Execute(Request(adapter, program, host.View(), 2, 102))
+              .status == hal::StatusId::stale);
+  }
+  return true;
+}
+
 bool ExecuteIsAllocationFreeAfterPrepare() {
   FakeResidentFrameExecutor executor{};
   HooksFixture hooks{};
@@ -827,6 +1174,69 @@ bool ExecuteIsAllocationFreeAfterPrepare() {
   return true;
 }
 
+bool NeutralDisabledFrameLoopIsAllocationFreeAfterPrepare() {
+  FakeResidentFrameExecutor executor{};
+  executor.FailStage(ResidentStageKind::denoise,
+                     ResidentBoundaryResult::runtime_failure);
+  HooksFixture hooks{};
+  MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                   hooks.Hooks(executor));
+  hal::PreparedProgramSession session{};
+  auto program = Program();
+  program.stage_count = 1;
+  program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
+                            hal::SemanticEffectProviderId::maxine_vfx, false);
+  CHECK(Configure(session, adapter, program));
+  NeutralHostFixture host{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  hal::HostFrameTokens tokens{};
+  CHECK(session.BindHostFrame(host.Binding(program, 1), &tokens, &reason) ==
+        hal::StatusId::ready);
+  hal::ExecuteRequest request{};
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = tokens.input;
+  auto warm = session.Execute(request);
+  CHECK(warm.status == hal::StatusId::degraded);
+  hal::HostFrameOutputResolution resolution{};
+  CHECK(session.ResolveHostFrameOutput(warm.completion, warm.output,
+                                       &resolution,
+                                       &reason) == hal::StatusId::ready);
+  CHECK(session.CommitOutput({warm.completion, true}, &reason) ==
+        hal::StatusId::ready);
+  CHECK(session.disabled_stage_mask() == 0x1);
+
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations = true;
+  bool succeeded = true;
+  for (std::uint64_t sequence = 2; sequence != 130; ++sequence) {
+    if (session.BindHostFrame(host.Binding(program, sequence), &tokens,
+                              &reason) != hal::StatusId::ready) {
+      succeeded = false;
+      break;
+    }
+    request.capture_sequence = sequence;
+    request.input = tokens.input;
+    const auto result = session.Execute(request);
+    if (result.status != hal::StatusId::executed ||
+        result.stages[0].status !=
+            hal::StageExecutionStatus::disabled_preserved ||
+        session.ResolveHostFrameOutput(result.completion, result.output,
+                                       &resolution,
+                                       &reason) != hal::StatusId::ready ||
+        session.CommitOutput({result.completion, true}, &reason) !=
+            hal::StatusId::ready) {
+      succeeded = false;
+      break;
+    }
+  }
+  g_count_allocations = false;
+  CHECK(succeeded);
+  CHECK(g_allocations.load(std::memory_order_relaxed) == 0);
+  return true;
+}
+
 } // namespace
 
 void *operator new(std::size_t size) { return Allocate(size); }
@@ -850,7 +1260,12 @@ int main() {
       AutoFrameRequiresDeclaredCpuTailAndTemporalNeedsResetHook,
       AuthoritativeTelemetryIsMandatoryAndRejectsHiddenBoundaries,
       MatteFingerprintTracksPreparedInvalidationIdentity,
+      NeutralHostBindingExecutesAndResolvesExactOutput,
+      NeutralHostTokensRejectStaleForeignGenerationAndDomain,
+      DisabledOptionalStagesArePreservedWithoutExecution,
+      RequiredDisableFailsClosedAndBreakerActionsAreTyped,
       ExecuteIsAllocationFreeAfterPrepare,
+      NeutralDisabledFrameLoopIsAllocationFreeAfterPrepare,
   };
   for (const auto test : tests) {
     if (!test())
