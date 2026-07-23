@@ -143,7 +143,8 @@ set(_studiocast_video_io_sources
 set(_studiocast_vulkan_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_eye_contact.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_matting_setup_policy.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_video_noise_removal.cpp)
+        ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_video_noise_removal.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/hal_resident_adapter.cpp)
 
 set(_studiocast_vulkan_backend_optional_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_runtime.cpp
@@ -281,6 +282,7 @@ target_link_libraries(studiocast_open_video_backend
 target_link_libraries(studiocast_vulkan_backend
         PUBLIC
         studiocast_contracts
+        studiocast_hal_contracts
         studiocast_model_support
         studiocast_video_support
         PRIVATE studiocast_util)
@@ -516,7 +518,7 @@ studiocast_assert_direct_dependencies(studiocast_open_video_backend
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_vulkan_backend
         PUBLIC_STUDIOCAST_DEPS
-        studiocast_contracts studiocast_model_support
+        studiocast_contracts studiocast_hal_contracts studiocast_model_support
         studiocast_video_support
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_audio_runtime
@@ -574,7 +576,7 @@ set(_studiocast_expected_sources
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 113)
+set(_studiocast_expected_source_count 114)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

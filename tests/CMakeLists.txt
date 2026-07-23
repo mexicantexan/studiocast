@@ -889,6 +889,33 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-vulkan-capability-audit-tests
             unit video gpu vulkan installer)
 
+    add_executable(studiocast-vulkan-hal-resident-adapter-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_hal_resident_adapter_tests.cpp
+    )
+
+    target_link_libraries(studiocast-vulkan-hal-resident-adapter-tests PRIVATE
+            studiocast_vulkan_backend
+    )
+
+    target_include_directories(studiocast-vulkan-hal-resident-adapter-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-vulkan-hal-resident-adapter-tests)
+    studiocast_enable_sanitizers(studiocast-vulkan-hal-resident-adapter-tests)
+
+    set_target_properties(studiocast-vulkan-hal-resident-adapter-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-vulkan-hal-resident-adapter-tests
+            COMMAND studiocast-vulkan-hal-resident-adapter-tests)
+    studiocast_set_test_labels(studiocast-vulkan-hal-resident-adapter-tests
+            unit video gpu vulkan)
+
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
         add_executable(studiocast-vulkan-kernel-tests
                 ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_kernel_tests.cpp
