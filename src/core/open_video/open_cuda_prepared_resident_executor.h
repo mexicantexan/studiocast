@@ -1,0 +1,230 @@
+#pragma once
+
+#include "core/cuda/cuda_driver_api.h"
+#include "core/cuda/cuda_prepared_transfer_completion.h"
+#include "core/hal/prepared_program.h"
+#include "core/open_video/model_pack_registry.h"
+#include "core/open_video/open_cuda_hal_adapter.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+namespace studiocast::open_cuda {
+
+inline constexpr std::uint32_t kPreparedOpenCudaRuntimeApiVersion = 1;
+
+// Stable executor/runtime outcomes. These are deliberately independent of
+// CUDA and ONNX Runtime error values so frame-time code never parses strings.
+enum class PreparedOpenCudaRuntimeStatus : std::uint16_t {
+  invalid = 0,
+  ready = 1,
+  executed = 2,
+  optional_failed_open = 3,
+  required_failed = 4,
+  malformed_contract = 5,
+  unsupported_effect = 6,
+  wrong_provider = 7,
+  wrong_execution_domain = 8,
+  stale_generation = 9,
+  stale_artifact = 10,
+  resource_exhausted = 11,
+  not_prepared = 12,
+  foreign_handle = 13,
+  host_binding_invalid = 14,
+  preprocess_failed = 15,
+  inference_failed = 16,
+  postprocess_failed = 17,
+  transfer_failed = 18,
+  synchronization_failed = 19,
+  timeout = 20,
+  stop_requested = 21,
+  cancelled = 22,
+  device_lost = 23,
+  quarantined = 24,
+  shutdown = 25,
+  completion_pending = 26,
+};
+
+struct PreparedOpenCudaRuntimeHandle {
+  std::uint64_t handle_id = 0;
+  std::uint64_t program_id = 0;
+  hal::ProgramInvalidationKey invalidation_key{};
+  hal::ExecutionDomainId execution_domain{};
+  std::array<std::uint64_t, 2> opaque{};
+};
+
+struct PreparedOpenCudaProductionConfig {
+  cuda::CudaDriverApi *driver = nullptr;
+  cuda::CUstream prepared_stream = nullptr;
+  const open_video::ModelPack *model_pack = nullptr;
+  open_video::ValidatedModelArtifactIdentity model_artifact{};
+  int cuda_device_id = 0;
+  std::uint64_t adapter_instance_id = 0;
+  std::uint64_t stream_identity = 0;
+  std::uint64_t configuration_generation = 0;
+  std::uint64_t model_preprocess_generation = 0;
+  std::uint64_t model_artifact_hash = 0;
+  bool executor_owns_stream = false;
+  int blur_radius = 16;
+  int alpha_feather_radius = 0;
+  std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
+  cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
+};
+
+struct PreparedOpenCudaRuntimeEvidence {
+  std::uint32_t api_version = kPreparedOpenCudaRuntimeApiVersion;
+  PreparedOpenCudaRuntimeStatus status = PreparedOpenCudaRuntimeStatus::invalid;
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
+  hal::SemanticEffectProviderId provider =
+      hal::SemanticEffectProviderId::invalid;
+  hal::ExecutionDomainId execution_domain{};
+  open_video::ValidatedModelArtifactIdentity model_artifact{};
+  hal::ResourceBudget reserved_budget{};
+  bool strict_cuda_only = false;
+  bool user_stream_bound = false;
+  bool cpu_provider_fallback_disabled = false;
+  bool reusable_resources_prepared = false;
+  bool setup_warmup_complete = false;
+  bool inference_only_frame_path = false;
+  bool device_preprocess = false;
+  bool device_postprocess = false;
+  bool one_upload_one_readback = false;
+  bool no_intermediate_crossings = false;
+  bool single_in_flight = false;
+};
+
+struct PreparedOpenCudaRuntimePrepareResult {
+  PreparedOpenCudaRuntimeStatus status = PreparedOpenCudaRuntimeStatus::invalid;
+  hal::ReasonId reason = hal::ReasonId::capability_evidence_incomplete;
+  PreparedOpenCudaRuntimeHandle handle{};
+  PreparedOpenCudaRuntimeEvidence evidence{};
+};
+
+struct PreparedOpenCudaRuntimeFrame {
+  std::uint32_t api_version = kPreparedOpenCudaRuntimeApiVersion;
+  std::uint64_t capture_sequence = 0;
+  const std::byte *input = nullptr;
+  std::byte *output = nullptr;
+  std::size_t input_span_bytes = 0;
+  std::size_t output_span_bytes = 0;
+  std::size_t input_row_stride_bytes = 0;
+  std::size_t output_row_stride_bytes = 0;
+  bool stage_disabled = false;
+  bool stage_required = false;
+  hal::FailureAction failure_action = hal::FailureAction::fail_closed;
+};
+
+struct PreparedOpenCudaRuntimeFrameResult {
+  std::uint32_t api_version = kPreparedOpenCudaRuntimeApiVersion;
+  PreparedOpenCudaRuntimeStatus status = PreparedOpenCudaRuntimeStatus::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  // Policy outcome remains optional_failed_open/required_failed while this
+  // fixed status preserves the exact resident operation that failed.
+  PreparedOpenCudaRuntimeStatus stage_failure_status =
+      PreparedOpenCudaRuntimeStatus::invalid;
+  hal::ReasonId stage_failure_reason = hal::ReasonId::none;
+  hal::TransferCounters transfers{};
+  std::uint64_t stage_elapsed_ns = 0;
+  std::uint64_t frame_elapsed_ns = 0;
+  bool output_valid = false;
+  bool valid_input_preserved = false;
+  bool analysis_ran = false;
+  bool inference_only_path = false;
+};
+
+struct PreparedOpenCudaRuntimeTelemetry {
+  std::uint64_t allocation_requests = 0;
+  std::uint64_t provider_probes = 0;
+  std::uint64_t model_scans = 0;
+  std::uint64_t manifest_parses = 0;
+  std::uint64_t session_constructions = 0;
+  std::uint64_t json_serializations = 0;
+};
+
+// Fixed, injectable production seam. Prepare/Destroy may allocate and inspect
+// already-selected model metadata. ExecuteFrame must be allocation-, probe-,
+// session-, model-scan-, manifest-, and JSON-free.
+class IPreparedOpenCudaRuntime {
+public:
+  virtual ~IPreparedOpenCudaRuntime() = default;
+
+  virtual PreparedOpenCudaRuntimePrepareResult
+  Prepare(const hal::PreparedProgram &program,
+          const PreparedOpenCudaProductionConfig &config) noexcept = 0;
+  virtual PreparedOpenCudaRuntimeFrameResult
+  ExecuteFrame(const PreparedOpenCudaRuntimeHandle &handle,
+               const PreparedOpenCudaRuntimeFrame &frame) noexcept = 0;
+  virtual PreparedOpenCudaRuntimeStatus
+  ResetTemporalState(const PreparedOpenCudaRuntimeHandle &handle,
+                     hal::ReasonId reason) noexcept = 0;
+  // A pending return means asynchronous DMA may still reference prepared
+  // resources. The runtime retains them and retries on a later Shutdown().
+  virtual PreparedOpenCudaRuntimeStatus
+  DestroyPrepared(PreparedOpenCudaRuntimeHandle *handle) noexcept = 0;
+  virtual void Shutdown() noexcept = 0;
+  [[nodiscard]] virtual PreparedOpenCudaRuntimeTelemetry
+  Telemetry() const noexcept = 0;
+};
+
+class OpenCudaPreparedResidentExecutor final
+    : public IPreparedResidentExecutor {
+public:
+  struct Options {
+    cuda::CudaDriverApi *driver = nullptr;
+    // The adapter owns this already-created stream for the executor lifetime.
+    // stream_identity must be its exact process-local uintptr_t value.
+    cuda::CUstream prepared_stream = nullptr;
+    open_video::ModelPack model_pack{};
+    open_video::ValidatedModelArtifactIdentity model_artifact{};
+    int cuda_device_id = 0;
+    std::uint64_t adapter_instance_id = 0;
+    std::uint64_t stream_identity = 0;
+    std::uint64_t configuration_generation = 0;
+    std::uint64_t model_preprocess_generation = 0;
+    std::uint64_t model_artifact_hash = 0;
+    bool executor_owns_stream = false;
+    int blur_radius = 16;
+    int alpha_feather_radius = 0;
+    std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
+    cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
+    // Null selects the production CUDA/ORT implementation.
+    IPreparedOpenCudaRuntime *runtime = nullptr;
+  };
+
+  explicit OpenCudaPreparedResidentExecutor(Options options);
+  ~OpenCudaPreparedResidentExecutor() override;
+
+  OpenCudaPreparedResidentExecutor(const OpenCudaPreparedResidentExecutor &) =
+      delete;
+  OpenCudaPreparedResidentExecutor &
+  operator=(const OpenCudaPreparedResidentExecutor &) = delete;
+
+  ExecutorPrepareResult
+  Prepare(const hal::PreparedProgram &program) noexcept override;
+  hal::ExecuteResult
+  Execute(const PreparedExecutorHandle &program,
+          const hal::ExecuteRequest &request) noexcept override;
+  hal::StatusId BindHostFrame(const PreparedExecutorHandle &program,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override;
+  hal::StatusId
+  ResolveHostFrameOutput(const PreparedExecutorHandle &program,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &output,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override;
+  hal::StatusId ResetTemporalState(const PreparedExecutorHandle &program,
+                                   hal::ReasonId reason) noexcept override;
+  void DestroyPrepared(PreparedExecutorHandle *program) noexcept override;
+  void Shutdown() noexcept override;
+  [[nodiscard]] ExecutorTelemetrySnapshot Telemetry() const noexcept override;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace studiocast::open_cuda
