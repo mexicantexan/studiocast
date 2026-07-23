@@ -18,6 +18,7 @@
 #include "core/maxine/production_resident_frame_executor.h"
 #include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
+#include "core/video/prepared_hardware_execution_owner.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
@@ -551,6 +552,10 @@ struct CameraPipelineStatus {
   // effect has been bypassed and the frame loop is continuing pass-through.
   DegradedEffect degraded_effect{};
 
+  // Typed status for the bounded prepared-hardware migration. This remains
+  // additive and is not serialized into the existing daemon IPC schema.
+  PreparedHardwareExecutionSnapshot prepared_hardware_execution{};
+
   std::string last_error;
 };
 
@@ -687,6 +692,7 @@ private:
   CameraPipelineStatus::OpenCudaTransfers open_cuda_transfers_{};
   CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
+  PreparedHardwareExecutionSnapshot prepared_hardware_execution_{};
 
   // Effects: updated live by SetEffects.
   //

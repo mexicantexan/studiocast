@@ -1166,6 +1166,7 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_cuda_transfers = open_cuda_transfers_;
     s.open_vulkan_transfers = open_vulkan_transfers_;
     s.maxine_transfers = maxine_transfers_;
+    s.prepared_hardware_execution = prepared_hardware_execution_;
   } else {
     // Avoid exposing stale negotiated formats when the pipeline is idle.
     //
@@ -1192,6 +1193,7 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_cuda_transfers = CameraPipelineStatus::OpenCudaTransfers{};
     s.open_vulkan_transfers = CameraPipelineStatus::OpenVulkanTransfers{};
     s.maxine_transfers = CameraPipelineStatus::MaxineTransfers{};
+    s.prepared_hardware_execution = PreparedHardwareExecutionSnapshot{};
   }
   s.frame_index = frame_index_;
   // Live attribution is meaningful only while a successfully-started pipeline
@@ -1288,6 +1290,7 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   open_cuda_transfers_ = CameraPipelineStatus::OpenCudaTransfers{};
   open_vulkan_transfers_ = CameraPipelineStatus::OpenVulkanTransfers{};
   maxine_transfers_ = CameraPipelineStatus::MaxineTransfers{};
+  prepared_hardware_execution_ = PreparedHardwareExecutionSnapshot{};
 
   effects_backends_.clear();
   effects_note_.clear();
@@ -2087,8 +2090,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
   std::vector<std::uint8_t> rgbScaled;
   if (outA.width > 0 && outA.height > 0) {
-    rgbScaled.reserve(static_cast<std::size_t>(outA.width) *
-                      static_cast<std::size_t>(outA.height) * 3u);
+    // Prepared final-output adapters borrow this fixed writer buffer. Size it
+    // during setup so their frame path never grows the vector.
+    rgbScaled.resize(static_cast<std::size_t>(outA.width) *
+                     static_cast<std::size_t>(outA.height) * 3u);
   }
   Rgb24BilinearResizePlan cpuResizePlan;
 
@@ -8540,6 +8545,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::uint64_t maxine_resident_setup_successes = 0;
 
   LiveEffectBackendAttribution live_effect_attribution;
+  PreparedHardwareExecutionOwner prepared_hardware_owner;
+  bool prepared_hardware_final_live = false;
+  bool prepared_hardware_runtime_suspended = false;
+  std::uint64_t prepared_hardware_geometry_generation = 1;
+  auto publish_prepared_hardware_status = [&] {
+    const auto snapshot = prepared_hardware_owner.Snapshot();
+    std::lock_guard<std::mutex> lock(mu_);
+    prepared_hardware_execution_ = snapshot;
+  };
 
   enum class OptionalEffectSlot : std::size_t {
     denoise = 0,
@@ -9648,11 +9662,87 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 #endif
 
+    // First bounded live HAL migration: one adapter owns the complete final
+    // resident island, and only the already-qualified fixed-center vignette
+    // and mirror semantics may enter it. Any other stage, tracked-center
+    // semantics, or non-tight RGB writer layout stays on the retained path.
+    {
+      const std::string vignette_id(
+          studiocast::video::effects::contract::kEffectIdVignette);
+      const std::string mirror_id(
+          studiocast::video::effects::contract::kEffectIdMirror);
+      const bool contains_unqualified_stage = std::any_of(
+          plan.ordered_effect_ids.begin(), plan.ordered_effect_ids.end(),
+          [&](const std::string &id) {
+            return id != vignette_id && id != mirror_id;
+          });
+      const std::size_t tight_output_bytes =
+          static_cast<std::size_t>(outA.width) *
+          static_cast<std::size_t>(outA.height) * 3u;
+      const std::size_t tight_input_stride =
+          static_cast<std::size_t>(capA.width) * 3u;
+      const std::size_t tight_input_bytes =
+          tight_input_stride * static_cast<std::size_t>(capA.height);
+      PreparedFinalHardwareRequest request;
+      request.requested_backend =
+          cfg.compute_backend == ComputeBackendPreference::vulkan
+              ? hal::BackendId::vulkan
+              : hal::BackendId::invalid;
+      request.strict_backend_selection =
+          cfg.compute_backend == ComputeBackendPreference::vulkan;
+      request.request_fixed_center_vignette = has(vignette_id);
+      request.request_mirror = has(mirror_id);
+      request.contains_unqualified_stage = contains_unqualified_stage;
+      request.tracked_vignette_center =
+          request.request_fixed_center_vignette &&
+          fx.vignette.center_on_tracked_face;
+      request.host_input_is_tight_rgb24 =
+          rgbStride == tight_input_stride && rgb.size() == tight_input_bytes;
+      request.host_output_is_tight_rgb24 =
+          outA.format == PixelFormat::rgb24 &&
+          outA.bytes_per_line ==
+              static_cast<std::size_t>(outA.width) * 3u &&
+          outA.size_image == tight_output_bytes;
+      request.input_width = static_cast<std::uint32_t>(capA.width);
+      request.input_height = static_cast<std::uint32_t>(capA.height);
+      request.output_width = static_cast<std::uint32_t>(outA.width);
+      request.output_height = static_cast<std::uint32_t>(outA.height);
+      request.vignette_intensity_percent = fx.vignette.intensity;
+      request.generations.configuration = effects_generation;
+      request.generations.geometry =
+          prepared_hardware_geometry_generation;
+
+      const auto setup = prepared_hardware_owner.ConfigureFinal(request);
+      prepared_hardware_final_live =
+          setup.route == PreparedHardwareRoute::hal_live;
+      prepared_hardware_runtime_suspended = false;
+      if (prepared_hardware_final_live) {
+        const auto &active = prepared_hardware_owner.active_request();
+        have_open_vulkan_vignette =
+            active.request_fixed_center_vignette;
+        want_open_vulkan_vignette =
+            active.request_fixed_center_vignette;
+        have_open_vulkan_mirror = active.request_mirror;
+        want_open_vulkan_mirror = active.request_mirror;
+        compute_available.vulkan_available = true;
+        if (active.request_fixed_center_vignette)
+          set_backend(vignette_id, "open_vulkan");
+        if (active.request_mirror)
+          set_backend(mirror_id, "open_vulkan");
+        append_note(
+            "Open Vulkan HAL: prepared final resident section owns one "
+            "upload, fixed-center vignette/mirror execution, and one final "
+            "readback.");
+      }
+      publish_prepared_hardware_status();
+    }
+
     // Vignette final-output stage. Compatible explicit Vulkan requests run the
     // fixed-center device-resident implementation after output geometry and
     // before mirror. Other backends retain their existing attachment behavior.
     if (has(studiocast::video::effects::contract::kEffectIdVignette) &&
-        cfg.compute_backend == ComputeBackendPreference::vulkan) {
+        cfg.compute_backend == ComputeBackendPreference::vulkan &&
+        !prepared_hardware_final_live) {
       const std::string stage_id =
           std::string(studiocast::video::effects::contract::kEffectIdVignette);
       want_open_vulkan_vignette = true;
@@ -9712,7 +9802,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       compute_available.vulkan_unavailable_reason = vk_err;
       remove_stage_from_plan(stage_id);
 #endif
-    } else if (has(studiocast::video::effects::contract::kEffectIdVignette) &&
+    } else if (!prepared_hardware_final_live &&
+               has(studiocast::video::effects::contract::kEffectIdVignette) &&
                plan.vignette_attach_to_effect_id.empty()) {
       const bool have_any_maxine_gpu_stage =
           have_maxine_eye_contact || have_maxine_bg_blur ||
@@ -9744,7 +9835,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (has(studiocast::video::effects::contract::kEffectIdMirror)) {
       const std::string stage_id =
           std::string(studiocast::video::effects::contract::kEffectIdMirror);
-      if (cfg.compute_backend == ComputeBackendPreference::vulkan) {
+      if (cfg.compute_backend == ComputeBackendPreference::vulkan &&
+          !prepared_hardware_final_live) {
         want_open_vulkan_mirror = true;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
         std::string vk_err;
@@ -9798,7 +9890,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         compute_available.vulkan_unavailable_reason = vk_err;
         remove_stage_from_plan(stage_id);
 #endif
-      } else {
+      } else if (!prepared_hardware_final_live) {
         remove_stage_from_plan(stage_id);
       }
     }
@@ -10401,6 +10493,25 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
     if (need > 0)
       outBuf.resize(need);
+    if (outA.width > 0 && outA.height > 0) {
+      rgbScaled.resize(static_cast<std::size_t>(outA.width) *
+                       static_cast<std::size_t>(outA.height) * 3u);
+    }
+    if (prepared_hardware_final_live) {
+      prepared_hardware_owner.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+      prepared_hardware_final_live = false;
+      have_open_vulkan_vignette = false;
+      have_open_vulkan_mirror = false;
+      publish_prepared_hardware_status();
+    }
+    ++prepared_hardware_geometry_generation;
+    if (prepared_hardware_geometry_generation == 0)
+      prepared_hardware_geometry_generation = 1;
+    // The next frame must rebuild against the renegotiated layout. This also
+    // prepares the retained legacy final stage when the new layout is not HAL
+    // eligible; no silently missing vignette/mirror interval is permitted.
+    appliedEffectsGeneration = 0;
     ResizeYuyvConversionScratch();
     ZeroRgbOutputPadding();
     raw_yuyv_plan =
@@ -10613,6 +10724,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     DeferredGpuOut deferred_gpu_out{};
     bool have_deferred_gpu_out = false;
+    hal::CompletionToken prepared_hardware_completion{};
+    bool prepared_hardware_completion_pending = false;
     bool open_cuda_gpu_frame_pending_cpu_readback = false;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     bool open_vulkan_vignette_attempt_this_frame = false;
@@ -10967,11 +11080,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const EffectStage vig_attach = frame_plan.vignette_attachment;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       open_vulkan_vignette_attempt_this_frame =
-          have_open_vulkan_vignette && vignette_requested &&
+          !prepared_hardware_final_live && have_open_vulkan_vignette &&
+          vignette_requested &&
           optional_breaker(OptionalEffectSlot::vignette)
               .AllowsAttempt(f.sequence);
       open_vulkan_mirror_attempt_this_frame =
-          have_open_vulkan_mirror &&
+          !prepared_hardware_final_live && have_open_vulkan_mirror &&
           frame_plan.Contains(EffectStage::mirror) &&
           optional_breaker(OptionalEffectSlot::mirror)
               .AllowsAttempt(f.sequence);
@@ -12642,7 +12756,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     // Final-output vignette/mirror requests enter the same resident block as
     // earlier Vulkan stages. Otherwise upload the post-analysis CPU frame once
     // here; resize, vignette, and mirror are batched below.
-    if ((open_vulkan_vignette_attempt_this_frame ||
+    if (!prepared_hardware_final_live &&
+        (open_vulkan_vignette_attempt_this_frame ||
          open_vulkan_mirror_attempt_this_frame) &&
         !have_deferred_gpu_out) {
       std::string final_err;
@@ -12703,6 +12818,59 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const std::uint8_t *rgbOut = rgb.data();
     std::size_t rgbOutStride = rgbStride;
     std::size_t rgbOutBytes = rgb.size();
+
+    if (prepared_hardware_final_live &&
+        !prepared_hardware_runtime_suspended) {
+      const std::size_t tight_stride = static_cast<std::size_t>(outW) * 3u;
+      const std::size_t tight_bytes =
+          tight_stride * static_cast<std::size_t>(outH);
+      const auto prepared_frame = prepared_hardware_owner.ExecuteHostFrame(
+          rgb.data(), rgb.size(), rgbStride, rgbScaled.data(), tight_bytes,
+          tight_stride, f.sequence);
+      publish_prepared_hardware_status();
+      prepared_hardware_completion = prepared_frame.completion;
+      prepared_hardware_completion_pending =
+          prepared_frame.completion_pending;
+      if (prepared_frame.output_ready &&
+          prepared_frame.output == rgbScaled.data() &&
+          prepared_frame.output_size_bytes == tight_bytes &&
+          prepared_frame.output_row_stride_bytes == tight_stride) {
+        frameW = outW;
+        frameH = outH;
+        rgbOut = prepared_frame.output;
+        rgbOutStride = prepared_frame.output_row_stride_bytes;
+        rgbOutBytes = prepared_frame.output_size_bytes;
+      } else if (prepared_hardware_completion_pending) {
+        hal::ReasonId reason = hal::ReasonId::none;
+        (void)prepared_hardware_owner.CommitOutput(
+            prepared_hardware_completion, false, &reason);
+        prepared_hardware_completion_pending = false;
+        publish_prepared_hardware_status();
+      }
+      if (!prepared_frame.output_ready) {
+        prepared_hardware_runtime_suspended = true;
+        const auto &active = prepared_hardware_owner.active_request();
+        const std::string failure =
+            "Prepared Vulkan HAL runtime failure [" +
+            std::string(PreparedHardwareReasonCode(prepared_frame.reason)) +
+            "].";
+        if (active.request_fixed_center_vignette) {
+          block_optional_effect(
+              OptionalEffectSlot::vignette,
+              studiocast::video::effects::contract::kEffectIdVignette,
+              "open_vulkan", failure, f.sequence);
+        }
+        if (active.request_mirror) {
+          block_optional_effect(
+              OptionalEffectSlot::mirror,
+              studiocast::video::effects::contract::kEffectIdMirror,
+              "open_vulkan", failure, f.sequence);
+        }
+      }
+      // No legacy Vulkan retry is attempted here. Optional-stage or device
+      // failure leaves the last valid CPU frame intact; typed HAL status
+      // carries the exact blocker and the ordinary output transport continues.
+    }
 
     // If we deferred GPU readback, perform GPU resize (bilinear) to output
     // dimensions and do a single GPU->CPU transfer for the final output buffer.
@@ -13590,6 +13758,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const double scale_ms =
         scaling_needed ? ToMs(t_scale_end - t_scale_start) : 0.0;
 
+    const auto finish_prepared_hardware_frame =
+        [&](bool output_write_succeeded) {
+          if (!prepared_hardware_completion_pending)
+            return true;
+          hal::ReasonId reason = hal::ReasonId::none;
+          const hal::StatusId status = prepared_hardware_owner.CommitOutput(
+              prepared_hardware_completion, output_write_succeeded, &reason);
+          prepared_hardware_completion_pending = false;
+          publish_prepared_hardware_status();
+          return output_write_succeeded && status == hal::StatusId::ready;
+        };
+
     // Output pacing: enforce negotiated output FPS when we're ahead of
     // schedule to avoid bursty cadence (helps browser/WebRTC capture).
     if (pace_period != Clock::duration::zero()) {
@@ -13620,8 +13800,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       next_pace_deadline += pace_period;
     }
 
-    if (stop_.load())
+    if (stop_.load()) {
+      (void)finish_prepared_hardware_frame(false);
       break;
+    }
 
     const auto t_write_start = Clock::now();
 
@@ -13630,6 +13812,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             appliedEffectsGeneration) {
       // An effect change raced with this prepared raw frame. Drop it before
       // the write boundary; the next loop rebuilds and uses the RGB path.
+      (void)finish_prepared_hardware_frame(false);
       continue;
     }
 
@@ -13674,6 +13857,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const FrameWriteResult write_result =
         writer_.WriteFrameDetailed(output_data, output_bytes, &stop_);
     if (write_result.status == FrameWriteStatus::stopped) {
+      (void)finish_prepared_hardware_frame(false);
       live_effect_attribution.DiscardFrame();
       std::lock_guard<std::mutex> lock(mu_);
       PublishWriterCountersLocked();
@@ -13682,6 +13866,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (write_result.status == FrameWriteStatus::would_block_dropped) {
       // Zero-queue latest-frame policy: this frame is discarded and the next
       // capture replaces it. Do not probe or format an error on this path.
+      (void)finish_prepared_hardware_frame(false);
       live_effect_attribution.DiscardFrame();
       {
         std::lock_guard<std::mutex> lock(mu_);
@@ -13693,17 +13878,69 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       // A consumer-driven format change is the sole write failure that may
       // trigger an in-place refresh. Transport/disconnect and partial-frame
       // failures remain fatal and visible.
-      if (write_result.ShouldRefreshFormat() &&
-          RefreshOutputActual("write_format_mismatch")) {
-        ++output_write_recoveries;
-        live_effect_attribution.DiscardFrame();
-        continue;
+      if (write_result.ShouldRefreshFormat()) {
+        (void)finish_prepared_hardware_frame(false);
+        if (RefreshOutputActual("write_format_mismatch")) {
+          ++output_write_recoveries;
+          live_effect_attribution.DiscardFrame();
+          continue;
+        }
       }
+      (void)finish_prepared_hardware_frame(false);
       const std::string werr = DescribeFrameWriteResult(write_result);
       std::lock_guard<std::mutex> lock(mu_);
       PublishWriterCountersLocked();
       last_error_ = "Write failed: " + werr;
       break;
+    }
+
+    if (prepared_hardware_completion_pending) {
+      if (!finish_prepared_hardware_frame(true)) {
+        live_effect_attribution.DiscardFrame();
+        std::lock_guard<std::mutex> lock(mu_);
+        last_error_ =
+            "Prepared hardware output attribution commit failed after writer "
+            "success.";
+        break;
+      }
+      const auto committed =
+          prepared_hardware_owner.Snapshot().latest_committed_frame;
+      for (std::size_t index = 0; index < committed.stage_count; ++index) {
+        const auto &stage = committed.stages[index];
+        if (stage.status != hal::StageExecutionStatus::succeeded) {
+          if (stage.status ==
+              hal::StageExecutionStatus::optional_failed_open) {
+            const std::string failure =
+                "Prepared Vulkan HAL optional stage failed open [" +
+                std::string(PreparedHardwareReasonCode(stage.reason)) + "].";
+            if (stage.semantic == hal::SemanticEffectId::vignette) {
+              block_optional_effect(
+                  OptionalEffectSlot::vignette,
+                  studiocast::video::effects::contract::kEffectIdVignette,
+                  "open_vulkan", failure, f.sequence);
+            } else if (stage.semantic == hal::SemanticEffectId::mirror) {
+              block_optional_effect(
+                  OptionalEffectSlot::mirror,
+                  studiocast::video::effects::contract::kEffectIdMirror,
+                  "open_vulkan", failure, f.sequence);
+            }
+          }
+          continue;
+        }
+        if (stage.semantic == hal::SemanticEffectId::vignette) {
+          clear_optional_effect_on_success(
+              optional_breaker(OptionalEffectSlot::vignette), f.sequence);
+          mark_live_effect_success(
+              studiocast::video::effects::contract::kEffectIdVignette,
+              "open_vulkan");
+        } else if (stage.semantic == hal::SemanticEffectId::mirror) {
+          clear_optional_effect_on_success(
+              optional_breaker(OptionalEffectSlot::mirror), f.sequence);
+          mark_live_effect_success(
+              studiocast::video::effects::contract::kEffectIdMirror,
+              "open_vulkan");
+        }
+      }
     }
 
     if (live_effect_attribution.CommitSuccessfulFrame(
@@ -13887,19 +14124,28 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       open_cuda_transfers_.cpu_tail_denoise_calls =
           open_cuda_denoise_cpu_tail_calls;
 
-      open_vulkan_transfers_.active_frames = open_vulkan_active_frames;
+      const auto prepared_vulkan_compat =
+          ProjectPreparedHardwareCompatibilityTelemetry(
+              prepared_hardware_owner.Snapshot());
+      open_vulkan_transfers_.active_frames =
+          open_vulkan_active_frames + prepared_vulkan_compat.active_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       open_vulkan_transfers_.upload_calls =
           open_vulkan_upload_calls +
-          open_vulkan_vb.replace_effect_counters.asset_upload_calls;
+          open_vulkan_vb.replace_effect_counters.asset_upload_calls +
+          prepared_vulkan_compat.upload_calls;
       open_vulkan_transfers_.download_calls =
-          open_vulkan_download_calls + open_vulkan_vb.alpha_download_calls;
+          open_vulkan_download_calls + open_vulkan_vb.alpha_download_calls +
+          prepared_vulkan_compat.download_calls;
 #else
-      open_vulkan_transfers_.upload_calls = open_vulkan_upload_calls;
-      open_vulkan_transfers_.download_calls = open_vulkan_download_calls;
+      open_vulkan_transfers_.upload_calls =
+          open_vulkan_upload_calls + prepared_vulkan_compat.upload_calls;
+      open_vulkan_transfers_.download_calls =
+          open_vulkan_download_calls + prepared_vulkan_compat.download_calls;
 #endif
       open_vulkan_transfers_.final_download_calls =
-          open_vulkan_final_download_calls;
+          open_vulkan_final_download_calls +
+          prepared_vulkan_compat.final_download_calls;
       open_vulkan_transfers_.cpu_continuation_download_calls =
           open_vulkan_cpu_continuation_download_calls;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -13999,9 +14245,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
           open_vulkan_forced_sync_calls + open_vulkan_vb.forced_sync_calls +
           open_vulkan_vb.replace_effect_counters.asset_upload_calls +
-          open_vulkan_vb.replace_effect_counters.asset_resize_dispatch_calls;
+          open_vulkan_vb.replace_effect_counters.asset_resize_dispatch_calls +
+          prepared_vulkan_compat.forced_sync_calls;
 #else
-          open_vulkan_forced_sync_calls;
+          open_vulkan_forced_sync_calls +
+          prepared_vulkan_compat.forced_sync_calls;
 #endif
       open_vulkan_transfers_.cpu_tail_stage_calls =
           open_vulkan_cpu_tail_stage_calls;
@@ -14037,14 +14285,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           open_vulkan_auto_frame.counters.temporal_reset_calls;
 #endif
       open_vulkan_transfers_.runtime_failure_frames =
-          open_vulkan_runtime_failure_frames;
+          open_vulkan_runtime_failure_frames +
+          prepared_vulkan_compat.runtime_failure_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
       open_vulkan_transfers_.runtime_failure_frames +=
           open_vulkan_vignette_counters.runtime_failure_frames;
       open_vulkan_transfers_.runtime_failure_frames +=
           open_vulkan_mirror_counters.runtime_failure_frames;
 #endif
-      open_vulkan_transfers_.fallback_frames = open_vulkan_fallback_frames;
+      open_vulkan_transfers_.fallback_frames =
+          open_vulkan_fallback_frames + prepared_vulkan_compat.fallback_frames;
 
       maxine_transfers_.active_frames = maxine_active_frames;
       maxine_transfers_.rgb_to_bgr_calls = maxine_rgb_to_bgr_calls;
