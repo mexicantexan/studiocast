@@ -552,8 +552,8 @@ struct CameraPipelineStatus {
   // effect has been bypassed and the frame loop is continuing pass-through.
   DegradedEffect degraded_effect{};
 
-  // Typed status for the bounded prepared-hardware migration. This remains
-  // additive and is not serialized into the existing daemon IPC schema.
+  // Typed status for the bounded prepared-hardware migration. GET_STATUS
+  // publishes it additively without changing the existing daemon IPC fields.
   PreparedHardwareExecutionSnapshot prepared_hardware_execution{};
 
   std::string last_error;

@@ -1694,7 +1694,8 @@ HistogramIsWellFormed(const hal::LatencyHistogram &histogram) noexcept {
            histogram.p95_ns == 0 && histogram.p99_ns == 0;
   }
   return histogram.maximum_ns <= histogram.total_ns &&
-         histogram.p95_ns <= histogram.p99_ns;
+         histogram.p95_ns <= histogram.p99_ns &&
+         histogram.p99_ns <= histogram.maximum_ns;
 }
 
 struct PreparedSnapshotValidation {
@@ -2191,12 +2192,14 @@ PreparedHardwareExecutionJsonResult SerializePreparedHardwareExecutionJson(
       safe.telemetry.runtime_status != hal::StatusId::failed &&
       safe.telemetry.runtime_reason != hal::ReasonId::device_lost &&
       safe.telemetry.runtime_reason != hal::ReasonId::shutdown_requested;
+  const bool exact_program_match =
+      validation.valid && CommitMatchesPreparedSetup(safe);
   const bool current_commit =
-      validation.valid && supervisor_pipeline_running &&
+      exact_program_match && supervisor_pipeline_running &&
       !supervisor_pipeline_starting &&
       safe.route == video::PreparedHardwareRoute::hal_live &&
       safe.eligibility == video::PreparedHardwareEligibility::eligible &&
-      safe.prepared && live_runtime_status && CommitMatchesPreparedSetup(safe);
+      safe.prepared && live_runtime_status;
   bool successful_effect_committed = false;
   if (current_commit) {
     for (std::size_t index = 0; index < safe.latest_committed_frame.stage_count;
@@ -2327,8 +2330,8 @@ PreparedHardwareExecutionJsonResult SerializePreparedHardwareExecutionJson(
   out << "]},\"telemetry\":";
   AppendPreparedTelemetry(out, safe.telemetry, safe.setup.resolution);
   out << ",\"latest_committed_frame\":";
-  AppendPreparedCommittedFrame(out, safe.latest_committed_frame, current_commit,
-                               expose_active);
+  AppendPreparedCommittedFrame(out, safe.latest_committed_frame,
+                               exact_program_match, expose_active);
   out << '}';
 
   result.ok = true;

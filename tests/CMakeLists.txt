@@ -639,6 +639,7 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-daemon-status-tests PRIVATE
+            studiocast_daemon_status
             studiocast_ipc
             studiocast_runtime_config)
 

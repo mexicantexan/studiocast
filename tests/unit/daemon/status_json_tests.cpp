@@ -310,9 +310,9 @@ void SetSingleLatencySample(studiocast::hal::LatencyHistogram *histogram,
   histogram->samples = 1;
   histogram->total_ns = elapsed_ns;
   histogram->maximum_ns = elapsed_ns;
-  histogram->p95_ns = 250'000;
-  histogram->p99_ns = 250'000;
-  histogram->bucket_upper_ns[0] = 250'000;
+  histogram->p95_ns = elapsed_ns;
+  histogram->p99_ns = elapsed_ns;
+  histogram->bucket_upper_ns[0] = elapsed_ns;
   histogram->bucket_counts[0] = 1;
 }
 
@@ -620,8 +620,8 @@ bool TestPreparedHardwareLiveCommittedSuccess() {
           result.json.find("\"final_readbacks\":1") != std::string::npos &&
           result.json.find("\"synchronizations\":1") != std::string::npos,
       "exact cumulative transfer counters must be serialized");
-  ok &= Expect(result.json.find("\"p95_ns\":250000") != std::string::npos &&
-                   result.json.find("\"p99_ns\":250000") != std::string::npos &&
+  ok &= Expect(result.json.find("\"p95_ns\":100000") != std::string::npos &&
+                   result.json.find("\"p99_ns\":100000") != std::string::npos &&
                    result.json.find("\"stage_timing\"") != std::string::npos,
                "tail latency and stage timing must be serialized");
   ok &= Expect(
@@ -641,6 +641,8 @@ bool TestPreparedHardwareActivityFailsClosed() {
   ok &= Expect(
       result.ok && !result.active_attribution_valid &&
           result.json.find("\"active_backend\":{\"id\":0,\"token\":\"\"}") !=
+              std::string::npos &&
+          result.json.find("\"current_program_match\":true") !=
               std::string::npos,
       "stopped-after-commit snapshot must not remain active");
 
