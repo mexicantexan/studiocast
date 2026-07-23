@@ -179,21 +179,32 @@ VignetteThenMirror(const std::vector<std::uint8_t> &input, int intensity) {
       const float radius =
           std::clamp(std::sqrt(fx * fx + fy * fy) * 0.70710677f, 0.0f, 1.0f);
       const float factor = std::max(0.0f, 1.0f - scale * radius * radius);
+      const auto pixel_index =
+          static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+          static_cast<std::size_t>(x);
       for (int c = 0; c < 3; ++c) {
-        const auto index = (static_cast<std::size_t>(y) * kWidth + x) * 3 + c;
+        const auto index =
+            pixel_index * 3u + static_cast<std::size_t>(c);
         vignette[index] = static_cast<std::uint8_t>(
             std::clamp(static_cast<int>(input[index] * factor + 0.5f), 0, 255));
       }
     }
   }
   std::vector<std::uint8_t> output(input.size());
-  for (int y = 0; y < kHeight; ++y)
-    for (int x = 0; x < kWidth; ++x)
-      for (int c = 0; c < 3; ++c)
-        output[(static_cast<std::size_t>(y) * kWidth + x) * 3 + c] =
-            vignette[(static_cast<std::size_t>(y) * kWidth + (kWidth - 1 - x)) *
-                         3 +
-                     c];
+  for (int y = 0; y < kHeight; ++y) {
+    const auto row_offset =
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth);
+    for (int x = 0; x < kWidth; ++x) {
+      const auto output_pixel = row_offset + static_cast<std::size_t>(x);
+      const auto input_pixel =
+          row_offset + static_cast<std::size_t>(kWidth - 1 - x);
+      for (int c = 0; c < 3; ++c) {
+        const auto channel = static_cast<std::size_t>(c);
+        output[output_pixel * 3u + channel] =
+            vignette[input_pixel * 3u + channel];
+      }
+    }
+  }
   return output;
 }
 

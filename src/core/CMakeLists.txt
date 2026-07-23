@@ -154,6 +154,7 @@ set(_studiocast_vulkan_backend_optional_sources
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/vulkan_device.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/vulkan_image.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/vulkan_tensor.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/qualified_final_resident_executor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/kernels/resize_bilinear.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/kernels/utility_kernels.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_mirror.cpp
@@ -606,7 +607,7 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_vulkan_backend_optional_sources})
     math(EXPR _studiocast_expected_source_count
-            "${_studiocast_expected_source_count} + 16")
+            "${_studiocast_expected_source_count} + 17")
 endif ()
 if (PULSE_SIMPLE_FOUND)
     list(APPEND _studiocast_expected_sources

@@ -1076,6 +1076,33 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-vulkan-final-stage-integration-tests
                 integration video gpu vulkan)
 
+        add_executable(studiocast-vulkan-qualified-final-executor-tests
+                ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/qualified_final_resident_executor_tests.cpp
+        )
+
+        target_link_libraries(studiocast-vulkan-qualified-final-executor-tests PRIVATE
+                studiocast_vulkan_backend
+        )
+
+        target_include_directories(studiocast-vulkan-qualified-final-executor-tests PRIVATE
+                "${PROJECT_SOURCE_DIR}/src"
+                "${STUDIOCAST_GENERATED_DIR}"
+        )
+
+        studiocast_set_project_warnings(studiocast-vulkan-qualified-final-executor-tests)
+        studiocast_enable_sanitizers(studiocast-vulkan-qualified-final-executor-tests)
+
+        set_target_properties(studiocast-vulkan-qualified-final-executor-tests PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF
+        )
+
+        add_test(NAME studiocast-vulkan-qualified-final-executor-tests
+                COMMAND studiocast-vulkan-qualified-final-executor-tests)
+        studiocast_set_test_labels(studiocast-vulkan-qualified-final-executor-tests
+                integration video gpu vulkan hardware)
+
         add_executable(studiocast-vulkan-matting-runtime-tests
                 ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_matting_runtime_tests.cpp
         )
