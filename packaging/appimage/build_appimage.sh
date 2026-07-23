@@ -422,6 +422,10 @@ stage_appdir() {
     die "staged installer backend is missing: ${APPDIR}/usr/share/studiocast/installer/studiocast-installer-backend"
   fi
   if [[ "${DRY_RUN}" -eq 0 &&
+        ! -f "${APPDIR}/usr/share/studiocast/installer/studiocast_installer_backend/cli.py" ]]; then
+    die "staged installer backend package is incomplete"
+  fi
+  if [[ "${DRY_RUN}" -eq 0 &&
         ! -f "${APPDIR}/usr/share/studiocast/installer/release/release_channel.py" ]]; then
     die "staged signed-release verifier is missing"
   fi

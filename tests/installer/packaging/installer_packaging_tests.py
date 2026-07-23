@@ -14,6 +14,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
+BACKEND_PACKAGE = ROOT / "installer/backend/studiocast_installer_backend"
+BACKEND_MODULES = (
+    "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
+    "manifest.py", "packaged.py", "plan.py", "recommendation.py",
+)
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
 PRODUCTION_KEY_ID = "studiocast-release-2026"
@@ -85,9 +90,11 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.home = self.root / "home"
         self.env = os.environ.copy()
+        self.env.pop("PYTHONPATH", None)
         self.env.update({"HOME": str(self.home), "XDG_DATA_HOME": str(self.root / "data"),
                          "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
-                         "XDG_CACHE_HOME": str(self.root / "cache"), "STUDIOCAST_INSTALLER_TEST_MODE": "1"})
+                         "XDG_CACHE_HOME": str(self.root / "cache"), "STUDIOCAST_INSTALLER_TEST_MODE": "1",
+                         "PYTHONDONTWRITEBYTECODE": "1"})
         self.fixture = self.root / "fixture"
         shutil.copytree(FIXTURES, self.fixture)
         installer = self.root / "AppDir/usr/share/studiocast/installer"
@@ -95,6 +102,11 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.backend_path = installer / "studiocast-installer-backend"
         shutil.copy2(BACKEND, self.backend_path)
         self.backend_path.chmod(0o755)
+        shutil.copytree(
+            BACKEND_PACKAGE,
+            installer / BACKEND_PACKAGE.name,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         shutil.copytree(ROOT / "installer/release", installer / "release",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copytree(ROOT / "installer/models", installer / "models",
@@ -116,7 +128,8 @@ class PackagingIntegrationTests(unittest.TestCase):
     def backend(self, *args: str, check: bool = True, production: bool = False) -> subprocess.CompletedProcess[str]:
         env = dict(self.env)
         if production: env.pop("STUDIOCAST_INSTALLER_TEST_MODE", None)
-        result = subprocess.run([str(BACKEND if production else self.backend_path), *args], env=env, text=True,
+        result = subprocess.run([str(BACKEND if production else self.backend_path), *args], env=env,
+                                cwd=self.root, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if check and result.returncode:
             self.fail(f"backend failed ({result.returncode})\nstdout={result.stdout}\nstderr={result.stderr}")
@@ -138,7 +151,8 @@ class PackagingIntegrationTests(unittest.TestCase):
         return json.loads(text[marker + 1 if marker >= 0 else 0:])
 
     def test_installer_component_stages_release_primitives_and_production_trust_contract(self) -> None:
-        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        cmake = ((ROOT / "CMakeLists.txt").read_text(encoding="utf-8") +
+                 (ROOT / "installer/CMakeLists.txt").read_text(encoding="utf-8"))
         for required in ("installer/release/release_channel.py", "release-manifest-v1.schema.json",
                          "installer/release/keys/README.md",
                          f"installer/release/keys/{PRODUCTION_KEY_ID}.pem",
@@ -147,6 +161,11 @@ class PackagingIntegrationTests(unittest.TestCase):
                          "installer/models/model_transactions.py", "curated-model-catalog-v1.json",
                          "resources/model_packs/", "installer/privileged/client_contract.py"):
             self.assertIn(required, cmake)
+        for module in BACKEND_MODULES:
+            self.assertIn(f"studiocast_installer_backend/{module}", cmake)
+            self.assertTrue(
+                (self.backend_path.parent / "studiocast_installer_backend" / module).is_file()
+            )
         for obsolete in (
             "packaging/release/release_channel.py",
             "packaging/release/release-manifest-v1.schema.json",

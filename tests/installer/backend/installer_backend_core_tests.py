@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import py_compile
 import shutil
 import signal
 import socket
@@ -19,6 +20,11 @@ from pathlib import Path
 
 SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[3]))
 BACKEND = SOURCE / "installer/backend/studiocast-installer-backend"
+BACKEND_PACKAGE = SOURCE / "installer/backend/studiocast_installer_backend"
+BACKEND_MODULES = (
+    "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
+    "manifest.py", "packaged.py", "plan.py", "recommendation.py",
+)
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
@@ -39,6 +45,19 @@ CANONICAL_EFFECTS = [
     "virtual_background.replace", "auto_frame", "eye_contact",
     "video_noise_removal", "virtual_key_light", "vignette",
 ]
+
+
+def stage_backend(installer_root: Path) -> Path:
+    staged_backend = installer_root / "studiocast-installer-backend"
+    installer_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(BACKEND, staged_backend)
+    staged_backend.chmod(0o755)
+    shutil.copytree(
+        BACKEND_PACKAGE,
+        installer_root / BACKEND_PACKAGE.name,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    return staged_backend
 
 
 def terminal_result(text: str) -> dict:
@@ -268,11 +287,13 @@ class Sandbox:
         self.temp = tempfile.TemporaryDirectory(prefix="studiocast-installer-core-")
         self.root = Path(self.temp.name)
         self.env = os.environ.copy()
+        self.env.pop("PYTHONPATH", None)
         self.env.update({"HOME": str(self.root / "home"), "XDG_DATA_HOME": str(self.root / "data"),
                          "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
                          "XDG_CACHE_HOME": str(self.root / "cache"),
                          "STUDIOCAST_INSTALLER_OFFLINE": "1",
-                         "STUDIOCAST_INSTALLER_TEST_MODE": "1"})
+                         "STUDIOCAST_INSTALLER_TEST_MODE": "1",
+                         "PYTHONDONTWRITEBYTECODE": "1"})
         self.facts = self.root / "facts.json"
         self.write_facts(base_facts())
 
@@ -302,6 +323,33 @@ class InstallerBackendCoreTests(unittest.TestCase):
         return self.s.json("plan", "install", "--facts", str(self.s.facts),
                            "--source-dir", str(SOURCE), "--no-v4l2loopback",
                            "--no-service", "--no-models", "--allow-unsupported", *extra)
+
+    def test_backend_package_has_exact_compilable_importable_topology(self):
+        self.assertEqual(set(BACKEND_MODULES),
+                         {path.name for path in BACKEND_PACKAGE.iterdir()
+                          if path.is_file() and path.suffix == ".py"})
+        compile_root = self.s.root / "compiled"
+        compile_root.mkdir()
+        for name in BACKEND_MODULES:
+            py_compile.compile(
+                str(BACKEND_PACKAGE / name),
+                cfile=str(compile_root / f"{name}c"),
+                doraise=True,
+            )
+        imports = ";".join(
+            f"import studiocast_installer_backend.{Path(name).stem}"
+            for name in BACKEND_MODULES if name != "__init__.py"
+        )
+        code = "import sys;sys.path.insert(0,sys.argv[1]);" + imports
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code, str(BACKEND.parent)],
+            cwd=self.s.root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
 
     def test_fixture_analysis_is_exact_no_host_probe(self):
         marker = self.s.root / "marker"
@@ -396,10 +444,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
     def test_recommendation_never_reads_replaced_packaged_catalog(self):
         component = self.s.root / "pure-recommend-component"
         installer_root = component / "installer"
-        staged_backend = installer_root / "studiocast-installer-backend"
-        installer_root.mkdir(parents=True)
-        shutil.copy2(BACKEND, staged_backend)
-        staged_backend.chmod(0o755)
+        staged_backend = stage_backend(installer_root)
         model_dir = installer_root / "models"
         model_dir.mkdir()
         for name in ("__init__.py", "model_transactions.py"):
@@ -913,9 +958,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
     def test_backend_executes_packaged_atomic_model_transaction_and_degrades_on_missing_source(self):
         component = self.s.root / "component"
         installer_root = component / "installer"
-        staged_backend = installer_root / "studiocast-installer-backend"
-        installer_root.mkdir(parents=True)
-        shutil.copy2(BACKEND, staged_backend); staged_backend.chmod(0o755)
+        staged_backend = stage_backend(installer_root)
         model_dir = installer_root / "models"; model_dir.mkdir()
         for name in ("__init__.py", "model_transactions.py"):
             shutil.copy2(SOURCE / "installer/models" / name, model_dir / name)

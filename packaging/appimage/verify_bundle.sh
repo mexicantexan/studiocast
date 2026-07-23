@@ -169,6 +169,10 @@ verify_staged_metadata() {
     "usage: studiocast-installer-backend" \
     "${appdir}/usr/share/studiocast/installer/studiocast-installer-backend" \
     --help
+  local backend_module
+  for backend_module in __init__.py cli.py contracts.py executor.py facts.py manifest.py packaged.py plan.py recommendation.py; do
+    require_file "${appdir}/usr/share/studiocast/installer/studiocast_installer_backend/${backend_module}"
+  done
   require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
   require_file "${appdir}/usr/share/studiocast/installer/release/release-manifest-v1.schema.json"
   require_file "${appdir}/usr/share/studiocast/installer/privileged/__init__.py"
@@ -617,6 +621,7 @@ main() {
   require_file "${checksum_file}"
   require_executable "${APPDIR}/usr/bin/studiocast-installer"
   require_executable "${APPDIR}/usr/share/studiocast/installer/studiocast-installer-backend"
+  require_file "${APPDIR}/usr/share/studiocast/installer/studiocast_installer_backend/cli.py"
   require_file "${APPDIR}/usr/share/applications/studiocast-installer.desktop"
   require_file "${APPDIR}/studiocast-installer.desktop"
   require_file "${staged_source_archive}"
@@ -641,6 +646,9 @@ main() {
     "${appdir_base}/usr/bin/studiocast-installer" "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/studiocast/installer/studiocast-installer-backend" \
+    "AppDir tarball"
+  tarball_contains "${appdir_tarball}" \
+    "${appdir_base}/usr/share/studiocast/installer/studiocast_installer_backend/cli.py" \
     "AppDir tarball"
   tarball_contains "${appdir_tarball}" \
     "${appdir_base}/usr/share/studiocast/installer/release/release_channel.py" \
