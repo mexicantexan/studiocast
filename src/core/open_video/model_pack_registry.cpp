@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -210,10 +211,91 @@ bool ComputeSha256File(const fs::path &path, std::string *out,
   return true;
 }
 
+std::array<std::uint8_t, 32> ComputeSha256Bytes(const std::uint8_t *data,
+                                               std::size_t size) {
+  Sha256 sha;
+  if (data && size > 0)
+    sha.Update(data, size);
+  return sha.Final();
+}
+
 } // namespace studiocast::model_integrity_internal
 
 namespace studiocast::open_video {
 namespace {
+
+std::atomic<std::uint64_t> g_registry_generation{1};
+
+std::uint64_t NextRegistryGeneration() noexcept {
+  std::uint64_t generation =
+      g_registry_generation.fetch_add(1, std::memory_order_relaxed);
+  if (generation != 0)
+    return generation;
+  generation = g_registry_generation.fetch_add(1, std::memory_order_relaxed);
+  return generation == 0 ? 1 : generation;
+}
+
+bool HexToDigest(const std::string &hex,
+                 std::array<std::uint8_t, 32> *digest) {
+  if (!digest ||
+      !studiocast::model_integrity_internal::IsSha256Hex(hex))
+    return false;
+  auto nibble = [](char c) -> std::uint8_t {
+    if (c >= '0' && c <= '9')
+      return static_cast<std::uint8_t>(c - '0');
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return static_cast<std::uint8_t>(10 + c - 'a');
+  };
+  for (std::size_t i = 0; i < digest->size(); ++i) {
+    (*digest)[i] =
+        static_cast<std::uint8_t>((nibble(hex[i * 2]) << 4) |
+                                  nibble(hex[i * 2 + 1]));
+  }
+  return true;
+}
+
+bool CanonicalRegularFileWithin(const fs::path &root, const fs::path &path,
+                                fs::path *canonical_out,
+                                ModelArtifactValidationStatus *status,
+                                std::string *detail) {
+  std::error_code ec;
+  const fs::path canonical_root = fs::weakly_canonical(root, ec);
+  if (ec || canonical_root.empty() ||
+      !fs::is_directory(canonical_root, ec) || ec) {
+    if (status)
+      *status = ModelArtifactValidationStatus::invalid_path;
+    if (detail)
+      *detail = "model pack root is not a canonical directory";
+    return false;
+  }
+  const fs::path canonical_path = fs::weakly_canonical(path, ec);
+  if (ec || canonical_path.empty()) {
+    if (status)
+      *status = ModelArtifactValidationStatus::missing;
+    if (detail)
+      *detail = "model artifact path cannot be resolved";
+    return false;
+  }
+  const fs::path relative = canonical_path.lexically_relative(canonical_root);
+  if (relative.empty() || relative.is_absolute() ||
+      *relative.begin() == "..") {
+    if (status)
+      *status = ModelArtifactValidationStatus::invalid_path;
+    if (detail)
+      *detail = "model artifact escapes its registry pack";
+    return false;
+  }
+  if (!fs::is_regular_file(canonical_path, ec) || ec) {
+    if (status)
+      *status = ModelArtifactValidationStatus::missing;
+    if (detail)
+      *detail = "model artifact is missing or is not a regular file";
+    return false;
+  }
+  if (canonical_out)
+    *canonical_out = canonical_path;
+  return true;
+}
 
 std::string PathForError(const fs::path &p) {
   // Avoid platform-specific quoting. We only need human-readable paths.
@@ -999,6 +1081,142 @@ ModelPackVerification FailedVerification(const fs::path &scan_root,
 
 } // namespace
 
+bool ValidatedModelArtifactIdentity::Valid() const noexcept {
+  const auto nonzero = [](const std::array<std::uint8_t, 32> &digest) {
+    return std::any_of(digest.begin(), digest.end(),
+                       [](std::uint8_t byte) { return byte != 0; });
+  };
+  return schema_version == kSchemaVersion && registry_generation != 0 &&
+         nonzero(model_id_sha256) && nonzero(manifest_sha256) &&
+         nonzero(artifact_sha256) && nonzero(artifact_set_sha256);
+}
+
+bool ModelArtifactIdentityMatches(
+    const ValidatedModelArtifactIdentity &prepared,
+    const ValidatedModelArtifactIdentity &current) noexcept {
+  return prepared.Valid() && current.Valid() && prepared == current;
+}
+
+ModelArtifactValidationResult
+ValidateModelArtifactIdentity(const ModelPack &pack,
+                              const ModelFile &artifact) {
+  ModelArtifactValidationResult result;
+  if (pack.registry_generation == 0 || pack.id.empty() ||
+      pack.root_dir.empty() || pack.manifest_path.empty() ||
+      !std::any_of(pack.registry_manifest_sha256.begin(),
+                   pack.registry_manifest_sha256.end(),
+                   [](std::uint8_t byte) { return byte != 0; })) {
+    result.status = ModelArtifactValidationStatus::foreign_pack;
+    result.detail = "model pack does not carry a trusted registry generation";
+    return result;
+  }
+
+  std::size_t matching_files = 0;
+  const ModelFile *registered = nullptr;
+  for (const auto &file : pack.files) {
+    if (file.name == artifact.name && file.kind == artifact.kind &&
+        file.role == artifact.role && file.path == artifact.path) {
+      ++matching_files;
+      registered = &file;
+    }
+  }
+  if (matching_files != 1 || !registered ||
+      !IsSafeRelativePath(fs::path(registered->name))) {
+    result.status = ModelArtifactValidationStatus::foreign_pack;
+    result.detail =
+        "model artifact is not an exact unique member of the registry pack";
+    return result;
+  }
+
+  fs::path canonical_manifest;
+  if (!CanonicalRegularFileWithin(pack.root_dir, pack.manifest_path,
+                                  &canonical_manifest, &result.status,
+                                  &result.detail)) {
+    return result;
+  }
+  fs::path canonical_artifact;
+  if (!CanonicalRegularFileWithin(pack.root_dir, registered->path,
+                                  &canonical_artifact, &result.status,
+                                  &result.detail)) {
+    return result;
+  }
+
+  std::string manifest_hex;
+  std::string artifact_hex;
+  std::string hash_error;
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          canonical_manifest, &manifest_hex, &hash_error) ||
+      !HexToDigest(manifest_hex, &result.identity.manifest_sha256)) {
+    result.status = ModelArtifactValidationStatus::read_error;
+    result.detail = hash_error.empty() ? "failed to hash model manifest"
+                                       : std::move(hash_error);
+    return result;
+  }
+  if (result.identity.manifest_sha256 != pack.registry_manifest_sha256) {
+    result.status = ModelArtifactValidationStatus::stale_registry;
+    result.detail =
+        "model manifest changed after this registry generation parsed it";
+    return result;
+  }
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          canonical_artifact, &artifact_hex, &hash_error) ||
+      !HexToDigest(artifact_hex, &result.identity.artifact_sha256)) {
+    result.status = ModelArtifactValidationStatus::read_error;
+    result.detail = hash_error.empty() ? "failed to hash model artifact"
+                                       : std::move(hash_error);
+    return result;
+  }
+
+  const std::string expected =
+      studiocast::model_integrity_internal::NormalizeSha256Hex(
+          registered->sha256);
+  if (!expected.empty()) {
+    if (!studiocast::model_integrity_internal::IsSha256Hex(expected)) {
+      result.status =
+          ModelArtifactValidationStatus::invalid_manifest_checksum;
+      result.detail =
+          "model manifest artifact checksum is not a SHA-256 digest";
+      return result;
+    }
+    if (!IsDownloadOnlyChecksum(pack, *registered) &&
+        artifact_hex != expected) {
+      result.status = ModelArtifactValidationStatus::checksum_mismatch;
+      result.detail =
+          "installed model artifact does not match the manifest checksum";
+      return result;
+    }
+  }
+
+  result.identity.registry_generation = pack.registry_generation;
+  result.identity.model_id_sha256 =
+      studiocast::model_integrity_internal::ComputeSha256Bytes(
+          reinterpret_cast<const std::uint8_t *>(pack.id.data()),
+          pack.id.size());
+
+  std::array<std::uint8_t, 32 * 3> identity_material{};
+  std::copy(result.identity.model_id_sha256.begin(),
+            result.identity.model_id_sha256.end(),
+            identity_material.begin());
+  std::copy(result.identity.manifest_sha256.begin(),
+            result.identity.manifest_sha256.end(),
+            identity_material.begin() + 32);
+  std::copy(result.identity.artifact_sha256.begin(),
+            result.identity.artifact_sha256.end(),
+            identity_material.begin() + 64);
+  result.identity.artifact_set_sha256 =
+      studiocast::model_integrity_internal::ComputeSha256Bytes(
+          identity_material.data(), identity_material.size());
+
+  if (!result.identity.Valid()) {
+    result.status = ModelArtifactValidationStatus::read_error;
+    result.detail = "computed model artifact identity is invalid";
+    return result;
+  }
+  result.status = ModelArtifactValidationStatus::ok;
+  result.detail.clear();
+  return result;
+}
+
 bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
                                              std::string *error) {
   if (error)
@@ -1119,6 +1337,7 @@ ModelPackRegistry
 ModelPackRegistry::Scan(const std::filesystem::path &open_video_models_dir) {
   ModelPackRegistry reg;
   reg.root_ = open_video_models_dir;
+  reg.generation_ = NextRegistryGeneration();
 
   if (open_video_models_dir.empty()) {
     reg.problems_["(open_video)"] = "open_video models directory is empty";
@@ -1174,6 +1393,22 @@ ModelPackRegistry::Scan(const std::filesystem::path &open_video_models_dir) {
       continue;
     }
 
+    std::string parsed_manifest_hex;
+    std::string manifest_hash_error;
+    if (!studiocast::model_integrity_internal::ComputeSha256File(
+            manifest, &parsed_manifest_hex, &manifest_hash_error) ||
+        !HexToDigest(parsed_manifest_hex,
+                     &pack.registry_manifest_sha256)) {
+      const std::string dirKey = PackDirKey(open_video_models_dir, pack_dir);
+      const std::string key = pack.id.empty() ? dirKey : pack.id;
+      reg.problems_[key] =
+          ClassifiedMessage("read_error",
+                            manifest_hash_error.empty()
+                                ? "failed to hash parsed model manifest"
+                                : manifest_hash_error);
+      continue;
+    }
+
     if (IsPlaceholderModelId(pack.id)) {
       reg.problems_[pack.id] =
           "placeholder: model id contains 'placeholder' and is skipped by "
@@ -1185,6 +1420,7 @@ ModelPackRegistry::Scan(const std::filesystem::path &open_video_models_dir) {
     if (fs::exists(lic)) {
       pack.license_path = lic;
     }
+    pack.registry_generation = reg.generation_;
 
     // Task-specific validation.
     // Matting packs must include at least one ONNX file, since the runtime

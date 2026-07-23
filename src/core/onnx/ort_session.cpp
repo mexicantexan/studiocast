@@ -83,6 +83,24 @@ std::filesystem::path DefaultTensorRtCachePath(int cuda_device_id) {
          (std::string("gpu") + std::to_string(id));
 }
 
+bool OrtPreparedProviderEvidence::ValidStrictCuda() const noexcept {
+  return schema_version == kSchemaVersion &&
+         provider == OrtExecutionProviderId::cuda && cuda_device_id >= 0 &&
+         cuda_context_generation != 0 && cpu_ep_fallback_disabled &&
+         (requested_stream_identity == 0 ||
+          user_stream_bound || explicit_stream_synchronization);
+}
+
+bool OrtPreparedProviderEvidenceMatches(
+    const OrtPreparedProviderEvidence &prepared, int cuda_device_id,
+    std::uint64_t cuda_context_generation,
+    std::uintptr_t requested_stream_identity) noexcept {
+  return prepared.ValidStrictCuda() &&
+         prepared.cuda_device_id == cuda_device_id &&
+         prepared.cuda_context_generation == cuda_context_generation &&
+         prepared.requested_stream_identity == requested_stream_identity;
+}
+
 bool OrtErrorLooksLikeVramOom(const std::string &ort_msg) {
   // Common failure strings seen from ORT CUDA EP when VRAM is exhausted or
   // cuDNN can't find a viable algorithm/workspace due to memory pressure.
@@ -196,6 +214,53 @@ void MarkCreatedSessionProviders(OrtSessionInfo *info) {
   }
 }
 
+bool FinalizeStrictCudaProviderEvidence(const OrtSessionOptions &opts,
+                                        OrtSessionInfo *info,
+                                        std::string *error) {
+  if (error)
+    error->clear();
+  if (!info || opts.provider_policy != OrtProviderPolicy::strict_cuda_only)
+    return true;
+  if (opts.enable_tensorrt) {
+    if (error)
+      *error = "strict CUDA provider mode rejects TensorRT";
+    return false;
+  }
+  if (opts.cuda_context_generation == 0) {
+    if (error)
+      *error = "strict CUDA provider mode requires a context generation";
+    return false;
+  }
+  if (!info->using_cuda || info->using_tensorrt ||
+      !info->cuda_provider_appended || info->active_provider != "cuda" ||
+      !info->cpu_ep_fallback_disabled ||
+      info->cuda_device_id != opts.cuda_device_id ||
+      info->cuda_context_generation != opts.cuda_context_generation) {
+    if (error)
+      *error =
+          "strict CUDA provider mode could not prove the exact CUDA EP";
+    return false;
+  }
+
+  OrtPreparedProviderEvidence evidence;
+  evidence.provider = OrtExecutionProviderId::cuda;
+  evidence.cuda_device_id = info->cuda_device_id;
+  evidence.cuda_context_generation = info->cuda_context_generation;
+  evidence.requested_stream_identity =
+      info->cuda_user_compute_stream_identity;
+  evidence.user_stream_bound = info->cuda_user_compute_stream_bound;
+  evidence.explicit_stream_synchronization = info->cuda_needs_stream_sync;
+  evidence.cpu_ep_fallback_disabled = info->cpu_ep_fallback_disabled;
+  if (!evidence.ValidStrictCuda()) {
+    if (error)
+      *error = "strict CUDA provider evidence is incomplete";
+    return false;
+  }
+  info->prepared_provider_evidence = evidence;
+  info->strict_provider_validation_passed = true;
+  return true;
+}
+
 void PrependWarnings(OrtSessionInfo *dst,
                      const std::vector<std::string> &warnings) {
   if (!dst || warnings.empty())
@@ -229,6 +294,11 @@ OrtSessionInfo PlanOrtProviderAttempt(const OrtRuntimeInfo &runtime,
   info.using_cuda = false;
   info.cuda_needs_stream_sync = false;
   info.cuda_device_id = opts.cuda_device_id;
+  info.cuda_context_generation = opts.cuda_context_generation;
+  info.cpu_ep_fallback_disabled =
+      opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+  info.strict_provider_validation_passed = false;
+  info.prepared_provider_evidence = {};
   info.cuda_user_compute_stream_requested =
       opts.user_compute_stream != nullptr;
   info.cuda_user_compute_stream_bound = false;
@@ -340,6 +410,18 @@ CreateOrtSessionWithProviderFallbacks(const OrtSessionOptions &opts,
                                       const OrtSessionCreateHooks &hooks) {
   OrtSessionCreatePlanResult plan;
 
+  if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only &&
+      (opts.enable_tensorrt || !opts.prefer_cuda ||
+       opts.cuda_context_generation == 0)) {
+    plan.error = opts.enable_tensorrt
+                     ? "strict CUDA provider mode rejects TensorRT"
+                     : (!opts.prefer_cuda
+                            ? "strict CUDA provider mode requires CUDA"
+                            : "strict CUDA provider mode requires a context "
+                              "generation");
+    return plan;
+  }
+
   auto try_cpu_fallback =
       [&](const OrtSessionOptions &failed_opts,
           const OrtSessionInfo &failed_info,
@@ -381,12 +463,25 @@ CreateOrtSessionWithProviderFallbacks(const OrtSessionOptions &opts,
       CallCreateSession(hooks, OrtSessionCreateAttempt::Initial, opts, &info);
   if (initial.created) {
     MarkCreatedSessionProviders(&info);
+    if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only) {
+      std::string strict_error;
+      if (!FinalizeStrictCudaProviderEvidence(opts, &info, &strict_error)) {
+        plan.error = std::move(strict_error);
+        return plan;
+      }
+    }
     plan.created = true;
     plan.info = std::move(info);
     return plan;
   }
 
   const std::string first_error = initial.error;
+  if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only) {
+    plan.error = first_error.empty()
+                     ? "strict CUDA provider session creation failed"
+                     : first_error;
+    return plan;
+  }
   if (opts.enable_tensorrt && info.using_tensorrt &&
       opts.tensorrt_enable_cuda_fallback && opts.prefer_cuda) {
     OrtSessionOptions retry_opts = opts;
@@ -837,6 +932,12 @@ CreateOrtSessionForPlan(void *context, internal::OrtSessionCreateAttempt,
     so.SetIntraOpNumThreads(1);
     so.SetInterOpNumThreads(1);
     so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
+    if (session_opts.provider_policy ==
+        OrtProviderPolicy::strict_cuda_only) {
+      // Fail session construction when any graph node would otherwise be
+      // assigned to ORT's implicit CPU execution provider.
+      so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+    }
     ConfigureExecutionProviders(&so, session_opts, provider_info);
     auto session = std::make_unique<Ort::Session>(
         GlobalEnv(), create_context->model->c_str(), so);

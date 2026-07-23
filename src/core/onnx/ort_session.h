@@ -32,14 +32,70 @@ bool OrtBuildHasTensorRtEpV2();
 // Default TensorRT engine cache path for a CUDA device.
 std::filesystem::path DefaultTensorRtCachePath(int cuda_device_id);
 
+enum class OrtProviderPolicy : std::uint8_t {
+  // Existing behavior: prefer requested accelerator providers but preserve
+  // historical CUDA->CPU and TensorRT->CUDA/CPU compatibility fallbacks.
+  compatibility = 0,
+
+  // Prepared Open Video hardware execution: require exactly the CUDA EP and
+  // disable ORT CPU graph/provider fallback. TensorRT is a distinct provider
+  // and is rejected by this policy.
+  strict_cuda_only = 1,
+};
+
+enum class OrtExecutionProviderId : std::uint8_t {
+  invalid = 0,
+  cpu = 1,
+  cuda = 2,
+  tensorrt = 3,
+};
+
+struct OrtPreparedProviderEvidence {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtExecutionProviderId provider = OrtExecutionProviderId::invalid;
+  std::int32_t cuda_device_id = -1;
+  std::uint64_t cuda_context_generation = 0;
+  std::uintptr_t requested_stream_identity = 0;
+  bool user_stream_bound = false;
+  bool explicit_stream_synchronization = false;
+  bool cpu_ep_fallback_disabled = false;
+
+  bool ValidStrictCuda() const noexcept;
+  bool operator==(const OrtPreparedProviderEvidence &other) const noexcept {
+    return schema_version == other.schema_version &&
+           provider == other.provider &&
+           cuda_device_id == other.cuda_device_id &&
+           cuda_context_generation == other.cuda_context_generation &&
+           requested_stream_identity == other.requested_stream_identity &&
+           user_stream_bound == other.user_stream_bound &&
+           explicit_stream_synchronization ==
+               other.explicit_stream_synchronization &&
+           cpu_ep_fallback_disabled == other.cpu_ep_fallback_disabled;
+  }
+};
+
+bool OrtPreparedProviderEvidenceMatches(
+    const OrtPreparedProviderEvidence &prepared, int cuda_device_id,
+    std::uint64_t cuda_context_generation,
+    std::uintptr_t requested_stream_identity) noexcept;
+
 // Options for creating an ONNX Runtime session.
 struct OrtSessionOptions {
+  OrtProviderPolicy provider_policy = OrtProviderPolicy::compatibility;
+
   // If true, attempt to use CUDA EP and fall back to CPU EP if CUDA EP is not
   // available.
   bool prefer_cuda = true;
 
   // CUDA device id to use when CUDA EP is available.
   int cuda_device_id = 0;
+
+  // Caller-owned CUDA context generation. Strict prepared execution requires
+  // a non-zero value and retains it as typed evidence; ORT itself does not own
+  // the CUDA primary-context lifecycle.
+  std::uint64_t cuda_context_generation = 0;
 
   // Optional CUDA EP V2 provider options. Zero/empty means "use ORT default".
   std::uint64_t cuda_gpu_mem_limit = 0;
@@ -104,6 +160,10 @@ struct OrtSessionInfo {
   bool cuda_user_compute_stream_requested = false;
   bool cuda_user_compute_stream_bound = false;
   std::uintptr_t cuda_user_compute_stream_identity = 0;
+  std::uint64_t cuda_context_generation = 0;
+  bool cpu_ep_fallback_disabled = false;
+  bool strict_provider_validation_passed = false;
+  OrtPreparedProviderEvidence prepared_provider_evidence{};
 
   // Provider/status diagnostics for tools and engine JSON.
   std::string active_provider;

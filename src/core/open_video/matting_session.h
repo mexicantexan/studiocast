@@ -7,6 +7,7 @@
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
 #include "core/cuda/cuda_driver_api.h"
+#include "core/onnx/ort_session.h"
 #include "core/open_video/model_pack_registry.h"
 
 namespace studiocast::open_cuda {
@@ -21,6 +22,10 @@ public:
   struct Options {
     int device_id = 0;
     bool enable_tensorrt = false;
+    // Compatibility remains the default for current tools/live paths. Future
+    // prepared HAL execution must opt in and receives no TensorRT or CPU
+    // provider/graph fallback.
+    bool strict_cuda_provider = false;
   };
 
   struct PreparationEvidence {
@@ -34,6 +39,8 @@ public:
     std::string active_provider;
     std::string model_id;
     std::string model_artifact_sha256;
+    studiocast::onnx::OrtPreparedProviderEvidence provider;
+    studiocast::open_video::ValidatedModelArtifactIdentity model_artifact;
   };
 
   OpenCudaMattingSession(studiocast::cuda::CudaDriverApi *cuda,

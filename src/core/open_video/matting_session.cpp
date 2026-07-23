@@ -39,6 +39,18 @@ FindMainOnnxFile(const studiocast::open_video::ModelPack &p) {
   return nullptr;
 }
 
+[[maybe_unused]] std::string
+DigestToHex(const std::array<std::uint8_t, 32> &digest) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string value;
+  value.reserve(digest.size() * 2);
+  for (const std::uint8_t byte : digest) {
+    value.push_back(kHex[(byte >> 4) & 0x0f]);
+    value.push_back(kHex[byte & 0x0f]);
+  }
+  return value;
+}
+
 } // namespace
 
 struct OpenCudaMattingSession::Impl {
@@ -74,6 +86,7 @@ struct OpenCudaMattingSession::Impl {
   studiocast::cuda::CUstream prepared_stream = nullptr;
   studiocast::cuda::CUdeviceptr prepared_output_ptr = 0;
   OpenCudaMattingSession::PreparationEvidence preparation_evidence;
+  studiocast::open_video::ValidatedModelArtifactIdentity artifact_identity;
 
   // When the GPU runs out of memory, ORT can spam errors every frame.
   // Latch the first failure so we can return a clear, human-friendly message
@@ -97,6 +110,32 @@ struct OpenCudaMattingSession::Impl {
     ort_opts.prefer_cuda = true;
     ort_opts.cuda_device_id = opts.device_id;
     ort_opts.enable_tensorrt = opts.enable_tensorrt;
+    if (opts.strict_cuda_provider) {
+      if (opts.enable_tensorrt) {
+        if (error_out)
+          *error_out =
+              "OpenCudaMattingSession: strict CUDA mode rejects TensorRT.";
+        return false;
+      }
+      if (stream == nullptr) {
+        if (error_out)
+          *error_out =
+              "OpenCudaMattingSession: strict CUDA mode requires a non-null "
+              "resident stream.";
+        return false;
+      }
+      const auto *context = cuda ? cuda->context_identity() : nullptr;
+      if (!context || !context->Valid()) {
+        if (error_out)
+          *error_out =
+              "OpenCudaMattingSession: strict CUDA context identity is "
+              "unavailable.";
+        return false;
+      }
+      ort_opts.provider_policy =
+          studiocast::onnx::OrtProviderPolicy::strict_cuda_only;
+      ort_opts.cuda_context_generation = context->logical_generation;
+    }
     if (stream != nullptr) {
       // Treat CUstream as an opaque handle and pass it as void* to ORT.
       ort_opts.user_compute_stream = reinterpret_cast<void *>(stream);
@@ -144,6 +183,19 @@ struct OpenCudaMattingSession::Impl {
       }
       if (error_out)
         *error_out = msg;
+      return false;
+    }
+    if (opts.strict_cuda_provider &&
+        (!ort_info.strict_provider_validation_passed ||
+         !ort_info.prepared_provider_evidence.ValidStrictCuda() ||
+         ort_info.prepared_provider_evidence.provider !=
+             studiocast::onnx::OrtExecutionProviderId::cuda ||
+         !ort_info.cuda_user_compute_stream_bound ||
+         ort_info.cuda_needs_stream_sync)) {
+      if (error_out)
+        *error_out =
+            "OpenCudaMattingSession: exact CUDA-only provider evidence is "
+            "unavailable.";
       return false;
     }
 
@@ -457,6 +509,13 @@ bool OpenCudaMattingSession::Prepare(
   if (!EnsureInitialized(frame_w, frame_h, error_out) ||
       !ValidateOutputTensor(impl_->pack, output_alpha_gpu, error_out))
     return false;
+  if (impl_->opts.strict_cuda_provider && stream == nullptr) {
+    if (error_out)
+      *error_out =
+          "OpenCudaMattingSession: strict CUDA mode requires a non-null "
+          "resident stream.";
+    return false;
+  }
 
   const auto *context = impl_->cuda->context_identity();
   if (!context || !context->Valid()) {
@@ -483,6 +542,29 @@ bool OpenCudaMattingSession::Prepare(
     *error_out = "OpenCudaMattingSession: built without ONNX Runtime support.";
   return false;
 #else
+  studiocast::open_video::ModelArtifactValidationResult artifact_validation;
+  if (impl_->opts.strict_cuda_provider) {
+    const auto *model = FindMainOnnxFile(impl_->pack);
+    if (!model) {
+      if (error_out)
+        *error_out =
+            "OpenCudaMattingSession: strict model artifact is missing.";
+      return false;
+    }
+    artifact_validation =
+        studiocast::open_video::ValidateModelArtifactIdentity(impl_->pack,
+                                                               *model);
+    if (!artifact_validation.ok()) {
+      if (error_out) {
+        *error_out =
+            "OpenCudaMattingSession: strict model artifact validation failed";
+        if (!artifact_validation.detail.empty())
+          *error_out += ": " + artifact_validation.detail;
+      }
+      return false;
+    }
+  }
+
   // Build a replacement session and binding in isolation. Nothing below
   // mutates the live preparation until every evidence check and binding step
   // has succeeded.
@@ -493,6 +575,7 @@ bool OpenCudaMattingSession::Prepare(
   candidate.opts = impl_->opts;
   candidate.validated_pack = true;
   candidate.preprocess = impl_->preprocess;
+  candidate.artifact_identity = artifact_validation.identity;
 
   std::string setup_error;
   if (!candidate.CreateOrtSession(stream, &setup_error)) {
@@ -518,6 +601,19 @@ bool OpenCudaMattingSession::Prepare(
     if (error_out)
       *error_out = "OpenCudaMattingSession: ORT provider/device/user-stream "
                    "evidence does not match the requested setup.";
+    return false;
+  }
+  if (impl_->opts.strict_cuda_provider &&
+      (!studiocast::onnx::OrtPreparedProviderEvidenceMatches(
+           info.prepared_provider_evidence, impl_->opts.device_id,
+           context->logical_generation, requested_stream) ||
+       !info.prepared_provider_evidence.user_stream_bound ||
+       info.prepared_provider_evidence.explicit_stream_synchronization ||
+       !candidate.artifact_identity.Valid())) {
+    if (error_out)
+      *error_out =
+          "OpenCudaMattingSession: strict provider/artifact evidence does not "
+          "match the requested setup.";
     return false;
   }
 
@@ -601,6 +697,7 @@ bool OpenCudaMattingSession::Prepare(
   impl_->ort_needs_stream_sync = candidate.ort_needs_stream_sync;
   impl_->ort_latched_failure = false;
   impl_->ort_latched_error.clear();
+  impl_->artifact_identity = candidate.artifact_identity;
   impl_->execution_prepared = true;
   impl_->prepared_frame_w = frame_w;
   impl_->prepared_frame_h = frame_h;
@@ -619,6 +716,13 @@ bool OpenCudaMattingSession::Prepare(
   impl_->preparation_evidence.model_id = impl_->pack.id;
   if (const auto *model = FindMainOnnxFile(impl_->pack))
     impl_->preparation_evidence.model_artifact_sha256 = model->sha256;
+  impl_->preparation_evidence.provider =
+      impl_->ort_info.prepared_provider_evidence;
+  impl_->preparation_evidence.model_artifact = impl_->artifact_identity;
+  if (impl_->artifact_identity.Valid()) {
+    impl_->preparation_evidence.model_artifact_sha256 =
+        DigestToHex(impl_->artifact_identity.artifact_sha256);
+  }
   return true;
 #endif
 }
@@ -671,6 +775,19 @@ bool OpenCudaMattingSession::RunPrepared(
     if (error_out)
       *error_out = "OpenCudaMattingSession::Run: geometry, stream, output, or "
                    "CUDA context generation differs from setup.";
+    return false;
+  }
+  if (impl_->opts.strict_cuda_provider &&
+      (!studiocast::onnx::OrtPreparedProviderEvidenceMatches(
+           impl_->preparation_evidence.provider, impl_->opts.device_id,
+           context->logical_generation,
+           reinterpret_cast<std::uintptr_t>(stream)) ||
+       !impl_->preparation_evidence.provider.user_stream_bound ||
+       impl_->preparation_evidence.provider.explicit_stream_synchronization ||
+       !impl_->preparation_evidence.model_artifact.Valid())) {
+    if (error_out)
+      *error_out = "OpenCudaMattingSession::Run: strict provider, device, "
+                   "context, stream, or artifact evidence is stale.";
     return false;
   }
 
