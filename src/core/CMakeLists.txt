@@ -186,6 +186,7 @@ set(_studiocast_video_runtime_sources
         # Protected implementation: source ownership only; contents remain unchanged.
         ${PROJECT_SOURCE_DIR}/src/core/video/camera_pipeline.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/prepared_hardware_execution_owner.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_maxine_hardware_execution_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/virtual_camera_service.cpp)
 
 set(_studiocast_runtime_config_sources
@@ -598,7 +599,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 120)
+set(_studiocast_expected_source_count 121)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

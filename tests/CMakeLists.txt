@@ -127,6 +127,32 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-prepared-hardware-execution-owner-tests
             integration core video gpu vulkan hal)
 
+    add_executable(studiocast-prepared-maxine-hardware-execution-owner-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_maxine_hardware_execution_owner_tests.cpp
+    )
+
+    target_link_libraries(studiocast-prepared-maxine-hardware-execution-owner-tests PRIVATE
+            studiocast_video_runtime)
+
+    target_include_directories(studiocast-prepared-maxine-hardware-execution-owner-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-prepared-maxine-hardware-execution-owner-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-maxine-hardware-execution-owner-tests)
+
+    set_target_properties(studiocast-prepared-maxine-hardware-execution-owner-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-prepared-maxine-hardware-execution-owner-tests
+            COMMAND studiocast-prepared-maxine-hardware-execution-owner-tests)
+    studiocast_set_test_labels(studiocast-prepared-maxine-hardware-execution-owner-tests
+            integration core video gpu maxine hal)
+
     add_executable(studiocast-video-runtime-status-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
     )
