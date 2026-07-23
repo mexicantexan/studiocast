@@ -1,0 +1,19 @@
+{
+  "typed_video_status": {
+    "lifecycle": "running",
+    "active": {
+      "active_backend": "open_video_onnxruntime",
+      "mixed_backends": false
+    }
+  },
+  "video": {
+    "compute": {
+      "resolved_backend": "cuda",
+      "active_backend": "cuda",
+      "active_engines": ["open_cuda"]
+    },
+    "pipeline": {
+      "effects_backends": "virtual_background.blur:open_cuda"
+    }
+  }
+}
