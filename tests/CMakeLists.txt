@@ -101,6 +101,32 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-hardware-execution-runtime-tests
             unit core video gpu)
 
+    add_executable(studiocast-prepared-hardware-execution-owner-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_hardware_execution_owner_tests.cpp
+    )
+
+    target_link_libraries(studiocast-prepared-hardware-execution-owner-tests PRIVATE
+            studiocast_video_runtime)
+
+    target_include_directories(studiocast-prepared-hardware-execution-owner-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-prepared-hardware-execution-owner-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-hardware-execution-owner-tests)
+
+    set_target_properties(studiocast-prepared-hardware-execution-owner-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-prepared-hardware-execution-owner-tests
+            COMMAND studiocast-prepared-hardware-execution-owner-tests)
+    studiocast_set_test_labels(studiocast-prepared-hardware-execution-owner-tests
+            integration core video gpu vulkan hal)
+
     add_executable(studiocast-video-runtime-status-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
     )
