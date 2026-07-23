@@ -243,6 +243,51 @@ bool TestDeterministicPrecedenceAndStrictSelection() {
                     reverse_result.stages[0].adapter_instance_id == 21,
                 "selection precedence depended on registration order");
 
+  auto strict_maxine_family = AutoRequest();
+  strict_maxine_family.preferences.compute_family =
+      ComputeFamilyAllowance::cuda_family;
+  strict_maxine_family.preferences.effects_engine =
+      EffectsEnginePreferenceConstraint::maxine;
+  strict_maxine_family.preferences.strict_effects_engine = true;
+  strict_maxine_family.stages[0] = Stage(1, SemanticEffectId::mirror);
+  strict_maxine_family.stage_count = 1;
+  const auto exact_maxine = ResolveSemanticStages(first, strict_maxine_family);
+  ok &= Require(exact_maxine.status == StatusId::ready &&
+                    exact_maxine.selected_backend == BackendId::maxine &&
+                    exact_maxine.selected_provider ==
+                        SemanticEffectProviderId::maxine_vfx,
+                "strict CUDA-family Maxine preference was not exact");
+
+  auto strict_open_cuda_family = strict_maxine_family;
+  strict_open_cuda_family.preferences.effects_engine =
+      EffectsEnginePreferenceConstraint::open_cuda;
+  const auto exact_open_cuda =
+      ResolveSemanticStages(first, strict_open_cuda_family);
+  ok &= Require(exact_open_cuda.status == StatusId::ready &&
+                    exact_open_cuda.selected_backend == BackendId::cuda &&
+                    exact_open_cuda.selected_provider ==
+                        SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                "strict CUDA-family Open CUDA preference selected Maxine");
+
+  StaticAdapterRegistry maxine_only;
+  ok &= Register(&maxine_only, maxine_registration);
+  const auto unavailable_open_cuda =
+      ResolveSemanticStages(maxine_only, strict_open_cuda_family);
+  ok &= Require(unavailable_open_cuda.status == StatusId::blocked &&
+                    unavailable_open_cuda.reason ==
+                        ReasonId::semantic_provider_unavailable,
+                "strict Open CUDA engine silently fell back to Maxine");
+  auto preferred_open_cuda = strict_open_cuda_family;
+  preferred_open_cuda.preferences.strict_effects_engine = false;
+  const auto engine_fallback =
+      ResolveSemanticStages(maxine_only, preferred_open_cuda);
+  ok &= Require(engine_fallback.status == StatusId::degraded &&
+                    engine_fallback.fallback &&
+                    engine_fallback.stages[0].fallback_selected &&
+                    engine_fallback.reason ==
+                        ReasonId::semantic_provider_unavailable,
+                "non-strict effects-engine fallback was not attributed");
+
   auto strict_cuda = StrictRequest(BackendId::cuda);
   strict_cuda.stages[0] = Stage(1, SemanticEffectId::mirror);
   strict_cuda.stage_count = 1;
@@ -557,6 +602,31 @@ bool TestCrossAdapterPlanningAndCpuTails() {
           final_tail_plan.expected_transfers.cpu_tail_boundaries == 1 &&
           final_tail_plan.expected_transfers.synchronizations == 1,
       "final CPU tail was incorrectly counted as a resumed island");
+
+  auto before_registration = maxine_registration;
+  before_registration.semantic_capabilities[0].cpu_tail_placement =
+      DeclaredCpuTail::Placement::before_stage;
+  StaticAdapterRegistry before_registry;
+  ok &= Register(&before_registry, before_registration);
+  auto before_request = AutoRequest();
+  before_request.stages[0] = Stage(1, SemanticEffectId::mirror);
+  before_request.stages[1] = Stage(2, SemanticEffectId::auto_frame);
+  before_request.stage_count = 2;
+  const auto before_resolution =
+      ResolveSemanticStages(before_registry, before_request);
+  const auto before_plan =
+      PlanExecutionDomains(before_registry, before_resolution,
+                           CrossAdapterPolicy::split_with_measured_transfer);
+  ok &= Require(
+      before_plan.status == StatusId::degraded &&
+          before_plan.island_count == 2 && before_plan.boundary_count == 1 &&
+          before_plan.boundaries[0].kind == ExecutionBoundaryKind::cpu_tail &&
+          before_plan.boundaries[0].after_stage_id == 1 &&
+          before_plan.boundaries[0].before_stage_id == 2 &&
+          before_plan.boundaries[0].boundary_index == 1 &&
+          before_plan.expected_transfers.intermediate_readbacks == 1 &&
+          before_plan.expected_transfers.intermediate_uploads == 1,
+      "before-stage CPU boundary was not placed and measured exactly");
   return ok;
 }
 
@@ -566,6 +636,21 @@ bool TestVulkanEligibilityPassthroughAndCapacity() {
   registration.semantic_capabilities[0] =
       Capability(SemanticEffectId::mirror,
                  SemanticEffectProviderId::open_vulkan_production_kernels);
+  registration.semantic_capabilities[0].evidence_count = 2;
+  registration.semantic_capabilities[0].evidence[0] = {
+      CapabilityEvidenceCode::open_vulkan_mirror_production_ready,
+      StatusId::ready,
+      ReasonId::none,
+      SemanticEffectId::mirror,
+      BackendId::vulkan,
+      true};
+  registration.semantic_capabilities[0].evidence[1] = {
+      CapabilityEvidenceCode::vulkan_no_intermediate_readbacks,
+      StatusId::ready,
+      ReasonId::none,
+      SemanticEffectId::mirror,
+      BackendId::vulkan,
+      true};
   registration.semantic_capabilities[1] =
       Capability(SemanticEffectId::vignette,
                  SemanticEffectProviderId::open_vulkan_production_kernels);
@@ -592,6 +677,11 @@ bool TestVulkanEligibilityPassthroughAndCapacity() {
                     result.stages[2].reason ==
                         ReasonId::capability_evidence_incomplete,
                 "Vulkan eligibility was not limited to vignette and mirror");
+  ok &= Require(
+      result.stages[1].evidence_count == 2 &&
+          result.stages[1].evidence[0].code ==
+              CapabilityEvidenceCode::open_vulkan_mirror_production_ready,
+      "fixed typed Vulkan evidence was not preserved by resolution");
 
   auto invalid = Registration(&vulkan, BackendId::vulkan, 300, 51);
   invalid.adapter_instance_id = 51;

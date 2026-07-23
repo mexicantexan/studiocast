@@ -60,6 +60,140 @@ bool BudgetContains(const ResourceBudget &available,
          available.in_flight_slots >= required.in_flight_slots;
 }
 
+std::uint64_t BoundaryBudget(const ResourceBudget &budget,
+                             MemoryDomain domain) noexcept {
+  switch (domain) {
+  case MemoryDomain::upload_staging:
+    return budget.upload_staging_bytes;
+  case MemoryDomain::readback_staging:
+    return budget.readback_staging_bytes;
+  case MemoryDomain::scratch:
+    return budget.scratch_bytes;
+  case MemoryDomain::device_local:
+  case MemoryDomain::provider_owned:
+    return budget.persistent_bytes;
+  case MemoryDomain::host:
+    return budget.persistent_bytes;
+  case MemoryDomain::invalid:
+    return 0;
+  }
+  return 0;
+}
+
+bool SameImageLayout(const ImageDescriptor &left,
+                     const ImageDescriptor &right) noexcept;
+
+bool SameStageIoDescriptor(const StageIoDescriptor &left,
+                           const StageIoDescriptor &right) noexcept {
+  if (left.kind != right.kind)
+    return false;
+  if (left.kind == StageIoKind::image)
+    return SameImageLayout(left.image, right.image);
+  return left.tensor.element_type == right.tensor.element_type &&
+         left.tensor.layout == right.tensor.layout &&
+         left.tensor.channel_order == right.tensor.channel_order &&
+         left.tensor.color_space == right.tensor.color_space &&
+         left.tensor.color_range == right.tensor.color_range &&
+         left.tensor.alpha_meaning == right.tensor.alpha_meaning &&
+         left.tensor.orientation == right.tensor.orientation &&
+         left.tensor.host_coherence == right.tensor.host_coherence &&
+         left.tensor.rank == right.tensor.rank &&
+         left.tensor.base_alignment_bytes ==
+             right.tensor.base_alignment_bytes &&
+         left.tensor.dimensions == right.tensor.dimensions &&
+         left.tensor.strides_bytes == right.tensor.strides_bytes;
+}
+
+bool SameImageLayout(const ImageDescriptor &left,
+                     const ImageDescriptor &right) noexcept {
+  if (left.width != right.width || left.height != right.height ||
+      left.plane_count != right.plane_count || left.format != right.format ||
+      left.channel_order != right.channel_order ||
+      left.color_space != right.color_space ||
+      left.color_range != right.color_range ||
+      left.alpha_meaning != right.alpha_meaning ||
+      left.orientation != right.orientation ||
+      left.host_coherence != right.host_coherence ||
+      left.base_alignment_bytes != right.base_alignment_bytes) {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.plane_count; ++index) {
+    const auto &a = left.planes[index];
+    const auto &b = right.planes[index];
+    if (a.offset_bytes != b.offset_bytes ||
+        a.row_stride_bytes != b.row_stride_bytes ||
+        a.size_bytes != b.size_bytes || a.width != b.width ||
+        a.height != b.height || a.alignment_bytes != b.alignment_bytes) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameImageDescriptor(const ImageDescriptor &left,
+                         const ImageDescriptor &right) noexcept {
+  return SameImageLayout(left, right) && left.mutability == right.mutability &&
+         left.aliasing == right.aliasing &&
+         left.in_place_permitted == right.in_place_permitted;
+}
+
+bool SameResourceToken(const ResourceHandle &left,
+                       const ResourceHandle &right) noexcept {
+  return left.resource_id == right.resource_id &&
+         left.allocator_owner_id == right.allocator_owner_id &&
+         left.lifetime_generation == right.lifetime_generation &&
+         left.memory_domain == right.memory_domain &&
+         left.lifetime == right.lifetime &&
+         left.synchronization_state == right.synchronization_state &&
+         left.execution_domain == right.execution_domain &&
+         left.size_bytes == right.size_bytes &&
+         left.alignment_bytes == right.alignment_bytes &&
+         left.mutable_resource == right.mutable_resource &&
+         left.aliasable == right.aliasable &&
+         left.adapter_opaque == right.adapter_opaque;
+}
+
+bool ValidCapabilityEvidence(
+    const CapabilityEvidenceRecord &evidence) noexcept {
+  if (evidence.code == CapabilityEvidenceCode::invalid ||
+      evidence.status == StatusId::invalid ||
+      evidence.backend == BackendId::invalid) {
+    return false;
+  }
+  if (evidence.satisfied)
+    return (evidence.status == StatusId::ready &&
+            evidence.reason == ReasonId::none) ||
+           (evidence.status == StatusId::degraded &&
+            evidence.reason != ReasonId::none);
+  return (evidence.status == StatusId::blocked ||
+          evidence.status == StatusId::unavailable) &&
+         evidence.reason != ReasonId::none;
+}
+
+bool ValidReadinessEvidence(const ReadinessSnapshot &readiness) noexcept {
+  if (readiness.evidence_count > readiness.evidence.size())
+    return false;
+  for (std::size_t index = 0; index < readiness.evidence_count; ++index) {
+    if (!ValidCapabilityEvidence(readiness.evidence[index]))
+      return false;
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (readiness.evidence[previous].code == readiness.evidence[index].code &&
+          readiness.evidence[previous].semantic ==
+              readiness.evidence[index].semantic) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void DestroyResource(ResourceHandle *resource) noexcept {
+  if (resource != nullptr && resource->destroy != nullptr)
+    resource->destroy(resource->destruction_owner, resource);
+  if (resource != nullptr)
+    *resource = {};
+}
+
 ExecuteResult FailedExecute(StatusId status, ReasonId reason) noexcept {
   ExecuteResult result;
   result.status = status;
@@ -145,22 +279,8 @@ bool ValidateResourceHandle(const ResourceHandle &resource,
                             const ExecutionDomainId &expected_domain,
                             std::uint64_t expected_lifetime_generation,
                             const ResourceBudget &budget) noexcept {
-  std::uint64_t total_budget = budget.persistent_bytes;
-  if (total_budget >
-      std::numeric_limits<std::uint64_t>::max() - budget.scratch_bytes) {
-    return false;
-  }
-  total_budget += budget.scratch_bytes;
-  if (total_budget >
-      std::numeric_limits<std::uint64_t>::max() - budget.upload_staging_bytes) {
-    return false;
-  }
-  total_budget += budget.upload_staging_bytes;
-  if (total_budget > std::numeric_limits<std::uint64_t>::max() -
-                         budget.readback_staging_bytes) {
-    return false;
-  }
-  total_budget += budget.readback_staging_bytes;
+  const std::uint64_t boundary_budget =
+      BoundaryBudget(budget, resource.memory_domain);
 
   return resource.resource_id != 0 && resource.allocator_owner_id != 0 &&
          resource.allocator_owner_id == expected_domain.adapter_instance_id &&
@@ -169,7 +289,7 @@ bool ValidateResourceHandle(const ResourceHandle &resource,
          resource.lifetime != ResourceLifetime::invalid &&
          resource.synchronization_state == SynchronizationState::ready &&
          resource.execution_domain == expected_domain &&
-         resource.size_bytes != 0 && resource.size_bytes <= total_budget &&
+         resource.size_bytes != 0 && resource.size_bytes <= boundary_budget &&
          IsPowerOfTwo(resource.alignment_bytes);
 }
 
@@ -183,6 +303,18 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
   if (program.program_id == 0 || program.owner_adapter_instance_id == 0 ||
       program.stage_count == 0 || program.stage_count > program.stages.size() ||
       program.cpu_tail_count > program.cpu_tails.size() ||
+      (program.setup_failure_policy != SetupFailurePolicy::retain_old_program &&
+       program.setup_failure_policy != SetupFailurePolicy::stop_pipeline) ||
+      (program.temporal.frame_drop_behavior !=
+           FrameDropBehavior::latest_frame_wins &&
+       program.temporal.frame_drop_behavior !=
+           FrameDropBehavior::preserve_order &&
+       program.temporal.frame_drop_behavior !=
+           FrameDropBehavior::reset_temporal_state) ||
+      (program.temporal.discontinuity_action !=
+           TemporalDiscontinuityAction::reset_and_continue &&
+       program.temporal.discontinuity_action !=
+           TemporalDiscontinuityAction::fail_frame) ||
       !ValidateExecutionDomain(program.execution_domain)) {
     SetReason(reason, ReasonId::malformed_contract);
     return false;
@@ -199,6 +331,17 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
   if (program.strict_backend_selection &&
       program.requested_backend != program.execution_domain.backend) {
     SetReason(reason, ReasonId::strict_backend_unavailable);
+    return false;
+  }
+  if (program.strict_provider_selection &&
+      program.requested_provider == SemanticEffectProviderId::invalid) {
+    SetReason(reason, ReasonId::malformed_contract);
+    return false;
+  }
+  if (program.strict_execution_domain &&
+      (!ValidateExecutionDomain(program.requested_execution_domain) ||
+       program.requested_execution_domain != program.execution_domain)) {
+    SetReason(reason, ReasonId::wrong_execution_domain);
     return false;
   }
   if (program.invalidation_key.generations.configuration == 0 ||
@@ -219,9 +362,18 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
   std::uint64_t stage_scratch = 0;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
+    const bool semantic_stage =
+        stage.semantic != SemanticEffectId::invalid &&
+        stage.primitive == PrimitiveOperationId::invalid;
+    const bool primitive_stage =
+        stage.semantic == SemanticEffectId::invalid &&
+        stage.primitive != PrimitiveOperationId::invalid;
     if (stage.stage_id == 0 || stage.stage_id <= previous_stage_id ||
-        stage.semantic == SemanticEffectId::invalid ||
-        stage.provider == SemanticEffectProviderId::invalid ||
+        (!semantic_stage && !primitive_stage) ||
+        (semantic_stage &&
+         stage.provider == SemanticEffectProviderId::invalid) ||
+        (primitive_stage &&
+         stage.provider != SemanticEffectProviderId::invalid) ||
         stage.backend == BackendId::invalid ||
         stage.execution_domain != program.execution_domain ||
         stage.backend != program.execution_domain.backend) {
@@ -229,6 +381,11 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
                                 program.owner_adapter_instance_id
                             ? ReasonId::cross_adapter_residency_forbidden
                             : ReasonId::malformed_contract);
+      return false;
+    }
+    if (program.strict_provider_selection && semantic_stage &&
+        stage.provider != program.requested_provider) {
+      SetReason(reason, ReasonId::semantic_provider_unavailable);
       return false;
     }
     if ((stage.input.kind == StageIoKind::image &&
@@ -243,7 +400,20 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
          stage.failure_action == FailureAction::fail_closed) ||
         (stage.required &&
          stage.failure_action != FailureAction::fail_closed) ||
-        stage.circuit_breaker.consecutive_failure_limit == 0) {
+        (!stage.required &&
+         stage.failure_action != FailureAction::fail_open_preserve_input &&
+         stage.failure_action !=
+             FailureAction::fail_open_preserve_last_valid) ||
+        stage.circuit_breaker.consecutive_failure_limit == 0 ||
+        (stage.circuit_breaker.action != CircuitBreakerAction::disable_stage &&
+         stage.circuit_breaker.action !=
+             CircuitBreakerAction::quarantine_program &&
+         stage.circuit_breaker.action !=
+             CircuitBreakerAction::request_rebuild) ||
+        (stage.required &&
+         stage.circuit_breaker.action == CircuitBreakerAction::disable_stage) ||
+        (index != 0 && !SameStageIoDescriptor(program.stages[index - 1].output,
+                                              stage.input))) {
       SetReason(reason, ReasonId::malformed_descriptor);
       return false;
     }
@@ -259,12 +429,128 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
     SetReason(reason, ReasonId::resource_exhausted);
     return false;
   }
+  std::uint32_t previous_boundary_index = 0;
+  bool have_boundary = false;
+  std::uint64_t cpu_tail_scratch = 0;
   for (std::size_t index = 0; index < program.cpu_tail_count; ++index) {
     const auto &tail = program.cpu_tails[index];
-    if (tail.id == CpuTailId::invalid ||
-        FindStage(program, tail.after_stage_id) == nullptr) {
+    std::uint32_t derived_boundary = 0;
+    if (tail.placement == DeclaredCpuTail::Placement::after_stage) {
+      const auto *stage = FindStage(program, tail.after_stage_id);
+      if (stage == nullptr || tail.before_stage_id != 0) {
+        SetReason(reason, ReasonId::malformed_contract);
+        return false;
+      }
+      derived_boundary =
+          static_cast<std::uint32_t>(stage - program.stages.data() + 1);
+    } else if (tail.placement == DeclaredCpuTail::Placement::before_stage) {
+      const auto *stage = FindStage(program, tail.before_stage_id);
+      if (stage == nullptr || tail.after_stage_id != 0) {
+        SetReason(reason, ReasonId::malformed_contract);
+        return false;
+      }
+      derived_boundary =
+          static_cast<std::uint32_t>(stage - program.stages.data());
+    } else {
       SetReason(reason, ReasonId::malformed_contract);
       return false;
+    }
+    if (tail.id == CpuTailId::invalid ||
+        (tail.boundary_index != 0 && tail.boundary_index != derived_boundary) ||
+        (have_boundary && derived_boundary < previous_boundary_index) ||
+        cpu_tail_scratch >
+            std::numeric_limits<std::uint64_t>::max() - tail.scratch_bytes) {
+      SetReason(reason, ReasonId::malformed_contract);
+      return false;
+    }
+    cpu_tail_scratch += tail.scratch_bytes;
+    previous_boundary_index = derived_boundary;
+    have_boundary = true;
+  }
+  if (cpu_tail_scratch > program.budget.scratch_bytes - stage_scratch) {
+    SetReason(reason, ReasonId::resource_exhausted);
+    return false;
+  }
+  return true;
+}
+
+bool ValidateHostFrameBinding(const HostFrameBinding &binding,
+                              const PreparedProgram &program,
+                              ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (program.stage_count == 0 ||
+      program.stages[0].input.kind != StageIoKind::image ||
+      program.stages[program.stage_count - 1].output.kind !=
+          StageIoKind::image ||
+      binding.capture_sequence == 0 ||
+      binding.ownership != OwnershipModel::borrowed_until_completion ||
+      binding.lifetime != ResourceLifetime::frame_borrowed ||
+      binding.input_plane_count != binding.input_descriptor.plane_count ||
+      binding.output_plane_count != binding.output_descriptor.plane_count ||
+      binding.input_plane_count > binding.input_planes.size() ||
+      binding.output_plane_count > binding.output_planes.size() ||
+      !SameImageDescriptor(binding.input_descriptor,
+                           program.stages[0].input.image) ||
+      !SameImageDescriptor(
+          binding.output_descriptor,
+          program.stages[program.stage_count - 1].output.image)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return false;
+  }
+  const auto validate_planes = [](const auto &bindings, std::size_t count,
+                                  const ImageDescriptor &descriptor,
+                                  bool input) noexcept {
+    for (std::size_t index = 0; index < count; ++index) {
+      const auto &plane = bindings[index];
+      const auto &expected = descriptor.planes[index];
+      const auto *pointer =
+          input ? plane.read_data
+                : static_cast<const std::byte *>(plane.write_data);
+      const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+      if (pointer == nullptr || plane.span_bytes < expected.size_bytes ||
+          plane.row_stride_bytes != expected.row_stride_bytes ||
+          address % expected.alignment_bytes != 0 ||
+          address >
+              std::numeric_limits<std::uintptr_t>::max() - plane.span_bytes) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!validate_planes(binding.input_planes, binding.input_plane_count,
+                       binding.input_descriptor, true) ||
+      !validate_planes(binding.output_planes, binding.output_plane_count,
+                       binding.output_descriptor, false)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return false;
+  }
+  for (std::size_t input = 0; input < binding.input_plane_count; ++input) {
+    const auto input_begin =
+        reinterpret_cast<std::uintptr_t>(binding.input_planes[input].read_data);
+    const auto input_end = input_begin + binding.input_planes[input].span_bytes;
+    for (std::size_t output = 0; output < binding.output_plane_count;
+         ++output) {
+      const auto output_begin = reinterpret_cast<std::uintptr_t>(
+          binding.output_planes[output].write_data);
+      const auto output_end =
+          output_begin + binding.output_planes[output].span_bytes;
+      if (input_begin >= output_end || output_begin >= input_end)
+        continue;
+      const bool exact = input_begin == output_begin && input_end == output_end;
+      const auto input_alias = binding.input_descriptor.aliasing;
+      const auto output_alias = binding.output_descriptor.aliasing;
+      const bool alias_allowed =
+          binding.input_descriptor.in_place_permitted &&
+          binding.output_descriptor.in_place_permitted &&
+          input_alias != AliasingPermission::forbidden &&
+          output_alias != AliasingPermission::forbidden &&
+          ((input_alias == AliasingPermission::overlapping_allowed &&
+            output_alias == AliasingPermission::overlapping_allowed) ||
+           exact);
+      if (!alias_allowed) {
+        SetReason(reason, ReasonId::host_frame_binding_invalid);
+        return false;
+      }
     }
   }
   return true;
@@ -290,8 +576,12 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   ReasonId validation_reason = ReasonId::none;
   if (!ValidatePreparedProgram(program, &validation_reason)) {
     SetReason(reason, validation_reason);
-    if (prepared_)
-      ++telemetry_.setup_rollbacks;
+    if (prepared_) {
+      if (MayRetainOldProgram(program))
+        ++telemetry_.setup_rollbacks;
+      else
+        RejectOldProgramRetention(ReasonId::old_program_policy_incompatible);
+    }
     return validation_reason == ReasonId::resource_exhausted
                ? StatusId::resource_exhausted
                : StatusId::blocked;
@@ -299,8 +589,12 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   if (adapter.adapter_instance_id() != program.owner_adapter_instance_id ||
       adapter.backend_id() != program.execution_domain.backend) {
     SetReason(reason, ReasonId::foreign_adapter);
-    if (prepared_)
-      ++telemetry_.setup_rollbacks;
+    if (prepared_) {
+      if (MayRetainOldProgram(program))
+        ++telemetry_.setup_rollbacks;
+      else
+        RejectOldProgramRetention(ReasonId::old_program_policy_incompatible);
+    }
     return StatusId::blocked;
   }
 
@@ -313,8 +607,12 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
       prepare_status != StatusId::degraded) {
     if (candidate.handle_id != 0)
       adapter.DestroyPrepared(&candidate);
-    if (prepared_)
-      ++telemetry_.setup_rollbacks;
+    if (prepared_) {
+      if (MayRetainOldProgram(program))
+        ++telemetry_.setup_rollbacks;
+      else
+        RejectOldProgramRetention(ReasonId::old_program_policy_incompatible);
+    }
     if (readiness)
       *readiness = candidate_readiness;
     SetReason(reason, prepare_reason);
@@ -335,12 +633,17 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
       candidate_readiness.requested_backend == program.requested_backend &&
       candidate_readiness.selected_backend ==
           program.execution_domain.backend &&
-      candidate_readiness.execution_domain == program.execution_domain;
+      candidate_readiness.execution_domain == program.execution_domain &&
+      ValidReadinessEvidence(candidate_readiness);
   if (!handle_valid || !readiness_valid) {
     if (candidate.handle_id != 0)
       adapter.DestroyPrepared(&candidate);
-    if (prepared_)
-      ++telemetry_.setup_rollbacks;
+    if (prepared_) {
+      if (MayRetainOldProgram(program))
+        ++telemetry_.setup_rollbacks;
+      else
+        RejectOldProgramRetention(ReasonId::old_program_policy_incompatible);
+    }
     SetReason(reason, !budget_valid ? ReasonId::resource_exhausted
                                     : ReasonId::malformed_contract);
     return StatusId::blocked;
@@ -355,9 +658,19 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   stopped_ = false;
   completion_pending_ = false;
   have_capture_sequence_ = false;
+  rebuild_requested_ = false;
+  disabled_stage_mask_ = 0;
+  permanent_disabled_stage_mask_ = 0;
+  consecutive_failures_.fill(0);
+  retry_after_sequence_.fill(0);
   ++telemetry_.setup_successes;
   telemetry_.requested_backend = program.requested_backend;
   telemetry_.selected_backend = program.execution_domain.backend;
+  telemetry_.runtime_status = prepare_status;
+  telemetry_.runtime_reason = candidate_readiness.reason;
+  telemetry_.disabled_stage_mask = 0;
+  readiness_ = candidate_readiness;
+  configured_readiness_ = candidate_readiness;
   if (readiness)
     *readiness = candidate_readiness;
   return prepare_status;
@@ -368,7 +681,12 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
   if (stopped_)
     return FailedExecute(StatusId::stopped, ReasonId::shutdown_requested);
   if (quarantined_)
-    return FailedExecute(StatusId::quarantined, ReasonId::device_lost);
+    return FailedExecute(StatusId::quarantined,
+                         readiness_.reason == ReasonId::none
+                             ? ReasonId::circuit_breaker_open
+                             : readiness_.reason);
+  if (rebuild_requested_)
+    return FailedExecute(StatusId::stale, ReasonId::reconfiguration_required);
   if (!prepared_ || adapter_ == nullptr)
     return FailedExecute(StatusId::blocked, ReasonId::stale_program);
   if (completion_pending_)
@@ -377,6 +695,8 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
     return FailedExecute(StatusId::stale, ReasonId::reconfiguration_required);
   if (request.execution_domain != program_.execution_domain)
     return FailedExecute(StatusId::blocked, ReasonId::wrong_execution_domain);
+  if (request.disabled_stage_mask != 0)
+    return FailedExecute(StatusId::blocked, ReasonId::malformed_contract);
   if (!ValidateResourceHandle(
           request.input, program_.execution_domain,
           program_.execution_domain.logical_context_generation,
@@ -391,75 +711,181 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
     return FailedExecute(StatusId::blocked, resource_reason);
   }
 
-  if (program_.temporal.temporal &&
-      program_.temporal.requires_contiguous_capture_sequence &&
-      have_capture_sequence_ &&
-      request.capture_sequence != last_capture_sequence_ + 1) {
-    if (program_.temporal.discontinuity_action ==
-        TemporalDiscontinuityAction::fail_frame) {
-      return FailedExecute(StatusId::failed, ReasonId::temporal_discontinuity);
+  if (request.capture_sequence == 0)
+    return FailedExecute(StatusId::blocked, ReasonId::malformed_contract);
+
+  bool temporal_state_reset = false;
+  std::uint64_t dropped_capture_frames = 0;
+  if (have_capture_sequence_) {
+    if (request.capture_sequence <= last_capture_sequence_) {
+      ++telemetry_.frame_drop_events;
+      ++telemetry_.preserve_order_failures;
+      telemetry_.runtime_status = StatusId::failed;
+      telemetry_.runtime_reason = ReasonId::frame_order_violated;
+      return FailedExecute(StatusId::failed, ReasonId::frame_order_violated);
     }
-    const StatusId reset =
-        adapter_->ResetTemporalState(handle_, ReasonId::temporal_discontinuity);
-    if (reset != StatusId::ready)
-      return FailedExecute(reset, ReasonId::temporal_discontinuity);
-    ++telemetry_.temporal_resets;
+    if (request.capture_sequence != last_capture_sequence_ + 1) {
+      dropped_capture_frames =
+          request.capture_sequence - last_capture_sequence_ - 1;
+      ++telemetry_.frame_drop_events;
+      telemetry_.dropped_capture_frames += dropped_capture_frames;
+      switch (program_.temporal.frame_drop_behavior) {
+      case FrameDropBehavior::preserve_order:
+        ++telemetry_.preserve_order_failures;
+        telemetry_.runtime_status = StatusId::failed;
+        telemetry_.runtime_reason = ReasonId::frame_order_violated;
+        return FailedExecute(StatusId::failed, ReasonId::frame_order_violated);
+      case FrameDropBehavior::reset_temporal_state: {
+        const StatusId reset = adapter_->ResetTemporalState(
+            handle_, ReasonId::temporal_discontinuity);
+        if (reset != StatusId::ready)
+          return FailedExecute(reset, ReasonId::temporal_discontinuity);
+        ++telemetry_.temporal_resets;
+        temporal_state_reset = true;
+        break;
+      }
+      case FrameDropBehavior::latest_frame_wins:
+        ++telemetry_.latest_frame_wins_events;
+        if (program_.temporal.temporal &&
+            program_.temporal.requires_contiguous_capture_sequence) {
+          if (program_.temporal.discontinuity_action ==
+              TemporalDiscontinuityAction::fail_frame) {
+            return FailedExecute(StatusId::failed,
+                                 ReasonId::temporal_discontinuity);
+          }
+          const StatusId reset = adapter_->ResetTemporalState(
+              handle_, ReasonId::temporal_discontinuity);
+          if (reset != StatusId::ready)
+            return FailedExecute(reset, ReasonId::temporal_discontinuity);
+          ++telemetry_.temporal_resets;
+          temporal_state_reset = true;
+        }
+        break;
+      }
+    }
   }
 
+  for (std::size_t index = 0; index < program_.stage_count; ++index) {
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if ((disabled_stage_mask_ & bit) != 0 &&
+        (permanent_disabled_stage_mask_ & bit) == 0 &&
+        request.capture_sequence >= retry_after_sequence_[index]) {
+      disabled_stage_mask_ &= ~bit;
+      retry_after_sequence_[index] = 0;
+      readiness_.blocked_stage_mask &= ~bit;
+    }
+  }
+  if (disabled_stage_mask_ == 0 && !quarantined_ && !rebuild_requested_)
+    readiness_ = configured_readiness_;
+  telemetry_.disabled_stage_mask = disabled_stage_mask_;
+  readiness_.disabled_stage_mask = disabled_stage_mask_;
+  ExecuteRequest effective_request = request;
+  effective_request.disabled_stage_mask = disabled_stage_mask_;
   ++telemetry_.execution_attempts;
-  ExecuteResult result = adapter_->Execute(handle_, request);
+  ExecuteResult result = adapter_->Execute(handle_, effective_request);
+  const auto fail_after_adapter = [this](ExecuteResult failure) noexcept {
+    host_binding_pending_ = false;
+    pending_host_tokens_ = {};
+    return failure;
+  };
+  result.dropped_capture_frames = dropped_capture_frames;
+  result.temporal_state_reset = temporal_state_reset;
   if (result.stage_count > result.stages.size())
-    return FailedExecute(StatusId::failed, ReasonId::malformed_contract);
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::malformed_contract));
   AccumulateExecuteTelemetry(result);
   if (result.reason == ReasonId::device_lost) {
     quarantined_ = true;
     ++telemetry_.device_losses;
     result.status = StatusId::quarantined;
-    return result;
+    readiness_.status = StatusId::quarantined;
+    readiness_.reason = ReasonId::device_lost;
+    readiness_.available = false;
+    telemetry_.runtime_status = StatusId::quarantined;
+    telemetry_.runtime_reason = ReasonId::device_lost;
+    return fail_after_adapter(result);
   }
-  if (!IsSuccessfulExecution(result.status))
-    return result;
+  // Adapter-side token/binding validation can fail before any stage runs.
+  // Preserve that exact typed failure; stage circuit breakers have no result
+  // to consume in this case.
+  if (!IsSuccessfulExecution(result.status) && result.stage_count == 0)
+    return fail_after_adapter(result);
+  if (result.stage_count != program_.stage_count)
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::malformed_contract));
+
+  bool optional_failure = false;
+  bool required_failure = false;
+  for (std::size_t index = 0; index < result.stage_count; ++index) {
+    const auto &stage_result = result.stages[index];
+    const auto &stage = program_.stages[index];
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    if (stage.stage_id != stage_result.stage_id ||
+        stage.semantic != stage_result.semantic ||
+        stage.primitive != stage_result.primitive) {
+      return fail_after_adapter(
+          FailedExecute(StatusId::failed, ReasonId::malformed_contract));
+    }
+    if ((effective_request.disabled_stage_mask & bit) != 0) {
+      if (stage.required ||
+          stage_result.status != StageExecutionStatus::disabled_preserved ||
+          stage_result.reason != ReasonId::circuit_breaker_open ||
+          !stage_result.valid_output_preserved ||
+          stage_result.elapsed_ns != 0) {
+        return fail_after_adapter(
+            FailedExecute(StatusId::failed, ReasonId::circuit_breaker_open));
+      }
+      ++telemetry_.disabled_stage_frames;
+      continue;
+    }
+    if (stage_result.status == StageExecutionStatus::disabled_preserved)
+      return fail_after_adapter(
+          FailedExecute(StatusId::failed, ReasonId::malformed_contract));
+    if (stage_result.status == StageExecutionStatus::optional_failed_open) {
+      if (stage.required || !stage_result.valid_output_preserved)
+        return fail_after_adapter(
+            FailedExecute(StatusId::failed, ReasonId::required_stage_failed));
+      optional_failure = true;
+    }
+    if (stage_result.status == StageExecutionStatus::required_failed ||
+        stage_result.status == StageExecutionStatus::not_run) {
+      required_failure = true;
+    }
+  }
+  UpdateCircuitBreakers(result, request.capture_sequence);
+  if (!IsSuccessfulExecution(result.status) || required_failure)
+    return fail_after_adapter(result);
   if (!result.completion.complete || result.completion.token_id == 0 ||
       result.completion.program_id != program_.program_id ||
       result.completion.adapter_instance_id !=
           program_.owner_adapter_instance_id ||
       result.completion.capture_sequence != request.capture_sequence) {
-    return FailedExecute(StatusId::failed, ReasonId::incomplete_execution);
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::incomplete_execution));
   }
-  if (result.stage_count != program_.stage_count)
-    return FailedExecute(StatusId::failed, ReasonId::malformed_contract);
   if (!result.output_valid ||
       !ValidateResourceHandle(
           result.output, program_.execution_domain,
           program_.execution_domain.logical_context_generation,
           program_.budget)) {
-    return FailedExecute(StatusId::failed, ReasonId::invalid_resource);
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::invalid_resource));
+  }
+  if (host_binding_pending_ &&
+      (!SameResourceToken(request.input, pending_host_tokens_.input) ||
+       !SameResourceToken(result.output, pending_host_tokens_.output))) {
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::host_frame_binding_invalid));
   }
 
-  bool optional_failure = false;
-  for (std::size_t index = 0; index < result.stage_count; ++index) {
-    const auto &stage_result = result.stages[index];
-    const auto &stage = program_.stages[index];
-    if (stage.stage_id != stage_result.stage_id ||
-        stage.semantic != stage_result.semantic) {
-      return FailedExecute(StatusId::failed, ReasonId::malformed_contract);
-    }
-    if (stage_result.status == StageExecutionStatus::optional_failed_open) {
-      if (stage.required || !stage_result.valid_output_preserved)
-        return FailedExecute(StatusId::failed, ReasonId::required_stage_failed);
-      optional_failure = true;
-    }
-    if (stage_result.status == StageExecutionStatus::required_failed ||
-        stage_result.status == StageExecutionStatus::not_run) {
-      return FailedExecute(StatusId::failed, ReasonId::required_stage_failed);
-    }
-  }
   if (result.transfers.intermediate_readbacks != 0 ||
       result.transfers.intermediate_uploads != 0 ||
-      (program_.requires_upload && result.transfers.uploads != 1) ||
-      (program_.requires_final_readback &&
-       result.transfers.final_readbacks != 1)) {
-    return FailedExecute(StatusId::failed, ReasonId::synchronization_failed);
+      result.transfers.uploads != (program_.requires_upload ? 1u : 0u) ||
+      result.transfers.final_readbacks !=
+          (program_.requires_final_readback ? 1u : 0u) ||
+      result.transfers.cpu_tail_boundaries != program_.cpu_tail_count) {
+    return fail_after_adapter(
+        FailedExecute(StatusId::failed, ReasonId::transfer_contract_violated));
   }
   if (optional_failure) {
     result.status = StatusId::degraded;
@@ -474,7 +900,111 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
   completion_pending_ = true;
   last_capture_sequence_ = request.capture_sequence;
   have_capture_sequence_ = true;
+  if (!quarantined_ && !rebuild_requested_ && disabled_stage_mask_ == 0) {
+    telemetry_.runtime_status = result.status;
+    telemetry_.runtime_reason = result.reason;
+  }
   return result;
+}
+
+StatusId PreparedProgramSession::BindHostFrame(const HostFrameBinding &binding,
+                                               HostFrameTokens *tokens,
+                                               ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (stopped_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  if (!prepared_ || adapter_ == nullptr || tokens == nullptr ||
+      completion_pending_ || host_binding_pending_) {
+    SetReason(reason, completion_pending_ || host_binding_pending_
+                          ? ReasonId::output_not_committed
+                          : ReasonId::stale_program);
+    return StatusId::blocked;
+  }
+  ReasonId validation_reason = ReasonId::none;
+  if (!ValidateHostFrameBinding(binding, program_, &validation_reason)) {
+    SetReason(reason, validation_reason);
+    return StatusId::blocked;
+  }
+  HostFrameTokens candidate;
+  const StatusId status =
+      adapter_->BindHostFrame(handle_, binding, &candidate, reason);
+  if (status != StatusId::ready)
+    return status;
+  if (!ValidateResourceHandle(
+          candidate.input, program_.execution_domain,
+          program_.execution_domain.logical_context_generation,
+          program_.budget) ||
+      candidate.input.lifetime != ResourceLifetime::frame_borrowed ||
+      !ValidateResourceHandle(
+          candidate.output, program_.execution_domain,
+          program_.execution_domain.logical_context_generation,
+          program_.budget) ||
+      candidate.output.lifetime != ResourceLifetime::frame_borrowed) {
+    const bool one_resource =
+        candidate.input.resource_id != 0 &&
+        candidate.input.resource_id == candidate.output.resource_id &&
+        candidate.input.allocator_owner_id ==
+            candidate.output.allocator_owner_id;
+    DestroyResource(&candidate.input);
+    if (!one_resource)
+      DestroyResource(&candidate.output);
+    else
+      candidate.output = {};
+    SetReason(reason, ReasonId::invalid_resource);
+    return StatusId::blocked;
+  }
+  *tokens = candidate;
+  pending_host_binding_ = binding;
+  pending_host_tokens_ = candidate;
+  host_binding_pending_ = true;
+  return StatusId::ready;
+}
+
+StatusId PreparedProgramSession::ResolveHostFrameOutput(
+    const CompletionToken &completion, const ResourceHandle &output,
+    HostFrameOutputResolution *resolution, ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (!prepared_ || adapter_ == nullptr || resolution == nullptr ||
+      !host_binding_pending_ || !completion_pending_ ||
+      completion.token_id != pending_completion_.token_id ||
+      completion.program_id != pending_completion_.program_id ||
+      completion.adapter_instance_id !=
+          pending_completion_.adapter_instance_id ||
+      completion.capture_sequence != pending_completion_.capture_sequence) {
+    SetReason(reason, ReasonId::output_not_committed);
+    return StatusId::blocked;
+  }
+  if (!SameResourceToken(output, pending_host_tokens_.output)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  HostFrameOutputResolution candidate;
+  const StatusId status = adapter_->ResolveHostFrameOutput(
+      handle_, completion, output, &candidate, reason);
+  if (status != StatusId::ready)
+    return status;
+  if (!candidate.output_ready ||
+      candidate.capture_sequence != pending_host_binding_.capture_sequence ||
+      candidate.plane_count != pending_host_binding_.output_plane_count ||
+      !SameImageDescriptor(candidate.descriptor,
+                           pending_host_binding_.output_descriptor)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  for (std::size_t index = 0; index < candidate.plane_count; ++index) {
+    const auto &actual = candidate.planes[index];
+    const auto &expected = pending_host_binding_.output_planes[index];
+    if (actual.write_data != expected.write_data ||
+        actual.span_bytes != expected.span_bytes ||
+        actual.row_stride_bytes != expected.row_stride_bytes) {
+      SetReason(reason, ReasonId::host_frame_binding_invalid);
+      return StatusId::blocked;
+    }
+  }
+  *resolution = candidate;
+  return StatusId::ready;
 }
 
 StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
@@ -492,6 +1022,7 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
   }
 
   completion_pending_ = false;
+  host_binding_pending_ = false;
   if (!commit.output_write_succeeded) {
     SetReason(reason, ReasonId::output_write_failed);
     pending_stage_count_ = 0;
@@ -537,8 +1068,137 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
   return StatusId::ready;
 }
 
+bool PreparedProgramSession::MayRetainOldProgram(
+    const PreparedProgram &candidate) const noexcept {
+  if (!prepared_ || candidate.setup_failure_policy !=
+                        SetupFailurePolicy::retain_old_program) {
+    return false;
+  }
+  if (candidate.strict_backend_selection &&
+      (candidate.requested_backend == BackendId::invalid ||
+       program_.execution_domain.backend != candidate.requested_backend)) {
+    return false;
+  }
+  if (candidate.strict_provider_selection) {
+    if (candidate.requested_provider == SemanticEffectProviderId::invalid)
+      return false;
+    for (std::size_t index = 0; index < program_.stage_count; ++index) {
+      if (program_.stages[index].semantic != SemanticEffectId::invalid &&
+          program_.stages[index].provider != candidate.requested_provider) {
+        return false;
+      }
+    }
+  }
+  if (candidate.strict_execution_domain &&
+      (!ValidateExecutionDomain(candidate.requested_execution_domain) ||
+       program_.execution_domain != candidate.requested_execution_domain)) {
+    return false;
+  }
+  return true;
+}
+
+void PreparedProgramSession::RejectOldProgramRetention(
+    ReasonId reason) noexcept {
+  ++telemetry_.setup_retention_rejections;
+  telemetry_.runtime_status = StatusId::blocked;
+  telemetry_.runtime_reason = reason;
+  readiness_.status = StatusId::blocked;
+  readiness_.reason = reason;
+  readiness_.available = false;
+  DestroyActive();
+}
+
+void PreparedProgramSession::UpdateCircuitBreakers(
+    const ExecuteResult &result, std::uint64_t capture_sequence) noexcept {
+  for (std::size_t index = 0;
+       index < result.stage_count && index < program_.stage_count; ++index) {
+    const auto status = result.stages[index].status;
+    if (status == StageExecutionStatus::succeeded) {
+      consecutive_failures_[index] = 0;
+      continue;
+    }
+    if (status == StageExecutionStatus::disabled_preserved)
+      continue;
+    if (status != StageExecutionStatus::optional_failed_open &&
+        status != StageExecutionStatus::required_failed &&
+        status != StageExecutionStatus::not_run) {
+      continue;
+    }
+    if (consecutive_failures_[index] !=
+        std::numeric_limits<std::uint32_t>::max()) {
+      ++consecutive_failures_[index];
+    }
+    const auto &stage = program_.stages[index];
+    if (consecutive_failures_[index] <
+        stage.circuit_breaker.consecutive_failure_limit) {
+      continue;
+    }
+    consecutive_failures_[index] = 0;
+    ++telemetry_.circuit_breaker_opens;
+    const std::uint32_t bit = std::uint32_t{1} << index;
+    switch (stage.circuit_breaker.action) {
+    case CircuitBreakerAction::disable_stage:
+      if (stage.required) {
+        quarantined_ = true;
+        readiness_.status = StatusId::quarantined;
+        readiness_.reason = ReasonId::required_stage_failed;
+        readiness_.available = false;
+        telemetry_.runtime_status = StatusId::quarantined;
+        telemetry_.runtime_reason = ReasonId::required_stage_failed;
+        break;
+      }
+      disabled_stage_mask_ |= bit;
+      readiness_.disabled_stage_mask = disabled_stage_mask_;
+      readiness_.blocked_stage_mask |= bit;
+      readiness_.status = StatusId::degraded;
+      readiness_.available = true;
+      readiness_.degraded = true;
+      readiness_.reason = stage.circuit_breaker.cooldown_frames == 0
+                              ? ReasonId::circuit_breaker_permanently_disabled
+                              : ReasonId::circuit_breaker_retry_pending;
+      telemetry_.disabled_stage_mask = disabled_stage_mask_;
+      telemetry_.runtime_status = StatusId::degraded;
+      telemetry_.runtime_reason = readiness_.reason;
+      if (stage.circuit_breaker.cooldown_frames == 0) {
+        permanent_disabled_stage_mask_ |= bit;
+        retry_after_sequence_[index] =
+            std::numeric_limits<std::uint64_t>::max();
+      } else if (capture_sequence <= std::numeric_limits<std::uint64_t>::max() -
+                                         stage.circuit_breaker.cooldown_frames -
+                                         1) {
+        retry_after_sequence_[index] =
+            capture_sequence + stage.circuit_breaker.cooldown_frames + 1;
+      } else {
+        permanent_disabled_stage_mask_ |= bit;
+        retry_after_sequence_[index] =
+            std::numeric_limits<std::uint64_t>::max();
+      }
+      break;
+    case CircuitBreakerAction::quarantine_program:
+      quarantined_ = true;
+      readiness_.status = StatusId::quarantined;
+      readiness_.reason = ReasonId::circuit_breaker_open;
+      readiness_.available = false;
+      telemetry_.runtime_status = StatusId::quarantined;
+      telemetry_.runtime_reason = ReasonId::circuit_breaker_open;
+      break;
+    case CircuitBreakerAction::request_rebuild:
+      rebuild_requested_ = true;
+      ++telemetry_.rebuild_requests;
+      readiness_.status = StatusId::stale;
+      readiness_.reason = ReasonId::reconfiguration_required;
+      readiness_.available = false;
+      readiness_.rebuild_requested = true;
+      telemetry_.runtime_status = StatusId::stale;
+      telemetry_.runtime_reason = ReasonId::reconfiguration_required;
+      break;
+    }
+  }
+}
+
 void PreparedProgramSession::Invalidate(ReasonId reason) noexcept {
   completion_pending_ = false;
+  host_binding_pending_ = false;
   pending_stage_count_ = 0;
   have_capture_sequence_ = false;
   if (reason == ReasonId::device_lost) {
@@ -552,6 +1212,7 @@ void PreparedProgramSession::Shutdown() noexcept {
   if (stopped_)
     return;
   completion_pending_ = false;
+  host_binding_pending_ = false;
   pending_stage_count_ = 0;
   IResidentAdapter *adapter = adapter_;
   DestroyActive();

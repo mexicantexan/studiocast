@@ -54,6 +54,8 @@ bool ValidateSemanticCapability(
        !capability.production_eligible)) {
     return false;
   }
+  if (capability.evidence_count > capability.evidence.size())
+    return false;
   if (capability.production_eligible &&
       (!capability.live_stage || !capability.exact_evidence ||
        (capability.status != StatusId::ready &&
@@ -63,6 +65,35 @@ bool ValidateSemanticCapability(
   if (capability.cpu_tail == CpuTailId::invalid &&
       capability.cpu_tail_scratch_bytes != 0) {
     return false;
+  }
+  if (capability.cpu_tail == CpuTailId::invalid &&
+      capability.cpu_tail_placement !=
+          DeclaredCpuTail::Placement::after_stage) {
+    return false;
+  }
+  for (std::size_t index = 0; index < capability.evidence_count; ++index) {
+    const auto &evidence = capability.evidence[index];
+    if (evidence.code == CapabilityEvidenceCode::invalid ||
+        evidence.status == StatusId::invalid ||
+        evidence.backend != registration.backend ||
+        (evidence.semantic != SemanticEffectId::invalid &&
+         evidence.semantic != capability.semantic) ||
+        (evidence.satisfied && !((evidence.status == StatusId::ready &&
+                                  evidence.reason == ReasonId::none) ||
+                                 (evidence.status == StatusId::degraded &&
+                                  evidence.reason != ReasonId::none))) ||
+        (!evidence.satisfied &&
+         (!((evidence.status == StatusId::blocked ||
+             evidence.status == StatusId::unavailable)) ||
+          evidence.reason == ReasonId::none))) {
+      return false;
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (capability.evidence[previous].code == evidence.code &&
+          capability.evidence[previous].semantic == evidence.semantic) {
+        return false;
+      }
+    }
   }
   if (capability.supports_tracked_vignette_center &&
       capability.semantic != SemanticEffectId::vignette) {

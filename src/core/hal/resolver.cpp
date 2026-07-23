@@ -26,8 +26,74 @@ bool IsSelectable(const SemanticCapabilityEvidence &capability) noexcept {
           capability.status == StatusId::degraded);
 }
 
+bool ComputeFamilyAllows(ComputeFamilyAllowance allowance,
+                         BackendId backend) noexcept {
+  switch (allowance) {
+  case ComputeFamilyAllowance::any:
+    return true;
+  case ComputeFamilyAllowance::cpu_only:
+    return backend == BackendId::cpu ||
+           backend == BackendId::open_video_onnxruntime;
+  case ComputeFamilyAllowance::cuda_family:
+    return backend == BackendId::cuda || backend == BackendId::maxine;
+  case ComputeFamilyAllowance::vulkan_only:
+    return backend == BackendId::vulkan;
+  }
+  return false;
+}
+
+bool EffectsEngineMatches(EffectsEnginePreferenceConstraint preference,
+                          BackendId backend) noexcept {
+  switch (preference) {
+  case EffectsEnginePreferenceConstraint::automatic:
+    return true;
+  case EffectsEnginePreferenceConstraint::maxine:
+    return backend == BackendId::maxine;
+  case EffectsEnginePreferenceConstraint::open_cuda:
+    return backend == BackendId::cuda;
+  }
+  return false;
+}
+
+bool ValidPreferences(const PreferenceConstraints &preferences) noexcept {
+  switch (preferences.compute_family) {
+  case ComputeFamilyAllowance::any:
+  case ComputeFamilyAllowance::cpu_only:
+  case ComputeFamilyAllowance::cuda_family:
+  case ComputeFamilyAllowance::vulkan_only:
+    break;
+  default:
+    return false;
+  }
+  switch (preferences.effects_engine) {
+  case EffectsEnginePreferenceConstraint::automatic:
+  case EffectsEnginePreferenceConstraint::maxine:
+  case EffectsEnginePreferenceConstraint::open_cuda:
+    break;
+  default:
+    return false;
+  }
+  if (preferences.strict_effects_engine &&
+      preferences.effects_engine ==
+          EffectsEnginePreferenceConstraint::automatic) {
+    return false;
+  }
+  if (preferences.compute_family == ComputeFamilyAllowance::cpu_only &&
+      preferences.effects_engine !=
+          EffectsEnginePreferenceConstraint::automatic) {
+    return false;
+  }
+  if (preferences.compute_family == ComputeFamilyAllowance::vulkan_only &&
+      preferences.effects_engine !=
+          EffectsEnginePreferenceConstraint::automatic) {
+    return false;
+  }
+  return true;
+}
+
 bool BetterCandidate(const Candidate &candidate, const Candidate &current,
-                     const BackendRequest &request) noexcept {
+                     const BackendRequest &request,
+                     const PreferenceConstraints &preferences) noexcept {
   if (current.registration == nullptr)
     return true;
   const bool candidate_requested =
@@ -38,6 +104,12 @@ bool BetterCandidate(const Candidate &candidate, const Candidate &current,
       current.registration->backend == request.backend;
   if (candidate_requested != current_requested)
     return candidate_requested;
+  const bool candidate_engine = EffectsEngineMatches(
+      preferences.effects_engine, candidate.registration->backend);
+  const bool current_engine = EffectsEngineMatches(
+      preferences.effects_engine, current.registration->backend);
+  if (candidate_engine != current_engine)
+    return candidate_engine;
   if (candidate.registration->selection_priority !=
       current.registration->selection_priority) {
     return candidate.registration->selection_priority <
@@ -55,9 +127,10 @@ bool BetterCandidate(const Candidate &candidate, const Candidate &current,
          current.registration->adapter_instance_id;
 }
 
-CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
-                              const CanonicalStageIntent &intent,
-                              const BackendRequest &request) noexcept {
+CandidateSearch
+FindCandidate(const StaticAdapterRegistry &registry,
+              const CanonicalStageIntent &intent, const BackendRequest &request,
+              const PreferenceConstraints &preferences) noexcept {
   CandidateSearch search;
   std::uint32_t unavailable_priority =
       std::numeric_limits<std::uint32_t>::max();
@@ -80,6 +153,10 @@ CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
       if (capability.semantic != intent.semantic)
         continue;
       search.semantic_evidence_exists = true;
+      if (!ComputeFamilyAllows(preferences.compute_family,
+                               registration->backend)) {
+        continue;
+      }
       if (request.mode == BackendRequestMode::explicit_backend &&
           registration->backend == request.backend) {
         search.requested_backend_evidence_exists = true;
@@ -101,9 +178,14 @@ CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
       }
       if (request.strict && registration->backend != request.backend)
         continue;
+      if (preferences.strict_effects_engine &&
+          !EffectsEngineMatches(preferences.effects_engine,
+                                registration->backend)) {
+        continue;
+      }
       if (IsSelectable(capability) && configuration_supported) {
         const Candidate candidate{registration, &capability};
-        if (BetterCandidate(candidate, search.selected, request))
+        if (BetterCandidate(candidate, search.selected, request, preferences))
           search.selected = candidate;
       } else if (registration->selection_priority < unavailable_priority ||
                  (registration->selection_priority == unavailable_priority &&
@@ -192,13 +274,22 @@ ResolveSemanticStages(const StaticAdapterRegistry &registry,
   result.request_mode = request.backend.mode;
   result.strict_backend_selection = request.backend.strict;
   result.requested_backend = request.backend.backend;
+  result.preferences = request.preferences;
   result.stage_count = request.stage_count;
   if (request.stage_count > request.stages.size() ||
       (request.backend.mode == BackendRequestMode::explicit_backend &&
        request.backend.backend == BackendId::invalid) ||
       (request.backend.mode == BackendRequestMode::automatic &&
        (request.backend.backend != BackendId::invalid ||
-        request.backend.strict))) {
+        request.backend.strict)) ||
+      !ValidPreferences(request.preferences) ||
+      (request.backend.mode == BackendRequestMode::explicit_backend &&
+       !ComputeFamilyAllows(request.preferences.compute_family,
+                            request.backend.backend)) ||
+      (request.backend.mode == BackendRequestMode::explicit_backend &&
+       request.backend.strict && request.preferences.strict_effects_engine &&
+       !EffectsEngineMatches(request.preferences.effects_engine,
+                             request.backend.backend))) {
     result.status = StatusId::blocked;
     result.reason = ReasonId::malformed_contract;
     return result;
@@ -232,7 +323,7 @@ ResolveSemanticStages(const StaticAdapterRegistry &registry,
     previous_stage_id = intent.stage_id;
 
     const CandidateSearch search =
-        FindCandidate(registry, intent, request.backend);
+        FindCandidate(registry, intent, request.backend, request.preferences);
     const Candidate selected = search.selected;
     if (selected.registration == nullptr) {
       resolved.status = StatusId::blocked;
@@ -259,14 +350,27 @@ ResolveSemanticStages(const StaticAdapterRegistry &registry,
     resolved.cpu_tail = selected.capability->cpu_tail;
     resolved.cpu_tail_scratch_bytes =
         selected.capability->cpu_tail_scratch_bytes;
+    resolved.cpu_tail_placement = selected.capability->cpu_tail_placement;
+    resolved.evidence_count = selected.capability->evidence_count;
+    std::copy_n(selected.capability->evidence.begin(),
+                selected.capability->evidence_count, resolved.evidence.begin());
     have_selected_stage = true;
-    const bool fallback_selected =
+    const bool backend_fallback =
         request.backend.mode == BackendRequestMode::explicit_backend &&
         !request.backend.strict &&
         selected.registration->backend != request.backend.backend;
+    const bool engine_fallback =
+        request.preferences.effects_engine !=
+            EffectsEnginePreferenceConstraint::automatic &&
+        !request.preferences.strict_effects_engine &&
+        !EffectsEngineMatches(request.preferences.effects_engine,
+                              selected.registration->backend);
+    const bool fallback_selected = backend_fallback || engine_fallback;
     if (fallback_selected) {
       resolved.status = StatusId::degraded;
-      resolved.reason = FallbackReason(search);
+      resolved.reason = backend_fallback
+                            ? FallbackReason(search)
+                            : ReasonId::semantic_provider_unavailable;
       resolved.fallback_selected = true;
       result.fallback = true;
       result.degraded = true;
@@ -317,6 +421,15 @@ CompareShadowResolution(const ResolutionResult &live,
   ShadowComparison comparison;
   AddDiscrepancy(&comparison, ShadowField::request_mode, 0,
                  Numeric(live.request_mode), Numeric(shadow.request_mode));
+  AddDiscrepancy(&comparison, ShadowField::compute_family, 0,
+                 Numeric(live.preferences.compute_family),
+                 Numeric(shadow.preferences.compute_family));
+  AddDiscrepancy(&comparison, ShadowField::effects_engine, 0,
+                 Numeric(live.preferences.effects_engine),
+                 Numeric(shadow.preferences.effects_engine));
+  AddDiscrepancy(&comparison, ShadowField::strict_effects_engine, 0,
+                 live.preferences.strict_effects_engine,
+                 shadow.preferences.strict_effects_engine);
   AddDiscrepancy(&comparison, ShadowField::requested_backend, 0,
                  Numeric(live.requested_backend),
                  Numeric(shadow.requested_backend));

@@ -12,6 +12,7 @@ namespace studiocast::hal {
 inline constexpr std::size_t kMaxPreparedStages = 32;
 inline constexpr std::size_t kMaxCpuTails = 8;
 inline constexpr std::size_t kMaxLatencyHistogramBuckets = 16;
+inline constexpr std::size_t kMaxCapabilityEvidenceRecords = 24;
 
 enum class MemoryDomain : std::uint16_t {
   invalid = 0,
@@ -20,6 +21,7 @@ enum class MemoryDomain : std::uint16_t {
   device_local,
   readback_staging,
   provider_owned,
+  scratch,
 };
 
 enum class SynchronizationState : std::uint16_t {
@@ -121,6 +123,9 @@ struct PreparedStage {
   FailureAction failure_action = FailureAction::fail_closed;
   CircuitBreakerPolicy circuit_breaker{};
   std::uint64_t scratch_bytes = 0;
+  // A stage is either a product semantic or a utility primitive, never both.
+  // Appending this field preserves positional aggregate initialization.
+  PrimitiveOperationId primitive = PrimitiveOperationId::invalid;
 };
 
 enum class FrameDropBehavior : std::uint8_t {
@@ -178,6 +183,16 @@ struct DeclaredCpuTail {
   std::uint32_t after_stage_id = 0;
   std::uint64_t scratch_bytes = 0;
   bool required = true;
+  enum class Placement : std::uint8_t {
+    after_stage = 1,
+    before_stage,
+  };
+  Placement placement = Placement::after_stage;
+  std::uint32_t before_stage_id = 0;
+  // Zero preserves legacy aggregate initialization. A non-zero value is the
+  // exact boundary position in [0, stage_count]: before stage i is i, after
+  // stage i is i + 1.
+  std::uint32_t boundary_index = 0;
 };
 
 enum class SetupFailurePolicy : std::uint8_t {
@@ -201,8 +216,22 @@ struct PreparedProgram {
   std::size_t cpu_tail_count = 0;
   BackendId requested_backend = BackendId::invalid;
   bool strict_backend_selection = true;
+  SemanticEffectProviderId requested_provider =
+      SemanticEffectProviderId::invalid;
+  bool strict_provider_selection = false;
+  ExecutionDomainId requested_execution_domain{};
+  bool strict_execution_domain = false;
   bool requires_upload = true;
   bool requires_final_readback = true;
+};
+
+struct CapabilityEvidenceRecord {
+  CapabilityEvidenceCode code = CapabilityEvidenceCode::invalid;
+  StatusId status = StatusId::invalid;
+  ReasonId reason = ReasonId::none;
+  SemanticEffectId semantic = SemanticEffectId::invalid;
+  BackendId backend = BackendId::invalid;
+  bool satisfied = false;
 };
 
 struct ReadinessSnapshot {
@@ -214,8 +243,13 @@ struct ReadinessSnapshot {
   ExecutionDomainId execution_domain{};
   std::uint32_t ready_stage_mask = 0;
   std::uint32_t blocked_stage_mask = 0;
+  std::uint32_t disabled_stage_mask = 0;
+  std::array<CapabilityEvidenceRecord, kMaxCapabilityEvidenceRecords>
+      evidence{};
+  std::size_t evidence_count = 0;
   bool available = false;
   bool degraded = false;
+  bool rebuild_requested = false;
 };
 
 struct PreparedProgramHandle {
@@ -233,6 +267,7 @@ enum class StageExecutionStatus : std::uint8_t {
   succeeded,
   optional_failed_open,
   required_failed,
+  disabled_preserved,
 };
 
 struct StageExecutionResult {
@@ -242,6 +277,7 @@ struct StageExecutionResult {
   ReasonId reason = ReasonId::none;
   bool valid_output_preserved = false;
   std::uint64_t elapsed_ns = 0;
+  PrimitiveOperationId primitive = PrimitiveOperationId::invalid;
 };
 
 struct TransferCounters {
@@ -280,6 +316,17 @@ struct ExecutionTelemetry {
   std::uint64_t setup_attempts = 0;
   std::uint64_t setup_successes = 0;
   std::uint64_t setup_rollbacks = 0;
+  std::uint64_t setup_retention_rejections = 0;
+  std::uint64_t circuit_breaker_opens = 0;
+  std::uint64_t disabled_stage_frames = 0;
+  std::uint64_t rebuild_requests = 0;
+  std::uint64_t frame_drop_events = 0;
+  std::uint64_t dropped_capture_frames = 0;
+  std::uint64_t preserve_order_failures = 0;
+  std::uint64_t latest_frame_wins_events = 0;
+  std::uint32_t disabled_stage_mask = 0;
+  StatusId runtime_status = StatusId::invalid;
+  ReasonId runtime_reason = ReasonId::none;
   TransferCounters transfers{};
   LatencyHistogram frame_latency{};
   std::array<LatencyHistogram, kMaxPreparedStages> stage_latency{};
@@ -299,6 +346,10 @@ struct ExecuteRequest {
   ExecutionDomainId execution_domain{};
   std::uint64_t capture_sequence = 0;
   ResourceHandle input{};
+  // Filled by PreparedProgramSession from its fixed circuit-breaker state.
+  // Callers must pass zero; adapters must return disabled_preserved for every
+  // set optional-stage bit without executing that stage.
+  std::uint32_t disabled_stage_mask = 0;
 };
 
 struct ExecuteResult {
@@ -311,11 +362,45 @@ struct ExecuteResult {
   std::size_t stage_count = 0;
   TransferCounters transfers{};
   std::uint64_t frame_elapsed_ns = 0;
+  std::uint64_t dropped_capture_frames = 0;
+  bool temporal_state_reset = false;
 };
 
 struct OutputCommit {
   CompletionToken completion{};
   bool output_write_succeeded = false;
+};
+
+struct HostPlaneBinding {
+  const std::byte *read_data = nullptr;
+  std::byte *write_data = nullptr;
+  std::uint64_t span_bytes = 0;
+  std::uint64_t row_stride_bytes = 0;
+};
+
+struct HostFrameBinding {
+  ImageDescriptor input_descriptor{};
+  ImageDescriptor output_descriptor{};
+  std::array<HostPlaneBinding, kMaxImagePlanes> input_planes{};
+  std::array<HostPlaneBinding, kMaxImagePlanes> output_planes{};
+  std::size_t input_plane_count = 0;
+  std::size_t output_plane_count = 0;
+  std::uint64_t capture_sequence = 0;
+  OwnershipModel ownership = OwnershipModel::borrowed_until_completion;
+  ResourceLifetime lifetime = ResourceLifetime::frame_borrowed;
+};
+
+struct HostFrameTokens {
+  ResourceHandle input{};
+  ResourceHandle output{};
+};
+
+struct HostFrameOutputResolution {
+  ImageDescriptor descriptor{};
+  std::array<HostPlaneBinding, kMaxImagePlanes> planes{};
+  std::size_t plane_count = 0;
+  std::uint64_t capture_sequence = 0;
+  bool output_ready = false;
 };
 
 [[nodiscard]] bool
@@ -325,6 +410,9 @@ ValidateResourceHandle(const ResourceHandle &resource,
                        const ResourceBudget &budget) noexcept;
 [[nodiscard]] bool ValidatePreparedProgram(const PreparedProgram &program,
                                            ReasonId *reason) noexcept;
+[[nodiscard]] bool ValidateHostFrameBinding(const HostFrameBinding &binding,
+                                            const PreparedProgram &program,
+                                            ReasonId *reason) noexcept;
 
 class IResidentAdapter {
 public:
@@ -343,6 +431,22 @@ public:
                                 const ExecuteRequest &request) noexcept = 0;
   virtual StatusId ResetTemporalState(const PreparedProgramHandle &program,
                                       ReasonId reason) noexcept = 0;
+  virtual StatusId BindHostFrame(const PreparedProgramHandle &,
+                                 const HostFrameBinding &, HostFrameTokens *,
+                                 ReasonId *reason) noexcept {
+    if (reason)
+      *reason = ReasonId::host_frame_binding_unsupported;
+    return StatusId::blocked;
+  }
+  virtual StatusId ResolveHostFrameOutput(const PreparedProgramHandle &,
+                                          const CompletionToken &,
+                                          const ResourceHandle &,
+                                          HostFrameOutputResolution *,
+                                          ReasonId *reason) noexcept {
+    if (reason)
+      *reason = ReasonId::host_frame_binding_unsupported;
+    return StatusId::blocked;
+  }
   virtual void DestroyPrepared(PreparedProgramHandle *program) noexcept = 0;
   virtual void Shutdown() noexcept = 0;
 };
@@ -363,12 +467,27 @@ public:
   [[nodiscard]] ExecuteResult Execute(const ExecuteRequest &request) noexcept;
   [[nodiscard]] StatusId CommitOutput(const OutputCommit &commit,
                                       ReasonId *reason) noexcept;
+  [[nodiscard]] StatusId BindHostFrame(const HostFrameBinding &binding,
+                                       HostFrameTokens *tokens,
+                                       ReasonId *reason) noexcept;
+  [[nodiscard]] StatusId ResolveHostFrameOutput(
+      const CompletionToken &completion, const ResourceHandle &output,
+      HostFrameOutputResolution *resolution, ReasonId *reason) noexcept;
   void Invalidate(ReasonId reason) noexcept;
   void Shutdown() noexcept;
 
   [[nodiscard]] bool prepared() const noexcept { return prepared_; }
   [[nodiscard]] bool quarantined() const noexcept { return quarantined_; }
   [[nodiscard]] bool stopped() const noexcept { return stopped_; }
+  [[nodiscard]] bool rebuild_requested() const noexcept {
+    return rebuild_requested_;
+  }
+  [[nodiscard]] std::uint32_t disabled_stage_mask() const noexcept {
+    return disabled_stage_mask_;
+  }
+  [[nodiscard]] const ReadinessSnapshot &readiness() const noexcept {
+    return readiness_;
+  }
   [[nodiscard]] const PreparedProgram &program() const noexcept {
     return program_;
   }
@@ -379,20 +498,35 @@ public:
 private:
   void DestroyActive() noexcept;
   void AccumulateExecuteTelemetry(const ExecuteResult &result) noexcept;
+  [[nodiscard]] bool
+  MayRetainOldProgram(const PreparedProgram &candidate) const noexcept;
+  void RejectOldProgramRetention(ReasonId reason) noexcept;
+  void UpdateCircuitBreakers(const ExecuteResult &result,
+                             std::uint64_t capture_sequence) noexcept;
 
   IResidentAdapter *adapter_ = nullptr;
   PreparedProgram program_{};
   PreparedProgramHandle handle_{};
   ExecutionTelemetry telemetry_{};
   CompletionToken pending_completion_{};
+  ReadinessSnapshot readiness_{};
+  ReadinessSnapshot configured_readiness_{};
+  HostFrameBinding pending_host_binding_{};
+  HostFrameTokens pending_host_tokens_{};
   std::array<StageExecutionResult, kMaxPreparedStages> pending_stages_{};
   std::size_t pending_stage_count_ = 0;
   std::uint64_t last_capture_sequence_ = 0;
+  std::array<std::uint32_t, kMaxPreparedStages> consecutive_failures_{};
+  std::array<std::uint64_t, kMaxPreparedStages> retry_after_sequence_{};
+  std::uint32_t disabled_stage_mask_ = 0;
+  std::uint32_t permanent_disabled_stage_mask_ = 0;
   bool have_capture_sequence_ = false;
   bool prepared_ = false;
   bool quarantined_ = false;
   bool stopped_ = false;
   bool completion_pending_ = false;
+  bool host_binding_pending_ = false;
+  bool rebuild_requested_ = false;
 };
 
 } // namespace studiocast::hal

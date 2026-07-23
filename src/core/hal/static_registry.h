@@ -35,6 +35,11 @@ struct SemanticCapabilityEvidence {
   ReasonId reason = ReasonId::none;
   CpuTailId cpu_tail = CpuTailId::invalid;
   std::uint64_t cpu_tail_scratch_bytes = 0;
+  DeclaredCpuTail::Placement cpu_tail_placement =
+      DeclaredCpuTail::Placement::after_stage;
+  std::array<CapabilityEvidenceRecord, kMaxCapabilityEvidenceRecords>
+      evidence{};
+  std::size_t evidence_count = 0;
   bool live_stage = false;
   bool production_eligible = false;
   bool exact_evidence = false;

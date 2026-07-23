@@ -84,6 +84,41 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
       return plan;
     }
 
+    if (stage.cpu_tail != CpuTailId::invalid &&
+        stage.cpu_tail_placement == DeclaredCpuTail::Placement::before_stage) {
+      ExecutionBoundary boundary;
+      boundary.kind = ExecutionBoundaryKind::cpu_tail;
+      boundary.before_stage_id = stage.intent.stage_id;
+      boundary.boundary_index = static_cast<std::uint32_t>(stage_index);
+      boundary.cpu_tail = stage.cpu_tail;
+      boundary.scratch_bytes = stage.cpu_tail_scratch_bytes;
+      boundary.destination_domain = stage.execution_domain;
+      boundary.following_upload_required =
+          ClassifyExecutionResidency(stage.execution_domain) ==
+          ExecutionResidencyClass::device;
+      if (previous_stage != nullptr && plan.island_count != 0) {
+        boundary.after_stage_id = previous_stage->intent.stage_id;
+        boundary.source_domain =
+            plan.islands[plan.island_count - 1].execution_domain;
+        boundary.readback_required =
+            ClassifyExecutionResidency(boundary.source_domain) ==
+            ExecutionResidencyClass::device;
+        force_new_island = true;
+      }
+      if (!AddBoundary(&plan, boundary)) {
+        plan.status = StatusId::resource_exhausted;
+        plan.reason = ReasonId::resource_exhausted;
+        return plan;
+      }
+      ++plan.expected_transfers.cpu_tail_boundaries;
+      if (previous_stage != nullptr) {
+        if (boundary.readback_required)
+          ++plan.expected_transfers.intermediate_readbacks;
+        if (boundary.following_upload_required)
+          ++plan.expected_transfers.intermediate_uploads;
+      }
+    }
+
     const bool need_new_island =
         plan.island_count == 0 || force_new_island ||
         !SameIsland(plan.islands[plan.island_count - 1], stage);
@@ -105,6 +140,7 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
           boundary.kind = ExecutionBoundaryKind::adapter_transfer;
           boundary.after_stage_id = previous_stage->intent.stage_id;
           boundary.before_stage_id = stage.intent.stage_id;
+          boundary.boundary_index = static_cast<std::uint32_t>(stage_index);
           boundary.source_domain = prior_island.execution_domain;
           boundary.destination_domain = stage.execution_domain;
           boundary.readback_required =
@@ -140,10 +176,12 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
     }
 
     force_new_island = false;
-    if (stage.cpu_tail != CpuTailId::invalid) {
+    if (stage.cpu_tail != CpuTailId::invalid &&
+        stage.cpu_tail_placement == DeclaredCpuTail::Placement::after_stage) {
       ExecutionBoundary boundary;
       boundary.kind = ExecutionBoundaryKind::cpu_tail;
       boundary.after_stage_id = stage.intent.stage_id;
+      boundary.boundary_index = static_cast<std::uint32_t>(stage_index + 1);
       boundary.cpu_tail = stage.cpu_tail;
       boundary.scratch_bytes = stage.cpu_tail_scratch_bytes;
       boundary.source_domain = stage.execution_domain;

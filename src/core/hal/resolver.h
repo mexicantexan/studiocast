@@ -9,7 +9,7 @@
 namespace studiocast::hal {
 
 inline constexpr std::size_t kMaxResolutionDiscrepancies =
-    13 + (kMaxPreparedStages * 9);
+    16 + (kMaxPreparedStages * 9);
 
 enum class BackendRequestMode : std::uint8_t {
   automatic = 1,
@@ -22,6 +22,28 @@ struct BackendRequest {
   bool strict = false;
 };
 
+// Additive setup-time constraints mirroring the current persisted selectors.
+// They deliberately do not reuse or renumber the persisted/IPC enums.
+enum class ComputeFamilyAllowance : std::uint8_t {
+  any = 1,
+  cpu_only,
+  cuda_family,
+  vulkan_only,
+};
+
+enum class EffectsEnginePreferenceConstraint : std::uint8_t {
+  automatic = 1,
+  maxine,
+  open_cuda,
+};
+
+struct PreferenceConstraints {
+  ComputeFamilyAllowance compute_family = ComputeFamilyAllowance::any;
+  EffectsEnginePreferenceConstraint effects_engine =
+      EffectsEnginePreferenceConstraint::automatic;
+  bool strict_effects_engine = false;
+};
+
 struct CanonicalStageIntent {
   std::uint32_t stage_id = 0;
   SemanticEffectId semantic = SemanticEffectId::invalid;
@@ -32,6 +54,7 @@ struct CanonicalStageIntent {
 
 struct ResolutionRequest {
   BackendRequest backend{};
+  PreferenceConstraints preferences{};
   std::array<CanonicalStageIntent, kMaxPreparedStages> stages{};
   std::size_t stage_count = 0;
 };
@@ -46,6 +69,11 @@ struct ResolvedStage {
   ExecutionDomainId execution_domain{};
   CpuTailId cpu_tail = CpuTailId::invalid;
   std::uint64_t cpu_tail_scratch_bytes = 0;
+  DeclaredCpuTail::Placement cpu_tail_placement =
+      DeclaredCpuTail::Placement::after_stage;
+  std::array<CapabilityEvidenceRecord, kMaxCapabilityEvidenceRecords>
+      evidence{};
+  std::size_t evidence_count = 0;
   bool skipped_optional = false;
   bool fallback_selected = false;
 };
@@ -56,6 +84,7 @@ struct ResolutionResult {
   StatusId status = StatusId::invalid;
   ReasonId reason = ReasonId::none;
   BackendId requested_backend = BackendId::invalid;
+  PreferenceConstraints preferences{};
   BackendId selected_backend = BackendId::invalid;
   // Resolution never claims live activity. The execution session commits this
   // field only after effect success and a successful output write.
@@ -78,6 +107,9 @@ ResolveSemanticStages(const StaticAdapterRegistry &registry,
 
 enum class ShadowField : std::uint16_t {
   request_mode = 1,
+  compute_family,
+  effects_engine,
+  strict_effects_engine,
   requested_backend,
   strict_backend_selection,
   selected_backend,

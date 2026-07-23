@@ -18,8 +18,13 @@ static_assert(static_cast<std::uint32_t>(
                   studiocast::hal::ReasonId::capability_evidence_incomplete) ==
               28);
 static_assert(static_cast<std::uint32_t>(
-                  studiocast::hal::SemanticEffectProviderId::
-                      maxine_cuda_utility) == 6);
+                  studiocast::hal::ReasonId::frame_order_violated) == 35);
+static_assert(static_cast<std::uint32_t>(
+                  studiocast::hal::CapabilityEvidenceCode::
+                      per_effect_capability_evidence_missing) == 46);
+static_assert(
+    static_cast<std::uint32_t>(
+        studiocast::hal::SemanticEffectProviderId::maxine_cuda_utility) == 6);
 static_assert(std::is_standard_layout_v<studiocast::hal::ResourceHandle>);
 
 std::atomic<std::size_t> g_allocations{0};
@@ -185,6 +190,9 @@ public:
   bool foreign_handle = false;
   bool exhaust_budget = false;
   bool wrong_readiness_requested_backend = false;
+  bool corrupt_host_resolution = false;
+  bool provide_evidence = false;
+  bool invalid_evidence = false;
   FakeExecuteMode execute_mode = FakeExecuteMode::success;
   std::uint64_t next_token = 1;
   std::uint64_t prepare_calls = 0;
@@ -193,6 +201,8 @@ public:
   std::uint64_t reset_calls = 0;
   std::uint64_t shutdown_calls = 0;
   PreparedProgram prepared_program{};
+  HostFrameBinding host_binding{};
+  HostFrameTokens host_tokens{};
 
   std::uint64_t adapter_instance_id() const noexcept override {
     return instance;
@@ -232,6 +242,17 @@ public:
     readiness->provider = program.stages[0].provider;
     readiness->execution_domain = program.execution_domain;
     readiness->ready_stage_mask = 0x3;
+    if (provide_evidence) {
+      readiness->evidence_count = 1;
+      readiness->evidence[0].code =
+          CapabilityEvidenceCode::provider_runtime_available;
+      readiness->evidence[0].status =
+          invalid_evidence ? StatusId::blocked : StatusId::ready;
+      readiness->evidence[0].reason =
+          invalid_evidence ? ReasonId::none : ReasonId::none;
+      readiness->evidence[0].backend = program.execution_domain.backend;
+      readiness->evidence[0].satisfied = true;
+    }
     readiness->available = true;
     readiness->degraded = prepare_status == StatusId::degraded;
     return prepare_status;
@@ -250,11 +271,15 @@ public:
     result.completion.complete = execute_mode != FakeExecuteMode::incomplete;
     result.output = request.input;
     result.output.resource_id += 1000;
+    if (host_binding.capture_sequence == request.capture_sequence)
+      result.output = host_tokens.output;
     result.output_valid = true;
     result.stage_count = prepared_program.stage_count;
     result.frame_elapsed_ns = 3'000'000;
-    result.transfers.uploads = 1;
-    result.transfers.final_readbacks = 1;
+    result.transfers.uploads = prepared_program.requires_upload ? 1 : 0;
+    result.transfers.final_readbacks =
+        prepared_program.requires_final_readback ? 1 : 0;
+    result.transfers.cpu_tail_boundaries = prepared_program.cpu_tail_count;
     result.transfers.synchronizations = 1;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
       result.stages[index].stage_id = prepared_program.stages[index].stage_id;
@@ -262,15 +287,23 @@ public:
       result.stages[index].status = StageExecutionStatus::succeeded;
       result.stages[index].valid_output_preserved = true;
       result.stages[index].elapsed_ns = 1'000'000;
+      const std::uint32_t bit = std::uint32_t{1} << index;
+      if ((request.disabled_stage_mask & bit) != 0) {
+        result.stages[index].status = StageExecutionStatus::disabled_preserved;
+        result.stages[index].reason = ReasonId::circuit_breaker_open;
+        result.stages[index].elapsed_ns = 0;
+      }
     }
     switch (execute_mode) {
     case FakeExecuteMode::success:
     case FakeExecuteMode::incomplete:
       break;
     case FakeExecuteMode::optional_failure:
-      result.status = StatusId::degraded;
-      result.reason = ReasonId::optional_stage_failed_open;
-      result.stages[1].status = StageExecutionStatus::optional_failed_open;
+      if ((request.disabled_stage_mask & (std::uint32_t{1} << 1)) == 0) {
+        result.status = StatusId::degraded;
+        result.reason = ReasonId::optional_stage_failed_open;
+        result.stages[1].status = StageExecutionStatus::optional_failed_open;
+      }
       break;
     case FakeExecuteMode::required_failure:
       result.status = StatusId::failed;
@@ -296,6 +329,34 @@ public:
   StatusId ResetTemporalState(const PreparedProgramHandle &,
                               ReasonId) noexcept override {
     ++reset_calls;
+    return StatusId::ready;
+  }
+  StatusId BindHostFrame(const PreparedProgramHandle &,
+                         const HostFrameBinding &binding,
+                         HostFrameTokens *tokens,
+                         ReasonId *reason) noexcept override {
+    host_binding = binding;
+    tokens->input = Resource(prepared_program, 5001);
+    tokens->output = Resource(prepared_program, 5002);
+    host_tokens = *tokens;
+    if (reason)
+      *reason = ReasonId::none;
+    return StatusId::ready;
+  }
+  StatusId ResolveHostFrameOutput(const PreparedProgramHandle &,
+                                  const CompletionToken &,
+                                  const ResourceHandle &,
+                                  HostFrameOutputResolution *resolution,
+                                  ReasonId *reason) noexcept override {
+    resolution->descriptor = host_binding.output_descriptor;
+    resolution->planes = host_binding.output_planes;
+    resolution->plane_count = host_binding.output_plane_count;
+    resolution->capture_sequence = host_binding.capture_sequence;
+    resolution->output_ready = true;
+    if (corrupt_host_resolution)
+      ++resolution->planes[0].span_bytes;
+    if (reason)
+      *reason = ReasonId::none;
     return StatusId::ready;
   }
   void DestroyPrepared(PreparedProgramHandle *program) noexcept override {
@@ -358,8 +419,7 @@ bool TestIdsDescriptorsAndDomain() {
   ok &= Require(!ValidateExecutionDomain(domain),
                 "cross-family memory handle evidence was accepted");
   domain = Domain();
-  domain.synchronization_protocol =
-      SynchronizationProtocol::vulkan_queue_fence;
+  domain.synchronization_protocol = SynchronizationProtocol::vulkan_queue_fence;
   ok &= Require(!ValidateExecutionDomain(domain),
                 "cross-family synchronization evidence was accepted");
   return ok;
@@ -396,6 +456,47 @@ bool TestMalformedCrossAdapterAndExhaustion() {
                     reason == ReasonId::resource_exhausted,
                 "stage scratch exhaustion was not rejected");
 
+  auto primitive = program;
+  primitive.stages[1].semantic = SemanticEffectId::invalid;
+  primitive.stages[1].primitive = PrimitiveOperationId::mirror;
+  primitive.stages[1].provider = SemanticEffectProviderId::invalid;
+  ok &= Require(ValidatePreparedProgram(primitive, &reason),
+                "explicit primitive prepared stage was rejected");
+  primitive.stages[1].semantic = SemanticEffectId::mirror;
+  ok &= Require(!ValidatePreparedProgram(primitive, &reason),
+                "stage carrying both semantic and primitive was accepted");
+  primitive.stages[1].semantic = SemanticEffectId::invalid;
+  primitive.stages[1].primitive = PrimitiveOperationId::invalid;
+  ok &= Require(!ValidatePreparedProgram(primitive, &reason),
+                "stage carrying neither semantic nor primitive was accepted");
+
+  auto boundaries = program;
+  boundaries.cpu_tail_count = 2;
+  boundaries.cpu_tails[0].id = CpuTailId::provider_postprocess;
+  boundaries.cpu_tails[0].placement = DeclaredCpuTail::Placement::after_stage;
+  boundaries.cpu_tails[0].after_stage_id = 1;
+  boundaries.cpu_tails[0].boundary_index = 1;
+  boundaries.cpu_tails[0].scratch_bytes = 64;
+  boundaries.cpu_tails[1].id = CpuTailId::output_format_conversion;
+  boundaries.cpu_tails[1].placement = DeclaredCpuTail::Placement::before_stage;
+  boundaries.cpu_tails[1].before_stage_id = 2;
+  boundaries.cpu_tails[1].boundary_index = 1;
+  boundaries.cpu_tails[1].scratch_bytes = 64;
+  ok &= Require(ValidatePreparedProgram(boundaries, &reason),
+                "exact before/after CPU boundaries were rejected");
+  boundaries.cpu_tails[1].boundary_index = 2;
+  ok &= Require(!ValidatePreparedProgram(boundaries, &reason),
+                "wrong CPU boundary index was accepted");
+
+  auto boundary_resource = Resource(program);
+  boundary_resource.memory_domain = MemoryDomain::upload_staging;
+  boundary_resource.size_bytes = program.budget.upload_staging_bytes + 1;
+  ok &= Require(!ValidateResourceHandle(
+                    boundary_resource, program.execution_domain,
+                    program.execution_domain.logical_context_generation,
+                    program.budget),
+                "upload resource borrowed capacity from another budget class");
+
   FakeAdapter adapter;
   PreparedProgramSession session;
   adapter.foreign_handle = true;
@@ -420,6 +521,24 @@ bool TestMalformedCrossAdapterAndExhaustion() {
                         StatusId::blocked &&
                     reason == ReasonId::malformed_contract,
                 "readiness for a different requested backend was accepted");
+
+  FakeAdapter evidence_adapter;
+  evidence_adapter.provide_evidence = true;
+  PreparedProgramSession evidence_session;
+  ok &=
+      Require(evidence_session.Configure(program, evidence_adapter, &readiness,
+                                         &reason) == StatusId::ready &&
+                  readiness.evidence_count == 1 &&
+                  readiness.evidence[0].code ==
+                      CapabilityEvidenceCode::provider_runtime_available,
+              "typed readiness evidence was not preserved");
+  evidence_session.Invalidate(ReasonId::reconfiguration_required);
+  evidence_adapter.invalid_evidence = true;
+  ok &=
+      Require(evidence_session.Configure(program, evidence_adapter, &readiness,
+                                         &reason) == StatusId::blocked &&
+                  reason == ReasonId::malformed_contract,
+              "internally inconsistent typed evidence was accepted");
   return ok;
 }
 
@@ -495,6 +614,79 @@ bool TestExecutionValidationAndNoAllocation() {
   return ok;
 }
 
+bool TestNeutralHostBindingAndTransportZeros() {
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> input_bytes{};
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> output_bytes{};
+  FakeAdapter adapter;
+  PreparedProgramSession session;
+  auto program = Program();
+  program.requires_upload = false;
+  program.requires_final_readback = false;
+  bool ok = Configure(&session, &adapter, program);
+
+  HostFrameBinding binding;
+  binding.input_descriptor = program.stages[0].input.image;
+  binding.output_descriptor =
+      program.stages[program.stage_count - 1].output.image;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.capture_sequence = 1;
+  binding.input_planes[0].read_data = input_bytes.data();
+  binding.input_planes[0].span_bytes = input_bytes.size();
+  binding.input_planes[0].row_stride_bytes = 640 * 3;
+  binding.output_planes[0].write_data = output_bytes.data();
+  binding.output_planes[0].span_bytes = output_bytes.size();
+  binding.output_planes[0].row_stride_bytes = 640 * 3;
+
+  HostFrameTokens tokens;
+  ReasonId reason = ReasonId::none;
+  auto malformed = binding;
+  ++malformed.input_planes[0].row_stride_bytes;
+  ok &= Require(session.BindHostFrame(malformed, &tokens, &reason) ==
+                        StatusId::blocked &&
+                    reason == ReasonId::host_frame_binding_invalid,
+                "malformed host stride was accepted");
+  ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                    StatusId::ready,
+                "valid bounded host binding was rejected");
+  auto request = Request(program, 1);
+  request.input = tokens.input;
+  const auto result = session.Execute(request);
+  ok &= Require(result.status == StatusId::executed &&
+                    result.transfers.uploads == 0 &&
+                    result.transfers.final_readbacks == 0,
+                "declared no-transport program did not enforce exact zeros");
+
+  HostFrameOutputResolution resolution;
+  ok &= Require(session.ResolveHostFrameOutput(result.completion, result.output,
+                                               &resolution,
+                                               &reason) == StatusId::ready &&
+                    resolution.output_ready &&
+                    resolution.planes[0].write_data == output_bytes.data(),
+                "neutral host output did not resolve exact borrowed storage");
+  ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                    StatusId::ready,
+                "host-bound output commit failed");
+
+  binding.capture_sequence = 2;
+  ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                    StatusId::ready,
+                "second host binding failed");
+  request = Request(program, 2);
+  request.input = tokens.input;
+  const auto corrupt = session.Execute(request);
+  adapter.corrupt_host_resolution = true;
+  ok &= Require(session.ResolveHostFrameOutput(corrupt.completion,
+                                               corrupt.output, &resolution,
+                                               &reason) == StatusId::blocked &&
+                    reason == ReasonId::host_frame_binding_invalid,
+                "mutated host output span was accepted");
+  ok &= Require(session.CommitOutput({corrupt.completion, false}, &reason) ==
+                    StatusId::failed,
+                "failed corrupt output was not released");
+  return ok;
+}
+
 bool TestOptionalFailureAndOutputCommitAttribution() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -521,10 +713,11 @@ bool TestOptionalFailureAndOutputCommitAttribution() {
   ok &= Require(session.CommitOutput({retry.completion, true}, &reason) ==
                         StatusId::ready &&
                     session.telemetry().active_backend_frames == 1 &&
-                    session.telemetry().optional_fail_open_stages == 2 &&
+                    session.telemetry().optional_fail_open_stages == 1 &&
+                    session.telemetry().disabled_stage_frames == 1 &&
                     session.telemetry().committed_stage_successes[0] == 1 &&
                     session.telemetry().committed_stage_successes[1] == 0,
-                "optional fail-open attribution changed");
+                "optional breaker disable or attribution changed");
   return ok;
 }
 
@@ -543,15 +736,14 @@ bool TestExplicitFallbackReadinessAndCommittedAttribution() {
   ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
                     StatusId::degraded,
                 "explicit fallback setup was not reported as degraded");
-  ok &= Require(session.prepared() && readiness.degraded &&
-                    readiness.requested_backend == BackendId::vulkan &&
-                    readiness.selected_backend == BackendId::cuda &&
-                    readiness.reason ==
-                        ReasonId::semantic_provider_unavailable &&
-                    session.telemetry().requested_backend ==
-                        BackendId::vulkan &&
-                    session.telemetry().selected_backend == BackendId::cuda,
-                "fallback readiness lost requested/selected attribution");
+  ok &=
+      Require(session.prepared() && readiness.degraded &&
+                  readiness.requested_backend == BackendId::vulkan &&
+                  readiness.selected_backend == BackendId::cuda &&
+                  readiness.reason == ReasonId::semantic_provider_unavailable &&
+                  session.telemetry().requested_backend == BackendId::vulkan &&
+                  session.telemetry().selected_backend == BackendId::cuda,
+              "fallback readiness lost requested/selected attribution");
 
   const auto result = session.Execute(Request(program, 1));
   ok &= Require(result.status == StatusId::executed,
@@ -559,7 +751,7 @@ bool TestExplicitFallbackReadinessAndCommittedAttribution() {
   ok &= Require(session.telemetry().fallback_frames == 0,
                 "fallback was attributed before output commit");
   ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
-                    StatusId::ready &&
+                        StatusId::ready &&
                     session.telemetry().fallback_frames == 1,
                 "committed fallback frame was not attributed exactly once");
   return ok;
@@ -601,7 +793,7 @@ bool TestFailuresDeviceLossAndTransferEnforcement() {
     const auto program = Program();
     ok &= Configure(&session, &adapter, program);
     ok &= Require(session.Execute(Request(program, 1)).reason ==
-                      ReasonId::synchronization_failed,
+                      ReasonId::transfer_contract_violated,
                   "hidden intermediate crossing was accepted");
   }
   {
@@ -623,6 +815,114 @@ bool TestFailuresDeviceLossAndTransferEnforcement() {
     ok &= Require(session.Execute(Request(program, 1)).reason ==
                       ReasonId::incomplete_execution,
                   "non-complete v1 token was accepted");
+  }
+  return ok;
+}
+
+bool TestCircuitBreakerActionsAndRetryTransitions() {
+  bool ok = true;
+  ReasonId reason = ReasonId::none;
+  {
+    auto program = Program();
+    program.stages[1].circuit_breaker.cooldown_frames = 2;
+    FakeAdapter adapter;
+    adapter.execute_mode = FakeExecuteMode::optional_failure;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+
+    const auto first = session.Execute(Request(program, 1));
+    ok &= Require(first.status == StatusId::degraded &&
+                      session.disabled_stage_mask() == 0x2 &&
+                      session.readiness().reason ==
+                          ReasonId::circuit_breaker_retry_pending,
+                  "cooldown breaker did not open on threshold");
+    ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "breaker-opening frame did not commit valid output");
+
+    const auto cooldown_one = session.Execute(Request(program, 2));
+    ok &= Require(cooldown_one.stages[1].status ==
+                      StageExecutionStatus::disabled_preserved,
+                  "disabled optional stage executed during cooldown");
+    ok &= Require(session.CommitOutput({cooldown_one.completion, true},
+                                       &reason) == StatusId::ready,
+                  "first cooldown frame did not commit");
+    const auto cooldown_two = session.Execute(Request(program, 3));
+    ok &= Require(cooldown_two.stages[1].status ==
+                      StageExecutionStatus::disabled_preserved,
+                  "cooldown ended one frame early");
+    ok &= Require(session.CommitOutput({cooldown_two.completion, true},
+                                       &reason) == StatusId::ready,
+                  "second cooldown frame did not commit");
+    const auto retry = session.Execute(Request(program, 4));
+    ok &= Require(retry.stages[1].status ==
+                          StageExecutionStatus::optional_failed_open &&
+                      session.telemetry().circuit_breaker_opens == 2 &&
+                      session.telemetry().disabled_stage_frames == 2,
+                  "cooldown retry transition did not execute exactly once");
+  }
+  {
+    auto program = Program();
+    program.stages[1].circuit_breaker.action =
+        CircuitBreakerAction::quarantine_program;
+    FakeAdapter adapter;
+    adapter.execute_mode = FakeExecuteMode::optional_failure;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto result = session.Execute(Request(program, 1));
+    ok &=
+        Require(result.status == StatusId::degraded && session.quarantined() &&
+                    session.readiness().status == StatusId::quarantined,
+                "quarantine circuit action did not latch");
+    ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "quarantine action corrupted current valid output");
+    ok &= Require(session.Execute(Request(program, 2)).status ==
+                      StatusId::quarantined,
+                  "quarantined program re-entered adapter");
+  }
+  {
+    auto program = Program();
+    program.stages[1].circuit_breaker.action =
+        CircuitBreakerAction::request_rebuild;
+    FakeAdapter adapter;
+    adapter.execute_mode = FakeExecuteMode::optional_failure;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto result = session.Execute(Request(program, 1));
+    ok &= Require(result.status == StatusId::degraded &&
+                      session.rebuild_requested() &&
+                      session.readiness().rebuild_requested &&
+                      session.telemetry().rebuild_requests == 1,
+                  "request-rebuild circuit action did not latch");
+    ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "rebuild-request frame did not preserve current output");
+    ok &= Require(session.Execute(Request(program, 2)).reason ==
+                      ReasonId::reconfiguration_required,
+                  "rebuild-requested program executed another frame");
+  }
+  {
+    auto invalid = Program();
+    invalid.stages[0].circuit_breaker.action =
+        CircuitBreakerAction::disable_stage;
+    ok &= Require(!ValidatePreparedProgram(invalid, &reason),
+                  "required stage was allowed to silently disable");
+  }
+  {
+    auto program = Program();
+    program.stages[0].circuit_breaker.consecutive_failure_limit = 1;
+    FakeAdapter adapter;
+    adapter.execute_mode = FakeExecuteMode::required_failure;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto result = session.Execute(Request(program, 1));
+    ok &= Require(result.status == StatusId::failed &&
+                      result.reason == ReasonId::required_stage_failed &&
+                      session.quarantined() &&
+                      session.readiness().status == StatusId::quarantined &&
+                      session.telemetry().required_stage_failures == 1,
+                  "required failure did not enforce quarantine action");
   }
   return ok;
 }
@@ -680,6 +980,138 @@ bool TestRollbackReconfigurationTemporalAndShutdown() {
   return ok;
 }
 
+bool TestObservableFrameDropPolicies() {
+  bool ok = true;
+  ReasonId reason = ReasonId::none;
+  {
+    auto program = Program();
+    program.temporal.frame_drop_behavior = FrameDropBehavior::preserve_order;
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto first = session.Execute(Request(program, 1));
+    ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "preserve-order first frame failed");
+    const auto gap = session.Execute(Request(program, 3));
+    ok &= Require(gap.reason == ReasonId::frame_order_violated &&
+                      adapter.execute_calls == 1 &&
+                      session.telemetry().preserve_order_failures == 1 &&
+                      session.telemetry().dropped_capture_frames == 1,
+                  "preserve-order gap was not observable and fail-closed");
+    const auto next = session.Execute(Request(program, 2));
+    ok &= Require(next.status == StatusId::executed,
+                  "preserve-order failure advanced accepted sequence");
+  }
+  {
+    auto program = Program();
+    program.temporal.temporal = false;
+    program.temporal.requires_contiguous_capture_sequence = false;
+    program.temporal.frame_drop_behavior = FrameDropBehavior::latest_frame_wins;
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto first = session.Execute(Request(program, 10));
+    ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "latest-frame first output failed");
+    const auto latest = session.Execute(Request(program, 14));
+    ok &= Require(latest.status == StatusId::executed &&
+                      latest.dropped_capture_frames == 3 &&
+                      !latest.temporal_state_reset &&
+                      session.telemetry().latest_frame_wins_events == 1 &&
+                      session.telemetry().dropped_capture_frames == 3,
+                  "latest-frame-wins gap was not observable");
+  }
+  {
+    auto program = Program();
+    program.temporal.frame_drop_behavior =
+        FrameDropBehavior::reset_temporal_state;
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto first = session.Execute(Request(program, 1));
+    ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "reset policy first output failed");
+    const auto reset = session.Execute(Request(program, 4));
+    ok &= Require(
+        reset.status == StatusId::executed && reset.temporal_state_reset &&
+            reset.dropped_capture_frames == 2 && adapter.reset_calls == 1 &&
+            session.telemetry().temporal_resets == 1,
+        "reset-on-discontinuity was not observable");
+  }
+  return ok;
+}
+
+bool TestStrictSafeOldPlanRetention() {
+  bool ok = true;
+  ReasonId reason = ReasonId::none;
+  ReadinessSnapshot readiness;
+  {
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    const auto old = Program();
+    ok &= Configure(&session, &adapter, old);
+    auto invalid_backend = Program(200, 77, 2);
+    invalid_backend.requested_backend = BackendId::vulkan;
+    ok &= Require(session.Configure(invalid_backend, adapter, &readiness,
+                                    &reason) == StatusId::blocked &&
+                      !session.prepared() &&
+                      session.telemetry().setup_retention_rejections == 1,
+                  "strict backend change retained an incompatible old plan");
+  }
+  {
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    const auto old = Program();
+    ok &= Configure(&session, &adapter, old);
+    auto invalid_provider = Program(201, 77, 2);
+    invalid_provider.strict_provider_selection = true;
+    invalid_provider.requested_provider = SemanticEffectProviderId::maxine_vfx;
+    ok &= Require(session.Configure(invalid_provider, adapter, &readiness,
+                                    &reason) == StatusId::blocked &&
+                      !session.prepared(),
+                  "strict provider change retained an incompatible old plan");
+  }
+  {
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    const auto old = Program();
+    ok &= Configure(&session, &adapter, old);
+    auto replacement = Program(202, 77, 2);
+    replacement.execution_domain = Domain(77, 6);
+    replacement.invalidation_key.generations.context = 6;
+    replacement.invalidation_key.execution_domain_hash = 44;
+    for (std::size_t index = 0; index < replacement.stage_count; ++index)
+      replacement.stages[index].execution_domain = replacement.execution_domain;
+    replacement.strict_execution_domain = true;
+    replacement.requested_execution_domain = replacement.execution_domain;
+    adapter.prepare_status = StatusId::blocked;
+    adapter.prepare_reason = ReasonId::resource_exhausted;
+    ok &= Require(session.Configure(replacement, adapter, &readiness,
+                                    &reason) == StatusId::blocked &&
+                      !session.prepared() &&
+                      session.telemetry().setup_retention_rejections == 1,
+                  "failed strict domain setup retained the old domain");
+  }
+  {
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    const auto old = Program();
+    ok &= Configure(&session, &adapter, old);
+    auto replacement = Program(203, 77, 2);
+    replacement.setup_failure_policy = SetupFailurePolicy::stop_pipeline;
+    adapter.prepare_status = StatusId::blocked;
+    adapter.prepare_reason = ReasonId::resource_exhausted;
+    ok &= Require(session.Configure(replacement, adapter, &readiness,
+                                    &reason) == StatusId::blocked &&
+                      !session.prepared(),
+                  "stop-on-setup-failure retained the old plan");
+  }
+  return ok;
+}
+
 } // namespace
 
 void *operator new(std::size_t size) {
@@ -698,10 +1130,14 @@ int main() {
   ok &= TestIdsDescriptorsAndDomain();
   ok &= TestMalformedCrossAdapterAndExhaustion();
   ok &= TestExecutionValidationAndNoAllocation();
+  ok &= TestNeutralHostBindingAndTransportZeros();
   ok &= TestOptionalFailureAndOutputCommitAttribution();
   ok &= TestExplicitFallbackReadinessAndCommittedAttribution();
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
+  ok &= TestCircuitBreakerActionsAndRetryTransitions();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
+  ok &= TestObservableFrameDropPolicies();
+  ok &= TestStrictSafeOldPlanRetention();
   if (ok)
     std::cout << "StudioCast HAL contract tests passed\n";
   return ok ? 0 : 1;

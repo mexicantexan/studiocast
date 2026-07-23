@@ -26,6 +26,7 @@ struct ExecutionBoundary {
   ExecutionBoundaryKind kind = ExecutionBoundaryKind::adapter_transfer;
   std::uint32_t after_stage_id = 0;
   std::uint32_t before_stage_id = 0;
+  std::uint32_t boundary_index = 0;
   CpuTailId cpu_tail = CpuTailId::invalid;
   std::uint64_t scratch_bytes = 0;
   ExecutionDomainId source_domain{};
