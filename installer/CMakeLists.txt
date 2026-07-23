@@ -4,7 +4,13 @@
 add_executable(studiocast-installer
         ${PROJECT_SOURCE_DIR}/installer/gui/main.cpp
         ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard.h
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_internal.h
         ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard.cpp
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_support.cpp
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_intro_pages.cpp
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_setup_pages.cpp
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_review_pages.cpp
+        ${PROJECT_SOURCE_DIR}/installer/gui/installer_wizard_progress.cpp
         ${PROJECT_SOURCE_DIR}/src/gui/theme.h
         ${PROJECT_SOURCE_DIR}/src/gui/theme.cpp
         ${PROJECT_SOURCE_DIR}/src/gui/resources/gui_resources.qrc
