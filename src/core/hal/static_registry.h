@@ -12,6 +12,15 @@ inline constexpr std::size_t kMaxRegisteredAdapters = 16;
 inline constexpr std::size_t kMaxSemanticCapabilitiesPerAdapter = 16;
 inline constexpr std::size_t kMaxPrimitiveCapabilitiesPerAdapter = 16;
 
+enum class ExecutionResidencyClass : std::uint8_t {
+  invalid = 0,
+  host,
+  device,
+};
+
+[[nodiscard]] ExecutionResidencyClass
+ClassifyExecutionResidency(const ExecutionDomainId &domain) noexcept;
+
 struct PrimitiveCapabilityEvidence {
   PrimitiveOperationId operation = PrimitiveOperationId::invalid;
   StatusId status = StatusId::invalid;

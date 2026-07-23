@@ -9,7 +9,7 @@
 namespace studiocast::hal {
 
 inline constexpr std::size_t kMaxResolutionDiscrepancies =
-    12 + (kMaxPreparedStages * 8);
+    13 + (kMaxPreparedStages * 9);
 
 enum class BackendRequestMode : std::uint8_t {
   automatic = 1,
@@ -47,6 +47,7 @@ struct ResolvedStage {
   CpuTailId cpu_tail = CpuTailId::invalid;
   std::uint64_t cpu_tail_scratch_bytes = 0;
   bool skipped_optional = false;
+  bool fallback_selected = false;
 };
 
 struct ResolutionResult {
@@ -65,6 +66,7 @@ struct ResolutionResult {
   std::size_t stage_count = 0;
   bool available = false;
   bool degraded = false;
+  bool fallback = false;
   bool passthrough = false;
 };
 
@@ -85,6 +87,7 @@ enum class ShadowField : std::uint16_t {
   overall_reason,
   available,
   degraded,
+  fallback,
   passthrough,
   stage_count,
   stage_id,
@@ -95,6 +98,7 @@ enum class ShadowField : std::uint16_t {
   stage_status,
   stage_reason,
   stage_skipped_optional,
+  stage_fallback,
 };
 
 struct ShadowDiscrepancy {

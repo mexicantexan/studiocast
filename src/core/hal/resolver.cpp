@@ -14,6 +14,7 @@ struct Candidate {
 struct CandidateSearch {
   Candidate selected{};
   ReasonId unavailable_reason = ReasonId::none;
+  ReasonId requested_backend_reason = ReasonId::none;
   bool semantic_evidence_exists = false;
   bool requested_backend_evidence_exists = false;
 };
@@ -61,6 +62,10 @@ CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
   std::uint32_t unavailable_priority =
       std::numeric_limits<std::uint32_t>::max();
   std::uint64_t unavailable_adapter = std::numeric_limits<std::uint64_t>::max();
+  std::uint32_t requested_unavailable_priority =
+      std::numeric_limits<std::uint32_t>::max();
+  std::uint64_t requested_unavailable_adapter =
+      std::numeric_limits<std::uint64_t>::max();
 
   for (std::size_t registration_index = 0; registration_index < registry.size();
        ++registration_index) {
@@ -79,11 +84,23 @@ CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
           registration->backend == request.backend) {
         search.requested_backend_evidence_exists = true;
       }
-      if (request.strict && registration->backend != request.backend)
-        continue;
       const bool configuration_supported =
           !intent.requires_tracked_vignette_center ||
           capability.supports_tracked_vignette_center;
+      if (request.mode == BackendRequestMode::explicit_backend &&
+          registration->backend == request.backend &&
+          (!IsSelectable(capability) || !configuration_supported) &&
+          (registration->selection_priority < requested_unavailable_priority ||
+           (registration->selection_priority ==
+                requested_unavailable_priority &&
+            registration->adapter_instance_id <
+                requested_unavailable_adapter))) {
+        requested_unavailable_priority = registration->selection_priority;
+        requested_unavailable_adapter = registration->adapter_instance_id;
+        search.requested_backend_reason = capability.reason;
+      }
+      if (request.strict && registration->backend != request.backend)
+        continue;
       if (IsSelectable(capability) && configuration_supported) {
         const Candidate candidate{registration, &capability};
         if (BetterCandidate(candidate, search.selected, request))
@@ -98,6 +115,12 @@ CandidateSearch FindCandidate(const StaticAdapterRegistry &registry,
     }
   }
   return search;
+}
+
+ReasonId FallbackReason(const CandidateSearch &search) noexcept {
+  return search.requested_backend_reason != ReasonId::none
+             ? search.requested_backend_reason
+             : ReasonId::semantic_provider_unavailable;
 }
 
 ReasonId NoCandidateReason(const CandidateSearch &search,
@@ -237,8 +260,20 @@ ResolveSemanticStages(const StaticAdapterRegistry &registry,
     resolved.cpu_tail_scratch_bytes =
         selected.capability->cpu_tail_scratch_bytes;
     have_selected_stage = true;
-    if (selected.capability->status == StatusId::degraded ||
-        selected.capability->cpu_tail != CpuTailId::invalid) {
+    const bool fallback_selected =
+        request.backend.mode == BackendRequestMode::explicit_backend &&
+        !request.backend.strict &&
+        selected.registration->backend != request.backend.backend;
+    if (fallback_selected) {
+      resolved.status = StatusId::degraded;
+      resolved.reason = FallbackReason(search);
+      resolved.fallback_selected = true;
+      result.fallback = true;
+      result.degraded = true;
+      if (result.reason == ReasonId::none)
+        result.reason = resolved.reason;
+    } else if (selected.capability->status == StatusId::degraded ||
+               selected.capability->cpu_tail != CpuTailId::invalid) {
       result.degraded = true;
       if (result.reason == ReasonId::none) {
         result.reason = selected.capability->reason != ReasonId::none
@@ -304,6 +339,8 @@ CompareShadowResolution(const ResolutionResult &live,
                  shadow.available);
   AddDiscrepancy(&comparison, ShadowField::degraded, 0, live.degraded,
                  shadow.degraded);
+  AddDiscrepancy(&comparison, ShadowField::fallback, 0, live.fallback,
+                 shadow.fallback);
   AddDiscrepancy(&comparison, ShadowField::passthrough, 0, live.passthrough,
                  shadow.passthrough);
   AddDiscrepancy(&comparison, ShadowField::stage_count, 0, live.stage_count,
@@ -337,6 +374,9 @@ CompareShadowResolution(const ResolutionResult &live,
     AddDiscrepancy(&comparison, ShadowField::stage_skipped_optional, index,
                    live.stages[index].skipped_optional,
                    shadow.stages[index].skipped_optional);
+    AddDiscrepancy(&comparison, ShadowField::stage_fallback, index,
+                   live.stages[index].fallback_selected,
+                   shadow.stages[index].fallback_selected);
   }
   return comparison;
 }

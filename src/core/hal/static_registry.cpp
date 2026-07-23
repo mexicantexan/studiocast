@@ -22,7 +22,8 @@ bool ProviderMatchesBackend(BackendId backend,
     return provider == SemanticEffectProviderId::open_video_onnxruntime_cuda;
   case BackendId::maxine:
     return provider == SemanticEffectProviderId::maxine_vfx ||
-           provider == SemanticEffectProviderId::maxine_ar;
+           provider == SemanticEffectProviderId::maxine_ar ||
+           provider == SemanticEffectProviderId::maxine_cuda_utility;
   case BackendId::open_video_onnxruntime:
     return provider == SemanticEffectProviderId::open_video_onnxruntime_cpu;
   case BackendId::vulkan:
@@ -81,6 +82,47 @@ bool ValidateSemanticCapability(
 
 } // namespace
 
+ExecutionResidencyClass
+ClassifyExecutionResidency(const ExecutionDomainId &domain) noexcept {
+  const bool host_memory =
+      domain.api_family == ApiFamily::host &&
+      domain.allocator_family == AllocatorFamily::host &&
+      domain.memory_handle_family == MemoryHandleFamily::host_pointer &&
+      domain.synchronization_protocol ==
+          SynchronizationProtocol::host_synchronous;
+  const bool onnxruntime_host =
+      domain.api_family == ApiFamily::onnxruntime &&
+      domain.allocator_family == AllocatorFamily::onnxruntime &&
+      domain.memory_handle_family == MemoryHandleFamily::ort_value &&
+      domain.synchronization_protocol ==
+          SynchronizationProtocol::ort_provider_synchronous;
+  if (host_memory || onnxruntime_host)
+    return ExecutionResidencyClass::host;
+
+  const bool cuda_device =
+      domain.api_family == ApiFamily::cuda_driver &&
+      domain.allocator_family == AllocatorFamily::cuda_driver &&
+      domain.memory_handle_family == MemoryHandleFamily::cuda_device_pointer &&
+      domain.synchronization_protocol ==
+          SynchronizationProtocol::cuda_stream_ordered;
+  const bool maxine_device =
+      domain.api_family == ApiFamily::maxine_nvcv &&
+      domain.allocator_family == AllocatorFamily::maxine_nvcv &&
+      domain.memory_handle_family == MemoryHandleFamily::nvcv_image &&
+      domain.synchronization_protocol ==
+          SynchronizationProtocol::maxine_bound_cuda_stream;
+  const bool vulkan_device =
+      domain.api_family == ApiFamily::vulkan &&
+      domain.allocator_family == AllocatorFamily::vulkan &&
+      (domain.memory_handle_family == MemoryHandleFamily::vulkan_buffer ||
+       domain.memory_handle_family == MemoryHandleFamily::vulkan_image) &&
+      domain.synchronization_protocol ==
+          SynchronizationProtocol::vulkan_queue_fence;
+  return cuda_device || maxine_device || vulkan_device
+             ? ExecutionResidencyClass::device
+             : ExecutionResidencyClass::invalid;
+}
+
 StatusId
 StaticAdapterRegistry::Register(const AdapterRegistration &registration,
                                 ReasonId *reason) noexcept {
@@ -93,6 +135,8 @@ StaticAdapterRegistry::Register(const AdapterRegistration &registration,
       registration.primitive_capability_count >
           registration.primitive_capabilities.size() ||
       !ValidateExecutionDomain(registration.execution_domain) ||
+      ClassifyExecutionResidency(registration.execution_domain) ==
+          ExecutionResidencyClass::invalid ||
       registration.execution_domain.adapter_instance_id !=
           registration.adapter_instance_id ||
       registration.execution_domain.backend != registration.backend) {

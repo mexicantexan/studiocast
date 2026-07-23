@@ -23,13 +23,16 @@ ExecutionDomainId Domain(BackendId backend, std::uint64_t adapter,
                          std::uint8_t stable_byte) {
   ExecutionDomainId domain;
   domain.backend = backend;
-  domain.api_family = backend == BackendId::vulkan
-                          ? ApiFamily::vulkan
-                          : (backend == BackendId::cpu
-                                 ? ApiFamily::host
-                                 : (backend == BackendId::open_video_onnxruntime
-                                        ? ApiFamily::onnxruntime
-                                        : ApiFamily::cuda_driver));
+  domain.api_family =
+      backend == BackendId::vulkan
+          ? ApiFamily::vulkan
+          : (backend == BackendId::maxine
+                 ? ApiFamily::maxine_nvcv
+                 : (backend == BackendId::cpu
+                        ? ApiFamily::host
+                        : (backend == BackendId::open_video_onnxruntime
+                               ? ApiFamily::onnxruntime
+                               : ApiFamily::cuda_driver)));
   domain.physical_device.vendor_id =
       backend == BackendId::vulkan ? 0x1002u : 0x10deu;
   domain.physical_device.device_id = stable_byte;
@@ -38,29 +41,37 @@ ExecutionDomainId Domain(BackendId backend, std::uint64_t adapter,
   domain.allocator_family =
       backend == BackendId::vulkan
           ? AllocatorFamily::vulkan
-          : (backend == BackendId::cpu
-                 ? AllocatorFamily::host
-                 : (backend == BackendId::open_video_onnxruntime
-                        ? AllocatorFamily::onnxruntime
-                        : AllocatorFamily::cuda_driver));
+          : (backend == BackendId::maxine
+                 ? AllocatorFamily::maxine_nvcv
+                 : (backend == BackendId::cpu
+                        ? AllocatorFamily::host
+                        : (backend == BackendId::open_video_onnxruntime
+                               ? AllocatorFamily::onnxruntime
+                               : AllocatorFamily::cuda_driver)));
   domain.memory_handle_family =
       backend == BackendId::vulkan
           ? MemoryHandleFamily::vulkan_buffer
-          : (backend == BackendId::cpu
-                 ? MemoryHandleFamily::host_pointer
-                 : (backend == BackendId::open_video_onnxruntime
-                        ? MemoryHandleFamily::ort_value
-                        : MemoryHandleFamily::cuda_device_pointer));
+          : (backend == BackendId::maxine
+                 ? MemoryHandleFamily::nvcv_image
+                 : (backend == BackendId::cpu
+                        ? MemoryHandleFamily::host_pointer
+                        : (backend == BackendId::open_video_onnxruntime
+                               ? MemoryHandleFamily::ort_value
+                               : MemoryHandleFamily::cuda_device_pointer)));
   domain.queue_or_stream_identity = 100 + adapter;
   domain.ownership_model = OwnershipModel::adapter_exclusive;
   domain.synchronization_protocol =
       backend == BackendId::vulkan
           ? SynchronizationProtocol::vulkan_queue_fence
-          : (backend == BackendId::cpu
-                 ? SynchronizationProtocol::host_synchronous
-                 : (backend == BackendId::open_video_onnxruntime
-                        ? SynchronizationProtocol::ort_provider_synchronous
-                        : SynchronizationProtocol::cuda_stream_ordered));
+          : (backend == BackendId::maxine
+                 ? SynchronizationProtocol::maxine_bound_cuda_stream
+                 : (backend == BackendId::cpu
+                        ? SynchronizationProtocol::host_synchronous
+                        : (backend == BackendId::open_video_onnxruntime
+                               ? SynchronizationProtocol::
+                                     ort_provider_synchronous
+                               : SynchronizationProtocol::
+                                     cuda_stream_ordered)));
   domain.adapter_instance_id = adapter;
   return domain;
 }
@@ -181,6 +192,23 @@ bool TestPrimitiveAndSemanticEvidenceRemainSeparate() {
                     result.reason == ReasonId::semantic_effect_unsupported &&
                     result.selected_backend == BackendId::invalid,
                 "CPU primitive incorrectly promoted CPU effect capability");
+
+  FakeAdapter maxine(11, BackendId::maxine);
+  auto maxine_registration = Registration(&maxine, BackendId::maxine, 100, 11);
+  maxine_registration.semantic_capabilities[0] =
+      Capability(SemanticEffectId::vignette,
+                 SemanticEffectProviderId::maxine_cuda_utility);
+  maxine_registration.semantic_capability_count = 1;
+  StaticAdapterRegistry maxine_registry;
+  ok &= Register(&maxine_registry, maxine_registration);
+  auto vignette = StrictRequest(BackendId::maxine);
+  vignette.stages[0] = Stage(1, SemanticEffectId::vignette);
+  vignette.stage_count = 1;
+  const auto vignette_result = ResolveSemanticStages(maxine_registry, vignette);
+  ok &= Require(vignette_result.status == StatusId::ready &&
+                    vignette_result.selected_provider ==
+                        SemanticEffectProviderId::maxine_cuda_utility,
+                "Maxine vignette lost exact CUDA utility provider attribution");
   return ok;
 }
 
@@ -231,6 +259,56 @@ bool TestDeterministicPrecedenceAndStrictSelection() {
   ok &= Require(blocked.status == StatusId::blocked &&
                     blocked.reason == ReasonId::strict_backend_unavailable,
                 "strict request silently selected another GPU backend");
+
+  StaticAdapterRegistry fallback_registry;
+  ok &= Register(&fallback_registry, maxine_registration);
+  auto unavailable_cuda = cuda_registration;
+  unavailable_cuda.semantic_capabilities[0] = Capability(
+      SemanticEffectId::mirror,
+      SemanticEffectProviderId::open_video_onnxruntime_cuda, StatusId::blocked,
+      ReasonId::capability_evidence_incomplete, false);
+  ok &= Register(&fallback_registry, unavailable_cuda);
+  auto preferred_cuda = StrictRequest(BackendId::cuda);
+  preferred_cuda.backend.strict = false;
+  preferred_cuda.stages[0] = Stage(1, SemanticEffectId::mirror);
+  preferred_cuda.stage_count = 1;
+  const auto fallback =
+      ResolveSemanticStages(fallback_registry, preferred_cuda);
+  ok &= Require(
+      fallback.status == StatusId::degraded && fallback.degraded &&
+          fallback.fallback &&
+          fallback.reason == ReasonId::capability_evidence_incomplete &&
+          fallback.requested_backend == BackendId::cuda &&
+          fallback.selected_backend == BackendId::maxine &&
+          fallback.active_backend == BackendId::invalid &&
+          fallback.stages[0].fallback_selected &&
+          fallback.stages[0].status == StatusId::degraded &&
+          fallback.stages[0].reason == ReasonId::capability_evidence_incomplete,
+      "non-strict backend fallback lost exact attribution");
+
+  StaticAdapterRegistry no_requested_evidence_registry;
+  ok &= Register(&no_requested_evidence_registry, maxine_registration);
+  const auto provider_unavailable =
+      ResolveSemanticStages(no_requested_evidence_registry, preferred_cuda);
+  ok &= Require(
+      provider_unavailable.status == StatusId::degraded &&
+          provider_unavailable.fallback &&
+          provider_unavailable.reason ==
+              ReasonId::semantic_provider_unavailable,
+      "fallback without requested-backend evidence lost its typed reason");
+
+  auto live_fallback = fallback;
+  live_fallback.fallback = false;
+  live_fallback.stages[0].fallback_selected = false;
+  const auto fallback_comparison =
+      CompareShadowResolution(live_fallback, fallback);
+  ok &= Require(
+      !fallback_comparison.exact_match &&
+          fallback_comparison.discrepancy_count == 2 &&
+          fallback_comparison.discrepancies[0].field == ShadowField::fallback &&
+          fallback_comparison.discrepancies[1].field ==
+              ShadowField::stage_fallback,
+      "shadow comparison did not expose fallback attribution discrepancy");
   return ok;
 }
 
@@ -261,14 +339,43 @@ bool TestExplicitSemanticCpuProviderDoesNotLeakIntoStrictGpuSelection() {
       PlanExecutionDomains(registry, automatic_result,
                            CrossAdapterPolicy::split_with_measured_transfer);
   ok &= Require(cpu_plan.status == StatusId::ready &&
+                    ClassifyExecutionResidency(registration.execution_domain) ==
+                        ExecutionResidencyClass::host &&
                     cpu_plan.island_count == 1 &&
                     !cpu_plan.islands[0].requires_upload &&
                     !cpu_plan.islands[0].requires_final_readback &&
                     cpu_plan.expected_transfers.uploads == 0 &&
                     cpu_plan.expected_transfers.final_readbacks == 0 &&
                     cpu_plan.expected_transfers.intermediate_uploads == 0 &&
-                    cpu_plan.expected_transfers.intermediate_readbacks == 0,
+                    cpu_plan.expected_transfers.intermediate_readbacks == 0 &&
+                    cpu_plan.expected_transfers.synchronizations == 0,
                 "CPU semantic provider introduced GPU transfers");
+
+  FakeAdapter vulkan(26, BackendId::vulkan);
+  auto vulkan_registration = Registration(&vulkan, BackendId::vulkan, 300, 26);
+  vulkan_registration.semantic_capabilities[0] =
+      Capability(SemanticEffectId::mirror,
+                 SemanticEffectProviderId::open_vulkan_production_kernels);
+  vulkan_registration.semantic_capability_count = 1;
+  ok &= Register(&registry, vulkan_registration);
+  auto mixed_request = automatic;
+  mixed_request.stages[1] = Stage(2, SemanticEffectId::mirror);
+  mixed_request.stage_count = 2;
+  const auto mixed_resolution = ResolveSemanticStages(registry, mixed_request);
+  const auto mixed_plan =
+      PlanExecutionDomains(registry, mixed_resolution,
+                           CrossAdapterPolicy::split_with_measured_transfer);
+  ok &= Require(
+      mixed_plan.status == StatusId::ready && mixed_plan.island_count == 2 &&
+          mixed_plan.boundary_count == 1 &&
+          !mixed_plan.boundaries[0].readback_required &&
+          mixed_plan.boundaries[0].following_upload_required &&
+          mixed_plan.expected_transfers.uploads == 0 &&
+          mixed_plan.expected_transfers.intermediate_readbacks == 0 &&
+          mixed_plan.expected_transfers.intermediate_uploads == 1 &&
+          mixed_plan.expected_transfers.final_readbacks == 1 &&
+          mixed_plan.expected_transfers.synchronizations == 1,
+      "host-to-device split transfer or synchronization accounting changed");
 
   auto strict_open_video = StrictRequest(BackendId::open_video_onnxruntime);
   strict_open_video.stages[0] =
@@ -500,6 +607,18 @@ bool TestVulkanEligibilityPassthroughAndCapacity() {
                         StatusId::blocked &&
                     reason == ReasonId::malformed_contract,
                 "unqualified Vulkan semantic registered as production");
+
+  auto incoherent_domain = registration;
+  incoherent_domain.execution_domain.allocator_family =
+      AllocatorFamily::cuda_driver;
+  StaticAdapterRegistry incoherent_registry;
+  ok &= Require(
+      ClassifyExecutionResidency(incoherent_domain.execution_domain) ==
+              ExecutionResidencyClass::invalid &&
+          incoherent_registry.Register(incoherent_domain, &reason) ==
+              StatusId::blocked &&
+          reason == ReasonId::malformed_contract,
+      "incoherent execution-domain family evidence did not fail closed");
 
   auto wrong_provider = registration;
   wrong_provider.adapter_instance_id = 53;

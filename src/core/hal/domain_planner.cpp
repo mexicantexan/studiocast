@@ -9,12 +9,6 @@ bool SameIsland(const ResidentIslandPlan &island,
          island.execution_domain == stage.execution_domain;
 }
 
-bool IsDeviceResident(const ExecutionDomainId &domain) noexcept {
-  return domain.backend != BackendId::cpu &&
-         domain.backend != BackendId::open_video_onnxruntime &&
-         domain.api_family != ApiFamily::host;
-}
-
 bool AddBoundary(DomainPlan *plan, const ExecutionBoundary &boundary) noexcept {
   if (plan->boundary_count == plan->boundaries.size())
     return false;
@@ -31,9 +25,12 @@ bool AddIsland(DomainPlan *plan, const AdapterRegistration &registration,
   island.resident_adapter = registration.resident_adapter;
   island.execution_domain = registration.execution_domain;
   island.resolved_stage_indices[island.stage_count++] = stage_index;
-  island.requires_upload = IsDeviceResident(registration.execution_domain);
+  island.requires_upload =
+      ClassifyExecutionResidency(registration.execution_domain) ==
+      ExecutionResidencyClass::device;
   island.requires_final_readback =
-      IsDeviceResident(registration.execution_domain);
+      ClassifyExecutionResidency(registration.execution_domain) ==
+      ExecutionResidencyClass::device;
   return true;
 }
 
@@ -110,9 +107,12 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
           boundary.before_stage_id = stage.intent.stage_id;
           boundary.source_domain = prior_island.execution_domain;
           boundary.destination_domain = stage.execution_domain;
-          boundary.readback_required = IsDeviceResident(boundary.source_domain);
+          boundary.readback_required =
+              ClassifyExecutionResidency(boundary.source_domain) ==
+              ExecutionResidencyClass::device;
           boundary.following_upload_required =
-              IsDeviceResident(boundary.destination_domain);
+              ClassifyExecutionResidency(boundary.destination_domain) ==
+              ExecutionResidencyClass::device;
           if (!AddBoundary(&plan, boundary)) {
             plan.status = StatusId::resource_exhausted;
             plan.reason = ReasonId::resource_exhausted;
@@ -147,7 +147,9 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
       boundary.cpu_tail = stage.cpu_tail;
       boundary.scratch_bytes = stage.cpu_tail_scratch_bytes;
       boundary.source_domain = stage.execution_domain;
-      boundary.readback_required = IsDeviceResident(stage.execution_domain);
+      boundary.readback_required =
+          ClassifyExecutionResidency(stage.execution_domain) ==
+          ExecutionResidencyClass::device;
       boundary.following_upload_required = false;
       bool has_following_stage = false;
       for (std::size_t following = stage_index + 1;
@@ -159,7 +161,8 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
           boundary.destination_domain =
               resolution.stages[following].execution_domain;
           boundary.following_upload_required =
-              IsDeviceResident(boundary.destination_domain);
+              ClassifyExecutionResidency(boundary.destination_domain) ==
+              ExecutionResidencyClass::device;
           break;
         }
       }
@@ -188,7 +191,12 @@ DomainPlan PlanExecutionDomains(const StaticAdapterRegistry &registry,
   plan.expected_transfers.uploads = plan.islands[0].requires_upload ? 1 : 0;
   plan.expected_transfers.final_readbacks =
       plan.islands[plan.island_count - 1].requires_final_readback ? 1 : 0;
-  plan.expected_transfers.synchronizations = plan.island_count;
+  for (std::size_t index = 0; index < plan.island_count; ++index) {
+    if (ClassifyExecutionResidency(plan.islands[index].execution_domain) ==
+        ExecutionResidencyClass::device) {
+      ++plan.expected_transfers.synchronizations;
+    }
+  }
   plan.status = resolution.degraded ? StatusId::degraded : StatusId::ready;
   plan.reason = resolution.reason;
   return plan;
