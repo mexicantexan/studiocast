@@ -309,7 +309,8 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   ReasonId prepare_reason = ReasonId::none;
   const StatusId prepare_status = adapter.Prepare(
       program, &candidate, &candidate_readiness, &prepare_reason);
-  if (prepare_status != StatusId::ready) {
+  if (prepare_status != StatusId::ready &&
+      prepare_status != StatusId::degraded) {
     if (candidate.handle_id != 0)
       adapter.DestroyPrepared(&candidate);
     if (prepared_)
@@ -329,7 +330,7 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
       candidate.invalidation_key == program.invalidation_key &&
       candidate.execution_domain == program.execution_domain && budget_valid;
   const bool readiness_valid =
-      candidate_readiness.status == StatusId::ready &&
+      candidate_readiness.status == prepare_status &&
       candidate_readiness.available &&
       candidate_readiness.requested_backend == program.requested_backend &&
       candidate_readiness.selected_backend ==
@@ -355,10 +356,11 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   completion_pending_ = false;
   have_capture_sequence_ = false;
   ++telemetry_.setup_successes;
+  telemetry_.requested_backend = program.requested_backend;
   telemetry_.selected_backend = program.execution_domain.backend;
   if (readiness)
     *readiness = candidate_readiness;
-  return StatusId::ready;
+  return prepare_status;
 }
 
 ExecuteResult
@@ -505,6 +507,10 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
   if (effect_succeeded) {
     ++telemetry_.active_backend_frames;
     telemetry_.active_backend = program_.execution_domain.backend;
+    if (!program_.strict_backend_selection &&
+        telemetry_.requested_backend != telemetry_.selected_backend) {
+      ++telemetry_.fallback_frames;
+    }
     if (program_.stage_count != 0) {
       const auto provider = program_.stages[0].provider;
       const bool one_provider =
@@ -572,8 +578,6 @@ void PreparedProgramSession::AccumulateExecuteTelemetry(
   telemetry_.transfers.synchronizations += result.transfers.synchronizations;
   telemetry_.transfers.cpu_tail_boundaries +=
       result.transfers.cpu_tail_boundaries;
-  if (result.status == StatusId::passthrough)
-    ++telemetry_.fallback_frames;
   for (std::size_t index = 0; index < result.stage_count; ++index) {
     if (result.stages[index].status ==
         StageExecutionStatus::optional_failed_open) {

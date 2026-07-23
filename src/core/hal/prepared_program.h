@@ -264,6 +264,7 @@ struct LatencyHistogram {
 };
 
 struct ExecutionTelemetry {
+  BackendId requested_backend = BackendId::invalid;
   BackendId selected_backend = BackendId::invalid;
   BackendId active_backend = BackendId::invalid;
   SemanticEffectProviderId active_provider = SemanticEffectProviderId::invalid;

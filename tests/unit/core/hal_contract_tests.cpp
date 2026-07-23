@@ -206,7 +206,8 @@ public:
     ++prepare_calls;
     if (reason)
       *reason = prepare_reason;
-    if (prepare_status != StatusId::ready) {
+    if (prepare_status != StatusId::ready &&
+        prepare_status != StatusId::degraded) {
       if (readiness) {
         readiness->status = prepare_status;
         readiness->reason = prepare_reason;
@@ -222,8 +223,8 @@ public:
     candidate->reserved_budget = program.budget;
     if (exhaust_budget)
       ++candidate->reserved_budget.resource_count;
-    readiness->status = StatusId::ready;
-    readiness->reason = ReasonId::none;
+    readiness->status = prepare_status;
+    readiness->reason = prepare_reason;
     readiness->requested_backend = wrong_readiness_requested_backend
                                        ? BackendId::vulkan
                                        : program.requested_backend;
@@ -232,7 +233,8 @@ public:
     readiness->execution_domain = program.execution_domain;
     readiness->ready_stage_mask = 0x3;
     readiness->available = true;
-    return StatusId::ready;
+    readiness->degraded = prepare_status == StatusId::degraded;
+    return prepare_status;
   }
 
   ExecuteResult Execute(const PreparedProgramHandle &,
@@ -526,6 +528,43 @@ bool TestOptionalFailureAndOutputCommitAttribution() {
   return ok;
 }
 
+bool TestExplicitFallbackReadinessAndCommittedAttribution() {
+  bool ok = true;
+  auto program = Program();
+  program.requested_backend = BackendId::vulkan;
+  program.strict_backend_selection = false;
+
+  FakeAdapter adapter;
+  adapter.prepare_status = StatusId::degraded;
+  adapter.prepare_reason = ReasonId::semantic_provider_unavailable;
+  PreparedProgramSession session;
+  ReadinessSnapshot readiness;
+  ReasonId reason = ReasonId::none;
+  ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
+                    StatusId::degraded,
+                "explicit fallback setup was not reported as degraded");
+  ok &= Require(session.prepared() && readiness.degraded &&
+                    readiness.requested_backend == BackendId::vulkan &&
+                    readiness.selected_backend == BackendId::cuda &&
+                    readiness.reason ==
+                        ReasonId::semantic_provider_unavailable &&
+                    session.telemetry().requested_backend ==
+                        BackendId::vulkan &&
+                    session.telemetry().selected_backend == BackendId::cuda,
+                "fallback readiness lost requested/selected attribution");
+
+  const auto result = session.Execute(Request(program, 1));
+  ok &= Require(result.status == StatusId::executed,
+                "degraded fallback setup did not execute");
+  ok &= Require(session.telemetry().fallback_frames == 0,
+                "fallback was attributed before output commit");
+  ok &= Require(session.CommitOutput({result.completion, true}, &reason) ==
+                    StatusId::ready &&
+                    session.telemetry().fallback_frames == 1,
+                "committed fallback frame was not attributed exactly once");
+  return ok;
+}
+
 bool TestFailuresDeviceLossAndTransferEnforcement() {
   bool ok = true;
   {
@@ -660,6 +699,7 @@ int main() {
   ok &= TestMalformedCrossAdapterAndExhaustion();
   ok &= TestExecutionValidationAndNoAllocation();
   ok &= TestOptionalFailureAndOutputCommitAttribution();
+  ok &= TestExplicitFallbackReadinessAndCommittedAttribution();
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   if (ok)
