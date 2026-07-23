@@ -7,6 +7,16 @@
 
 namespace {
 
+static_assert(static_cast<std::uint32_t>(
+                  studiocast::hal::ReasonId::semantic_provider_unavailable) ==
+              26);
+static_assert(static_cast<std::uint32_t>(
+                  studiocast::hal::ReasonId::semantic_effect_unsupported) ==
+              27);
+static_assert(static_cast<std::uint32_t>(
+                  studiocast::hal::ReasonId::capability_evidence_incomplete) ==
+              28);
+
 std::atomic<std::size_t> g_allocations{0};
 std::atomic<bool> g_count_allocations{false};
 

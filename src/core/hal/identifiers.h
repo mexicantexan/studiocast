@@ -94,6 +94,9 @@ enum class ReasonId : std::uint32_t {
   cpu_tail_required = 23,
   circuit_breaker_open = 24,
   cancellation_unsupported_v1 = 25,
+  semantic_provider_unavailable = 26,
+  semantic_effect_unsupported = 27,
+  capability_evidence_incomplete = 28,
 };
 
 [[nodiscard]] constexpr std::string_view
