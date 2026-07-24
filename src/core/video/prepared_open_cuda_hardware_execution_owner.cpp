@@ -669,9 +669,10 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
       snapshot.production.quiescent = true;
       snapshot.production.driver_context_release_permitted = true;
       snapshot.production.stopped = true;
-      snapshot.stopped = true;
     }
 #endif
+    if (!injected)
+      snapshot.stopped = snapshot.production.stopped;
   }
 
   void RetireActive(hal::ReasonId reason) noexcept {
@@ -733,6 +734,14 @@ PreparedOpenCudaHardwareExecutionOwner::Configure(
   PreparedOpenCudaHardwareSetupResult result;
   const auto eligibility = EvaluatePreparedOpenCudaHardwareEligibility(request);
   result.eligibility = eligibility;
+
+  if (impl_->shutdown_requested) {
+    result.route = PreparedOpenCudaHardwareRoute::legacy_compatibility;
+    result.status = hal::StatusId::stopped;
+    result.reason = hal::ReasonId::shutdown_requested;
+    impl_->Refresh(result.route, eligibility);
+    return result;
+  }
 
   if (impl_->frame_pending) {
     result.route = impl_->snapshot.prepared

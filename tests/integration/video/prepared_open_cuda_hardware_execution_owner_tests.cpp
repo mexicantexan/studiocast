@@ -619,6 +619,12 @@ bool ExecuteCommitFailuresAndAllocationFreeFramePath() {
   CHECK(unavailable_stopped.production.shutdown_requested);
   CHECK(unavailable_stopped.production.quiescent);
   CHECK(unavailable_stopped.production.driver_context_release_permitted);
+  const auto unavailable_reconfigure = unavailable.Configure(Request());
+  CHECK(unavailable_reconfigure.route ==
+        video::PreparedOpenCudaHardwareRoute::legacy_compatibility);
+  CHECK(unavailable_reconfigure.status == hal::StatusId::stopped);
+  CHECK(unavailable_reconfigure.reason == hal::ReasonId::shutdown_requested);
+  CHECK(unavailable.Snapshot().stopped);
   return true;
 }
 
