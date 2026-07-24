@@ -88,9 +88,19 @@ public:
   void Shutdown() noexcept override {}
 };
 
+struct FakeExecutorCounters {
+  std::uint64_t execute_calls = 0;
+  std::uint64_t commit_calls = 0;
+  std::uint64_t invalidate_calls = 0;
+  std::uint64_t reset_calls = 0;
+  std::uint64_t shutdown_calls = 0;
+};
+
 class FakeExecutor final : public video::IVideoExecutionExecutor {
 public:
-  explicit FakeExecutor(video::FrozenVideoExecutionPlan plan) : plan_(plan) {
+  FakeExecutor(video::FrozenVideoExecutionPlan plan,
+               FakeExecutorCounters *counters)
+      : plan_(plan), counters_(counters) {
     snapshot_.status = hal::StatusId::ready;
     snapshot_.execution_domain = plan_.domain_plan.islands[0].execution_domain;
     snapshot_.plan_id = plan_.plan_id;
@@ -107,7 +117,7 @@ public:
 
   video::VideoExecutionFrameResult
   Execute(const hal::HostFrameBinding &binding) noexcept override {
-    ++execute_calls;
+    ++counters_->execute_calls;
     video::VideoExecutionFrameResult result;
     if (invalidated_ || stopped_) {
       result.status = stopped_ ? hal::StatusId::stopped : hal::StatusId::stale;
@@ -143,7 +153,7 @@ public:
   hal::StatusId CommitOutput(const hal::CompletionToken &completion,
                              bool writer_succeeded,
                              hal::ReasonId *reason) noexcept override {
-    ++commit_calls;
+    ++counters_->commit_calls;
     if (completion.token_id != pending_.token_id) {
       if (reason)
         *reason = hal::ReasonId::stale_program;
@@ -157,16 +167,16 @@ public:
   }
 
   void Invalidate(hal::ReasonId) noexcept override {
-    ++invalidate_calls;
+    ++counters_->invalidate_calls;
     invalidated_ = true;
     snapshot_.prepared = false;
   }
   hal::StatusId ResetTemporal(hal::ReasonId) noexcept override {
-    ++reset_calls;
+    ++counters_->reset_calls;
     return hal::StatusId::ready;
   }
   void Shutdown() noexcept override {
-    ++shutdown_calls;
+    ++counters_->shutdown_calls;
     stopped_ = true;
     snapshot_.stopped = true;
   }
@@ -174,14 +184,9 @@ public:
     return snapshot_;
   }
 
-  std::uint64_t execute_calls = 0;
-  std::uint64_t commit_calls = 0;
-  std::uint64_t invalidate_calls = 0;
-  std::uint64_t reset_calls = 0;
-  std::uint64_t shutdown_calls = 0;
-
 private:
   video::FrozenVideoExecutionPlan plan_{};
+  FakeExecutorCounters *counters_ = nullptr;
   video::VideoExecutionAdapterSnapshot snapshot_{};
   hal::CompletionToken pending_{};
   std::uint64_t next_token_ = 1;
@@ -261,12 +266,10 @@ public:
   Prepare(const video::FrozenVideoExecutionPlan &plan,
           video::VideoAdapterPrepareEvidence *evidence) noexcept override {
     evidence->status = hal::StatusId::ready;
-    auto executor = std::make_unique<FakeExecutor>(plan);
-    latest = executor.get();
-    return executor;
+    return std::make_unique<FakeExecutor>(plan, &counters);
   }
 
-  FakeExecutor *latest = nullptr;
+  FakeExecutorCounters counters{};
 };
 
 hal::AdapterRegistration Registration(UnusedAdapter *adapter) {
@@ -417,10 +420,10 @@ bool TestLifecycleAndAttribution() {
   composition.Shutdown();
   ok &= Require(composition.Snapshot().stopped,
                 "shutdown must be visible in the neutral snapshot");
-  ok &= Require(factory.latest && factory.latest->execute_calls == 2 &&
-                    factory.latest->commit_calls == 2 &&
-                    factory.latest->invalidate_calls == 1 &&
-                    factory.latest->shutdown_calls == 1,
+  ok &= Require(factory.counters.execute_calls == 2 &&
+                    factory.counters.commit_calls == 2 &&
+                    factory.counters.invalidate_calls == 1 &&
+                    factory.counters.shutdown_calls == 1,
                 "composition must own the complete executor lifecycle");
   return ok;
 }
