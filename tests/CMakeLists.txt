@@ -1412,7 +1412,8 @@ if (BUILD_TESTING)
     )
 
     target_link_libraries(studiocast-open-cuda-production-hal-owner-tests PRIVATE
-            studiocast_open_video_backend)
+            studiocast_open_video_backend
+            studiocast_video_execution_runtime)
 
     target_include_directories(studiocast-open-cuda-production-hal-owner-tests PRIVATE
             "${PROJECT_SOURCE_DIR}/src"
