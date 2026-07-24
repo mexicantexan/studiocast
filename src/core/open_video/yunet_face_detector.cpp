@@ -746,12 +746,10 @@ YunetFaceDetector::Letterbox YunetFaceDetector::ComputeLetterbox(int src_w,
   const float sy = static_cast<float>(dst_h) / static_cast<float>(src_h);
   lb.scale = std::min(sx, sy);
 
-  const int resized_w =
-      std::max(1, static_cast<int>(
-                      std::lround(static_cast<float>(src_w) * lb.scale)));
-  const int resized_h =
-      std::max(1, static_cast<int>(
-                      std::lround(static_cast<float>(src_h) * lb.scale)));
+  const int resized_w = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(src_w) * lb.scale)));
+  const int resized_h = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(src_h) * lb.scale)));
   lb.pad_x = (dst_w - resized_w) / 2;
   lb.pad_y = (dst_h - resized_h) / 2;
   return lb;
@@ -770,12 +768,10 @@ void YunetFaceDetector::FillInputTensorBgr(const std::uint8_t *rgb, int src_w,
     return;
 
   const float inv_scale = (lb.scale > 0.0f) ? (1.0f / lb.scale) : 1.0f;
-  const int content_w =
-      std::max(1, static_cast<int>(
-                      std::lround(static_cast<float>(src_w) * lb.scale)));
-  const int content_h =
-      std::max(1, static_cast<int>(
-                      std::lround(static_cast<float>(src_h) * lb.scale)));
+  const int content_w = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(src_w) * lb.scale)));
+  const int content_h = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(src_h) * lb.scale)));
   const int x0 = std::max(0, lb.pad_x);
   const int y0 = std::max(0, lb.pad_y);
   const int x1 = std::min(out_w, lb.pad_x + content_w);
@@ -896,6 +892,26 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
     const std::string &requested_model_id, std::uint64_t capture_sequence,
     FrameAnalysisCache *cache, std::string *error,
     YunetProviderPolicy provider_policy) {
+  return EnsureDetectionsForFrameImpl(rgb, width, height, stride,
+                                      requested_model_id, capture_sequence,
+                                      cache, error, provider_policy, true);
+}
+
+bool YunetFaceDetector::EnsurePreparedDetectionsForFrame(
+    const std::uint8_t *rgb, int width, int height, std::size_t stride,
+    const std::string &requested_model_id, std::uint64_t capture_sequence,
+    FrameAnalysisCache *cache, std::string *error,
+    YunetProviderPolicy provider_policy) {
+  return EnsureDetectionsForFrameImpl(rgb, width, height, stride,
+                                      requested_model_id, capture_sequence,
+                                      cache, error, provider_policy, false);
+}
+
+bool YunetFaceDetector::EnsureDetectionsForFrameImpl(
+    const std::uint8_t *rgb, int width, int height, std::size_t stride,
+    const std::string &requested_model_id, std::uint64_t capture_sequence,
+    FrameAnalysisCache *cache, std::string *error,
+    YunetProviderPolicy provider_policy, bool allow_setup) {
   if (error)
     error->clear();
   if (!cache) {
@@ -909,10 +925,18 @@ bool YunetFaceDetector::EnsureDetectionsForFrame(
     return true;
   }
 
-  std::string init_err;
-  if (!EnsureInitialized(requested_model_id, &init_err, provider_policy)) {
+  if (allow_setup) {
+    std::string init_err;
+    if (!EnsureInitialized(requested_model_id, &init_err, provider_policy)) {
+      if (error)
+        *error = init_err;
+      return false;
+    }
+  } else if (!initialized_ || !warmed_ || !session_ ||
+             requested_model_id != active_requested_model_id_ ||
+             provider_policy != active_provider_policy_) {
     if (error)
-      *error = init_err;
+      *error = "YuNet prepared state is stale.";
     return false;
   }
 

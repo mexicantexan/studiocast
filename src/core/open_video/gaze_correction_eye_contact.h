@@ -78,6 +78,14 @@ public:
                        const std::string &requested_model_id,
                        YunetFaceDetector *yunet, FrameAnalysisCache *cache,
                        std::string *error);
+  bool ApplyPreparedRgbInPlace(std::uint64_t capture_sequence,
+                               std::uint8_t *rgb, int width, int height,
+                               std::size_t stride, int strength,
+                               bool look_away_enabled,
+                               const std::string &face_detection_model_id,
+                               const std::string &requested_model_id,
+                               YunetFaceDetector *yunet,
+                               FrameAnalysisCache *cache, std::string *error);
 
   bool initialized() const { return initialized_; }
   bool disabled() const { return disabled_; }
@@ -189,6 +197,13 @@ private:
                         int dst_w, int dst_h, std::string *error);
 
   void DisableAfterFailure(const std::string &why);
+  bool ApplyRgbInPlaceImpl(std::uint64_t capture_sequence, std::uint8_t *rgb,
+                           int width, int height, std::size_t stride,
+                           int strength, bool look_away_enabled,
+                           const std::string &face_detection_model_id,
+                           const std::string &requested_model_id,
+                           YunetFaceDetector *yunet, FrameAnalysisCache *cache,
+                           bool allow_setup, std::string *error);
 
   bool initialized_ = false;
   bool disabled_ = false;

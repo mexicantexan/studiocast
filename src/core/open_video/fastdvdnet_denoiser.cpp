@@ -895,6 +895,22 @@ bool FastDvdnetDenoiser::ApplyRgbInPlace(std::uint64_t capture_sequence,
                                          int strength,
                                          const std::string &requested_model_id,
                                          std::string *error) {
+  return ApplyRgbInPlaceImpl(capture_sequence, rgb, width, height, stride,
+                             strength, requested_model_id, true, error);
+}
+
+bool FastDvdnetDenoiser::ApplyPreparedRgbInPlace(
+    std::uint64_t capture_sequence, std::uint8_t *rgb, int width, int height,
+    std::size_t stride, int strength, const std::string &requested_model_id,
+    std::string *error) {
+  return ApplyRgbInPlaceImpl(capture_sequence, rgb, width, height, stride,
+                             strength, requested_model_id, false, error);
+}
+
+bool FastDvdnetDenoiser::ApplyRgbInPlaceImpl(
+    std::uint64_t capture_sequence, std::uint8_t *rgb, int width, int height,
+    std::size_t stride, int strength, const std::string &requested_model_id,
+    bool allow_setup, std::string *error) {
   last_tensor_run_stats_ = DenoiseTensorRunStats{};
   if (error)
     error->clear();
@@ -915,10 +931,18 @@ bool FastDvdnetDenoiser::ApplyRgbInPlace(std::uint64_t capture_sequence,
     return true;
   }
 
-  std::string init_err;
-  if (!EnsureInitialized(width, height, requested_model_id, &init_err)) {
+  if (allow_setup) {
+    std::string init_err;
+    if (!EnsureInitialized(width, height, requested_model_id, &init_err)) {
+      if (error)
+        *error = init_err;
+      return false;
+    }
+  } else if (!initialized_ || !ort_session_active_ ||
+             requested_model_id != active_requested_model_id_ ||
+             width != src_w_ || height != src_h_) {
     if (error)
-      *error = init_err;
+      *error = "Open Video FastDVDnet: prepared state is stale.";
     return false;
   }
   if (!ort_session_active_) {

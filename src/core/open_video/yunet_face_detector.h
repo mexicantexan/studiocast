@@ -136,6 +136,14 @@ public:
       FrameAnalysisCache *cache, std::string *error,
       YunetProviderPolicy provider_policy = YunetProviderPolicy::prefer_cuda);
 
+  // Prepared-only frame entry point. The exact model/provider policy must have
+  // been initialized and warmed during setup.
+  bool EnsurePreparedDetectionsForFrame(
+      const std::uint8_t *rgb, int width, int height, std::size_t stride,
+      const std::string &requested_model_id, std::uint64_t capture_sequence,
+      FrameAnalysisCache *cache, std::string *error,
+      YunetProviderPolicy provider_policy = YunetProviderPolicy::prefer_cuda);
+
   bool available() const { return initialized_; }
   const std::string &active_model_id() const { return active_model_id_; }
   FaceDetectionRuntimeStatus runtime_status() const;
@@ -205,6 +213,11 @@ private:
                           std::size_t src_stride, const Letterbox &lb);
 
   static float IoU(const FaceDetection &a, const FaceDetection &b);
+  bool EnsureDetectionsForFrameImpl(
+      const std::uint8_t *rgb, int width, int height, std::size_t stride,
+      const std::string &requested_model_id, std::uint64_t capture_sequence,
+      FrameAnalysisCache *cache, std::string *error,
+      YunetProviderPolicy provider_policy, bool allow_setup);
 };
 
 } // namespace studiocast::open_video

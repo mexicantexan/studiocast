@@ -1118,6 +1118,28 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
     const std::string &face_detection_model_id,
     const std::string &requested_model_id, YunetFaceDetector *yunet,
     FrameAnalysisCache *cache, std::string *error) {
+  return ApplyRgbInPlaceImpl(
+      capture_sequence, rgb, width, height, stride, strength, look_away_enabled,
+      face_detection_model_id, requested_model_id, yunet, cache, true, error);
+}
+
+bool GazeCorrectionEyeContact::ApplyPreparedRgbInPlace(
+    std::uint64_t capture_sequence, std::uint8_t *rgb, int width, int height,
+    std::size_t stride, int strength, bool look_away_enabled,
+    const std::string &face_detection_model_id,
+    const std::string &requested_model_id, YunetFaceDetector *yunet,
+    FrameAnalysisCache *cache, std::string *error) {
+  return ApplyRgbInPlaceImpl(
+      capture_sequence, rgb, width, height, stride, strength, look_away_enabled,
+      face_detection_model_id, requested_model_id, yunet, cache, false, error);
+}
+
+bool GazeCorrectionEyeContact::ApplyRgbInPlaceImpl(
+    std::uint64_t capture_sequence, std::uint8_t *rgb, int width, int height,
+    std::size_t stride, int strength, bool look_away_enabled,
+    const std::string &face_detection_model_id,
+    const std::string &requested_model_id, YunetFaceDetector *yunet,
+    FrameAnalysisCache *cache, bool allow_setup, std::string *error) {
   if (error)
     error->clear();
   (void)look_away_enabled;
@@ -1143,28 +1165,39 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
     return true;
   const float strength01 = Clamp01(static_cast<float>(strength) / 100.f);
 
-  std::string init_err;
-  if (!EnsureInitialized(requested_model_id, &init_err)) {
-    // If not initialized (missing models), treat as bypass rather than hard
-    // failure.
+  if (allow_setup) {
+    std::string init_err;
+    if (!EnsureInitialized(requested_model_id, &init_err)) {
+      if (error)
+        *error = init_err;
+      return false;
+    }
+    std::string scratch_error;
+    if (!PrepareScratch(width, height, left_.input_w, left_.input_h,
+                        right_.input_w, right_.input_h, &scratch_error)) {
+      if (error)
+        *error = scratch_error;
+      return false;
+    }
+  } else if (!initialized_ || !left_.session_active || !right_.session_active ||
+             requested_model_id != active_requested_model_id_ ||
+             scratch_frame_width_ != width || scratch_frame_height_ != height) {
     if (error)
-      *error = init_err;
-    return false;
-  }
-
-  std::string scratch_error;
-  if (!PrepareScratch(width, height, left_.input_w, left_.input_h,
-                      right_.input_w, right_.input_h, &scratch_error)) {
-    if (error)
-      *error = scratch_error;
+      *error = "Eye Contact prepared state is stale.";
     return false;
   }
 
   // Ensure face detections.
   std::string det_err;
-  if (!yunet->EnsureDetectionsForFrame(rgb, width, height, stride,
-                                       face_detection_model_id,
-                                       capture_sequence, cache, &det_err)) {
+  const bool detections_ok =
+      allow_setup
+          ? yunet->EnsureDetectionsForFrame(rgb, width, height, stride,
+                                            face_detection_model_id,
+                                            capture_sequence, cache, &det_err)
+          : yunet->EnsurePreparedDetectionsForFrame(
+                rgb, width, height, stride, face_detection_model_id,
+                capture_sequence, cache, &det_err);
+  if (!detections_ok) {
     if (error)
       *error = det_err;
     return false;
@@ -1179,9 +1212,15 @@ bool GazeCorrectionEyeContact::ApplyRgbInPlace(
 
   // Landmarks (cached).
   std::string lm_err;
-  if (!dlib_landmarks_.EnsureLandmarksForFrame(rgb, width, height, stride,
-                                               capture_sequence, *face, cache,
-                                               &lm_err)) {
+  const bool landmarks_ok =
+      allow_setup
+          ? dlib_landmarks_.EnsureLandmarksForFrame(rgb, width, height, stride,
+                                                    capture_sequence, *face,
+                                                    cache, &lm_err)
+          : dlib_landmarks_.EnsurePreparedLandmarksForFrame(
+                rgb, width, height, stride, capture_sequence, *face, cache,
+                &lm_err);
+  if (!landmarks_ok) {
     if (error)
       *error = lm_err;
     return false;
