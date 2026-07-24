@@ -93,6 +93,13 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
   bool Setup(PreparedOpenVideoCompatibilitySetupResult *result) {
     const int width = static_cast<int>(config.plan.host_input.width);
     const int height = static_cast<int>(config.plan.host_input.height);
+    if (config.selected_backend == hal::BackendId::invalid ||
+        config.selected_provider == hal::SemanticEffectProviderId::invalid ||
+        !hal::ValidateExecutionDomain(config.execution_domain)) {
+      result->status = hal::StatusId::blocked;
+      result->reason = hal::ReasonId::malformed_execution_domain;
+      return false;
+    }
     output.resize(
         static_cast<std::size_t>(config.plan.host_output.planes[0].size_bytes));
     candidate.resize(output.size());
@@ -128,7 +135,11 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
           return false;
         }
         have_eye_contact = true;
-      } else {
+      } else if (config.prepared_stage_runner == nullptr ||
+                 (semantic !=
+                      hal::SemanticEffectId::virtual_background_replace &&
+                  semantic != hal::SemanticEffectId::virtual_key_light &&
+                  semantic != hal::SemanticEffectId::auto_frame)) {
         result->status = hal::StatusId::blocked;
         result->reason = hal::ReasonId::semantic_effect_unsupported;
         return false;
@@ -136,32 +147,43 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
       // CPU-tensor Open Video stages remain explicitly host-provider stages
       // even when ORT internally activates CUDA EP.
       if (config.providers[index] !=
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cpu) {
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cpu &&
+          config.providers[index] !=
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+        result->status = hal::StatusId::blocked;
+        result->reason = hal::ReasonId::semantic_provider_unavailable;
+        return false;
+      }
+      if (config.backends[index] == hal::BackendId::invalid) {
         result->status = hal::StatusId::blocked;
         result->reason = hal::ReasonId::semantic_provider_unavailable;
         return false;
       }
     }
-    snapshot.status = hal::StatusId::degraded;
-    snapshot.reason = hal::ReasonId::cpu_tail_required;
+    const bool host_provider =
+        config.selected_provider ==
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    snapshot.status =
+        host_provider ? hal::StatusId::degraded : hal::StatusId::ready;
+    snapshot.reason =
+        host_provider ? hal::ReasonId::cpu_tail_required : hal::ReasonId::none;
     snapshot.plan_id = config.plan.plan_id;
     snapshot.prepared = true;
     snapshot.readiness.status = snapshot.status;
     snapshot.readiness.reason = snapshot.reason;
     snapshot.readiness.requested_backend = config.plan.intent.backend.backend;
-    snapshot.readiness.selected_backend =
-        hal::BackendId::open_video_onnxruntime;
-    snapshot.readiness.provider =
-        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    snapshot.readiness.selected_backend = config.selected_backend;
+    snapshot.readiness.provider = config.selected_provider;
+    snapshot.readiness.execution_domain = config.execution_domain;
     snapshot.readiness.available = true;
-    snapshot.readiness.degraded = true;
+    snapshot.readiness.degraded = host_provider;
     snapshot.readiness.ready_stage_mask =
         config.plan.intent.stage_count >= 32
             ? UINT32_MAX
             : ((UINT32_C(1) << config.plan.intent.stage_count) - 1u);
     snapshot.telemetry.requested_backend = config.plan.intent.backend.backend;
-    snapshot.telemetry.selected_backend =
-        hal::BackendId::open_video_onnxruntime;
+    snapshot.execution_domain = config.execution_domain;
+    snapshot.telemetry.selected_backend = config.selected_backend;
     snapshot.telemetry.runtime_status = snapshot.status;
     snapshot.telemetry.runtime_reason = snapshot.reason;
     result->status = snapshot.status;
@@ -372,16 +394,14 @@ hal::StatusId PreparedOpenVideoCompatibilityExecutor::CommitOutput(
     committed.stages[index].stage_id = impl_->pending_stages[index].stage_id;
     committed.stages[index].semantic = impl_->pending_stages[index].semantic;
     committed.stages[index].provider = impl_->config.providers[index];
-    committed.stages[index].backend = hal::BackendId::open_video_onnxruntime;
+    committed.stages[index].backend = impl_->config.backends[index];
     committed.stages[index].status = impl_->pending_stages[index].status;
     committed.stages[index].reason = impl_->pending_stages[index].reason;
   }
   ++impl_->snapshot.telemetry.committed_output_frames;
   ++impl_->snapshot.telemetry.active_backend_frames;
-  impl_->snapshot.telemetry.active_backend =
-      hal::BackendId::open_video_onnxruntime;
-  impl_->snapshot.telemetry.active_provider =
-      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  impl_->snapshot.telemetry.active_backend = impl_->config.selected_backend;
+  impl_->snapshot.telemetry.active_provider = impl_->config.selected_provider;
   impl_->pending = {};
   return hal::StatusId::ready;
 }

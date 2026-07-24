@@ -56,6 +56,23 @@ hal::ImageDescriptor Image(hal::Mutability mutability) {
   return image;
 }
 
+hal::ExecutionDomainId Domain() {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::open_video_onnxruntime;
+  domain.api_family = hal::ApiFamily::onnxruntime;
+  domain.physical_device.vendor_id = 0x535443;
+  domain.physical_device.stable_id[0] = 0x4f;
+  domain.logical_context_generation = 1;
+  domain.allocator_family = hal::AllocatorFamily::onnxruntime;
+  domain.memory_handle_family = hal::MemoryHandleFamily::ort_value;
+  domain.queue_or_stream_identity = 17;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::ort_provider_synchronous;
+  domain.adapter_instance_id = 19;
+  return domain;
+}
+
 struct RunnerState {
   std::uint64_t calls = 0;
 };
@@ -97,6 +114,12 @@ open_video::PreparedOpenVideoCompatibilityConfig Config(RunnerState *state) {
       hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
   config.providers[1] =
       hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  config.backends[0] = hal::BackendId::open_video_onnxruntime;
+  config.backends[1] = hal::BackendId::open_video_onnxruntime;
+  config.selected_backend = hal::BackendId::open_video_onnxruntime;
+  config.selected_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  config.execution_domain = Domain();
   config.prepared_stage_runner = &RunStage;
   config.prepared_stage_runner_context = state;
   return config;

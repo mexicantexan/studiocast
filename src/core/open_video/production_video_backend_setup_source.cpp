@@ -457,10 +457,15 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
   open_video::PreparedOpenVideoCompatibilityConfig config;
   config.plan = result.plan;
   config.effects = request.effects;
+  config.selected_backend = hal::BackendId::open_video_onnxruntime;
+  config.selected_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  config.execution_domain = entry.domain;
   config.expected_transfers = topology.expected_transfers;
   for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
     config.providers[index] =
         hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    config.backends[index] = hal::BackendId::open_video_onnxruntime;
   }
   open_video::PreparedOpenVideoCompatibilitySetupResult setup;
   result.compatibility_executor =

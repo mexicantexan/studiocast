@@ -20,12 +20,18 @@ struct PreparedOpenVideoCompatibilityConfig {
   video::effects::BroadcastCameraEffects effects{};
   std::array<hal::SemanticEffectProviderId, hal::kMaxPreparedStages>
       providers{};
+  std::array<hal::BackendId, hal::kMaxPreparedStages> backends{};
+  hal::BackendId selected_backend = hal::BackendId::invalid;
+  hal::SemanticEffectProviderId selected_provider =
+      hal::SemanticEffectProviderId::invalid;
+  hal::ExecutionDomainId execution_domain{};
   hal::TransferCounters expected_transfers{};
   // Optional already-prepared runner used by backend-private composed stages
   // and hermetic conformance tests. Ownership and preparation remain with the
   // caller; Execute never probes, prepares, or allocates it.
   PreparedStageRunner prepared_stage_runner = nullptr;
   void *prepared_stage_runner_context = nullptr;
+  std::shared_ptr<void> prepared_stage_runner_owner;
 };
 
 struct PreparedOpenVideoCompatibilitySetupResult {
