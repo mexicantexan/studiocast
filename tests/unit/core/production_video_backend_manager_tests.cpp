@@ -490,6 +490,9 @@ enum class SourceMode {
   ready,
   malformed_returned_plan,
   foreign_returned_domain,
+  single_domain_compatibility,
+  single_domain_fabricated_boundary,
+  single_domain_fabricated_transfer,
 };
 
 class FakeSetupSource final : public video::IProductionVideoBackendSetupSource {
@@ -525,17 +528,6 @@ public:
           video::ProductionVideoExecutionDomainHash(foreign);
     }
 
-    auto owner = std::make_unique<FakeLeaseOwner>(counters_);
-    auto snapshot = LeaseSnapshot(owner.get());
-    video::ProductionVideoSetupLeaseAcquireEvidence acquire;
-    hal::ReasonId reason = hal::ReasonId::none;
-    const auto status = video::ProductionVideoSetupLease::Acquire(
-        snapshot, std::move(owner), &result.lease, &acquire, &reason);
-    result.status = status;
-    result.reason = reason;
-    result.readiness = snapshot.readiness;
-    result.lease_acquire = acquire;
-    result.setup_completed_outside_frame_loop = true;
     auto &selection = result.model_selections[0];
     selection.semantic = hal::SemanticEffectId::virtual_background_blur;
     selection.requested_model_id = request.effects.virtual_background.model_id;
@@ -547,6 +539,58 @@ public:
     selection.default_selected =
         request.effects.virtual_background.model_id.empty();
     result.model_selection_count = 1;
+
+    if (mode == SourceMode::single_domain_compatibility ||
+        mode == SourceMode::single_domain_fabricated_boundary ||
+        mode == SourceMode::single_domain_fabricated_transfer) {
+      video::FrozenVideoExecutionPlan frozen;
+      frozen.plan_id = result.plan.plan_id;
+      result.execution_kind =
+          video::ProductionVideoResidentSetupSourceResult::ExecutionKind::
+              typed_compatibility;
+      result.compatibility_executor =
+          std::make_unique<FakeExecutor>(std::move(frozen), counters_);
+      auto &topology = result.compatibility_topology;
+      topology.domain_count = 1;
+      topology.domains[0].domain = Domain();
+      topology.domains[0].backend = hal::BackendId::maxine;
+      topology.domains[0].provider =
+          hal::SemanticEffectProviderId::maxine_vfx;
+      topology.domains[0].first_stage_id = 1;
+      topology.domains[0].last_stage_id = 1;
+      topology.exact_ordered_boundaries = true;
+      topology.cross_adapter_residency_forbidden = true;
+      if (mode == SourceMode::single_domain_fabricated_boundary) {
+        topology.boundary_count = 1;
+        topology.boundaries[0].kind =
+            hal::ExecutionBoundaryKind::adapter_transfer;
+      }
+      if (mode == SourceMode::single_domain_fabricated_transfer)
+        topology.expected_transfers.intermediate_readbacks = 1;
+      result.status = hal::StatusId::ready;
+      result.readiness.status = hal::StatusId::ready;
+      result.readiness.requested_backend = hal::BackendId::maxine;
+      result.readiness.selected_backend = hal::BackendId::maxine;
+      result.readiness.provider =
+          hal::SemanticEffectProviderId::maxine_vfx;
+      result.readiness.execution_domain = Domain();
+      result.readiness.ready_stage_mask = 1;
+      result.readiness.available = true;
+      result.setup_completed_outside_frame_loop = true;
+      return result;
+    }
+
+    auto owner = std::make_unique<FakeLeaseOwner>(counters_);
+    auto snapshot = LeaseSnapshot(owner.get());
+    video::ProductionVideoSetupLeaseAcquireEvidence acquire;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status = video::ProductionVideoSetupLease::Acquire(
+        snapshot, std::move(owner), &result.lease, &acquire, &reason);
+    result.status = status;
+    result.reason = reason;
+    result.readiness = snapshot.readiness;
+    result.lease_acquire = acquire;
+    result.setup_completed_outside_frame_loop = true;
     return result;
   }
 
@@ -881,6 +925,40 @@ bool TestInvalidationAndRetryableShutdownAreTyped() {
   return ok;
 }
 
+bool TestSingleDomainCompatibilityTopologyIsExact() {
+  Counters counters;
+  auto source = std::make_unique<FakeSetupSource>(&counters);
+  auto *raw_source = source.get();
+  video::ProductionVideoBackendManager manager(std::move(source));
+  const auto request = ResidentRequest();
+  video::ProductionVideoBackendSetupEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+
+  raw_source->mode = SourceMode::single_domain_compatibility;
+  bool ok = Require(
+      manager.Setup(request, &evidence, &reason) == hal::StatusId::ready &&
+          manager.Snapshot().state ==
+              video::ProductionVideoBackendManagerState::compatibility_ready &&
+          manager.Snapshot().compatibility_topology.domain_count == 1 &&
+          manager.Snapshot().compatibility_topology.boundary_count == 0,
+      "one exact provider-matching compatibility domain must be valid");
+
+  raw_source->mode = SourceMode::single_domain_fabricated_boundary;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    evidence.old_plan_retained,
+                "one-domain topology must reject a fabricated boundary");
+
+  raw_source->mode = SourceMode::single_domain_fabricated_transfer;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    evidence.old_plan_retained,
+                "one-domain topology must reject an intermediate transfer");
+  return ok;
+}
+
 bool TestFailedTemporalResetRequiresSetupReprepare() {
   Counters counters;
   auto source = std::make_unique<FakeSetupSource>(&counters);
@@ -935,6 +1013,7 @@ int main() {
   ok &= TestSourceBindsDefaultModelWithinCallerBudget();
   ok &= TestMalformedStaleWrongDomainAndStrictSubstitution();
   ok &= TestInvalidationAndRetryableShutdownAreTyped();
+  ok &= TestSingleDomainCompatibilityTopologyIsExact();
   ok &= TestFailedTemporalResetRequiresSetupReprepare();
   if (!ok)
     return 1;

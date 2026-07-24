@@ -457,14 +457,26 @@ bool ValidCompatibilityTopology(
         CompatibilityExecutionTopology &topology) noexcept {
   if (topology.contract_version !=
           kProductionVideoBackendManagerContractVersion ||
-      topology.domain_count < 2 ||
+      topology.domain_count == 0 ||
       topology.domain_count > topology.domains.size() ||
-      topology.boundary_count != topology.domain_count - 1 ||
       topology.boundary_count > topology.boundaries.size() ||
       !topology.exact_ordered_boundaries ||
       !topology.cross_adapter_residency_forbidden) {
     return false;
   }
+  if (topology.domain_count == 1) {
+    const auto &domain = topology.domains[0];
+    return topology.boundary_count == 0 &&
+           hal::ValidateExecutionDomain(domain.domain) &&
+           ProviderMatchesCompatibilityDomain(domain) &&
+           domain.first_stage_id != 0 &&
+           domain.last_stage_id >= domain.first_stage_id &&
+           topology.expected_transfers.intermediate_readbacks == 0 &&
+           topology.expected_transfers.intermediate_uploads == 0 &&
+           topology.expected_transfers.cpu_tail_boundaries == 0;
+  }
+  if (topology.boundary_count != topology.domain_count - 1)
+    return false;
   std::uint64_t readbacks = 0;
   std::uint64_t uploads = 0;
   for (std::size_t index = 0; index < topology.domain_count; ++index) {
