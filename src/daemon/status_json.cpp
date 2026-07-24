@@ -586,6 +586,135 @@ PrimitiveToken(hal::PrimitiveOperationId value) noexcept {
   return {};
 }
 
+[[nodiscard]] constexpr std::string_view
+MultiIslandRouteToken(video::PreparedExecutionRouteId value) noexcept {
+  switch (value) {
+  case video::PreparedExecutionRouteId::invalid:
+    return {};
+  case video::PreparedExecutionRouteId::final_visual:
+    return "final_visual";
+  case video::PreparedExecutionRouteId::maxine_resident:
+    return "maxine_resident";
+  case video::PreparedExecutionRouteId::open_cuda_virtual_background:
+    return "open_cuda_virtual_background";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view
+FailureActionToken(hal::FailureAction value) noexcept {
+  switch (value) {
+  case hal::FailureAction::fail_closed:
+    return "fail_closed";
+  case hal::FailureAction::fail_open_preserve_input:
+    return "fail_open_preserve_input";
+  case hal::FailureAction::fail_open_preserve_last_valid:
+    return "fail_open_preserve_last_valid";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view
+CpuTailPlacementToken(hal::DeclaredCpuTail::Placement value) noexcept {
+  switch (value) {
+  case hal::DeclaredCpuTail::Placement::after_stage:
+    return "after_stage";
+  case hal::DeclaredCpuTail::Placement::before_stage:
+    return "before_stage";
+  }
+  return {};
+}
+
+void AppendBackendId(std::ostream &out, hal::BackendId value) {
+  out << "{\"id\":" << static_cast<std::uint32_t>(value) << ",\"token\":";
+  AppendJsonString(out, BackendToken(value));
+  out << '}';
+}
+
+void AppendProviderId(std::ostream &out, hal::SemanticEffectProviderId value) {
+  out << "{\"id\":" << static_cast<std::uint32_t>(value) << ",\"token\":";
+  AppendJsonString(out, ProviderToken(value));
+  out << '}';
+}
+
+void AppendStatusId(std::ostream &out, hal::StatusId value) {
+  out << "{\"id\":" << static_cast<std::uint32_t>(value) << ",\"token\":";
+  AppendJsonString(out, StatusToken(value));
+  out << '}';
+}
+
+void AppendReasonId(std::ostream &out, hal::ReasonId value) {
+  out << "{\"id\":" << static_cast<std::uint32_t>(value) << ",\"token\":";
+  AppendJsonString(out, ReasonToken(value));
+  out << '}';
+}
+
+void AppendEffectId(std::ostream &out, hal::SemanticEffectId value) {
+  out << "{\"id\":" << static_cast<std::uint32_t>(value) << ",\"token\":";
+  AppendJsonString(out, hal::StableEffectId(value));
+  out << '}';
+}
+
+void AppendEvidenceArray(
+    std::ostream &out,
+    const std::array<hal::CapabilityEvidenceRecord,
+                     hal::kMaxCapabilityEvidenceRecords> &evidence,
+    std::size_t count);
+
+void AppendTypedEvidenceArray(
+    std::ostream &out,
+    const std::array<hal::CapabilityEvidenceRecord,
+                     hal::kMaxCapabilityEvidenceRecords> &evidence,
+    std::size_t count) {
+  out << '[';
+  for (std::size_t index = 0; index < count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &record = evidence[index];
+    out << "{\"code\":{\"id\":" << static_cast<std::uint32_t>(record.code)
+        << ",\"token\":";
+    AppendJsonString(out, EvidenceToken(record.code));
+    out << "},\"status\":";
+    AppendStatusId(out, record.status);
+    out << ",\"reason\":";
+    AppendReasonId(out, record.reason);
+    out << ",\"effect\":";
+    AppendEffectId(out, record.semantic);
+    out << ",\"backend\":";
+    AppendBackendId(out, record.backend);
+    out << ",\"satisfied\":" << (record.satisfied ? "true" : "false") << '}';
+  }
+  out << ']';
+}
+
+void AppendProviderCapability(std::ostream &out,
+                              const hal::SemanticCapabilityEvidence &value) {
+  out << "{\"effect\":";
+  AppendEffectId(out, value.semantic);
+  out << ",\"provider\":";
+  AppendProviderId(out, value.provider);
+  out << ",\"status\":";
+  AppendStatusId(out, value.status);
+  out << ",\"reason\":";
+  AppendReasonId(out, value.reason);
+  out << ",\"cpu_tail\":{\"id\":" << static_cast<std::uint32_t>(value.cpu_tail)
+      << ",\"token\":";
+  AppendJsonString(out, CpuTailToken(value.cpu_tail));
+  out << "},\"cpu_tail_scratch_bytes\":" << value.cpu_tail_scratch_bytes
+      << ",\"cpu_tail_placement\":{\"id\":"
+      << static_cast<unsigned int>(value.cpu_tail_placement) << ",\"token\":";
+  AppendJsonString(out, CpuTailPlacementToken(value.cpu_tail_placement));
+  out << "},\"live_stage\":" << (value.live_stage ? "true" : "false")
+      << ",\"production_eligible\":"
+      << (value.production_eligible ? "true" : "false")
+      << ",\"exact_evidence\":" << (value.exact_evidence ? "true" : "false")
+      << ",\"supports_tracked_vignette_center\":"
+      << (value.supports_tracked_vignette_center ? "true" : "false")
+      << ",\"evidence\":";
+  AppendTypedEvidenceArray(out, value.evidence, value.evidence_count);
+  out << '}';
+}
+
 void AppendCode(std::ostream &out, EffectCapabilityCode code) {
   out << "{\"id\":" << static_cast<std::uint32_t>(code) << ",\"token\":";
   AppendJsonString(out, video::effects::EffectCapabilityCodeToken(code));
@@ -1640,6 +1769,360 @@ void AppendTypedRuntime(std::ostream &out,
 }
 
 void AppendPreparedExecutionDomain(std::ostream &out,
+                                   const hal::ExecutionDomainId &value);
+
+void AppendWriterCommitIdentity(
+    std::ostream &out, const video::WriterOutputCommitIdentity &value) {
+  out << "{\"valid\":" << (value.valid ? "true" : "false")
+      << ",\"capture_sequence\":" << value.capture_sequence
+      << ",\"output_commit_sequence\":" << value.output_commit_sequence << '}';
+}
+
+void AppendMultiIslandResolution(std::ostream &out,
+                                 const hal::ResolutionResult &value) {
+  out << "{\"request_mode\":{\"id\":"
+      << static_cast<unsigned int>(value.request_mode) << ",\"token\":";
+  AppendJsonString(out, value.request_mode == hal::BackendRequestMode::automatic
+                            ? std::string_view{"automatic"}
+                            : std::string_view{"explicit_backend"});
+  out << "},\"strict_backend_selection\":"
+      << (value.strict_backend_selection ? "true" : "false") << ",\"status\":";
+  AppendStatusId(out, value.status);
+  out << ",\"reason\":";
+  AppendReasonId(out, value.reason);
+  out << ",\"requested_backend\":";
+  AppendBackendId(out, value.requested_backend);
+  out << ",\"selected_backend\":";
+  AppendBackendId(out, value.selected_backend);
+  out << ",\"active_backend\":";
+  AppendBackendId(out, value.active_backend);
+  out << ",\"selected_provider\":";
+  AppendProviderId(out, value.selected_provider);
+  out << ",\"available\":" << (value.available ? "true" : "false")
+      << ",\"degraded\":" << (value.degraded ? "true" : "false")
+      << ",\"fallback\":" << (value.fallback ? "true" : "false")
+      << ",\"passthrough\":" << (value.passthrough ? "true" : "false")
+      << ",\"stages\":[";
+  for (std::size_t index = 0; index < value.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &stage = value.stages[index];
+    out << "{\"stage_id\":" << stage.intent.stage_id << ",\"effect\":";
+    AppendEffectId(out, stage.intent.semantic);
+    out << ",\"required\":" << (stage.intent.required ? "true" : "false")
+        << ",\"failure_action\":{\"id\":"
+        << static_cast<unsigned int>(stage.intent.failure_action)
+        << ",\"token\":";
+    AppendJsonString(out, FailureActionToken(stage.intent.failure_action));
+    out << "},\"requires_tracked_vignette_center\":"
+        << (stage.intent.requires_tracked_vignette_center ? "true" : "false")
+        << ",\"status\":";
+    AppendStatusId(out, stage.status);
+    out << ",\"reason\":";
+    AppendReasonId(out, stage.reason);
+    out << ",\"selected_backend\":";
+    AppendBackendId(out, stage.selected_backend);
+    out << ",\"provider\":";
+    AppendProviderId(out, stage.provider);
+    out << ",\"adapter_instance_id\":" << stage.adapter_instance_id
+        << ",\"execution_domain\":";
+    AppendPreparedExecutionDomain(out, stage.execution_domain);
+    out << ",\"cpu_tail\":{\"id\":"
+        << static_cast<std::uint32_t>(stage.cpu_tail) << ",\"token\":";
+    AppendJsonString(out, CpuTailToken(stage.cpu_tail));
+    out << "},\"cpu_tail_scratch_bytes\":" << stage.cpu_tail_scratch_bytes
+        << ",\"cpu_tail_placement\":{\"id\":"
+        << static_cast<unsigned int>(stage.cpu_tail_placement) << ",\"token\":";
+    AppendJsonString(out, CpuTailPlacementToken(stage.cpu_tail_placement));
+    out << "},\"skipped_optional\":"
+        << (stage.skipped_optional ? "true" : "false")
+        << ",\"fallback_selected\":"
+        << (stage.fallback_selected ? "true" : "false") << ",\"evidence\":";
+    AppendTypedEvidenceArray(out, stage.evidence, stage.evidence_count);
+    out << '}';
+  }
+  out << "]}";
+}
+
+void AppendMultiIslandReadiness(std::ostream &out,
+                                const video::TypedRuntimeReadiness &value) {
+  out << "{\"configured\":" << (value.configured ? "true" : "false")
+      << ",\"program_id\":" << value.program_id << ",\"invalidation_key\":";
+  AppendInvalidationKey(out, value.invalidation_key);
+  out << ",\"status\":";
+  AppendStatusId(out, value.value.status);
+  out << ",\"reason\":";
+  AppendReasonId(out, value.value.reason);
+  out << ",\"requested_backend\":";
+  AppendBackendId(out, value.value.requested_backend);
+  out << ",\"selected_backend\":";
+  AppendBackendId(out, value.value.selected_backend);
+  out << ",\"provider\":";
+  AppendProviderId(out, value.value.provider);
+  out << ",\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, value.value.execution_domain);
+  out << ",\"ready_stage_mask\":" << value.value.ready_stage_mask
+      << ",\"blocked_stage_mask\":" << value.value.blocked_stage_mask
+      << ",\"disabled_stage_mask\":" << value.value.disabled_stage_mask
+      << ",\"available\":" << (value.value.available ? "true" : "false")
+      << ",\"degraded\":" << (value.value.degraded ? "true" : "false")
+      << ",\"rebuild_requested\":"
+      << (value.value.rebuild_requested ? "true" : "false") << ",\"evidence\":";
+  AppendTypedEvidenceArray(out, value.value.evidence,
+                           value.value.evidence_count);
+  out << '}';
+}
+
+void AppendMultiIslandCommittedFrame(std::ostream &out,
+                                     const hal::CommittedFrameSnapshot &value) {
+  out << "{\"valid\":" << (value.valid ? "true" : "false")
+      << ",\"program_id\":" << value.program_id << ",\"invalidation_key\":";
+  AppendInvalidationKey(out, value.invalidation_key);
+  out << ",\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, value.execution_domain);
+  out << ",\"capture_sequence\":" << value.capture_sequence
+      << ",\"output_commit_sequence\":" << value.output_commit_sequence
+      << ",\"stages\":[";
+  for (std::size_t index = 0; index < value.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    const auto &stage = value.stages[index];
+    out << "{\"stage_id\":" << stage.stage_id << ",\"effect\":";
+    AppendEffectId(out, stage.semantic);
+    out << ",\"primitive\":{\"id\":"
+        << static_cast<std::uint32_t>(stage.primitive) << ",\"token\":";
+    AppendJsonString(out, PrimitiveToken(stage.primitive));
+    out << "},\"backend\":";
+    AppendBackendId(out, stage.backend);
+    out << ",\"provider\":";
+    AppendProviderId(out, stage.provider);
+    out << ",\"status\":{\"id\":" << static_cast<unsigned int>(stage.status)
+        << ",\"token\":";
+    AppendJsonString(out, StageExecutionToken(stage.status));
+    out << "},\"reason\":";
+    AppendReasonId(out, stage.reason);
+    out << '}';
+  }
+  out << "]}";
+}
+
+void AppendMultiIslandTelemetry(std::ostream &out,
+                                const hal::ExecutionTelemetry &value,
+                                const hal::ResolutionResult &resolution) {
+  out << "{\"requested_backend\":";
+  AppendBackendId(out, value.requested_backend);
+  out << ",\"selected_backend\":";
+  AppendBackendId(out, value.selected_backend);
+  out << ",\"active_backend\":";
+  AppendBackendId(out, value.active_backend);
+  out << ",\"active_provider\":";
+  AppendProviderId(out, value.active_provider);
+  out << ",\"execution_attempts\":" << value.execution_attempts
+      << ",\"execution_successes\":" << value.execution_successes
+      << ",\"committed_output_frames\":" << value.committed_output_frames
+      << ",\"active_backend_frames\":" << value.active_backend_frames
+      << ",\"fallback_frames\":" << value.fallback_frames
+      << ",\"optional_fail_open_stages\":" << value.optional_fail_open_stages
+      << ",\"required_stage_failures\":" << value.required_stage_failures
+      << ",\"temporal_resets\":" << value.temporal_resets
+      << ",\"device_losses\":" << value.device_losses
+      << ",\"setup_attempts\":" << value.setup_attempts
+      << ",\"setup_successes\":" << value.setup_successes
+      << ",\"setup_rollbacks\":" << value.setup_rollbacks
+      << ",\"setup_retention_rejections\":" << value.setup_retention_rejections
+      << ",\"circuit_breaker_opens\":" << value.circuit_breaker_opens
+      << ",\"disabled_stage_frames\":" << value.disabled_stage_frames
+      << ",\"rebuild_requests\":" << value.rebuild_requests
+      << ",\"frame_drop_events\":" << value.frame_drop_events
+      << ",\"dropped_capture_frames\":" << value.dropped_capture_frames
+      << ",\"preserve_order_failures\":" << value.preserve_order_failures
+      << ",\"latest_frame_wins_events\":" << value.latest_frame_wins_events
+      << ",\"disabled_stage_mask\":" << value.disabled_stage_mask
+      << ",\"runtime_status\":";
+  AppendStatusId(out, value.runtime_status);
+  out << ",\"runtime_reason\":";
+  AppendReasonId(out, value.runtime_reason);
+  out << ",\"transfers\":";
+  AppendTransferCounters(out, value.transfers);
+  out << ",\"frame_latency\":";
+  AppendLatencyHistogram(out, value.frame_latency);
+  out << ",\"stage_latency\":[";
+  for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    out << "{\"stage_id\":" << resolution.stages[index].intent.stage_id
+        << ",\"effect\":";
+    AppendEffectId(out, resolution.stages[index].intent.semantic);
+    out << ",\"latency\":";
+    AppendLatencyHistogram(out, value.stage_latency[index]);
+    out << ",\"committed_successes\":" << value.committed_stage_successes[index]
+        << '}';
+  }
+  out << "]}";
+}
+
+void AppendPreparedIslandStageRecord(
+    std::ostream &out, const video::PreparedIslandStageRecord &value) {
+  out << "{\"stage_id\":" << value.stage_id << ",\"effect\":";
+  AppendEffectId(out, value.effect);
+  out << ",\"backend\":";
+  AppendBackendId(out, value.backend);
+  out << ",\"provider\":";
+  AppendProviderId(out, value.provider);
+  out << ",\"status\":";
+  AppendStatusId(out, value.status);
+  out << ",\"reason\":";
+  AppendReasonId(out, value.reason);
+  out << ",\"failure_action\":{\"id\":"
+      << static_cast<unsigned int>(value.failure_action) << ",\"token\":";
+  AppendJsonString(out, FailureActionToken(value.failure_action));
+  out << "},\"committed_status\":{\"id\":"
+      << static_cast<unsigned int>(value.committed_status) << ",\"token\":";
+  AppendJsonString(out, StageExecutionToken(value.committed_status));
+  out << "},\"required\":" << (value.required ? "true" : "false")
+      << ",\"resolved\":" << (value.resolved ? "true" : "false")
+      << ",\"committed\":" << (value.committed ? "true" : "false") << '}';
+}
+
+void AppendPreparedExecutionIsland(
+    std::ostream &out, const video::PreparedExecutionIslandStatus &value) {
+  out << "{\"route\":{\"id\":" << static_cast<std::uint32_t>(value.route)
+      << ",\"token\":";
+  AppendJsonString(out, MultiIslandRouteToken(value.route));
+  out << "},\"island_id\":" << value.island_id
+      << ",\"adapter_instance_id\":" << value.adapter_instance_id
+      << ",\"snapshot_generation\":" << value.snapshot_generation
+      << ",\"capability_generation\":" << value.capability_generation
+      << ",\"backend\":";
+  AppendBackendId(out, value.backend);
+  out << ",\"execution_domain\":";
+  AppendPreparedExecutionDomain(out, value.execution_domain);
+  out << ",\"resolution\":";
+  AppendMultiIslandResolution(out, value.resolution);
+  out << ",\"readiness\":";
+  AppendMultiIslandReadiness(out, value.readiness);
+  out << ",\"telemetry\":";
+  AppendMultiIslandTelemetry(out, value.telemetry, value.resolution);
+  out << ",\"latest_committed_frame\":";
+  AppendMultiIslandCommittedFrame(out, value.latest_committed_frame);
+  out << ",\"stages\":[";
+  for (std::size_t index = 0; index < value.stage_count; ++index) {
+    if (index != 0)
+      out << ',';
+    AppendPreparedIslandStageRecord(out, value.stages[index]);
+  }
+  out << "],\"valid\":" << (value.valid ? "true" : "false")
+      << ",\"current\":" << (value.current ? "true" : "false") << '}';
+}
+
+void AppendCapabilitySelection(
+    std::ostream &out, video::ProductCapabilityLaneId lane,
+    EffectCapabilityCode code, EffectCapabilityCode nested_code,
+    const hal::SemanticCapabilityEvidence &capability) {
+  out << "{\"lane\":{\"id\":" << static_cast<unsigned int>(lane)
+      << ",\"token\":";
+  AppendJsonString(out, LaneToken(lane));
+  out << "},\"code\":";
+  AppendCode(out, code);
+  out << ",\"nested_code\":";
+  AppendCode(out, nested_code);
+  out << ",\"semantic\":";
+  AppendProviderCapability(out, capability);
+  out << '}';
+}
+
+void AppendStableEffectRuntimeState(
+    std::ostream &out, const video::StableEffectRuntimeState &value) {
+  out << "{\"effect\":";
+  AppendEffectId(out, value.effect);
+  out << ",\"requested_capability\":";
+  AppendCapabilitySelection(out, value.capability_lane, value.capability_code,
+                            value.nested_capability_code, value.capability);
+  out << ",\"selected_capability\":";
+  AppendCapabilitySelection(
+      out, value.selected_capability_lane, value.selected_capability_code,
+      value.selected_nested_capability_code, value.selected_capability);
+  out << ",\"requested_backend\":";
+  AppendBackendId(out, value.requested_backend);
+  out << ",\"requested_provider\":";
+  AppendProviderId(out, value.requested_provider);
+  out << ",\"selected_backend\":";
+  AppendBackendId(out, value.selected_backend);
+  out << ",\"selected_provider\":";
+  AppendProviderId(out, value.selected_provider);
+  out << ",\"active_backend\":";
+  AppendBackendId(out, value.active_backend);
+  out << ",\"active_provider\":";
+  AppendProviderId(out, value.active_provider);
+  out << ",\"status\":";
+  AppendStatusId(out, value.status);
+  out << ",\"reason\":";
+  AppendReasonId(out, value.reason);
+  out << ",\"failure_action\":{\"id\":"
+      << static_cast<unsigned int>(value.failure_action) << ",\"token\":";
+  AppendJsonString(out, FailureActionToken(value.failure_action));
+  out << "},\"commit\":";
+  AppendWriterCommitIdentity(out, value.commit);
+  out << ",\"selected_island_id\":" << value.selected_island_id
+      << ",\"committed_stage_id\":" << value.committed_stage_id
+      << ",\"committed_stage_status\":{\"id\":"
+      << static_cast<unsigned int>(value.committed_stage_status)
+      << ",\"token\":";
+  AppendJsonString(out, StageExecutionToken(value.committed_stage_status));
+  out << "},\"strict_backend_selection\":"
+      << (value.strict_backend_selection ? "true" : "false")
+      << ",\"strict_provider_selection\":"
+      << (value.strict_provider_selection ? "true" : "false")
+      << ",\"required\":" << (value.required ? "true" : "false")
+      << ",\"requested\":" << (value.requested ? "true" : "false")
+      << ",\"available\":" << (value.available ? "true" : "false")
+      << ",\"selected\":" << (value.selected ? "true" : "false")
+      << ",\"active\":" << (value.active ? "true" : "false")
+      << ",\"degraded\":" << (value.degraded ? "true" : "false")
+      << ",\"blocked\":" << (value.blocked ? "true" : "false")
+      << ",\"fallback\":" << (value.fallback ? "true" : "false") << '}';
+}
+
+void AppendMultiIslandVideoRuntimeStatus(
+    std::ostream &out,
+    const video::MultiIslandVideoRuntimeStatusSnapshot &snapshot) {
+  out << "{\"valid\":true,\"schema_version\":" << snapshot.schema_version
+      << ",\"hal_contract_version\":" << snapshot.hal_contract_version
+      << ",\"reason_code_version\":" << snapshot.reason_code_version
+      << ",\"status_generation\":" << snapshot.status_generation
+      << ",\"generations\":";
+  AppendGenerations(out, snapshot.generations);
+  out << ",\"program_generations\":";
+  AppendProgramGenerations(out, snapshot.program_generations);
+  out << ",\"lifecycle\":{\"id\":"
+      << static_cast<unsigned int>(snapshot.lifecycle) << ",\"token\":";
+  AppendJsonString(out, LifecycleToken(snapshot.lifecycle));
+  out << "},\"capabilities\":";
+  AppendCapabilitySnapshot(out, snapshot.capabilities);
+  out << ",\"writer_commit\":";
+  AppendWriterCommitIdentity(out, snapshot.writer_commit);
+  out << ",\"islands\":[";
+  for (std::size_t index = 0; index < snapshot.island_count; ++index) {
+    if (index != 0)
+      out << ',';
+    AppendPreparedExecutionIsland(out, snapshot.islands[index]);
+  }
+  out << "],\"effects\":[";
+  for (std::size_t index = 0; index < snapshot.effect_count; ++index) {
+    if (index != 0)
+      out << ',';
+    AppendStableEffectRuntimeState(out, snapshot.effects[index]);
+  }
+  out << "],\"aggregate\":{\"current_island_count\":"
+      << snapshot.aggregate.current_island_count << ",\"transfers\":";
+  // The contract validator proves this aggregate equals the once-only sum of
+  // current islands. Serialize the aggregate directly; never add island
+  // counters again on the diagnostics path.
+  AppendTransferCounters(out, snapshot.aggregate.transfers);
+  out << "}}";
+}
+
+void AppendPreparedExecutionDomain(std::ostream &out,
                                    const hal::ExecutionDomainId &value) {
   out << "{\"backend\":{\"id\":" << static_cast<std::uint32_t>(value.backend)
       << ",\"token\":";
@@ -2171,6 +2654,22 @@ VideoRuntimeStatusJsonResult SerializeVideoRuntimeStatusJson(
   out << ",\"effects_backends\":\"";
   AppendLegacyEffectsBackends(out, compatibility);
   out << "\"}}}";
+  result.json = out.str();
+  result.ok = true;
+  return result;
+}
+
+MultiIslandVideoRuntimeStatusJsonResult
+SerializeMultiIslandVideoRuntimeStatusJson(
+    const video::MultiIslandVideoRuntimeStatusSnapshot &snapshot) {
+  MultiIslandVideoRuntimeStatusJsonResult result;
+  result.validation =
+      video::ValidateMultiIslandVideoRuntimeStatusSnapshot(snapshot);
+  if (result.validation.code != video::MultiIslandStatusValidationCode::valid) {
+    return result;
+  }
+  std::ostringstream out;
+  AppendMultiIslandVideoRuntimeStatus(out, snapshot);
   result.json = out.str();
   result.ok = true;
   return result;

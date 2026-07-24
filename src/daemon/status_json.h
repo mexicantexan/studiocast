@@ -19,6 +19,12 @@ struct VideoRuntimeStatusJsonResult {
   std::string json;
 };
 
+struct MultiIslandVideoRuntimeStatusJsonResult {
+  bool ok = false;
+  video::MultiIslandStatusValidationResult validation{};
+  std::string json;
+};
+
 struct PreparedHardwareExecutionJsonResult {
   bool ok = false;
   bool snapshot_valid = false;
@@ -44,6 +50,16 @@ struct PreparedHardwareExecutionJsonResult {
 // success-looking legacy facts from escaping.
 [[nodiscard]] VideoRuntimeStatusJsonResult SerializeVideoRuntimeStatusJson(
     const video::VideoRuntimeStatusSnapshot &snapshot);
+
+// Produces the standalone value for the additive
+// typed_multi_island_video_status subtree. The caller may insert this already
+// serialized value into GET_STATUS without reparsing backend diagnostics.
+// Invalid, stale, mixed-generation, or otherwise inconsistent snapshots return
+// ok=false and an empty JSON string, matching the fail-closed convention of
+// the singular typed serializer.
+[[nodiscard]] MultiIslandVideoRuntimeStatusJsonResult
+SerializeMultiIslandVideoRuntimeStatusJson(
+    const video::MultiIslandVideoRuntimeStatusSnapshot &snapshot);
 
 // Serializes the bounded prepared-hardware migration snapshot directly from
 // typed structures. supervisor_pipeline_running is an authority gate: cached

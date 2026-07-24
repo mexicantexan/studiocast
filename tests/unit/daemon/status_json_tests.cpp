@@ -25,11 +25,17 @@ using studiocast::hal::StatusId;
 using studiocast::util::json::Value;
 using studiocast::video::CapabilityRefreshSnapshot;
 using studiocast::video::CapabilityRefreshStatus;
+using studiocast::video::MultiIslandStatusValidationCode;
+using studiocast::video::MultiIslandVideoRuntimeStatusBuildInput;
+using studiocast::video::MultiIslandVideoRuntimeStatusSnapshot;
+using studiocast::video::PreparedExecutionIslandStatus;
+using studiocast::video::PreparedExecutionRouteId;
 using studiocast::video::ProductCapabilityDisposition;
 using studiocast::video::ProductCapabilityGenerations;
 using studiocast::video::ProductCapabilityLane;
 using studiocast::video::ProductCapabilityLaneId;
 using studiocast::video::ProductCapabilitySnapshot;
+using studiocast::video::StableEffectRuntimeState;
 using studiocast::video::VideoRuntimeLifecycle;
 using studiocast::video::VideoRuntimeStatusSnapshot;
 using Code = studiocast::video::effects::EffectCapabilityCode;
@@ -38,6 +44,16 @@ bool Expect(bool condition, std::string_view message) {
   if (!condition)
     std::cerr << "FAIL: " << message << '\n';
   return condition;
+}
+
+std::uint64_t StableJsonHash(std::string_view value) {
+  std::uint64_t hash = 14695981039346656037ull;
+  for (const char raw : value) {
+    const auto byte = static_cast<unsigned char>(raw);
+    hash ^= byte;
+    hash *= 1099511628211ull;
+  }
+  return hash;
 }
 
 ProductCapabilityGenerations Generations(std::uint64_t capability = 7) {
@@ -423,6 +439,222 @@ LivePreparedHardwareSnapshot() {
   return snapshot;
 }
 
+studiocast::hal::ProgramGenerations
+ProgramGenerations(const ProductCapabilityGenerations &generations) {
+  studiocast::hal::ProgramGenerations value;
+  value.configuration = generations.configuration;
+  value.geometry = 21;
+  value.model = 22;
+  value.provider = generations.provider;
+  value.device = generations.device;
+  value.context = generations.context;
+  return value;
+}
+
+studiocast::hal::ExecutionDomainId MultiIslandDomain(BackendId backend,
+                                                     std::uint64_t adapter_id) {
+  studiocast::hal::ExecutionDomainId domain;
+  domain.backend = backend;
+  domain.physical_device.vendor_id = 0x10de;
+  domain.physical_device.device_id = 0x1c30;
+  domain.physical_device.stable_id[0] = static_cast<std::uint8_t>(adapter_id);
+  domain.logical_context_generation = 14;
+  domain.queue_or_stream_identity = 1000 + adapter_id;
+  domain.ownership_model = studiocast::hal::OwnershipModel::adapter_exclusive;
+  domain.adapter_instance_id = adapter_id;
+  if (backend == BackendId::vulkan) {
+    domain.api_family = studiocast::hal::ApiFamily::vulkan;
+    domain.allocator_family = studiocast::hal::AllocatorFamily::vulkan;
+    domain.memory_handle_family =
+        studiocast::hal::MemoryHandleFamily::vulkan_buffer;
+    domain.synchronization_protocol =
+        studiocast::hal::SynchronizationProtocol::vulkan_queue_fence;
+  } else if (backend == BackendId::maxine) {
+    domain.api_family = studiocast::hal::ApiFamily::maxine_nvcv;
+    domain.allocator_family = studiocast::hal::AllocatorFamily::maxine_nvcv;
+    domain.memory_handle_family =
+        studiocast::hal::MemoryHandleFamily::nvcv_image;
+    domain.synchronization_protocol =
+        studiocast::hal::SynchronizationProtocol::maxine_bound_cuda_stream;
+  } else {
+    domain.api_family = studiocast::hal::ApiFamily::cuda_driver;
+    domain.allocator_family = studiocast::hal::AllocatorFamily::cuda_driver;
+    domain.memory_handle_family =
+        studiocast::hal::MemoryHandleFamily::cuda_device_pointer;
+    domain.synchronization_protocol =
+        studiocast::hal::SynchronizationProtocol::cuda_stream_ordered;
+  }
+  return domain;
+}
+
+MultiIslandVideoRuntimeStatusBuildInput MultiIslandPassthroughInput() {
+  MultiIslandVideoRuntimeStatusBuildInput input;
+  input.status_generation = 100;
+  input.generations = Generations();
+  input.program_generations = ProgramGenerations(input.generations);
+  input.lifecycle = VideoRuntimeLifecycle::running;
+  input.capabilities = CurrentCapabilities();
+  input.effect_count = studiocast::video::kCanonicalVideoEffectCount;
+  for (std::size_t index = 0; index < input.effect_count; ++index) {
+    input.effects[index].effect =
+        studiocast::video::kCanonicalVideoEffects[index];
+    input.effects[index].status = StatusId::passthrough;
+  }
+  return input;
+}
+
+void ConfigureMultiIsland(MultiIslandVideoRuntimeStatusBuildInput *input,
+                          PreparedExecutionRouteId route,
+                          std::uint64_t island_id, std::uint64_t adapter_id,
+                          std::uint32_t stage_id, SemanticEffectId effect,
+                          BackendId backend, SemanticEffectProviderId provider,
+                          ProductCapabilityLaneId lane, Code capability_code,
+                          std::uint64_t uploads, std::uint64_t readbacks,
+                          std::uint64_t cpu_tails) {
+  if (!input || input->island_count >= input->islands.size())
+    std::abort();
+  Promote(&input->capabilities, effect, lane, provider, capability_code);
+  const ProductCapabilityLane *capability =
+      studiocast::video::FindProductCapabilityLane(input->capabilities, effect,
+                                                   lane);
+  if (!capability)
+    std::abort();
+
+  PreparedExecutionIslandStatus &island = input->islands[input->island_count++];
+  island.route = route;
+  island.island_id = island_id;
+  island.adapter_instance_id = adapter_id;
+  island.snapshot_generation = input->status_generation;
+  island.capability_generation = input->generations.capability;
+  island.backend = backend;
+  island.execution_domain = MultiIslandDomain(backend, adapter_id);
+  island.valid = true;
+  island.current = true;
+  island.resolution.status = StatusId::ready;
+  island.resolution.available = true;
+  island.resolution.selected_backend = backend;
+  island.resolution.selected_provider = provider;
+  island.resolution.stage_count = 1;
+  auto &resolved = island.resolution.stages[0];
+  resolved.intent.stage_id = stage_id;
+  resolved.intent.semantic = effect;
+  resolved.intent.failure_action =
+      studiocast::hal::FailureAction::fail_open_preserve_input;
+  resolved.status = StatusId::ready;
+  resolved.selected_backend = backend;
+  resolved.provider = provider;
+  resolved.adapter_instance_id = adapter_id;
+  resolved.execution_domain = island.execution_domain;
+
+  island.readiness.configured = true;
+  island.readiness.program_id = 1000 + island_id;
+  island.readiness.invalidation_key = Invalidation(input->generations);
+  island.readiness.value.status = StatusId::ready;
+  island.readiness.value.available = true;
+  island.readiness.value.selected_backend = backend;
+  island.readiness.value.provider = provider;
+  island.readiness.value.execution_domain = island.execution_domain;
+  island.telemetry.requested_backend = backend;
+  island.telemetry.selected_backend = backend;
+  island.telemetry.active_backend = backend;
+  island.telemetry.active_provider = provider;
+  island.telemetry.execution_attempts = 1;
+  island.telemetry.execution_successes = 1;
+  island.telemetry.committed_output_frames = 1;
+  island.telemetry.active_backend_frames = 1;
+  island.telemetry.runtime_status = StatusId::executed;
+  island.telemetry.transfers.uploads = uploads;
+  island.telemetry.transfers.final_readbacks = readbacks;
+  island.telemetry.transfers.cpu_tail_boundaries = cpu_tails;
+  island.telemetry.transfers.synchronizations = 1;
+
+  island.latest_committed_frame.valid = true;
+  island.latest_committed_frame.program_id = island.readiness.program_id;
+  island.latest_committed_frame.invalidation_key =
+      island.readiness.invalidation_key;
+  island.latest_committed_frame.execution_domain = island.execution_domain;
+  island.latest_committed_frame.capture_sequence =
+      input->writer_commit.capture_sequence;
+  island.latest_committed_frame.output_commit_sequence =
+      input->writer_commit.output_commit_sequence;
+  island.latest_committed_frame.stage_count = 1;
+  island.latest_committed_frame.stages[0] = {
+      stage_id,       effect,   studiocast::hal::PrimitiveOperationId::invalid,
+      backend,        provider, StageExecutionStatus::succeeded,
+      ReasonId::none,
+  };
+
+  island.stage_count = 1;
+  island.stages[0].stage_id = stage_id;
+  island.stages[0].effect = effect;
+  island.stages[0].backend = backend;
+  island.stages[0].provider = provider;
+  island.stages[0].status = StatusId::ready;
+  island.stages[0].failure_action =
+      studiocast::hal::FailureAction::fail_open_preserve_input;
+  island.stages[0].committed_status = StageExecutionStatus::succeeded;
+  island.stages[0].resolved = true;
+  island.stages[0].committed = true;
+
+  StableEffectRuntimeState &state =
+      input->effects[static_cast<std::size_t>(effect) - 1];
+  state.capability_lane = lane;
+  state.capability_code = capability->code;
+  state.nested_capability_code = capability->nested_code;
+  state.capability = capability->semantic;
+  state.selected_capability_lane = lane;
+  state.selected_capability_code = capability->code;
+  state.selected_nested_capability_code = capability->nested_code;
+  state.selected_capability = capability->semantic;
+  state.requested_backend = backend;
+  state.requested_provider = provider;
+  state.selected_backend = backend;
+  state.selected_provider = provider;
+  state.active_backend = backend;
+  state.active_provider = provider;
+  state.status = StatusId::executed;
+  state.commit = input->writer_commit;
+  state.selected_island_id = island_id;
+  state.committed_stage_id = stage_id;
+  state.committed_stage_status = StageExecutionStatus::succeeded;
+  state.requested = true;
+  state.available = true;
+  state.selected = true;
+  state.active = true;
+}
+
+MultiIslandVideoRuntimeStatusBuildInput ThreeIslandInput() {
+  MultiIslandVideoRuntimeStatusBuildInput input = MultiIslandPassthroughInput();
+  input.writer_commit = {true, 501, 9};
+  ConfigureMultiIsland(&input, PreparedExecutionRouteId::final_visual, 1, 101,
+                       11, SemanticEffectId::mirror, BackendId::vulkan,
+                       SemanticEffectProviderId::open_vulkan_production_kernels,
+                       ProductCapabilityLaneId::open_vulkan,
+                       Code::open_vulkan_mirror_production_ready, 1, 1, 0);
+  ConfigureMultiIsland(&input, PreparedExecutionRouteId::maxine_resident, 2,
+                       102, 12, SemanticEffectId::eye_contact,
+                       BackendId::maxine, SemanticEffectProviderId::maxine_ar,
+                       ProductCapabilityLaneId::maxine,
+                       Code::maxine_effect_usable, 1, 1, 1);
+  ConfigureMultiIsland(
+      &input, PreparedExecutionRouteId::open_cuda_virtual_background, 3, 103,
+      13, SemanticEffectId::virtual_background_blur, BackendId::cuda,
+      SemanticEffectProviderId::open_video_onnxruntime_cuda,
+      ProductCapabilityLaneId::open_cuda, Code::open_cuda_effect_available, 1,
+      1, 1);
+  return input;
+}
+
+MultiIslandVideoRuntimeStatusSnapshot BuildThreeIslandSnapshot() {
+  MultiIslandVideoRuntimeStatusSnapshot snapshot;
+  const auto result =
+      studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+          ThreeIslandInput(), &snapshot);
+  if (result.code != MultiIslandStatusValidationCode::valid)
+    std::abort();
+  return snapshot;
+}
+
 bool ParseJson(const std::string &text, Value *value,
                std::string_view context) {
   std::string error;
@@ -486,6 +718,32 @@ bool MatchesFixture(std::string_view fixture,
     return false;
   Value actual;
   if (!ParseJson(result.json, &actual, "serialized runtime status"))
+    return false;
+  const std::filesystem::path path =
+      std::filesystem::path(STUDIOCAST_SOURCE_DIR) / "tests" / "data" /
+      "status" / fixture;
+  std::ifstream input(path);
+  if (!input) {
+    std::cerr << "FAIL: cannot read fixture " << path << '\n';
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  Value expected;
+  if (!ParseJson(buffer.str(), &expected, path.string()))
+    return false;
+  return IsSubset(expected, actual, "$");
+}
+
+bool MatchesMultiIslandFixture(
+    std::string_view fixture,
+    const MultiIslandVideoRuntimeStatusSnapshot &snapshot) {
+  const auto result =
+      studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(snapshot);
+  if (!Expect(result.ok, "valid multi-island snapshot must serialize"))
+    return false;
+  Value actual;
+  if (!ParseJson(result.json, &actual, "serialized multi-island status"))
     return false;
   const std::filesystem::path path =
       std::filesystem::path(STUDIOCAST_SOURCE_DIR) / "tests" / "data" /
@@ -596,6 +854,253 @@ bool TestActivityRequiresGenerationValidSuccessfulCommit() {
   ok &= Expect(result.ok && result.json.find("\"effects_backends\":\"\"") !=
                                 std::string::npos,
                "failed-open stage must not receive active attribution");
+  return ok;
+}
+
+bool TestMultiIslandZeroAndMultipleIslandProjection() {
+  MultiIslandVideoRuntimeStatusSnapshot passthrough;
+  const auto passthrough_build =
+      studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+          MultiIslandPassthroughInput(), &passthrough);
+  auto result = studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+      passthrough);
+  bool ok =
+      Expect(passthrough_build.code == MultiIslandStatusValidationCode::valid &&
+                 result.ok,
+             "zero-island passthrough snapshot must serialize");
+  Value parsed;
+  ok &= ParseJson(result.json, &parsed, "zero-island multi status");
+  ok &= Expect(result.json.find("\"islands\":[]") != std::string::npos &&
+                   result.json.find("\"current_island_count\":0") !=
+                       std::string::npos &&
+                   result.json.find("\"uploads\":0") != std::string::npos,
+               "zero-island projection must remain transfer-free");
+  ok &= Expect(result.json.find("\"requested\":false") != std::string::npos &&
+                   result.json.find("\"status\":{\"id\":5,\"token\":"
+                                    "\"passthrough\"}") != std::string::npos,
+               "inactive canonical effects must remain explicit");
+
+  const auto multiple = BuildThreeIslandSnapshot();
+  result =
+      studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(multiple);
+  ok &= Expect(result.ok, "three current islands must serialize");
+  ok &= ParseJson(result.json, &parsed, "three-island multi status");
+  ok &= Expect(
+      result.json.find("\"route\":{\"id\":1,\"token\":\"final_visual\"}") !=
+              std::string::npos &&
+          result.json.find(
+              "\"route\":{\"id\":2,\"token\":\"maxine_resident\"}") !=
+              std::string::npos &&
+          result.json.find("\"route\":{\"id\":3,\"token\":"
+                           "\"open_cuda_virtual_background\"}") !=
+              std::string::npos,
+      "all stable prepared island route IDs and tokens must be serialized");
+  ok &= Expect(
+      result.json.find("\"current_island_count\":3,\"transfers\":{"
+                       "\"uploads\":3,\"final_readbacks\":3,"
+                       "\"intermediate_readbacks\":0,"
+                       "\"intermediate_uploads\":0,\"synchronizations\":3,"
+                       "\"cpu_tail_boundaries\":2}") != std::string::npos,
+      "aggregate transfers must be emitted once from the validated aggregate");
+  ok &= Expect(result.json.find("\"effect\":{\"id\":9,\"token\":\"mirror\"}") !=
+                       std::string::npos &&
+                   result.json.find("\"active\":true") != std::string::npos &&
+                   result.json.find("\"writer_commit\":{\"valid\":true,"
+                                    "\"capture_sequence\":501,"
+                                    "\"output_commit_sequence\":9}") !=
+                       std::string::npos,
+               "active effect attribution must bind stable IDs to writer "
+               "commit identity");
+  ok &= MatchesMultiIslandFixture("multi_island.json", multiple);
+  return ok;
+}
+
+bool TestMultiIslandDegradedBlockedAndFallbackProjection() {
+  bool ok = true;
+  auto optional_failure = BuildThreeIslandSnapshot();
+  auto &state =
+      optional_failure.effects[static_cast<std::size_t>(
+                                   SemanticEffectId::virtual_background_blur) -
+                               1];
+  state.active = false;
+  state.active_backend = BackendId::invalid;
+  state.active_provider = SemanticEffectProviderId::invalid;
+  state.degraded = true;
+  state.fallback = true;
+  state.status = StatusId::degraded;
+  state.reason = ReasonId::optional_stage_failed_open;
+  state.committed_stage_status = StageExecutionStatus::optional_failed_open;
+  optional_failure.islands[2].latest_committed_frame.stages[0].status =
+      StageExecutionStatus::optional_failed_open;
+  optional_failure.islands[2].latest_committed_frame.stages[0].reason =
+      ReasonId::optional_stage_failed_open;
+  optional_failure.islands[2].stages[0].committed_status =
+      StageExecutionStatus::optional_failed_open;
+  auto result = studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+      optional_failure);
+  ok &= Expect(result.ok &&
+                   result.json.find("\"degraded\":true,\"blocked\":false,"
+                                    "\"fallback\":true") != std::string::npos &&
+                   result.json.find("\"token\":\"optional_failed_open\"") !=
+                       std::string::npos,
+               "optional fail-open must preserve exact degradation and "
+               "fallback state without active attribution");
+
+  auto substituted = BuildThreeIslandSnapshot();
+  auto &substitution =
+      substituted.effects[static_cast<std::size_t>(
+                              SemanticEffectId::virtual_background_blur) -
+                          1];
+  substitution.requested_backend = BackendId::open_video_onnxruntime;
+  substitution.fallback = true;
+  result = studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+      substituted);
+  ok &= Expect(result.ok &&
+                   result.json.find("\"requested_backend\":{\"id\":4,"
+                                    "\"token\":\"open_video_onnxruntime\"}") !=
+                       std::string::npos &&
+                   result.json.find("\"selected_backend\":{\"id\":2,"
+                                    "\"token\":\"cuda\"}") != std::string::npos,
+               "non-strict backend fallback must preserve requested and exact "
+               "selected backend identities");
+
+  MultiIslandVideoRuntimeStatusBuildInput blocked =
+      MultiIslandPassthroughInput();
+  StableEffectRuntimeState &blocked_state =
+      blocked
+          .effects[static_cast<std::size_t>(SemanticEffectId::eye_contact) - 1];
+  const ProductCapabilityLane *lane =
+      studiocast::video::FindProductCapabilityLane(
+          blocked.capabilities, SemanticEffectId::eye_contact,
+          ProductCapabilityLaneId::maxine);
+  if (!lane)
+    std::abort();
+  blocked_state.capability_lane = ProductCapabilityLaneId::maxine;
+  blocked_state.capability_code = lane->code;
+  blocked_state.nested_capability_code = lane->nested_code;
+  blocked_state.capability = lane->semantic;
+  blocked_state.requested_backend = BackendId::maxine;
+  blocked_state.requested_provider = SemanticEffectProviderId::maxine_ar;
+  blocked_state.status = StatusId::blocked;
+  blocked_state.reason = ReasonId::capability_evidence_incomplete;
+  blocked_state.strict_backend_selection = true;
+  blocked_state.strict_provider_selection = true;
+  blocked_state.requested = true;
+  blocked_state.blocked = true;
+  MultiIslandVideoRuntimeStatusSnapshot blocked_snapshot;
+  const auto blocked_build =
+      studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+          blocked, &blocked_snapshot);
+  result = studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+      blocked_snapshot);
+  ok &= Expect(
+      blocked_build.code == MultiIslandStatusValidationCode::valid &&
+          result.ok &&
+          result.json.find("\"requested\":true,\"available\":false,"
+                           "\"selected\":false,\"active\":false,"
+                           "\"degraded\":false,\"blocked\":true,"
+                           "\"fallback\":false") != std::string::npos &&
+          result.json.find("\"token\":\"capability_evidence_incomplete\"") !=
+              std::string::npos,
+      "blocked strict effect must remain unavailable, unselected, and "
+      "fail-closed with its typed reason");
+  return ok;
+}
+
+bool TestMalformedMultiIslandSnapshotsFailClosed() {
+  bool ok = true;
+  const auto valid = BuildThreeIslandSnapshot();
+  const auto reject = [&](const MultiIslandVideoRuntimeStatusSnapshot &snapshot,
+                          MultiIslandStatusValidationCode code,
+                          std::string_view message) {
+    const auto result =
+        studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+            snapshot);
+    return Expect(!result.ok && result.json.empty() &&
+                      result.validation.code == code,
+                  message);
+  };
+
+  auto malformed = valid;
+  ++malformed.schema_version;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::wrong_schema_version,
+               "wrong schema must produce no subtree");
+
+  malformed = valid;
+  malformed.islands[1].island_id = malformed.islands[0].island_id;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::duplicate_island,
+               "duplicate island identity must produce no subtree");
+
+  malformed = valid;
+  malformed.effects.back() = malformed.effects.front();
+  ok &= reject(malformed, MultiIslandStatusValidationCode::duplicate_effect,
+               "duplicate canonical effect must produce no subtree");
+
+  malformed = valid;
+  malformed.islands[0].current = false;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::stale_island,
+               "stale island must produce no subtree");
+
+  malformed = valid;
+  ++malformed.islands[0].readiness.invalidation_key.generations.model;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::wrong_generation,
+               "mixed program generation must produce no subtree");
+
+  malformed = valid;
+  ++malformed.islands[1].latest_committed_frame.output_commit_sequence;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::mixed_writer_commit,
+               "mixed island writer commits must produce no subtree");
+
+  malformed = valid;
+  malformed.writer_commit.output_commit_sequence = 0;
+  ok &= reject(malformed,
+               MultiIslandStatusValidationCode::malformed_writer_commit,
+               "invalid writer commit identity must produce no subtree");
+
+  malformed = valid;
+  ++malformed.aggregate.transfers.uploads;
+  ok &= reject(malformed, MultiIslandStatusValidationCode::aggregate_mismatch,
+               "non-exact aggregate must produce no subtree");
+  return ok;
+}
+
+bool TestMultiIslandStableSchemaIdsAndLegacyIsolation() {
+  const auto singular =
+      studiocast::daemon::SerializeVideoRuntimeStatusJson(ActiveSnapshot());
+  const auto multiple =
+      studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+          BuildThreeIslandSnapshot());
+  bool ok = Expect(singular.ok && multiple.ok,
+                   "singular and multi-island snapshots must serialize");
+  const std::uint64_t singular_hash = StableJsonHash(singular.json);
+  ok &= Expect(singular_hash == 14534633004353582804ull &&
+                   singular.json.size() == 34790,
+               "active singular JSON must remain byte-for-byte stable");
+  ok &= Expect(
+      singular.json.find("typed_multi_island_video_status") ==
+              std::string::npos &&
+          singular.json.find("\"typed_video_status\"") != std::string::npos &&
+          singular.json.find("\"effects_backends\":\"virtual_background."
+                             "blur:open_cuda\"") != std::string::npos,
+      "the standalone addition must leave every legacy singular field and "
+      "meaning unchanged");
+  ok &= Expect(
+      multiple.json.find("\"schema_version\":1,\"hal_contract_version\":1,"
+                         "\"reason_code_version\":1") != std::string::npos &&
+          multiple.json.find(
+              "\"lifecycle\":{\"id\":3,\"token\":\"running\"}") !=
+              std::string::npos &&
+          multiple.json.find("\"effect\":{\"id\":3,\"token\":"
+                             "\"virtual_background.blur\"}") !=
+              std::string::npos &&
+          multiple.json.find("\"provider\":{\"id\":3,\"token\":"
+                             "\"open_video_onnxruntime_cuda\"}") !=
+              std::string::npos &&
+          multiple.json.find("\"failure_action\":{\"id\":2,\"token\":"
+                             "\"fail_open_preserve_input\"}") !=
+              std::string::npos,
+      "schema, HAL, reason, lifecycle, effect, provider, and policy IDs must "
+      "retain their stable numeric/token pairs");
   return ok;
 }
 
@@ -744,6 +1249,10 @@ int main() {
   ok &= TestCompleteTypedCapabilityProjection();
   ok &= TestMalformedSnapshotsFailClosed();
   ok &= TestActivityRequiresGenerationValidSuccessfulCommit();
+  ok &= TestMultiIslandZeroAndMultipleIslandProjection();
+  ok &= TestMultiIslandDegradedBlockedAndFallbackProjection();
+  ok &= TestMalformedMultiIslandSnapshotsFailClosed();
+  ok &= TestMultiIslandStableSchemaIdsAndLegacyIsolation();
   ok &= TestPreparedHardwareLiveCommittedSuccess();
   ok &= TestPreparedHardwareActivityFailsClosed();
   ok &= TestPreparedHardwareOptionalFailOpenAndMalformedCounts();
