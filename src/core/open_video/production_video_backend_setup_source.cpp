@@ -4,6 +4,7 @@
 #include "core/open_video/prepared_open_video_compatibility_executor.h"
 #include "core/open_video/video_execution_factory.h"
 #include "core/video/effects/broadcast_effect_contract.h"
+#include "core/video/image_ppm.h"
 
 #include <algorithm>
 #include <array>
@@ -118,6 +119,8 @@ bool AlignRow(std::uint64_t active, std::uint64_t *aligned) noexcept {
 bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
                        std::uint32_t model_width, std::uint32_t model_height,
                        hal::SemanticEffectId semantic, int strength,
+                       std::uint32_t replacement_width,
+                       std::uint32_t replacement_height,
                        hal::ResourceBudget *budget) noexcept {
   if (budget == nullptr || frame_width == 0 || frame_height == 0 ||
       model_width == 0 || model_height == 0) {
@@ -160,18 +163,37 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
                  video::effects::contract::kVbStrengthMax);
   const bool feather = std::min(4, canonical_strength / 16) > 0;
   const bool blur = semantic == hal::SemanticEffectId::virtual_background_blur;
-  if (feather && (!Add(frame_alpha, &result.scratch_bytes) ||
-                  !Add(frame_alpha, &result.scratch_bytes))) {
+  const bool key_light =
+      semantic == hal::SemanticEffectId::virtual_key_light;
+  const bool replace =
+      semantic == hal::SemanticEffectId::virtual_background_replace;
+  const bool prepared_feather = !key_light && feather;
+  if (prepared_feather && (!Add(frame_alpha, &result.scratch_bytes) ||
+                           !Add(frame_alpha, &result.scratch_bytes))) {
     return false;
   }
   if (blur && (!Add(frame_rgb, &result.scratch_bytes) ||
                !Add(frame_rgb, &result.scratch_bytes))) {
     return false;
   }
+  if (replace) {
+    std::uint64_t replacement_row = 0;
+    std::uint64_t replacement_bytes = 0;
+    if (replacement_width == 0 || replacement_height == 0 ||
+        !AlignRow(static_cast<std::uint64_t>(replacement_width) * 3u,
+                  &replacement_row) ||
+        !Multiply(replacement_row, replacement_height, &replacement_bytes) ||
+        !Add(replacement_bytes, &result.persistent_bytes) ||
+        !Add(frame_rgb, &result.persistent_bytes)) {
+      return false;
+    }
+  }
   result.scratch_bytes = std::max<std::uint64_t>(result.scratch_bytes, 1);
   result.upload_staging_bytes = boundary;
   result.readback_staging_bytes = boundary;
-  result.resource_count = (blur ? 19u : 17u) + (feather ? 2u : 0u);
+  result.resource_count = (blur ? 19u : 17u) +
+                          (prepared_feather ? 2u : 0u) +
+                          (replace ? 2u : 0u);
   result.in_flight_slots = 1;
   if (result.persistent_bytes > (UINT64_C(2) << 30) ||
       result.scratch_bytes > (UINT64_C(1) << 30) ||
@@ -519,7 +541,10 @@ public:
     if (stage.intent.semantic !=
             hal::SemanticEffectId::virtual_background_blur &&
         stage.intent.semantic !=
-            hal::SemanticEffectId::virtual_background_remove) {
+            hal::SemanticEffectId::virtual_background_remove &&
+        stage.intent.semantic !=
+            hal::SemanticEffectId::virtual_background_replace &&
+        stage.intent.semantic != hal::SemanticEffectId::virtual_key_light) {
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::semantic_effect_unsupported);
     }
@@ -547,12 +572,28 @@ public:
                        hal::ReasonId::capability_evidence_incomplete);
       }
       const auto &matting = *pack.matting;
+      std::vector<std::uint8_t> replacement_rgb;
+      int replacement_width = 0;
+      int replacement_height = 0;
+      if (stage.intent.semantic ==
+              hal::SemanticEffectId::virtual_background_replace &&
+          (!video::LoadImageRgb24(
+               request.effects.virtual_background.replace_path,
+               &replacement_width, &replacement_height, &replacement_rgb,
+               nullptr) ||
+           replacement_width <= 0 || replacement_height <= 0)) {
+        return Failure(hal::StatusId::unavailable,
+                       hal::ReasonId::capability_evidence_incomplete);
+      }
       hal::ResourceBudget budget;
       const int strength = Strength(stage);
       if (!ResourceBudgetFor(caller.host_input.width, caller.host_input.height,
                              static_cast<std::uint32_t>(matting.input.width),
                              static_cast<std::uint32_t>(matting.input.height),
-                             stage.intent.semantic, strength, &budget)) {
+                             stage.intent.semantic, strength,
+                             static_cast<std::uint32_t>(replacement_width),
+                             static_cast<std::uint32_t>(replacement_height),
+                             &budget)) {
         return Failure(hal::StatusId::resource_exhausted,
                        hal::ReasonId::resource_exhausted);
       }
@@ -592,6 +633,15 @@ public:
       factory.backend.model_artifact_hash = HashArtifact(artifact);
       factory.backend.strength = strength;
       factory.backend.remove_background_rgb = RemoveColor(stage);
+      factory.backend.replacement_rgb = std::move(replacement_rgb);
+      factory.backend.replacement_width = replacement_width;
+      factory.backend.replacement_height = replacement_height;
+      factory.backend.key_light_intensity =
+          request.effects.virtual_key_light.intensity;
+      factory.backend.key_light_temperature_preset =
+          request.effects.virtual_key_light.temperature_preset;
+      factory.backend.key_light_direction_pan_degrees =
+          request.effects.virtual_key_light.direction_pan_degrees;
       factory.backend.wait_policy.timeout_nanoseconds =
           request.wait.timeout_nanoseconds;
       factory.backend.wait_policy.poll_interval_nanoseconds =
@@ -642,14 +692,17 @@ public:
           video::ProductionVideoExecutionDomainHash(
               bootstrap.setup_lease.execution_domain);
       result.plan.budget = bootstrap.setup_lease.reserved_budget;
-      auto &selection = result.model_selections[result.model_selection_count++];
-      selection.semantic = stage.intent.semantic;
-      selection.requested_model_id =
-          request.effects.virtual_background.model_id;
-      selection.selected_model_id = pack.id;
-      selection.artifact = bootstrap.setup_lease.artifacts[0].artifact;
-      selection.default_selected =
-          request.effects.virtual_background.model_id.empty();
+      if (stage.intent.semantic != hal::SemanticEffectId::virtual_key_light) {
+        auto &selection =
+            result.model_selections[result.model_selection_count++];
+        selection.semantic = stage.intent.semantic;
+        selection.requested_model_id =
+            request.effects.virtual_background.model_id;
+        selection.selected_model_id = pack.id;
+        selection.artifact = bootstrap.setup_lease.artifacts[0].artifact;
+        selection.default_selected =
+            request.effects.virtual_background.model_id.empty();
+      }
       return result;
     } catch (const std::bad_alloc &) {
       return Failure(hal::StatusId::resource_exhausted,

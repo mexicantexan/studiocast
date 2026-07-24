@@ -834,8 +834,19 @@ VideoRequest(const hal::ExecutionDomainId &domain) {
 }
 
 open_cuda::OpenCudaProductionVideoExecutionFactoryRequest
-ProductionFactoryRequest(FakeCudaState *state, PendingRuntime *runtime) {
+ProductionFactoryRequest(
+    FakeCudaState *state, PendingRuntime *runtime,
+    hal::SemanticEffectId semantic =
+        hal::SemanticEffectId::virtual_background_blur) {
   auto backend = BackendRequest(state, runtime);
+  if (semantic == hal::SemanticEffectId::virtual_background_replace) {
+    backend.replacement_width = 2;
+    backend.replacement_height = 2;
+    backend.replacement_rgb = {
+        255, 0,   0,   0, 255, 0,
+        0,   0,   255, 255, 255, 255,
+    };
+  }
   // The neutral setup lease binds its model generation to the exact validated
   // artifact registry generation.
   backend.model_preprocess_generation =
@@ -843,7 +854,7 @@ ProductionFactoryRequest(FakeCudaState *state, PendingRuntime *runtime) {
   open_cuda::OpenCudaProductionVideoExecutionFactoryRequest setup{};
   setup.factory_id = 7011;
   setup.selection_priority = 5;
-  setup.semantic = hal::SemanticEffectId::virtual_background_blur;
+  setup.semantic = semantic;
   setup.model.model_id_hash = backend.model_artifact.model_id_sha256;
   setup.model.artifact_set_hash =
       backend.model_artifact.artifact_set_sha256;
@@ -869,6 +880,77 @@ ProductionFactoryRequest(FakeCudaState *state, PendingRuntime *runtime) {
   setup.stop_aware_bounded_wait = true;
   setup.allocation_free_execute = true;
   return setup;
+}
+
+bool ProductionNewSemanticContractsAreExact() {
+  bool ok = true;
+  for (const auto semantic :
+       {hal::SemanticEffectId::virtual_background_replace,
+        hal::SemanticEffectId::virtual_key_light}) {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    runtime.pending = false;
+    auto setup = ProductionFactoryRequest(&state, &runtime, semantic);
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    auto factory =
+        open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(setup,
+                                                                   &bootstrap);
+    ok = Expect(factory && bootstrap.status == hal::StatusId::ready &&
+                    bootstrap.exact_candidate_ready &&
+                    factory->adapter_registration()
+                            .semantic_capabilities[0]
+                            .semantic == semantic &&
+                    factory->adapter_registration()
+                            .semantic_capabilities[0]
+                            .production_eligible,
+                "replace/key-light production capability must be exact and "
+                "selectable") &&
+         ok;
+    factory.reset();
+    ok = Expect(state.destroy_successes == 1 &&
+                    runtime.stream_destructions == 1,
+                "new semantic owner must retain normal quiescent teardown") &&
+         ok;
+  }
+
+  {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    auto invalid = ProductionFactoryRequest(
+        &state, &runtime,
+        hal::SemanticEffectId::virtual_background_replace);
+    invalid.backend.replacement_rgb.pop_back();
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    const auto factory =
+        open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(invalid,
+                                                                   &bootstrap);
+    ok = Expect(!factory && bootstrap.status == hal::StatusId::blocked &&
+                    bootstrap.reason ==
+                        hal::ReasonId::capability_evidence_incomplete &&
+                    state.create_calls == 0,
+                "malformed replacement resources must fail before CUDA "
+                "ownership") &&
+         ok;
+  }
+  {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    auto invalid = ProductionFactoryRequest(
+        &state, &runtime, hal::SemanticEffectId::virtual_key_light);
+    invalid.backend.key_light_intensity = 101;
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    const auto factory =
+        open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(invalid,
+                                                                   &bootstrap);
+    ok = Expect(!factory && bootstrap.status == hal::StatusId::blocked &&
+                    bootstrap.reason ==
+                        hal::ReasonId::capability_evidence_incomplete &&
+                    state.create_calls == 0,
+                "out-of-contract key-light parameters must fail before CUDA "
+                "ownership") &&
+         ok;
+  }
+  return ok;
 }
 
 bool ProductionSetupLeaseIsExactStableAndIdempotent() {
@@ -1293,6 +1375,7 @@ int main() {
   ok = CandidateFailuresRetainOldIslandAndRollbackExactStream() && ok;
   ok = ShutdownRetainsCompleteIslandUntilQuiescent() && ok;
   ok = ProductionStreamDestroyFailureIsRetryable() && ok;
+  ok = ProductionNewSemanticContractsAreExact() && ok;
   ok = ProductionSetupLeaseIsExactStableAndIdempotent() && ok;
   ok = ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() && ok;
   ok = ProductionSetupLeaseShutdownRetriesPendingThenComplete() && ok;

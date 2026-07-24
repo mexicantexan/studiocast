@@ -165,7 +165,9 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
   const auto &intent = request.intent.stages[0].intent;
   if (intent.stage_id == 0 ||
       (intent.semantic != hal::SemanticEffectId::virtual_background_blur &&
-       intent.semantic != hal::SemanticEffectId::virtual_background_remove) ||
+       intent.semantic != hal::SemanticEffectId::virtual_background_remove &&
+       intent.semantic != hal::SemanticEffectId::virtual_background_replace &&
+       intent.semantic != hal::SemanticEffectId::virtual_key_light) ||
       intent.requires_tracked_vignette_center ||
       (intent.required &&
        intent.failure_action != hal::FailureAction::fail_closed) ||
@@ -777,7 +779,25 @@ OpenCudaVideoExecutionFactory::CreateProduction(
   *result = {};
   const bool supported_semantic =
       request.semantic == hal::SemanticEffectId::virtual_background_blur ||
-      request.semantic == hal::SemanticEffectId::virtual_background_remove;
+      request.semantic == hal::SemanticEffectId::virtual_background_remove ||
+      request.semantic == hal::SemanticEffectId::virtual_background_replace ||
+      request.semantic == hal::SemanticEffectId::virtual_key_light;
+  const bool replacement_contract =
+      request.semantic != hal::SemanticEffectId::virtual_background_replace ||
+      (request.backend.replacement_width > 0 &&
+       request.backend.replacement_height > 0 &&
+       static_cast<std::uint64_t>(request.backend.replacement_width) *
+               static_cast<std::uint64_t>(request.backend.replacement_height) *
+               3u ==
+           request.backend.replacement_rgb.size());
+  const bool key_light_contract =
+      request.semantic != hal::SemanticEffectId::virtual_key_light ||
+      (request.backend.key_light_intensity >= 0 &&
+       request.backend.key_light_intensity <= 100 &&
+       request.backend.key_light_temperature_preset >= 0 &&
+       request.backend.key_light_temperature_preset <= 2 &&
+       request.backend.key_light_direction_pan_degrees >= -90 &&
+       request.backend.key_light_direction_pan_degrees <= 90);
   const bool exact_model =
       request.backend.model_artifact.Valid() &&
       request.model.model_id_hash ==
@@ -786,7 +806,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           request.backend.model_artifact.artifact_set_sha256 &&
       request.model.artifact_generation ==
           request.backend.model_artifact.registry_generation;
-  if (request.factory_id == 0 || !supported_semantic || !exact_model ||
+  if (request.factory_id == 0 || !supported_semantic ||
+      !replacement_contract || !key_light_contract || !exact_model ||
       !ValidReservedBudget(request.reserved_budget) ||
       request.generations.configuration == 0 ||
       request.generations.geometry == 0 || request.generations.model == 0 ||

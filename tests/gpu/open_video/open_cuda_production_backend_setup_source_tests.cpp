@@ -122,16 +122,41 @@ bool StrictPolicyIsFailClosed() {
   return ok;
 }
 
-bool UnsupportedSemanticsRemainBlocked() {
+bool SemanticCapabilityClaimsRemainExact() {
   auto source = open_cuda::CreateProductionVideoBackendSetupSource();
-  const hal::SemanticEffectId unsupported[] = {
+  const auto temp = std::filesystem::temp_directory_path() /
+                    "studiocast-open-cuda-capability-empty";
+  std::error_code ec;
+  std::filesystem::remove_all(temp, ec);
+  std::filesystem::create_directories(temp, ec);
+  const char *old = std::getenv("XDG_DATA_HOME");
+  const std::string old_value = old == nullptr ? std::string{} : old;
+  const bool had_old = old != nullptr;
+  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+  const hal::SemanticEffectId supported[] = {
       hal::SemanticEffectId::virtual_background_replace,
       hal::SemanticEffectId::virtual_key_light,
+  };
+  bool ok = true;
+  for (const auto semantic : supported) {
+    const auto result = source->AcquireResidentSetup(StrictRequest(semantic));
+    ok &= Check(
+        result.status == hal::StatusId::unavailable &&
+            result.reason == hal::ReasonId::capability_evidence_incomplete &&
+            result.setup_completed_outside_frame_loop && !result.lease.live(),
+        "supported semantic did not advance to setup-time model evidence");
+  }
+  if (had_old)
+    (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
+  else
+    (void)unsetenv("XDG_DATA_HOME");
+  std::filesystem::remove_all(temp, ec);
+
+  const hal::SemanticEffectId unsupported[] = {
       hal::SemanticEffectId::auto_frame,
       hal::SemanticEffectId::mirror,
       hal::SemanticEffectId::vignette,
   };
-  bool ok = true;
   for (const auto semantic : unsupported) {
     const auto result = source->AcquireResidentSetup(StrictRequest(semantic));
     ok &=
@@ -229,7 +254,7 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
 } // namespace
 
 int main() {
-  if (!StrictPolicyIsFailClosed() || !UnsupportedSemanticsRemainBlocked() ||
+  if (!StrictPolicyIsFailClosed() || !SemanticCapabilityClaimsRemainExact() ||
       !HostAndModelEvidenceAreSetupOnly() ||
       !CompatibilityTopologyNeverMasqueradesAsStrictCuda()) {
     return 1;
