@@ -1623,7 +1623,7 @@ if (BUILD_TESTING)
     add_test(NAME studiocast-video-frame-plan-tests
             COMMAND studiocast-video-frame-plan-tests)
     studiocast_set_test_labels(studiocast-video-frame-plan-tests
-            unit video gpu maxine)
+            unit core video)
 
     add_executable(studiocast-vulkan-frame-plan-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_frame_execution_plan_tests.cpp
