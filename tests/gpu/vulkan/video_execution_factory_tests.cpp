@@ -31,12 +31,28 @@ void *operator new[](std::size_t size) {
     return pointer;
   throw std::bad_alloc();
 }
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  return std::malloc(size);
+}
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  return std::malloc(size);
+}
 void operator delete(void *pointer) noexcept { std::free(pointer); }
 void operator delete[](void *pointer) noexcept { std::free(pointer); }
 void operator delete(void *pointer, std::size_t) noexcept {
   std::free(pointer);
 }
 void operator delete[](void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
+void operator delete(void *pointer, const std::nothrow_t &) noexcept {
+  std::free(pointer);
+}
+void operator delete[](void *pointer, const std::nothrow_t &) noexcept {
   std::free(pointer);
 }
 
