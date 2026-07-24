@@ -206,7 +206,6 @@ set(_studiocast_video_backend_composition_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/static_production_video_backend_setup_source.cpp)
 
 set(_studiocast_video_runtime_sources
-        # Protected implementation: source ownership only; contents remain unchanged.
         ${PROJECT_SOURCE_DIR}/src/core/video/camera_pipeline.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/virtual_camera_service.cpp)
 
@@ -345,13 +344,9 @@ target_link_libraries(studiocast_video_backend_composition
 target_link_libraries(studiocast_video_runtime
         PUBLIC
         studiocast_contracts
-        studiocast_cuda_support
         studiocast_video_execution_runtime
-        studiocast_maxine_backend
-        studiocast_open_video_backend
         studiocast_video_io
         studiocast_video_support
-        studiocast_vulkan_backend
         PRIVATE
         studiocast_util
         studiocast_video_backend_composition)
@@ -481,12 +476,6 @@ target_compile_definitions(studiocast_open_video_backend PUBLIC
 target_compile_definitions(studiocast_vulkan_backend PUBLIC
         STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
         STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=$<BOOL:${STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING}>)
-target_compile_definitions(studiocast_video_runtime PUBLIC
-        STUDIOCAST_ENABLE_OPEN_CUDA=$<BOOL:${STUDIOCAST_ENABLE_OPEN_CUDA}>
-        STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
-        STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=$<BOOL:${STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING}>
-        STUDIOCAST_ENABLE_OPEN_AUDIO=$<BOOL:${STUDIOCAST_ENABLE_OPEN_AUDIO}>
-        STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>)
 
 if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
     target_link_libraries(studiocast_vulkan_backend
@@ -589,11 +578,8 @@ studiocast_assert_direct_dependencies(studiocast_video_backend_composition
         studiocast_vulkan_backend)
 studiocast_assert_direct_dependencies(studiocast_video_runtime
         PUBLIC_STUDIOCAST_DEPS
-        studiocast_contracts studiocast_cuda_support
-        studiocast_maxine_backend studiocast_open_video_backend
-        studiocast_video_execution_runtime studiocast_video_io
-        studiocast_video_support
-        studiocast_vulkan_backend
+        studiocast_contracts studiocast_video_execution_runtime
+        studiocast_video_io studiocast_video_support
         PRIVATE_STUDIOCAST_DEPS
         studiocast_util studiocast_video_backend_composition)
 studiocast_assert_direct_dependencies(studiocast_runtime_config
