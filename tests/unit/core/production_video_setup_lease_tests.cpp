@@ -350,9 +350,10 @@ bool TestFailedCandidateRetainsOldLease() {
 
 bool TestCoordinatorBeforeLeaseDestructionOrder() {
   struct FakeCoordinator {
-    explicit FakeCoordinator(std::vector<int> *events) : events(events) {}
-    ~FakeCoordinator() { events->push_back(1); }
-    std::vector<int> *events;
+    explicit FakeCoordinator(std::vector<int> *events_out)
+        : event_log(events_out) {}
+    ~FakeCoordinator() { event_log->push_back(1); }
+    std::vector<int> *event_log;
   };
 
   std::vector<int> events;
