@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/open_video/open_cuda_production_hal_owner.h"
 #include "core/video/video_adapter_factory.h"
 
 #include <cstdint>
@@ -9,6 +10,12 @@ namespace studiocast::open_cuda {
 
 struct OpenCudaVideoExecutionCandidate {
   using DestroyOwner = void (*)(void *owner) noexcept;
+  using CommitPreparedOwner = hal::StatusId (*)(
+      void *owner, const hal::PreparedProgram &program,
+      const hal::ReadinessSnapshot &readiness, hal::ReasonId *reason) noexcept;
+  using ObserveRuntimeOwner = void (*)(void *owner, hal::StatusId status,
+                                       hal::ReasonId reason) noexcept;
+  using ShutdownOwner = void (*)(void *owner) noexcept;
 
   OpenCudaVideoExecutionCandidate() = default;
   ~OpenCudaVideoExecutionCandidate();
@@ -30,6 +37,9 @@ struct OpenCudaVideoExecutionCandidate {
   // evidence. No vendor or model-pack type crosses this API.
   void *owner = nullptr;
   DestroyOwner destroy_owner = nullptr;
+  CommitPreparedOwner commit_prepared_owner = nullptr;
+  ObserveRuntimeOwner observe_runtime_owner = nullptr;
+  ShutdownOwner shutdown_owner = nullptr;
   hal::AdapterRegistration registration{};
 };
 
@@ -69,6 +79,37 @@ struct OpenCudaVideoExecutionFactoryConfig {
   void *setup_context = nullptr;
 };
 
+// Setup-only production evidence. Model discovery, manifest parsing, artifact
+// validation, provider selection, and sizing have already completed. The
+// bootstrap creates one exact context/stream owner for the registry/factory
+// lifetime. Prepared executors borrow that adapter and own only their prepared
+// slot; retiring a plan therefore cannot dangle the registry registration.
+// No work in this structure is consulted per frame.
+struct OpenCudaProductionVideoExecutionFactoryRequest {
+  std::uint64_t factory_id = 0;
+  std::uint32_t selection_priority = 0;
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
+  hal::ModelArtifactIdentity model{};
+  hal::ProgramGenerations generations{};
+  OpenCudaProductionBackendRequest backend{};
+  bool model_artifact_validated = false;
+  bool provider_runtime_validated = false;
+  bool cuda_iobinding_validated = false;
+  bool user_stream_bound = false;
+  bool reusable_resources_supported = false;
+  bool device_preprocess_supported = false;
+  bool device_postprocess_supported = false;
+  bool stop_aware_bounded_wait = false;
+  bool allocation_free_execute = false;
+};
+
+struct OpenCudaProductionVideoExecutionBootstrapResult {
+  hal::StatusId status = hal::StatusId::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  OpenCudaProductionPreparationResult owner{};
+  bool exact_candidate_ready = false;
+};
+
 // Static Open CUDA/Open Video adapter factory for the first conservative
 // production route: exactly one strict ONNX Runtime CUDA virtual-background
 // blur/remove stage over tight same-geometry RGB24, followed by one declared
@@ -77,6 +118,10 @@ class OpenCudaVideoExecutionFactory final : public video::IVideoAdapterFactory {
 public:
   explicit OpenCudaVideoExecutionFactory(
       OpenCudaVideoExecutionFactoryConfig config) noexcept;
+  [[nodiscard]] static std::unique_ptr<OpenCudaVideoExecutionFactory>
+  CreateProduction(
+      const OpenCudaProductionVideoExecutionFactoryRequest &request,
+      OpenCudaProductionVideoExecutionBootstrapResult *result) noexcept;
   ~OpenCudaVideoExecutionFactory() override;
 
   OpenCudaVideoExecutionFactory(const OpenCudaVideoExecutionFactory &) = delete;
@@ -84,6 +129,7 @@ public:
   operator=(const OpenCudaVideoExecutionFactory &) = delete;
 
   [[nodiscard]] video::VideoAdapterFactoryRegistration Registration() noexcept;
+  [[nodiscard]] hal::AdapterRegistration adapter_registration() const noexcept;
 
   [[nodiscard]] video::VideoAdapterFactoryPreflight
   Preflight(const video::VideoExecutionPlanRequest &request,

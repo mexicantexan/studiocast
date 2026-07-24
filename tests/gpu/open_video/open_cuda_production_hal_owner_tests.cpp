@@ -1,4 +1,6 @@
 #include "core/open_video/open_cuda_production_hal_owner.h"
+#include "core/open_video/video_execution_factory.h"
+#include "core/video/video_execution_coordinator.h"
 
 #include <array>
 #include <cstddef>
@@ -334,18 +336,101 @@ hal::ReadinessSnapshot Readiness(const hal::PreparedProgram &program) {
 class PendingRuntime final : public open_cuda::IPreparedOpenCudaRuntime {
 public:
   bool pending = true;
+  std::uint32_t fail_prepare_count = 0;
+  std::uint64_t prepare_calls = 0;
+  std::uint64_t execute_calls = 0;
+  open_cuda::PreparedOpenCudaRuntimeHandle active{};
   std::uint64_t shutdown_calls = 0;
   std::uint64_t stream_destructions = 0;
 
-  open_cuda::PreparedOpenCudaRuntimePrepareResult Prepare(
-      const hal::PreparedProgram &,
-      const open_cuda::PreparedOpenCudaProductionConfig &) noexcept override {
-    return {};
+  open_cuda::PreparedOpenCudaRuntimePrepareResult
+  Prepare(const hal::PreparedProgram &program,
+          const open_cuda::PreparedOpenCudaProductionConfig &config) noexcept
+      override {
+    ++prepare_calls;
+    open_cuda::PreparedOpenCudaRuntimePrepareResult result{};
+    if (fail_prepare_count != 0) {
+      --fail_prepare_count;
+      result.status = RuntimeStatus::resource_exhausted;
+      result.reason = hal::ReasonId::resource_exhausted;
+      return result;
+    }
+    result.status = RuntimeStatus::ready;
+    result.reason = hal::ReasonId::none;
+    result.handle.handle_id = prepare_calls;
+    result.handle.program_id = program.program_id;
+    result.handle.invalidation_key = program.invalidation_key;
+    result.handle.execution_domain = program.execution_domain;
+    result.evidence.status = RuntimeStatus::ready;
+    result.evidence.semantic = program.stages[0].semantic;
+    result.evidence.provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    result.evidence.execution_domain = program.execution_domain;
+    result.evidence.model_artifact = config.model_artifact;
+    open_cuda::PreparedOpenCudaVbPlanInput input{};
+    input.semantic = program.stages[0].semantic;
+    input.frame_width = program.host_input.width;
+    input.frame_height = program.host_input.height;
+    input.model_width =
+        static_cast<std::uint64_t>(config.model_pack->matting->input.width);
+    input.model_height =
+        static_cast<std::uint64_t>(config.model_pack->matting->input.height);
+    input.requested_strength = config.strength;
+    input.input_pitch_bytes =
+        program.stages[0].input.image.planes[0].row_stride_bytes;
+    input.output_pitch_bytes =
+        program.stages[0].output.image.planes[0].row_stride_bytes;
+    input.model_alpha_capacity_bytes =
+        input.model_width * input.model_height * sizeof(float);
+    input.input_tensor_capacity_bytes = input.model_alpha_capacity_bytes * 3;
+    input.resized_alpha_pitch_bytes = input.frame_width * sizeof(float);
+    input.alpha_scratch_pitch_bytes = input.resized_alpha_pitch_bytes;
+    input.alpha_feather_pitch_bytes = input.resized_alpha_pitch_bytes;
+    input.blur_scratch_pitch_bytes = input.input_pitch_bytes;
+    input.blurred_pitch_bytes = input.input_pitch_bytes;
+    input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
+    input.readback_staging_bytes = program.host_output.planes[0].size_bytes;
+    input.available_budget = program.budget;
+    result.evidence.geometry_plan =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    result.evidence.reserved_budget =
+        result.evidence.geometry_plan.required_budget;
+    result.evidence.strict_cuda_only = true;
+    result.evidence.user_stream_bound = true;
+    result.evidence.cpu_provider_fallback_disabled = true;
+    result.evidence.reusable_resources_prepared = true;
+    result.evidence.setup_warmup_complete = true;
+    result.evidence.inference_only_frame_path = true;
+    result.evidence.device_preprocess = true;
+    result.evidence.device_postprocess = true;
+    result.evidence.one_upload_one_readback = true;
+    result.evidence.no_intermediate_crossings = true;
+    result.evidence.single_in_flight = true;
+    active = result.handle;
+    return result;
   }
   open_cuda::PreparedOpenCudaRuntimeFrameResult ExecuteFrame(
-      const open_cuda::PreparedOpenCudaRuntimeHandle &,
-      const open_cuda::PreparedOpenCudaRuntimeFrame &) noexcept override {
-    return {};
+      const open_cuda::PreparedOpenCudaRuntimeHandle &handle,
+      const open_cuda::PreparedOpenCudaRuntimeFrame &frame) noexcept override {
+    ++execute_calls;
+    open_cuda::PreparedOpenCudaRuntimeFrameResult result{};
+    if (handle.handle_id == 0 || handle.handle_id != active.handle_id) {
+      result.status = RuntimeStatus::foreign_handle;
+      result.reason = hal::ReasonId::stale_program;
+      return result;
+    }
+    std::memcpy(frame.output, frame.input,
+                std::min(frame.input_span_bytes, frame.output_span_bytes));
+    result.status = RuntimeStatus::executed;
+    result.reason = hal::ReasonId::none;
+    result.transfers.uploads = 1;
+    result.transfers.final_readbacks = 1;
+    result.transfers.synchronizations = 1;
+    result.transfers.cpu_tail_boundaries = 1;
+    result.output_valid = true;
+    result.analysis_ran = true;
+    result.inference_only_path = true;
+    return result;
   }
   RuntimeStatus
   ResetTemporalState(const open_cuda::PreparedOpenCudaRuntimeHandle &,
@@ -353,8 +438,13 @@ public:
     return RuntimeStatus::not_prepared;
   }
   RuntimeStatus DestroyPrepared(
-      open_cuda::PreparedOpenCudaRuntimeHandle *) noexcept override {
-    return pending ? RuntimeStatus::completion_pending : RuntimeStatus::ready;
+      open_cuda::PreparedOpenCudaRuntimeHandle *handle) noexcept override {
+    if (pending)
+      return RuntimeStatus::completion_pending;
+    if (handle)
+      *handle = {};
+    active = {};
+    return RuntimeStatus::ready;
   }
   open_cuda::PreparedOpenCudaShutdownSnapshot
   RequestShutdown() noexcept override {
@@ -706,6 +796,177 @@ bool ProductionStreamDestroyFailureIsRetryable() {
   return ok;
 }
 
+video::VideoExecutionPlanRequest
+VideoRequest(const hal::ExecutionDomainId &domain) {
+  const auto program = Program(domain);
+  video::VideoExecutionPlanRequest request{};
+  request.plan_id = program.program_id;
+  request.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  request.intent.backend.backend = hal::BackendId::cuda;
+  request.intent.backend.strict = true;
+  request.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  request.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::open_cuda;
+  request.intent.preferences.strict_effects_engine = true;
+  request.intent.requested_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  request.intent.strict_provider_selection = true;
+  request.intent.stages[0].intent.stage_id = program.stages[0].stage_id;
+  request.intent.stages[0].intent.semantic = program.stages[0].semantic;
+  request.intent.stages[0].intent.required = true;
+  request.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_closed;
+  request.intent.stages[0].model = program.stages[0].model;
+  request.intent.stage_count = 1;
+  request.host_input = program.host_input;
+  request.host_output = program.host_output;
+  request.invalidation_key = program.invalidation_key;
+  request.temporal.frame_drop_behavior =
+      hal::FrameDropBehavior::latest_frame_wins;
+  request.budget = program.budget;
+  request.cpu_tails = program.cpu_tails;
+  request.cpu_tail_count = program.cpu_tail_count;
+  request.setup_failure_policy = hal::SetupFailurePolicy::retain_old_program;
+  request.migration_policy =
+      video::VideoExecutionMigrationPolicy::prepared_only;
+  return request;
+}
+
+bool ProductionFactoryReprepareAndRollbackAreLifetimeSafe() {
+  FakeCudaState state{};
+  PendingRuntime runtime{};
+  runtime.pending = false;
+  auto backend = BackendRequest(&state, &runtime);
+  open_cuda::OpenCudaProductionVideoExecutionFactoryRequest setup{};
+  setup.factory_id = 7009;
+  setup.selection_priority = 5;
+  setup.semantic = hal::SemanticEffectId::virtual_background_blur;
+  setup.model.model_id_hash = backend.model_artifact.model_id_sha256;
+  setup.model.artifact_set_hash = backend.model_artifact.artifact_set_sha256;
+  setup.model.artifact_generation = backend.model_artifact.registry_generation;
+  setup.generations = {11, 12, 13, 14, 15, 0};
+  setup.backend = backend;
+  setup.model_artifact_validated = true;
+  setup.provider_runtime_validated = true;
+  setup.cuda_iobinding_validated = true;
+  setup.user_stream_bound = true;
+  setup.reusable_resources_supported = true;
+  setup.device_preprocess_supported = true;
+  setup.device_postprocess_supported = true;
+  setup.stop_aware_bounded_wait = true;
+  setup.allocation_free_execute = true;
+
+  open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+  auto factory = open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+      setup, &bootstrap);
+  bool ok = Expect(factory && bootstrap.exact_candidate_ready &&
+                       bootstrap.status == hal::StatusId::ready,
+                   "production factory bootstrap should retain exact owner");
+  if (!factory)
+    return false;
+  const auto adapter = factory->adapter_registration();
+  const auto factory_registration = factory->Registration();
+  ok = Expect(adapter.resident_adapter != nullptr &&
+                  adapter.execution_domain ==
+                      factory_registration.execution_domain &&
+                  adapter.adapter_instance_id ==
+                      factory_registration.adapter_instance_id,
+              "factory and registry must expose the same exact adapter") &&
+       ok;
+
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok = Expect(registry.Register(adapter, &reason) == hal::StatusId::ready,
+              "exact production adapter registration should be selectable") &&
+       ok;
+  video::VideoExecutionCoordinator coordinator(registry);
+  ok = Expect(coordinator.RegisterFactory(factory_registration, &reason) ==
+                  hal::StatusId::ready,
+              "exact production factory registration should be accepted") &&
+       ok;
+  auto request = VideoRequest(adapter.execution_domain);
+  runtime.fail_prepare_count = 1;
+  video::VideoExecutionPrepareEvidence evidence{};
+  ok = Expect(coordinator.Prepare(request, &evidence, &reason) ==
+                      hal::StatusId::resource_exhausted &&
+                  runtime.prepare_calls == 1 &&
+                  factory->adapter_registration().resident_adapter ==
+                      adapter.resident_adapter,
+              "failed prepared slot must roll back without retiring registry "
+              "owner") &&
+       ok;
+  const auto retry_status = coordinator.Prepare(request, &evidence, &reason);
+  if (retry_status != hal::StatusId::ready &&
+      retry_status != hal::StatusId::degraded)
+    std::cerr << "[DETAIL] retry status=" << static_cast<unsigned>(retry_status)
+              << " reason=" << static_cast<unsigned>(reason)
+              << " calls=" << runtime.prepare_calls << '\n';
+  ok = Expect((retry_status == hal::StatusId::ready ||
+               retry_status == hal::StatusId::degraded) &&
+                  runtime.prepare_calls == 2,
+              "same exact factory must retry after failed preparation") &&
+       ok;
+
+  std::array<std::byte, 384> input{};
+  std::array<std::byte, 384> output{};
+  input.fill(std::byte{0x5a});
+  hal::HostFrameBinding binding{};
+  binding.input_descriptor = request.host_input;
+  binding.output_descriptor = request.host_output;
+  binding.input_planes[0].read_data = input.data();
+  binding.input_planes[0].span_bytes = input.size();
+  binding.input_planes[0].row_stride_bytes = 48;
+  binding.output_planes[0].write_data = output.data();
+  binding.output_planes[0].span_bytes = output.size();
+  binding.output_planes[0].row_stride_bytes = 48;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.capture_sequence = 1;
+  binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+  binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+  const auto frame = coordinator.Execute(binding);
+  ok = Expect(frame.status == hal::StatusId::executed && frame.output_ready &&
+                  frame.transfers.uploads == 1 &&
+                  frame.transfers.final_readbacks == 1 &&
+                  frame.transfers.intermediate_uploads == 0 &&
+                  frame.transfers.intermediate_readbacks == 0 &&
+                  coordinator.CommitOutput(frame.completion, true, &reason) ==
+                      hal::StatusId::ready &&
+                  coordinator.Snapshot().latest_committed_frame.valid,
+              "production execution should preserve transfer and commit "
+              "attribution") &&
+       ok;
+
+  coordinator.Invalidate(hal::ReasonId::reconfiguration_required);
+  const auto reprepare_status =
+      coordinator.Prepare(request, &evidence, &reason);
+  if (reprepare_status != hal::StatusId::ready &&
+      reprepare_status != hal::StatusId::degraded)
+    std::cerr << "[DETAIL] reprepare status="
+              << static_cast<unsigned>(reprepare_status)
+              << " reason=" << static_cast<unsigned>(reason)
+              << " calls=" << runtime.prepare_calls << '\n';
+  ok = Expect((reprepare_status == hal::StatusId::ready ||
+               reprepare_status == hal::StatusId::degraded) &&
+                  runtime.prepare_calls == 3 &&
+                  factory->adapter_registration().resident_adapter ==
+                      adapter.resident_adapter,
+              "invalidate/reprepare must keep registry adapter alive") &&
+       ok;
+  coordinator.Shutdown();
+  factory.reset();
+  if (state.destroy_successes != 1 || runtime.stream_destructions != 1)
+    std::cerr << "[DETAIL] stream destroy successes=" << state.destroy_successes
+              << " attempts=" << state.destroy_attempts << '\n';
+  ok =
+      Expect(state.destroy_successes == 1 && runtime.stream_destructions == 1,
+             "factory retirement should destroy validation and injected "
+             "runtime-owned streams exactly once after coordinator shutdown") &&
+      ok;
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -714,6 +975,7 @@ int main() {
   ok = CandidateFailuresRetainOldIslandAndRollbackExactStream() && ok;
   ok = ShutdownRetainsCompleteIslandUntilQuiescent() && ok;
   ok = ProductionStreamDestroyFailureIsRetryable() && ok;
+  ok = ProductionFactoryReprepareAndRollbackAreLifetimeSafe() && ok;
   g_cuda = nullptr;
   if (!ok)
     return EXIT_FAILURE;
