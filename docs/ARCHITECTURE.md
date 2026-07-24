@@ -112,6 +112,14 @@ New backends should link down to the smallest neutral layer that owns their
 shared concepts; sibling backends must not link to one another for shared types
 or utilities.
 
+The complete HAL contract, exact execution-domain identity, current prepared
+adapter gates, status migration, and deferred plugin security boundary are
+documented in
+[HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). The important
+separation is that CPU primitive availability never establishes selectable
+product-effect capability, while each v1 resident island is owned by exactly
+one adapter.
+
 ## Canonical effect model: `BroadcastCameraEffects`
 
 The single canonical effect schema across **config persistence**, **IPC**, **daemon pipeline**, **GUI rendering**, and
@@ -162,7 +170,9 @@ Installation docs:
 
 ## Availability: daemon diagnostics are authoritative
 
-Effect availability must be computed **only** by the daemon and exposed via `GET_STATUS`.
+Effect availability must be computed **only** by the daemon. Legacy consumers
+receive it through `GET_STATUS`; the versioned HAL command below is an additive
+typed status surface.
 
 - The daemon includes per-engine diagnostics in `GET_STATUS` under:
   - `engines.maxine` (and a legacy top-level `maxine` alias)
@@ -171,6 +181,13 @@ Effect availability must be computed **only** by the daemon and exposed via `GET
   - whether each engine is usable on this machine
   - which effects are available vs blocked (with reason codes)
   - what remediation/install hints to show
+
+The additive `GET_VIDEO_HAL_STATUS_V1` command exposes the validated typed
+multi-island HAL snapshot without changing legacy `GET_STATUS` bytes. It
+distinguishes requested, selected, available, active, degraded, blocked, and
+fallback state and attributes activity only after a successful output write.
+The installer parser for this schema remains shadow-only and ineligible to
+affect recommendations.
 
 ## Open CUDA model packs (XDG)
 

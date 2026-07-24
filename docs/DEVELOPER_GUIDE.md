@@ -487,6 +487,9 @@ When adding code, link the smallest owning CMake target:
 
 - contracts/config/IPC/utilities: `studiocast_contracts`,
   `studiocast_config`, `studiocast_ipc`, or `studiocast_util`;
+- hardware execution contracts and setup-time resolution:
+  `studiocast_hal_contracts`, `studiocast_hal_runtime`, or
+  `studiocast_video_execution_runtime`;
 - CUDA and ONNX support: `studiocast_cuda_support` or
   `studiocast_onnx_support`;
 - platform support: `studiocast_audio_support`,
@@ -500,6 +503,13 @@ When adding code, link the smallest owning CMake target:
 Use `studiocast_core` only where compatibility or genuine full-runtime
 aggregation is required. Configure-time assertions reject unreviewed
 StudioCast target edges and duplicate production-source ownership.
+
+The Hardware Execution Layer is documented in
+[HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). Neutral HAL targets
+must build without optional SDK headers, vendor libraries, or backend feature
+definitions. The current staged migration still leaves optional backend
+dependencies on `studiocast_video_runtime`; do not treat that transitional edge
+as permission to put vendor types in neutral contracts.
 
 Key concepts:
 
@@ -546,6 +556,14 @@ The normalized video backend status lives under `video.compute` and includes:
 Keep this status built from cached setup-time diagnostics and pipeline counters.
 Do not add provider/package/runtime checks, JSON construction, or probe logic to
 the frame loop.
+
+For typed HAL diagnostics, the daemon also accepts
+`GET_VIDEO_HAL_STATUS_V1`. It returns a standalone, versioned multi-island
+snapshot with exact execution domains, per-effect requested/selected/active
+state, committed-output identity, transfers, CPU-tail boundaries, and blocker
+reasons. This command is additive: legacy `GET_STATUS` serialization remains
+unchanged. The GUI has not become authoritative, and installer consumption is
+still shadow-only and recommendation-ineligible.
 
 Open CUDA video effects are GPU-only. If CUDA, ONNX Runtime, or model packs are
 missing, the effects should be marked unavailable rather than silently falling
@@ -674,7 +692,8 @@ cmake -S . -B build-bench -G Ninja \
 cmake --build build-bench --target \
   studiocast-rgb-yuyv-bench \
   studiocast-cuda-transfer-bench \
-  studiocast-resize-backend-bench
+  studiocast-resize-backend-bench \
+  studiocast-prepared-open-cuda-facade-bench
 ```
 
 Coverage:
@@ -685,6 +704,10 @@ Coverage:
   transfer rows.
 - `studiocast-resize-backend-bench`: CPU/CUDA/Vulkan resize comparisons when
   each backend is compiled and available.
+- `studiocast-prepared-open-cuda-facade-bench`: synthetic fake-adapter
+  measurement of prepared-facade overhead, transfer accounting, and
+  committed-output attribution. It performs no CUDA, ONNX Runtime, or model
+  work and is not hardware evidence.
 
 CSV output includes warmup/iteration counts, avg/p95/p99/min/max timing, status
 (`ok` or `skipped`), and skip reasons for unavailable GPU backends. Hardware
@@ -728,6 +751,8 @@ distribution packaging and polished non-developer install flows as future work.
   backend setup.
 - [ARCHITECTURE.md](ARCHITECTURE.md): canonical effect model and daemon-owned
   availability notes.
+- [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md): neutral HAL
+  contracts, adapters, migration gates, telemetry, and extension rules.
 - [MANUAL_TESTING.md](MANUAL_TESTING.md): hardware and GUI manual regression
   plan.
 - [README.md](README.md): documentation status, ownership, and lifecycle index.
