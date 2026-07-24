@@ -85,7 +85,9 @@ set(_studiocast_maxine_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/maxine/production_hal_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/production_resident_frame_executor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/resident_frame_section.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/maxine/vfx_api.cpp)
+        ${PROJECT_SOURCE_DIR}/src/core/maxine/video_execution_factory.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/maxine/vfx_api.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_maxine_hardware_execution_owner.cpp)
 
 set(_studiocast_onnx_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/onnx/ort_session.cpp)
@@ -109,8 +111,10 @@ set(_studiocast_open_video_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_hal_adapter.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_production_hal_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_prepared_resident_executor.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/video_execution_factory.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/matting_session.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/open_video/yunet_face_detector.cpp)
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/yunet_face_detector.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_open_cuda_hardware_execution_owner.cpp)
 
 set(_studiocast_video_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/convert.cpp
@@ -151,7 +155,9 @@ set(_studiocast_vulkan_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_eye_contact.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_matting_setup_policy.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_video_noise_removal.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/vulkan/hal_resident_adapter.cpp)
+        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_hardware_execution_owner.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/hal_resident_adapter.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/video_execution_factory.cpp)
 
 set(_studiocast_vulkan_backend_optional_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_runtime.cpp
@@ -192,9 +198,6 @@ set(_studiocast_video_execution_runtime_sources
 set(_studiocast_video_runtime_sources
         # Protected implementation: source ownership only; contents remain unchanged.
         ${PROJECT_SOURCE_DIR}/src/core/video/camera_pipeline.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_hardware_execution_owner.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_maxine_hardware_execution_owner.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/video/prepared_open_cuda_hardware_execution_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/virtual_camera_service.cpp)
 
 set(_studiocast_runtime_config_sources
@@ -307,7 +310,9 @@ target_link_libraries(studiocast_vulkan_backend
         studiocast_hal_contracts
         studiocast_model_support
         studiocast_video_support
-        PRIVATE studiocast_util)
+        PRIVATE
+        studiocast_util
+        studiocast_video_execution_runtime)
 target_link_libraries(studiocast_audio_runtime
         PUBLIC
         studiocast_audio_support
@@ -546,7 +551,8 @@ studiocast_assert_direct_dependencies(studiocast_vulkan_backend
         PUBLIC_STUDIOCAST_DEPS
         studiocast_contracts studiocast_hal_contracts studiocast_model_support
         studiocast_video_support
-        PRIVATE_STUDIOCAST_DEPS studiocast_util)
+        PRIVATE_STUDIOCAST_DEPS
+        studiocast_util studiocast_video_execution_runtime)
 studiocast_assert_direct_dependencies(studiocast_audio_runtime
         PUBLIC_STUDIOCAST_DEPS
         studiocast_audio_support studiocast_config studiocast_contracts
@@ -607,7 +613,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 129)
+set(_studiocast_expected_source_count 132)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

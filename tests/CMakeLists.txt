@@ -128,6 +128,94 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-video-execution-coordinator-tests
             unit core video gpu)
 
+    add_executable(studiocast-maxine-video-execution-factory-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_video_execution_factory_tests.cpp
+    )
+
+    target_link_libraries(studiocast-maxine-video-execution-factory-tests PRIVATE
+            studiocast_video_runtime)
+
+    target_include_directories(studiocast-maxine-video-execution-factory-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-maxine-video-execution-factory-tests)
+    studiocast_enable_sanitizers(
+            studiocast-maxine-video-execution-factory-tests)
+
+    set_target_properties(studiocast-maxine-video-execution-factory-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-maxine-video-execution-factory-tests
+            COMMAND studiocast-maxine-video-execution-factory-tests)
+    studiocast_set_test_labels(studiocast-maxine-video-execution-factory-tests
+            unit core video gpu maxine)
+
+    add_executable(studiocast-open-cuda-video-execution-factory-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/open_cuda_video_execution_factory_tests.cpp
+    )
+
+    target_link_libraries(studiocast-open-cuda-video-execution-factory-tests PRIVATE
+            studiocast_open_video_backend
+            studiocast_video_execution_runtime)
+
+    target_include_directories(studiocast-open-cuda-video-execution-factory-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-open-cuda-video-execution-factory-tests)
+    studiocast_enable_sanitizers(
+            studiocast-open-cuda-video-execution-factory-tests)
+
+    set_target_properties(
+            studiocast-open-cuda-video-execution-factory-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-open-cuda-video-execution-factory-tests
+            COMMAND studiocast-open-cuda-video-execution-factory-tests)
+    studiocast_set_test_labels(
+            studiocast-open-cuda-video-execution-factory-tests
+            unit core video gpu model)
+
+    add_executable(studiocast-vulkan-video-execution-factory-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/video_execution_factory_tests.cpp
+    )
+
+    target_link_libraries(studiocast-vulkan-video-execution-factory-tests PRIVATE
+            studiocast_video_execution_runtime
+            studiocast_vulkan_backend)
+
+    target_include_directories(studiocast-vulkan-video-execution-factory-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-vulkan-video-execution-factory-tests)
+    studiocast_enable_sanitizers(
+            studiocast-vulkan-video-execution-factory-tests)
+
+    set_target_properties(
+            studiocast-vulkan-video-execution-factory-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-vulkan-video-execution-factory-tests
+            COMMAND studiocast-vulkan-video-execution-factory-tests)
+    studiocast_set_test_labels(
+            studiocast-vulkan-video-execution-factory-tests
+            unit core video gpu vulkan)
+
     add_executable(studiocast-prepared-hardware-execution-owner-tests
             ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_hardware_execution_owner_tests.cpp
     )
