@@ -1563,6 +1563,42 @@ if (BUILD_TESTING)
             studiocast-open-cuda-production-backend-setup-source-tests
             unit gpu video model)
 
+    add_executable(
+            studiocast-prepared-open-video-compatibility-executor-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_open_video_compatibility_executor_tests.cpp
+    )
+
+    target_link_libraries(
+            studiocast-prepared-open-video-compatibility-executor-tests PRIVATE
+            studiocast_open_video_backend
+            studiocast_video_execution_runtime)
+
+    target_include_directories(
+            studiocast-prepared-open-video-compatibility-executor-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-prepared-open-video-compatibility-executor-tests)
+    studiocast_enable_sanitizers(
+            studiocast-prepared-open-video-compatibility-executor-tests)
+
+    set_target_properties(
+            studiocast-prepared-open-video-compatibility-executor-tests
+            PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(
+            NAME studiocast-prepared-open-video-compatibility-executor-tests
+            COMMAND studiocast-prepared-open-video-compatibility-executor-tests)
+    studiocast_set_test_labels(
+            studiocast-prepared-open-video-compatibility-executor-tests
+            unit gpu video model)
+
     add_executable(studiocast-video-frame-plan-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/video/video_frame_plan_tests.cpp
     )
