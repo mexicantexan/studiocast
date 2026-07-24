@@ -737,6 +737,140 @@ bool OpenCudaTensorRtEnabledFromEnv() {
   return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
+const studiocast::open_video::ModelFile *
+FindPreparedOpenCudaMainOnnx(
+    const studiocast::open_video::ModelPack &pack) noexcept {
+  for (const auto &file : pack.files) {
+    if (file.kind == "onnx" &&
+        (file.role.empty() || file.role == "main")) {
+      return &file;
+    }
+  }
+  for (const auto &file : pack.files) {
+    if (file.kind == "onnx")
+      return &file;
+  }
+  return nullptr;
+}
+
+bool CheckedOpenCudaBudgetMultiply(std::uint64_t lhs, std::uint64_t rhs,
+                                   std::uint64_t *result) noexcept {
+  if (!result ||
+      (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs)) {
+    return false;
+  }
+  *result = lhs * rhs;
+  return true;
+}
+
+bool CheckedOpenCudaBudgetAdd(std::uint64_t value,
+                              std::uint64_t *total) noexcept {
+  if (!total ||
+      value > std::numeric_limits<std::uint64_t>::max() - *total) {
+    return false;
+  }
+  *total += value;
+  return true;
+}
+
+bool PreparedOpenCudaBudgetFor(
+    std::uint32_t frame_width, std::uint32_t frame_height,
+    std::uint32_t model_width, std::uint32_t model_height,
+    hal::SemanticEffectId semantic, int strength,
+    hal::ResourceBudget *budget) noexcept {
+  if (!budget || frame_width == 0 || frame_height == 0 || model_width == 0 ||
+      model_height == 0) {
+    return false;
+  }
+
+  // CUDA pitched allocations are implementation-owned. Reserve every image
+  // row at a conservative 4-KiB-aligned upper bound while retaining exact
+  // geometry/model dimensions. The resident executor records the exact pitch
+  // and commits only the actually reserved budget after allocation.
+  const auto aligned_row = [](std::uint64_t active,
+                              std::uint64_t *aligned) noexcept {
+    constexpr std::uint64_t kAlignment = 4096;
+    if (!aligned ||
+        active > std::numeric_limits<std::uint64_t>::max() -
+                     (kAlignment - 1)) {
+      return false;
+    }
+    *aligned = ((active + kAlignment - 1) / kAlignment) * kAlignment;
+    return true;
+  };
+  std::uint64_t rgb_row = 0;
+  std::uint64_t alpha_row = 0;
+  std::uint64_t frame_rgb = 0;
+  std::uint64_t frame_alpha = 0;
+  std::uint64_t model_alpha_row = 0;
+  std::uint64_t model_tensor_row = 0;
+  std::uint64_t model_alpha = 0;
+  std::uint64_t model_tensor = 0;
+  std::uint64_t boundary = 0;
+  if (!aligned_row(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
+      !aligned_row(static_cast<std::uint64_t>(frame_width) * 4u, &alpha_row) ||
+      !CheckedOpenCudaBudgetMultiply(rgb_row, frame_height, &frame_rgb) ||
+      !CheckedOpenCudaBudgetMultiply(alpha_row, frame_height, &frame_alpha) ||
+      !CheckedOpenCudaBudgetMultiply(model_width, 4u, &model_alpha_row) ||
+      !aligned_row(model_alpha_row, &model_alpha_row) ||
+      !CheckedOpenCudaBudgetMultiply(model_alpha_row, model_height,
+                                     &model_alpha) ||
+      !CheckedOpenCudaBudgetMultiply(model_width, 12u, &model_tensor_row) ||
+      !aligned_row(model_tensor_row, &model_tensor_row) ||
+      !CheckedOpenCudaBudgetMultiply(model_tensor_row, model_height,
+                                     &model_tensor) ||
+      !CheckedOpenCudaBudgetMultiply(frame_width, frame_height, &boundary) ||
+      !CheckedOpenCudaBudgetMultiply(boundary, 3u, &boundary)) {
+    return false;
+  }
+
+  hal::ResourceBudget result{};
+  // Input, output, model alpha, NCHW input tensor, and frame-sized alpha.
+  if (!CheckedOpenCudaBudgetAdd(frame_rgb, &result.persistent_bytes) ||
+      !CheckedOpenCudaBudgetAdd(frame_rgb, &result.persistent_bytes) ||
+      !CheckedOpenCudaBudgetAdd(model_alpha, &result.persistent_bytes) ||
+      !CheckedOpenCudaBudgetAdd(model_tensor, &result.persistent_bytes) ||
+      !CheckedOpenCudaBudgetAdd(frame_alpha, &result.persistent_bytes)) {
+    return false;
+  }
+  const int canonical_strength = std::clamp(
+      strength, effects::contract::kVbStrengthMin,
+      effects::contract::kVbStrengthMax);
+  const bool feather = std::min(4, canonical_strength / 16) > 0;
+  const bool blur =
+      semantic == hal::SemanticEffectId::virtual_background_blur;
+  if (feather &&
+      (!CheckedOpenCudaBudgetAdd(frame_alpha, &result.scratch_bytes) ||
+       !CheckedOpenCudaBudgetAdd(frame_alpha, &result.scratch_bytes))) {
+    return false;
+  }
+  if (blur &&
+      (!CheckedOpenCudaBudgetAdd(frame_rgb, &result.scratch_bytes) ||
+       !CheckedOpenCudaBudgetAdd(frame_rgb, &result.scratch_bytes))) {
+    return false;
+  }
+  // The facade rejects a zero scratch declaration; one byte explicitly means
+  // no scratch allocation is required for remove-without-feather.
+  result.scratch_bytes = std::max<std::uint64_t>(result.scratch_bytes, 1u);
+  result.upload_staging_bytes = boundary;
+  result.readback_staging_bytes = boundary;
+  result.resource_count =
+      (blur ? 19u : 17u) + (feather ? 2u : 0u);
+  result.in_flight_slots = 1;
+
+  constexpr std::uint64_t kMaxPersistent = UINT64_C(2) << 30;
+  constexpr std::uint64_t kMaxScratch = UINT64_C(1) << 30;
+  constexpr std::uint64_t kMaxBoundary = UINT64_C(1) << 30;
+  if (result.persistent_bytes > kMaxPersistent ||
+      result.scratch_bytes > kMaxScratch ||
+      result.upload_staging_bytes > kMaxBoundary ||
+      result.readback_staging_bytes > kMaxBoundary) {
+    return false;
+  }
+  *budget = result;
+  return true;
+}
+
 bool ParseRgbHex(const std::string &s, std::uint32_t *out_rgb) {
   if (!out_rgb)
     return false;
@@ -957,6 +1091,31 @@ std::string CombineEffectsNotes(const std::string &base,
 
 } // namespace
 
+bool BuildPreparedOpenCudaPipelineResourceBudget(
+    std::uint32_t frame_width, std::uint32_t frame_height,
+    std::uint32_t model_width, std::uint32_t model_height,
+    hal::SemanticEffectId semantic, int strength,
+    hal::ResourceBudget *budget) noexcept {
+  return PreparedOpenCudaBudgetFor(frame_width, frame_height, model_width,
+                                   model_height, semantic, strength, budget);
+}
+
+bool PreparedOpenCudaPipelineMayCommitAttribution(
+    hal::StageExecutionStatus stage_status, bool writer_frame_committed,
+    hal::StatusId output_commit_status) noexcept {
+  return writer_frame_committed &&
+         output_commit_status == hal::StatusId::ready &&
+         stage_status == hal::StageExecutionStatus::succeeded;
+}
+
+bool PreparedOpenCudaPipelineShouldSuspend(
+    hal::StatusId status, hal::ReasonId reason) noexcept {
+  return reason == hal::ReasonId::device_lost ||
+         reason == hal::ReasonId::shutdown_requested ||
+         status == hal::StatusId::quarantined ||
+         status == hal::StatusId::stopped;
+}
+
 int OptionalEffectBreaker::CooldownFramesForFailureCount(int failure_count) {
   if (failure_count <= 0)
     return 0;
@@ -1167,6 +1326,8 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_vulkan_transfers = open_vulkan_transfers_;
     s.maxine_transfers = maxine_transfers_;
     s.prepared_hardware_execution = prepared_hardware_execution_;
+    s.prepared_open_cuda_hardware_execution =
+        prepared_open_cuda_hardware_execution_;
   } else {
     // Avoid exposing stale negotiated formats when the pipeline is idle.
     //
@@ -1194,6 +1355,8 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_vulkan_transfers = CameraPipelineStatus::OpenVulkanTransfers{};
     s.maxine_transfers = CameraPipelineStatus::MaxineTransfers{};
     s.prepared_hardware_execution = PreparedHardwareExecutionSnapshot{};
+    s.prepared_open_cuda_hardware_execution =
+        PreparedOpenCudaHardwareExecutionSnapshot{};
   }
   s.frame_index = frame_index_;
   // Live attribution is meaningful only while a successfully-started pipeline
@@ -1291,6 +1454,8 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   open_vulkan_transfers_ = CameraPipelineStatus::OpenVulkanTransfers{};
   maxine_transfers_ = CameraPipelineStatus::MaxineTransfers{};
   prepared_hardware_execution_ = PreparedHardwareExecutionSnapshot{};
+  prepared_open_cuda_hardware_execution_ =
+      PreparedOpenCudaHardwareExecutionSnapshot{};
 
   effects_backends_.clear();
   effects_note_.clear();
@@ -8558,6 +8723,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     prepared_hardware_execution_ = snapshot;
   };
+  PreparedOpenCudaHardwareExecutionOwner prepared_open_cuda_hardware_owner;
+  bool prepared_open_cuda_hardware_live = false;
+  bool prepared_open_cuda_hardware_suspended = false;
+  bool prepared_open_cuda_setup_attempted = false;
+  std::vector<std::uint8_t> prepared_open_cuda_rgb_output;
+  auto publish_prepared_open_cuda_status = [&] {
+    const auto snapshot = prepared_open_cuda_hardware_owner.Snapshot();
+    std::lock_guard<std::mutex> lock(mu_);
+    prepared_open_cuda_hardware_execution_ = snapshot;
+  };
 
   enum class OptionalEffectSlot : std::size_t {
     denoise = 0,
@@ -8730,6 +8905,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     want_open_cuda_vb = false;
     have_open_cuda_vb = false;
+    prepared_open_cuda_hardware_live =
+        prepared_open_cuda_hardware_owner.Snapshot().prepared;
+    prepared_open_cuda_hardware_suspended = false;
+    prepared_open_cuda_setup_attempted = false;
 
     want_open_vulkan_vb = false;
     have_open_vulkan_vb = false;
@@ -9100,6 +9279,243 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
     }
 
+    // Prepare the first production Open CUDA HAL route before the frame loop.
+    // This deliberately resolves and validates the model without constructing
+    // the legacy OpenCudaVirtualBackgroundContext. The facade owns CUDA,
+    // stream, ORT session, device buffers, execution and shutdown.
+    auto try_prepare_open_cuda_virtual_background =
+        [&](hal::SemanticEffectId semantic, std::string *setup_error) {
+          prepared_open_cuda_setup_attempted = true;
+          if (setup_error)
+            setup_error->clear();
+          const auto retire_unmatched_prepared = [&] {
+            if (prepared_open_cuda_hardware_owner.Snapshot().prepared) {
+              prepared_open_cuda_hardware_owner.Invalidate(
+                  hal::ReasonId::reconfiguration_required);
+              publish_prepared_open_cuda_status();
+            }
+            prepared_open_cuda_hardware_live = false;
+          };
+
+          PreparedOpenCudaHardwareRequest request;
+          request.effects_engine =
+              fx.engine == effects::EffectsEnginePreference::open_cuda
+                  ? PreparedOpenCudaEffectsEngineIntent::open_cuda
+                  : (fx.engine == effects::EffectsEnginePreference::maxine
+                         ? PreparedOpenCudaEffectsEngineIntent::maxine
+                         : PreparedOpenCudaEffectsEngineIntent::automatic);
+          switch (cfg.compute_backend) {
+          case ComputeBackendPreference::cpu:
+            request.compute = PreparedOpenCudaComputeIntent::cpu;
+            break;
+          case ComputeBackendPreference::cuda:
+            request.compute = PreparedOpenCudaComputeIntent::cuda;
+            break;
+          case ComputeBackendPreference::vulkan:
+            request.compute = PreparedOpenCudaComputeIntent::vulkan;
+            break;
+          case ComputeBackendPreference::auto_select:
+            request.compute = PreparedOpenCudaComputeIntent::automatic;
+            break;
+          }
+          request.requested_backend = hal::BackendId::cuda;
+          request.strict_backend_selection = true;
+          request.requested_provider =
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+          request.strict_provider_selection = true;
+          request.tensorrt_enabled = OpenCudaTensorRtEnabledFromEnv();
+          request.stage_id = static_cast<std::uint32_t>(semantic);
+          request.semantic = semantic;
+          request.semantic_stage_count = plan.ordered_effect_ids.size();
+          request.required = false;
+          request.single_resident_island = true;
+          request.contains_other_execution_domain = false;
+          request.contains_other_resident_stage =
+              plan.ordered_effect_ids.size() != 1;
+          request.request_virtual_background_replace =
+              fx.virtual_background.mode ==
+              effects::VirtualBackgroundMode::replace;
+          request.request_vignette =
+              has(effects::contract::kEffectIdVignette);
+          request.request_video_noise_removal =
+              has(effects::contract::kEffectIdVideoNoiseRemoval);
+          request.request_eye_contact =
+              has(effects::contract::kEffectIdEyeContact);
+          request.request_virtual_key_light =
+              has(effects::contract::kEffectIdVirtualKeyLight);
+          request.request_auto_frame =
+              has(effects::contract::kEffectIdAutoFrame);
+          request.request_mirror =
+              has(effects::contract::kEffectIdMirror);
+          request.shared_matte_required =
+              request.request_virtual_key_light ||
+              request.request_auto_frame;
+          request.temporal_history_required =
+              fx.virtual_background.greenscreen_temporal;
+          request.capture_width = static_cast<std::uint32_t>(capA.width);
+          request.capture_height = static_cast<std::uint32_t>(capA.height);
+          request.output_width = static_cast<std::uint32_t>(outA.width);
+          request.output_height = static_cast<std::uint32_t>(outA.height);
+          const std::size_t input_stride =
+              static_cast<std::size_t>(capA.width) * 3u;
+          const std::size_t input_bytes =
+              input_stride * static_cast<std::size_t>(capA.height);
+          const std::size_t output_stride =
+              static_cast<std::size_t>(outA.width) * 3u;
+          const std::size_t output_bytes =
+              output_stride * static_cast<std::size_t>(outA.height);
+          request.host_input_is_tight_rgb24 =
+              rgbStride == input_stride && rgb.size() == input_bytes;
+          request.host_output_is_tight_rgb24 =
+              outA.format == PixelFormat::rgb24 &&
+              outA.bytes_per_line == output_stride &&
+              outA.size_image == output_bytes;
+          request.scaling_required =
+              capA.width != outA.width || capA.height != outA.height;
+          request.output_format_conversion_required =
+              outA.format != PixelFormat::rgb24;
+          request.generations.configuration = effects_generation;
+          request.generations.geometry =
+              prepared_hardware_geometry_generation;
+          request.generations.provider = 1;
+          request.generations.device = 1;
+          request.cuda_device_id = 0;
+          request.strength = fx.virtual_background.strength;
+          std::uint32_t remove_rgb = 0;
+          (void)ParseRgbHex(fx.virtual_background.remove_color, &remove_rgb);
+          request.remove_background_rgb = {
+              static_cast<std::uint8_t>((remove_rgb >> 16u) & 0xffu),
+              static_cast<std::uint8_t>((remove_rgb >> 8u) & 0xffu),
+              static_cast<std::uint8_t>(remove_rgb & 0xffu)};
+          request.wait.timeout_nanoseconds = UINT64_C(500000000);
+          request.wait.poll_interval_nanoseconds = UINT64_C(1000000);
+          request.wait.maximum_poll_count = 500;
+          request.wait.stop_requested =
+              [](void *context) noexcept {
+                return static_cast<std::atomic_bool *>(context)->load(
+                    std::memory_order_relaxed);
+              };
+          request.wait.cancel_requested = request.wait.stop_requested;
+          request.wait.now_nanoseconds =
+              [](void *) noexcept -> std::uint64_t {
+            return static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+          };
+          request.wait.poll_wait =
+              [](void *, std::uint64_t nanoseconds) noexcept {
+            std::this_thread::sleep_for(
+                std::chrono::nanoseconds(nanoseconds));
+          };
+          request.wait.callback_context = &stop_;
+          request.declares_writer_copy_cpu_tail = true;
+
+          // Cheap structural rejection precedes model discovery and hashing.
+          PreparedOpenCudaHardwareRequest structural = request;
+          structural.generations.model = 1;
+          structural.model_pack.registry_generation = 1;
+          structural.model_pack.task = "matting";
+          structural.model_pack.matting =
+              studiocast::open_video::MattingSpec{};
+          structural.model_pack.matting->input = {
+              "input", "nchw", "float32", 1, 1, 3};
+          structural.model_pack.matting->output = {
+              "alpha", "alpha", "float32", "", 0, 0, 0};
+          structural.model_pack.matting->preprocess.color = "rgb";
+          structural.model_pack.matting->preprocess.range = "0..1";
+          structural.model_pack.files.push_back({});
+          structural.model_artifact.registry_generation = 1;
+          structural.model_artifact.model_id_sha256[0] = 1;
+          structural.model_artifact.manifest_sha256[0] = 1;
+          structural.model_artifact.artifact_sha256[0] = 1;
+          structural.model_artifact.artifact_set_sha256[0] = 1;
+          structural.model_pack.registry_manifest_sha256 =
+              structural.model_artifact.manifest_sha256;
+          structural.capacity = {1, 1, input_bytes, output_bytes, 1, 1};
+          const auto structural_eligibility =
+              EvaluatePreparedOpenCudaHardwareEligibility(structural);
+          if (structural_eligibility !=
+              PreparedOpenCudaHardwareEligibility::eligible) {
+            retire_unmatched_prepared();
+            if (setup_error)
+              *setup_error =
+                  "Prepared Open CUDA HAL route is ineligible for this "
+                  "configuration.";
+            return false;
+          }
+
+          const auto registry =
+              studiocast::open_video::ModelPackRegistry::ScanDefault();
+          std::string model_id = fx.virtual_background.model_id;
+          if (model_id.empty())
+            model_id = registry.DefaultModelIdForTask("matting");
+          const auto pack = registry.Find("matting", model_id);
+          if (!pack.has_value()) {
+            retire_unmatched_prepared();
+            if (setup_error)
+              *setup_error =
+                  "Prepared Open CUDA HAL model pack is unavailable.";
+            return false;
+          }
+          const auto *artifact = FindPreparedOpenCudaMainOnnx(*pack);
+          if (!artifact) {
+            retire_unmatched_prepared();
+            if (setup_error)
+              *setup_error =
+                  "Prepared Open CUDA HAL model has no ONNX artifact.";
+            return false;
+          }
+          const auto validation =
+              studiocast::open_video::ValidateModelArtifactIdentity(
+                  *pack, *artifact);
+          if (!validation.ok()) {
+            retire_unmatched_prepared();
+            if (setup_error) {
+              *setup_error =
+                  "Prepared Open CUDA HAL model artifact validation failed";
+              if (!validation.detail.empty())
+                *setup_error += ": " + validation.detail;
+            }
+            return false;
+          }
+          request.model_pack = *pack;
+          request.model_artifact = validation.identity;
+          request.generations.model = pack->registry_generation;
+          const auto &matting = *pack->matting;
+          if (!BuildPreparedOpenCudaPipelineResourceBudget(
+                  request.capture_width, request.capture_height,
+                  static_cast<std::uint32_t>(matting.input.width),
+                  static_cast<std::uint32_t>(matting.input.height), semantic,
+                  request.strength, &request.capacity)) {
+            retire_unmatched_prepared();
+            if (setup_error)
+              *setup_error =
+                  "Prepared Open CUDA HAL resource budget is invalid.";
+            return false;
+          }
+
+          prepared_open_cuda_rgb_output.resize(output_bytes);
+          const auto setup =
+              prepared_open_cuda_hardware_owner.Configure(request);
+          publish_prepared_open_cuda_status();
+          if (setup.route != PreparedOpenCudaHardwareRoute::hal_live) {
+            if (setup_error) {
+              *setup_error =
+                  "Prepared Open CUDA HAL setup failed [" +
+                  std::string(PreparedHardwareReasonCode(setup.reason)) +
+                  "].";
+            }
+            return false;
+          }
+          prepared_open_cuda_hardware_live = true;
+          prepared_open_cuda_hardware_suspended = false;
+          // A prior compatibility generation may have owned a legacy
+          // CUDA/ORT session. It cannot coexist with the prepared island.
+          open_cuda_vb.Destroy();
+          return true;
+        };
+
     // Background effects.
     if (vb_requested) {
       const auto vb_mode = fx.virtual_background.mode;
@@ -9184,12 +9600,33 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                                   EffectsEnginePreference::open_cuda) {
         want_open_cuda_vb = true;
         std::string oc_err;
-        if (open_cuda_vb.EnsureInitialized(capA.width, capA.height, fx,
-                                           &oc_err)) {
+        hal::SemanticEffectId prepared_semantic =
+            hal::SemanticEffectId::invalid;
+        if (vb_mode ==
+            studiocast::video::effects::VirtualBackgroundMode::blur) {
+          prepared_semantic =
+              hal::SemanticEffectId::virtual_background_blur;
+        } else if (
+            vb_mode ==
+            studiocast::video::effects::VirtualBackgroundMode::remove) {
+          prepared_semantic =
+              hal::SemanticEffectId::virtual_background_remove;
+        }
+        const bool prepared_live =
+            prepared_semantic != hal::SemanticEffectId::invalid &&
+            try_prepare_open_cuda_virtual_background(prepared_semantic,
+                                                     &oc_err);
+        if (prepared_live) {
           have_open_cuda_vb = true;
           if (vb_effect_id.has_value())
             set_backend(*vb_effect_id, "open_cuda");
-          append_backend_note("Open CUDA");
+          append_backend_note("Open CUDA HAL");
+        } else if (open_cuda_vb.EnsureInitialized(
+                       capA.width, capA.height, fx, &oc_err)) {
+          have_open_cuda_vb = true;
+          if (vb_effect_id.has_value())
+            set_backend(*vb_effect_id, "open_cuda");
+          append_backend_note("Open CUDA compatibility");
         } else {
           if (!note.empty())
             note += "\n";
@@ -9897,6 +10334,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       } else if (!prepared_hardware_final_live) {
         remove_stage_from_plan(stage_id);
       }
+    }
+
+    if (!prepared_open_cuda_setup_attempted &&
+        prepared_open_cuda_hardware_owner.Snapshot().prepared) {
+      prepared_open_cuda_hardware_owner.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+      prepared_open_cuda_hardware_live = false;
+      publish_prepared_open_cuda_status();
     }
 
     auto prepared_frame_plan =
@@ -10642,6 +11087,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       have_open_vulkan_mirror = false;
       publish_prepared_hardware_status();
     }
+    if (prepared_open_cuda_hardware_live) {
+      prepared_open_cuda_hardware_owner.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+      prepared_open_cuda_hardware_live = false;
+      prepared_open_cuda_hardware_suspended = false;
+      publish_prepared_open_cuda_status();
+    }
     ++prepared_hardware_geometry_generation;
     if (prepared_hardware_geometry_generation == 0)
       prepared_hardware_geometry_generation = 1;
@@ -10865,6 +11317,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     bool prepared_hardware_completion_pending = false;
     hal::CompletionToken prepared_maxine_completion{};
     bool prepared_maxine_completion_pending = false;
+    hal::CompletionToken prepared_open_cuda_completion{};
+    bool prepared_open_cuda_completion_pending = false;
+    bool prepared_open_cuda_output_ready = false;
     bool open_cuda_gpu_frame_pending_cpu_readback = false;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
     bool open_vulkan_vignette_attempt_this_frame = false;
@@ -11997,6 +12452,78 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
           if (have_open_cuda_vb) {
             open_cuda_vb_ran_this_frame = true;
+            if (prepared_open_cuda_hardware_live) {
+              // The prepared facade is the sole live executor for this
+              // qualified generation. Never retry through the legacy context
+              // in the same frame.
+              if (prepared_open_cuda_hardware_suspended)
+                return;
+              auto &breaker =
+                  optional_breaker(OptionalEffectSlot::virtual_background);
+              if (!breaker.AllowsAttempt(capture_sequence))
+                return;
+              const std::size_t tight_stride =
+                  static_cast<std::size_t>(capA.width) * 3u;
+              const std::size_t tight_bytes =
+                  tight_stride * static_cast<std::size_t>(capA.height);
+              const auto prepared_frame =
+                  prepared_open_cuda_hardware_owner.ExecuteHostFrame(
+                      rgb.data(), rgb.size(), rgbStride,
+                      prepared_open_cuda_rgb_output.data(), tight_bytes,
+                      tight_stride, capture_sequence);
+              publish_prepared_open_cuda_status();
+              prepared_open_cuda_completion = prepared_frame.completion;
+              prepared_open_cuda_completion_pending =
+                  prepared_frame.completion_pending;
+              const bool exact_transfer_shape =
+                  prepared_frame.transfers.uploads == 1 &&
+                  prepared_frame.transfers.final_readbacks == 1 &&
+                  prepared_frame.transfers.intermediate_uploads == 0 &&
+                  prepared_frame.transfers.intermediate_readbacks == 0 &&
+                  prepared_frame.transfers.synchronizations == 1 &&
+                  prepared_frame.transfers.cpu_tail_boundaries == 1;
+              prepared_open_cuda_output_ready =
+                  prepared_frame.output_ready && exact_transfer_shape &&
+                  prepared_frame.output ==
+                      prepared_open_cuda_rgb_output.data() &&
+                  prepared_frame.output_size_bytes == tight_bytes &&
+                  prepared_frame.output_row_stride_bytes == tight_stride;
+              if (prepared_open_cuda_output_ready) {
+                open_cuda_frame_upload_calls +=
+                    prepared_frame.transfers.uploads;
+                open_cuda_rgb_download_calls +=
+                    prepared_frame.transfers.final_readbacks;
+                open_cuda_final_download_calls +=
+                    prepared_frame.transfers.final_readbacks;
+                open_cuda_forced_sync_calls +=
+                    prepared_frame.transfers.synchronizations;
+                open_cuda_cpu_tail_stage_calls +=
+                    prepared_frame.transfers.cpu_tail_boundaries;
+                return;
+              }
+              if (prepared_open_cuda_completion_pending) {
+                hal::ReasonId commit_reason = hal::ReasonId::none;
+                (void)prepared_open_cuda_hardware_owner.CommitOutput(
+                    prepared_open_cuda_completion, false, &commit_reason);
+                prepared_open_cuda_completion_pending = false;
+              }
+              if (prepared_frame.reason == hal::ReasonId::device_lost) {
+                prepared_open_cuda_hardware_owner.ObserveDeviceLoss();
+              }
+              prepared_open_cuda_hardware_suspended =
+                  PreparedOpenCudaPipelineShouldSuspend(
+                      prepared_frame.status, prepared_frame.reason);
+              publish_prepared_open_cuda_status();
+              block_optional_effect(
+                  OptionalEffectSlot::virtual_background, stage_id,
+                  "open_cuda",
+                  "Prepared Open CUDA HAL runtime failure [" +
+                      std::string(
+                          PreparedHardwareReasonCode(prepared_frame.reason)) +
+                      "].",
+                  capture_sequence);
+              return;
+            }
             // If the Open CUDA key light stage was deferred earlier in the
             // chain (to avoid a redundant CPU->GPU upload for matting), apply
             // it here immediately after the Open CUDA VB stage finishes (or is
@@ -13190,6 +13717,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     const std::uint8_t *rgbOut = rgb.data();
     std::size_t rgbOutStride = rgbStride;
     std::size_t rgbOutBytes = rgb.size();
+    if (prepared_open_cuda_output_ready) {
+      rgbOut = prepared_open_cuda_rgb_output.data();
+      rgbOutStride = static_cast<std::size_t>(capA.width) * 3u;
+      rgbOutBytes = prepared_open_cuda_rgb_output.size();
+    }
 
     if (prepared_hardware_final_live &&
         !prepared_hardware_runtime_suspended) {
@@ -14152,6 +14684,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             prepared_maxine_completion_pending = false;
             committed &= status == hal::StatusId::ready;
           }
+          if (prepared_open_cuda_completion_pending) {
+            hal::ReasonId reason = hal::ReasonId::none;
+            const hal::StatusId status =
+                prepared_open_cuda_hardware_owner.CommitOutput(
+                    prepared_open_cuda_completion, output_write_succeeded,
+                    &reason);
+            prepared_open_cuda_completion_pending = false;
+            publish_prepared_open_cuda_status();
+            committed &= status == hal::StatusId::ready;
+          }
           return committed;
         };
 
@@ -14283,8 +14825,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         prepared_hardware_completion_pending;
     const bool had_prepared_maxine_completion =
         prepared_maxine_completion_pending;
+    const bool had_prepared_open_cuda_completion =
+        prepared_open_cuda_completion_pending;
     if (had_prepared_vulkan_completion ||
-        had_prepared_maxine_completion) {
+        had_prepared_maxine_completion ||
+        had_prepared_open_cuda_completion) {
       if (!finish_prepared_hardware_frame(true)) {
         live_effect_attribution.DiscardFrame();
         std::lock_guard<std::mutex> lock(mu_);
@@ -14412,6 +14957,55 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         if (maxine_effect_succeeded) {
           (void)MarkGpuBackendActiveFrame(maxine_active_this_frame,
                                           maxine_active_frames);
+        }
+      }
+      if (had_prepared_open_cuda_completion) {
+        const auto snapshot =
+            prepared_open_cuda_hardware_owner.Snapshot();
+        const auto &committed = snapshot.latest_committed_frame;
+        const auto &active_program = snapshot.active_program;
+        if (!committed.valid ||
+            committed.program_id != active_program.program_id ||
+            committed.invalidation_key !=
+                active_program.invalidation_key ||
+            committed.execution_domain !=
+                active_program.execution_domain ||
+            committed.stage_count != 1) {
+          live_effect_attribution.DiscardFrame();
+          std::lock_guard<std::mutex> lock(mu_);
+          last_error_ =
+              "Prepared Open CUDA HAL committed attribution is stale.";
+          break;
+        }
+        const auto &stage = committed.stages[0];
+        std::string_view effect_id;
+        if (stage.semantic ==
+            hal::SemanticEffectId::virtual_background_blur) {
+          effect_id = effects::contract::kEffectIdVirtualBackgroundBlur;
+        } else if (stage.semantic ==
+                   hal::SemanticEffectId::virtual_background_remove) {
+          effect_id = effects::contract::kEffectIdVirtualBackgroundRemove;
+        }
+        if (PreparedOpenCudaPipelineMayCommitAttribution(
+                stage.status, write_result.FrameCommitted(),
+                hal::StatusId::ready) &&
+            !effect_id.empty()) {
+          mark_open_cuda_active_frame();
+          clear_optional_effect_on_success(
+              optional_breaker(OptionalEffectSlot::virtual_background),
+              f.sequence);
+          mark_live_effect_success(effect_id, "open_cuda");
+        } else if (
+            stage.status ==
+                hal::StageExecutionStatus::optional_failed_open &&
+            !effect_id.empty()) {
+          block_optional_effect(
+              OptionalEffectSlot::virtual_background, effect_id,
+              "open_cuda",
+              "Prepared Open CUDA HAL optional stage failed open [" +
+                  std::string(PreparedHardwareReasonCode(stage.reason)) +
+                  "].",
+              f.sequence);
         }
       }
     }
@@ -14867,6 +15461,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   open_cuda_curr = nullptr;
   open_cuda_next = nullptr;
   open_cuda_uploaded_this_frame = false;
+
+  prepared_open_cuda_hardware_owner.Shutdown();
+  for (int attempt = 0;
+       attempt < 8 &&
+       prepared_open_cuda_hardware_owner.Snapshot().shutdown_pending;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    prepared_open_cuda_hardware_owner.Shutdown();
+  }
+  publish_prepared_open_cuda_status();
 
   {
     std::lock_guard<std::mutex> lock(mu_);

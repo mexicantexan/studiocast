@@ -20,6 +20,7 @@
 #include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/prepared_hardware_execution_owner.h"
 #include "core/video/prepared_maxine_hardware_execution_owner.h"
+#include "core/video/prepared_open_cuda_hardware_execution_owner.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
@@ -87,6 +88,20 @@ std::string ResolveActiveComputeBackendName(
     bool vulkan_compute_available);
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
+
+// Pure setup/commit seams for the first live Open CUDA migration. Budget
+// construction uses conservative checked pitch bounds; the executor replaces
+// them with exact allocation evidence before publishing readiness.
+bool BuildPreparedOpenCudaPipelineResourceBudget(
+    std::uint32_t frame_width, std::uint32_t frame_height,
+    std::uint32_t model_width, std::uint32_t model_height,
+    hal::SemanticEffectId semantic, int strength,
+    hal::ResourceBudget *budget) noexcept;
+bool PreparedOpenCudaPipelineMayCommitAttribution(
+    hal::StageExecutionStatus stage_status, bool writer_frame_committed,
+    hal::StatusId output_commit_status) noexcept;
+bool PreparedOpenCudaPipelineShouldSuspend(
+    hal::StatusId status, hal::ReasonId reason) noexcept;
 
 inline constexpr std::size_t kMaxPreparedMaxineResidentIslands = 9;
 
@@ -556,6 +571,12 @@ struct CameraPipelineStatus {
   // Typed status for the bounded prepared-hardware migration. GET_STATUS
   // publishes it additively without changing the existing daemon IPC fields.
   PreparedHardwareExecutionSnapshot prepared_hardware_execution{};
+  // Internal cached typed shadow for the prepared Open CUDA migration. The
+  // current GET_STATUS serializer intentionally does not consume this field,
+  // so legacy IPC bytes remain unchanged until a separately versioned status
+  // integration.
+  PreparedOpenCudaHardwareExecutionSnapshot
+      prepared_open_cuda_hardware_execution{};
 
   std::string last_error;
 };
@@ -694,6 +715,8 @@ private:
   CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
   PreparedHardwareExecutionSnapshot prepared_hardware_execution_{};
+  PreparedOpenCudaHardwareExecutionSnapshot
+      prepared_open_cuda_hardware_execution_{};
 
   // Effects: updated live by SetEffects.
   //
