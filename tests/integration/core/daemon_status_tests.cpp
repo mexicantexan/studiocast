@@ -2606,6 +2606,7 @@ bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
   manager.readiness.available = true;
   manager.resident.prepared = true;
   manager.resident.readiness = manager.readiness;
+  manager.resident.telemetry.runtime_status = hal::StatusId::executed;
   manager.resident.plan.plan_id = 41;
   manager.resident.plan.prepared_program.program_id = 41;
   manager.resident.plan.prepared_program.owner_adapter_instance_id = 23;
@@ -2667,6 +2668,34 @@ bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
              "typed manager selection/commit must override contradictory "
              "legacy diagnostics and stale compatibility fields");
 
+  auto &cpuMirror = status.pipeline.cpu_primitive_tail_activity;
+  cpuMirror.valid = true;
+  cpuMirror.active = true;
+  cpuMirror.status = hal::StatusId::executed;
+  cpuMirror.writer_commit = {true, 101, 700};
+  cpuMirror.attempts = 1;
+  cpuMirror.successes = 1;
+  status.pipeline.debug.capture_sequence = 101;
+  status.pipeline.debug.output_frames_committed = 700;
+  const std::string mixedStatus = StatusForVideoStateWithDiagnostics(
+      status, config, "", contradictoryOpenCuda, contradictoryVulkan);
+  const ComputeFields mixed = ComputeFieldsFor(mixedStatus);
+  ok &= Expect(
+      mixed.active == "cuda" && mixed.provider_mode == "open_cuda" &&
+          mixed.active_provider == "CUDAExecutionProvider" &&
+          PipelineEffectsBackendsFor(mixedStatus) ==
+              "virtual_background.blur:open_cuda,mirror:cpu",
+      "coherent resident and CPU primitive commits must merge without a CPU "
+      "semantic provider");
+  cpuMirror.writer_commit.capture_sequence = 100;
+  ok &= Expect(
+      PipelineEffectsBackendsFor(StatusForVideoStateWithDiagnostics(
+          status, config, "", contradictoryOpenCuda,
+          contradictoryVulkan)) ==
+          "virtual_background.blur:open_cuda",
+      "foreign-capture CPU mirror must not merge with resident activity");
+  cpuMirror = {};
+
   // Automatic requests intentionally have no exact requested BackendId. A
   // completed manager setup still owns selection and committed attribution.
   manager.readiness.requested_backend = hal::BackendId::invalid;
@@ -2694,6 +2723,25 @@ bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
   config.pipeline.compute_backend = video::ComputeBackendPreference::cuda;
   config.pipeline.effects.engine =
       video::effects::EffectsEnginePreference::open_cuda;
+
+  manager.resident.telemetry.runtime_status = hal::StatusId::failed;
+  const std::string failedRuntimeStatus =
+      StatusForVideoStateWithDiagnostics(status, config, "",
+                                         contradictoryOpenCuda,
+                                         contradictoryVulkan);
+  ok &= Expect(
+      ComputeFieldsFor(failedRuntimeStatus).active.empty() &&
+          PipelineEffectsBackendsFor(failedRuntimeStatus).empty(),
+      "stale manager commit must become inactive after runtime failure");
+  manager.resident.telemetry.runtime_status = hal::StatusId::executed;
+  manager.resident.quarantined = true;
+  ok &= Expect(
+      ComputeFieldsFor(StatusForVideoStateWithDiagnostics(
+                           status, config, "", contradictoryOpenCuda,
+                           contradictoryVulkan))
+          .active.empty(),
+      "stale manager commit must become inactive after quarantine");
+  manager.resident.quarantined = false;
 
   // A successful-looking commit from a different queue/domain may not provide
   // active attribution for the selected manager program.
@@ -2742,6 +2790,54 @@ bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
                "typed strict-backend blocker must remain authoritative over "
                "legacy availability evidence");
   return ok;
+}
+
+bool TestTypedCpuMirrorIsPrimitiveEvidenceNotProviderCapability() {
+  namespace hal = studiocast::hal;
+  namespace video = studiocast::video;
+  video::VirtualCameraServiceStatus status;
+  status.service_running = true;
+  status.virtual_device_present = true;
+  status.virtual_device_available = true;
+  status.pipeline_state = "running";
+  status.pipeline.running = true;
+  status.pipeline.debug.capture_sequence = 41;
+  status.pipeline.debug.output_frames_committed = 71;
+  auto &manager = status.pipeline.production_backend;
+  manager.state =
+      video::ProductionVideoBackendManagerState::cpu_primitives_only;
+  manager.status = hal::StatusId::ready;
+  manager.setup_attempts = 1;
+  manager.setup_successes = 1;
+  manager.setup_complete = true;
+  manager.readiness.status = hal::StatusId::ready;
+  manager.readiness.selected_backend = hal::BackendId::cpu;
+  manager.readiness.available = true;
+  auto &tail = status.pipeline.cpu_primitive_tail_activity;
+  tail.valid = true;
+  tail.active = true;
+  tail.status = hal::StatusId::executed;
+  tail.writer_commit = {true, 41, 71};
+  tail.attempts = 3;
+  tail.successes = 2;
+  tail.fail_open_frames = 1;
+  video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.effects.mirror = true;
+  config.pipeline.compute_backend = video::ComputeBackendPreference::cpu;
+  const std::string json =
+      StatusForVideoStateWithDiagnostics(status, config, "", "", "");
+  const ComputeFields compute = ComputeFieldsFor(json);
+  const ReadinessFields mirror = ReadinessEntryFor(json, "mirror");
+  return Expect(PipelineEffectsBackendsFor(json) == "mirror:cpu",
+                "typed CPU mirror must publish exact live attribution") &&
+         Expect(compute.active == "cpu" &&
+                    compute.active_engine_count == 0 &&
+                    compute.provider_mode.empty() &&
+                    compute.active_provider.empty(),
+                "CPU primitive must not become a semantic provider") &&
+         Expect(mirror.present && mirror.state != "ready",
+                "CPU primitive must not promote product mirror capability");
 }
 
 bool TestAudioStatusReportsResolvedSourceAndWarnings() {
@@ -2887,6 +2983,7 @@ int main() {
   ok = TestUnavailableVulkanRequestUsesRequestedEffectBlocker() && ok;
   ok = TestVersionedVideoHalStatusAndLegacyByteStability() && ok;
   ok = TestTypedManagerStatusOverridesLegacyDiagnosticResolution() && ok;
+  ok = TestTypedCpuMirrorIsPrimitiveEvidenceNotProviderCapability() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;
   return ok ? 0 : 1;

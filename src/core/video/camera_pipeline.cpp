@@ -540,12 +540,9 @@ ProductionVideoBackendSetupRequest BuildSetupRequest(
                : hal::FrameDropBehavior::latest_frame_wins;
   plan.temporal.discontinuity_action =
       hal::TemporalDiscontinuityAction::reset_and_continue;
-  plan.cpu_tails[0].id =
-      output_format == PixelFormat::rgb24
-          ? hal::CpuTailId::writer_copy
-          : hal::CpuTailId::output_format_conversion;
+  plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
   plan.cpu_tails[0].after_stage_id =
-      static_cast<std::uint32_t>(plan.intent.stage_count);
+      plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id;
   plan.cpu_tails[0].required = true;
   plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
   plan.cpu_tails[0].boundary_index =
@@ -1548,6 +1545,66 @@ void LiveEffectBackendAttribution::SerializeActive() {
   }
 }
 
+void CpuPrimitiveTailActivityTracker::BeginFrame(
+    std::uint64_t capture_sequence) noexcept {
+  pending_capture_sequence_ = capture_sequence;
+  pending_elapsed_ns_ = 0;
+  pending_attempted_ = false;
+  pending_succeeded_ = false;
+}
+
+void CpuPrimitiveTailActivityTracker::RecordMirrorResult(
+    bool succeeded, std::uint64_t elapsed_ns) noexcept {
+  if (pending_capture_sequence_ == 0 || pending_attempted_)
+    return;
+  pending_attempted_ = true;
+  pending_succeeded_ = succeeded;
+  pending_elapsed_ns_ = elapsed_ns;
+  ++attempts_;
+  if (succeeded)
+    ++successes_;
+  else
+    ++fail_open_frames_;
+}
+
+void CpuPrimitiveTailActivityTracker::DiscardFrame() noexcept {
+  pending_capture_sequence_ = 0;
+  pending_elapsed_ns_ = 0;
+  pending_attempted_ = false;
+  pending_succeeded_ = false;
+}
+
+bool CpuPrimitiveTailActivityTracker::CommitSuccessfulWriter(
+    std::uint64_t output_commit_sequence) noexcept {
+  if (pending_capture_sequence_ == 0 || output_commit_sequence == 0 ||
+      (committed_.writer_commit.valid &&
+       output_commit_sequence <=
+           committed_.writer_commit.output_commit_sequence)) {
+    DiscardFrame();
+    return false;
+  }
+  CpuPrimitiveTailActivityRecord next;
+  next.valid = true;
+  next.active = pending_attempted_ && pending_succeeded_;
+  next.status = !pending_attempted_
+                    ? hal::StatusId::passthrough
+                    : (pending_succeeded_ ? hal::StatusId::executed
+                                          : hal::StatusId::degraded);
+  next.reason =
+      pending_attempted_ && !pending_succeeded_
+          ? hal::ReasonId::optional_stage_failed_open
+          : hal::ReasonId::none;
+  next.writer_commit = {
+      true, pending_capture_sequence_, output_commit_sequence};
+  next.elapsed_ns = pending_elapsed_ns_;
+  next.attempts = attempts_;
+  next.successes = successes_;
+  next.fail_open_frames = fail_open_frames_;
+  committed_ = next;
+  DiscardFrame();
+  return true;
+}
+
 int OptionalEffectBreaker::CooldownFramesForFailureCount(int failure_count) {
   if (failure_count <= 0)
     return 0;
@@ -1719,6 +1776,9 @@ CameraPipelineStatus CameraPipeline::Status() const {
   status.cpu_primitive_tails =
       running_ ? cpu_primitive_tails_
                : CameraPipelineStatus::CpuPrimitiveTails{};
+  status.cpu_primitive_tail_activity =
+      running_ ? cpu_primitive_tail_activity_
+               : CpuPrimitiveTailActivityRecord{};
   status.production_backend = production_backend_;
   status.video_hal_status = video_hal_status_;
   status.effects_backends =
@@ -1793,6 +1853,7 @@ bool CameraPipeline::Start(const CameraPipelineConfig &config,
   open_vulkan_transfers_ = {};
   maxine_transfers_ = {};
   cpu_primitive_tails_ = {};
+  cpu_primitive_tail_activity_ = {};
   production_backend_ = {};
   effects_backends_.clear();
   effects_note_.clear();
@@ -2156,6 +2217,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
   EffectsFramePreparationCounters preparation_counters;
   LiveEffectBackendAttribution attribution;
   CameraPipelineStatus::CpuPrimitiveTails cpu_primitive_tails;
+  CpuPrimitiveTailActivityTracker cpu_tail_activity;
   std::uint64_t last_sequence = 0;
   int dropped_frames = 0;
   int frame_index = 0;
@@ -2188,6 +2250,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
     open_vulkan_transfers_ = vulkan;
     maxine_transfers_ = maxine;
     cpu_primitive_tails_ = cpu_primitive_tails;
+    cpu_primitive_tail_activity_ = cpu_tail_activity.snapshot();
     video_hal_status_ =
         validation.code == MultiIslandStatusValidationCode::valid
             ? typed_status
@@ -2282,6 +2345,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
       break;
     dropped_frames += dropped;
     last_sequence = frame.sequence;
+    cpu_tail_activity.BeginFrame(frame.sequence);
     const auto capture_start = Clock::now();
     if (raw_yuyv_plan.eligible &&
         effects_generation_published_.load(std::memory_order_acquire) ==
@@ -2302,6 +2366,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
       const auto write_result = writer_.WriteFrameDetailed(
           output_buffer.data(), output_buffer.size(), &stop_);
       if (!write_result.FrameCommitted()) {
+        cpu_tail_activity.DiscardFrame();
         if (write_result.status == FrameWriteStatus::would_block_dropped)
           continue;
         if (write_result.status == FrameWriteStatus::stopped)
@@ -2310,6 +2375,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
         last_error_ = "Raw passthrough output write failed.";
         break;
       }
+      (void)cpu_tail_activity.CommitSuccessfulWriter(
+          writer_.WriteCounters().frames_written);
       write_average.Add(ToMs(Clock::now() - write_start));
       const auto frame_end = Clock::now();
       if (have_previous_frame) {
@@ -2475,12 +2542,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
                  CpuPrimitiveResult::success;
       }
       const auto mirror_elapsed = Clock::now() - mirror_start;
+      const auto mirror_elapsed_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              mirror_elapsed)
+              .count());
       primitive_tail_ms = ToMs(mirror_elapsed);
-      cpu_primitive_tails.mirror_elapsed_ns +=
-          static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  mirror_elapsed)
-                  .count());
+      cpu_primitive_tails.mirror_elapsed_ns += mirror_elapsed_ns;
       if (copied) {
         ++cpu_primitive_tails.mirror_successes;
         rgb_output = mirror_output.data();
@@ -2494,6 +2561,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
         // or suppressing unrelated stages.
         ++cpu_primitive_tails.mirror_fail_open_frames;
       }
+      cpu_tail_activity.RecordMirrorResult(copied, mirror_elapsed_ns);
     }
     effects_average.Add(resident_effect_ms + primitive_tail_ms);
 
@@ -2555,6 +2623,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
     }
     if (!written) {
       attribution.DiscardFrame();
+      cpu_tail_activity.DiscardFrame();
       if (write_result.status == FrameWriteStatus::would_block_dropped)
         continue;
       if (write_result.status == FrameWriteStatus::stopped)
@@ -2563,6 +2632,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
       last_error_ = "Output write failed.";
       break;
     }
+    (void)cpu_tail_activity.CommitSuccessfulWriter(
+        writer_.WriteCounters().frames_written);
 
     backend_snapshot = backend_manager.Snapshot();
     const auto *committed =

@@ -347,9 +347,12 @@ public:
     program.strict_execution_domain = true;
     program.requires_upload = true;
     program.requires_final_readback = true;
+    program.cpu_tail_count = request.cpu_tail_count;
+    for (std::size_t index = 0; index < request.cpu_tail_count; ++index)
+      program.cpu_tails[index] = request.cpu_tails[index];
     program.stage_count = 1;
     auto &stage = program.stages[0];
-    stage.stage_id = 1;
+    stage.stage_id = request.intent.stages[0].intent.stage_id;
     stage.semantic = hal::SemanticEffectId::virtual_background_blur;
     stage.model = request.intent.stages[0].model;
     stage.provider = result.provider;
@@ -495,6 +498,16 @@ enum class SourceMode {
   single_domain_fabricated_transfer,
 };
 
+enum class SourceTailMode {
+  preserve,
+  writer_copy,
+  output_format_conversion,
+  provider_postprocess,
+  no_tail,
+  wrong_tail,
+  altered_boundary,
+};
+
 class FakeSetupSource final : public video::IProductionVideoBackendSetupSource {
 public:
   explicit FakeSetupSource(Counters *counters) : counters_(counters) {}
@@ -519,6 +532,34 @@ public:
     result.plan.budget = Plan().budget;
     result.plan.invalidation_key.execution_domain_hash =
         video::ProductionVideoExecutionDomainHash(Domain());
+    if (tail_mode == SourceTailMode::no_tail) {
+      result.plan.cpu_tails = {};
+      result.plan.cpu_tail_count = 0;
+    } else if (result.plan.cpu_tail_count == 1) {
+      auto &tail = result.plan.cpu_tails[0];
+      switch (tail_mode) {
+      case SourceTailMode::preserve:
+        break;
+      case SourceTailMode::writer_copy:
+        tail.id = hal::CpuTailId::writer_copy;
+        break;
+      case SourceTailMode::output_format_conversion:
+        tail.id = hal::CpuTailId::output_format_conversion;
+        break;
+      case SourceTailMode::provider_postprocess:
+        tail.id = hal::CpuTailId::provider_postprocess;
+        break;
+      case SourceTailMode::wrong_tail:
+        tail.id = hal::CpuTailId::auto_frame_tracking;
+        break;
+      case SourceTailMode::altered_boundary:
+        tail.id = hal::CpuTailId::writer_copy;
+        --tail.boundary_index;
+        break;
+      case SourceTailMode::no_tail:
+        break;
+      }
+    }
     if (mode == SourceMode::malformed_returned_plan)
       ++result.plan.plan_id;
     if (mode == SourceMode::foreign_returned_domain) {
@@ -595,6 +636,7 @@ public:
   }
 
   SourceMode mode = SourceMode::ready;
+  SourceTailMode tail_mode = SourceTailMode::preserve;
 
 private:
   Counters *counters_ = nullptr;
@@ -734,6 +776,78 @@ bool TestPreparedExecutionAndWriterGatedCommit() {
   ok &= Require(counters.source_calls == 1 && counters.execute_calls == 2 &&
                     counters.commit_calls == 2,
                 "frame calls must not perform setup or discovery");
+  return ok;
+}
+
+video::ProductionVideoBackendSetupRequest BackendResolvedTailRequest() {
+  auto request = ResidentRequest();
+  auto &plan = request.resident.plan;
+  plan.intent.stages[0].intent.stage_id = 2;
+  plan.cpu_tail_count = 1;
+  plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
+  plan.cpu_tails[0].after_stage_id = 2;
+  plan.cpu_tails[0].required = true;
+  plan.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  plan.cpu_tails[0].boundary_index = 1;
+  return request;
+}
+
+bool TestSetupOnlyOutputTailRefinementIsExact() {
+  Counters counters;
+  auto source = std::make_unique<FakeSetupSource>(&counters);
+  auto *raw_source = source.get();
+  raw_source->mode = SourceMode::single_domain_compatibility;
+  video::ProductionVideoBackendManager manager(std::move(source));
+  const auto request = BackendResolvedTailRequest();
+  video::ProductionVideoBackendSetupEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+
+  raw_source->tail_mode = SourceTailMode::writer_copy;
+  const auto writer_status = manager.Setup(request, &evidence, &reason);
+  bool ok = Require(
+      writer_status == hal::StatusId::ready &&
+          manager.Snapshot().compatibility_topology.domain_count == 1 &&
+          raw_source->tail_mode == SourceTailMode::writer_copy &&
+          request.resident.plan.cpu_tails[0].id ==
+              hal::CpuTailId::backend_resolved_output &&
+          evidence.candidate_setup_only &&
+          manager.Snapshot().compatibility.prepared &&
+          manager.Snapshot().compatibility.status == hal::StatusId::ready &&
+          manager.Snapshot().readiness.available &&
+          manager.Snapshot().state ==
+              video::ProductionVideoBackendManagerState::compatibility_ready,
+      "non-ordinal terminal marker must refine to writer_copy");
+  raw_source->tail_mode = SourceTailMode::output_format_conversion;
+  ok &= Require(
+      manager.Setup(request, &evidence, &reason) == hal::StatusId::ready &&
+          manager.Snapshot().state ==
+              video::ProductionVideoBackendManagerState::compatibility_ready,
+      "terminal marker must refine to output conversion");
+  raw_source->tail_mode = SourceTailMode::provider_postprocess;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::ready,
+                "terminal marker must refine to provider postprocess");
+  raw_source->tail_mode = SourceTailMode::no_tail;
+  ok &= Require(
+      manager.Setup(request, &evidence, &reason) == hal::StatusId::ready &&
+          manager.Snapshot().compatibility_topology.boundary_count == 0,
+      "Vulkan-style zero-tail refinement must be accepted");
+  raw_source->tail_mode = SourceTailMode::preserve;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract,
+                "setup marker must not reach prepared execution");
+  raw_source->tail_mode = SourceTailMode::wrong_tail;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract,
+                "unapproved tail refinement must fail closed");
+  raw_source->tail_mode = SourceTailMode::altered_boundary;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract,
+                "tail refinement must preserve terminal placement");
   return ok;
 }
 
@@ -1010,6 +1124,7 @@ int main() {
   bool ok = true;
   ok &= TestCpuPrimitiveOnlyIsExplicitAndNonSemantic();
   ok &= TestPreparedExecutionAndWriterGatedCommit();
+  ok &= TestSetupOnlyOutputTailRefinementIsExact();
   ok &= TestSourceBindsDefaultModelWithinCallerBudget();
   ok &= TestMalformedStaleWrongDomainAndStrictSubstitution();
   ok &= TestInvalidationAndRetryableShutdownAreTyped();

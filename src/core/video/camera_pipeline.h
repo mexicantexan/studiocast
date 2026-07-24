@@ -167,6 +167,50 @@ private:
   std::string active_backends_;
 };
 
+inline constexpr std::uint32_t kCpuPrimitiveTailActivityVersion = 1;
+
+struct CpuPrimitiveTailActivityRecord {
+  std::uint32_t contract_version = kCpuPrimitiveTailActivityVersion;
+  bool valid = false;
+  bool active = false;
+  hal::CpuTailId cpu_tail = hal::CpuTailId::cpu_primitive_mirror;
+  hal::PrimitiveOperationId primitive = hal::PrimitiveOperationId::mirror;
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::mirror;
+  hal::BackendId backend = hal::BackendId::cpu;
+  hal::SemanticEffectProviderId provider =
+      hal::SemanticEffectProviderId::invalid;
+  hal::StatusId status = hal::StatusId::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  WriterOutputCommitIdentity writer_commit{};
+  std::uint64_t elapsed_ns = 0;
+  std::uint64_t attempts = 0;
+  std::uint64_t successes = 0;
+  std::uint64_t fail_open_frames = 0;
+};
+
+class CpuPrimitiveTailActivityTracker {
+public:
+  void BeginFrame(std::uint64_t capture_sequence) noexcept;
+  void RecordMirrorResult(bool succeeded, std::uint64_t elapsed_ns) noexcept;
+  void DiscardFrame() noexcept;
+  [[nodiscard]] bool
+  CommitSuccessfulWriter(std::uint64_t output_commit_sequence) noexcept;
+  [[nodiscard]] const CpuPrimitiveTailActivityRecord &
+  snapshot() const noexcept {
+    return committed_;
+  }
+
+private:
+  CpuPrimitiveTailActivityRecord committed_{};
+  std::uint64_t pending_capture_sequence_ = 0;
+  std::uint64_t pending_elapsed_ns_ = 0;
+  std::uint64_t attempts_ = 0;
+  std::uint64_t successes_ = 0;
+  std::uint64_t fail_open_frames_ = 0;
+  bool pending_attempted_ = false;
+  bool pending_succeeded_ = false;
+};
+
 // Retained source-compatible policy helpers. They mutate only an already
 // canonical setup-time plan and are not used by CameraPipeline execution.
 inline constexpr std::string_view
@@ -493,6 +537,7 @@ struct CameraPipelineStatus {
     std::uint64_t mirror_fail_open_frames = 0;
     std::uint64_t mirror_elapsed_ns = 0;
   } cpu_primitive_tails{};
+  CpuPrimitiveTailActivityRecord cpu_primitive_tail_activity{};
 
   // Debug/status for effects.
   std::string
@@ -658,6 +703,7 @@ private:
   CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
   CameraPipelineStatus::CpuPrimitiveTails cpu_primitive_tails_{};
+  CpuPrimitiveTailActivityRecord cpu_primitive_tail_activity_{};
   ProductionVideoBackendManagerSnapshot production_backend_{};
   MultiIslandVideoRuntimeStatusSnapshot video_hal_status_{};
   std::uint64_t video_hal_status_generation_ = 0;

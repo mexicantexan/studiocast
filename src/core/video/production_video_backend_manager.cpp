@@ -180,6 +180,49 @@ bool SameTail(const hal::DeclaredCpuTail &left,
          left.boundary_index == right.boundary_index;
 }
 
+bool IsTerminalBackendResolvedOutputTail(
+    const VideoExecutionPlanRequest &plan) noexcept {
+  if (plan.cpu_tail_count != 1 || plan.intent.stage_count == 0 ||
+      plan.intent.stage_count > plan.intent.stages.size())
+    return false;
+  const auto &tail = plan.cpu_tails[0];
+  const auto final_stage_id =
+      plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id;
+  if (final_stage_id == 0)
+    return false;
+  return tail.id == hal::CpuTailId::backend_resolved_output &&
+         tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
+         tail.after_stage_id == final_stage_id &&
+         tail.before_stage_id == 0 &&
+         tail.boundary_index == plan.intent.stage_count;
+}
+
+bool CompatibleCpuTails(const VideoExecutionPlanRequest &caller,
+                        const VideoExecutionPlanRequest &bound) noexcept {
+  if (!IsTerminalBackendResolvedOutputTail(caller)) {
+    if (caller.cpu_tail_count != bound.cpu_tail_count)
+      return false;
+    for (std::size_t index = 0; index < caller.cpu_tail_count; ++index) {
+      if (!SameTail(caller.cpu_tails[index], bound.cpu_tails[index]))
+        return false;
+    }
+    return true;
+  }
+  if (bound.cpu_tail_count == 0)
+    return true;
+  if (bound.cpu_tail_count != 1)
+    return false;
+  const auto &bound_tail = bound.cpu_tails[0];
+  if (bound_tail.id != hal::CpuTailId::writer_copy &&
+      bound_tail.id != hal::CpuTailId::output_format_conversion &&
+      bound_tail.id != hal::CpuTailId::provider_postprocess) {
+    return false;
+  }
+  auto exact = caller.cpu_tails[0];
+  exact.id = bound_tail.id;
+  return SameTail(exact, bound_tail);
+}
+
 bool ValidWaitPolicy(const ProductionVideoBoundedWaitPolicy &wait) noexcept {
   return wait.contract_version ==
              kProductionVideoBackendManagerContractVersion &&
@@ -546,14 +589,10 @@ bool SameCanonicalPlanRequest(const VideoExecutionPlanRequest &caller,
       bound.invalidation_key.execution_domain_hash == 0 ||
       !SameTemporal(caller.temporal, bound.temporal) ||
       !BudgetWithin(caller.budget, bound.budget) ||
-      caller.cpu_tail_count != bound.cpu_tail_count ||
+      !CompatibleCpuTails(caller, bound) ||
       caller.setup_failure_policy != bound.setup_failure_policy ||
       caller.migration_policy != bound.migration_policy) {
     return false;
-  }
-  for (std::size_t index = 0; index < caller.cpu_tail_count; ++index) {
-    if (!SameTail(caller.cpu_tails[index], bound.cpu_tails[index]))
-      return false;
   }
   return true;
 }
@@ -846,6 +885,8 @@ hal::StatusId ProductionVideoBackendManager::Setup(
   }
   hal::ReasonId plan_reason = hal::ReasonId::none;
   auto validation_plan = request.resident.plan;
+  if (IsTerminalBackendResolvedOutputTail(validation_plan))
+    validation_plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
   validation_plan.invalidation_key.execution_domain_hash = 1;
   auto &validation_generations = validation_plan.invalidation_key.generations;
   if (validation_generations.model == 0)

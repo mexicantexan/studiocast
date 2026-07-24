@@ -423,6 +423,10 @@ CpuTailToken(hal::CpuTailId value) noexcept {
     return "provider_postprocess";
   case hal::CpuTailId::writer_copy:
     return "writer_copy";
+  case hal::CpuTailId::cpu_primitive_mirror:
+    return "cpu_primitive_mirror";
+  case hal::CpuTailId::backend_resolved_output:
+    return "backend_resolved_output";
   }
   return {};
 }

@@ -129,6 +129,7 @@ bool ValidateVideoExecutionPlanRequest(const VideoExecutionPlanRequest &request,
   for (std::size_t index = 0; index < request.cpu_tail_count; ++index) {
     const auto &tail = request.cpu_tails[index];
     if (tail.id == hal::CpuTailId::invalid ||
+        tail.id == hal::CpuTailId::backend_resolved_output ||
         (tail.placement == hal::DeclaredCpuTail::Placement::before_stage &&
          (tail.before_stage_id == 0 || tail.after_stage_id != 0)) ||
         (tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&

@@ -392,6 +392,14 @@ bool Configure(PreparedProgramSession *session, FakeAdapter *adapter,
 bool TestIdsDescriptorsAndDomain() {
   bool ok = true;
   ok &= Require(kContractVersion == 1, "contract version changed");
+  ok &= Require(
+      static_cast<std::uint16_t>(CpuTailId::output_format_conversion) == 1 &&
+          static_cast<std::uint16_t>(CpuTailId::auto_frame_tracking) == 2 &&
+          static_cast<std::uint16_t>(CpuTailId::provider_postprocess) == 3 &&
+          static_cast<std::uint16_t>(CpuTailId::writer_copy) == 4 &&
+          static_cast<std::uint16_t>(CpuTailId::cpu_primitive_mirror) == 5 &&
+          static_cast<std::uint16_t>(CpuTailId::backend_resolved_output) == 6,
+      "stable CPU tail IDs changed");
   ok &= Require(StableEffectId(SemanticEffectId::virtual_background_blur) ==
                     "virtual_background.blur",
                 "stable effect ID mapping changed");
@@ -523,6 +531,12 @@ bool TestMalformedCrossAdapterAndExhaustion() {
   boundaries.cpu_tails[1].scratch_bytes = 64;
   ok &= Require(ValidatePreparedProgram(boundaries, &reason),
                 "exact before/after CPU boundaries were rejected");
+  auto setup_only_tail = boundaries;
+  setup_only_tail.cpu_tail_count = 1;
+  setup_only_tail.cpu_tails[0].id = CpuTailId::backend_resolved_output;
+  ok &= Require(!ValidatePreparedProgram(setup_only_tail, &reason) &&
+                    reason == ReasonId::malformed_contract,
+                "setup-only output-tail marker reached prepared execution");
   boundaries.cpu_tails[1].boundary_index = 2;
   ok &= Require(!ValidatePreparedProgram(boundaries, &reason),
                 "wrong CPU boundary index was accepted");

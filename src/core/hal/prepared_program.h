@@ -172,11 +172,19 @@ struct ProgramInvalidationKey {
 
 enum class CpuTailId : std::uint16_t {
   invalid = 0,
-  output_format_conversion,
-  auto_frame_tracking,
-  provider_postprocess,
-  writer_copy,
+  output_format_conversion = 1,
+  auto_frame_tracking = 2,
+  provider_postprocess = 3,
+  writer_copy = 4,
+  cpu_primitive_mirror = 5,
+  // Setup-request placeholder only. A backend setup source must refine this
+  // before the plan may be validated or executed.
+  backend_resolved_output = 6,
 };
+static_assert(static_cast<std::uint16_t>(CpuTailId::writer_copy) == 4);
+static_assert(static_cast<std::uint16_t>(CpuTailId::cpu_primitive_mirror) == 5);
+static_assert(static_cast<std::uint16_t>(
+                  CpuTailId::backend_resolved_output) == 6);
 
 struct DeclaredCpuTail {
   CpuTailId id = CpuTailId::invalid;

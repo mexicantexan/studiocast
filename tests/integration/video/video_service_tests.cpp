@@ -362,6 +362,58 @@ bool TestLiveEffectBackendAttributionRequiresSuccessfulFrameCommit() {
   return true;
 }
 
+bool TestCpuPrimitiveMirrorActivityRequiresWriterCommit() {
+  namespace hal = studiocast::hal;
+  studiocast::video::CpuPrimitiveTailActivityTracker tracker;
+  tracker.BeginFrame(10);
+  tracker.RecordMirrorResult(true, 80);
+  tracker.DiscardFrame();
+  if (tracker.snapshot().valid) {
+    std::cerr << "discarded CPU mirror forged writer attribution\n";
+    return false;
+  }
+  tracker.BeginFrame(11);
+  tracker.RecordMirrorResult(true, 90);
+  if (!tracker.CommitSuccessfulWriter(21)) {
+    std::cerr << "writer-committed CPU mirror was not published\n";
+    return false;
+  }
+  const auto succeeded = tracker.snapshot();
+  if (!succeeded.active ||
+      succeeded.cpu_tail != hal::CpuTailId::cpu_primitive_mirror ||
+      succeeded.primitive != hal::PrimitiveOperationId::mirror ||
+      succeeded.semantic != hal::SemanticEffectId::mirror ||
+      succeeded.backend != hal::BackendId::cpu ||
+      succeeded.provider != hal::SemanticEffectProviderId::invalid ||
+      succeeded.status != hal::StatusId::executed ||
+      succeeded.writer_commit.capture_sequence != 11 ||
+      succeeded.writer_commit.output_commit_sequence != 21 ||
+      succeeded.attempts != 2 || succeeded.successes != 2) {
+    std::cerr << "CPU mirror typed success record is incomplete\n";
+    return false;
+  }
+  tracker.BeginFrame(12);
+  if (!tracker.CommitSuccessfulWriter(22) || tracker.snapshot().active ||
+      tracker.snapshot().status != hal::StatusId::passthrough) {
+    std::cerr << "written mirror-disabled frame did not clear activity\n";
+    return false;
+  }
+  tracker.BeginFrame(13);
+  tracker.RecordMirrorResult(false, 100);
+  if (!tracker.CommitSuccessfulWriter(23) || tracker.snapshot().active ||
+      tracker.snapshot().status != hal::StatusId::degraded ||
+      tracker.snapshot().reason !=
+          hal::ReasonId::optional_stage_failed_open ||
+      tracker.snapshot().fail_open_frames != 1) {
+    std::cerr << "written mirror fail-open did not clear active evidence\n";
+    return false;
+  }
+  tracker.BeginFrame(14);
+  tracker.RecordMirrorResult(true, 110);
+  return !tracker.CommitSuccessfulWriter(23) &&
+         tracker.snapshot().writer_commit.capture_sequence == 13;
+}
+
 bool TestVideoServiceSanitizesEffectBackendsAcrossLifecycle() {
   ServiceHarness h;
   h.consumer_present.store(true, std::memory_order_relaxed);
@@ -1940,6 +1992,8 @@ int main() {
   } tests[] = {
       {"live effect attribution requires successful frame commit",
        &TestLiveEffectBackendAttributionRequiresSuccessfulFrameCommit},
+      {"CPU primitive mirror activity requires writer commit",
+       &TestCpuPrimitiveMirrorActivityRequiresWriterCommit},
       {"video service sanitizes effect attribution across lifecycle",
        &TestVideoServiceSanitizesEffectBackendsAcrossLifecycle},
       {"video service delivers only genuine live effect changes",

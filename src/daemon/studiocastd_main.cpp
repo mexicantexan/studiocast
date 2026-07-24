@@ -893,6 +893,7 @@ struct TypedProductionComputeAuthority {
   bool fallback = false;
   bool degraded = false;
   bool blocked = false;
+  bool cpu_primitive_active = false;
   studiocast::hal::ReasonId reason = studiocast::hal::ReasonId::none;
   studiocast::hal::BackendId requested_backend =
       studiocast::hal::BackendId::invalid;
@@ -902,6 +903,39 @@ struct TypedProductionComputeAuthority {
       studiocast::hal::SemanticEffectProviderId::invalid;
   std::string active_effect_backends;
 };
+
+bool IsHealthyTypedRuntimeStatus(studiocast::hal::StatusId status) {
+  return status == studiocast::hal::StatusId::ready ||
+         status == studiocast::hal::StatusId::degraded ||
+         status == studiocast::hal::StatusId::executed;
+}
+
+bool HasCurrentCpuMirrorTail(
+    const studiocast::video::VirtualCameraServiceStatus &status) {
+  const auto &tail = status.pipeline.cpu_primitive_tail_activity;
+  return HasAuthoritativeRunningVideoFrame(status) &&
+         tail.contract_version ==
+             studiocast::video::kCpuPrimitiveTailActivityVersion &&
+         tail.valid && tail.active &&
+         tail.cpu_tail ==
+             studiocast::hal::CpuTailId::cpu_primitive_mirror &&
+         tail.primitive == studiocast::hal::PrimitiveOperationId::mirror &&
+         tail.semantic == studiocast::hal::SemanticEffectId::mirror &&
+         tail.backend == studiocast::hal::BackendId::cpu &&
+         tail.provider ==
+             studiocast::hal::SemanticEffectProviderId::invalid &&
+         tail.status == studiocast::hal::StatusId::executed &&
+         tail.reason == studiocast::hal::ReasonId::none &&
+         tail.writer_commit.valid &&
+         tail.writer_commit.capture_sequence ==
+             status.pipeline.debug.capture_sequence &&
+         tail.writer_commit.output_commit_sequence ==
+             status.pipeline.debug.output_frames_committed &&
+         tail.writer_commit.capture_sequence != 0 &&
+         tail.writer_commit.output_commit_sequence != 0 &&
+         tail.attempts >= tail.successes && tail.successes != 0 &&
+         tail.attempts - tail.successes >= tail.fail_open_frames;
+}
 
 std::string TypedLegacyResolvedBackend(studiocast::hal::BackendId backend) {
   switch (backend) {
@@ -993,7 +1027,12 @@ TypedProductionComputeAuthority TypedProductionAuthority(
   const bool residentReady =
       manager.state == ManagerState::resident_ready &&
       manager.resident_prepared && manager.resident.prepared &&
-      !manager.resident.stopped &&
+      !manager.frame_pending && !manager.resident.frame_pending &&
+      !manager.resident.quarantined && !manager.resident.stopped &&
+      IsHealthyTypedRuntimeStatus(manager.status) &&
+      IsHealthyTypedRuntimeStatus(manager.readiness.status) &&
+      IsHealthyTypedRuntimeStatus(manager.resident.readiness.status) &&
+      IsHealthyTypedRuntimeStatus(manager.resident.telemetry.runtime_status) &&
       manager.readiness.execution_domain ==
           manager.resident.readiness.execution_domain &&
       manager.readiness.selected_backend ==
@@ -1004,7 +1043,13 @@ TypedProductionComputeAuthority TypedProductionAuthority(
   const bool compatibilityReady =
       manager.state == ManagerState::compatibility_ready &&
       !manager.resident_prepared && manager.compatibility.prepared &&
-      !manager.compatibility.stopped &&
+      !manager.frame_pending && !manager.compatibility.stopped &&
+      IsHealthyTypedRuntimeStatus(manager.status) &&
+      IsHealthyTypedRuntimeStatus(manager.readiness.status) &&
+      IsHealthyTypedRuntimeStatus(manager.compatibility.status) &&
+      IsHealthyTypedRuntimeStatus(manager.compatibility.readiness.status) &&
+      IsHealthyTypedRuntimeStatus(
+          manager.compatibility.telemetry.runtime_status) &&
       manager.compatibility.plan_id != 0 &&
       manager.readiness.execution_domain ==
           manager.compatibility.execution_domain &&
@@ -1073,6 +1118,20 @@ TypedProductionComputeAuthority TypedProductionAuthority(
         out.provider = stage.provider;
       }
     }
+  }
+  const bool cpu_mirror_active = HasCurrentCpuMirrorTail(status);
+  const bool coherent_with_resident =
+      !out.active ||
+      (commit != nullptr && commit->valid &&
+       commit->capture_sequence ==
+           status.pipeline.cpu_primitive_tail_activity.writer_commit
+               .capture_sequence);
+  if (cpu_mirror_active && coherent_with_resident &&
+      out.active_effect_backends.find("mirror:") == std::string::npos) {
+    if (!out.active_effect_backends.empty())
+      out.active_effect_backends.push_back(',');
+    out.active_effect_backends.append("mirror:cpu");
+    out.cpu_primitive_active = true;
   }
   return out;
 }
@@ -2621,7 +2680,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
     computeActive =
         typedProduction.active
             ? TypedLegacyActiveBackend(typedProduction.selected_backend)
-            : std::string{};
+            : (typedProduction.cpu_primitive_active ? std::string("cpu")
+                                                    : std::string{});
     liveEffectBackends = typedProduction.active_effect_backends;
 
     const std::string typedReason(

@@ -513,6 +513,7 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
       return false;
     }
     if (tail.id == CpuTailId::invalid ||
+        tail.id == CpuTailId::backend_resolved_output ||
         (tail.boundary_index != 0 && tail.boundary_index != derived_boundary) ||
         (have_boundary && derived_boundary < previous_boundary_index) ||
         cpu_tail_scratch >
