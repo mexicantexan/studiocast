@@ -244,7 +244,23 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
   request.plan.intent.strict_provider_selection = false;
   request.effects.video_noise_removal.enabled = true;
   request.effects.eye_contact.enabled = true;
+
+  const auto temp = std::filesystem::temp_directory_path() /
+                    "studiocast-open-cuda-compatibility-empty";
+  std::error_code ec;
+  std::filesystem::remove_all(temp, ec);
+  std::filesystem::create_directories(temp, ec);
+  const char *old = std::getenv("XDG_DATA_HOME");
+  const std::string old_value = old == nullptr ? std::string{} : old;
+  const bool had_old = old != nullptr;
+  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
   result = source->AcquireResidentSetup(request);
+  if (had_old)
+    (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
+  else
+    (void)unsetenv("XDG_DATA_HOME");
+  std::filesystem::remove_all(temp, ec);
+
   ok &= Check(
       result.status == hal::StatusId::unavailable &&
           result.reason == hal::ReasonId::capability_evidence_incomplete &&
