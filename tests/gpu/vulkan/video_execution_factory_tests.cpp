@@ -1,4 +1,5 @@
 #include "core/video/video_execution_coordinator.h"
+#include "core/vulkan/production_video_backend_setup_source.h"
 #include "core/vulkan/video_execution_factory.h"
 
 #include <array>
@@ -781,6 +782,44 @@ int TestProductionRuntimeIfAvailable() {
       RunProductionCombination(&factory, registry, Request(), true, true, 103);
   return ok ? 0 : 1;
 }
+
+int TestProductionSetupSourceIfAvailable() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  if (!Require(source != nullptr,
+               "production Vulkan setup source must be constructible")) {
+    return 1;
+  }
+  video::ProductionVideoResidentSetup request;
+  request.effects.vignette.enabled = true;
+  request.effects.vignette.intensity = 61;
+  request.effects.vignette.center_on_tracked_face = false;
+  request.effects.mirror = true;
+  request.plan = Request();
+  request.plan.invalidation_key.execution_domain_hash = 0;
+  auto result = source->AcquireResidentSetup(request);
+  if (result.status != hal::StatusId::ready &&
+      result.status != hal::StatusId::degraded) {
+    return OptionalVulkanSkip(result.reason);
+  }
+  bool ok =
+      Require(result.setup_completed_outside_frame_loop &&
+                  result.execution_kind ==
+                      video::ProductionVideoResidentSetupSourceResult::
+                          ExecutionKind::resident_island &&
+                  result.lease.live() &&
+                  result.lease.snapshot().backend == hal::BackendId::vulkan &&
+                  result.plan.invalidation_key.execution_domain_hash != 0 &&
+                  result.plan.invalidation_key.generations.context ==
+                      result.lease.snapshot()
+                          .execution_domain.logical_context_generation,
+              "production setup source must bind an exact live Vulkan lease");
+  const auto shutdown = result.lease.Shutdown();
+  ok &= Require(shutdown.status == hal::StatusId::stopped &&
+                    shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted,
+                "production Vulkan setup lease must shut down synchronously");
+  return ok ? 0 : 1;
+}
 #endif
 
 } // namespace
@@ -793,6 +832,7 @@ int main() {
   ok &= TestExecutorShutdownDoesNotOwnSharedAdapter();
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
   ok &= TestProductionRuntimeIfAvailable() == 0;
+  ok &= TestProductionSetupSourceIfAvailable() == 0;
 #endif
   return ok ? 0 : 1;
 }
