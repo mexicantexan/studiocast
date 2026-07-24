@@ -107,6 +107,7 @@ set(_studiocast_open_video_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/fastdvdnet_denoiser.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/gaze_correction_eye_contact.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_hal_adapter.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_production_hal_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/open_cuda_prepared_resident_executor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/matting_session.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/yunet_face_detector.cpp)
@@ -603,7 +604,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 125)
+set(_studiocast_expected_source_count 126)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

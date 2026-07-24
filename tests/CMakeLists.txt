@@ -1171,6 +1171,36 @@ if (BUILD_TESTING)
             studiocast-open-cuda-prepared-resident-executor-tests
             unit gpu video model)
 
+    add_executable(studiocast-open-cuda-production-hal-owner-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/open_cuda_production_hal_owner_tests.cpp
+    )
+
+    target_link_libraries(studiocast-open-cuda-production-hal-owner-tests PRIVATE
+            studiocast_open_video_backend)
+
+    target_include_directories(studiocast-open-cuda-production-hal-owner-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-open-cuda-production-hal-owner-tests)
+    studiocast_enable_sanitizers(
+            studiocast-open-cuda-production-hal-owner-tests)
+
+    set_target_properties(
+            studiocast-open-cuda-production-hal-owner-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-open-cuda-production-hal-owner-tests
+            COMMAND studiocast-open-cuda-production-hal-owner-tests)
+    studiocast_set_test_labels(
+            studiocast-open-cuda-production-hal-owner-tests
+            unit gpu video model)
+
     add_executable(studiocast-video-frame-plan-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/video/video_frame_plan_tests.cpp
     )
