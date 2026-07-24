@@ -182,12 +182,18 @@ typed status surface.
   - which effects are available vs blocked (with reason codes)
   - what remediation/install hints to show
 
-The additive `GET_VIDEO_HAL_STATUS_V1` command exposes the validated typed
-multi-island HAL snapshot without changing legacy `GET_STATUS` bytes. It
-distinguishes requested, selected, available, active, degraded, blocked, and
-fallback state and attributes activity only after a successful output write.
-The installer parser for this schema remains shadow-only and ineligible to
-affect recommendations.
+The additive `GET_VIDEO_HAL_STATUS_V1` command exposes a validated typed
+multi-island snapshot only when every requested effect is covered by a current
+prepared HAL island. Its fixed-capacity authority masks identify the
+prepared-route scope. While staged migration retains a compatibility route for
+any requested effect, the command fails closed with `ERR` instead of presenting
+prepared-only blocked, unavailable, or active facts as authoritative for the
+whole live pipeline. Complete prepared-route snapshots distinguish requested,
+selected, available, active, degraded, blocked, and fallback state and
+attribute activity only after a successful output write. Legacy `GET_STATUS`
+bytes remain unchanged and authoritative for compatibility-route state. The
+installer parser remains shadow-only, rejects incomplete authority, and is
+ineligible to affect recommendations.
 
 ## Open CUDA model packs (XDG)
 

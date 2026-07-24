@@ -995,15 +995,13 @@ bool TestMultiIslandDegradedBlockedAndFallbackProjection() {
       blocked_snapshot);
   ok &= Expect(
       blocked_build.code == MultiIslandStatusValidationCode::valid &&
-          result.ok &&
-          result.json.find("\"requested\":true,\"available\":false,"
-                           "\"selected\":false,\"active\":false,"
-                           "\"degraded\":false,\"blocked\":true,"
-                           "\"fallback\":false") != std::string::npos &&
-          result.json.find("\"token\":\"capability_evidence_incomplete\"") !=
-              std::string::npos,
-      "blocked strict effect must remain unavailable, unselected, and "
-      "fail-closed with its typed reason");
+          !blocked_snapshot.authority.complete && !result.ok &&
+          result.json.empty() &&
+          result.validation.code ==
+              MultiIslandStatusValidationCode::incomplete_effect_authority,
+      "a requested effect not covered by a prepared island must fail the "
+      "standalone status serializer instead of escaping as an authoritative "
+      "blocked compatibility-path claim");
   return ok;
 }
 
@@ -1087,6 +1085,11 @@ bool TestMultiIslandStableSchemaIdsAndLegacyIsolation() {
   ok &= Expect(
       multiple.json.find("\"schema_version\":1,\"hal_contract_version\":1,"
                          "\"reason_code_version\":1") != std::string::npos &&
+          multiple.json.find(
+              "\"authority\":{\"scope\":\"prepared_routes_only\","
+              "\"complete\":true,\"prepared_route_effect_mask\":262,"
+              "\"compatibility_uncovered_effect_mask\":0}") !=
+              std::string::npos &&
           multiple.json.find(
               "\"lifecycle\":{\"id\":3,\"token\":\"running\"}") !=
               std::string::npos &&

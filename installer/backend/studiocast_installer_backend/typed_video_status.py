@@ -2,7 +2,8 @@
 
 The installer consumes this snapshot only as shadow evidence.  Existing
 per-effect recommendation facts remain authoritative until a separately
-reviewed migration proves parity.
+reviewed migration proves parity.  Missing or incomplete prepared-route
+authority is rejected rather than interpreted as compatibility-route state.
 """
 
 from __future__ import annotations
@@ -1048,6 +1049,26 @@ def parse_typed_multi_island_video_status(
         for key in ("configuration", "provider", "device", "context"):
             if generations[key] != program_generations[key]:
                 _fail("typed_status.mixed_generation")
+        authority = _object(
+            value.get("authority"), "typed_status.authority_invalid")
+        if authority.get("scope") != "prepared_routes_only":
+            _fail("typed_status.authority_invalid")
+        authority_complete = _boolean(
+            authority.get("complete"), "typed_status.authority_invalid")
+        prepared_effect_mask = _uint(
+            authority.get("prepared_route_effect_mask"),
+            "typed_status.authority_invalid")
+        uncovered_effect_mask = _uint(
+            authority.get("compatibility_uncovered_effect_mask"),
+            "typed_status.authority_invalid")
+        canonical_effect_mask = (1 << len(EFFECT_IDS)) - 1
+        if ((prepared_effect_mask | uncovered_effect_mask) &
+                ~canonical_effect_mask or
+                prepared_effect_mask & uncovered_effect_mask or
+                authority_complete != (uncovered_effect_mask == 0)):
+            _fail("typed_status.authority_invalid")
+        if not authority_complete:
+            _fail("typed_status.authority_incomplete")
         _, lifecycle = _pair(
             value.get("lifecycle"), LIFECYCLES, "typed_status.lifecycle_invalid")
         writer_commit = _commit(
@@ -1115,6 +1136,16 @@ def parse_typed_multi_island_video_status(
             effects[effect] = normalized
         if set(effects) != set(EFFECT_IDS) or set(effects) != set(CANONICAL_EFFECTS):
             _fail("typed_status.unknown_or_missing_effect")
+        expected_prepared_effect_mask = sum(
+            1 << (EFFECT_IDS[effect] - 1)
+            for effect, state in effects.items() if state["selected"])
+        expected_uncovered_effect_mask = sum(
+            1 << (EFFECT_IDS[effect] - 1)
+            for effect, state in effects.items()
+            if state["requested"] and not state["selected"])
+        if (prepared_effect_mask != expected_prepared_effect_mask or
+                uncovered_effect_mask != expected_uncovered_effect_mask):
+            _fail("typed_status.authority_invalid")
         if (any(effect["active"] for effect in effects.values()) and
                 not writer_commit["valid"]):
             _fail("typed_status.writer_commit_activity_mismatch")
@@ -1140,6 +1171,12 @@ def parse_typed_multi_island_video_status(
             "generations": generations,
             "program_generations": program_generations,
             "writer_commit": writer_commit,
+            "authority": {
+                "scope": "prepared_routes_only",
+                "complete": True,
+                "prepared_route_effect_mask": prepared_effect_mask,
+                "compatibility_uncovered_effect_mask": 0,
+            },
             "islands": [islands[key] for key in sorted(islands)],
             "effects": effects,
             "aggregate": {

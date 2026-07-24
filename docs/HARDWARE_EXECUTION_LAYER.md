@@ -225,10 +225,16 @@ multi-island snapshot with:
 - one monotonic writer-commit identity; and
 - aggregate transfers summed once across current islands.
 
-`GET_VIDEO_HAL_STATUS_V1` returns this validated standalone JSON object. A
-malformed, stale, mixed-generation, foreign-domain, strict-substitution, or
-mixed-writer-commit snapshot returns an error rather than partial
-success-looking facts. A stopped or no-GPU pipeline publishes a valid
+`GET_VIDEO_HAL_STATUS_V1` returns this validated standalone JSON object only
+when its fixed-capacity authority coverage is complete. The snapshot carries a
+prepared-route effect mask and a compatibility-uncovered effect mask. A
+requested effect without a selected current prepared island is uncovered:
+the retained compatibility pipeline may still be executing it, so the command
+returns an error instead of serializing a prepared-only blocked, unavailable,
+or active claim as daemon-wide truth. A malformed, stale, mixed-generation,
+foreign-domain, strict-substitution, mixed-writer-commit, or incomplete
+authority snapshot likewise returns an error rather than partial success-looking
+facts. A stopped or no-GPU pipeline with no requested effects publishes a valid
 fail-closed idle/disabled or passthrough snapshot.
 
 The existing `GET_STATUS` bytes and canonical effect/parameter IDs are
@@ -239,9 +245,10 @@ commit is active evidence.
 
 The installer contains a strict parser for a
 `typed_multi_island_video_status` diagnostics value, but it is shadow-only and
-sets `recommendation_eligible=false`. Existing exact per-effect installer facts
-remain authoritative. Connecting the new daemon command to installer
-recommendation is a separate parity-reviewed migration.
+sets `recommendation_eligible=false`; it also rejects absent, malformed, or
+incomplete authority coverage. Existing exact per-effect installer facts remain
+authoritative. Connecting the new daemon command to installer recommendation is
+a separate parity-reviewed migration.
 
 ## Extension and security boundary
 

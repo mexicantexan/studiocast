@@ -1295,6 +1295,38 @@ MultiIslandStatusValidationResult ValidateMultiIslandVideoRuntimeStatusSnapshot(
       return result;
     }
   }
+  constexpr std::uint16_t kCanonicalEffectMask =
+      (std::uint16_t{1} << kCanonicalVideoEffectCount) - 1u;
+  if ((snapshot.authority.prepared_route_effect_mask & ~kCanonicalEffectMask) !=
+          0 ||
+      (snapshot.authority.compatibility_uncovered_effect_mask &
+       ~kCanonicalEffectMask) != 0 ||
+      (snapshot.authority.prepared_route_effect_mask &
+       snapshot.authority.compatibility_uncovered_effect_mask) != 0) {
+    result.code = MultiIslandStatusValidationCode::malformed_authority_coverage;
+    return result;
+  }
+  std::uint16_t expected_prepared_mask = 0;
+  std::uint16_t expected_uncovered_mask = 0;
+  for (std::size_t i = 0; i < snapshot.effect_count; ++i) {
+    const StableEffectRuntimeState &effect = snapshot.effects[i];
+    const std::size_t stable_index = EffectIndex(effect.effect);
+    if (!effect.requested)
+      continue;
+    const std::uint16_t bit = std::uint16_t{1}
+                              << static_cast<unsigned int>(stable_index);
+    if (effect.selected)
+      expected_prepared_mask |= bit;
+    else
+      expected_uncovered_mask |= bit;
+  }
+  if (snapshot.authority.prepared_route_effect_mask != expected_prepared_mask ||
+      snapshot.authority.compatibility_uncovered_effect_mask !=
+          expected_uncovered_mask ||
+      snapshot.authority.complete != (expected_uncovered_mask == 0)) {
+    result.code = MultiIslandStatusValidationCode::malformed_authority_coverage;
+    return result;
+  }
   if (snapshot.aggregate.current_island_count != snapshot.island_count ||
       !TransfersEqual(snapshot.aggregate.transfers, aggregate_transfers)) {
     result.code = MultiIslandStatusValidationCode::aggregate_mismatch;
@@ -1328,6 +1360,22 @@ MultiIslandStatusValidationResult BuildMultiIslandVideoRuntimeStatusSnapshot(
     for (std::size_t i = 0; i < input.effect_count; ++i)
       candidate.effects[i] = input.effects[i];
   }
+  if (input.effect_count <= input.effects.size()) {
+    for (std::size_t i = 0; i < input.effect_count; ++i) {
+      const StableEffectRuntimeState &effect = input.effects[i];
+      const std::size_t stable_index = EffectIndex(effect.effect);
+      if (!effect.requested || stable_index == kCanonicalVideoEffectCount)
+        continue;
+      const std::uint16_t bit = std::uint16_t{1}
+                                << static_cast<unsigned int>(stable_index);
+      if (effect.selected)
+        candidate.authority.prepared_route_effect_mask |= bit;
+      else
+        candidate.authority.compatibility_uncovered_effect_mask |= bit;
+    }
+  }
+  candidate.authority.complete =
+      candidate.authority.compatibility_uncovered_effect_mask == 0;
   candidate.aggregate.current_island_count = input.island_count;
   if (input.island_count <= input.islands.size()) {
     for (std::size_t i = 0; i < input.island_count; ++i) {

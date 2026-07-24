@@ -2094,6 +2094,12 @@ void AppendMultiIslandVideoRuntimeStatus(
   AppendGenerations(out, snapshot.generations);
   out << ",\"program_generations\":";
   AppendProgramGenerations(out, snapshot.program_generations);
+  out << ",\"authority\":{\"scope\":\"prepared_routes_only\","
+      << "\"complete\":" << (snapshot.authority.complete ? "true" : "false")
+      << ",\"prepared_route_effect_mask\":"
+      << snapshot.authority.prepared_route_effect_mask
+      << ",\"compatibility_uncovered_effect_mask\":"
+      << snapshot.authority.compatibility_uncovered_effect_mask << '}';
   out << ",\"lifecycle\":{\"id\":"
       << static_cast<unsigned int>(snapshot.lifecycle) << ",\"token\":";
   AppendJsonString(out, LifecycleToken(snapshot.lifecycle));
@@ -2666,6 +2672,12 @@ SerializeMultiIslandVideoRuntimeStatusJson(
   result.validation =
       video::ValidateMultiIslandVideoRuntimeStatusSnapshot(snapshot);
   if (result.validation.code != video::MultiIslandStatusValidationCode::valid) {
+    return result;
+  }
+  if (!snapshot.authority.complete ||
+      snapshot.authority.compatibility_uncovered_effect_mask != 0) {
+    result.validation.code =
+        video::MultiIslandStatusValidationCode::incomplete_effect_authority;
     return result;
   }
   std::ostringstream out;

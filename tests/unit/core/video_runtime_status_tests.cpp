@@ -438,7 +438,13 @@ bool TestStableCodes() {
           static_cast<std::uint16_t>(
               MultiIslandStatusValidationCode::mixed_writer_commit) == 18 &&
           static_cast<std::uint16_t>(
-              MultiIslandStatusValidationCode::aggregate_mismatch) == 31,
+              MultiIslandStatusValidationCode::aggregate_mismatch) == 31 &&
+          static_cast<std::uint16_t>(
+              MultiIslandStatusValidationCode::malformed_authority_coverage) ==
+              32 &&
+          static_cast<std::uint16_t>(
+              MultiIslandStatusValidationCode::incomplete_effect_authority) ==
+              33,
       "multi-island schema and stable numeric IDs changed");
   ok &= Expect(EffectCapabilityCodeToken(
                    Code::cpu_virtual_background_replace_unavailable) ==
@@ -729,6 +735,9 @@ bool TestMultiIslandPassthroughAndProductionFixtures() {
           passthrough.island_count == 0 &&
           passthrough.effect_count ==
               studiocast::video::kCanonicalVideoEffectCount &&
+          passthrough.authority.complete &&
+          passthrough.authority.prepared_route_effect_mask == 0 &&
+          passthrough.authority.compatibility_uncovered_effect_mask == 0 &&
           passthrough.aggregate.current_island_count == 0 &&
           passthrough.aggregate.transfers.uploads == 0,
       "zero-island CPU passthrough must remain explicit and transfer-free");
@@ -744,7 +753,12 @@ bool TestMultiIslandPassthroughAndProductionFixtures() {
           snapshot.aggregate.transfers.uploads == 3 &&
           snapshot.aggregate.transfers.final_readbacks == 3 &&
           snapshot.aggregate.transfers.synchronizations == 3 &&
-          snapshot.aggregate.transfers.cpu_tail_boundaries == 2,
+          snapshot.aggregate.transfers.cpu_tail_boundaries == 2 &&
+          snapshot.authority.complete &&
+          snapshot.authority.prepared_route_effect_mask ==
+              ((std::uint16_t{1} << 1u) | (std::uint16_t{1} << 2u) |
+               (std::uint16_t{1} << 8u)) &&
+          snapshot.authority.compatibility_uncovered_effect_mask == 0,
       "Vulkan, Maxine, and Open CUDA islands must aggregate exactly once");
   ok &= Expect(
       snapshot.effects[static_cast<std::size_t>(SemanticEffectId::mirror) - 1]
@@ -906,6 +920,15 @@ bool TestMultiIslandStructuralRejection() {
                    MultiIslandStatusValidationCode::aggregate_mismatch,
                "aggregate transfers must equal the once-only island sum");
 
+  malformed = snapshot;
+  malformed.authority.prepared_route_effect_mask = 0;
+  ok &= Expect(
+      studiocast::video::ValidateMultiIslandVideoRuntimeStatusSnapshot(
+          malformed)
+              .code ==
+          MultiIslandStatusValidationCode::malformed_authority_coverage,
+      "prepared-route authority coverage must match selected effect state");
+
   MultiIslandVideoRuntimeStatusBuildInput overflow = ThreeIslandInput();
   overflow.islands[0].telemetry.transfers.uploads =
       std::numeric_limits<std::uint64_t>::max();
@@ -1031,6 +1054,10 @@ bool TestMultiIslandStrictAndFailureSemantics() {
       studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
           blocked, &blocked_snapshot)
                   .code == MultiIslandStatusValidationCode::valid &&
+          !blocked_snapshot.authority.complete &&
+          blocked_snapshot.authority.prepared_route_effect_mask == 0 &&
+          blocked_snapshot.authority.compatibility_uncovered_effect_mask ==
+              (std::uint16_t{1} << 1u) &&
           !blocked_snapshot
                .effects
                    [static_cast<std::size_t>(SemanticEffectId::eye_contact) - 1]

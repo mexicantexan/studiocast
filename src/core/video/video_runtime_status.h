@@ -323,6 +323,16 @@ struct MultiIslandAggregateTelemetry {
   std::uint64_t current_island_count = 0;
 };
 
+// The v1 command is authoritative only for effect stages owned by a current
+// prepared HAL island. A requested effect with no selected prepared island may
+// still be running through the retained compatibility pipeline, so it is
+// explicitly marked uncovered and the standalone serializer fails closed.
+struct MultiIslandStatusAuthorityCoverage {
+  std::uint16_t prepared_route_effect_mask = 0;
+  std::uint16_t compatibility_uncovered_effect_mask = 0;
+  bool complete = true;
+};
+
 struct MultiIslandVideoRuntimeStatusSnapshot {
   std::uint32_t schema_version = kMultiIslandVideoRuntimeStatusSchemaVersion;
   std::uint32_t hal_contract_version = hal::kContractVersion;
@@ -338,6 +348,7 @@ struct MultiIslandVideoRuntimeStatusSnapshot {
   std::size_t island_count = 0;
   std::array<StableEffectRuntimeState, kCanonicalVideoEffectCount> effects{};
   std::size_t effect_count = 0;
+  MultiIslandStatusAuthorityCoverage authority{};
   MultiIslandAggregateTelemetry aggregate{};
 };
 
@@ -388,6 +399,8 @@ enum class MultiIslandStatusValidationCode : std::uint16_t {
   optional_failure_inconsistent = 29,
   aggregate_overflow = 30,
   aggregate_mismatch = 31,
+  malformed_authority_coverage = 32,
+  incomplete_effect_authority = 33,
 };
 
 struct MultiIslandStatusValidationResult {

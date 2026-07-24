@@ -2518,6 +2518,34 @@ bool TestVersionedVideoHalStatusAndLegacyByteStability() {
       rejected.rfind("ERR ", 0) == 0 &&
           rejected.find("validation_code=") != std::string::npos,
       "malformed cached typed status must fail closed with an ERR response");
+
+  studiocast::video::effects::BroadcastCameraEffects compatibilityEffects;
+  compatibilityEffects.eye_contact.enabled = true;
+  studiocast::video::CameraPipelineHalStatusProjectionInput projection;
+  projection.effects = &compatibilityEffects;
+  projection.lifecycle =
+      studiocast::video::VideoRuntimeLifecycle::running;
+  projection.status_generation = 91;
+  projection.configuration_generation = 1;
+  projection.geometry_generation = 1;
+  studiocast::video::VirtualCameraServiceStatus compatibilityOnly;
+  const auto projection_result =
+      studiocast::video::BuildCameraPipelineHalStatusSnapshot(
+          projection, &compatibilityOnly.pipeline.video_hal_status);
+  const std::string compatibility_rejected =
+      VideoHalStatusV1Response(compatibilityOnly);
+  ok &= Expect(
+      projection_result.code ==
+              studiocast::video::MultiIslandStatusValidationCode::valid &&
+          !compatibilityOnly.pipeline.video_hal_status.authority.complete &&
+          compatibilityOnly.pipeline.video_hal_status.authority
+                  .compatibility_uncovered_effect_mask ==
+              (std::uint16_t{1} << 1u) &&
+          compatibility_rejected.rfind("ERR ", 0) == 0 &&
+          compatibility_rejected.find("validation_code=33") !=
+              std::string::npos,
+      "Eye Contact retained compatibility execution must not serialize as an "
+      "authoritative prepared-HAL blocked or unavailable claim");
   const ParsedCommand parsed_command = ParseLine("GET_VIDEO_HAL_STATUS_V1");
   ok &= Expect(parsed_command.cmd == "GET_VIDEO_HAL_STATUS_V1",
                "versioned daemon command token must remain exact");

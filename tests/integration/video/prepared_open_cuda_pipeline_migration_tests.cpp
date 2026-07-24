@@ -387,6 +387,10 @@ void TestTypedPipelineStatusProjection() {
   CHECK(!automatic_eye.strict_backend_selection);
   CHECK(automatic_eye.blocked);
   CHECK(!automatic_eye.available);
+  CHECK(!snapshot.authority.complete);
+  CHECK(snapshot.authority.prepared_route_effect_mask == 0);
+  CHECK(snapshot.authority.compatibility_uncovered_effect_mask ==
+        (std::uint16_t{1} << 1u));
 
   effects.mirror = true;
   effects.engine = video::effects::EffectsEnginePreference::maxine;
@@ -405,6 +409,8 @@ void TestTypedPipelineStatusProjection() {
   CHECK(snapshot.effects[1].active);
   CHECK(snapshot.effects[8].active);
   CHECK(snapshot.effects[8].active_backend == hal::BackendId::vulkan);
+  CHECK(snapshot.authority.complete);
+  CHECK(snapshot.authority.compatibility_uncovered_effect_mask == 0);
 
   const auto qualified_maxine = input.maxine_resident;
   input.maxine_resident.eligibility =

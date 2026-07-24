@@ -54,9 +54,10 @@ struct PreparedHardwareExecutionJsonResult {
 // Produces the standalone value for the additive
 // typed_multi_island_video_status subtree. The caller may insert this already
 // serialized value into GET_STATUS without reparsing backend diagnostics.
-// Invalid, stale, mixed-generation, or otherwise inconsistent snapshots return
-// ok=false and an empty JSON string, matching the fail-closed convention of
-// the singular typed serializer.
+// Invalid, stale, mixed-generation, otherwise inconsistent, or incomplete
+// prepared-route authority snapshots return ok=false and an empty JSON string.
+// In particular, a requested effect that is only covered by the retained
+// compatibility pipeline cannot escape as an authoritative blocked claim.
 [[nodiscard]] MultiIslandVideoRuntimeStatusJsonResult
 SerializeMultiIslandVideoRuntimeStatusJson(
     const video::MultiIslandVideoRuntimeStatusSnapshot &snapshot);

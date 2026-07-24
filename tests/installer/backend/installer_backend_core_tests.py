@@ -635,6 +635,11 @@ def typed_multi_island_fixture():
             "device": 13, "context": 14,
         },
         "program_generations": typed_invalidation()["generations"],
+        "authority": {
+            "scope": "prepared_routes_only", "complete": True,
+            "prepared_route_effect_mask": 262,
+            "compatibility_uncovered_effect_mask": 0,
+        },
         "lifecycle": typed_pair(3, "running"),
         "capabilities": {
             "valid": True, "schema_version": 1, "hal_contract_version": 1,
@@ -764,6 +769,11 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertTrue(parsed["present"] and parsed["valid"])
         self.assertEqual(parsed["mode"], "shadow_only")
         self.assertFalse(parsed["recommendation_eligible"])
+        self.assertEqual(parsed["authority"], {
+            "scope": "prepared_routes_only", "complete": True,
+            "prepared_route_effect_mask": 262,
+            "compatibility_uncovered_effect_mask": 0,
+        })
         self.assertEqual(set(parsed["effects"]), set(CANONICAL_EFFECTS))
         self.assertEqual(
             [(entry["route"], entry["backend"], entry["provider"])
@@ -825,6 +835,21 @@ class InstallerBackendCoreTests(unittest.TestCase):
         aggregate = typed_multi_island_fixture()
         aggregate["aggregate"]["transfers"]["uploads"] += 1
         cases.append((aggregate, "typed_status.aggregate_mismatch"))
+        missing_authority = typed_multi_island_fixture()
+        missing_authority.pop("authority")
+        cases.append((
+            missing_authority, "typed_status.authority_invalid"))
+        malformed_authority = typed_multi_island_fixture()
+        malformed_authority["authority"]["prepared_route_effect_mask"] = 0
+        cases.append((
+            malformed_authority, "typed_status.authority_invalid"))
+        incomplete_authority = typed_multi_island_fixture()
+        incomplete_authority["authority"].update({
+            "complete": False,
+            "compatibility_uncovered_effect_mask": 1 << 0,
+        })
+        cases.append((
+            incomplete_authority, "typed_status.authority_incomplete"))
         domain = typed_multi_island_fixture()
         domain["islands"][2]["execution_domain"]["api_family"] = typed_pair(
             5, "vulkan")
@@ -848,7 +873,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
                 self.assertEqual(parsed["reason_codes"], [reason])
                 self.assertEqual(parsed["effects"], {})
 
-    def test_typed_multi_island_status_preserves_blockers_without_promotion(self):
+    def test_typed_multi_island_status_rejects_uncovered_compatibility_blockers(self):
         value = typed_multi_island_fixture()
         effects = {
             entry["effect"]["token"]: entry for entry in value["effects"]
@@ -920,27 +945,19 @@ class InstallerBackendCoreTests(unittest.TestCase):
                 if identity == ("virtual_key_light", 3):
                     updated["disposition"] = "experimental"
                 value["capabilities"]["lanes"][index] = updated
+        value["authority"].update({
+            "complete": False,
+            "compatibility_uncovered_effect_mask":
+                (1 << 0) | (1 << 5) | (1 << 7),
+        })
         parsed = parse_typed_multi_island_video_status({
             "typed_multi_island_video_status": value,
         })
-        self.assertTrue(parsed["valid"])
+        self.assertFalse(parsed["valid"])
         self.assertFalse(parsed["recommendation_eligible"])
         self.assertEqual(
-            parsed["effects"]["vignette"]["requested_capability"]["code"],
-            typed_pair(124, "vulkan_vignette_tracked_center_not_supported"))
-        self.assertEqual(
-            parsed["effects"]["video_noise_removal"]
-            ["requested_capability"]["code"],
-            typed_pair(2, "maxine.effect.unavailable"))
-        self.assertTrue(parsed["effects"]["vignette"]["blocked"])
-        self.assertTrue(parsed["effects"]["video_noise_removal"]["blocked"])
-        self.assertEqual(
-            parsed["effects"]["virtual_key_light"]
-            ["requested_capability"]["disposition"], "experimental")
-        self.assertEqual(
-            parsed["effects"]["virtual_key_light"]
-            ["requested_capability"]["nested_code"],
-            typed_pair(118, "open_vulkan_matting_adapter_unavailable"))
+            parsed["reason_codes"], ["typed_status.authority_incomplete"])
+        self.assertEqual(parsed["effects"], {})
 
     def test_typed_multi_island_status_accepts_maxine_zero_numeric_device_identity(self):
         value = typed_multi_island_fixture()

@@ -561,9 +561,15 @@ For typed HAL diagnostics, the daemon also accepts
 `GET_VIDEO_HAL_STATUS_V1`. It returns a standalone, versioned multi-island
 snapshot with exact execution domains, per-effect requested/selected/active
 state, committed-output identity, transfers, CPU-tail boundaries, and blocker
-reasons. This command is additive: legacy `GET_STATUS` serialization remains
-unchanged. The GUI has not become authoritative, and installer consumption is
-still shadow-only and recommendation-ineligible.
+reasons when all requested effects are owned by current prepared islands. The
+snapshot carries prepared-route and compatibility-uncovered effect masks. If a
+requested effect is still routed through retained compatibility orchestration,
+the command returns `ERR` rather than inventing an authoritative prepared-HAL
+blocked or unavailable state. This command is additive: legacy `GET_STATUS`
+serialization remains unchanged and remains the authority for compatibility
+routes. The GUI has not become authoritative, and installer consumption is
+still shadow-only, rejects incomplete authority, and is
+recommendation-ineligible.
 
 Open CUDA video effects are GPU-only. If CUDA, ONNX Runtime, or model packs are
 missing, the effects should be marked unavailable rather than silently falling
