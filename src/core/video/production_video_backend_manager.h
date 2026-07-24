@@ -150,6 +150,13 @@ public:
       0;
 };
 
+// Implemented by the backend-composition target. The returned setup source
+// owns the deterministic in-tree adapter registry and performs all
+// backend/provider/model discovery during Setup; callers never construct or
+// select a backend implementation directly.
+[[nodiscard]] std::unique_ptr<IProductionVideoBackendSetupSource>
+CreateStaticProductionVideoBackendSetupSource() noexcept;
+
 struct ProductionVideoBackendSetupEvidence {
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;
