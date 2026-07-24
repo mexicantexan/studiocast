@@ -124,12 +124,6 @@ bool HasExactCpuTail(const video::VideoExecutionPlanRequest &request,
   if (request.cpu_tail_count != 1 || resolution.stage_count == 0)
     return false;
   std::size_t last_resolved = resolution.stage_count;
-  bool has_auto_frame = false;
-  for (std::size_t index = 0; index < resolution.stage_count; ++index) {
-    has_auto_frame |= !resolution.stages[index].skipped_optional &&
-                      resolution.stages[index].intent.semantic ==
-                          hal::SemanticEffectId::auto_frame;
-  }
   while (last_resolved != 0 &&
          resolution.stages[last_resolved - 1].skipped_optional) {
     --last_resolved;
@@ -138,9 +132,7 @@ bool HasExactCpuTail(const video::VideoExecutionPlanRequest &request,
     return false;
   const auto &last = resolution.stages[last_resolved - 1];
   const auto &tail = request.cpu_tails[0];
-  return tail.id == (has_auto_frame
-                         ? hal::CpuTailId::auto_frame_tracking
-                         : hal::CpuTailId::output_format_conversion) &&
+  return tail.id == hal::CpuTailId::output_format_conversion &&
          tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
          tail.after_stage_id == last.intent.stage_id &&
          tail.before_stage_id == 0 && tail.boundary_index == last_resolved;
@@ -179,8 +171,8 @@ bool ExactFrozenInputs(const video::VideoExecutionPlanRequest &request,
   }
   if (!IsTightHostImage(request.host_input, hal::PixelFormat::rgb_u8,
                         hal::ChannelOrder::rgb, hal::Mutability::read_only) ||
-      !IsTightHostImage(request.host_output, hal::PixelFormat::bgr_u8,
-                        hal::ChannelOrder::bgr, hal::Mutability::write_only)) {
+      !IsTightHostImage(request.host_output, hal::PixelFormat::rgb_u8,
+                        hal::ChannelOrder::rgb, hal::Mutability::write_only)) {
     SetReason(reason, hal::ReasonId::malformed_descriptor);
     return false;
   }
@@ -524,7 +516,7 @@ bool BuildOwnerRequest(
   request->contains_other_execution_domain = false;
   request->temporal_reset_required = plan.temporal.temporal;
   request->host_input_is_tight_rgb24 = true;
-  request->host_output_is_tight_bgr24 = true;
+  request->host_output_is_tight_rgb24 = true;
   request->declares_output_format_cpu_tail = true;
   request->adapter_instance_id =
       plan.domain_plan.islands[0].adapter_instance_id;

@@ -2,6 +2,7 @@
 
 #include "core/hal/prepared_program.h"
 #include "core/maxine/resident_frame_section.h"
+#include "core/video/cpu_primitive_hal.h"
 
 #include <array>
 #include <cstddef>
@@ -62,6 +63,12 @@ struct MaxineAuthoritativeTelemetrySnapshot {
   bool device_lost = false;
 };
 
+struct MaxineOutputFormatConversionTelemetry {
+  std::uint64_t attempts = 0;
+  std::uint64_t successes = 0;
+  std::uint64_t elapsed_ns = 0;
+};
+
 [[nodiscard]] MaxineAuthoritativeTelemetrySnapshot
 AuthoritativeSnapshotFromProduction(
     const ProductionResidentTelemetry &telemetry,
@@ -101,6 +108,9 @@ struct MaxineHalAdapterConfiguration {
   hal::ExecutionDomainId execution_domain{};
   ResidentFrameKey resident_key{};
   hal::ResourceBudget capacity{};
+  // Captured from the immutable process CPU primitive table during backend
+  // setup. The frame path never probes or selects an implementation.
+  video::CpuRgb24Bgr24Fn output_format_converter = nullptr;
   // Some SDK stages have no proven allocation-free history reset. Production
   // may still prepare them when its neutral executor guarantees that a
   // discontinuity invalidates the program and requires setup-thread reprepare.
@@ -160,6 +170,10 @@ public:
   [[nodiscard]] bool
   ResolveOutput(const hal::ResourceHandle &resource,
                 MaxineFrameOutputBinding *output) const noexcept;
+  [[nodiscard]] const MaxineOutputFormatConversionTelemetry &
+  output_format_conversion_telemetry() const noexcept {
+    return output_format_conversion_telemetry_;
+  }
 
 private:
   struct HostFrameState {
@@ -180,6 +194,7 @@ private:
     hal::ResourceHandle output_resource{};
     std::uint64_t output_resource_id = 0;
     std::uint64_t output_cookie = 0;
+    bool neutral_output_materialized = false;
     HostFrameState host_frame{};
   };
 
@@ -212,6 +227,7 @@ private:
   std::uint64_t next_nonce_ = 1;
   std::uint64_t next_host_resource_id_ = 1;
   std::uint64_t next_output_resource_id_ = 1;
+  MaxineOutputFormatConversionTelemetry output_format_conversion_telemetry_{};
   bool stopped_ = false;
 };
 

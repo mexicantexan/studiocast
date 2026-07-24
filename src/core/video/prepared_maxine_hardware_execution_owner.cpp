@@ -364,7 +364,7 @@ hal::PreparedProgram Program(const PreparedMaxineHardwareRequest &request,
   program.host_output =
       Image(request.output_width == 0 ? request.width : request.output_width,
             request.output_height == 0 ? request.height : request.output_height,
-            hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   program.invalidation_key.generations = request.generations;
   program.invalidation_key.generations.context =
@@ -460,6 +460,10 @@ bool Delta(std::uint64_t before, std::uint64_t after,
 PreparedMaxineCompatibilityTelemetry
 CompatibilityDelta(const maxine::ProductionResidentTelemetry &before,
                    const maxine::ProductionResidentTelemetry &after,
+                   const maxine::MaxineOutputFormatConversionTelemetry
+                       &conversion_before,
+                   const maxine::MaxineOutputFormatConversionTelemetry
+                       &conversion_after,
                    const PreparedMaxineHardwareRequest &request) noexcept {
   PreparedMaxineCompatibilityTelemetry result;
   const auto transfer = [&](maxine::ProductionTransferKind kind,
@@ -472,8 +476,22 @@ CompatibilityDelta(const maxine::ProductionResidentTelemetry &before,
   };
   const auto cpu_index = static_cast<std::size_t>(
       maxine::ProductionCpuStageKind::rgb_to_bgr_staging);
+  const auto auto_frame_index = static_cast<std::size_t>(
+      maxine::ProductionCpuStageKind::auto_frame_tracking);
   if (!Delta(before.cpu_stages[cpu_index].successes,
              after.cpu_stages[cpu_index].successes, &result.rgb_to_bgr_calls) ||
+      !Delta(conversion_before.attempts, conversion_after.attempts,
+             &result.output_format_conversion_attempts) ||
+      !Delta(conversion_before.successes, conversion_after.successes,
+             &result.output_format_conversion_calls) ||
+      !Delta(conversion_before.elapsed_ns, conversion_after.elapsed_ns,
+             &result.output_format_conversion_elapsed_ns) ||
+      !Delta(before.cpu_stages[auto_frame_index].attempts,
+             after.cpu_stages[auto_frame_index].attempts,
+             &result.auto_frame_tracking_attempts) ||
+      !Delta(before.cpu_stages[auto_frame_index].successes,
+             after.cpu_stages[auto_frame_index].successes,
+             &result.auto_frame_tracking_calls) ||
       !transfer(maxine::ProductionTransferKind::host_upload,
                 &result.upload_attempts, &result.upload_calls) ||
       !transfer(maxine::ProductionTransferKind::final_download,
@@ -546,7 +564,7 @@ PreparedMaxineHardwareEligibility EvaluatePreparedMaxineHardwareEligibility(
   if (request.stage_count > request.stages.size())
     return PreparedMaxineHardwareEligibility::unsupported_stage;
   if (!request.host_input_is_tight_rgb24 ||
-      !request.host_output_is_tight_bgr24 || request.width == 0 ||
+      !request.host_output_is_tight_rgb24 || request.width == 0 ||
       request.height == 0 ||
       (request.output_width == 0) != (request.output_height == 0)) {
     return PreparedMaxineHardwareEligibility::unsupported_host_layout;
@@ -933,7 +951,7 @@ PreparedMaxineHardwareExecutionOwner::ConfigureInternal(
 PreparedMaxineHardwareFrameResult
 PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
     const std::uint8_t *input, std::size_t input_size_bytes,
-    std::size_t input_row_stride_bytes, std::uint8_t *output_bgr,
+    std::size_t input_row_stride_bytes, std::uint8_t *output_rgb,
     std::size_t output_size_bytes, std::size_t output_row_stride_bytes,
     std::uint64_t capture_sequence) noexcept {
   PreparedMaxineHardwareFrameResult frame;
@@ -947,7 +965,7 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   const std::uint64_t expected_bytes = program.host_input.planes[0].size_bytes;
   const std::uint64_t expected_stride =
       program.host_input.planes[0].row_stride_bytes;
-  if (!input || !output_bgr || capture_sequence == 0 ||
+  if (!input || !output_rgb || capture_sequence == 0 ||
       input_size_bytes != expected_bytes ||
       output_size_bytes != program.host_output.planes[0].size_bytes ||
       input_row_stride_bytes != expected_stride ||
@@ -959,9 +977,12 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   }
 
   maxine::ProductionResidentTelemetry before;
+  maxine::MaxineOutputFormatConversionTelemetry conversion_before;
   bool have_production_telemetry = false;
   if (impl_->production && impl_->production->executor()) {
     before = impl_->production->executor()->telemetry();
+    conversion_before =
+        impl_->production->output_format_conversion_telemetry();
     have_production_telemetry = true;
   }
 
@@ -973,7 +994,7 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   binding.input_planes[0].span_bytes = input_size_bytes;
   binding.input_planes[0].row_stride_bytes = input_row_stride_bytes;
   binding.output_planes[0].write_data =
-      reinterpret_cast<std::byte *>(output_bgr);
+      reinterpret_cast<std::byte *>(output_rgb);
   binding.output_planes[0].span_bytes = output_size_bytes;
   binding.output_planes[0].row_stride_bytes = output_row_stride_bytes;
   binding.input_plane_count = 1;
@@ -1016,7 +1037,7 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
       resolution.capture_sequence != capture_sequence ||
       resolution.plane_count != 1 ||
       resolution.planes[0].write_data !=
-          reinterpret_cast<std::byte *>(output_bgr)) {
+          reinterpret_cast<std::byte *>(output_rgb)) {
     hal::ReasonId commit_reason = hal::ReasonId::none;
     (void)session->CommitOutput({execution.completion, false}, &commit_reason);
     frame.completion_pending = false;
@@ -1027,7 +1048,7 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   }
   frame.status = execution.status;
   frame.reason = execution.reason;
-  frame.output = output_bgr;
+  frame.output = output_rgb;
   frame.output_size_bytes = output_size_bytes;
   frame.output_row_stride_bytes = output_row_stride_bytes;
   frame.output_ready = true;
@@ -1035,6 +1056,9 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   if (have_production_telemetry && impl_->production->executor()) {
     frame.compatibility =
         CompatibilityDelta(before, impl_->production->executor()->telemetry(),
+                           conversion_before,
+                           impl_->production
+                               ->output_format_conversion_telemetry(),
                            impl_->active_request);
   }
   impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::hal_live,

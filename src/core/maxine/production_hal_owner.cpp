@@ -1,6 +1,7 @@
 #include "core/maxine/production_hal_owner.h"
 
 #include "core/cuda/cuda_driver_api.h"
+#include "core/video/cpu_primitive_hal.h"
 #include "core/video/effects/broadcast_effect_rules.h"
 
 #include <algorithm>
@@ -379,6 +380,19 @@ MaxineProductionHalOwner::CreateBackend(
     configuration.execution_domain = owner->execution_domain_;
     configuration.resident_key = owner->resident_key_;
     configuration.capacity = request.capacity;
+    const auto &cpu_primitives = video::GetCpuPrimitiveTable();
+    if (cpu_primitives.table_version != video::kCpuPrimitiveTableVersion ||
+        cpu_primitives.struct_size != sizeof(video::CpuPrimitiveTable) ||
+        !video::CpuPrimitiveTableSupports(
+            cpu_primitives,
+            hal::PrimitiveOperationId::convert_pixel_format) ||
+        cpu_primitives.rgb24_bgr24 == nullptr) {
+      SetResult(result, StatusId::blocked,
+                ReasonId::capability_evidence_incomplete,
+                "Startup-selected CPU output conversion is unavailable.");
+      return nullptr;
+    }
+    configuration.output_format_converter = cpu_primitives.rgb24_bgr24;
     configuration.temporal_reprepare_on_reset = true;
     MaxineHalAdapterHooks hooks{};
     hooks.owner = owner.get();

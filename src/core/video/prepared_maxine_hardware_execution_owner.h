@@ -70,6 +70,9 @@ struct PreparedMaxineHardwareRequest {
   bool contains_other_execution_domain = false;
   bool temporal_reset_required = false;
   bool host_input_is_tight_rgb24 = false;
+  bool host_output_is_tight_rgb24 = false;
+  // Transitional source compatibility for the removed direct pipeline owner.
+  // The prepared factory rejects this legacy BGR host boundary.
   bool host_output_is_tight_bgr24 = false;
   bool declares_output_format_cpu_tail = true;
   std::uint64_t adapter_instance_id = 0;
@@ -104,6 +107,11 @@ struct PreparedMaxineHardwareSetupResult {
 
 struct PreparedMaxineCompatibilityTelemetry {
   std::uint64_t rgb_to_bgr_calls = 0;
+  std::uint64_t output_format_conversion_attempts = 0;
+  std::uint64_t output_format_conversion_calls = 0;
+  std::uint64_t output_format_conversion_elapsed_ns = 0;
+  std::uint64_t auto_frame_tracking_attempts = 0;
+  std::uint64_t auto_frame_tracking_calls = 0;
   std::uint64_t upload_attempts = 0;
   std::uint64_t upload_calls = 0;
   std::uint64_t final_download_attempts = 0;
@@ -195,7 +203,7 @@ public:
 
   [[nodiscard]] PreparedMaxineHardwareFrameResult
   ExecuteHostFrame(const std::uint8_t *input, std::size_t input_size_bytes,
-                   std::size_t input_row_stride_bytes, std::uint8_t *output_bgr,
+                   std::size_t input_row_stride_bytes, std::uint8_t *output_rgb,
                    std::size_t output_size_bytes,
                    std::size_t output_row_stride_bytes,
                    std::uint64_t capture_sequence) noexcept;

@@ -131,7 +131,7 @@ hal::PreparedProgram Program() {
       HostImageDescriptor(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
                           hal::Mutability::read_only);
   program.host_output =
-      HostImageDescriptor(hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      HostImageDescriptor(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
                           hal::Mutability::write_only);
   program.requested_backend = hal::BackendId::maxine;
   program.strict_backend_selection = true;
@@ -154,6 +154,31 @@ hal::PreparedProgram Program() {
   return program;
 }
 
+void DeclareOutputFormatTail(hal::PreparedProgram *program) {
+  program->cpu_tails[0] = hal::DeclaredCpuTail{
+      hal::CpuTailId::output_format_conversion,
+      program->stages[program->stage_count - 1].stage_id, 0, true};
+  program->cpu_tail_count = 1;
+}
+
+video::CpuPrimitiveResult SwapRgbBgr(
+    const std::uint8_t *src, std::uint8_t *dst, int width, int height,
+    std::size_t src_stride, std::size_t dst_stride) noexcept {
+  if (!src || !dst || width <= 0 || height <= 0)
+    return video::CpuPrimitiveResult::invalid_argument;
+  for (int y = 0; y < height; ++y) {
+    const auto *source = src + static_cast<std::size_t>(y) * src_stride;
+    auto *destination = dst + static_cast<std::size_t>(y) * dst_stride;
+    for (int x = 0; x < width; ++x) {
+      const auto offset = static_cast<std::size_t>(x) * 3u;
+      destination[offset] = source[offset + 2];
+      destination[offset + 1] = source[offset + 1];
+      destination[offset + 2] = source[offset];
+    }
+  }
+  return video::CpuPrimitiveResult::success;
+}
+
 MaxineHalAdapterConfiguration
 Configuration(std::uint64_t adapter_id = kAdapterId) {
   MaxineHalAdapterConfiguration config{};
@@ -166,6 +191,7 @@ Configuration(std::uint64_t adapter_id = kAdapterId) {
   config.capacity.readback_staging_bytes = 8192;
   config.capacity.resource_count = 32;
   config.capacity.in_flight_slots = 1;
+  config.output_format_converter = SwapRgbBgr;
   return config;
 }
 
@@ -574,8 +600,8 @@ bool StrictBackendProviderDomainAndGenerationReject() {
   CHECK(reason == hal::ReasonId::malformed_descriptor);
 
   auto wrong_host_output = Program();
-  wrong_host_output.host_output.format = hal::PixelFormat::rgb_u8;
-  wrong_host_output.host_output.channel_order = hal::ChannelOrder::rgb;
+  wrong_host_output.host_output.format = hal::PixelFormat::bgr_u8;
+  wrong_host_output.host_output.channel_order = hal::ChannelOrder::bgr;
   CHECK(adapter.Prepare(wrong_host_output, &handle, &readiness, &reason) ==
         hal::StatusId::blocked);
   CHECK(reason == hal::ReasonId::malformed_descriptor);
@@ -739,7 +765,7 @@ bool TemporalResetDeviceLossAndShutdownAreTyped() {
   return true;
 }
 
-bool AutoFrameRequiresDeclaredCpuTailAndTemporalNeedsResetHook() {
+bool AutoFrameUsesOutputFormatTailAndTemporalNeedsResetHook() {
   FakeResidentFrameExecutor executor{};
   HooksFixture hooks{};
   MaxineHalResidentAdapter adapter(Configuration(), executor,
@@ -752,12 +778,18 @@ bool AutoFrameRequiresDeclaredCpuTailAndTemporalNeedsResetHook() {
   hal::ReadinessSnapshot readiness{};
   hal::ReasonId reason = hal::ReasonId::none;
   CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
-        hal::StatusId::blocked);
-  CHECK(reason == hal::ReasonId::cpu_tail_required);
+        hal::StatusId::ready);
+  adapter.DestroyPrepared(&handle);
 
   program.cpu_tails[0] =
       hal::DeclaredCpuTail{hal::CpuTailId::auto_frame_tracking, 1, 0, true};
   program.cpu_tail_count = 1;
+  CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
+        hal::StatusId::blocked);
+  CHECK(reason == hal::ReasonId::malformed_contract);
+
+  program.cpu_tails[0] =
+      hal::DeclaredCpuTail{hal::CpuTailId::output_format_conversion, 1, 0, true};
   CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
         hal::StatusId::ready);
   adapter.DestroyPrepared(&handle);
@@ -868,6 +900,7 @@ bool NeutralHostBindingExecutesAndResolvesExactOutput() {
                                    hooks.Hooks(executor));
   hal::PreparedProgramSession session{};
   auto program = Program();
+  DeclareOutputFormatTail(&program);
   CHECK(Configure(session, adapter, program));
 
   NeutralHostFixture host{};
@@ -903,8 +936,13 @@ bool NeutralHostBindingExecutesAndResolvesExactOutput() {
   CHECK(resolution.capture_sequence == binding.capture_sequence);
   CHECK(resolution.plane_count == 1);
   CHECK(resolution.planes[0].write_data == binding.output_planes[0].write_data);
-  for (std::size_t index = 0; index < 12; ++index)
-    CHECK(host.output[index] == hooks.output[index]);
+  for (std::size_t index = 0; index < 12; index += 3) {
+    CHECK(host.output[index] == hooks.output[index + 2]);
+    CHECK(host.output[index + 1] == hooks.output[index + 1]);
+    CHECK(host.output[index + 2] == hooks.output[index]);
+  }
+  CHECK(adapter.output_format_conversion_telemetry().attempts == 1);
+  CHECK(adapter.output_format_conversion_telemetry().successes == 1);
   CHECK(session.CommitOutput({result.completion, true}, &reason) ==
         hal::StatusId::ready);
 
@@ -941,6 +979,7 @@ bool NeutralHostTokensRejectStaleForeignGenerationAndDomain() {
   MaxineHalResidentAdapter adapter(Configuration(), executor,
                                    hooks.Hooks(executor));
   auto program = Program();
+  DeclareOutputFormatTail(&program);
   hal::PreparedProgramHandle handle{};
   hal::ReadinessSnapshot readiness{};
   hal::ReasonId reason = hal::ReasonId::none;
@@ -1225,6 +1264,7 @@ bool NeutralDisabledFrameLoopIsAllocationFreeAfterPrepare() {
   program.stage_count = 1;
   program.stages[0] = Stage(1, hal::SemanticEffectId::video_noise_removal,
                             hal::SemanticEffectProviderId::maxine_vfx, false);
+  DeclareOutputFormatTail(&program);
   CHECK(Configure(session, adapter, program));
   NeutralHostFixture host{};
   hal::ReasonId reason = hal::ReasonId::none;
@@ -1296,7 +1336,7 @@ int main() {
       StrictBackendProviderDomainAndGenerationReject,
       ResourceExhaustionMalformedBindingAndOldPlanRetention,
       TemporalResetDeviceLossAndShutdownAreTyped,
-      AutoFrameRequiresDeclaredCpuTailAndTemporalNeedsResetHook,
+      AutoFrameUsesOutputFormatTailAndTemporalNeedsResetHook,
       AuthoritativeTelemetryIsMandatoryAndRejectsHiddenBoundaries,
       MatteFingerprintTracksPreparedInvalidationIdentity,
       NeutralHostBindingExecutesAndResolvesExactOutput,

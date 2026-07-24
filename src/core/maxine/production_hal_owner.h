@@ -89,6 +89,11 @@ public:
       noexcept {
     return executor_.get();
   }
+  [[nodiscard]] MaxineOutputFormatConversionTelemetry
+  output_format_conversion_telemetry() const noexcept {
+    return adapter_ ? adapter_->output_format_conversion_telemetry()
+                    : MaxineOutputFormatConversionTelemetry{};
+  }
 
   // Device-loss detection remains outside this owner because the current
   // Maxine wrappers collapse SDK/CUDA failures to a boolean. A cached,

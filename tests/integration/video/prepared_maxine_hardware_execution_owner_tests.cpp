@@ -262,7 +262,7 @@ video::PreparedMaxineHardwareRequest Request() {
   request.strict_backend_selection = true;
   request.single_resident_island = true;
   request.host_input_is_tight_rgb24 = true;
-  request.host_output_is_tight_bgr24 = true;
+  request.host_output_is_tight_rgb24 = true;
   request.adapter_instance_id = 91;
   request.width = 8;
   request.height = 6;

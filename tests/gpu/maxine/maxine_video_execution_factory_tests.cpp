@@ -293,7 +293,7 @@ video::VideoExecutionPlanRequest Request() {
       Image(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::read_only);
   request.host_output =
-      Image(hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      Image(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   request.invalidation_key.generations = {2, 3, 13, 5, 7, 37};
   request.invalidation_key.canonical_plan_hash = 101;
@@ -320,7 +320,7 @@ hal::HostFrameBinding Binding(std::uint8_t *input, std::uint8_t *output,
       Image(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::read_only);
   binding.output_descriptor =
-      Image(hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      Image(hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   binding.input_planes[0].read_data =
       reinterpret_cast<const std::byte *>(input);

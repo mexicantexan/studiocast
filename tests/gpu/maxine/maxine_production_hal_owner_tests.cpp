@@ -393,16 +393,14 @@ SetupSourceRequest(hal::SemanticEffectId semantic,
       Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::read_only);
   plan.host_output =
-      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   plan.invalidation_key.generations.configuration = 7;
   plan.invalidation_key.generations.geometry = 8;
   plan.invalidation_key.canonical_plan_hash =
       9000 + static_cast<std::uint32_t>(semantic);
   plan.budget = Capacity();
-  plan.cpu_tails[0].id = semantic == hal::SemanticEffectId::auto_frame
-                             ? hal::CpuTailId::auto_frame_tracking
-                             : hal::CpuTailId::output_format_conversion;
+  plan.cpu_tails[0].id = hal::CpuTailId::output_format_conversion;
   plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
   plan.cpu_tails[0].after_stage_id = 1;
   plan.cpu_tails[0].boundary_index = 1;
@@ -461,7 +459,7 @@ hal::PreparedProgram CombinedProgram(const MaxineProductionHalOwner &owner) {
       Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::read_only);
   program.host_output =
-      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   program.requested_backend = hal::BackendId::maxine;
   program.strict_backend_selection = true;
@@ -479,6 +477,12 @@ hal::PreparedProgram CombinedProgram(const MaxineProductionHalOwner &owner) {
                             hal::SemanticEffectId::virtual_key_light,
                             hal::SemanticEffectProviderId::maxine_vfx, true);
   program.stage_count = 2;
+  program.cpu_tails[0].id = hal::CpuTailId::output_format_conversion;
+  program.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  program.cpu_tails[0].after_stage_id = 2;
+  program.cpu_tails[0].boundary_index = 2;
+  program.cpu_tail_count = 1;
   return program;
 }
 
@@ -529,7 +533,7 @@ video::PreparedMaxineHardwareRequest BootstrapRequest(RuntimeFixture &runtime,
   request.strict_backend_selection = true;
   request.single_resident_island = true;
   request.host_input_is_tight_rgb24 = true;
-  request.host_output_is_tight_bgr24 = true;
+  request.host_output_is_tight_rgb24 = true;
   request.declares_output_format_cpu_tail = true;
   // Mirrors the production camera request; the backend bootstrap owns stable
   // adapter identity assignment.
@@ -602,7 +606,7 @@ CoordinatorRequest(const hal::ExecutionDomainId &domain,
       Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::read_only);
   request.host_output =
-      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
             hal::HostCoherence::coherent, hal::Mutability::write_only);
   request.invalidation_key.generations = {
       7, 1, 1, 1, 1, domain.logical_context_generation};
@@ -729,10 +733,13 @@ bool ExactDomainAndPreparedExecutionAreAllocationFree() {
             .successes == 128);
   CHECK(telemetry
             .transfers[static_cast<std::size_t>(
-                ProductionTransferKind::final_download)]
+                ProductionTransferKind::cpu_continuation_download)]
             .successes == 128);
   CHECK(telemetry.matte_inferences.successes == 128);
   CHECK(telemetry.shared_matte_reuses == 128);
+  const auto conversion = owner->output_format_conversion_telemetry();
+  CHECK(conversion.attempts == 129);
+  CHECK(conversion.successes == 129);
   CHECK(owner->session()->latest_committed_frame().valid);
   CHECK(owner->session()->latest_committed_frame().stage_count == 2);
   CHECK(owner->session()->latest_committed_frame().stages[0].backend ==
@@ -786,6 +793,8 @@ bool IdentityStageBudgetAndRollbackFailuresAreTyped() {
   CHECK(owner);
   auto program = CombinedProgram(*owner);
   program.stage_count = 1;
+  program.cpu_tails[0].after_stage_id = 1;
+  program.cpu_tails[0].boundary_index = 1;
   program.stages[0] =
       Stage(program.execution_domain, 1, hal::SemanticEffectId::vignette,
             hal::SemanticEffectProviderId::maxine_cuda_utility, true);
@@ -840,6 +849,8 @@ bool OptionalFailureCommitDeviceLossAndShutdownAreSafe() {
   CHECK(owner);
   auto program = CombinedProgram(*owner);
   program.stage_count = 1;
+  program.cpu_tails[0].after_stage_id = 1;
+  program.cpu_tails[0].boundary_index = 1;
   program.stages[0] =
       Stage(program.execution_domain, 1, hal::SemanticEffectId::vignette,
             hal::SemanticEffectProviderId::maxine_cuda_utility, false);
@@ -1236,6 +1247,14 @@ bool BackendSetupSourceBindsEveryCurrentSemanticExactly() {
     CHECK(result.lease.snapshot().backend == hal::BackendId::maxine);
     CHECK(result.lease.snapshot().execution_domain.backend ==
           hal::BackendId::maxine);
+    CHECK(result.lease.snapshot().adapter.semantic_capability_count == 1);
+    CHECK(result.lease.snapshot().adapter.semantic_capabilities[0].cpu_tail ==
+          hal::CpuTailId::output_format_conversion);
+    CHECK(result.plan.host_output.format == hal::PixelFormat::rgb_u8);
+    CHECK(result.plan.host_output.channel_order == hal::ChannelOrder::rgb);
+    CHECK(result.plan.cpu_tail_count == 1);
+    CHECK(result.plan.cpu_tails[0].id ==
+          hal::CpuTailId::output_format_conversion);
     CHECK(result.lease.snapshot().reserved_budget.persistent_bytes ==
           request.plan.budget.persistent_bytes);
     const bool has_configurable_model =
@@ -1307,6 +1326,8 @@ bool TemporalConfigurationsPrepareButResetRequiresReconstruction() {
   CHECK(owner);
   auto program = CombinedProgram(*owner);
   program.stage_count = 1;
+  program.cpu_tails[0].after_stage_id = 1;
+  program.cpu_tails[0].boundary_index = 1;
   program.stages[0] = Stage(program.execution_domain, 1,
                             hal::SemanticEffectId::virtual_background_blur,
                             hal::SemanticEffectProviderId::maxine_vfx, true);

@@ -1158,7 +1158,7 @@ public:
       prepared.single_resident_island = true;
       prepared.temporal_reset_required = plan.temporal.temporal;
       prepared.host_input_is_tight_rgb24 = true;
-      prepared.host_output_is_tight_bgr24 = true;
+      prepared.host_output_is_tight_rgb24 = true;
       prepared.width = plan.host_input.width;
       prepared.height = plan.host_input.height;
       prepared.output_width = plan.host_output.width;

@@ -2,7 +2,6 @@
 #include "core/maxine/production_resident_frame_executor.h"
 
 #include <chrono>
-#include <cstring>
 #include <limits>
 
 namespace studiocast::maxine {
@@ -523,7 +522,8 @@ bool MaxineHalResidentAdapter::ConfigurationValid() const noexcept {
              domain.queue_or_stream_identity &&
          configuration_.resident_key.configuration_generation != 0 &&
          configuration_.capacity.resource_count != 0 &&
-         configuration_.capacity.in_flight_slots == 1;
+         configuration_.capacity.in_flight_slots == 1 &&
+         configuration_.output_format_converter != nullptr;
 }
 
 bool MaxineHalResidentAdapter::ProgramToResidentPlan(
@@ -545,7 +545,7 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
                          hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
                          hal::Mutability::read_only) ||
       !ValidHostBoundary(program.host_output, configuration_.resident_key,
-                         hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+                         hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
                          hal::Mutability::write_only)) {
     SetReason(reason, ReasonId::malformed_descriptor);
     return false;
@@ -554,7 +554,6 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
   // transport conversion. It is covered by the single upload accounting and
   // is not an effect-level CPU fallback or an undeclared CPU tail.
 
-  bool has_auto_frame = false;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
     if (stage.backend != BackendId::maxine ||
@@ -585,7 +584,6 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
       SetReason(reason, ReasonId::capability_evidence_incomplete);
       return false;
     }
-    has_auto_frame |= kind == ResidentStageKind::auto_frame;
     if (!plan->AddCompatible(kind, !stage.required, requires_matte,
                              requires_matte ? MatteFingerprint(program, stage)
                                             : std::uint64_t{0})) {
@@ -598,7 +596,6 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
     SetReason(reason, ReasonId::cpu_tail_required);
     return false;
   }
-  bool declares_auto_frame_tail = false;
   if (program.cpu_tail_count == 1) {
     const auto &tail = program.cpu_tails[0];
     if (tail.after_stage_id !=
@@ -615,19 +612,10 @@ bool MaxineHalResidentAdapter::ProgramToResidentPlan(
                             : tail_reason);
       return false;
     }
-    declares_auto_frame_tail = tail.id == hal::CpuTailId::auto_frame_tracking;
-  }
-
-  // The current production Maxine auto-frame executor performs CPU tracking
-  // inside its prepared stage. Requiring the declaration keeps that boundary
-  // visible until the tracker is split into a separately schedulable tail.
-  if (has_auto_frame && !declares_auto_frame_tail) {
-    SetReason(reason, ReasonId::cpu_tail_required);
-    return false;
-  }
-  if (!has_auto_frame && declares_auto_frame_tail) {
-    SetReason(reason, ReasonId::malformed_contract);
-    return false;
+    if (tail.id != hal::CpuTailId::output_format_conversion) {
+      SetReason(reason, ReasonId::malformed_contract);
+      return false;
+    }
   }
 
   plan->require_cpu_output =
@@ -826,6 +814,9 @@ StatusId MaxineHalResidentAdapter::BindHostFrame(
   ReasonId binding_reason = ReasonId::none;
   if (!tokens || !slot->program.requires_upload ||
       !slot->program.requires_final_readback ||
+      slot->program.cpu_tail_count != 1 ||
+      slot->program.cpu_tails[0].id !=
+          hal::CpuTailId::output_format_conversion ||
       !hal::ValidateHostFrameBinding(binding, slot->program, &binding_reason) ||
       binding.input_plane_count != 1 || binding.output_plane_count != 1 ||
       !SameImageDescriptor(binding.input_descriptor,
@@ -910,6 +901,7 @@ StatusId MaxineHalResidentAdapter::BindHostFrame(
   slot->output_resource = {};
   slot->output_resource_id = 0;
   slot->output_cookie = 0;
+  slot->neutral_output_materialized = false;
   *tokens = candidate;
   return StatusId::ready;
 }
@@ -1023,6 +1015,33 @@ bool MaxineHalResidentAdapter::PopulateOutput(
         slot.host_frame.tokens.output.size_bytes != size_bytes) {
       return false;
     }
+    const auto &descriptor = slot.host_frame.binding.output_descriptor;
+    const auto &plane = slot.host_frame.binding.output_planes[0];
+    if (output.boundary != MaxineOutputBoundary::cpu_tail_readback ||
+        descriptor.format != hal::PixelFormat::rgb_u8 ||
+        descriptor.channel_order != hal::ChannelOrder::rgb ||
+        output.width != descriptor.width || output.height != descriptor.height ||
+        plane.row_stride_bytes != descriptor.planes[0].row_stride_bytes ||
+        plane.write_data == nullptr) {
+      return false;
+    }
+    const auto conversion_started = std::chrono::steady_clock::now();
+    ++output_format_conversion_telemetry_.attempts;
+    const auto conversion = configuration_.output_format_converter(
+        output.host_bgr,
+        reinterpret_cast<std::uint8_t *>(plane.write_data),
+        static_cast<int>(descriptor.width), static_cast<int>(descriptor.height),
+        output.stride_bytes, static_cast<std::size_t>(plane.row_stride_bytes));
+    const auto conversion_finished = std::chrono::steady_clock::now();
+    output_format_conversion_telemetry_.elapsed_ns +=
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                conversion_finished - conversion_started)
+                .count());
+    if (conversion != video::CpuPrimitiveResult::success)
+      return false;
+    ++output_format_conversion_telemetry_.successes;
+    slot.neutral_output_materialized = true;
     slot.output_resource = slot.host_frame.tokens.output;
     slot.output_resource_id = slot.output_resource.resource_id;
     slot.output_cookie = slot.host_frame.token_cookie;
@@ -1170,6 +1189,8 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
     return Failed(StatusId::quarantined, ReasonId::device_lost);
 
   const auto started = std::chrono::steady_clock::now();
+  const auto output_conversion_ns_before =
+      output_format_conversion_telemetry_.elapsed_ns;
   const auto counters_before = slot->section.counters();
   PrevalidatedExecutor prevalidated(*executor_, configuration_.resident_key);
   ResidentFrameExecutionResult execution{};
@@ -1359,6 +1380,9 @@ MaxineHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
     result.reason = ReasonId::invalid_resource;
     return result;
   }
+  result.frame_elapsed_ns +=
+      output_format_conversion_telemetry_.elapsed_ns -
+      output_conversion_ns_before;
   result.output_valid = true;
   result.status = execution.optional_failure_observed ? StatusId::degraded
                                                       : StatusId::executed;
@@ -1447,29 +1471,14 @@ StatusId MaxineHalResidentAdapter::ResolveHostFrameOutput(
       (slot->output.boundary != MaxineOutputBoundary::final_readback &&
        slot->output.boundary != MaxineOutputBoundary::cpu_tail_readback) ||
       !slot->output.ValidHost() ||
+      !slot->neutral_output_materialized ||
       !SameImageDescriptor(slot->host_frame.binding.output_descriptor,
                            slot->program.host_output)) {
     SetReason(reason, ReasonId::host_frame_binding_invalid);
     return StatusId::blocked;
   }
 
-  const auto &descriptor = slot->host_frame.binding.output_descriptor;
-  const auto &plane = slot->host_frame.binding.output_planes[0];
-  if (slot->output.width != descriptor.width ||
-      slot->output.height != descriptor.height ||
-      plane.row_stride_bytes != descriptor.planes[0].row_stride_bytes) {
-    SetReason(reason, ReasonId::host_frame_binding_invalid);
-    return StatusId::blocked;
-  }
-  const std::size_t row_bytes = static_cast<std::size_t>(descriptor.width) * 3u;
-  auto *destination = reinterpret_cast<std::uint8_t *>(plane.write_data);
-  for (std::uint32_t row = 0; row < descriptor.height; ++row) {
-    std::memmove(destination + row * plane.row_stride_bytes,
-                 slot->output.host_bgr + row * slot->output.stride_bytes,
-                 row_bytes);
-  }
-
-  resolution->descriptor = descriptor;
+  resolution->descriptor = slot->host_frame.binding.output_descriptor;
   resolution->planes = slot->host_frame.binding.output_planes;
   resolution->plane_count = slot->host_frame.binding.output_plane_count;
   resolution->capture_sequence = completion.capture_sequence;
