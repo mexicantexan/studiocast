@@ -1,0 +1,722 @@
+#include "core/open_video/open_cuda_production_hal_owner.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string_view>
+
+namespace {
+
+using namespace studiocast;
+using OwnerStatus = open_cuda::OpenCudaProductionOwnerStatus;
+using RuntimeStatus = open_cuda::PreparedOpenCudaRuntimeStatus;
+
+bool Expect(bool condition, std::string_view message) {
+  if (!condition)
+    std::cerr << "[FAIL] " << message << '\n';
+  return condition;
+}
+
+struct FakeCudaState {
+  cuda::CUcontext current = nullptr;
+  cuda::CUcontext primary =
+      reinterpret_cast<cuda::CUcontext>(std::uintptr_t{0xC001});
+  int context_device = 0;
+  int create_calls = 0;
+  int destroy_attempts = 0;
+  int destroy_successes = 0;
+  int primary_releases = 0;
+  int fail_create_call = 0;
+  bool fail_actual_destroy = false;
+  std::array<cuda::CUstream, 16> destroyed{};
+  std::size_t destroyed_count = 0;
+};
+
+FakeCudaState *g_cuda = nullptr;
+
+cuda::CUresult CudaInit(unsigned int) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult CudaModuleLoad(cuda::CUmodule *module, const void *) {
+  *module = reinterpret_cast<cuda::CUmodule>(std::uintptr_t{0x2001});
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaModuleGetFunction(cuda::CUfunction *function, cuda::CUmodule,
+                                     const char *) {
+  *function = reinterpret_cast<cuda::CUfunction>(std::uintptr_t{0x2002});
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaLaunch(cuda::CUfunction, unsigned int, unsigned int,
+                          unsigned int, unsigned int, unsigned int,
+                          unsigned int, unsigned int, cuda::CUstream, void **,
+                          void **) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaAlloc(cuda::CUdeviceptr *pointer, std::size_t *pitch,
+                         std::size_t width, std::size_t, unsigned int) {
+  *pointer = 0x3000;
+  *pitch = width;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaFree(cuda::CUdeviceptr) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult CudaCopy(const cuda::CUDA_MEMCPY2D *, cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaMemset(cuda::CUdeviceptr, unsigned char, std::size_t,
+                          cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamCreate(cuda::CUstream *stream, unsigned int) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  ++g_cuda->create_calls;
+  if (g_cuda->fail_create_call == g_cuda->create_calls) {
+    *stream = nullptr;
+    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  *stream = reinterpret_cast<cuda::CUstream>(
+      static_cast<std::uintptr_t>(0x7000 + g_cuda->create_calls));
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamDestroy(cuda::CUstream stream) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  ++g_cuda->destroy_attempts;
+  const auto identity = reinterpret_cast<std::uintptr_t>(stream);
+  if (g_cuda->fail_actual_destroy && identity >= 0x7002)
+    return cuda::CUDA_ERROR_INVALID_CONTEXT;
+  ++g_cuda->destroy_successes;
+  if (g_cuda->destroyed_count < g_cuda->destroyed.size())
+    g_cuda->destroyed[g_cuda->destroyed_count++] = stream;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaStreamSynchronize(cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceCount(int *count) {
+  *count = 1;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceGet(cuda::CUdevice *device, int ordinal) {
+  *device = ordinal;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDeviceUuid(cuda::CUuuid *uuid, cuda::CUdevice device) {
+  std::memset(uuid->bytes, 0, sizeof(uuid->bytes));
+  uuid->bytes[0] = 0x42;
+  uuid->bytes[15] = static_cast<char>(device + 1);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaDevicePci(char *pci, int length, cuda::CUdevice) {
+  constexpr char value[] = "0000:01:00.0";
+  if (length < static_cast<int>(sizeof(value)))
+    return cuda::CUDA_ERROR_UNKNOWN;
+  std::memcpy(pci, value, sizeof(value));
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaPrimaryRetain(cuda::CUcontext *context, cuda::CUdevice) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  *context = g_cuda->primary;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaPrimaryRelease(cuda::CUdevice) {
+  if (g_cuda)
+    ++g_cuda->primary_releases;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxSet(cuda::CUcontext context) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  g_cuda->current = context;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxGet(cuda::CUcontext *context) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  *context = g_cuda->current;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult CudaCtxDevice(cuda::CUdevice *device) {
+  if (!g_cuda)
+    return cuda::CUDA_ERROR_UNKNOWN;
+  *device = g_cuda->context_device;
+  return cuda::CUDA_SUCCESS;
+}
+
+cuda::CudaDriverApi::Functions CudaFunctions() {
+  cuda::CudaDriverApi::Functions functions{};
+  functions.cuInit = CudaInit;
+  functions.cuModuleLoadData = CudaModuleLoad;
+  functions.cuModuleGetFunction = CudaModuleGetFunction;
+  functions.cuLaunchKernel = CudaLaunch;
+  functions.cuMemAllocPitch = CudaAlloc;
+  functions.cuMemFree = CudaFree;
+  functions.cuMemcpy2DAsync = CudaCopy;
+  functions.cuMemsetD8Async = CudaMemset;
+  functions.cuStreamCreate = CudaStreamCreate;
+  functions.cuStreamDestroy = CudaStreamDestroy;
+  functions.cuStreamSynchronize = CudaStreamSynchronize;
+  functions.cuDeviceGetCount = CudaDeviceCount;
+  functions.cuDeviceGet = CudaDeviceGet;
+  functions.cuDeviceGetUuid = CudaDeviceUuid;
+  functions.cuDeviceGetPCIBusId = CudaDevicePci;
+  functions.cuDevicePrimaryCtxRetain = CudaPrimaryRetain;
+  functions.cuDevicePrimaryCtxRelease = CudaPrimaryRelease;
+  functions.cuCtxSetCurrent = CudaCtxSet;
+  functions.cuCtxGetCurrent = CudaCtxGet;
+  functions.cuCtxGetDevice = CudaCtxDevice;
+  return functions;
+}
+
+bool InitializeFakeDriver(void *context, cuda::CudaDriverApi *driver,
+                          std::string *error) noexcept {
+  g_cuda = static_cast<FakeCudaState *>(context);
+  return driver && driver->InitializeForTesting(CudaFunctions(), error);
+}
+
+open_video::ValidatedModelArtifactIdentity Artifact() {
+  open_video::ValidatedModelArtifactIdentity artifact{};
+  artifact.registry_generation = 3;
+  artifact.model_id_sha256[0] = 1;
+  artifact.manifest_sha256[0] = 2;
+  artifact.artifact_sha256[0] = 3;
+  artifact.artifact_set_sha256[0] = 4;
+  return artifact;
+}
+
+open_video::ModelPack Pack() {
+  open_video::ModelPack pack{};
+  pack.id = "owner-hermetic-matting";
+  pack.display_name = "Owner hermetic matting";
+  pack.task = "matting";
+  pack.registry_generation = 3;
+  pack.registry_manifest_sha256[0] = 2;
+  open_video::MattingSpec matting{};
+  matting.input.name = "input";
+  matting.input.layout = "nchw";
+  matting.input.dtype = "float32";
+  matting.input.width = 16;
+  matting.input.height = 8;
+  matting.input.channels = 3;
+  matting.output.name = "alpha";
+  matting.output.kind = "alpha";
+  matting.output.dtype = "float32";
+  matting.output.layout = "nchw";
+  matting.output.width = 16;
+  matting.output.height = 8;
+  matting.output.channels = 1;
+  matting.preprocess.color = "rgb";
+  matting.preprocess.range = "0..1";
+  pack.matting = matting;
+  return pack;
+}
+
+open_cuda::OpenCudaProductionBackendRequest
+BackendRequest(FakeCudaState *state,
+               open_cuda::IPreparedOpenCudaRuntime *runtime = nullptr) {
+  open_cuda::OpenCudaProductionBackendRequest request{};
+  request.adapter_instance_id = 91;
+  request.cuda_device_id = 0;
+  request.model_pack = Pack();
+  request.model_artifact = Artifact();
+  request.configuration_generation = 11;
+  request.model_preprocess_generation = 13;
+  request.model_artifact_hash = 0xA2;
+  request.runtime = runtime;
+  request.initialize_driver = InitializeFakeDriver;
+  request.initialize_driver_context = state;
+  return request;
+}
+
+hal::ImageDescriptor Image(hal::HostCoherence coherence,
+                           hal::Mutability mutability) {
+  hal::ImageDescriptor image{};
+  image.width = 16;
+  image.height = 8;
+  image.plane_count = 1;
+  image.format = hal::PixelFormat::rgb_u8;
+  image.channel_order = hal::ChannelOrder::rgb;
+  image.color_space = hal::ColorSpace::srgb;
+  image.color_range = hal::ColorRange::full;
+  image.orientation = hal::Orientation::top_left;
+  image.host_coherence = coherence;
+  image.mutability = mutability;
+  image.aliasing = hal::AliasingPermission::forbidden;
+  image.base_alignment_bytes =
+      coherence == hal::HostCoherence::not_host_visible ? 16 : 1;
+  image.planes[0].row_stride_bytes = 48;
+  image.planes[0].size_bytes = 384;
+  image.planes[0].width = 16;
+  image.planes[0].height = 8;
+  image.planes[0].alignment_bytes = image.base_alignment_bytes;
+  return image;
+}
+
+hal::PreparedProgram Program(const hal::ExecutionDomainId &domain) {
+  const auto artifact = Artifact();
+  hal::PreparedProgram program{};
+  program.program_id = 101;
+  program.owner_adapter_instance_id = domain.adapter_instance_id;
+  program.execution_domain = domain;
+  program.host_input =
+      Image(hal::HostCoherence::coherent, hal::Mutability::read_only);
+  program.host_output =
+      Image(hal::HostCoherence::coherent, hal::Mutability::write_only);
+  program.invalidation_key.generations = {
+      .configuration = 11,
+      .geometry = 12,
+      .model = 13,
+      .provider = 14,
+      .device = 15,
+      .context = domain.logical_context_generation,
+  };
+  program.invalidation_key.canonical_plan_hash = 0xA1;
+  program.invalidation_key.model_artifact_hash = 0xA2;
+  program.invalidation_key.execution_domain_hash = 0xA3;
+  program.budget = {128 * 1024, 64 * 1024, 4096, 4096, 32, 1};
+  auto &stage = program.stages[0];
+  stage.stage_id = 1;
+  stage.semantic = hal::SemanticEffectId::virtual_background_blur;
+  stage.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  stage.backend = hal::BackendId::cuda;
+  stage.execution_domain = domain;
+  stage.input.kind = hal::StageIoKind::image;
+  stage.input.image =
+      Image(hal::HostCoherence::not_host_visible, hal::Mutability::read_only);
+  stage.output.kind = hal::StageIoKind::image;
+  stage.output.image =
+      Image(hal::HostCoherence::not_host_visible, hal::Mutability::read_write);
+  stage.model.model_id_hash = artifact.model_id_sha256;
+  stage.model.artifact_set_hash = artifact.artifact_set_sha256;
+  stage.model.artifact_generation = artifact.registry_generation;
+  stage.required = true;
+  stage.failure_action = hal::FailureAction::fail_closed;
+  stage.circuit_breaker.consecutive_failure_limit = 2;
+  stage.circuit_breaker.cooldown_frames = 1;
+  stage.circuit_breaker.action = hal::CircuitBreakerAction::quarantine_program;
+  stage.scratch_bytes = 4096;
+  program.stage_count = 1;
+  program.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+  program.cpu_tails[0].after_stage_id = 1;
+  program.cpu_tails[0].required = true;
+  program.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
+  program.cpu_tails[0].boundary_index = 1;
+  program.cpu_tail_count = 1;
+  program.requested_backend = hal::BackendId::cuda;
+  program.strict_backend_selection = true;
+  program.requested_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  program.strict_provider_selection = true;
+  program.requested_execution_domain = domain;
+  program.strict_execution_domain = true;
+  program.requires_upload = true;
+  program.requires_final_readback = true;
+  return program;
+}
+
+hal::ReadinessSnapshot Readiness(const hal::PreparedProgram &program) {
+  hal::ReadinessSnapshot readiness{};
+  readiness.status = hal::StatusId::degraded;
+  readiness.reason = hal::ReasonId::cpu_tail_required;
+  readiness.requested_backend = hal::BackendId::cuda;
+  readiness.selected_backend = hal::BackendId::cuda;
+  readiness.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  readiness.execution_domain = program.execution_domain;
+  readiness.ready_stage_mask = 1;
+  readiness.available = true;
+  readiness.degraded = true;
+  return readiness;
+}
+
+class PendingRuntime final : public open_cuda::IPreparedOpenCudaRuntime {
+public:
+  bool pending = true;
+  std::uint64_t shutdown_calls = 0;
+  std::uint64_t stream_destructions = 0;
+
+  open_cuda::PreparedOpenCudaRuntimePrepareResult Prepare(
+      const hal::PreparedProgram &,
+      const open_cuda::PreparedOpenCudaProductionConfig &) noexcept override {
+    return {};
+  }
+  open_cuda::PreparedOpenCudaRuntimeFrameResult ExecuteFrame(
+      const open_cuda::PreparedOpenCudaRuntimeHandle &,
+      const open_cuda::PreparedOpenCudaRuntimeFrame &) noexcept override {
+    return {};
+  }
+  RuntimeStatus
+  ResetTemporalState(const open_cuda::PreparedOpenCudaRuntimeHandle &,
+                     hal::ReasonId) noexcept override {
+    return RuntimeStatus::not_prepared;
+  }
+  RuntimeStatus DestroyPrepared(
+      open_cuda::PreparedOpenCudaRuntimeHandle *) noexcept override {
+    return pending ? RuntimeStatus::completion_pending : RuntimeStatus::ready;
+  }
+  open_cuda::PreparedOpenCudaShutdownSnapshot
+  RequestShutdown() noexcept override {
+    ++shutdown_calls;
+    if (!pending && stream_destructions == 0)
+      ++stream_destructions;
+    open_cuda::PreparedOpenCudaShutdownSnapshot snapshot{};
+    snapshot.status =
+        pending ? RuntimeStatus::completion_pending : RuntimeStatus::ready;
+    snapshot.shutdown_attempts = shutdown_calls;
+    snapshot.stream_destructions = stream_destructions;
+    snapshot.pending_prepared_slots = pending ? 1 : 0;
+    snapshot.shutdown_requested = true;
+    snapshot.quiescent = !pending;
+    snapshot.stream_owned = true;
+    snapshot.stream_destroyed = !pending;
+    snapshot.driver_context_release_permitted = !pending;
+    return snapshot;
+  }
+  open_cuda::PreparedOpenCudaShutdownSnapshot
+  ShutdownSnapshot() const noexcept override {
+    open_cuda::PreparedOpenCudaShutdownSnapshot snapshot{};
+    snapshot.status =
+        pending ? RuntimeStatus::completion_pending : RuntimeStatus::ready;
+    snapshot.shutdown_attempts = shutdown_calls;
+    snapshot.stream_destructions = stream_destructions;
+    snapshot.pending_prepared_slots = pending ? 1 : 0;
+    snapshot.shutdown_requested = shutdown_calls != 0;
+    snapshot.quiescent = !pending && shutdown_calls != 0;
+    snapshot.stream_owned = true;
+    snapshot.stream_destroyed = stream_destructions != 0;
+    snapshot.driver_context_release_permitted = snapshot.quiescent;
+    return snapshot;
+  }
+  open_cuda::PreparedOpenCudaRuntimeTelemetry
+  Telemetry() const noexcept override {
+    return {};
+  }
+};
+
+bool ExactDomainCapabilityAndQuarantineAreTyped() {
+  FakeCudaState state{};
+  open_cuda::OpenCudaProductionPreparationResult result{};
+  auto owner = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      BackendRequest(&state), &result);
+  bool ok = Expect(owner && result.bootstrap_domain_ready &&
+                       !result.prepared_capability_committed &&
+                       result.status == OwnerStatus::domain_ready,
+                   "bootstrap should not claim prepared model capability");
+  if (!owner)
+    return false;
+
+  const auto stream_identity =
+      reinterpret_cast<std::uintptr_t>(owner->prepared_stream());
+  ok = Expect(state.create_calls == 2 && stream_identity == 0x7002 &&
+                  result.execution_domain.queue_or_stream_identity ==
+                      stream_identity &&
+                  result.context == owner->context_identity() &&
+                  result.execution_domain.physical_device.stable_id ==
+                      result.context.physical_device.uuid &&
+                  result.execution_domain.logical_context_generation ==
+                      result.context.logical_generation &&
+                  result.execution_domain.allocator_family ==
+                      hal::AllocatorFamily::cuda_driver &&
+                  result.execution_domain.memory_handle_family ==
+                      hal::MemoryHandleFamily::cuda_device_pointer &&
+                  result.execution_domain.ownership_model ==
+                      hal::OwnershipModel::adapter_exclusive &&
+                  result.execution_domain.synchronization_protocol ==
+                      hal::SynchronizationProtocol::cuda_stream_ordered,
+              "domain must bind exact context, actual non-default stream, "
+              "CUDA memory, and exclusive ownership") &&
+       ok;
+
+  const auto program = Program(owner->execution_domain());
+  const auto readiness = Readiness(program);
+  const auto committed = owner->CommitPreparedCapability(program, readiness);
+  ok = Expect(committed.status == OwnerStatus::prepared_capability_committed &&
+                  committed.prepared_capability_committed &&
+                  owner->prepared_capability_committed(),
+              "only exact adapter readiness should commit capability") &&
+       ok;
+
+  auto foreign_readiness = readiness;
+  ++foreign_readiness.execution_domain.adapter_instance_id;
+  const auto foreign =
+      owner->CommitPreparedCapability(program, foreign_readiness);
+  ok = Expect(foreign.status == OwnerStatus::wrong_execution_domain &&
+                  owner->prepared_capability_committed(),
+              "foreign evidence must retain old committed capability") &&
+       ok;
+
+  auto stale_program = program;
+  ++stale_program.invalidation_key.generations.context;
+  const auto stale = owner->CommitPreparedCapability(stale_program, readiness);
+  ok = Expect(stale.status == OwnerStatus::stale_generation &&
+                  owner->prepared_capability_committed(),
+              "stale generation must retain old capability") &&
+       ok;
+
+  auto cpu_readiness = readiness;
+  cpu_readiness.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  const auto cpu = owner->CommitPreparedCapability(program, cpu_readiness);
+  ok = Expect(cpu.status == OwnerStatus::capability_evidence_incomplete &&
+                  owner->prepared_capability_committed(),
+              "CPU evidence must never promote Open CUDA capability") &&
+       ok;
+
+  auto exhausted_readiness = readiness;
+  exhausted_readiness.status = hal::StatusId::resource_exhausted;
+  exhausted_readiness.reason = hal::ReasonId::resource_exhausted;
+  exhausted_readiness.available = false;
+  const auto exhausted =
+      owner->CommitPreparedCapability(program, exhausted_readiness);
+  ok = Expect(exhausted.status == OwnerStatus::resource_exhausted &&
+                  exhausted.hal_status == hal::StatusId::resource_exhausted &&
+                  exhausted.reason == hal::ReasonId::resource_exhausted &&
+                  owner->prepared_capability_committed(),
+              "resource exhaustion must remain typed and retain old "
+              "capability") &&
+       ok;
+
+  auto foreign_program = program;
+  ++foreign_program.owner_adapter_instance_id;
+  const auto foreign_adapter =
+      owner->CommitPreparedCapability(foreign_program, readiness);
+  if (foreign_adapter.status != OwnerStatus::foreign_adapter) {
+    std::cerr << "[DETAIL] foreign status="
+              << static_cast<unsigned>(foreign_adapter.status)
+              << " reason=" << static_cast<unsigned>(foreign_adapter.reason)
+              << '\n';
+  }
+  ok = Expect(foreign_adapter.status == OwnerStatus::foreign_adapter &&
+                  owner->prepared_capability_committed(),
+              "foreign adapter ownership must fail closed") &&
+       ok;
+
+  auto malformed_program = program;
+  malformed_program.execution_domain.queue_or_stream_identity = 0;
+  malformed_program.requested_execution_domain =
+      malformed_program.execution_domain;
+  malformed_program.stages[0].execution_domain =
+      malformed_program.execution_domain;
+  const auto malformed_domain =
+      owner->CommitPreparedCapability(malformed_program, readiness);
+  if (malformed_domain.reason != hal::ReasonId::malformed_execution_domain) {
+    std::cerr << "[DETAIL] malformed status="
+              << static_cast<unsigned>(malformed_domain.status)
+              << " reason=" << static_cast<unsigned>(malformed_domain.reason)
+              << '\n';
+  }
+  ok = Expect(
+           malformed_domain.status ==
+                   OwnerStatus::capability_evidence_incomplete &&
+               malformed_domain.reason ==
+                   hal::ReasonId::malformed_execution_domain &&
+               owner->prepared_capability_committed(),
+           "malformed execution domain must fail before capability mutation") &&
+       ok;
+
+  owner->ObserveRuntimeStatus(hal::StatusId::quarantined,
+                              hal::ReasonId::device_lost);
+  const auto snapshot = owner->Snapshot();
+  ok = Expect(snapshot.quarantined && snapshot.device_lost &&
+                  !snapshot.prepared_capability.committed &&
+                  !owner->prepared_capability_committed(),
+              "device loss must quarantine and revoke capability") &&
+       ok;
+
+  const auto shutdown = owner->RequestShutdown();
+  ok = Expect(
+           shutdown.quiescent && shutdown.driver_context_release_permitted &&
+               state.destroy_successes == 2 && state.destroyed_count == 2 &&
+               reinterpret_cast<std::uintptr_t>(state.destroyed[0]) == 0x7001 &&
+               reinterpret_cast<std::uintptr_t>(state.destroyed[1]) == 0x7002,
+           "validation and owned streams must each be destroyed once") &&
+       ok;
+  return ok;
+}
+
+bool CandidateFailuresRetainOldIslandAndRollbackExactStream() {
+  {
+    FakeCudaState malformed_state{};
+    auto malformed_request = BackendRequest(&malformed_state);
+    malformed_request.adapter_instance_id = 0;
+    open_cuda::OpenCudaProductionPreparationResult malformed_result{};
+    auto malformed = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+        malformed_request, &malformed_result);
+    if (!Expect(!malformed &&
+                    malformed_result.status == OwnerStatus::malformed_request &&
+                    malformed_state.create_calls == 0,
+                "malformed bootstrap request must fail before CUDA work")) {
+      return false;
+    }
+  }
+
+  FakeCudaState old_state{};
+  open_cuda::OpenCudaProductionPreparationResult result{};
+  auto old_owner = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      BackendRequest(&old_state), &result);
+  bool ok = Expect(old_owner && old_owner->bootstrap_domain_ready(),
+                   "old valid island should bootstrap");
+  if (!old_owner)
+    return false;
+
+  FakeCudaState mismatch_state{};
+  auto mismatch_request = BackendRequest(&mismatch_state);
+  mismatch_request.require_expected_context = true;
+  mismatch_request.expected_context = old_owner->context_identity();
+  auto mismatch = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      mismatch_request, &result);
+  ok = Expect(!mismatch && result.status == OwnerStatus::context_mismatch &&
+                  result.reason == hal::ReasonId::wrong_generation &&
+                  mismatch_state.create_calls == 2 &&
+                  mismatch_state.destroy_successes == 2 &&
+                  old_owner->bootstrap_domain_ready() &&
+                  old_owner->driver() != nullptr &&
+                  old_owner->adapter() != nullptr,
+              "failed candidate must roll back and leave old owner intact") &&
+       ok;
+
+  FakeCudaState create_failure_state{};
+  create_failure_state.fail_create_call = 2;
+  auto create_failure = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      BackendRequest(&create_failure_state), &result);
+  ok = Expect(!create_failure &&
+                  result.status == OwnerStatus::stream_create_failed &&
+                  create_failure_state.create_calls == 2 &&
+                  create_failure_state.destroy_successes == 1 &&
+                  old_owner->bootstrap_domain_ready(),
+              "actual stream-create failure must retain old owner") &&
+       ok;
+
+  FakeCudaState cleanup_state{};
+  cleanup_state.fail_actual_destroy = true;
+  auto cleanup_request = BackendRequest(&cleanup_state);
+  cleanup_request.require_expected_context = true;
+  cleanup_request.expected_context = old_owner->context_identity();
+  auto cleanup_owner = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      cleanup_request, &result);
+  ok = Expect(cleanup_owner && result.retained_cleanup_island &&
+                  result.status == OwnerStatus::stream_destroy_failed &&
+                  cleanup_owner->driver() != nullptr &&
+                  cleanup_owner->prepared_stream() != nullptr &&
+                  !cleanup_owner->ShutdownSnapshot()
+                       .driver_context_release_permitted,
+              "failed rollback destruction must retain the partial island") &&
+       ok;
+  if (cleanup_owner) {
+    cleanup_state.fail_actual_destroy = false;
+    const auto cleaned = cleanup_owner->RequestShutdown();
+    ok = Expect(cleaned.quiescent && cleaned.driver_context_release_permitted &&
+                    cleaned.owner_stream_destructions == 1 &&
+                    cleanup_state.destroy_successes == 2,
+                "retry must destroy retained stream before context release") &&
+         ok;
+  }
+
+  g_cuda = &old_state;
+  (void)old_owner->RequestShutdown();
+  return ok;
+}
+
+bool ShutdownRetainsCompleteIslandUntilQuiescent() {
+  FakeCudaState state{};
+  PendingRuntime runtime{};
+  open_cuda::OpenCudaProductionPreparationResult result{};
+  auto owner = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      BackendRequest(&state, &runtime), &result);
+  bool ok = Expect(owner && owner->bootstrap_domain_ready(),
+                   "pending fixture should bootstrap");
+  if (!owner)
+    return false;
+
+  const auto pending = owner->RequestShutdown();
+  ok = Expect(pending.status == OwnerStatus::shutdown_pending &&
+                  !pending.quiescent &&
+                  !pending.driver_context_release_permitted &&
+                  pending.executor.pending_prepared_slots == 1 &&
+                  owner->driver() != nullptr && owner->executor() != nullptr &&
+                  owner->adapter() != nullptr &&
+                  owner->prepared_stream() != nullptr &&
+                  state.primary_releases == 0,
+              "pending work must retain the complete island") &&
+       ok;
+
+  const auto repeated_pending = owner->RequestShutdown();
+  ok = Expect(!repeated_pending.driver_context_release_permitted &&
+                  runtime.stream_destructions == 0 &&
+                  state.primary_releases == 0,
+              "repeated pending shutdown must not release resources") &&
+       ok;
+
+  runtime.pending = false;
+  const auto quiescent = owner->RequestShutdown();
+  ok = Expect(
+           quiescent.quiescent && quiescent.driver_context_release_permitted &&
+               quiescent.executor.stream_destructions == 1 &&
+               runtime.stream_destructions == 1 && owner->driver() == nullptr &&
+               owner->executor() == nullptr && owner->adapter() == nullptr &&
+               owner->prepared_stream() == nullptr &&
+               state.primary_releases == 1,
+           "quiescent retry must release the island in order") &&
+       ok;
+
+  const auto repeated = owner->RequestShutdown();
+  ok = Expect(repeated.quiescent && runtime.stream_destructions == 1 &&
+                  state.primary_releases == 1,
+              "completed shutdown must not double destroy") &&
+       ok;
+  return ok;
+}
+
+bool ProductionStreamDestroyFailureIsRetryable() {
+  FakeCudaState state{};
+  open_cuda::OpenCudaProductionPreparationResult result{};
+  auto owner = open_cuda::OpenCudaProductionHalOwner::CreateBackend(
+      BackendRequest(&state), &result);
+  bool ok = Expect(owner && owner->bootstrap_domain_ready(),
+                   "destroy-failure fixture should bootstrap");
+  if (!owner)
+    return false;
+
+  state.fail_actual_destroy = true;
+  const auto pending = owner->RequestShutdown();
+  ok = Expect(pending.status == OwnerStatus::shutdown_pending &&
+                  !pending.driver_context_release_permitted &&
+                  pending.executor.stream_owned &&
+                  !pending.executor.stream_destroyed &&
+                  owner->driver() != nullptr && owner->executor() != nullptr &&
+                  state.primary_releases == 0,
+              "stream destroy failure must retain the production island") &&
+       ok;
+
+  state.fail_actual_destroy = false;
+  const auto complete = owner->RequestShutdown();
+  ok = Expect(complete.quiescent && complete.driver_context_release_permitted &&
+                  complete.executor.stream_destructions == 1 &&
+                  state.primary_releases == 1,
+              "production destroy retry must succeed exactly once") &&
+       ok;
+  const int successes = state.destroy_successes;
+  (void)owner->RequestShutdown();
+  ok = Expect(state.destroy_successes == successes &&
+                  state.primary_releases == 1,
+              "post-quiescence retry must be idempotent") &&
+       ok;
+  return ok;
+}
+
+} // namespace
+
+int main() {
+  bool ok = true;
+  ok = ExactDomainCapabilityAndQuarantineAreTyped() && ok;
+  ok = CandidateFailuresRetainOldIslandAndRollbackExactStream() && ok;
+  ok = ShutdownRetainsCompleteIslandUntilQuiescent() && ok;
+  ok = ProductionStreamDestroyFailureIsRetryable() && ok;
+  g_cuda = nullptr;
+  if (!ok)
+    return EXIT_FAILURE;
+  std::cout << "[PASS] Open CUDA production HAL owner tests\n";
+  return EXIT_SUCCESS;
+}
