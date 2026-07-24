@@ -12,10 +12,11 @@ Video, and Open Vulkan implementations. It is not OpenCV's macro HAL and does
 not imply that CUDA, Maxine, ONNX Runtime, Vulkan, or another API can share
 resources merely because they use the same physical GPU.
 
-The migration is deliberately incremental. A qualified prepared route owns its
-live execution island; configurations outside that route continue through the
-existing compatibility implementation. Compatibility does not relax strict
-backend selection, production capability evidence, or transfer accounting.
+The production camera path now has one neutral plan owner. A qualified resident
+route owns its live execution island; the only retained compatibility execution
+is itself a typed setup-source result with exact provider and execution-domain
+evidence. Compatibility does not relax strict backend selection, production
+capability evidence, or transfer accounting.
 
 ## Two separate layers
 
@@ -149,28 +150,38 @@ real hardware.
 
 ## Current production adapters and migration gates
 
-The camera pipeline uses neutral production compositions backed by typed setup
-leases. Backend factories own native sessions, contexts, streams/queues,
-buffers, and adapters; the pipeline sees prepared requests, host-frame
+The camera pipeline uses one `ProductionVideoBackendManager` backed by typed
+setup leases. Backend factories own native sessions, contexts, streams/queues,
+buffers, and adapters; the pipeline sees a canonical setup request, host-frame
 bindings, completion tokens, transfer counters, and snapshots rather than
 backend SDK objects. Candidate compositions replace a live composition only
 after registration and preparation succeed, so failed reconfiguration retains
-the prior valid plan. The current live migration is intentionally narrower than
-the full compatibility pipeline:
+the prior valid plan.
 
-| Route | Current prepared live eligibility | Compatibility behavior |
+| Route | Current prepared live eligibility | Exact limitation |
 | --- | --- | --- |
-| CPU primitives | Conversion, mirror, and prepared bilinear resize only | Existing callers use the process-lifetime function table; no product-effect capability is inferred |
-| Maxine resident | One qualified contiguous non-temporal Maxine island with tight RGB24 input, tight BGR24 output, and an explicit output-format CPU tail | Other Maxine configurations use the retained resident executor; unavailable resolved Maxine work is disabled rather than sent through the old per-effect upload/download path |
-| Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; no other stage in the plan | Ineligible configurations retain the existing exact Vulkan/legacy path and its capability gates |
-| Open CUDA/Open Video | Explicit Open CUDA effect engine; strict CUDA and ONNX Runtime CUDA provider; one blur or remove virtual-background stage; same capture/output geometry; tight RGB24; no mixed, replacement, temporal, shared-analysis, scaling, or conversion stage | Setup may retain the same explicit Open CUDA compatibility route; after a prepared frame starts, failure never retries the legacy route in that frame |
+| CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
+| Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
+| Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; zero CPU tails | Matting, tracked-center vignette, Auto Frame, eye contact, denoise, key light, and background modes remain blocked or non-production exactly as documented |
+| Open CUDA resident | Explicit strict CUDA plus ONNX Runtime CUDA; one blur, remove, replace, or virtual-key-light stage; tight same-geometry RGB24; one measured writer-copy tail | Multi-stage/shared-matte islands and Auto Frame remain blocked because the current contract cannot prove their full resident dependency graph |
+| Open Video compatibility | Typed host ONNX Runtime domain for the existing denoise and eye-contact route | It is not CUDA attribution and cannot satisfy strict CUDA/provider selection |
+
+The setup request declares a setup-only terminal
+`backend_resolved_output` marker. It is never executable. The selected setup
+source must bind it exactly to zero tails for Vulkan and host compatibility, an
+output-format conversion for Maxine, or a writer-copy/provider tail for Open
+CUDA. The manager accepts only that same terminal-boundary refinement; normal
+plan and prepared-program validation reject an unresolved marker.
 
 The Maxine owner generalizes the existing resident-section executor and
 preserves its shared upload, matte reuse, bounded resources, final readback,
-failure handling, and compatibility counters. The Open CUDA owner contains CUDA
+failure handling, and compatibility counters. Its canonical host output is
+RGB24; SDK-local BGR remains internal and the startup-selected CPU conversion
+is measured after the single final readback. The Open CUDA owner contains CUDA
 driver/stream ownership, prepared preprocessing and postprocessing kernels,
 ONNX Runtime CUDA IoBinding, validated artifact identity, reusable device
-resources, bounded completion waiting, and retryable shutdown. Model discovery,
+resources, bounded completion waiting, and retryable shutdown. Replacement
+images are decoded, uploaded, and resized during setup. Model discovery,
 manifest parsing, artifact validation, provider selection, session creation,
 and resource sizing happen at setup.
 
@@ -190,12 +201,13 @@ virtual key light, and virtual-background modes retain their existing
 production, degraded, experimental, diagnostics-only, or blocked states.
 Creating a generic Vulkan adapter does not promote them.
 
-`camera_pipeline.cpp` still contains compatibility orchestration while effect
-families move through parity, failure, transfer, and attribution gates.
-Consequently, `studiocast_video_runtime` still links all optional backend
-targets. This is migration debt, not the intended final dependency topology.
-Remove a compatibility planner or dependency only after every affected live
-route has passed its rollback gate; do not leave two indefinite planners.
+`camera_pipeline.cpp` no longer selects, instantiates, probes, or reallocates
+backend implementations. It builds one canonical request and executes the
+manager's prepared neutral result. The static backend-composition target owns
+the optional Maxine, Open CUDA/Open Video, and Vulkan dependencies privately;
+`studiocast_video_runtime` exposes only neutral contracts, execution runtime,
+video I/O, and support dependencies and receives no optional backend feature
+definitions.
 
 ## Transfers, CPU tails, and telemetry
 
@@ -203,13 +215,19 @@ One eligible full-domain GPU island reports:
 
 ```text
 host input -> one upload -> contiguous resident stages
-           -> one final readback -> declared writer/format CPU tail
+           -> one final readback -> exact declared writer/format CPU tail
 ```
 
 Intermediate uploads/readbacks, synchronization points, and CPU-tail
 boundaries are explicit counters. An adapter cannot hide a host round trip
 inside provider work or infer interoperation across domains. CPU-only
 passthrough remains CPU-only with zero GPU transfers.
+
+The host primitive mirror is also a typed CPU-tail activity record. It is
+published only after the same frame is committed by the writer. A dropped,
+unwritten, disabled, or fail-open frame cannot leave stale active mirror
+attribution, and this primitive record never becomes semantic-provider
+capability evidence.
 
 Typed telemetry includes requested, selected, and active attribution; setup and
 execution attempts/successes; committed output frames; fallback and optional
@@ -228,8 +246,12 @@ hardware-qualification evidence.
 ## Daemon status and compatibility
 
 The daemon remains authoritative for requested, selected, available, active,
-degraded, blocked, and fallback state. The pipeline caches a fixed-capacity
-multi-island snapshot with:
+degraded, blocked, and fallback state. `GET_STATUS` consumes the coherent typed
+manager selection and writer-commit snapshot as its live authority. Legacy raw
+backend diagnostics remain compatibility and installer evidence; they cannot
+override a current typed result. Failed, pending, stopped, or quarantined
+runtime state invalidates stale committed attribution. The pipeline also caches
+a fixed-capacity multi-island snapshot with:
 
 - all nine stable product effects and all capability lanes;
 - every current prepared island and its exact execution domain;
