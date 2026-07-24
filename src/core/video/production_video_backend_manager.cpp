@@ -734,29 +734,6 @@ ProductionVideoSetupLeaseShutdownResult ImmediateShutdown() noexcept {
 
 } // namespace
 
-std::uint64_t ProductionVideoExecutionDomainHash(
-    const hal::ExecutionDomainId &domain) noexcept {
-  std::uint64_t hash = UINT64_C(1469598103934665603);
-  const auto mix = [&](std::uint64_t value) {
-    hash ^= value;
-    hash *= UINT64_C(1099511628211);
-  };
-  mix(static_cast<std::uint64_t>(domain.backend));
-  mix(static_cast<std::uint64_t>(domain.api_family));
-  mix(domain.physical_device.vendor_id);
-  mix(domain.physical_device.device_id);
-  for (const auto byte : domain.physical_device.stable_id)
-    mix(byte);
-  mix(domain.logical_context_generation);
-  mix(static_cast<std::uint64_t>(domain.allocator_family));
-  mix(static_cast<std::uint64_t>(domain.memory_handle_family));
-  mix(domain.queue_or_stream_identity);
-  mix(static_cast<std::uint64_t>(domain.ownership_model));
-  mix(static_cast<std::uint64_t>(domain.synchronization_protocol));
-  mix(domain.adapter_instance_id);
-  return hash == 0 ? 1 : hash;
-}
-
 ProductionVideoBackendManager::ProductionVideoBackendManager(
     std::unique_ptr<IProductionVideoBackendSetupSource> setup_source)
     : setup_source_(std::move(setup_source)) {}

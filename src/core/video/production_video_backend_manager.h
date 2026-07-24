@@ -205,8 +205,28 @@ struct ProductionVideoBackendManagerSnapshot {
 
 // Stable hash for the exact typed execution-domain identity. This is an
 // invalidation key, not a substitute for comparing ExecutionDomainId itself.
-[[nodiscard]] std::uint64_t ProductionVideoExecutionDomainHash(
-    const hal::ExecutionDomainId &domain) noexcept;
+[[nodiscard]] inline std::uint64_t ProductionVideoExecutionDomainHash(
+    const hal::ExecutionDomainId &domain) noexcept {
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  const auto mix = [&](std::uint64_t value) {
+    hash ^= value;
+    hash *= UINT64_C(1099511628211);
+  };
+  mix(static_cast<std::uint64_t>(domain.backend));
+  mix(static_cast<std::uint64_t>(domain.api_family));
+  mix(domain.physical_device.vendor_id);
+  mix(domain.physical_device.device_id);
+  for (const auto byte : domain.physical_device.stable_id)
+    mix(byte);
+  mix(domain.logical_context_generation);
+  mix(static_cast<std::uint64_t>(domain.allocator_family));
+  mix(static_cast<std::uint64_t>(domain.memory_handle_family));
+  mix(domain.queue_or_stream_identity);
+  mix(static_cast<std::uint64_t>(domain.ownership_model));
+  mix(static_cast<std::uint64_t>(domain.synchronization_protocol));
+  mix(domain.adapter_instance_id);
+  return hash == 0 ? 1 : hash;
+}
 
 class IProductionVideoBackendManager {
 public:
