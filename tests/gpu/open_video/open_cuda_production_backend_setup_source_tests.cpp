@@ -79,7 +79,7 @@ StrictRequest(hal::SemanticEffectId semantic =
   plan.budget.readback_staging_bytes = UINT64_C(64) << 20;
   plan.budget.resource_count = 128;
   plan.budget.in_flight_slots = 1;
-  plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+  plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
   plan.cpu_tails[0].after_stage_id = stage.intent.stage_id;
   plan.cpu_tails[0].required = true;
   plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
@@ -222,6 +222,8 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
       hal::SemanticEffectId::eye_contact;
   request.plan.intent.stages[1].intent.failure_action =
       hal::FailureAction::fail_open_preserve_input;
+  request.plan.cpu_tails[0].after_stage_id = 8;
+  request.plan.cpu_tails[0].boundary_index = 2;
   auto result = source->AcquireResidentSetup(request);
   bool ok =
       Check(result.status == hal::StatusId::blocked &&

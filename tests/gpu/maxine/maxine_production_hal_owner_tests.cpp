@@ -400,7 +400,8 @@ SetupSourceRequest(hal::SemanticEffectId semantic,
   plan.invalidation_key.canonical_plan_hash =
       9000 + static_cast<std::uint32_t>(semantic);
   plan.budget = Capacity();
-  plan.cpu_tails[0].id = hal::CpuTailId::output_format_conversion;
+  plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
+  plan.cpu_tails[0].required = true;
   plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
   plan.cpu_tails[0].after_stage_id = 1;
   plan.cpu_tails[0].boundary_index = 1;

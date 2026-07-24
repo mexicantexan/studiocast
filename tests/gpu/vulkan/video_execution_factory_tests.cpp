@@ -796,6 +796,14 @@ int TestProductionSetupSourceIfAvailable() {
   request.effects.mirror = true;
   request.plan = Request();
   request.plan.invalidation_key.execution_domain_hash = 0;
+  request.plan.cpu_tails[0].id =
+      hal::CpuTailId::backend_resolved_output;
+  request.plan.cpu_tails[0].after_stage_id = 9;
+  request.plan.cpu_tails[0].required = true;
+  request.plan.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  request.plan.cpu_tails[0].boundary_index = 2;
+  request.plan.cpu_tail_count = 1;
   auto result = source->AcquireResidentSetup(request);
   if (result.status != hal::StatusId::ready &&
       result.status != hal::StatusId::degraded) {
@@ -808,6 +816,7 @@ int TestProductionSetupSourceIfAvailable() {
                           ExecutionKind::resident_island &&
                   result.lease.live() &&
                   result.lease.snapshot().backend == hal::BackendId::vulkan &&
+                  result.plan.cpu_tail_count == 0 &&
                   result.plan.invalidation_key.execution_domain_hash != 0 &&
                   result.plan.invalidation_key.generations.context ==
                       result.lease.snapshot()

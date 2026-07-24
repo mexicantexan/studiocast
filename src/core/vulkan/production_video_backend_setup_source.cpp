@@ -16,6 +16,23 @@ bool IsSetupSuccess(hal::StatusId status) noexcept {
   return status == hal::StatusId::ready || status == hal::StatusId::degraded;
 }
 
+bool ExactTerminalBackendResolvedOutputTail(
+    const video::VideoExecutionPlanRequest &plan) noexcept {
+  if (plan.intent.stage_count == 0 ||
+      plan.intent.stage_count > plan.intent.stages.size() ||
+      plan.cpu_tail_count != 1) {
+    return false;
+  }
+  const auto &tail = plan.cpu_tails[0];
+  return tail.id == hal::CpuTailId::backend_resolved_output &&
+         tail.required &&
+         tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
+         tail.after_stage_id ==
+             plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id &&
+         tail.before_stage_id == 0 &&
+         tail.boundary_index == plan.intent.stage_count;
+}
+
 video::ProductionVideoResidentSetupSourceResult
 Failure(hal::StatusId status, hal::ReasonId reason) noexcept {
   video::ProductionVideoResidentSetupSourceResult result;
@@ -84,6 +101,11 @@ public:
                        hal::ReasonId::semantic_effect_unsupported);
       }
     }
+    if (caller.cpu_tail_count != 0 &&
+        !ExactTerminalBackendResolvedOutputTail(caller)) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::cpu_tail_required);
+    }
 
     try {
       auto factory = std::make_unique<VulkanVideoExecutionFactory>();
@@ -106,6 +128,10 @@ public:
       result.canonical_effects = request.effects;
       result.setup_completed_outside_frame_loop = true;
       result.plan = caller;
+      if (ExactTerminalBackendResolvedOutputTail(result.plan)) {
+        result.plan.cpu_tails[0] = {};
+        result.plan.cpu_tail_count = 0;
+      }
       auto &generations = result.plan.invalidation_key.generations;
       if (generations.model == 0)
         generations.model = 1;

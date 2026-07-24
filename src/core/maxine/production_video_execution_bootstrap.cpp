@@ -314,6 +314,22 @@ bool SameOrContainedBudget(const hal::ResourceBudget &reserved,
          reserved.in_flight_slots == known.in_flight_slots;
 }
 
+bool ExactTerminalOutputTail(const video::VideoExecutionPlanRequest &plan,
+                             hal::CpuTailId id) noexcept {
+  if (plan.intent.stage_count == 0 ||
+      plan.intent.stage_count > plan.intent.stages.size() ||
+      plan.cpu_tail_count != 1) {
+    return false;
+  }
+  const auto &tail = plan.cpu_tails[0];
+  return tail.id == id && tail.required &&
+         tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
+         tail.after_stage_id ==
+             plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id &&
+         tail.before_stage_id == 0 &&
+         tail.boundary_index == plan.intent.stage_count;
+}
+
 bool ContainsProvider(const video::ProductionVideoSetupLeaseSnapshot &snapshot,
                       hal::SemanticEffectProviderId provider) noexcept {
   for (std::size_t index = 0; index < snapshot.provider_count; ++index) {
@@ -1073,6 +1089,13 @@ public:
                         ? hal::ReasonId::strict_backend_unavailable
                         : hal::ReasonId::semantic_effect_unsupported);
       }
+      if (!ExactTerminalOutputTail(
+              plan, hal::CpuTailId::backend_resolved_output) &&
+          !ExactTerminalOutputTail(
+              plan, hal::CpuTailId::output_format_conversion)) {
+        return fail(hal::StatusId::blocked,
+                    hal::ReasonId::cpu_tail_required);
+      }
 
       bool needs_vfx = false;
       bool needs_ar = false;
@@ -1302,6 +1325,8 @@ public:
       result.readiness = snapshot.readiness;
       result.canonical_effects = request.effects;
       result.plan = plan;
+      result.plan.cpu_tails[0].id =
+          hal::CpuTailId::output_format_conversion;
       result.plan.invalidation_key.generations = snapshot.generations;
       result.plan.invalidation_key.execution_domain_hash =
           ExecutionDomainHash(snapshot.execution_domain);

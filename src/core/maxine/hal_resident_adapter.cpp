@@ -353,6 +353,8 @@ ReasonId CpuTailToResident(hal::CpuTailId id, CpuTailKind *kind) noexcept {
   case hal::CpuTailId::provider_postprocess:
     *kind = CpuTailKind::incompatible_stage;
     return ReasonId::none;
+  case hal::CpuTailId::cpu_primitive_mirror:
+  case hal::CpuTailId::backend_resolved_output:
   case hal::CpuTailId::invalid:
     break;
   }

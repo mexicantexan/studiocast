@@ -116,6 +116,22 @@ bool AlignRow(std::uint64_t active, std::uint64_t *aligned) noexcept {
   return true;
 }
 
+bool ExactTerminalOutputTail(const video::VideoExecutionPlanRequest &plan,
+                             hal::CpuTailId id) noexcept {
+  if (plan.intent.stage_count == 0 ||
+      plan.intent.stage_count > plan.intent.stages.size() ||
+      plan.cpu_tail_count != 1) {
+    return false;
+  }
+  const auto &tail = plan.cpu_tails[0];
+  return tail.id == id && tail.required &&
+         tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
+         tail.after_stage_id ==
+             plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id &&
+         tail.before_stage_id == 0 &&
+         tail.boundary_index == plan.intent.stage_count;
+}
+
 bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
                        std::uint32_t model_width, std::uint32_t model_height,
                        hal::SemanticEffectId semantic, int strength,
@@ -408,12 +424,22 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
     return Failure(hal::StatusId::blocked,
                    hal::ReasonId::semantic_provider_unavailable);
   }
+  const bool setup_output_tail = ExactTerminalOutputTail(
+      caller, hal::CpuTailId::backend_resolved_output);
+  if (caller.cpu_tail_count != 0 && !setup_output_tail) {
+    return Failure(hal::StatusId::blocked,
+                   hal::ReasonId::cpu_tail_required);
+  }
 
   auto result = video::ProductionVideoResidentSetupSourceResult{};
   result.execution_kind = video::ProductionVideoResidentSetupSourceResult::
       ExecutionKind::typed_compatibility;
   result.canonical_effects = request.effects;
   result.plan = caller;
+  if (setup_output_tail) {
+    result.plan.cpu_tails[0] = {};
+    result.plan.cpu_tail_count = 0;
+  }
   const auto registry = open_video::ModelPackRegistry::ScanDefault();
   std::uint64_t artifact_hash = kHashOffset;
   for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
@@ -555,11 +581,10 @@ public:
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::malformed_descriptor);
     }
-    if (caller.cpu_tail_count != 1 ||
-        caller.cpu_tails[0].id != hal::CpuTailId::writer_copy ||
-        caller.cpu_tails[0].after_stage_id != stage.intent.stage_id ||
-        caller.cpu_tails[0].placement !=
-            hal::DeclaredCpuTail::Placement::after_stage) {
+    const bool setup_output_tail = ExactTerminalOutputTail(
+        caller, hal::CpuTailId::backend_resolved_output);
+    if (!setup_output_tail &&
+        !ExactTerminalOutputTail(caller, hal::CpuTailId::writer_copy)) {
       return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
     }
 
@@ -683,6 +708,8 @@ public:
         return result;
 
       result.plan = caller;
+      if (setup_output_tail)
+        result.plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
       result.plan.intent.stages[0].model =
           bootstrap.setup_lease.artifacts[0].artifact;
       result.plan.invalidation_key.generations =
