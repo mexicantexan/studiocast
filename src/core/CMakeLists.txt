@@ -185,6 +185,8 @@ set(_studiocast_audio_runtime_sources
 set(_studiocast_video_execution_runtime_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/effects/capability_reason_codes.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/hardware_execution_runtime.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/video_execution_coordinator.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/video_execution_plan.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/video_runtime_status.cpp)
 
 set(_studiocast_video_runtime_sources
@@ -605,7 +607,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_execution_runtime_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 127)
+set(_studiocast_expected_source_count 129)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

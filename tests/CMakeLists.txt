@@ -101,6 +101,33 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-hardware-execution-runtime-tests
             unit core video gpu)
 
+    add_executable(studiocast-video-execution-coordinator-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/video_execution_coordinator_tests.cpp
+    )
+
+    target_link_libraries(studiocast-video-execution-coordinator-tests PRIVATE
+            studiocast_video_execution_runtime)
+
+    target_include_directories(studiocast-video-execution-coordinator-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-video-execution-coordinator-tests)
+    studiocast_enable_sanitizers(
+            studiocast-video-execution-coordinator-tests)
+
+    set_target_properties(studiocast-video-execution-coordinator-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-video-execution-coordinator-tests
+            COMMAND studiocast-video-execution-coordinator-tests)
+    studiocast_set_test_labels(studiocast-video-execution-coordinator-tests
+            unit core video gpu)
+
     add_executable(studiocast-prepared-hardware-execution-owner-tests
             ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_hardware_execution_owner_tests.cpp
     )
