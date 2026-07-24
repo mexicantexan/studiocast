@@ -266,7 +266,17 @@ public:
     result.stages[0].semantic = hal::SemanticEffectId::virtual_background_blur;
     result.stages[0].status = hal::StageExecutionStatus::succeeded;
     result.stages[0].valid_output_preserved = true;
-    result.transfers = plan_.domain_plan.expected_transfers;
+    result.transfers.uploads = plan_.per_frame_transfers.uploads;
+    result.transfers.final_readbacks =
+        plan_.per_frame_transfers.final_readbacks;
+    result.transfers.intermediate_readbacks =
+        plan_.per_frame_transfers.intermediate_readbacks;
+    result.transfers.intermediate_uploads =
+        plan_.per_frame_transfers.intermediate_uploads;
+    result.transfers.synchronizations =
+        plan_.per_frame_transfers.minimum_synchronizations;
+    result.transfers.cpu_tail_boundaries =
+        plan_.per_frame_transfers.cpu_tail_boundaries;
     std::memcpy(binding.output_planes[0].write_data,
                 binding.input_planes[0].read_data, 24);
     switch (mode_) {
@@ -290,7 +300,8 @@ public:
       result.output_ready = false;
       break;
     case ExecuteMode::transfer_mismatch:
-      ++result.transfers.synchronizations;
+      result.transfers.synchronizations =
+          plan_.per_frame_transfers.maximum_synchronizations + 1;
       break;
     }
     return result;
@@ -369,6 +380,12 @@ public:
     result.cached_evidence_only = cached_evidence_only;
     result.accepts_frozen_resolution = accepts_frozen_resolution;
     result.performs_selection = performs_selection;
+    result.per_frame_transfers = video::BuildPerFrameTransferContract(
+        domain_plan, minimum_synchronizations, maximum_synchronizations);
+    if (malformed_transfer_boundary)
+      ++result.per_frame_transfers.intermediate_readbacks;
+    if (malformed_transfer_version)
+      ++result.per_frame_transfers.contract_version;
     result.readiness.status = preflight_status;
     result.readiness.requested_backend = resolution.requested_backend;
     result.readiness.selected_backend = result.backend;
@@ -455,7 +472,11 @@ public:
   bool wrong_preflight_domain = false;
   bool malformed_prepared_program = false;
   bool malformed_prepared_tail = false;
+  bool malformed_transfer_boundary = false;
+  bool malformed_transfer_version = false;
   bool candidate_rolled_back = false;
+  std::uint64_t minimum_synchronizations = 1;
+  std::uint64_t maximum_synchronizations = 1;
   std::uint64_t preflight_calls = 0;
   std::uint64_t prepare_calls = 0;
   FakeExecutor *latest_executor = nullptr;
@@ -1117,6 +1138,84 @@ bool TestPreparedTransferContractAndFinalCpuTail() {
          run(ExecuteMode::success, true);
 }
 
+bool TestTransferContractValidation() {
+  const auto run = [](bool malformed_boundary, bool malformed_version,
+                      std::uint64_t minimum, std::uint64_t maximum,
+                      const char *message) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    if (!RegisterCapability(
+            &registry, &resident, domain,
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
+      return false;
+    }
+    FakeFactory factory(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+    factory.malformed_transfer_boundary = malformed_boundary;
+    factory.malformed_transfer_version = malformed_version;
+    factory.minimum_synchronizations = minimum;
+    factory.maximum_synchronizations = maximum;
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(
+                1, video::VideoExecutionRoute::prepared_resident, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &factory),
+            &reason) != hal::StatusId::ready) {
+      return false;
+    }
+    video::VideoExecutionPrepareEvidence evidence;
+    return Require(coordinator.Prepare(Request(), &evidence, &reason) ==
+                           hal::StatusId::blocked &&
+                       reason == hal::ReasonId::malformed_contract,
+                   message) &&
+           Require(factory.prepare_calls == 0,
+                   "invalid transfer evidence must fail before Prepare");
+  };
+
+  bool ok = run(true, false, 1, 1, "boundary mismatch must fail preflight");
+  ok &= run(false, true, 1, 1,
+            "foreign transfer contract version must fail preflight");
+  ok &= run(false, false, 2, 1,
+            "inverted synchronization range must fail preflight");
+  ok &= run(false, false, 0, 0, "device synchronization range must be nonzero");
+  ok &= run(false, false, 1, video::kMaxPerFrameSynchronizationsV1 + 1,
+            "unbounded synchronization range must fail preflight");
+
+  const auto domain = Domain();
+  DummyResident resident(domain);
+  hal::StaticAdapterRegistry registry;
+  if (!RegisterCapability(
+          &registry, &resident, domain,
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
+    return false;
+  }
+  FakeFactory compatibility(
+      domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  compatibility.malformed_transfer_boundary = true;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (coordinator.RegisterFactory(
+          FactoryRegistration(
+              2, video::VideoExecutionRoute::legacy_compatibility, domain,
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+              &compatibility),
+          &reason) != hal::StatusId::ready) {
+    return false;
+  }
+  auto request = Request();
+  request.migration_policy = video::VideoExecutionMigrationPolicy::
+      prepared_then_same_resolution_compatibility;
+  video::VideoExecutionPrepareEvidence evidence;
+  ok &= Require(coordinator.Prepare(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract,
+                "compatibility transfer crossings must be bounded");
+  return ok;
+}
+
 bool TestNoAllocationDuringExecute() {
   const auto domain = Domain();
   DummyResident resident(domain);
@@ -1193,6 +1292,7 @@ int main() {
   ok &= TestNoPreparedFactoryMayUseCompatibility();
   ok &= TestCompatibilityRequiresPreparedRollbackEvidence();
   ok &= TestPreparedTransferContractAndFinalCpuTail();
+  ok &= TestTransferContractValidation();
   ok &= TestNoAllocationDuringExecute();
   if (!ok)
     return 1;

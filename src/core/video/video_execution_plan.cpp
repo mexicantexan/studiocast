@@ -1,6 +1,7 @@
 #include "core/video/video_execution_plan.h"
 
 #include <cmath>
+#include <type_traits>
 
 namespace studiocast::video {
 namespace {
@@ -41,6 +42,9 @@ bool ValidGenerations(const hal::ProgramGenerations &generations) noexcept {
 }
 
 } // namespace
+
+static_assert(std::is_standard_layout_v<PerFrameTransferContract>);
+static_assert(std::is_trivially_copyable_v<PerFrameTransferContract>);
 
 bool ValidateVideoExecutionPlanRequest(const VideoExecutionPlanRequest &request,
                                        hal::ReasonId *reason) noexcept {
@@ -146,6 +150,59 @@ hal::ResolutionRequest BuildVideoResolutionRequest(
   for (std::size_t index = 0; index < intent.stage_count; ++index)
     request.stages[index] = intent.stages[index].intent;
   return request;
+}
+
+PerFrameTransferContract
+BuildPerFrameTransferContract(const hal::DomainPlan &domain_plan,
+                              std::uint64_t minimum_synchronizations,
+                              std::uint64_t maximum_synchronizations) noexcept {
+  PerFrameTransferContract contract;
+  contract.uploads = domain_plan.expected_transfers.uploads;
+  contract.final_readbacks = domain_plan.expected_transfers.final_readbacks;
+  contract.intermediate_readbacks =
+      domain_plan.expected_transfers.intermediate_readbacks;
+  contract.intermediate_uploads =
+      domain_plan.expected_transfers.intermediate_uploads;
+  contract.cpu_tail_boundaries =
+      domain_plan.expected_transfers.cpu_tail_boundaries;
+  contract.minimum_synchronizations = minimum_synchronizations;
+  contract.maximum_synchronizations = maximum_synchronizations;
+  return contract;
+}
+
+bool ValidatePerFrameTransferContract(const PerFrameTransferContract &contract,
+                                      const hal::DomainPlan &domain_plan,
+                                      hal::ReasonId *reason) noexcept {
+  SetReason(reason, hal::ReasonId::none);
+  if (contract.contract_version != hal::kContractVersion ||
+      domain_plan.passthrough || domain_plan.island_count != 1 ||
+      contract.uploads != domain_plan.expected_transfers.uploads ||
+      contract.final_readbacks !=
+          domain_plan.expected_transfers.final_readbacks ||
+      contract.intermediate_readbacks !=
+          domain_plan.expected_transfers.intermediate_readbacks ||
+      contract.intermediate_uploads !=
+          domain_plan.expected_transfers.intermediate_uploads ||
+      contract.cpu_tail_boundaries !=
+          domain_plan.expected_transfers.cpu_tail_boundaries ||
+      contract.minimum_synchronizations > contract.maximum_synchronizations ||
+      contract.maximum_synchronizations > kMaxPerFrameSynchronizationsV1) {
+    SetReason(reason, hal::ReasonId::malformed_contract);
+    return false;
+  }
+
+  bool has_device_island = false;
+  for (std::size_t index = 0; index < domain_plan.island_count; ++index) {
+    has_device_island =
+        has_device_island || hal::ClassifyExecutionResidency(
+                                 domain_plan.islands[index].execution_domain) ==
+                                 hal::ExecutionResidencyClass::device;
+  }
+  if (has_device_island && contract.minimum_synchronizations == 0) {
+    SetReason(reason, hal::ReasonId::malformed_contract);
+    return false;
+  }
+  return true;
 }
 
 } // namespace studiocast::video

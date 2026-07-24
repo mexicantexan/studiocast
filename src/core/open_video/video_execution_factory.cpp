@@ -62,6 +62,10 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
                          const video::VideoExecutionPlanRequest &request,
                          const hal::ResolutionResult &resolution,
                          const hal::DomainPlan &domain_plan) noexcept {
+  const auto transfer_contract = video::BuildPerFrameTransferContract(
+      domain_plan, cached.minimum_synchronizations_per_frame,
+      cached.maximum_synchronizations_per_frame);
+  hal::ReasonId transfer_reason = hal::ReasonId::none;
   if (!cached.model_artifact_validated || !cached.provider_runtime_validated ||
       !cached.device_context_validated || !cached.cuda_iobinding_validated ||
       !cached.user_stream_bound || !cached.reusable_resources_supported ||
@@ -91,7 +95,9 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       request.invalidation_key.generations.context !=
           cached.execution_domain.logical_context_generation ||
       request.intent.stage_count != 1 ||
-      !SameModel(request.intent.stages[0].model, cached.model)) {
+      !SameModel(request.intent.stages[0].model, cached.model) ||
+      !video::ValidatePerFrameTransferContract(transfer_contract, domain_plan,
+                                               &transfer_reason)) {
     return false;
   }
   return true;
@@ -465,6 +471,10 @@ video::VideoAdapterFactoryPreflight OpenCudaVideoExecutionFactory::Preflight(
   }
   result.execution_domain = impl_->config.cached.execution_domain;
   result.readiness = impl_->config.cached.readiness;
+  result.per_frame_transfers = video::BuildPerFrameTransferContract(
+      frozen_domain_plan,
+      impl_->config.cached.minimum_synchronizations_per_frame,
+      impl_->config.cached.maximum_synchronizations_per_frame);
   if (route != video::VideoExecutionRoute::prepared_resident) {
     result.status = hal::StatusId::blocked;
     result.reason = hal::ReasonId::semantic_effect_unsupported;
@@ -513,6 +523,8 @@ OpenCudaVideoExecutionFactory::Prepare(
       !plan.prepared_program.strict_backend_selection ||
       plan.prepared_program.requested_provider != kProvider ||
       !plan.prepared_program.strict_provider_selection ||
+      !video::ValidatePerFrameTransferContract(plan.per_frame_transfers,
+                                               plan.domain_plan, nullptr) ||
       plan.prepared_program.stage_count != 1 ||
       !SameModel(plan.prepared_program.stages[0].model,
                  impl_->config.cached.model) ||

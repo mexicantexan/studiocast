@@ -435,6 +435,8 @@ FactoryConfig(SetupContext *context,
   config.cached.no_intermediate_crossings = true;
   config.cached.stop_aware_bounded_wait = true;
   config.cached.allocation_free_execute = true;
+  config.cached.minimum_synchronizations_per_frame = context->synchronizations;
+  config.cached.maximum_synchronizations_per_frame = context->synchronizations;
   config.prepare_candidate = PrepareCandidate;
   config.setup_context = context;
   return config;
@@ -476,6 +478,7 @@ bool BuildFrozen(const video::VideoExecutionPlanRequest &request,
   plan->resolution = resolution;
   plan->domain_plan = domain_plan;
   plan->factory_id = factory->Registration().factory_id;
+  plan->per_frame_transfers = preflight->per_frame_transfers;
   plan->prepared_program = preflight->prepared_program;
   return true;
 }
@@ -537,6 +540,8 @@ bool ExactPreflightAndMalformedRejection() {
   REQUIRE(preflight.readiness.ready_stage_mask == 1);
   REQUIRE(preflight.prepared_program.cpu_tails[0].id ==
           hal::CpuTailId::writer_copy);
+  REQUIRE(preflight.per_frame_transfers.minimum_synchronizations == 1);
+  REQUIRE(preflight.per_frame_transfers.maximum_synchronizations == 1);
 
   auto malformed = request;
   malformed.intent.backend.strict = false;
@@ -568,6 +573,16 @@ bool ExactPreflightAndMalformedRejection() {
   malformed.budget.readback_staging_bytes = 48;
   REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
   REQUIRE(preflight.status == hal::StatusId::blocked);
+
+  auto malformed_config = FactoryConfig(&context, request);
+  malformed_config.cached.minimum_synchronizations_per_frame = 2;
+  malformed_config.cached.maximum_synchronizations_per_frame = 1;
+  open_cuda::OpenCudaVideoExecutionFactory malformed_factory(
+      std::move(malformed_config));
+  REQUIRE(BuildFrozen(request, registration, &malformed_factory, &plan,
+                      &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+  REQUIRE(preflight.reason == hal::ReasonId::capability_evidence_incomplete);
   return true;
 }
 
@@ -588,6 +603,8 @@ bool ExecuteTransferCommitAndAllocationContract() {
   video::VideoAdapterFactoryPreflight preflight;
   REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
   REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.per_frame_transfers.minimum_synchronizations == 2);
+  REQUIRE(preflight.per_frame_transfers.maximum_synchronizations == 2);
   video::VideoAdapterPrepareEvidence evidence;
   auto executor = factory.Prepare(plan, &evidence);
   REQUIRE(executor != nullptr);

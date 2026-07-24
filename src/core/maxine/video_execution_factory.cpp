@@ -641,6 +641,9 @@ video::VideoAdapterFactoryPreflight MaxineVideoExecutionFactory::Preflight(
   if (configuration_.adapter_registration)
     result.execution_domain =
         configuration_.adapter_registration->execution_domain;
+  result.per_frame_transfers = video::BuildPerFrameTransferContract(
+      frozen_domain_plan, configuration_.minimum_synchronizations_per_frame,
+      configuration_.maximum_synchronizations_per_frame);
   result.readiness.requested_backend = frozen_resolution.requested_backend;
   result.readiness.selected_backend = hal::BackendId::maxine;
   result.readiness.provider = frozen_resolution.selected_provider;
@@ -670,6 +673,14 @@ video::VideoAdapterFactoryPreflight MaxineVideoExecutionFactory::Preflight(
   }
   if (!ExactFrozenInputs(request, frozen_resolution, frozen_domain_plan,
                          *configuration_.adapter_registration, &reason)) {
+    result.status = hal::StatusId::blocked;
+    result.reason = reason;
+    result.readiness.status = result.status;
+    result.readiness.reason = result.reason;
+    return result;
+  }
+  if (!video::ValidatePerFrameTransferContract(result.per_frame_transfers,
+                                               frozen_domain_plan, &reason)) {
     result.status = hal::StatusId::blocked;
     result.reason = reason;
     result.readiness.status = result.status;
@@ -727,6 +738,8 @@ MaxineVideoExecutionFactory::Prepare(
       plan.domain_plan.island_count != 1 ||
       plan.domain_plan.islands[0].execution_domain !=
           configuration_.adapter_registration->execution_domain ||
+      !video::ValidatePerFrameTransferContract(plan.per_frame_transfers,
+                                               plan.domain_plan, nullptr) ||
       plan.prepared_program.program_id != plan.plan_id ||
       plan.prepared_program.execution_domain !=
           configuration_.adapter_registration->execution_domain) {

@@ -319,6 +319,7 @@ bool ExactPreflight(const VideoAdapterFactoryRegistration &registration,
                     const hal::ResolutionResult &resolution,
                     const hal::DomainPlan &domain_plan,
                     VideoExecutionRoute route, hal::ReasonId *reason) noexcept {
+  hal::ReasonId transfer_reason = hal::ReasonId::none;
   if (!preflight.cached_evidence_only || !preflight.accepts_frozen_resolution ||
       preflight.performs_selection ||
       preflight.backend != resolution.selected_backend ||
@@ -331,7 +332,9 @@ bool ExactPreflight(const VideoAdapterFactoryRegistration &registration,
       preflight.execution_domain != registration.execution_domain ||
       preflight.execution_domain.adapter_instance_id !=
           registration.adapter_instance_id ||
-      registration.route != route) {
+      registration.route != route ||
+      !ValidatePerFrameTransferContract(preflight.per_frame_transfers,
+                                        domain_plan, &transfer_reason)) {
     SetReason(reason, preflight.execution_domain !=
                               domain_plan.islands[0].execution_domain
                           ? hal::ReasonId::wrong_execution_domain
@@ -523,6 +526,7 @@ hal::StatusId VideoExecutionCoordinator::TryPrepareRoute(
   candidate_plan->resolution = resolution;
   candidate_plan->domain_plan = domain_plan;
   candidate_plan->factory_id = registration->factory_id;
+  candidate_plan->per_frame_transfers = preflight->per_frame_transfers;
   if (route == VideoExecutionRoute::prepared_resident)
     candidate_plan->prepared_program = preflight->prepared_program;
 
@@ -852,19 +856,20 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     telemetry_.runtime_reason = frame.reason;
     return frame;
   }
-  if (!passthrough_ && plan_.route == VideoExecutionRoute::prepared_resident &&
-      (frame.transfers.uploads !=
-           plan_.domain_plan.expected_transfers.uploads ||
+  if (!passthrough_ &&
+      (frame.transfers.uploads != plan_.per_frame_transfers.uploads ||
        frame.transfers.final_readbacks !=
-           plan_.domain_plan.expected_transfers.final_readbacks ||
+           plan_.per_frame_transfers.final_readbacks ||
        frame.transfers.intermediate_readbacks !=
-           plan_.domain_plan.expected_transfers.intermediate_readbacks ||
+           plan_.per_frame_transfers.intermediate_readbacks ||
        frame.transfers.intermediate_uploads !=
-           plan_.domain_plan.expected_transfers.intermediate_uploads ||
-       frame.transfers.synchronizations !=
-           plan_.domain_plan.expected_transfers.synchronizations ||
+           plan_.per_frame_transfers.intermediate_uploads ||
+       frame.transfers.synchronizations <
+           plan_.per_frame_transfers.minimum_synchronizations ||
+       frame.transfers.synchronizations >
+           plan_.per_frame_transfers.maximum_synchronizations ||
        frame.transfers.cpu_tail_boundaries !=
-           plan_.domain_plan.expected_transfers.cpu_tail_boundaries)) {
+           plan_.per_frame_transfers.cpu_tail_boundaries)) {
     frame.status = hal::StatusId::failed;
     frame.reason = hal::ReasonId::transfer_contract_violated;
     telemetry_.runtime_status = frame.status;

@@ -13,6 +13,8 @@ namespace studiocast::vulkan {
 struct VulkanVideoExecutionFactoryConfiguration {
   std::uint64_t factory_id = UINT64_C(0x56554c4b00000001);
   std::uint32_t selection_priority = 300;
+  std::uint64_t minimum_synchronizations_per_frame = 2;
+  std::uint64_t maximum_synchronizations_per_frame = 3;
 };
 
 class VulkanVideoExecutionFactory final : public video::IVideoAdapterFactory {

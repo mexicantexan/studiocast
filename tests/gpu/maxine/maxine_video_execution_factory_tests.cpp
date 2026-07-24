@@ -338,12 +338,15 @@ hal::HostFrameBinding Binding(std::uint8_t *input, std::uint8_t *output,
 }
 
 struct Fixture {
-  Fixture()
+  Fixture(std::uint64_t minimum_synchronizations = 1,
+          std::uint64_t maximum_synchronizations = 1)
       : adapter_registration(Registration(&resident)), factory([&] {
           maxine::MaxineVideoExecutionFactoryConfiguration config;
           config.adapter_registration = &adapter_registration;
           config.factory_id = 8801;
           config.selection_priority = 10;
+          config.minimum_synchronizations_per_frame = minimum_synchronizations;
+          config.maximum_synchronizations_per_frame = maximum_synchronizations;
           config.setup_template.vfx_model_directory = "/hermetic/maxine/models";
           return config;
         }()),
@@ -397,6 +400,8 @@ bool ExactPreflightAndMalformedForeignGenerationRejection() {
   CHECK(preflight.prepared_program.execution_domain == Domain());
   CHECK(preflight.prepared_program.stage_count == 1);
   CHECK(preflight.prepared_program.cpu_tail_count == 1);
+  CHECK(preflight.per_frame_transfers.minimum_synchronizations == 1);
+  CHECK(preflight.per_frame_transfers.maximum_synchronizations == 1);
 
   auto wrong_generation = request;
   ++wrong_generation.invalidation_key.generations.context;
@@ -421,6 +426,19 @@ bool ExactPreflightAndMalformedForeignGenerationRejection() {
                                 video::VideoExecutionRoute::prepared_resident);
   CHECK(preflight.status == hal::StatusId::blocked);
   CHECK(preflight.reason == hal::ReasonId::wrong_execution_domain);
+
+  Fixture malformed_sync(0, 0);
+  const auto malformed_resolution = hal::ResolveSemanticStages(
+      malformed_sync.registry,
+      video::BuildVideoResolutionRequest(request.intent));
+  const auto malformed_domains =
+      hal::PlanExecutionDomains(malformed_sync.registry, malformed_resolution,
+                                hal::CrossAdapterPolicy::reject);
+  preflight = malformed_sync.factory.Preflight(
+      request, malformed_resolution, malformed_domains,
+      video::VideoExecutionRoute::prepared_resident);
+  CHECK(preflight.status == hal::StatusId::blocked);
+  CHECK(preflight.reason == hal::ReasonId::malformed_contract);
   return true;
 }
 

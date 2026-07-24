@@ -217,7 +217,7 @@ public:
     result.transfers.uploads = 1;
     result.transfers.final_readbacks = 1;
     result.transfers.synchronizations =
-        mode == ExecuteMode::transfer_mismatch ? 2 : 1;
+        mode == ExecuteMode::transfer_mismatch ? 4 : 2;
     result.frame_elapsed_ns = 500;
     return result;
   }
@@ -472,7 +472,7 @@ bool TestExactFactoryAndCommit() {
                     frame.transfers.final_readbacks == 1 &&
                     frame.transfers.intermediate_readbacks == 0 &&
                     frame.transfers.intermediate_uploads == 0 &&
-                    frame.transfers.synchronizations == 1 &&
+                    frame.transfers.synchronizations == 2 &&
                     std::memcmp(input, output, kBytes) == 0,
                 "prepared frame must keep the exact transfer contract");
   ok &= Require(g_allocations.load(std::memory_order_relaxed) == 0,
@@ -516,6 +516,20 @@ bool TestUnsupportedAndForeignPreflight() {
                     preflight.reason ==
                         hal::ReasonId::semantic_effect_unsupported,
                 "Vulkan matting semantics must remain fail-closed");
+
+  vulkan::VulkanVideoExecutionFactory invalid_sync_factory(
+      Registration(&fixture.adapter), {kFactoryId + 10, 300, 0, 0});
+  hal::ReasonId invalid_reason = hal::ReasonId::none;
+  ok &= Require(invalid_sync_factory.Initialize(&invalid_reason) ==
+                    hal::StatusId::ready,
+                "injected factory must initialize before sync validation");
+  request = Request();
+  preflight = invalid_sync_factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  ok &= Require(preflight.status == hal::StatusId::blocked &&
+                    preflight.reason == hal::ReasonId::malformed_contract,
+                "Vulkan device plan must reject a zero sync range");
 
   request = Request();
   request.invalidation_key.generations.context++;
@@ -704,6 +718,7 @@ bool RunProductionCombination(vulkan::VulkanVideoExecutionFactory *factory,
   plan.resolution = resolution;
   plan.domain_plan = domain_plan;
   plan.factory_id = factory->factory_registration().factory_id;
+  plan.per_frame_transfers = preflight.per_frame_transfers;
   plan.prepared_program = preflight.prepared_program;
   video::VideoAdapterPrepareEvidence prepare_evidence;
   auto executor = factory->Prepare(plan, &prepare_evidence);

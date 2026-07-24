@@ -60,6 +60,7 @@ struct VideoAdapterFactoryPreflight {
       hal::SemanticEffectProviderId::invalid;
   hal::ExecutionDomainId execution_domain{};
   hal::ReadinessSnapshot readiness{};
+  PerFrameTransferContract per_frame_transfers{};
   hal::PreparedProgram prepared_program{};
   bool cached_evidence_only = false;
   bool accepts_frozen_resolution = false;

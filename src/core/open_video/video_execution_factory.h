@@ -55,6 +55,8 @@ struct OpenCudaVideoExecutionCachedEvidence {
   bool no_intermediate_crossings = false;
   bool stop_aware_bounded_wait = false;
   bool allocation_free_execute = false;
+  std::uint64_t minimum_synchronizations_per_frame = 0;
+  std::uint64_t maximum_synchronizations_per_frame = 0;
 };
 
 struct OpenCudaVideoExecutionFactoryConfig {

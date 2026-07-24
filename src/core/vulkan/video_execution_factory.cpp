@@ -859,6 +859,10 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
   preflight.readiness.selected_backend = BackendId::vulkan;
   preflight.readiness.provider = kProvider;
   preflight.readiness.execution_domain = impl_->registration.execution_domain;
+  preflight.per_frame_transfers = video::BuildPerFrameTransferContract(
+      frozen_domain_plan,
+      impl_->configuration.minimum_synchronizations_per_frame,
+      impl_->configuration.maximum_synchronizations_per_frame);
 
   const auto fail = [&](StatusId status, ReasonId reason) {
     preflight.status = status;
@@ -911,6 +915,12 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
       frozen_domain_plan.expected_transfers.intermediate_uploads != 0 ||
       frozen_domain_plan.expected_transfers.cpu_tail_boundaries != 0) {
     return fail(StatusId::blocked, ReasonId::malformed_contract);
+  }
+  ReasonId transfer_reason = ReasonId::none;
+  if (!video::ValidatePerFrameTransferContract(preflight.per_frame_transfers,
+                                               frozen_domain_plan,
+                                               &transfer_reason)) {
+    return fail(StatusId::blocked, transfer_reason);
   }
 
   ParsedProgramOptions parsed;
@@ -980,6 +990,8 @@ VulkanVideoExecutionFactory::Prepare(
       plan.domain_plan.island_count != 1 ||
       plan.domain_plan.islands[0].execution_domain !=
           impl_->registration.execution_domain ||
+      !video::ValidatePerFrameTransferContract(plan.per_frame_transfers,
+                                               plan.domain_plan, nullptr) ||
       plan.prepared_program.execution_domain !=
           impl_->registration.execution_domain ||
       plan.resolution.selected_backend != BackendId::vulkan ||

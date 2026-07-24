@@ -9,6 +9,21 @@
 namespace studiocast::video {
 
 inline constexpr std::size_t kMaxCanonicalStageParameters = 16;
+inline constexpr std::uint64_t kMaxPerFrameSynchronizationsV1 = 16;
+
+// Fixed setup-time contract for one synchronous v1 frame. Transfer boundaries
+// are exact; synchronization calls may vary only inside the cached,
+// factory-declared range. The coordinator freezes this POD before Execute.
+struct PerFrameTransferContract {
+  std::uint32_t contract_version = hal::kContractVersion;
+  std::uint64_t uploads = 0;
+  std::uint64_t final_readbacks = 0;
+  std::uint64_t intermediate_readbacks = 0;
+  std::uint64_t intermediate_uploads = 0;
+  std::uint64_t cpu_tail_boundaries = 0;
+  std::uint64_t minimum_synchronizations = 0;
+  std::uint64_t maximum_synchronizations = 0;
+};
 
 // Numeric counterparts of the stable Broadcast parameter IDs. These values
 // are an in-process prepared-plan contract; IPC continues to use the existing
@@ -113,6 +128,7 @@ struct FrozenVideoExecutionPlan {
   hal::ResolutionResult resolution{};
   hal::DomainPlan domain_plan{};
   std::uint64_t factory_id = 0;
+  PerFrameTransferContract per_frame_transfers{};
   hal::PreparedProgram prepared_program{};
 };
 
@@ -122,5 +138,15 @@ ValidateVideoExecutionPlanRequest(const VideoExecutionPlanRequest &request,
 
 [[nodiscard]] hal::ResolutionRequest BuildVideoResolutionRequest(
     const NormalizedVideoExecutionIntent &intent) noexcept;
+
+[[nodiscard]] PerFrameTransferContract
+BuildPerFrameTransferContract(const hal::DomainPlan &domain_plan,
+                              std::uint64_t minimum_synchronizations,
+                              std::uint64_t maximum_synchronizations) noexcept;
+
+[[nodiscard]] bool
+ValidatePerFrameTransferContract(const PerFrameTransferContract &contract,
+                                 const hal::DomainPlan &domain_plan,
+                                 hal::ReasonId *reason) noexcept;
 
 } // namespace studiocast::video

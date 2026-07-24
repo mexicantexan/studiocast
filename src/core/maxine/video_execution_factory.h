@@ -16,6 +16,8 @@ struct MaxineVideoExecutionFactoryConfiguration {
   video::PreparedMaxineHardwareRequest setup_template{};
   std::uint64_t factory_id = 0;
   std::uint32_t selection_priority = 0;
+  std::uint64_t minimum_synchronizations_per_frame = 0;
+  std::uint64_t maximum_synchronizations_per_frame = 0;
 };
 
 class MaxineVideoExecutionFactory final : public video::IVideoAdapterFactory {
