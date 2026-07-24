@@ -40,6 +40,11 @@ studiocast::open_cuda::MattingPreparedRunEvidence MattingEvidence() {
   evidence.context.logical_generation = 9;
   evidence.stream_identity = 0x1234;
   evidence.input_tensor_ptr = 0x1000;
+  evidence.input_tensor_active_bytes = 3 * 224 * 224 * sizeof(float);
+  evidence.input_tensor_allocation_pitch_bytes =
+      evidence.input_tensor_active_bytes + 256;
+  evidence.input_tensor_allocation_capacity_bytes =
+      evidence.input_tensor_allocation_pitch_bytes;
   evidence.output_tensor_ptr = 0x2000;
   evidence.frame_width = 1920;
   evidence.frame_height = 1080;
@@ -123,7 +128,16 @@ bool TestStableIdsAndSchemas() {
          Expect(studiocast::onnx::OrtPreparedRunResult::kSchemaVersion == 1 &&
                     studiocast::open_cuda::MattingPreparedRunResult::
                             kSchemaVersion ==
-                        1,
+                        1 &&
+                    studiocast::open_cuda::MattingPreparedRunEvidence::
+                            kSchemaVersion ==
+                        2 &&
+                    studiocast::open_cuda::MattingPreparedInputTensorView::
+                            kSchemaVersion ==
+                        2 &&
+                    studiocast::open_cuda::OpenCudaMattingSession::
+                            PreparationEvidence::kSchemaVersion ==
+                        2,
                 "typed run schemas must be explicitly versioned") &&
          Expect(std::is_trivially_copyable_v<
                     studiocast::onnx::OrtPreparedRunResult> &&
@@ -324,7 +338,21 @@ bool TestMattingContractAndProjection() {
              },
              "provider mismatch") ||
       !check(MattingPreparedRunStatus::stale_binding,
-             [](auto &c) { c.binding_matches = false; }, "stale binding"))
+             [](auto &c) { c.binding_matches = false; }, "stale binding") ||
+      !check(MattingPreparedRunStatus::stale_binding,
+             [](auto &c) { ++c.requested.input_tensor_active_bytes; },
+             "stale input active size") ||
+      !check(MattingPreparedRunStatus::stale_binding,
+             [](auto &c) {
+               ++c.requested.input_tensor_allocation_pitch_bytes;
+               ++c.requested.input_tensor_allocation_capacity_bytes;
+             },
+             "stale input allocation pitch and capacity") ||
+      !check(MattingPreparedRunStatus::foreign_evidence,
+             [](auto &c) {
+               c.requested.input_tensor_allocation_capacity_bytes = 0;
+             },
+             "invalid input allocation evidence"))
     return false;
 
   if (!check(MattingPreparedRunStatus::cpu_fallback_forbidden,
@@ -424,6 +452,23 @@ bool TestRepeatedClassificationAndInferenceOnlyPreflight() {
   contract.strict_cuda_only = true;
   contract.active = MattingEvidence();
   contract.requested = contract.active;
+  MattingPreparedInputTensorView typed_view;
+  typed_view.ptr = contract.active.input_tensor_ptr;
+  typed_view.bytes = contract.active.input_tensor_active_bytes;
+  typed_view.allocation_pitch_bytes =
+      contract.active.input_tensor_allocation_pitch_bytes;
+  typed_view.allocation_capacity_bytes =
+      contract.active.input_tensor_allocation_capacity_bytes;
+  typed_view.n = 1;
+  typed_view.c = 3;
+  typed_view.h = 224;
+  typed_view.w = 224;
+  typed_view.evidence = contract.active;
+  if (!Expect(typed_view.Valid() &&
+                  typed_view.allocation_capacity_bytes > typed_view.bytes,
+              "typed input view must expose exact allocator capacity/pitch "
+              "separately from active tensor bytes"))
+    return false;
   for (int i = 0; i < 10000; ++i) {
     if (!internal::ClassifyMattingPreparedRunContract(contract).ok())
       return Expect(false, "repeated exact classifications must be stable");

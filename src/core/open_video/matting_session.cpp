@@ -130,8 +130,12 @@ DigestToHex(const std::array<std::uint8_t, 32> &digest) {
 bool MattingPreparedRunEvidence::Valid() const noexcept {
   return schema_version == kSchemaVersion && preparation_generation != 0 &&
          cuda_device_id >= 0 && context.Valid() &&
-         input_tensor_ptr != 0 && output_tensor_ptr != 0 && frame_width > 0 &&
-         frame_height > 0 && ort.Valid() &&
+         input_tensor_ptr != 0 && input_tensor_active_bytes != 0 &&
+         input_tensor_allocation_pitch_bytes >= input_tensor_active_bytes &&
+         input_tensor_allocation_capacity_bytes ==
+             input_tensor_allocation_pitch_bytes &&
+         output_tensor_ptr != 0 && frame_width > 0 && frame_height > 0 &&
+         ort.Valid() &&
          (!strict_cuda_only ||
           (stream_identity != 0 && artifact.Valid()));
 }
@@ -222,6 +226,12 @@ MattingPreparedRunResult ClassifyMattingPreparedRunContract(
   if (!contract.binding_matches ||
       contract.requested.input_tensor_ptr !=
           contract.active.input_tensor_ptr ||
+      contract.requested.input_tensor_active_bytes !=
+          contract.active.input_tensor_active_bytes ||
+      contract.requested.input_tensor_allocation_pitch_bytes !=
+          contract.active.input_tensor_allocation_pitch_bytes ||
+      contract.requested.input_tensor_allocation_capacity_bytes !=
+          contract.active.input_tensor_allocation_capacity_bytes ||
       contract.requested.output_tensor_ptr !=
           contract.active.output_tensor_ptr ||
       contract.requested.frame_width != contract.active.frame_width ||
@@ -977,6 +987,11 @@ bool OpenCudaMattingSession::Prepare(
   candidate_run_evidence.context = *context;
   candidate_run_evidence.stream_identity = requested_stream;
   candidate_run_evidence.input_tensor_ptr = impl_->input_tensor.ptr;
+  candidate_run_evidence.input_tensor_active_bytes = impl_->input_tensor.bytes;
+  candidate_run_evidence.input_tensor_allocation_pitch_bytes =
+      impl_->input_tensor.pitch;
+  candidate_run_evidence.input_tensor_allocation_capacity_bytes =
+      impl_->input_tensor.pitch;
   candidate_run_evidence.output_tensor_ptr = output_alpha_gpu->ptr;
   candidate_run_evidence.frame_width = frame_w;
   candidate_run_evidence.frame_height = frame_h;
@@ -1015,6 +1030,12 @@ bool OpenCudaMattingSession::Prepare(
       impl_->ort_info.cuda_needs_stream_sync;
   impl_->preparation_evidence.inference_warmup_complete = true;
   impl_->preparation_evidence.setup_warmup_inferences = 1;
+  impl_->preparation_evidence.input_tensor_active_bytes =
+      impl_->input_tensor.bytes;
+  impl_->preparation_evidence.input_tensor_allocation_pitch_bytes =
+      impl_->input_tensor.pitch;
+  impl_->preparation_evidence.input_tensor_allocation_capacity_bytes =
+      impl_->input_tensor.pitch;
   impl_->preparation_evidence.active_provider = impl_->ort_info.active_provider;
   impl_->preparation_evidence.model_id = impl_->pack.id;
   if (const auto *model = FindMainOnnxFile(impl_->pack))
@@ -1031,6 +1052,9 @@ bool OpenCudaMattingSession::Prepare(
   impl_->input_tensor_view = {};
   impl_->input_tensor_view.ptr = impl_->input_tensor.ptr;
   impl_->input_tensor_view.bytes = impl_->input_tensor.bytes;
+  impl_->input_tensor_view.allocation_pitch_bytes = impl_->input_tensor.pitch;
+  impl_->input_tensor_view.allocation_capacity_bytes =
+      impl_->input_tensor.pitch;
   impl_->input_tensor_view.n = impl_->input_tensor.n;
   impl_->input_tensor_view.c = impl_->input_tensor.c;
   impl_->input_tensor_view.h = impl_->input_tensor.h;
@@ -1128,6 +1152,14 @@ MattingPreparedRunResult OpenCudaMattingSession::RunPreparedTypedImpl(
   const bool binding_matches =
       context && impl_->prepared_frame_w == impl_->run_evidence.frame_width &&
       impl_->prepared_frame_h == impl_->run_evidence.frame_height &&
+      impl_->input_tensor.Valid() &&
+      impl_->input_tensor.ptr == impl_->run_evidence.input_tensor_ptr &&
+      impl_->input_tensor.bytes ==
+          impl_->run_evidence.input_tensor_active_bytes &&
+      impl_->input_tensor.pitch ==
+          impl_->run_evidence.input_tensor_allocation_pitch_bytes &&
+      impl_->input_tensor.pitch ==
+          impl_->run_evidence.input_tensor_allocation_capacity_bytes &&
       (!run_preprocess ||
        (input_rgb_gpu->w == impl_->prepared_frame_w &&
         input_rgb_gpu->h == impl_->prepared_frame_h)) &&

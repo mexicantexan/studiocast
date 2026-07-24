@@ -31,15 +31,19 @@ using RuntimeStatus = PreparedOpenCudaRuntimeStatus;
 constexpr std::size_t kRuntimeSlots = 4;
 constexpr std::uint32_t kKernelBlock = 16;
 // The original strict resident island owns 16 bounded resources. Geometry
-// parity adds three frame-sized alpha images; blur owns two additional RGB
-// scratch images.
+// parity always adds one resized-alpha image, optionally adds the separable
+// feather pair, and blur owns two additional RGB scratch images.
 constexpr std::uint32_t kBaseRuntimeResourceCount = 16;
-constexpr std::uint32_t kPreparedAlphaImageCount = 3;
+constexpr std::uint32_t kPreparedResizedAlphaImageCount = 1;
+constexpr std::uint32_t kPreparedFeatherImageCount = 2;
 constexpr std::uint32_t kPreparedRgbBlurImageCount = 2;
-constexpr std::uint32_t kRemoveRuntimeResourceCount =
-    kBaseRuntimeResourceCount + kPreparedAlphaImageCount;
-constexpr std::uint32_t kBlurRuntimeResourceCount =
-    kRemoveRuntimeResourceCount + kPreparedRgbBlurImageCount;
+
+constexpr std::uint32_t PreparedResourceCount(bool blur,
+                                              bool feather) noexcept {
+  return kBaseRuntimeResourceCount + kPreparedResizedAlphaImageCount +
+         (feather ? kPreparedFeatherImageCount : 0) +
+         (blur ? kPreparedRgbBlurImageCount : 0);
+}
 
 bool SameHalModel(
     const hal::ModelArtifactIdentity &model,
@@ -123,6 +127,12 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
     result.reason = ReasonId::semantic_effect_unsupported;
     return result;
   }
+  const int clamped_strength = std::clamp(
+      input.requested_strength, video::effects::contract::kVbStrengthMin,
+      video::effects::contract::kVbStrengthMax);
+  const std::uint32_t feather_radius =
+      static_cast<std::uint32_t>(std::min(4, clamped_strength / 16));
+  const bool feather = feather_radius != 0;
   if (input.frame_width == 0 || input.frame_height == 0 ||
       input.model_width == 0 || input.model_height == 0 ||
       input.frame_width >
@@ -158,8 +168,9 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       input.model_alpha_capacity_bytes < model_alpha_active ||
       input.input_tensor_capacity_bytes < input_tensor_active ||
       input.resized_alpha_pitch_bytes < frame_alpha_row ||
-      input.alpha_scratch_pitch_bytes < frame_alpha_row ||
-      input.alpha_feather_pitch_bytes < frame_alpha_row ||
+      (feather &&
+       (input.alpha_scratch_pitch_bytes < frame_alpha_row ||
+        input.alpha_feather_pitch_bytes < frame_alpha_row)) ||
       input.upload_staging_bytes < frame_rgb_active ||
       input.readback_staging_bytes < frame_rgb_active ||
       (blur && (input.blur_scratch_pitch_bytes < frame_rgb_row ||
@@ -182,10 +193,11 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
                   &output_capacity) ||
       !CheckedMul(input.resized_alpha_pitch_bytes, input.frame_height,
                   &resized_alpha_capacity) ||
-      !CheckedMul(input.alpha_scratch_pitch_bytes, input.frame_height,
-                  &alpha_scratch_capacity) ||
-      !CheckedMul(input.alpha_feather_pitch_bytes, input.frame_height,
-                  &alpha_feather_capacity) ||
+      (feather &&
+       (!CheckedMul(input.alpha_scratch_pitch_bytes, input.frame_height,
+                    &alpha_scratch_capacity) ||
+        !CheckedMul(input.alpha_feather_pitch_bytes, input.frame_height,
+                    &alpha_feather_capacity))) ||
       (blur && (!CheckedMul(input.blur_scratch_pitch_bytes, input.frame_height,
                             &blur_scratch_capacity) ||
                 !CheckedMul(input.blurred_pitch_bytes, input.frame_height,
@@ -204,8 +216,9 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       !add(input.model_alpha_capacity_bytes, &required.persistent_bytes) ||
       !add(input.input_tensor_capacity_bytes, &required.persistent_bytes) ||
       !add(resized_alpha_capacity, &required.persistent_bytes) ||
-      !add(alpha_scratch_capacity, &required.scratch_bytes) ||
-      !add(alpha_feather_capacity, &required.scratch_bytes) ||
+      (feather &&
+       (!add(alpha_scratch_capacity, &required.scratch_bytes) ||
+        !add(alpha_feather_capacity, &required.scratch_bytes))) ||
       (blur && (!add(blur_scratch_capacity, &required.scratch_bytes) ||
                 !add(blurred_capacity, &required.scratch_bytes)))) {
     result.status = RuntimeStatus::resource_exhausted;
@@ -214,8 +227,7 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
   }
   required.upload_staging_bytes = input.upload_staging_bytes;
   required.readback_staging_bytes = input.readback_staging_bytes;
-  required.resource_count =
-      blur ? kBlurRuntimeResourceCount : kRemoveRuntimeResourceCount;
+  required.resource_count = PreparedResourceCount(blur, feather);
   required.in_flight_slots = 1;
   if (!BudgetContains(input.available_budget, required)) {
     result.status = RuntimeStatus::resource_exhausted;
@@ -227,12 +239,8 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
   result.frame_height = static_cast<std::uint32_t>(input.frame_height);
   result.model_width = static_cast<std::uint32_t>(input.model_width);
   result.model_height = static_cast<std::uint32_t>(input.model_height);
-  const int clamped_strength = std::clamp(
-      input.requested_strength, video::effects::contract::kVbStrengthMin,
-      video::effects::contract::kVbStrengthMax);
   result.strength = static_cast<std::uint32_t>(clamped_strength);
-  result.alpha_feather_radius =
-      static_cast<std::uint32_t>(std::min(4, clamped_strength / 16));
+  result.alpha_feather_radius = feather_radius;
 
   const std::uint32_t grid_x =
       result.frame_width / kKernelBlock +
@@ -267,10 +275,15 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
 
 bool ExactPreparedOpenCudaVirtualBackgroundPlan(
     const PreparedOpenCudaVbPlan &plan) noexcept {
+  const bool blur =
+      plan.semantic == SemanticEffectId::virtual_background_blur;
+  const bool remove =
+      plan.semantic == SemanticEffectId::virtual_background_remove;
+  const bool feather = plan.alpha_feather_radius != 0;
   if (!plan.ready() || plan.frame_width == 0 || plan.frame_height == 0 ||
       plan.model_width == 0 || plan.model_height == 0 ||
       plan.required_budget.persistent_bytes == 0 ||
-      plan.required_budget.scratch_bytes == 0 ||
+      ((blur || feather) && plan.required_budget.scratch_bytes == 0) ||
       plan.required_budget.upload_staging_bytes == 0 ||
       plan.required_budget.readback_staging_bytes == 0 ||
       plan.required_budget.in_flight_slots != 1 ||
@@ -278,7 +291,10 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
                           video::effects::contract::kVbStrengthMin) ||
       plan.strength > static_cast<std::uint32_t>(
                           video::effects::contract::kVbStrengthMax) ||
-      plan.alpha_feather_radius != std::min(4u, plan.strength / 16u)) {
+      plan.alpha_feather_radius != std::min(4u, plan.strength / 16u) ||
+      (!blur && !remove) ||
+      plan.required_budget.resource_count !=
+          PreparedResourceCount(blur, feather)) {
     return false;
   }
   std::array<PreparedOpenCudaOperationId, PreparedOpenCudaVbPlan::kMaxLaunches>
@@ -291,18 +307,14 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
     expected[expected_count++] =
         PreparedOpenCudaOperationId::alpha_feather_vertical;
   }
-  if (plan.semantic == SemanticEffectId::virtual_background_blur) {
-    if (plan.required_budget.resource_count != kBlurRuntimeResourceCount)
-      return false;
+  if (blur) {
     expected[expected_count++] =
         PreparedOpenCudaOperationId::background_blur_horizontal;
     expected[expected_count++] =
         PreparedOpenCudaOperationId::background_blur_vertical;
     expected[expected_count++] =
         PreparedOpenCudaOperationId::composite_background;
-  } else if (plan.semantic == SemanticEffectId::virtual_background_remove) {
-    if (plan.required_budget.resource_count != kRemoveRuntimeResourceCount)
-      return false;
+  } else if (remove) {
     expected[expected_count++] = PreparedOpenCudaOperationId::composite_solid;
   } else {
     return false;
@@ -815,8 +827,14 @@ public:
       preflight.model_alpha_capacity_bytes = model_alpha_bytes;
       preflight.input_tensor_capacity_bytes = input_tensor_bytes;
       preflight.resized_alpha_pitch_bytes = frame_alpha_row;
-      preflight.alpha_scratch_pitch_bytes = frame_alpha_row;
-      preflight.alpha_feather_pitch_bytes = frame_alpha_row;
+      const int clamped_strength = std::clamp(
+          config.strength, video::effects::contract::kVbStrengthMin,
+          video::effects::contract::kVbStrengthMax);
+      const bool feather = std::min(4, clamped_strength / 16) != 0;
+      preflight.alpha_scratch_pitch_bytes =
+          feather ? frame_alpha_row : 0;
+      preflight.alpha_feather_pitch_bytes =
+          feather ? frame_alpha_row : 0;
       preflight.blur_scratch_pitch_bytes = image.planes[0].row_stride_bytes;
       preflight.blurred_pitch_bytes = image.planes[0].row_stride_bytes;
       preflight.upload_staging_bytes = program.host_input.planes[0].size_bytes;
@@ -859,12 +877,18 @@ public:
                                             model_w, &error) ||
           !candidate->alpha_resized.Allocate(config.driver, width, height,
                                              cuda::PixelFormatGpu::f32_1,
-                                             &error) ||
-          !candidate->alpha_tmp.Allocate(config.driver, width, height,
-                                         cuda::PixelFormatGpu::f32_1, &error) ||
-          !candidate->alpha_feather.Allocate(config.driver, width, height,
-                                             cuda::PixelFormatGpu::f32_1,
                                              &error)) {
+        CleanupCandidate(candidate.get());
+        return SetupFailure(RuntimeStatus::resource_exhausted,
+                            ReasonId::resource_exhausted);
+      }
+      if (feather &&
+          (!candidate->alpha_tmp.Allocate(config.driver, width, height,
+                                          cuda::PixelFormatGpu::f32_1,
+                                          &error) ||
+           !candidate->alpha_feather.Allocate(config.driver, width, height,
+                                              cuda::PixelFormatGpu::f32_1,
+                                              &error))) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::resource_exhausted,
                             ReasonId::resource_exhausted);
@@ -906,9 +930,16 @@ public:
       const auto input_view = candidate->session->prepared_input_tensor_view();
       if (!session_evidence || !input_view.Valid() ||
           !candidate->matting_evidence.Valid() ||
+          session_evidence->schema_version !=
+              OpenCudaMattingSession::PreparationEvidence::kSchemaVersion ||
           !session_evidence->ort_user_stream_bound ||
           session_evidence->explicit_stream_synchronization ||
           !session_evidence->inference_warmup_complete ||
+          session_evidence->input_tensor_active_bytes != input_view.bytes ||
+          session_evidence->input_tensor_allocation_pitch_bytes !=
+              input_view.allocation_pitch_bytes ||
+          session_evidence->input_tensor_allocation_capacity_bytes !=
+              input_view.allocation_capacity_bytes ||
           session_evidence->model_artifact != config.model_artifact ||
           candidate->matting_evidence.artifact != config.model_artifact ||
           candidate->matting_evidence.stream_identity !=
@@ -918,7 +949,7 @@ public:
                             ReasonId::capability_evidence_incomplete);
       }
       candidate->input_tensor.ptr = input_view.ptr;
-      candidate->input_tensor.pitch = input_view.bytes;
+      candidate->input_tensor.pitch = input_view.allocation_pitch_bytes;
       candidate->input_tensor.bytes = input_view.bytes;
       candidate->input_tensor.n = input_view.n;
       candidate->input_tensor.c = input_view.c;
@@ -1000,7 +1031,7 @@ public:
       exact_plan_input.output_pitch_bytes = candidate->output.pitch;
       exact_plan_input.model_alpha_capacity_bytes = candidate->alpha.pitch;
       exact_plan_input.input_tensor_capacity_bytes =
-          candidate->input_tensor.pitch;
+          input_view.allocation_capacity_bytes;
       exact_plan_input.resized_alpha_pitch_bytes =
           candidate->alpha_resized.pitch;
       exact_plan_input.alpha_scratch_pitch_bytes = candidate->alpha_tmp.pitch;
@@ -1529,11 +1560,21 @@ private:
     const auto fits_pitch = [](std::size_t pitch) noexcept {
       return pitch <= std::numeric_limits<std::uint32_t>::max();
     };
+    const bool feather = slot->postprocess_plan.alpha_feather_radius != 0;
+    if (!slot->alpha_resized.Valid() ||
+        (feather &&
+         (!slot->alpha_tmp.Valid() || !slot->alpha_feather.Valid())) ||
+        (!feather &&
+         (slot->alpha_tmp.ptr != 0 || slot->alpha_tmp.pitch != 0 ||
+          slot->alpha_feather.ptr != 0 || slot->alpha_feather.pitch != 0))) {
+      return false;
+    }
     if (!fits_pitch(slot->input.pitch) || !fits_pitch(slot->output.pitch) ||
         !fits_pitch(slot->alpha_image.pitch) ||
         !fits_pitch(slot->alpha_resized.pitch) ||
-        !fits_pitch(slot->alpha_tmp.pitch) ||
-        !fits_pitch(slot->alpha_feather.pitch) ||
+        (feather &&
+         (!fits_pitch(slot->alpha_tmp.pitch) ||
+          !fits_pitch(slot->alpha_feather.pitch))) ||
         (slot->program.stages[0].semantic ==
              SemanticEffectId::virtual_background_blur &&
          (!fits_pitch(slot->blur_tmp.pitch) ||
@@ -1570,7 +1611,6 @@ private:
         static_cast<int>(slot->postprocess_plan.alpha_feather_radius);
     slot->remove_background_rgb_arg = slot->config.remove_background_rgb;
 
-    const bool feather = slot->postprocess_plan.alpha_feather_radius != 0;
     for (std::uint32_t index = 0; index < slot->postprocess_plan.launch_count;
          ++index) {
       const auto &geometry = slot->postprocess_plan.launches[index];

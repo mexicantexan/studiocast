@@ -45,7 +45,7 @@ enum class MattingPreparedRunQuarantine : std::uint8_t {
 };
 
 struct MattingPreparedRunEvidence {
-  static constexpr std::uint32_t kSchemaVersion = 1;
+  static constexpr std::uint32_t kSchemaVersion = 2;
 
   std::uint32_t schema_version = kSchemaVersion;
   std::uint64_t preparation_generation = 0;
@@ -54,6 +54,9 @@ struct MattingPreparedRunEvidence {
   studiocast::cuda::CudaContextIdentity context{};
   std::uintptr_t stream_identity = 0;
   studiocast::cuda::CUdeviceptr input_tensor_ptr = 0;
+  std::size_t input_tensor_active_bytes = 0;
+  std::size_t input_tensor_allocation_pitch_bytes = 0;
+  std::size_t input_tensor_allocation_capacity_bytes = 0;
   studiocast::cuda::CUdeviceptr output_tensor_ptr = 0;
   int frame_width = 0;
   int frame_height = 0;
@@ -82,11 +85,13 @@ struct MattingPreparedRunResult {
 };
 
 struct MattingPreparedInputTensorView {
-  static constexpr std::uint32_t kSchemaVersion = 1;
+  static constexpr std::uint32_t kSchemaVersion = 2;
 
   std::uint32_t schema_version = kSchemaVersion;
   studiocast::cuda::CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
+  std::size_t allocation_pitch_bytes = 0;
+  std::size_t allocation_capacity_bytes = 0;
   int n = 0;
   int c = 0;
   int h = 0;
@@ -94,9 +99,20 @@ struct MattingPreparedInputTensorView {
   MattingPreparedRunEvidence evidence{};
 
   bool Valid() const noexcept {
-    return schema_version == kSchemaVersion && ptr != 0 && bytes != 0 &&
-           n == 1 && c == 3 && h > 0 && w > 0 && evidence.Valid() &&
-           ptr == evidence.input_tensor_ptr;
+    studiocast::cuda::CudaTensorSize expected{};
+    return studiocast::cuda::CheckedNchwF32Size(n, c, h, w, &expected,
+                                                nullptr) &&
+           schema_version == kSchemaVersion && ptr != 0 &&
+           bytes == expected.bytes &&
+           allocation_pitch_bytes >= bytes &&
+           allocation_capacity_bytes == allocation_pitch_bytes && n == 1 &&
+           c == 3 && h > 0 && w > 0 && evidence.Valid() &&
+           ptr == evidence.input_tensor_ptr &&
+           bytes == evidence.input_tensor_active_bytes &&
+           allocation_pitch_bytes ==
+               evidence.input_tensor_allocation_pitch_bytes &&
+           allocation_capacity_bytes ==
+               evidence.input_tensor_allocation_capacity_bytes;
   }
 };
 
@@ -144,6 +160,9 @@ public:
   };
 
   struct PreparationEvidence {
+    static constexpr std::uint32_t kSchemaVersion = 2;
+
+    std::uint32_t schema_version = kSchemaVersion;
     int cuda_device_id = 0;
     studiocast::cuda::CudaContextIdentity context;
     std::uintptr_t requested_stream_identity = 0;
@@ -151,6 +170,9 @@ public:
     bool explicit_stream_synchronization = false;
     bool inference_warmup_complete = false;
     std::uint64_t setup_warmup_inferences = 0;
+    std::size_t input_tensor_active_bytes = 0;
+    std::size_t input_tensor_allocation_pitch_bytes = 0;
+    std::size_t input_tensor_allocation_capacity_bytes = 0;
     std::string active_provider;
     std::string model_id;
     std::string model_artifact_sha256;

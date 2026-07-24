@@ -627,11 +627,16 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
         PlanningInput(hal::SemanticEffectId::virtual_background_blur,
                       threshold.requested));
     const std::uint32_t expected_launches = threshold.feather == 0 ? 4 : 6;
+    const std::uint32_t expected_resources =
+        threshold.feather == 0 ? 19 : 21;
     ok = Expect(
              blur.ready() && blur.frame_width == 17 && blur.frame_height == 9 &&
                  blur.model_width == 8 && blur.model_height == 4 &&
                  blur.strength == threshold.strength &&
                  blur.alpha_feather_radius == threshold.feather &&
+                 blur.required_budget.resource_count == expected_resources &&
+                 blur.required_budget.scratch_bytes ==
+                     (threshold.feather == 0 ? 1296 : 3456) &&
                  blur.launch_count == expected_launches &&
                  blur.launches[0].operation == Operation::alpha_resize &&
                  blur.launches[0].grid_x == 2 && blur.launches[0].grid_y == 1 &&
@@ -660,8 +665,14 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
                       threshold.requested));
     const std::uint32_t expected_remove_launches =
         threshold.feather == 0 ? 2 : 4;
+    const std::uint32_t expected_remove_resources =
+        threshold.feather == 0 ? 17 : 19;
     ok = Expect(remove.ready() && remove.strength == threshold.strength &&
                     remove.alpha_feather_radius == threshold.feather &&
+                    remove.required_budget.resource_count ==
+                        expected_remove_resources &&
+                    remove.required_budget.scratch_bytes ==
+                        (threshold.feather == 0 ? 0 : 2160) &&
                     remove.launch_count == expected_remove_launches &&
                     remove.launches[0].operation == Operation::alpha_resize &&
                     remove.launches[expected_remove_launches - 1].operation ==
@@ -689,6 +700,62 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
               "remove budget must include every prepared alpha buffer but no "
               "RGB blur buffers") &&
        ok;
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove, 15);
+    input.alpha_scratch_pitch_bytes = 0;
+    input.alpha_feather_pitch_bytes = 0;
+    const auto no_feather =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(no_feather.ready() &&
+                    no_feather.required_budget.resource_count == 17 &&
+                    no_feather.required_budget.scratch_bytes == 0 &&
+                    no_feather.launch_count == 2,
+                "below the feather threshold must require only resized alpha "
+                "and must not budget feather storage or launches") &&
+         ok;
+  }
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove, 16);
+    input.alpha_scratch_pitch_bytes = 0;
+    input.alpha_feather_pitch_bytes = 0;
+    const auto feather =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(feather.status == RuntimeStatus::malformed_contract &&
+                    feather.reason == hal::ReasonId::malformed_descriptor,
+                "at the feather threshold both prepared alpha scratch "
+                "pitches must be present") &&
+         ok;
+  }
+  {
+    auto active_capacity =
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
+    auto padded_capacity = active_capacity;
+    padded_capacity.input_tensor_capacity_bytes += 256;
+    const auto active =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(active_capacity);
+    const auto padded =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(padded_capacity);
+    ok = Expect(active.ready() && padded.ready() &&
+                    padded.required_budget.persistent_bytes ==
+                        active.required_budget.persistent_bytes + 256,
+                "input tensor budget must charge exact allocator capacity, "
+                "including pitch padding beyond active tensor bytes") &&
+         ok;
+  }
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
+    --input.input_tensor_capacity_bytes;
+    const auto undersized =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(undersized.status == RuntimeStatus::malformed_contract &&
+                    undersized.reason ==
+                        hal::ReasonId::malformed_descriptor,
+                "input tensor capacity below active bytes must fail closed") &&
+         ok;
+  }
   {
     auto input =
         PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
