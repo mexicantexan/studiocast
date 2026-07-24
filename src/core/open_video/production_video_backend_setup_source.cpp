@@ -1,6 +1,7 @@
 #include "core/open_video/production_video_backend_setup_source.h"
 
 #include "core/open_video/model_pack_registry.h"
+#include "core/open_video/prepared_open_video_compatibility_executor.h"
 #include "core/open_video/video_execution_factory.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 
@@ -282,12 +283,227 @@ bool ResolveModel(const video::CanonicalVideoStage &stage,
   return false;
 }
 
+bool CompatibilitySemantic(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::video_noise_removal ||
+         semantic == hal::SemanticEffectId::eye_contact;
+}
+
+hal::ExecutionDomainId
+HostOrtDomain(std::uint32_t stage_id, std::uint64_t generation,
+              std::uint64_t adapter_instance_id) noexcept {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::open_video_onnxruntime;
+  domain.api_family = hal::ApiFamily::onnxruntime;
+  domain.physical_device.vendor_id = UINT32_C(0x535443);
+  domain.physical_device.device_id = stage_id;
+  domain.physical_device.stable_id[0] = 0x4f;
+  domain.physical_device.stable_id[1] = 0x56;
+  domain.physical_device.stable_id[2] =
+      static_cast<std::uint8_t>(stage_id & 0xffu);
+  domain.logical_context_generation = generation;
+  domain.allocator_family = hal::AllocatorFamily::onnxruntime;
+  domain.memory_handle_family = hal::MemoryHandleFamily::ort_value;
+  domain.queue_or_stream_identity = adapter_instance_id ^ UINT64_C(0x4f525451);
+  if (domain.queue_or_stream_identity == 0)
+    domain.queue_or_stream_identity = 1;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::ort_provider_synchronous;
+  domain.adapter_instance_id = adapter_instance_id;
+  return domain;
+}
+
+bool ResolveCompatibilityModel(
+    const open_video::ModelPackRegistry &registry,
+    const video::CanonicalVideoStage &stage, const char *task,
+    const std::string &requested_model_id, open_video::ModelPack *pack,
+    open_video::ValidatedModelArtifactIdentity *identity) {
+  if (task == nullptr || pack == nullptr || identity == nullptr)
+    return false;
+  const auto accept = [&](const open_video::ModelPack &candidate) {
+    if (candidate.task != task)
+      return false;
+    const open_video::ModelFile *artifact = nullptr;
+    for (const auto &file : candidate.files) {
+      if (file.kind != "onnx")
+        continue;
+      if (file.role == "main" || file.role.empty() ||
+          (std::string_view(task) == "eye_contact" && file.role == "left")) {
+        artifact = &file;
+        break;
+      }
+    }
+    if (artifact == nullptr)
+      return false;
+    const auto validation =
+        open_video::ValidateModelArtifactIdentity(candidate, *artifact);
+    if (!validation.ok())
+      return false;
+    if (!IsZeroHash(stage.model.model_id_hash) &&
+        (stage.model.model_id_hash != validation.identity.model_id_sha256 ||
+         stage.model.artifact_set_hash !=
+             validation.identity.artifact_set_sha256)) {
+      return false;
+    }
+    *pack = candidate;
+    *identity = validation.identity;
+    return true;
+  };
+  if (!requested_model_id.empty()) {
+    const auto requested = registry.Find(task, requested_model_id);
+    return requested.has_value() && accept(*requested);
+  }
+  for (const auto &candidate : registry.ListModels()) {
+    if (accept(candidate))
+      return true;
+  }
+  return false;
+}
+
+video::ProductionVideoResidentSetupSourceResult
+BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
+  const auto &caller = request.plan;
+  if (caller.intent.stage_count < 2 ||
+      caller.intent.stage_count >
+          video::ProductionVideoResidentSetupSourceResult::
+              kMaxCompatibilityDomains) {
+    return Failure(hal::StatusId::blocked,
+                   hal::ReasonId::semantic_effect_unsupported);
+  }
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    if (!CompatibilitySemantic(caller.intent.stages[index].intent.semantic)) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::semantic_effect_unsupported);
+    }
+  }
+  if ((caller.intent.backend.mode ==
+           hal::BackendRequestMode::explicit_backend &&
+       caller.intent.backend.backend == hal::BackendId::cuda &&
+       caller.intent.backend.strict) ||
+      (caller.intent.strict_provider_selection &&
+       caller.intent.requested_provider !=
+           hal::SemanticEffectProviderId::open_video_onnxruntime_cpu)) {
+    return Failure(hal::StatusId::blocked,
+                   hal::ReasonId::semantic_provider_unavailable);
+  }
+
+  auto result = video::ProductionVideoResidentSetupSourceResult{};
+  result.execution_kind = video::ProductionVideoResidentSetupSourceResult::
+      ExecutionKind::typed_compatibility;
+  result.canonical_effects = request.effects;
+  result.plan = caller;
+  const auto registry = open_video::ModelPackRegistry::ScanDefault();
+  std::uint64_t artifact_hash = kHashOffset;
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    const auto semantic = caller.intent.stages[index].intent.semantic;
+    const char *task = semantic == hal::SemanticEffectId::video_noise_removal
+                           ? "video_denoise"
+                           : "eye_contact";
+    const std::string &requested =
+        semantic == hal::SemanticEffectId::video_noise_removal
+            ? request.effects.video_noise_removal.model_id
+            : request.effects.eye_contact.model_id;
+    open_video::ModelPack pack;
+    open_video::ValidatedModelArtifactIdentity identity;
+    if (!ResolveCompatibilityModel(registry, caller.intent.stages[index], task,
+                                   requested, &pack, &identity)) {
+      return Failure(hal::StatusId::unavailable,
+                     hal::ReasonId::capability_evidence_incomplete);
+    }
+    auto &model = result.plan.intent.stages[index].model;
+    model.model_id_hash = identity.model_id_sha256;
+    model.artifact_set_hash = identity.artifact_set_sha256;
+    model.artifact_generation = identity.registry_generation;
+    auto &selection = result.model_selections[result.model_selection_count++];
+    selection.semantic = semantic;
+    selection.requested_model_id = requested;
+    selection.selected_model_id = pack.id;
+    selection.artifact = model;
+    selection.default_selected = requested.empty();
+    artifact_hash = HashValue(artifact_hash, HashArtifact(identity));
+  }
+  auto &generations = result.plan.invalidation_key.generations;
+  generations.model = registry.generation();
+  if (generations.provider == 0)
+    generations.provider = 1;
+  if (generations.device == 0)
+    generations.device = 1;
+  if (generations.context == 0)
+    generations.context = 1;
+  result.plan.invalidation_key.model_artifact_hash =
+      artifact_hash == 0 ? 1 : artifact_hash;
+
+  static std::atomic<std::uint64_t> next_adapter{UINT64_C(0x4f56435000000000)};
+  auto &topology = result.compatibility_topology;
+  topology.domain_count = caller.intent.stage_count;
+  topology.boundary_count = topology.domain_count - 1;
+  topology.exact_ordered_boundaries = true;
+  topology.cross_adapter_residency_forbidden = true;
+  std::uint64_t domain_hash = kHashOffset;
+  for (std::size_t index = 0; index < topology.domain_count; ++index) {
+    const auto stage_id = caller.intent.stages[index].intent.stage_id;
+    const auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
+    auto &entry = topology.domains[index];
+    entry.domain = HostOrtDomain(stage_id, generations.context, adapter);
+    entry.backend = hal::BackendId::open_video_onnxruntime;
+    entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    entry.first_stage_id = stage_id;
+    entry.last_stage_id = stage_id;
+    domain_hash = HashValue(
+        domain_hash, video::ProductionVideoExecutionDomainHash(entry.domain));
+    if (index == 0)
+      continue;
+    auto &boundary = topology.boundaries[index - 1];
+    boundary.kind = hal::ExecutionBoundaryKind::adapter_transfer;
+    boundary.after_stage_id = topology.domains[index - 1].last_stage_id;
+    boundary.before_stage_id = entry.first_stage_id;
+    boundary.boundary_index = entry.first_stage_id - 1;
+    boundary.source_domain = topology.domains[index - 1].domain;
+    boundary.destination_domain = entry.domain;
+    boundary.readback_required = true;
+    boundary.following_upload_required = true;
+    ++topology.expected_transfers.intermediate_readbacks;
+    ++topology.expected_transfers.intermediate_uploads;
+  }
+  result.plan.invalidation_key.execution_domain_hash =
+      domain_hash == 0 ? 1 : domain_hash;
+
+  open_video::PreparedOpenVideoCompatibilityConfig config;
+  config.plan = result.plan;
+  config.effects = request.effects;
+  config.expected_transfers = topology.expected_transfers;
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    config.providers[index] =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  }
+  open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+  result.compatibility_executor =
+      open_video::PreparedOpenVideoCompatibilityExecutor::Create(config,
+                                                                 &setup);
+  if (!result.compatibility_executor) {
+    return Failure(setup.status, setup.reason);
+  }
+  result.status = setup.status;
+  result.reason = setup.reason;
+  result.readiness = setup.readiness;
+  result.setup_completed_outside_frame_loop = true;
+  return result;
+}
+
 class ProductionSetupSource final
     : public video::IProductionVideoBackendSetupSource {
 public:
   video::ProductionVideoResidentSetupSourceResult AcquireResidentSetup(
       const video::ProductionVideoResidentSetup &request) noexcept override {
     const auto &caller = request.plan;
+    bool compatibility = caller.intent.stage_count != 0;
+    for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+      compatibility =
+          compatibility &&
+          CompatibilitySemantic(caller.intent.stages[index].intent.semantic);
+    }
+    if (compatibility)
+      return BuildCompatibility(request);
     if (request.contract_version !=
             video::kProductionVideoBackendManagerContractVersion ||
         caller.intent.backend.mode !=

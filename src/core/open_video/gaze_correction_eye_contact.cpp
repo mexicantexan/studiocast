@@ -25,6 +25,58 @@ static std::size_t ByteOffset(std::size_t stride, int x, int y) {
   return static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x) * 3;
 }
 
+bool ResizeRgb24Prepared(const std::uint8_t *src, int src_w, int src_h,
+                         std::size_t src_stride, int dst_w, int dst_h,
+                         std::vector<std::uint8_t> *dst,
+                         std::size_t dst_stride) noexcept {
+  if (src == nullptr || dst == nullptr || src_w <= 0 || src_h <= 0 ||
+      dst_w <= 0 || dst_h <= 0 ||
+      src_stride < static_cast<std::size_t>(src_w) * 3u ||
+      dst_stride < static_cast<std::size_t>(dst_w) * 3u ||
+      dst->size() < dst_stride * static_cast<std::size_t>(dst_h)) {
+    return false;
+  }
+  const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
+  const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
+  for (int y = 0; y < dst_h; ++y) {
+    const float sy = std::clamp((static_cast<float>(y) + 0.5f) * scale_y - 0.5f,
+                                0.0f, static_cast<float>(src_h - 1));
+    const int y0 = static_cast<int>(std::floor(sy));
+    const int y1 = std::min(src_h - 1, y0 + 1);
+    const float fy = sy - static_cast<float>(y0);
+    auto *dst_row = dst->data() + static_cast<std::size_t>(y) * dst_stride;
+    const auto *src0 = src + static_cast<std::size_t>(y0) * src_stride;
+    const auto *src1 = src + static_cast<std::size_t>(y1) * src_stride;
+    for (int x = 0; x < dst_w; ++x) {
+      const float sx =
+          std::clamp((static_cast<float>(x) + 0.5f) * scale_x - 0.5f, 0.0f,
+                     static_cast<float>(src_w - 1));
+      const int x0 = static_cast<int>(std::floor(sx));
+      const int x1 = std::min(src_w - 1, x0 + 1);
+      const float fx = sx - static_cast<float>(x0);
+      for (int channel = 0; channel < 3; ++channel) {
+        const auto offset0 = static_cast<std::size_t>(x0) * 3u +
+                             static_cast<std::size_t>(channel);
+        const auto offset1 = static_cast<std::size_t>(x1) * 3u +
+                             static_cast<std::size_t>(channel);
+        const float top = static_cast<float>(src0[offset0]) +
+                          (static_cast<float>(src0[offset1]) -
+                           static_cast<float>(src0[offset0])) *
+                              fx;
+        const float bottom = static_cast<float>(src1[offset0]) +
+                             (static_cast<float>(src1[offset1]) -
+                              static_cast<float>(src1[offset0])) *
+                                 fx;
+        dst_row[static_cast<std::size_t>(x) * 3u +
+                static_cast<std::size_t>(channel)] =
+            static_cast<std::uint8_t>(
+                std::clamp(std::lround(top + (bottom - top) * fy), 0l, 255l));
+      }
+    }
+  }
+  return true;
+}
+
 static void BilinearSampleRgbNchw(const float *rgb_nchw, int w, int h, float x,
                                   float y, float *out_r, float *out_g,
                                   float *out_b) {
@@ -204,17 +256,17 @@ bool GazeCorrectionEyeContact::PrepareScratch(int frame_width, int frame_height,
                               std::vector<std::uint8_t> *corrected) {
     const std::size_t plane =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-    eye->eye_rgb_u8.reserve(plane * 3u);
-    eye->eye_nchw_f32.reserve(plane * 3u);
-    eye->anchors_nchw_f32.reserve(plane * 12u);
-    corrected->reserve(plane * 3u);
+    eye->eye_rgb_u8.resize(plane * 3u);
+    eye->eye_nchw_f32.resize(plane * 3u);
+    eye->anchors_nchw_f32.resize(plane * 12u);
+    corrected->resize(plane * 3u);
   };
   prepare_eye(left_input_width, left_input_height, &left_eye_scratch_,
               &left_corrected_scratch_);
   prepare_eye(right_input_width, right_input_height, &right_eye_scratch_,
               &right_corrected_scratch_);
-  upscale_scratch_.reserve(static_cast<std::size_t>(frame_width) *
-                           static_cast<std::size_t>(frame_height) * 3u);
+  upscale_scratch_.resize(static_cast<std::size_t>(frame_width) *
+                          static_cast<std::size_t>(frame_height) * 3u);
 
   scratch_frame_width_ = frame_width;
   scratch_frame_height_ = frame_height;
@@ -777,21 +829,18 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
 
   // Resize crop to the model input size.
   const std::uint8_t *crop_ptr = rgb + ByteOffset(frame_stride, left, top);
-  std::string rerr;
-  if (!EnsureResizePlan(left_eye, false, crop_w, crop_h, input_w, input_h,
-                        &rerr) ||
-      !(left_eye ? left_extract_plan_ : right_extract_plan_)
-           .Apply(crop_ptr, frame_stride, &out->eye_rgb_u8,
-                  static_cast<std::size_t>(input_w * 3), &rerr)) {
+  if (!ResizeRgb24Prepared(crop_ptr, crop_w, crop_h, frame_stride, input_w,
+                           input_h, &out->eye_rgb_u8,
+                           static_cast<std::size_t>(input_w) * 3u)) {
     if (error)
-      *error = "Eye crop resize failed: " + rerr;
+      *error = "Eye crop resize failed.";
     return false;
   }
   // Convert eye to NCHW float32 in 0..1.
   const std::size_t input_w_sz = static_cast<std::size_t>(input_w);
   const std::size_t input_h_sz = static_cast<std::size_t>(input_h);
   const std::size_t plane = input_w_sz * input_h_sz;
-  out->eye_nchw_f32.assign(static_cast<std::size_t>(3) * plane, 0.f);
+  std::fill(out->eye_nchw_f32.begin(), out->eye_nchw_f32.end(), 0.0f);
   for (int y = 0; y < input_h; ++y) {
     for (int x = 0; x < input_w; ++x) {
       const std::size_t idx = static_cast<std::size_t>(y) * input_w_sz +
@@ -811,7 +860,7 @@ bool GazeCorrectionEyeContact::ExtractEyeData(
   std::array<int, 6> seq = left_eye ? std::array<int, 6>{3, 2, 1, 0, 5, 4}
                                     : std::array<int, 6>{0, 1, 2, 3, 4, 5};
 
-  out->anchors_nchw_f32.assign(static_cast<std::size_t>(12) * plane, 0.f);
+  std::fill(out->anchors_nchw_f32.begin(), out->anchors_nchw_f32.end(), 0.0f);
 
   for (int i = 0; i < 6; ++i) {
     const auto pt =
@@ -1070,14 +1119,11 @@ void GazeCorrectionEyeContact::CompositeEyeIntoFrame(
     return;
 
   // Upscale corrected eye to the crop size.
-  std::string rerr;
-  if (!EnsureResizePlan(left_eye, true, eye.input_w, eye.input_h, eye.crop_w,
-                        eye.crop_h, &rerr))
-    return;
-  auto &plan = left_eye ? left_upscale_plan_ : right_upscale_plan_;
-  if (!plan.Apply(corrected_rgb_u8.data(),
-                  static_cast<std::size_t>(eye.input_w * 3), &upscale_scratch_,
-                  static_cast<std::size_t>(eye.crop_w * 3), &rerr))
+  (void)left_eye;
+  if (!ResizeRgb24Prepared(corrected_rgb_u8.data(), eye.input_w, eye.input_h,
+                           static_cast<std::size_t>(eye.input_w) * 3u,
+                           eye.crop_w, eye.crop_h, &upscale_scratch_,
+                           static_cast<std::size_t>(eye.crop_w) * 3u))
     return;
 
   // Blend into the original frame.

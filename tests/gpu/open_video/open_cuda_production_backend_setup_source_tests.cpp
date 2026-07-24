@@ -177,11 +177,50 @@ bool HostAndModelEvidenceAreSetupOnly() {
   return ok;
 }
 
+bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
+  auto source = open_cuda::CreateProductionVideoBackendSetupSource();
+  auto request = StrictRequest(hal::SemanticEffectId::video_noise_removal);
+  request.plan.intent.stage_count = 2;
+  request.plan.intent.stages[1].intent.stage_id = 8;
+  request.plan.intent.stages[1].intent.semantic =
+      hal::SemanticEffectId::eye_contact;
+  request.plan.intent.stages[1].intent.failure_action =
+      hal::FailureAction::fail_open_preserve_input;
+  auto result = source->AcquireResidentSetup(request);
+  bool ok =
+      Check(result.status == hal::StatusId::blocked &&
+                result.reason == hal::ReasonId::semantic_provider_unavailable &&
+                !result.lease.live() && !result.compatibility_executor,
+            "strict CUDA accepted CPU-tensor compatibility providers");
+
+  request.plan.intent.backend.mode = hal::BackendRequestMode::automatic;
+  request.plan.intent.backend.backend = hal::BackendId::invalid;
+  request.plan.intent.backend.strict = false;
+  request.plan.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::any;
+  request.plan.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::automatic;
+  request.plan.intent.preferences.strict_effects_engine = false;
+  request.plan.intent.requested_provider =
+      hal::SemanticEffectProviderId::invalid;
+  request.plan.intent.strict_provider_selection = false;
+  request.effects.video_noise_removal.enabled = true;
+  request.effects.eye_contact.enabled = true;
+  result = source->AcquireResidentSetup(request);
+  ok &= Check(
+      result.status == hal::StatusId::unavailable &&
+          result.reason == hal::ReasonId::capability_evidence_incomplete &&
+          result.setup_completed_outside_frame_loop && !result.lease.live(),
+      "automatic compatibility did not fail during model setup");
+  return ok;
+}
+
 } // namespace
 
 int main() {
   if (!StrictPolicyIsFailClosed() || !UnsupportedSemanticsRemainBlocked() ||
-      !HostAndModelEvidenceAreSetupOnly()) {
+      !HostAndModelEvidenceAreSetupOnly() ||
+      !CompatibilityTopologyNeverMasqueradesAsStrictCuda()) {
     return 1;
   }
   std::cout << "Open CUDA production backend setup-source tests passed.\n";
