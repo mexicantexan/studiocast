@@ -1,0 +1,794 @@
+#include "core/open_video/video_execution_factory.h"
+#include "core/video/video_execution_coordinator.h"
+
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <new>
+
+namespace {
+
+using namespace studiocast;
+
+std::atomic<bool> g_count_allocations{false};
+std::atomic<std::uint64_t> g_allocations{0};
+
+void *Allocate(std::size_t size) {
+  if (g_count_allocations.load(std::memory_order_acquire))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void *memory = std::malloc(size))
+    return memory;
+  throw std::bad_alloc();
+}
+
+bool Require(bool condition, const char *message) {
+  if (!condition)
+    std::cerr << "FAIL: " << message << '\n';
+  return condition;
+}
+
+#define REQUIRE(condition)                                                     \
+  do {                                                                         \
+    if (!Require((condition), #condition))                                     \
+      return false;                                                            \
+  } while (false)
+
+hal::ExecutionDomainId Domain(std::uint64_t adapter = 801,
+                              std::uint64_t context = 91) {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::cuda;
+  domain.api_family = hal::ApiFamily::cuda_driver;
+  domain.physical_device.vendor_id = 0x10de;
+  domain.physical_device.device_id = 0x1cbb;
+  domain.physical_device.stable_id[0] = 0x42;
+  domain.logical_context_generation = context;
+  domain.allocator_family = hal::AllocatorFamily::cuda_driver;
+  domain.memory_handle_family = hal::MemoryHandleFamily::cuda_device_pointer;
+  domain.queue_or_stream_identity = 0xcafe;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::cuda_stream_ordered;
+  domain.adapter_instance_id = adapter;
+  return domain;
+}
+
+hal::ImageDescriptor Image(hal::HostCoherence coherence,
+                           hal::Mutability mutability) {
+  hal::ImageDescriptor image;
+  image.width = 4;
+  image.height = 2;
+  image.plane_count = 1;
+  image.format = hal::PixelFormat::rgb_u8;
+  image.channel_order = hal::ChannelOrder::rgb;
+  image.color_space = hal::ColorSpace::srgb;
+  image.color_range = hal::ColorRange::full;
+  image.alpha_meaning = hal::AlphaMeaning::none;
+  image.orientation = hal::Orientation::top_left;
+  image.host_coherence = coherence;
+  image.mutability = mutability;
+  image.aliasing = hal::AliasingPermission::forbidden;
+  image.base_alignment_bytes = 1;
+  image.planes[0].row_stride_bytes = 12;
+  image.planes[0].size_bytes = 24;
+  image.planes[0].width = 4;
+  image.planes[0].height = 2;
+  image.planes[0].alignment_bytes = 1;
+  return image;
+}
+
+hal::ModelArtifactIdentity Model(std::uint8_t key = 7) {
+  hal::ModelArtifactIdentity model;
+  model.model_id_hash[0] = key;
+  model.artifact_set_hash[0] = static_cast<std::uint8_t>(key + 1);
+  model.artifact_generation = 13;
+  return model;
+}
+
+video::VideoExecutionPlanRequest
+Request(hal::SemanticEffectId semantic =
+            hal::SemanticEffectId::virtual_background_blur,
+        bool required = false) {
+  video::VideoExecutionPlanRequest request;
+  request.plan_id = 9001;
+  request.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  request.intent.backend.backend = hal::BackendId::cuda;
+  request.intent.backend.strict = true;
+  request.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  request.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::open_cuda;
+  request.intent.preferences.strict_effects_engine = true;
+  request.intent.requested_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  request.intent.strict_provider_selection = true;
+  auto &stage = request.intent.stages[0];
+  stage.intent.stage_id = 11;
+  stage.intent.semantic = semantic;
+  stage.intent.required = required;
+  stage.intent.failure_action =
+      required ? hal::FailureAction::fail_closed
+               : hal::FailureAction::fail_open_preserve_input;
+  stage.parameters[0].id = video::CanonicalVideoParameterId::strength;
+  stage.parameters[0].kind = video::CanonicalVideoParameterKind::signed_integer;
+  stage.parameters[0].signed_value = 8;
+  stage.parameter_count = 1;
+  stage.model = Model();
+  request.intent.stage_count = 1;
+  request.host_input =
+      Image(hal::HostCoherence::coherent, hal::Mutability::read_only);
+  request.host_output =
+      Image(hal::HostCoherence::coherent, hal::Mutability::write_only);
+  request.invalidation_key.generations = {21, 22, 23, 24, 25, 91};
+  request.invalidation_key.canonical_plan_hash = 0xa1;
+  request.invalidation_key.model_artifact_hash = 0xa2;
+  request.invalidation_key.execution_domain_hash = 0xa3;
+  request.temporal.temporal = false;
+  request.temporal.frame_drop_behavior =
+      hal::FrameDropBehavior::latest_frame_wins;
+  request.budget.persistent_bytes = 1024;
+  request.budget.scratch_bytes = 512;
+  request.budget.upload_staging_bytes = 24;
+  request.budget.readback_staging_bytes = 24;
+  request.budget.resource_count = 8;
+  request.budget.in_flight_slots = 1;
+  request.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+  request.cpu_tails[0].after_stage_id = 11;
+  request.cpu_tails[0].required = true;
+  request.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
+  request.cpu_tails[0].boundary_index = 1;
+  request.cpu_tail_count = 1;
+  return request;
+}
+
+hal::SemanticCapabilityEvidence
+Capability(hal::SemanticEffectId semantic =
+               hal::SemanticEffectId::virtual_background_blur) {
+  hal::SemanticCapabilityEvidence capability;
+  capability.semantic = semantic;
+  capability.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  capability.status = hal::StatusId::ready;
+  capability.cpu_tail = hal::CpuTailId::writer_copy;
+  capability.cpu_tail_placement = hal::DeclaredCpuTail::Placement::after_stage;
+  capability.live_stage = true;
+  capability.production_eligible = true;
+  capability.exact_evidence = true;
+  capability.evidence[0] = {
+      hal::CapabilityEvidenceCode::provider_runtime_available,
+      hal::StatusId::ready,
+      hal::ReasonId::none,
+      semantic,
+      hal::BackendId::cuda,
+      true,
+  };
+  capability.evidence_count = 1;
+  return capability;
+}
+
+enum class ExecuteMode {
+  success,
+  optional_fail_open,
+  device_loss,
+};
+
+class FakeOpenCudaResident final : public hal::IResidentAdapter {
+public:
+  FakeOpenCudaResident(hal::ExecutionDomainId domain, ExecuteMode mode,
+                       std::uint64_t synchronizations)
+      : domain_(domain), mode_(mode), synchronizations_(synchronizations) {}
+
+  std::uint64_t adapter_instance_id() const noexcept override {
+    return domain_.adapter_instance_id;
+  }
+  hal::BackendId backend_id() const noexcept override {
+    return hal::BackendId::cuda;
+  }
+
+  hal::StatusId Prepare(const hal::PreparedProgram &program,
+                        hal::PreparedProgramHandle *candidate,
+                        hal::ReadinessSnapshot *readiness,
+                        hal::ReasonId *reason) noexcept override {
+    ++prepare_calls;
+    program_ = program;
+    candidate->handle_id = 1;
+    candidate->program_id = program.program_id;
+    candidate->adapter_instance_id = domain_.adapter_instance_id;
+    candidate->invalidation_key = program.invalidation_key;
+    candidate->execution_domain = domain_;
+    candidate->reserved_budget = program.budget;
+    readiness->status = hal::StatusId::ready;
+    readiness->requested_backend = hal::BackendId::cuda;
+    readiness->selected_backend = hal::BackendId::cuda;
+    readiness->provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    readiness->execution_domain = domain_;
+    readiness->ready_stage_mask = 1;
+    readiness->available = true;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override {
+    binding_ = binding;
+    tokens_ = {};
+    tokens_.input = Resource(101, hal::MemoryDomain::upload_staging, false);
+    tokens_.output = Resource(102, hal::MemoryDomain::readback_staging, true);
+    *tokens = tokens_;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::ExecuteResult
+  Execute(const hal::PreparedProgramHandle &program,
+          const hal::ExecuteRequest &request) noexcept override {
+    ++execute_calls;
+    hal::ExecuteResult result;
+    result.status = hal::StatusId::executed;
+    result.completion = {next_token_++, program.program_id,
+                         domain_.adapter_instance_id, request.capture_sequence,
+                         true};
+    result.output = tokens_.output;
+    result.output_valid = true;
+    result.stage_count = 1;
+    result.stages[0].stage_id = program_.stages[0].stage_id;
+    result.stages[0].semantic = program_.stages[0].semantic;
+    result.stages[0].status = hal::StageExecutionStatus::succeeded;
+    result.stages[0].valid_output_preserved = true;
+    result.transfers.uploads = 1;
+    result.transfers.final_readbacks = 1;
+    result.transfers.synchronizations = synchronizations_;
+    result.transfers.cpu_tail_boundaries = 1;
+    std::memcpy(binding_.output_planes[0].write_data,
+                binding_.input_planes[0].read_data, 24);
+    if (mode_ == ExecuteMode::optional_fail_open) {
+      result.status = hal::StatusId::degraded;
+      result.reason = hal::ReasonId::optional_stage_failed_open;
+      result.stages[0].status = hal::StageExecutionStatus::optional_failed_open;
+      result.stages[0].reason = hal::ReasonId::optional_stage_failed_open;
+    } else if (mode_ == ExecuteMode::device_loss) {
+      result.status = hal::StatusId::failed;
+      result.reason = hal::ReasonId::device_lost;
+      result.output_valid = false;
+      result.stages[0].status = hal::StageExecutionStatus::required_failed;
+      result.stages[0].reason = hal::ReasonId::device_lost;
+      result.stages[0].valid_output_preserved = false;
+    }
+    return result;
+  }
+
+  hal::StatusId ResolveHostFrameOutput(
+      const hal::PreparedProgramHandle &, const hal::CompletionToken &,
+      const hal::ResourceHandle &, hal::HostFrameOutputResolution *resolution,
+      hal::ReasonId *reason) noexcept override {
+    resolution->descriptor = binding_.output_descriptor;
+    resolution->planes = binding_.output_planes;
+    resolution->plane_count = binding_.output_plane_count;
+    resolution->capture_sequence = binding_.capture_sequence;
+    resolution->output_ready = true;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &,
+                                   hal::ReasonId) noexcept override {
+    return hal::StatusId::ready;
+  }
+
+  void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override {
+    ++destroy_calls;
+    *program = {};
+  }
+  void Shutdown() noexcept override { ++shutdown_calls; }
+
+  std::uint64_t prepare_calls = 0;
+  std::uint64_t execute_calls = 0;
+  std::uint64_t destroy_calls = 0;
+  std::uint64_t shutdown_calls = 0;
+
+private:
+  hal::ResourceHandle Resource(std::uint64_t id, hal::MemoryDomain memory,
+                               bool writable) const noexcept {
+    hal::ResourceHandle resource;
+    resource.resource_id = id;
+    resource.allocator_owner_id = domain_.adapter_instance_id;
+    resource.lifetime_generation = domain_.logical_context_generation;
+    resource.memory_domain = memory;
+    resource.lifetime = hal::ResourceLifetime::frame_borrowed;
+    resource.synchronization_state = hal::SynchronizationState::ready;
+    resource.execution_domain = domain_;
+    resource.size_bytes = 24;
+    resource.alignment_bytes = 1;
+    resource.mutable_resource = writable;
+    return resource;
+  }
+
+  hal::ExecutionDomainId domain_{};
+  ExecuteMode mode_ = ExecuteMode::success;
+  std::uint64_t synchronizations_ = 1;
+  hal::PreparedProgram program_{};
+  hal::HostFrameBinding binding_{};
+  hal::HostFrameTokens tokens_{};
+  std::uint64_t next_token_ = 1;
+};
+
+struct CandidateOwner {
+  CandidateOwner(hal::ExecutionDomainId domain, ExecuteMode mode,
+                 std::uint64_t synchronizations)
+      : adapter(domain, mode, synchronizations) {}
+  FakeOpenCudaResident adapter;
+};
+
+struct SetupContext {
+  hal::ExecutionDomainId domain = Domain();
+  ExecuteMode mode = ExecuteMode::success;
+  std::uint64_t synchronizations = 1;
+  bool fail_prepare = false;
+  bool foreign_domain = false;
+  bool omit_owner = false;
+  std::uint64_t prepare_calls = 0;
+  std::uint64_t destructions = 0;
+  CandidateOwner *latest_owner = nullptr;
+};
+
+SetupContext *g_destroy_context = nullptr;
+
+void DestroyCandidate(void *owner) noexcept {
+  delete static_cast<CandidateOwner *>(owner);
+  if (g_destroy_context)
+    ++g_destroy_context->destructions;
+}
+
+hal::AdapterRegistration Registration(FakeOpenCudaResident *adapter,
+                                      const hal::ExecutionDomainId &domain,
+                                      hal::SemanticEffectId semantic) {
+  hal::AdapterRegistration registration;
+  registration.adapter_instance_id = domain.adapter_instance_id;
+  registration.backend = hal::BackendId::cuda;
+  registration.execution_domain = domain;
+  registration.selection_priority = 5;
+  registration.resident_adapter = adapter;
+  registration.semantic_capabilities[0] = Capability(semantic);
+  registration.semantic_capability_count = 1;
+  return registration;
+}
+
+hal::StatusId
+PrepareCandidate(void *opaque, const video::FrozenVideoExecutionPlan &plan,
+                 open_cuda::OpenCudaVideoExecutionCandidate *candidate,
+                 video::VideoAdapterPrepareEvidence *evidence) noexcept {
+  auto *context = static_cast<SetupContext *>(opaque);
+  ++context->prepare_calls;
+  if (context->fail_prepare) {
+    evidence->status = hal::StatusId::unavailable;
+    evidence->reason = hal::ReasonId::semantic_provider_unavailable;
+    evidence->candidate_resources_rolled_back = true;
+    return evidence->status;
+  }
+  if (context->omit_owner) {
+    evidence->status = hal::StatusId::ready;
+    evidence->candidate_resources_rolled_back = false;
+    return evidence->status;
+  }
+  auto *owner = new (std::nothrow)
+      CandidateOwner(context->domain, context->mode, context->synchronizations);
+  if (!owner) {
+    evidence->status = hal::StatusId::resource_exhausted;
+    evidence->reason = hal::ReasonId::resource_exhausted;
+    evidence->candidate_resources_rolled_back = true;
+    return evidence->status;
+  }
+  context->latest_owner = owner;
+  g_destroy_context = context;
+  candidate->owner = owner;
+  candidate->destroy_owner = DestroyCandidate;
+  auto registration_domain = context->domain;
+  if (context->foreign_domain)
+    ++registration_domain.adapter_instance_id;
+  candidate->registration =
+      Registration(&owner->adapter, registration_domain,
+                   plan.prepared_program.stages[0].semantic);
+  evidence->status = hal::StatusId::ready;
+  evidence->reason = hal::ReasonId::none;
+  return evidence->status;
+}
+
+hal::ReadinessSnapshot Readiness(const hal::ExecutionDomainId &domain) {
+  hal::ReadinessSnapshot readiness;
+  readiness.status = hal::StatusId::ready;
+  readiness.requested_backend = hal::BackendId::cuda;
+  readiness.selected_backend = hal::BackendId::cuda;
+  readiness.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  readiness.execution_domain = domain;
+  readiness.ready_stage_mask = 1;
+  readiness.available = true;
+  return readiness;
+}
+
+open_cuda::OpenCudaVideoExecutionFactoryConfig
+FactoryConfig(SetupContext *context,
+              const video::VideoExecutionPlanRequest &request) {
+  open_cuda::OpenCudaVideoExecutionFactoryConfig config;
+  config.factory_id = 7001;
+  config.selection_priority = 5;
+  config.cached.execution_domain = context->domain;
+  config.cached.readiness = Readiness(context->domain);
+  config.cached.model = request.intent.stages[0].model;
+  config.cached.generations = request.invalidation_key.generations;
+  config.cached.model_artifact_validated = true;
+  config.cached.provider_runtime_validated = true;
+  config.cached.device_context_validated = true;
+  config.cached.cuda_iobinding_validated = true;
+  config.cached.user_stream_bound = true;
+  config.cached.reusable_resources_supported = true;
+  config.cached.device_preprocess_supported = true;
+  config.cached.device_postprocess_supported = true;
+  config.cached.one_upload_one_readback = true;
+  config.cached.no_intermediate_crossings = true;
+  config.cached.stop_aware_bounded_wait = true;
+  config.cached.allocation_free_execute = true;
+  config.prepare_candidate = PrepareCandidate;
+  config.setup_context = context;
+  return config;
+}
+
+bool BuildFrozen(const video::VideoExecutionPlanRequest &request,
+                 const hal::AdapterRegistration &registration,
+                 open_cuda::OpenCudaVideoExecutionFactory *factory,
+                 video::FrozenVideoExecutionPlan *plan,
+                 video::VideoAdapterFactoryPreflight *preflight) {
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  REQUIRE(registry.Register(registration, &reason) == hal::StatusId::ready);
+  const auto resolution = hal::ResolveSemanticStages(
+      registry, video::BuildVideoResolutionRequest(request.intent));
+  REQUIRE(resolution.status == hal::StatusId::ready ||
+          resolution.status == hal::StatusId::degraded);
+  const auto domain_plan = hal::PlanExecutionDomains(
+      registry, resolution, hal::CrossAdapterPolicy::reject);
+  REQUIRE(domain_plan.status == hal::StatusId::ready ||
+          domain_plan.status == hal::StatusId::degraded);
+  *preflight =
+      factory->Preflight(request, resolution, domain_plan,
+                         video::VideoExecutionRoute::prepared_resident);
+  if (preflight->status != hal::StatusId::ready)
+    return true;
+  plan->plan_id = request.plan_id;
+  plan->route = video::VideoExecutionRoute::prepared_resident;
+  plan->intent = request.intent;
+  plan->host_input = request.host_input;
+  plan->host_output = request.host_output;
+  plan->invalidation_key = request.invalidation_key;
+  plan->temporal = request.temporal;
+  plan->budget = request.budget;
+  plan->cpu_tails = request.cpu_tails;
+  plan->cpu_tail_count = request.cpu_tail_count;
+  plan->setup_failure_policy = request.setup_failure_policy;
+  plan->migration_policy = request.migration_policy;
+  plan->resolution = resolution;
+  plan->domain_plan = domain_plan;
+  plan->factory_id = factory->Registration().factory_id;
+  plan->prepared_program = preflight->prepared_program;
+  return true;
+}
+
+hal::HostFrameBinding Binding(std::array<std::uint8_t, 24> *input,
+                              std::array<std::uint8_t, 24> *output,
+                              std::uint64_t sequence) {
+  hal::HostFrameBinding binding;
+  binding.input_descriptor =
+      Image(hal::HostCoherence::coherent, hal::Mutability::read_only);
+  binding.output_descriptor =
+      Image(hal::HostCoherence::coherent, hal::Mutability::write_only);
+  binding.input_planes[0].read_data =
+      reinterpret_cast<const std::byte *>(input->data());
+  binding.input_planes[0].span_bytes = input->size();
+  binding.input_planes[0].row_stride_bytes = 12;
+  binding.output_planes[0].write_data =
+      reinterpret_cast<std::byte *>(output->data());
+  binding.output_planes[0].span_bytes = output->size();
+  binding.output_planes[0].row_stride_bytes = 12;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.capture_sequence = sequence;
+  binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+  binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+  return binding;
+}
+
+bool ExactPreflightAndMalformedRejection() {
+  auto request = Request();
+  SetupContext context;
+  FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                        1);
+  auto registration = Registration(&registry_adapter, context.domain,
+                                   request.intent.stages[0].intent.semantic);
+  open_cuda::OpenCudaVideoExecutionFactory factory(
+      FactoryConfig(&context, request));
+  video::FrozenVideoExecutionPlan plan;
+  video::VideoAdapterFactoryPreflight preflight;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.cached_evidence_only);
+  REQUIRE(preflight.accepts_frozen_resolution);
+  REQUIRE(!preflight.performs_selection);
+  REQUIRE(preflight.backend == hal::BackendId::cuda);
+  REQUIRE(preflight.provider ==
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  REQUIRE(preflight.execution_domain == context.domain);
+  REQUIRE(preflight.prepared_program.program_id == request.plan_id);
+  REQUIRE(preflight.prepared_program.invalidation_key ==
+          request.invalidation_key);
+  REQUIRE(preflight.prepared_program.stages[0].model.model_id_hash ==
+          request.intent.stages[0].model.model_id_hash);
+  REQUIRE(preflight.prepared_program.stages[0].model.artifact_set_hash ==
+          request.intent.stages[0].model.artifact_set_hash);
+  REQUIRE(preflight.prepared_program.stages[0].model.artifact_generation ==
+          request.intent.stages[0].model.artifact_generation);
+  REQUIRE(preflight.prepared_program.stages[0].stage_id == 11);
+  REQUIRE(preflight.readiness.ready_stage_mask == 1);
+  REQUIRE(preflight.prepared_program.cpu_tails[0].id ==
+          hal::CpuTailId::writer_copy);
+
+  auto malformed = request;
+  malformed.intent.backend.strict = false;
+  REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+
+  malformed = request;
+  ++malformed.invalidation_key.generations.model;
+  REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+  REQUIRE(preflight.reason == hal::ReasonId::capability_evidence_incomplete);
+
+  malformed = request;
+  malformed.intent.stages[0].model = Model(33);
+  REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+
+  malformed = request;
+  malformed.temporal.temporal = true;
+  malformed.temporal.history_frames = 1;
+  REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+
+  malformed = request;
+  malformed.host_output.width = 8;
+  malformed.host_output.planes[0].width = 8;
+  malformed.host_output.planes[0].row_stride_bytes = 24;
+  malformed.host_output.planes[0].size_bytes = 48;
+  malformed.budget.readback_staging_bytes = 48;
+  REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+  return true;
+}
+
+bool ExecuteTransferCommitAndAllocationContract() {
+  auto request = Request();
+  SetupContext context;
+  // Two synchronization points are intentionally reported by the adapter.
+  // The factory must preserve actual counters rather than normalize them to
+  // the domain planner's current estimate.
+  context.synchronizations = 2;
+  FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                        1);
+  auto registration = Registration(&registry_adapter, context.domain,
+                                   request.intent.stages[0].intent.semantic);
+  open_cuda::OpenCudaVideoExecutionFactory factory(
+      FactoryConfig(&context, request));
+  video::FrozenVideoExecutionPlan plan;
+  video::VideoAdapterFactoryPreflight preflight;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  video::VideoAdapterPrepareEvidence evidence;
+  auto executor = factory.Prepare(plan, &evidence);
+  REQUIRE(executor != nullptr);
+  REQUIRE(evidence.status == hal::StatusId::ready);
+  REQUIRE(context.prepare_calls == 1);
+
+  std::array<std::uint8_t, 24> input{};
+  std::array<std::uint8_t, 24> output{};
+  input.fill(0x5a);
+  auto binding = Binding(&input, &output, 1);
+  auto frame = executor->Execute(binding);
+  REQUIRE(frame.status == hal::StatusId::executed);
+  REQUIRE(frame.output_ready);
+  REQUIRE(frame.execution_domain == context.domain);
+  REQUIRE(frame.transfers.uploads == 1);
+  REQUIRE(frame.transfers.final_readbacks == 1);
+  REQUIRE(frame.transfers.intermediate_uploads == 0);
+  REQUIRE(frame.transfers.intermediate_readbacks == 0);
+  REQUIRE(frame.transfers.synchronizations == 2);
+  REQUIRE(frame.transfers.cpu_tail_boundaries == 1);
+  REQUIRE(output == input);
+  REQUIRE(!executor->Snapshot().latest_committed_frame.valid);
+
+  hal::ReasonId reason = hal::ReasonId::none;
+  REQUIRE(executor->CommitOutput(frame.completion, false, &reason) ==
+          hal::StatusId::failed);
+  REQUIRE(reason == hal::ReasonId::output_write_failed);
+  REQUIRE(!executor->Snapshot().latest_committed_frame.valid);
+
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_release);
+  bool succeeded = true;
+  for (std::uint64_t sequence = 2; sequence != 66; ++sequence) {
+    binding.capture_sequence = sequence;
+    const auto next = executor->Execute(binding);
+    if (!next.output_ready ||
+        executor->CommitOutput(next.completion, true, &reason) !=
+            hal::StatusId::ready) {
+      succeeded = false;
+      break;
+    }
+  }
+  g_count_allocations.store(false, std::memory_order_release);
+  REQUIRE(succeeded);
+  REQUIRE(g_allocations.load(std::memory_order_relaxed) == 0);
+  const auto snapshot = executor->Snapshot();
+  REQUIRE(snapshot.latest_committed_frame.valid);
+  REQUIRE(snapshot.latest_committed_frame.capture_sequence == 65);
+  REQUIRE(snapshot.telemetry.active_backend_frames == 64);
+  REQUIRE(snapshot.telemetry.active_backend == hal::BackendId::cuda);
+  REQUIRE(snapshot.telemetry.active_provider ==
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  executor->Shutdown();
+  REQUIRE(executor->Snapshot().stopped);
+  return true;
+}
+
+bool OptionalFailureDeviceLossAndRollback() {
+  auto request = Request();
+  SetupContext context;
+  context.mode = ExecuteMode::optional_fail_open;
+  FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                        1);
+  auto registration = Registration(&registry_adapter, context.domain,
+                                   request.intent.stages[0].intent.semantic);
+  open_cuda::OpenCudaVideoExecutionFactory factory(
+      FactoryConfig(&context, request));
+  video::FrozenVideoExecutionPlan plan;
+  video::VideoAdapterFactoryPreflight preflight;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  video::VideoAdapterPrepareEvidence evidence;
+  auto executor = factory.Prepare(plan, &evidence);
+  REQUIRE(executor != nullptr);
+  std::array<std::uint8_t, 24> input{};
+  std::array<std::uint8_t, 24> output{};
+  input.fill(0x6b);
+  auto frame = executor->Execute(Binding(&input, &output, 1));
+  REQUIRE(frame.status == hal::StatusId::degraded);
+  REQUIRE(frame.output_ready);
+  REQUIRE(frame.stages[0].status ==
+          hal::StageExecutionStatus::optional_failed_open);
+  REQUIRE(frame.stages[0].valid_output_preserved);
+  hal::ReasonId reason = hal::ReasonId::none;
+  REQUIRE(executor->CommitOutput(frame.completion, true, &reason) ==
+          hal::StatusId::ready);
+  REQUIRE(executor->Snapshot().latest_committed_frame.valid);
+  REQUIRE(executor->Snapshot().telemetry.active_backend_frames == 0);
+  executor.reset();
+
+  context.mode = ExecuteMode::device_loss;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  executor = factory.Prepare(plan, &evidence);
+  REQUIRE(executor != nullptr);
+  frame = executor->Execute(Binding(&input, &output, 2));
+  REQUIRE(frame.reason == hal::ReasonId::device_lost);
+  REQUIRE(!frame.output_ready);
+  REQUIRE(executor->Snapshot().status == hal::StatusId::quarantined);
+  executor->Shutdown();
+
+  context.foreign_domain = true;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  executor = factory.Prepare(plan, &evidence);
+  REQUIRE(executor == nullptr);
+  REQUIRE(evidence.status == hal::StatusId::blocked);
+  REQUIRE(evidence.reason == hal::ReasonId::foreign_adapter);
+  REQUIRE(evidence.candidate_resources_rolled_back);
+
+  context.foreign_domain = false;
+  context.fail_prepare = true;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  executor = factory.Prepare(plan, &evidence);
+  REQUIRE(executor == nullptr);
+  REQUIRE(evidence.status == hal::StatusId::unavailable);
+  REQUIRE(evidence.candidate_resources_rolled_back);
+  return true;
+}
+
+bool CoordinatorStrictSelectionAndStopAwareShutdown() {
+  auto request = Request(hal::SemanticEffectId::virtual_background_remove);
+  SetupContext context;
+  FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                        1);
+  auto registration = Registration(&registry_adapter, context.domain,
+                                   request.intent.stages[0].intent.semantic);
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  REQUIRE(registry.Register(registration, &reason) == hal::StatusId::ready);
+  open_cuda::OpenCudaVideoExecutionFactory factory(
+      FactoryConfig(&context, request));
+  video::VideoExecutionCoordinator coordinator(registry);
+  const auto factory_registration = factory.Registration();
+  REQUIRE(coordinator.RegisterFactory(factory_registration, &reason) ==
+          hal::StatusId::ready);
+  video::VideoExecutionPrepareEvidence prepare;
+  REQUIRE(coordinator.Prepare(request, &prepare, &reason) ==
+          hal::StatusId::ready);
+  REQUIRE(prepare.selected_route ==
+          video::VideoExecutionRoute::prepared_resident);
+  REQUIRE(prepare.resolution.selected_backend == hal::BackendId::cuda);
+  REQUIRE(prepare.resolution.selected_provider ==
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  std::array<std::uint8_t, 24> input{};
+  std::array<std::uint8_t, 24> output{};
+  input.fill(0x7c);
+  const auto frame = coordinator.Execute(Binding(&input, &output, 1));
+  REQUIRE(frame.status == hal::StatusId::executed);
+  REQUIRE(coordinator.CommitOutput(frame.completion, true, &reason) ==
+          hal::StatusId::ready);
+  const auto snapshot = coordinator.Snapshot();
+  REQUIRE(snapshot.latest_committed_frame.valid);
+  REQUIRE(snapshot.telemetry.active_backend == hal::BackendId::cuda);
+  coordinator.Shutdown();
+  REQUIRE(coordinator.Snapshot().stopped);
+  REQUIRE(coordinator.Execute(Binding(&input, &output, 2)).status ==
+          hal::StatusId::stopped);
+
+  auto substituted = request;
+  substituted.intent.backend.backend = hal::BackendId::vulkan;
+  REQUIRE(coordinator.Prepare(substituted, &prepare, &reason) ==
+          hal::StatusId::stopped);
+  return true;
+}
+
+} // namespace
+
+void *operator new(std::size_t size) { return Allocate(size); }
+void *operator new[](std::size_t size) { return Allocate(size); }
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(size);
+  } catch (...) {
+    return nullptr;
+  }
+}
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
+  try {
+    return Allocate(size);
+  } catch (...) {
+    return nullptr;
+  }
+}
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, const std::nothrow_t &) noexcept {
+  std::free(memory);
+}
+void operator delete[](void *memory, const std::nothrow_t &) noexcept {
+  std::free(memory);
+}
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
+
+int main() {
+  if (!ExactPreflightAndMalformedRejection() ||
+      !ExecuteTransferCommitAndAllocationContract() ||
+      !OptionalFailureDeviceLossAndRollback() ||
+      !CoordinatorStrictSelectionAndStopAwareShutdown()) {
+    return EXIT_FAILURE;
+  }
+  std::cout << "Open CUDA video execution factory tests passed\n";
+  return EXIT_SUCCESS;
+}
