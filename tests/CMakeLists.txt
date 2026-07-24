@@ -420,6 +420,32 @@ if (BUILD_TESTING)
             studiocast-prepared-open-cuda-pipeline-migration-tests
             integration core video gpu model)
 
+    add_executable(studiocast-production-backend-pipeline-lease-cutover-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/production_backend_pipeline_lease_cutover_tests.cpp
+    )
+
+    target_compile_definitions(
+            studiocast-production-backend-pipeline-lease-cutover-tests PRIVATE
+            STUDIOCAST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    studiocast_set_project_warnings(
+            studiocast-production-backend-pipeline-lease-cutover-tests)
+    studiocast_enable_sanitizers(
+            studiocast-production-backend-pipeline-lease-cutover-tests)
+
+    set_target_properties(
+            studiocast-production-backend-pipeline-lease-cutover-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-production-backend-pipeline-lease-cutover-tests
+            COMMAND studiocast-production-backend-pipeline-lease-cutover-tests)
+    studiocast_set_test_labels(
+            studiocast-production-backend-pipeline-lease-cutover-tests
+            integration core video gpu model maxine)
+
     add_executable(studiocast-video-runtime-status-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
     )
