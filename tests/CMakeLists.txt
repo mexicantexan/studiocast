@@ -1374,6 +1374,13 @@ if (BUILD_TESTING)
             "${STUDIOCAST_GENERATED_DIR}"
     )
 
+    # The video runtime deliberately does not propagate optional-backend feature
+    # definitions. Matrix-aware contract tests still need the configured build
+    # state to select the matching fail-closed expectations.
+    target_compile_definitions(studiocast-video-tests PRIVATE
+            STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
+    )
+
     studiocast_set_project_warnings(studiocast-video-tests)
     studiocast_enable_sanitizers(studiocast-video-tests)
 
