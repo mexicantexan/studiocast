@@ -49,6 +49,15 @@ bool SameImage(const hal::ImageDescriptor &left,
   return true;
 }
 
+bool SameCompletion(const hal::CompletionToken &left,
+                    const hal::CompletionToken &right) noexcept {
+  return left.token_id == right.token_id &&
+         left.program_id == right.program_id &&
+         left.adapter_instance_id == right.adapter_instance_id &&
+         left.capture_sequence == right.capture_sequence &&
+         left.complete == right.complete;
+}
+
 std::uint64_t
 Elapsed(const std::chrono::steady_clock::time_point &start) noexcept {
   return static_cast<std::uint64_t>(
@@ -60,12 +69,16 @@ Elapsed(const std::chrono::steady_clock::time_point &start) noexcept {
 } // namespace
 
 struct PreparedOpenVideoCompatibilityExecutor::Impl {
+  static constexpr std::size_t kPreparedErrorCapacity = 4096;
+
   PreparedOpenVideoCompatibilityConfig config{};
   FastDvdnetDenoiser denoiser;
   YunetFaceDetector yunet;
   GazeCorrectionEyeContact gaze;
   FrameAnalysisCache analysis;
   std::vector<std::uint8_t> output;
+  std::vector<std::uint8_t> candidate;
+  std::array<std::string, hal::kMaxPreparedStages> frame_errors{};
   video::VideoExecutionAdapterSnapshot snapshot{};
   hal::CompletionToken pending{};
   std::array<hal::StageExecutionResult, hal::kMaxPreparedStages>
@@ -82,12 +95,15 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
     const int height = static_cast<int>(config.plan.host_input.height);
     output.resize(
         static_cast<std::size_t>(config.plan.host_output.planes[0].size_bytes));
+    candidate.resize(output.size());
     for (std::size_t index = 0; index < config.plan.intent.stage_count;
          ++index) {
       const auto semantic = config.plan.intent.stages[index].intent.semantic;
+      frame_errors[index].reserve(kPreparedErrorCapacity);
       std::string error;
       if (semantic == hal::SemanticEffectId::video_noise_removal) {
-        if (!denoiser.EnsureInitialized(
+        if (config.prepared_stage_runner == nullptr &&
+            !denoiser.EnsureInitialized(
                 width, height, config.effects.video_noise_removal.model_id,
                 &error)) {
           result->status = hal::StatusId::unavailable;
@@ -96,17 +112,17 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
         }
         have_denoise = true;
       } else if (semantic == hal::SemanticEffectId::eye_contact) {
-        if (!yunet.EnsureInitialized(config.effects.auto_frame.model_id,
-                                     &error) ||
-            !gaze.EnsureInitialized(config.effects.eye_contact.model_id,
-                                    &error)) {
+        if (config.prepared_stage_runner == nullptr &&
+            (!yunet.EnsureInitialized(config.effects.auto_frame.model_id,
+                                      &error) ||
+             !gaze.EnsureInitialized(config.effects.eye_contact.model_id,
+                                     &error))) {
           result->status = hal::StatusId::unavailable;
           result->reason = hal::ReasonId::capability_evidence_incomplete;
           return false;
         }
-        const auto scratch = gaze.scratch_status();
-        (void)scratch;
-        if (!gaze.PrepareScratch(width, height, 64, 48, 64, 48, &error)) {
+        if (config.prepared_stage_runner == nullptr &&
+            !gaze.PrepareScratch(width, height, 64, 48, 64, 48, &error)) {
           result->status = hal::StatusId::resource_exhausted;
           result->reason = hal::ReasonId::resource_exhausted;
           return false;
@@ -230,11 +246,24 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
     stage_result.stage_id = stage.intent.stage_id;
     stage_result.semantic = stage.intent.semantic;
     const auto start = std::chrono::steady_clock::now();
+    std::memcpy(impl_->candidate.data(), impl_->output.data(),
+                impl_->output.size());
     bool ok = false;
-    std::string error;
-    if (stage.intent.semantic == hal::SemanticEffectId::video_noise_removal) {
+    auto &error = impl_->frame_errors[index];
+    error.clear();
+    if (impl_->config.prepared_stage_runner != nullptr) {
+      ok = impl_->config.prepared_stage_runner(
+          impl_->config.prepared_stage_runner_context, stage,
+          binding.capture_sequence, impl_->candidate.data(),
+          static_cast<int>(impl_->config.plan.host_output.width),
+          static_cast<int>(impl_->config.plan.host_output.height),
+          static_cast<std::size_t>(
+              impl_->config.plan.host_output.planes[0].row_stride_bytes),
+          &error);
+    } else if (stage.intent.semantic ==
+               hal::SemanticEffectId::video_noise_removal) {
       ok = impl_->denoiser.ApplyPreparedRgbInPlace(
-          binding.capture_sequence, impl_->output.data(),
+          binding.capture_sequence, impl_->candidate.data(),
           static_cast<int>(impl_->config.plan.host_output.width),
           static_cast<int>(impl_->config.plan.host_output.height),
           static_cast<std::size_t>(
@@ -243,7 +272,7 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
           impl_->config.effects.video_noise_removal.model_id, &error);
     } else if (stage.intent.semantic == hal::SemanticEffectId::eye_contact) {
       ok = impl_->gaze.ApplyPreparedRgbInPlace(
-          binding.capture_sequence, impl_->output.data(),
+          binding.capture_sequence, impl_->candidate.data(),
           static_cast<int>(impl_->config.plan.host_output.width),
           static_cast<int>(impl_->config.plan.host_output.height),
           static_cast<std::size_t>(
@@ -256,6 +285,7 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
     }
     stage_result.elapsed_ns = Elapsed(start);
     if (ok) {
+      impl_->output.swap(impl_->candidate);
       stage_result.status = hal::StageExecutionStatus::succeeded;
       stage_result.valid_output_preserved = true;
     } else if (!stage.intent.required &&
@@ -321,8 +351,7 @@ hal::StatusId PreparedOpenVideoCompatibilityExecutor::CommitOutput(
     hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
   if (!impl_ || impl_->pending.token_id == 0 ||
-      completion.token_id != impl_->pending.token_id ||
-      completion.capture_sequence != impl_->pending.capture_sequence) {
+      !SameCompletion(completion, impl_->pending)) {
     SetReason(reason, hal::ReasonId::output_not_committed);
     return hal::StatusId::blocked;
   }

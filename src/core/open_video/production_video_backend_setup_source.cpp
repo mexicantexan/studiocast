@@ -363,7 +363,7 @@ bool ResolveCompatibilityModel(
 video::ProductionVideoResidentSetupSourceResult
 BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
   const auto &caller = request.plan;
-  if (caller.intent.stage_count < 2 ||
+  if (caller.intent.stage_count == 0 ||
       caller.intent.stage_count >
           video::ProductionVideoResidentSetupSourceResult::
               kMaxCompatibilityDomains) {
@@ -435,36 +435,22 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
 
   static std::atomic<std::uint64_t> next_adapter{UINT64_C(0x4f56435000000000)};
   auto &topology = result.compatibility_topology;
-  topology.domain_count = caller.intent.stage_count;
-  topology.boundary_count = topology.domain_count - 1;
+  topology.domain_count = 1;
+  topology.boundary_count = 0;
   topology.exact_ordered_boundaries = true;
   topology.cross_adapter_residency_forbidden = true;
-  std::uint64_t domain_hash = kHashOffset;
-  for (std::size_t index = 0; index < topology.domain_count; ++index) {
-    const auto stage_id = caller.intent.stages[index].intent.stage_id;
-    const auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
-    auto &entry = topology.domains[index];
-    entry.domain = HostOrtDomain(stage_id, generations.context, adapter);
-    entry.backend = hal::BackendId::open_video_onnxruntime;
-    entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
-    entry.first_stage_id = stage_id;
-    entry.last_stage_id = stage_id;
-    domain_hash = HashValue(
-        domain_hash, video::ProductionVideoExecutionDomainHash(entry.domain));
-    if (index == 0)
-      continue;
-    auto &boundary = topology.boundaries[index - 1];
-    boundary.kind = hal::ExecutionBoundaryKind::adapter_transfer;
-    boundary.after_stage_id = topology.domains[index - 1].last_stage_id;
-    boundary.before_stage_id = entry.first_stage_id;
-    boundary.boundary_index = entry.first_stage_id - 1;
-    boundary.source_domain = topology.domains[index - 1].domain;
-    boundary.destination_domain = entry.domain;
-    boundary.readback_required = true;
-    boundary.following_upload_required = true;
-    ++topology.expected_transfers.intermediate_readbacks;
-    ++topology.expected_transfers.intermediate_uploads;
-  }
+  const auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
+  auto &entry = topology.domains[0];
+  entry.domain =
+      HostOrtDomain(caller.intent.stages[0].intent.stage_id,
+                    generations.context, adapter);
+  entry.backend = hal::BackendId::open_video_onnxruntime;
+  entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  entry.first_stage_id = caller.intent.stages[0].intent.stage_id;
+  entry.last_stage_id =
+      caller.intent.stages[caller.intent.stage_count - 1].intent.stage_id;
+  const std::uint64_t domain_hash =
+      video::ProductionVideoExecutionDomainHash(entry.domain);
   result.plan.invalidation_key.execution_domain_hash =
       domain_hash == 0 ? 1 : domain_hash;
 

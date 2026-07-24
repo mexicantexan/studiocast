@@ -4,16 +4,28 @@
 #include "core/video/video_adapter_factory.h"
 
 #include <array>
+#include <cstdint>
 #include <memory>
+#include <string>
 
 namespace studiocast::open_video {
 
 struct PreparedOpenVideoCompatibilityConfig {
+  using PreparedStageRunner = bool (*)(
+      void *context, const video::CanonicalVideoStage &stage,
+      std::uint64_t capture_sequence, std::uint8_t *rgb, int width, int height,
+      std::size_t stride, std::string *error) noexcept;
+
   video::VideoExecutionPlanRequest plan{};
   video::effects::BroadcastCameraEffects effects{};
   std::array<hal::SemanticEffectProviderId, hal::kMaxPreparedStages>
       providers{};
   hal::TransferCounters expected_transfers{};
+  // Optional already-prepared runner used by backend-private composed stages
+  // and hermetic conformance tests. Ownership and preparation remain with the
+  // caller; Execute never probes, prepares, or allocates it.
+  PreparedStageRunner prepared_stage_runner = nullptr;
+  void *prepared_stage_runner_context = nullptr;
 };
 
 struct PreparedOpenVideoCompatibilitySetupResult {
