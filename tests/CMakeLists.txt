@@ -159,6 +159,37 @@ if (BUILD_TESTING)
             studiocast-production-video-setup-lease-tests
             unit core video gpu)
 
+    add_executable(studiocast-production-video-backend-manager-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/production_video_backend_manager_tests.cpp
+    )
+
+    target_link_libraries(
+            studiocast-production-video-backend-manager-tests PRIVATE
+            studiocast_video_backend_composition)
+
+    target_include_directories(
+            studiocast-production-video-backend-manager-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-production-video-backend-manager-tests)
+    studiocast_enable_sanitizers(
+            studiocast-production-video-backend-manager-tests)
+
+    set_target_properties(
+            studiocast-production-video-backend-manager-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-production-video-backend-manager-tests
+            COMMAND studiocast-production-video-backend-manager-tests)
+    studiocast_set_test_labels(
+            studiocast-production-video-backend-manager-tests
+            unit core video gpu)
+
     add_executable(studiocast-production-video-execution-composition-tests
             ${PROJECT_SOURCE_DIR}/tests/integration/video/production_video_execution_composition_tests.cpp
     )
