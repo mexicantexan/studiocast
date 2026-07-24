@@ -461,7 +461,7 @@ def typed_island(route_id, route, island_id, adapter_id, stage_id,
         "stage_id": stage_id, "effect": typed_pair(effect_id, effect),
         "backend": typed_pair(backend_id, backend),
         "provider": typed_pair(provider_id, provider),
-        "status": typed_pair(6, "executed"),
+        "status": typed_pair(1, "ready"),
         "reason": typed_pair(0, ""),
         "failure_action": typed_pair(2, "fail_open_preserve_input"),
         "committed_status": typed_pair(1, "succeeded"),
@@ -471,10 +471,15 @@ def typed_island(route_id, route, island_id, adapter_id, stage_id,
         "stage_id": stage_id, "effect": typed_pair(effect_id, effect),
         "required": False,
         "failure_action": typed_pair(2, "fail_open_preserve_input"),
+        "requires_tracked_vignette_center": False,
         "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
         "selected_backend": typed_pair(backend_id, backend),
         "provider": typed_pair(provider_id, provider),
         "adapter_instance_id": adapter_id, "execution_domain": domain,
+        "cpu_tail": typed_pair(0, ""), "cpu_tail_scratch_bytes": 0,
+        "cpu_tail_placement": typed_pair(1, "after_stage"),
+        "skipped_optional": False, "fallback_selected": False,
+        "evidence": [],
     }
     return {
         "route": typed_pair(route_id, route),
@@ -483,21 +488,27 @@ def typed_island(route_id, route, island_id, adapter_id, stage_id,
         "backend": typed_pair(backend_id, backend),
         "execution_domain": domain,
         "resolution": {
+            "request_mode": typed_pair(2, "explicit_backend"),
             "strict_backend_selection": True,
             "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
             "requested_backend": typed_pair(backend_id, backend),
             "selected_backend": typed_pair(backend_id, backend),
             "active_backend": typed_pair(backend_id, backend),
             "selected_provider": typed_pair(provider_id, provider),
-            "available": True, "stages": [resolution_stage],
+            "available": True, "degraded": False, "fallback": False,
+            "passthrough": False, "stages": [resolution_stage],
         },
         "readiness": {
             "configured": True, "program_id": 100 + island_id,
             "invalidation_key": typed_invalidation(),
             "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
+            "requested_backend": typed_pair(backend_id, backend),
             "selected_backend": typed_pair(backend_id, backend),
             "provider": typed_pair(provider_id, provider),
-            "execution_domain": domain, "available": True,
+            "execution_domain": domain,
+            "ready_stage_mask": 1, "blocked_stage_mask": 0,
+            "disabled_stage_mask": 0, "available": True,
+            "degraded": False, "rebuild_requested": False, "evidence": [],
         },
         "telemetry": {
             "requested_backend": typed_pair(backend_id, backend),
@@ -1002,6 +1013,102 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(
             parsed["reason_codes"],
             ["typed_status.selected_capability_incomplete"])
+
+    def test_typed_multi_island_status_rejects_misaligned_island_runtime_bindings(self):
+        cases = []
+
+        resolution_status = typed_multi_island_fixture()
+        resolution_status["islands"][0]["resolution"]["status"] = typed_pair(
+            7, "failed")
+        cases.append((
+            resolution_status, "typed_status.island_selection_mismatch"))
+
+        readiness_status = typed_multi_island_fixture()
+        readiness_status["islands"][0]["readiness"]["status"] = typed_pair(
+            11, "stale")
+        cases.append((
+            readiness_status, "typed_status.island_readiness_mismatch"))
+
+        active_backend = typed_multi_island_fixture()
+        active_backend["islands"][0]["resolution"]["active_backend"] = (
+            typed_pair(3, "maxine"))
+        cases.append((
+            active_backend, "typed_status.island_selection_mismatch"))
+
+        selected_provider = typed_multi_island_fixture()
+        selected_provider["islands"][0]["resolution"]["selected_provider"] = (
+            typed_pair(2, "maxine_ar"))
+        cases.append((
+            selected_provider, "typed_status.island_selection_mismatch"))
+
+        program = typed_multi_island_fixture()
+        program["islands"][0]["latest_committed_frame"]["program_id"] += 1
+        cases.append((program, "typed_status.commit_program_mismatch"))
+
+        invalid_commit = typed_multi_island_fixture()
+        commit = invalid_commit["islands"][0]["latest_committed_frame"]
+        commit["valid"] = False
+        commit["capture_sequence"] = 0
+        commit["output_commit_sequence"] = 0
+        cases.append((invalid_commit, "typed_status.invalid_commit"))
+
+        stage_identity = typed_multi_island_fixture()
+        stage_identity["islands"][0]["resolution"]["stages"][0][
+            "stage_id"] += 100
+        cases.append((
+            stage_identity, "typed_status.island_stage_mismatch"))
+
+        stage_required = typed_multi_island_fixture()
+        stage_required["islands"][0]["resolution"]["stages"][0][
+            "required"] = True
+        cases.append((
+            stage_required, "typed_status.island_stage_mismatch"))
+
+        stage_domain = typed_multi_island_fixture()
+        stage_domain["islands"][0]["resolution"]["stages"][0][
+            "execution_domain"] = copy.deepcopy(
+                stage_domain["islands"][0]["resolution"]["stages"][0]
+                ["execution_domain"])
+        stage_domain["islands"][0]["resolution"]["stages"][0][
+            "execution_domain"]["queue_or_stream_identity"] += 1
+        cases.append((
+            stage_domain,
+            "typed_status.island_resolution_stage_mismatch"))
+
+        duplicate_stage = typed_multi_island_fixture()
+        duplicate_stage["islands"][0]["resolution"]["stages"].append(
+            copy.deepcopy(
+                duplicate_stage["islands"][0]["resolution"]["stages"][0]))
+        duplicate_stage["islands"][0]["stages"].append(copy.deepcopy(
+            duplicate_stage["islands"][0]["stages"][0]))
+        cases.append((
+            duplicate_stage,
+            "typed_status.island_resolution_stage_mismatch"))
+
+        missing_stage_record = typed_multi_island_fixture()
+        missing_stage_record["islands"][0]["stages"] = []
+        cases.append((
+            missing_stage_record, "typed_status.island_stage_mismatch"))
+
+        unhealthy = typed_multi_island_fixture()
+        unhealthy["islands"][0]["telemetry"]["runtime_status"] = typed_pair(
+            7, "failed")
+        cases.append((
+            unhealthy, "typed_status.active_attribution_invalid"))
+
+        telemetry_provider = typed_multi_island_fixture()
+        telemetry_provider["islands"][0]["telemetry"]["active_provider"] = (
+            typed_pair(2, "maxine_ar"))
+        cases.append((
+            telemetry_provider, "typed_status.island_telemetry_mismatch"))
+
+        for value, reason in cases:
+            with self.subTest(reason=reason):
+                parsed = parse_typed_multi_island_video_status({
+                    "typed_multi_island_video_status": value,
+                })
+                self.assertFalse(parsed["valid"])
+                self.assertEqual(parsed["reason_codes"], [reason])
 
     def test_untyped_and_malformed_status_never_promote_installer_effects(self):
         absent = parse_typed_multi_island_video_status({

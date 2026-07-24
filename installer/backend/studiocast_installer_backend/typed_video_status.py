@@ -75,6 +75,7 @@ ROUTES = {
     2: "maxine_resident",
     3: "open_cuda_virtual_background",
 }
+REQUEST_MODES = {1: "automatic", 2: "explicit_backend"}
 LIFECYCLES = {
     0: "disabled", 1: "idle", 2: "starting",
     3: "running", 4: "stopping", 5: "failed",
@@ -615,39 +616,106 @@ def _parse_island(
         _fail("typed_status.route_backend_mismatch")
 
     resolution = _object(item.get("resolution"), code)
-    _pair(resolution.get("status"), STATUSES, code)
-    _pair(resolution.get("reason"), REASONS, code)
+    _pair(resolution.get("request_mode"), REQUEST_MODES, code)
+    resolution_status_id, _ = _pair(
+        resolution.get("status"), STATUSES, code)
+    resolution_reason_id, _ = _pair(
+        resolution.get("reason"), REASONS, code)
     requested_backend_id, _ = _pair(
         resolution.get("requested_backend"), BACKENDS, code)
     selected_backend_id, _ = _pair(
         resolution.get("selected_backend"), BACKENDS, code)
-    _pair(resolution.get("active_backend"), BACKENDS, code)
+    resolution_active_backend_id, _ = _pair(
+        resolution.get("active_backend"), BACKENDS, code)
     provider_id, provider = _pair(
         resolution.get("selected_provider"), PROVIDERS, code)
     strict_backend = _boolean(resolution.get("strict_backend_selection"), code)
-    if (selected_backend_id != backend_id or provider_id not in expected_providers):
+    resolution_degraded = _boolean(resolution.get("degraded"), code)
+    _boolean(resolution.get("fallback"), code)
+    resolution_passthrough = _boolean(resolution.get("passthrough"), code)
+    if (resolution_status_id not in {1, 3} or
+            resolution_degraded != (resolution_status_id == 3) or
+            (resolution_status_id == 1 and resolution_reason_id != 0) or
+            resolution_passthrough or selected_backend_id != backend_id or
+            resolution_active_backend_id not in {0, backend_id} or
+            provider_id not in expected_providers):
         _fail("typed_status.island_selection_mismatch")
     if strict_backend and requested_backend_id != selected_backend_id:
         _fail("typed_status.strict_backend_substitution")
     if not _boolean(resolution.get("available"), code):
         _fail("typed_status.current_island_unavailable")
     resolution_stages = _array(resolution.get("stages"), code, MAX_STAGES)
+    parsed_resolution_stages: dict[int, dict[str, Any]] = {}
+    for raw_stage in resolution_stages:
+        stage = _object(raw_stage, code)
+        stage_id = _uint(stage.get("stage_id"), code, nonzero=True)
+        effect_id, effect = _pair(
+            stage.get("effect"), EFFECT_IDENTITIES, code)
+        required = _boolean(stage.get("required"), code)
+        failure_action_id, _ = _pair(
+            stage.get("failure_action"), FAILURE_ACTIONS, code)
+        _boolean(stage.get("requires_tracked_vignette_center"), code)
+        stage_status_id, _ = _pair(stage.get("status"), STATUSES, code)
+        stage_reason_id, _ = _pair(stage.get("reason"), REASONS, code)
+        stage_backend_id, _ = _pair(
+            stage.get("selected_backend"), BACKENDS, code)
+        stage_provider_id, _ = _pair(stage.get("provider"), PROVIDERS, code)
+        stage_adapter = _uint(
+            stage.get("adapter_instance_id"), code, nonzero=True)
+        stage_domain = _domain(stage.get("execution_domain"), code)
+        _pair(stage.get("cpu_tail"), CPU_TAILS, code)
+        _uint(stage.get("cpu_tail_scratch_bytes"), code)
+        _pair(
+            stage.get("cpu_tail_placement"), CPU_TAIL_PLACEMENTS, code)
+        _boolean(stage.get("skipped_optional"), code)
+        _boolean(stage.get("fallback_selected"), code)
+        _semantic_evidence(stage.get("evidence"), code)
+        if (stage_id in parsed_resolution_stages or
+                stage_status_id not in {1, 3} or
+                (stage_status_id == 1 and stage_reason_id != 0) or
+                stage_backend_id != backend_id or
+                stage_provider_id not in expected_providers or
+                stage_adapter != adapter or
+                not _same_domain(stage_domain, domain)):
+            _fail("typed_status.island_resolution_stage_mismatch")
+        parsed_resolution_stages[stage_id] = {
+            "effect_id": effect_id, "effect": effect,
+            "backend_id": stage_backend_id,
+            "provider_id": stage_provider_id,
+            "status_id": stage_status_id, "reason_id": stage_reason_id,
+            "required": required, "failure_action_id": failure_action_id,
+        }
 
     readiness = _object(item.get("readiness"), code)
-    if (not _boolean(readiness.get("configured"), code) or
-            _uint(readiness.get("program_id"), code, nonzero=True) == 0):
+    readiness_program_id = _uint(
+        readiness.get("program_id"), code, nonzero=True)
+    if not _boolean(readiness.get("configured"), code):
         _fail(code)
     readiness_generations = _invalidation_generations(
         readiness.get("invalidation_key"), code)
     if readiness_generations != program_generations:
         _fail("typed_status.stale_generation")
-    _pair(readiness.get("status"), STATUSES, code)
-    _pair(readiness.get("reason"), REASONS, code)
+    readiness_status_id, _ = _pair(
+        readiness.get("status"), STATUSES, code)
+    readiness_reason_id, _ = _pair(
+        readiness.get("reason"), REASONS, code)
+    readiness_requested_backend_id, _ = _pair(
+        readiness.get("requested_backend"), BACKENDS, code)
     readiness_backend_id, _ = _pair(
         readiness.get("selected_backend"), BACKENDS, code)
     readiness_provider_id, _ = _pair(readiness.get("provider"), PROVIDERS, code)
     readiness_domain = _domain(readiness.get("execution_domain"), code)
-    if (readiness_backend_id != backend_id or
+    _uint(readiness.get("ready_stage_mask"), code)
+    _uint(readiness.get("blocked_stage_mask"), code)
+    _uint(readiness.get("disabled_stage_mask"), code)
+    readiness_degraded = _boolean(readiness.get("degraded"), code)
+    _boolean(readiness.get("rebuild_requested"), code)
+    _semantic_evidence(readiness.get("evidence"), code)
+    if (readiness_status_id not in {1, 3} or
+            readiness_degraded != (readiness_status_id == 3) or
+            (readiness_status_id == 1 and readiness_reason_id != 0) or
+            readiness_requested_backend_id not in {0, backend_id} or
+            readiness_backend_id != backend_id or
             readiness_provider_id != provider_id or
             not _same_domain(readiness_domain, domain) or
             not _boolean(readiness.get("available"), code)):
@@ -656,12 +724,22 @@ def _parse_island(
     telemetry = _object(item.get("telemetry"), code)
     telemetry_backend_id, _ = _pair(
         telemetry.get("selected_backend"), BACKENDS, code)
-    _pair(telemetry.get("requested_backend"), BACKENDS, code)
-    _pair(telemetry.get("active_backend"), BACKENDS, code)
-    _pair(telemetry.get("active_provider"), PROVIDERS, code)
-    _pair(telemetry.get("runtime_status"), STATUSES, code)
+    telemetry_requested_backend_id, _ = _pair(
+        telemetry.get("requested_backend"), BACKENDS, code)
+    telemetry_active_backend_id, _ = _pair(
+        telemetry.get("active_backend"), BACKENDS, code)
+    telemetry_active_provider_id, _ = _pair(
+        telemetry.get("active_provider"), PROVIDERS, code)
+    telemetry_runtime_status_id, telemetry_runtime_status = _pair(
+        telemetry.get("runtime_status"), STATUSES, code)
     _pair(telemetry.get("runtime_reason"), REASONS, code)
-    if telemetry_backend_id != backend_id:
+    if (telemetry_requested_backend_id not in {0, backend_id} or
+            telemetry_backend_id != backend_id or
+            telemetry_active_backend_id not in {0, backend_id} or
+            (telemetry_active_backend_id == 0) !=
+            (telemetry_active_provider_id == 0) or
+            (telemetry_active_provider_id != 0 and
+             telemetry_active_provider_id not in expected_providers)):
         _fail("typed_status.island_telemetry_mismatch")
     transfers = _transfers(telemetry.get("transfers"), code)
 
@@ -675,14 +753,26 @@ def _parse_island(
         effect_id, effect = _pair(stage.get("effect"), EFFECT_IDENTITIES, code)
         stage_backend_id, _ = _pair(stage.get("backend"), BACKENDS, code)
         stage_provider_id, _ = _pair(stage.get("provider"), PROVIDERS, code)
-        _pair(stage.get("status"), STATUSES, code)
-        _pair(stage.get("reason"), REASONS, code)
-        _pair(stage.get("failure_action"), FAILURE_ACTIONS, code)
+        stage_status_id, _ = _pair(stage.get("status"), STATUSES, code)
+        stage_reason_id, _ = _pair(stage.get("reason"), REASONS, code)
+        failure_action_id, _ = _pair(
+            stage.get("failure_action"), FAILURE_ACTIONS, code)
         committed_id, committed_status = _stage_status(
             stage.get("committed_status"), code)
+        required = _boolean(stage.get("required"), code)
+        resolved = _boolean(stage.get("resolved"), code)
         committed = _boolean(stage.get("committed"), code)
+        resolution_stage = parsed_resolution_stages.get(stage_id)
         if (stage_id in parsed_stages or stage_backend_id != backend_id or
                 stage_provider_id not in expected_providers or
+                not resolved or resolution_stage is None or
+                resolution_stage["effect_id"] != effect_id or
+                resolution_stage["backend_id"] != stage_backend_id or
+                resolution_stage["provider_id"] != stage_provider_id or
+                resolution_stage["status_id"] != stage_status_id or
+                resolution_stage["reason_id"] != stage_reason_id or
+                resolution_stage["required"] != required or
+                resolution_stage["failure_action_id"] != failure_action_id or
                 committed != (committed_id != 0)):
             _fail("typed_status.island_stage_mismatch")
         parsed_stages[stage_id] = {
@@ -691,8 +781,11 @@ def _parse_island(
             "committed": committed, "committed_status": committed_status,
             "committed_status_id": committed_id,
         }
+    if parsed_stages.keys() != parsed_resolution_stages.keys():
+        _fail("typed_status.island_stage_mismatch")
 
     committed = _object(item.get("latest_committed_frame"), code)
+    committed_program_id = _uint(committed.get("program_id"), code)
     committed_identity = {
         "valid": _boolean(committed.get("valid"), code),
         "capture_sequence": _uint(committed.get("capture_sequence"), code),
@@ -702,16 +795,21 @@ def _parse_island(
     if committed_identity["valid"]:
         if committed_identity != writer_commit:
             _fail("typed_status.mixed_writer_commit")
+        if committed_program_id != readiness_program_id:
+            _fail("typed_status.commit_program_mismatch")
         commit_generations = _invalidation_generations(
             committed.get("invalidation_key"), code)
         commit_domain = _domain(committed.get("execution_domain"), code)
         if (commit_generations != program_generations or
                 not _same_domain(commit_domain, domain)):
             _fail("typed_status.commit_binding_mismatch")
-    elif committed_identity["capture_sequence"] or committed_identity[
-            "output_commit_sequence"]:
+    elif (committed_program_id or committed_identity["capture_sequence"] or
+          committed_identity["output_commit_sequence"]):
         _fail("typed_status.invalid_commit")
     committed_stages = _array(committed.get("stages"), code, MAX_STAGES)
+    if not committed_identity["valid"] and committed_stages:
+        _fail("typed_status.invalid_commit")
+    seen_committed_stages: set[int] = set()
     for raw_stage in committed_stages:
         stage = _object(raw_stage, code)
         stage_id = _uint(stage.get("stage_id"), code, nonzero=True)
@@ -721,11 +819,13 @@ def _parse_island(
         status_id, status = _stage_status(stage.get("status"), code)
         _pair(stage.get("reason"), REASONS, code)
         known = parsed_stages.get(stage_id)
-        if (known is None or known["effect_id"] != effect_id or
+        if (stage_id in seen_committed_stages or known is None or
+                known["effect_id"] != effect_id or
                 known["provider_id"] != stage_provider_id or
                 stage_backend_id != backend_id or
                 known["committed_status_id"] != status_id):
             _fail("typed_status.commit_stage_mismatch")
+        seen_committed_stages.add(stage_id)
         known["commit_frame_status"] = status
     return ({
         "route": route, "route_id": route_id, "island_id": island_id,
@@ -734,6 +834,10 @@ def _parse_island(
         "provider_id": provider_id, "execution_domain": domain,
         "transfers": transfers, "current": True,
         "writer_commit": committed_identity,
+        "runtime_status": telemetry_runtime_status,
+        "runtime_status_id": telemetry_runtime_status_id,
+        "telemetry_active_backend_id": telemetry_active_backend_id,
+        "telemetry_active_provider_id": telemetry_active_provider_id,
     }, parsed_stages)
 
 
@@ -853,7 +957,10 @@ def _parse_effect(
         _fail("typed_status.commit_activity_mismatch")
     committed_success = (
         commit["valid"] and committed_status_id == 1 and
-        lifecycle == "running" and flags["selected"] and flags["available"])
+        lifecycle == "running" and flags["selected"] and flags["available"] and
+        island is not None and island["runtime_status_id"] in {1, 3, 6} and
+        island["telemetry_active_backend_id"] == selected_backend_id and
+        island["telemetry_active_provider_id"] == selected_provider_id)
     if flags["active"] != committed_success:
         _fail("typed_status.active_attribution_invalid")
     if flags["active"]:
