@@ -159,6 +159,32 @@ if (BUILD_TESTING)
             studiocast-production-video-execution-composition-tests
             integration core video gpu)
 
+    add_executable(studiocast-production-vulkan-pipeline-migration-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/production_vulkan_pipeline_migration_tests.cpp
+    )
+
+    target_compile_definitions(
+            studiocast-production-vulkan-pipeline-migration-tests PRIVATE
+            STUDIOCAST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    studiocast_set_project_warnings(
+            studiocast-production-vulkan-pipeline-migration-tests)
+    studiocast_enable_sanitizers(
+            studiocast-production-vulkan-pipeline-migration-tests)
+
+    set_target_properties(
+            studiocast-production-vulkan-pipeline-migration-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-production-vulkan-pipeline-migration-tests
+            COMMAND studiocast-production-vulkan-pipeline-migration-tests)
+    studiocast_set_test_labels(
+            studiocast-production-vulkan-pipeline-migration-tests
+            integration core video gpu vulkan)
+
     add_executable(studiocast-maxine-video-execution-factory-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_video_execution_factory_tests.cpp
     )

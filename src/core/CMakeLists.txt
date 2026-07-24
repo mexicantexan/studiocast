@@ -342,7 +342,9 @@ target_link_libraries(studiocast_video_runtime
         studiocast_video_io
         studiocast_video_support
         studiocast_vulkan_backend
-        PRIVATE studiocast_util)
+        PRIVATE
+        studiocast_util
+        studiocast_video_backend_composition)
 target_link_libraries(studiocast_runtime_config
         PUBLIC
         studiocast_audio_runtime
@@ -579,7 +581,8 @@ studiocast_assert_direct_dependencies(studiocast_video_runtime
         studiocast_video_execution_runtime studiocast_video_io
         studiocast_video_support
         studiocast_vulkan_backend
-        PRIVATE_STUDIOCAST_DEPS studiocast_util)
+        PRIVATE_STUDIOCAST_DEPS
+        studiocast_util studiocast_video_backend_composition)
 studiocast_assert_direct_dependencies(studiocast_runtime_config
         PUBLIC_STUDIOCAST_DEPS
         studiocast_audio_runtime studiocast_config studiocast_video_runtime
