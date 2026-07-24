@@ -195,6 +195,9 @@ set(_studiocast_video_execution_runtime_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/video_execution_plan.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/video_runtime_status.cpp)
 
+set(_studiocast_video_backend_composition_sources
+        ${PROJECT_SOURCE_DIR}/src/core/video/production_video_execution_composition.cpp)
+
 set(_studiocast_video_runtime_sources
         # Protected implementation: source ownership only; contents remain unchanged.
         ${PROJECT_SOURCE_DIR}/src/core/video/camera_pipeline.cpp
@@ -223,6 +226,8 @@ add_library(studiocast_vulkan_backend STATIC ${_studiocast_vulkan_backend_source
 add_library(studiocast_audio_runtime STATIC ${_studiocast_audio_runtime_sources})
 add_library(studiocast_video_execution_runtime STATIC
         ${_studiocast_video_execution_runtime_sources})
+add_library(studiocast_video_backend_composition STATIC
+        ${_studiocast_video_backend_composition_sources})
 add_library(studiocast_video_runtime STATIC ${_studiocast_video_runtime_sources})
 add_library(studiocast_runtime_config STATIC ${_studiocast_runtime_config_sources})
 
@@ -246,6 +251,7 @@ set(_studiocast_production_targets
         studiocast_vulkan_backend
         studiocast_audio_runtime
         studiocast_video_execution_runtime
+        studiocast_video_backend_composition
         studiocast_video_runtime
         studiocast_runtime_config)
 
@@ -323,6 +329,9 @@ target_link_libraries(studiocast_audio_runtime
         PRIVATE studiocast_util)
 target_link_libraries(studiocast_video_execution_runtime
         PUBLIC studiocast_hal_runtime)
+target_link_libraries(studiocast_video_backend_composition
+        PUBLIC studiocast_video_execution_runtime
+        PRIVATE studiocast_vulkan_backend)
 target_link_libraries(studiocast_video_runtime
         PUBLIC
         studiocast_contracts
@@ -560,6 +569,9 @@ studiocast_assert_direct_dependencies(studiocast_audio_runtime
         PRIVATE_STUDIOCAST_DEPS studiocast_util)
 studiocast_assert_direct_dependencies(studiocast_video_execution_runtime
         PUBLIC_STUDIOCAST_DEPS studiocast_hal_runtime)
+studiocast_assert_direct_dependencies(studiocast_video_backend_composition
+        PUBLIC_STUDIOCAST_DEPS studiocast_video_execution_runtime
+        PRIVATE_STUDIOCAST_DEPS studiocast_vulkan_backend)
 studiocast_assert_direct_dependencies(studiocast_video_runtime
         PUBLIC_STUDIOCAST_DEPS
         studiocast_contracts studiocast_cuda_support
@@ -611,9 +623,10 @@ set(_studiocast_expected_sources
         ${_studiocast_vulkan_backend_sources}
         ${_studiocast_audio_runtime_sources}
         ${_studiocast_video_execution_runtime_sources}
+        ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 132)
+set(_studiocast_expected_source_count 133)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

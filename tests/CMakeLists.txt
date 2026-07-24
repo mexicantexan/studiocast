@@ -128,6 +128,37 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-video-execution-coordinator-tests
             unit core video gpu)
 
+    add_executable(studiocast-production-video-execution-composition-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/production_video_execution_composition_tests.cpp
+    )
+
+    target_link_libraries(
+            studiocast-production-video-execution-composition-tests PRIVATE
+            studiocast_video_backend_composition)
+
+    target_include_directories(
+            studiocast-production-video-execution-composition-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+    )
+
+    studiocast_set_project_warnings(
+            studiocast-production-video-execution-composition-tests)
+    studiocast_enable_sanitizers(
+            studiocast-production-video-execution-composition-tests)
+
+    set_target_properties(
+            studiocast-production-video-execution-composition-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-production-video-execution-composition-tests
+            COMMAND studiocast-production-video-execution-composition-tests)
+    studiocast_set_test_labels(
+            studiocast-production-video-execution-composition-tests
+            integration core video gpu)
+
     add_executable(studiocast-maxine-video-execution-factory-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/maxine/maxine_video_execution_factory_tests.cpp
     )
