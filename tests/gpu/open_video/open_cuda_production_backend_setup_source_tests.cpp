@@ -127,8 +127,6 @@ bool UnsupportedSemanticsRemainBlocked() {
   const hal::SemanticEffectId unsupported[] = {
       hal::SemanticEffectId::virtual_background_replace,
       hal::SemanticEffectId::virtual_key_light,
-      hal::SemanticEffectId::video_noise_removal,
-      hal::SemanticEffectId::eye_contact,
       hal::SemanticEffectId::auto_frame,
       hal::SemanticEffectId::mirror,
       hal::SemanticEffectId::vignette,
@@ -141,6 +139,19 @@ bool UnsupportedSemanticsRemainBlocked() {
                   result.reason == hal::ReasonId::semantic_effect_unsupported &&
                   result.setup_completed_outside_frame_loop,
               "unsupported semantic gained false CUDA capability");
+  }
+  const hal::SemanticEffectId cpu_provider_compatibility[] = {
+      hal::SemanticEffectId::video_noise_removal,
+      hal::SemanticEffectId::eye_contact,
+  };
+  for (const auto semantic : cpu_provider_compatibility) {
+    const auto result = source->AcquireResidentSetup(StrictRequest(semantic));
+    ok &= Check(
+        result.status == hal::StatusId::blocked &&
+            result.reason == hal::ReasonId::semantic_provider_unavailable &&
+            result.setup_completed_outside_frame_loop && !result.lease.live() &&
+            !result.compatibility_executor,
+        "strict CUDA accepted a CPU-provider compatibility semantic");
   }
   return ok;
 }
