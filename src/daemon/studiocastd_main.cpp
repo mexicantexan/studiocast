@@ -979,9 +979,7 @@ TypedProductionComputeAuthority TypedProductionAuthority(
   // request's selected, active, degraded, or fallback facts.
   if (manager.contract_version !=
           studiocast::video::kProductionVideoBackendManagerContractVersion ||
-      manager.setup_attempts == 0 ||
-      manager.readiness.requested_backend ==
-          studiocast::hal::BackendId::invalid) {
+      manager.setup_attempts == 0) {
     return out;
   }
 

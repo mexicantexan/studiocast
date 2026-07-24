@@ -2667,6 +2667,34 @@ bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
              "typed manager selection/commit must override contradictory "
              "legacy diagnostics and stale compatibility fields");
 
+  // Automatic requests intentionally have no exact requested BackendId. A
+  // completed manager setup still owns selection and committed attribution.
+  manager.readiness.requested_backend = hal::BackendId::invalid;
+  manager.resident.readiness.requested_backend = hal::BackendId::invalid;
+  config.pipeline.compute_backend = video::ComputeBackendPreference::auto_select;
+  config.pipeline.effects.engine =
+      video::effects::EffectsEnginePreference::auto_select;
+  const std::string automaticStatus = StatusForVideoStateWithDiagnostics(
+      status, config, /*maxineJson=*/"", contradictoryOpenCuda,
+      contradictoryVulkan);
+  const ComputeFields automatic = ComputeFieldsFor(automaticStatus);
+  ok &= Expect(automatic.present && automatic.resolved == "cuda" &&
+                   automatic.active == "cuda" &&
+                   automatic.active_engine_count == 1 &&
+                   automatic.provider_mode == "open_cuda" &&
+                   automatic.active_provider == "CUDAExecutionProvider" &&
+                   automatic.fallback.empty() && automatic.degraded.empty() &&
+                   !automatic.fallback_active &&
+                   PipelineEffectsBackendsFor(automaticStatus) ==
+                       "virtual_background.blur:open_cuda",
+               "automatic typed manager selection and committed attribution "
+               "must override contradictory legacy diagnostics");
+  manager.readiness.requested_backend = hal::BackendId::cuda;
+  manager.resident.readiness.requested_backend = hal::BackendId::cuda;
+  config.pipeline.compute_backend = video::ComputeBackendPreference::cuda;
+  config.pipeline.effects.engine =
+      video::effects::EffectsEnginePreference::open_cuda;
+
   // A successful-looking commit from a different queue/domain may not provide
   // active attribution for the selected manager program.
   ++commit.execution_domain.queue_or_stream_identity;
