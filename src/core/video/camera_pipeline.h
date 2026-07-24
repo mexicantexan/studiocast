@@ -15,6 +15,8 @@
 
 #include "core/video/effects/broadcast_effects.h"
 #include "core/video/effects/broadcast_effect_rules.h"
+#include "core/video/open_vulkan_eye_contact.h"
+#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
@@ -164,6 +166,48 @@ private:
   std::size_t active_order_size_ = 0;
   std::string active_backends_;
 };
+
+// Retained source-compatible policy helpers. They mutate only an already
+// canonical setup-time plan and are not used by CameraPipeline execution.
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedReason =
+        "vulkan_vignette_tracked_center_not_supported";
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedDetail =
+        "tracked-center semantics require a device-resident center/mask "
+        "implementation";
+
+struct OpenVulkanVignettePlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view detail;
+};
+
+OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
+    const effects::BroadcastCameraEffects &effects,
+    effects::BroadcastEffectsPlan *retained_plan);
+
+struct OpenVulkanEyeContactPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+OpenVulkanEyeContactPlanCompatibility
+ApplyOpenVulkanEyeContactPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan);
+
+struct OpenVulkanVideoNoiseRemovalPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+OpenVulkanVideoNoiseRemovalPlanCompatibility
+ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan);
 
 using ProductionVideoBackendSetupSourceFactory =
     std::unique_ptr<IProductionVideoBackendSetupSource> (*)() noexcept;
@@ -440,6 +484,16 @@ struct CameraPipelineStatus {
     std::uint64_t standalone_scaler_download_calls = 0;
   } maxine_transfers{};
 
+  // Explicit host-primitive boundaries that are product-visible finalizers
+  // but are not semantic CPU providers. Timing covers the prepared copy into
+  // the mutable finalizer buffer plus the primitive call.
+  struct CpuPrimitiveTails {
+    std::uint64_t mirror_attempts = 0;
+    std::uint64_t mirror_successes = 0;
+    std::uint64_t mirror_fail_open_frames = 0;
+    std::uint64_t mirror_elapsed_ns = 0;
+  } cpu_primitive_tails{};
+
   // Debug/status for effects.
   std::string
       effects_backends; // e.g. "mirror:builtin,virtual_background.blur:maxine"
@@ -603,6 +657,7 @@ private:
   CameraPipelineStatus::OpenCudaTransfers open_cuda_transfers_{};
   CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
+  CameraPipelineStatus::CpuPrimitiveTails cpu_primitive_tails_{};
   ProductionVideoBackendManagerSnapshot production_backend_{};
   MultiIslandVideoRuntimeStatusSnapshot video_hal_status_{};
   std::uint64_t video_hal_status_generation_ = 0;

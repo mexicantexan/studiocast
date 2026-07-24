@@ -15,167 +15,184 @@ void Check(bool condition, const char *message) {
   std::cerr << "FAIL: " << message << '\n';
 }
 
-std::string ReadPipelineSource() {
+std::string Read(const char *relative) {
   const auto root = std::filesystem::path(STUDIOCAST_SOURCE_DIR);
-  std::ifstream input(root / "src/core/video/camera_pipeline.cpp");
+  std::ifstream input(root / relative);
   std::ostringstream contents;
   contents << input.rdbuf();
   return contents.str();
 }
 
-void TestSeparateNeutralIslandsOwnBackendLifetimes() {
-  const std::string source = ReadPipelineSource();
+void TestPublicHeaderIsBackendNeutral() {
+  const auto header = Read("src/core/video/camera_pipeline.h");
+  Check(!header.empty(), "camera pipeline header must be readable");
+  if (header.empty())
+    return;
+
+  constexpr const char *forbidden[] = {
+      "#include \"core/maxine/",
+      "#include \"core/open_video/",
+      "#include \"core/cuda/",
+      "#include \"core/vulkan/",
+      "prepared_hardware_execution_owner.h",
+      "prepared_maxine_hardware_execution_owner.h",
+      "prepared_open_cuda_hardware_execution_owner.h",
+      "maxine::",
+      "PreparedMaxineHardwareExecutionSnapshot",
+      "PreparedOpenCudaHardwareExecutionSnapshot",
+      "PreparedHardwareExecutionSnapshot",
+  };
+  for (const auto *needle : forbidden)
+    Check(header.find(needle) == std::string::npos,
+          "public header must not expose an optional backend type");
+
+  Check(header.find("#include \"core/video/"
+                    "production_video_backend_manager.h\"") !=
+            std::string::npos,
+        "public header must consume the neutral backend manager");
+  Check(header.find("ProductionVideoBackendSetupSourceFactory") !=
+            std::string::npos &&
+            header.find("backend_setup_source_factory") != std::string::npos,
+        "tests must have a neutral setup-source injection seam");
+  Check(header.find("ProductionVideoBackendManagerSnapshot "
+                    "production_backend") != std::string::npos,
+        "status must publish the neutral manager snapshot");
+}
+
+void TestPipelineOwnsNoBackendOrCompatibilityPlanner() {
+  const auto source = Read("src/core/video/camera_pipeline.cpp");
   Check(!source.empty(), "camera pipeline source must be readable");
   if (source.empty())
     return;
 
-  Check(source.find(
-            "ProductionVideoExecutionComposition "
-            "prepared_hardware_composition") != std::string::npos,
-        "Vulkan final execution must keep its own neutral composition");
-  Check(source.find(
-            "ProductionVideoExecutionComposition "
-            "maxine_hardware_composition") != std::string::npos,
-        "Maxine execution must use a distinct neutral composition");
-  Check(source.find(
-            "ProductionVideoExecutionComposition "
-            "open_cuda_hardware_composition") != std::string::npos,
-        "Open CUDA execution must use a distinct neutral composition");
+  constexpr const char *forbidden[] = {
+      "#include \"core/maxine/",
+      "#include \"core/open_video/",
+      "#include \"core/cuda/",
+      "#include \"core/vulkan/",
+      "PreparedMaxineHardwareExecutionOwner",
+      "PreparedOpenCudaHardwareExecutionOwner",
+      "PreparedHardwareExecutionOwner",
+      "ProductionVideoExecutionComposition",
+      "AcquireSetupLease",
+      "AcquireProductionSetupLease",
+      "EnsureInitialized(",
+      "ReallocIfNeeded",
+      "NvCVImage_Realloc",
+      "ModelPackRegistry",
+      ".Diagnose(",
+      "OpenCudaMattingSession",
+      "OpenVulkanMattingSession",
+      "maxine_hardware_composition",
+      "open_cuda_hardware_composition",
+      "prepared_hardware_composition",
+  };
+  for (const auto *needle : forbidden)
+    Check(source.find(needle) == std::string::npos,
+          "pipeline must not retain backend setup or frame orchestration");
 
-  Check(source.find("PreparedMaxineHardwareExecutionOwner "
-                    "prepared_maxine_hardware_owner") ==
+  Check(source.find("CreateStaticProductionVideoBackendSetupSource()") !=
             std::string::npos,
-        "CameraPipeline must not construct the Maxine prepared owner");
-  Check(source.find("PreparedOpenCudaHardwareExecutionOwner "
-                    "prepared_open_cuda_hardware_owner") ==
+        "production must obtain one neutral static setup source");
+  Check(source.find("ProductionVideoBackendManager backend_manager") !=
             std::string::npos,
-        "CameraPipeline must not construct the Open CUDA prepared owner");
-  Check(source.find("prepared_maxine_hardware_owner.") ==
-            std::string::npos,
-        "CameraPipeline must not call the Maxine prepared owner");
-  Check(source.find("prepared_open_cuda_hardware_owner.") ==
-            std::string::npos,
-        "CameraPipeline must not call the Open CUDA prepared owner");
-
-  Check(source.find("AcquireSetupLease") != std::string::npos,
-        "Maxine native setup must enter through a typed setup lease");
-  Check(source.find("AcquireProductionSetupLease") !=
-            std::string::npos,
-        "Open CUDA native setup must enter through a typed setup lease");
-  Check(source.find(
-            "maxine_hardware_composition.PrepareWithSetupLease") !=
-            std::string::npos &&
-            source.find(
-                "open_cuda_hardware_composition.PrepareWithSetupLease") !=
+        "pipeline must own exactly one neutral backend manager");
+  Check(source.find("BuildSetupRequest(") != std::string::npos &&
+            source.find("ProductionVideoBackendSetupRequest request") !=
                 std::string::npos,
-        "both backend leases must be prepared by neutral coordinators");
-  Check(source.find("mixed_providers") != std::string::npos &&
-            source.find(
-                "intent.strict_provider_selection =\n"
-                "              !mixed_providers") != std::string::npos,
-        "mixed Maxine providers must remain exact per stage");
+        "setup must originate in one canonical neutral request");
 }
 
-void TestPreparedFrameAndWriterBoundaries() {
-  const std::string source = ReadPipelineSource();
+void TestFrameLoopUsesOnlyPreparedManagerLifecycle() {
+  const auto source = Read("src/core/video/camera_pipeline.cpp");
   const auto loop = source.find("while (!stop_.load())");
-  const auto maxine_execute =
-      source.find("maxine_hardware_composition.Execute(binding)", loop);
-  const auto open_cuda_execute =
-      source.find("open_cuda_hardware_composition.Execute(binding)", loop);
+  const auto acquire = source.find("capture.AcquireFrame", loop);
+  const auto execute = source.find("backend_manager.Execute(binding)", acquire);
   const auto write =
-      source.find("writer_.WriteFrameDetailed", open_cuda_execute);
-  Check(loop != std::string::npos && maxine_execute != std::string::npos &&
-            maxine_execute > loop,
-        "Maxine frames must execute through the neutral composition");
-  Check(open_cuda_execute != std::string::npos &&
-            open_cuda_execute > loop,
-        "Open CUDA frames must execute through the neutral composition");
-  Check(write != std::string::npos,
-        "prepared completion must remain coupled to the writer");
-  Check(source.find("maxine_hardware_composition.CommitOutput") !=
-            std::string::npos &&
-            source.find("open_cuda_hardware_composition.CommitOutput") !=
-                std::string::npos &&
-            source.find("finish_prepared_hardware_frame(true)", write) !=
-                std::string::npos,
-        "successful backend attribution must commit after the writer");
+      source.find("writer_.WriteFrameDetailed", execute);
+  const auto commit =
+      source.find("backend_manager.CommitOutput(completion, written", write);
+  Check(loop != std::string::npos && acquire != std::string::npos,
+        "prepared live loop must acquire frames");
+  Check(execute != std::string::npos && execute > acquire,
+        "semantic execution must call only the neutral manager");
+  Check(write != std::string::npos && commit != std::string::npos &&
+            execute < write && write < commit,
+        "writer-gated attribution must commit only after output write");
 
-  Check(source.find("frame.transfers.uploads == 1") !=
-            std::string::npos &&
-            source.find("frame.transfers.final_readbacks == 1") !=
-                std::string::npos &&
-            source.find("frame.transfers.intermediate_uploads == 0") !=
-                std::string::npos &&
-            source.find("frame.transfers.intermediate_readbacks == 0") !=
+  const auto frame_region = source.substr(acquire, write - acquire);
+  constexpr const char *frame_forbidden[] = {
+      "BuildBroadcastEffectsPlan(",
+      "CreateStaticProductionVideoBackendSetupSource(",
+      "backend_manager.Setup(",
+      "ModelPack",
+      "Diagnose",
+      "EnsureInitialized",
+      "Realloc",
+  };
+  for (const auto *needle : frame_forbidden)
+    Check(frame_region.find(needle) == std::string::npos,
+          "ordinary frame execution must not probe, plan, or allocate");
+
+  Check(source.find("attempted_generation") != std::string::npos &&
+            source.find("published_generation, attempted_generation") !=
                 std::string::npos,
-        "Maxine output must enforce one upload/readback and no crossings");
-  Check(source.find("prepared_frame.transfers.uploads == 1") !=
+        "failed setup generation must be cached instead of retried per frame");
+  Check(source.find("backend_manager.ResetTemporal(") == std::string::npos,
+        "freshly prepared temporal programs must not be reset unconditionally");
+  Check(source.find("FrameDropBehavior::reset_temporal_state") !=
             std::string::npos &&
-            source.find(
-                "prepared_frame.transfers.final_readbacks == 1") !=
-                std::string::npos &&
-            source.find(
-                "prepared_frame.transfers.intermediate_uploads == 0") !=
-                std::string::npos &&
-            source.find(
-                "prepared_frame.transfers.intermediate_readbacks == 0") !=
+            source.find("requires_contiguous_capture_sequence = temporal") !=
                 std::string::npos,
-        "Open CUDA output must enforce one upload/readback and no crossings");
-  Check(source.find(
-            "VideoExecutionMigrationPolicy::prepared_only") !=
-            std::string::npos &&
-            source.find(
-                "hal::SetupFailurePolicy::retain_old_program") !=
-                std::string::npos &&
-            source.find("exact_old_retained") != std::string::npos,
-        "cutover must be prepared-only with exact old-plan rollback");
-  Check(source.find(
-            "Never retry through the legacy context") !=
-            std::string::npos,
-        "prepared Open CUDA failure must not retry compatibility in-frame");
+        "canonical request must preserve temporal ordering and drop behavior");
 }
 
-void TestStatusAndShutdownRemainBounded() {
-  const std::string source = ReadPipelineSource();
-  Check(source.find("prepared_maxine_snapshot") != std::string::npos &&
-            source.find("prepared_open_cuda_snapshot") !=
-                std::string::npos &&
+void TestCpuPrimitiveLaneAndBoundedShutdown() {
+  const auto source = Read("src/core/video/camera_pipeline.cpp");
+  Check(source.find("GetCpuPrimitiveTable()") != std::string::npos &&
             source.find(
-                "projection.maxine_resident = "
-                "prepared_maxine_snapshot()") != std::string::npos &&
-            source.find(
-                "projection.open_cuda_virtual_background =\n"
-                "            prepared_open_cuda_snapshot()") !=
+                "ProductionVideoBackendSetupKind::cpu_primitives_only") !=
                 std::string::npos,
-        "compatibility status must project neutral coordinator snapshots");
-  Check(source.find(
-            "open_cuda_hardware_composition.ShutdownSnapshot().pending") !=
+        "host primitives must remain a separate CPU HAL lane");
+  Check(source.find("PrepareRawYuyvPassthroughPlan(") != std::string::npos &&
+            source.find("CopyRawYuyvFrame(") != std::string::npos,
+        "zero-effect matching YUYV must retain CPU-only raw passthrough");
+  Check(source.find("compute_backend == "
+                    "ComputeBackendPreference::vulkan") !=
             std::string::npos &&
-            source.find(
-                "maxine_hardware_composition.ShutdownSnapshot().pending") !=
+            source.find("request.resident.effects.mirror = false") !=
                 std::string::npos,
-        "shutdown retries must be conditional on typed pending evidence");
-  Check(source.find("attempt < 8") != std::string::npos,
-        "shutdown retries must remain explicitly bounded");
-  Check(source.find(
-            "shutdown.quiescent && "
-            "shutdown.driver_context_release_permitted") !=
-            std::string::npos,
-        "Open CUDA stopped status must require proven quiescence");
+        "strict Vulkan must retain resident mirror while other modes lower it");
+  Check(source.find("PrimitiveOperationId::mirror") != std::string::npos &&
+            source.find("cpu.mirror_rgb24_in_place(") !=
+                std::string::npos &&
+            source.find("mirror_fail_open_frames") != std::string::npos,
+        "non-Vulkan mirror must be an explicit measured CPU primitive tail");
+  const auto mirror = source.find("cpu.mirror_rgb24_in_place(");
+  const auto write = source.find("writer_.WriteFrameDetailed", mirror);
+  const auto commit =
+      source.find("backend_manager.CommitOutput(completion, written", write);
+  Check(mirror != std::string::npos && write != std::string::npos &&
+            commit != std::string::npos && mirror < write && write < commit,
+        "CPU mirror finalizer must run before writer-gated manager commit");
+  Check(source.find("backend_manager.Invalidate(") != std::string::npos &&
+            source.find("backend_manager.Shutdown()") != std::string::npos &&
+            source.find("attempt < 8 && shutdown.pending") !=
+                std::string::npos,
+        "shutdown must consume typed evidence with an explicit retry bound");
 }
 
 } // namespace
 
 int main() {
-  TestSeparateNeutralIslandsOwnBackendLifetimes();
-  TestPreparedFrameAndWriterBoundaries();
-  TestStatusAndShutdownRemainBounded();
+  TestPublicHeaderIsBackendNeutral();
+  TestPipelineOwnsNoBackendOrCompatibilityPlanner();
+  TestFrameLoopUsesOnlyPreparedManagerLifecycle();
+  TestCpuPrimitiveLaneAndBoundedShutdown();
   if (failures != 0) {
-    std::cerr << failures
-              << " production backend lease cutover checks failed\n";
+    std::cerr << failures << " final pipeline cutover checks failed\n";
     return 1;
   }
-  std::cout << "production backend lease cutover checks passed\n";
+  std::cout << "final pipeline cutover checks passed\n";
   return 0;
 }
