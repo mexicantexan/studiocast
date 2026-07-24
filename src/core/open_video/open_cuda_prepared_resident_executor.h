@@ -143,6 +143,21 @@ struct PreparedOpenCudaRuntimeTelemetry {
   std::uint64_t json_serializations = 0;
 };
 
+struct PreparedOpenCudaShutdownSnapshot {
+  std::uint32_t api_version = kPreparedOpenCudaRuntimeApiVersion;
+  PreparedOpenCudaRuntimeStatus status = PreparedOpenCudaRuntimeStatus::invalid;
+  std::uint64_t shutdown_attempts = 0;
+  std::uint64_t stream_destructions = 0;
+  std::uint32_t pending_prepared_slots = 0;
+  bool shutdown_requested = false;
+  bool quiescent = false;
+  bool stream_owned = false;
+  bool stream_destroyed = false;
+  // A concrete owner must retain the executor, CudaDriverApi, retained
+  // primary context, and stream while this is false.
+  bool driver_context_release_permitted = false;
+};
+
 // Fixed, injectable production seam. Prepare/Destroy may allocate and inspect
 // already-selected model metadata. ExecuteFrame must be allocation-, probe-,
 // session-, model-scan-, manifest-, and JSON-free.
@@ -163,7 +178,10 @@ public:
   // resources. The runtime retains them and retries on a later Shutdown().
   virtual PreparedOpenCudaRuntimeStatus
   DestroyPrepared(PreparedOpenCudaRuntimeHandle *handle) noexcept = 0;
-  virtual void Shutdown() noexcept = 0;
+  virtual PreparedOpenCudaShutdownSnapshot RequestShutdown() noexcept = 0;
+  [[nodiscard]] virtual PreparedOpenCudaShutdownSnapshot
+  ShutdownSnapshot() const noexcept = 0;
+  virtual void Shutdown() noexcept { (void)RequestShutdown(); }
   [[nodiscard]] virtual PreparedOpenCudaRuntimeTelemetry
   Telemetry() const noexcept = 0;
 };
@@ -219,6 +237,12 @@ public:
   hal::StatusId ResetTemporalState(const PreparedExecutorHandle &program,
                                    hal::ReasonId reason) noexcept override;
   void DestroyPrepared(PreparedExecutorHandle *program) noexcept override;
+  // The shared HAL keeps its compatible void Shutdown(). Owners of the
+  // CUDA driver/context island must use this typed method and retain the
+  // complete island while driver_context_release_permitted is false.
+  [[nodiscard]] PreparedOpenCudaShutdownSnapshot RequestShutdown() noexcept;
+  [[nodiscard]] PreparedOpenCudaShutdownSnapshot
+  ShutdownSnapshot() const noexcept;
   void Shutdown() noexcept override;
   [[nodiscard]] ExecutorTelemetrySnapshot Telemetry() const noexcept override;
 

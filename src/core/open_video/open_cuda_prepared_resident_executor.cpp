@@ -466,11 +466,13 @@ public:
   ProductionPreparedOpenCudaRuntime(cuda::CudaDriverApi *driver,
                                     cuda::CUstream stream,
                                     bool owns_stream) noexcept
-      : owned_driver_(driver), owned_stream_(stream),
-        owns_stream_(owns_stream) {}
+      : owned_driver_(driver), owned_stream_(stream), owns_stream_(owns_stream),
+        stream_was_owned_(owns_stream) {
+    shutdown_snapshot_.stream_owned = stream_was_owned_;
+  }
 
   ~ProductionPreparedOpenCudaRuntime() override {
-    Shutdown();
+    (void)RequestShutdown();
     // If the driver still reports pending DMA, retaining the complete slot is
     // safer than destroying ORT/device/pinned storage underneath it. Context
     // teardown reclaims those process resources.
@@ -988,8 +990,10 @@ public:
     return RuntimeStatus::foreign_handle;
   }
 
-  void Shutdown() noexcept override {
+  PreparedOpenCudaShutdownSnapshot RequestShutdown() noexcept override {
     shutdown_ = true;
+    ++shutdown_snapshot_.shutdown_attempts;
+    shutdown_snapshot_.shutdown_requested = true;
     for (auto &slot : slots_) {
       if (!slot)
         continue;
@@ -999,14 +1003,32 @@ public:
       else
         slot->retired = true;
     }
-    const bool pending =
-        std::any_of(slots_.begin(), slots_.end(),
-                    [](const auto &slot) { return slot != nullptr; });
+    const auto pending_count = static_cast<std::uint32_t>(
+        std::count_if(slots_.begin(), slots_.end(),
+                      [](const auto &slot) { return slot != nullptr; }));
+    const bool pending = pending_count != 0;
     if (!pending && owns_stream_ && owned_stream_ && owned_driver_) {
-      (void)owned_driver_->DestroyStream(owned_stream_, nullptr);
-      owned_stream_ = nullptr;
-      owns_stream_ = false;
+      if (owned_driver_->DestroyStream(owned_stream_, nullptr)) {
+        owned_stream_ = nullptr;
+        owns_stream_ = false;
+        shutdown_snapshot_.stream_destroyed = true;
+        ++shutdown_snapshot_.stream_destructions;
+      }
     }
+    shutdown_snapshot_.pending_prepared_slots = pending_count;
+    shutdown_snapshot_.stream_owned = stream_was_owned_;
+    shutdown_snapshot_.quiescent =
+        !pending && (!stream_was_owned_ || shutdown_snapshot_.stream_destroyed);
+    shutdown_snapshot_.driver_context_release_permitted =
+        shutdown_snapshot_.quiescent;
+    shutdown_snapshot_.status = shutdown_snapshot_.quiescent
+                                    ? RuntimeStatus::ready
+                                    : RuntimeStatus::completion_pending;
+    return shutdown_snapshot_;
+  }
+
+  PreparedOpenCudaShutdownSnapshot ShutdownSnapshot() const noexcept override {
+    return shutdown_snapshot_;
   }
 
   PreparedOpenCudaRuntimeTelemetry Telemetry() const noexcept override {
@@ -1234,6 +1256,8 @@ private:
   cuda::CudaDriverApi *owned_driver_ = nullptr;
   cuda::CUstream owned_stream_ = nullptr;
   bool owns_stream_ = false;
+  bool stream_was_owned_ = false;
+  PreparedOpenCudaShutdownSnapshot shutdown_snapshot_{};
   bool shutdown_ = false;
 };
 
@@ -1312,7 +1336,8 @@ struct OpenCudaPreparedResidentExecutor::Impl {
   ExecutorTelemetrySnapshot telemetry{};
   std::uint64_t next_handle_id = 1;
   std::uint64_t next_resource_id = 1;
-  bool shutdown = false;
+  PreparedOpenCudaShutdownSnapshot shutdown_snapshot{};
+  bool shutdown_requested = false;
 };
 
 OpenCudaPreparedResidentExecutor::OpenCudaPreparedResidentExecutor(
@@ -1320,13 +1345,13 @@ OpenCudaPreparedResidentExecutor::OpenCudaPreparedResidentExecutor(
     : impl_(std::make_unique<Impl>(std::move(options))) {}
 
 OpenCudaPreparedResidentExecutor::~OpenCudaPreparedResidentExecutor() {
-  Shutdown();
+  (void)RequestShutdown();
 }
 
 ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
     const hal::PreparedProgram &program) noexcept {
   ExecutorPrepareResult result;
-  if (!impl_ || impl_->shutdown || !impl_->runtime) {
+  if (!impl_ || impl_->shutdown_requested || !impl_->runtime) {
     result.status = StatusId::stopped;
     result.reason = ReasonId::shutdown_requested;
     return result;
@@ -1453,7 +1478,7 @@ hal::ExecuteResult OpenCudaPreparedResidentExecutor::Execute(
     const PreparedExecutorHandle &program,
     const hal::ExecuteRequest &request) noexcept {
   hal::ExecuteResult result;
-  if (!impl_ || impl_->shutdown || !impl_->runtime) {
+  if (!impl_ || impl_->shutdown_requested || !impl_->runtime) {
     result.status = StatusId::stopped;
     result.reason = ReasonId::shutdown_requested;
     return result;
@@ -1572,7 +1597,7 @@ hal::StatusId OpenCudaPreparedResidentExecutor::BindHostFrame(
     *reason = ReasonId::none;
   if (tokens)
     *tokens = {};
-  if (!impl_ || impl_->shutdown) {
+  if (!impl_ || impl_->shutdown_requested) {
     if (reason)
       *reason = ReasonId::shutdown_requested;
     return StatusId::stopped;
@@ -1630,7 +1655,7 @@ hal::StatusId OpenCudaPreparedResidentExecutor::ResolveHostFrameOutput(
     *reason = ReasonId::none;
   if (resolution)
     *resolution = {};
-  if (!impl_ || impl_->shutdown) {
+  if (!impl_ || impl_->shutdown_requested) {
     if (reason)
       *reason = ReasonId::shutdown_requested;
     return StatusId::stopped;
@@ -1660,7 +1685,7 @@ hal::StatusId OpenCudaPreparedResidentExecutor::ResolveHostFrameOutput(
 
 hal::StatusId OpenCudaPreparedResidentExecutor::ResetTemporalState(
     const PreparedExecutorHandle &program, hal::ReasonId reason) noexcept {
-  if (!impl_ || impl_->shutdown || !impl_->runtime)
+  if (!impl_ || impl_->shutdown_requested || !impl_->runtime)
     return StatusId::stopped;
   Impl::Slot *slot = impl_->Find(program);
   if (!slot)
@@ -1685,17 +1710,47 @@ void OpenCudaPreparedResidentExecutor::DestroyPrepared(
   *program = {};
 }
 
-void OpenCudaPreparedResidentExecutor::Shutdown() noexcept {
-  if (!impl_ || impl_->shutdown)
-    return;
-  for (auto &slot : impl_->slots) {
-    if (slot.active && impl_->runtime)
-      (void)impl_->runtime->DestroyPrepared(&slot.runtime_handle);
-    slot = {};
+PreparedOpenCudaShutdownSnapshot
+OpenCudaPreparedResidentExecutor::RequestShutdown() noexcept {
+  PreparedOpenCudaShutdownSnapshot result;
+  result.status = RuntimeStatus::ready;
+  result.shutdown_requested = true;
+  result.quiescent = true;
+  result.driver_context_release_permitted = true;
+  if (!impl_)
+    return result;
+
+  if (!impl_->shutdown_requested) {
+    impl_->shutdown_requested = true;
+    for (auto &slot : impl_->slots) {
+      if (slot.active && impl_->runtime)
+        (void)impl_->runtime->DestroyPrepared(&slot.runtime_handle);
+      slot = {};
+    }
   }
   if (impl_->runtime)
-    impl_->runtime->Shutdown();
-  impl_->shutdown = true;
+    impl_->shutdown_snapshot = impl_->runtime->RequestShutdown();
+  else
+    impl_->shutdown_snapshot = result;
+  return impl_->shutdown_snapshot;
+}
+
+PreparedOpenCudaShutdownSnapshot
+OpenCudaPreparedResidentExecutor::ShutdownSnapshot() const noexcept {
+  PreparedOpenCudaShutdownSnapshot result;
+  result.status = RuntimeStatus::ready;
+  result.shutdown_requested = true;
+  result.quiescent = true;
+  result.driver_context_release_permitted = true;
+  if (!impl_)
+    return result;
+  if (impl_->runtime && impl_->shutdown_requested)
+    return impl_->runtime->ShutdownSnapshot();
+  return impl_->shutdown_snapshot;
+}
+
+void OpenCudaPreparedResidentExecutor::Shutdown() noexcept {
+  (void)RequestShutdown();
 }
 
 ExecutorTelemetrySnapshot

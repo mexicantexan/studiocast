@@ -235,6 +235,7 @@ public:
   std::uint64_t destroy_calls = 0;
   std::uint64_t shutdown_calls = 0;
   open_cuda::PreparedOpenCudaRuntimeTelemetry telemetry{};
+  open_cuda::PreparedOpenCudaShutdownSnapshot shutdown_snapshot{};
 
   open_cuda::PreparedOpenCudaRuntimePrepareResult
   Prepare(const hal::PreparedProgram &program,
@@ -292,6 +293,7 @@ public:
     result.evidence.one_upload_one_readback = true;
     result.evidence.no_intermediate_crossings = true;
     result.evidence.single_in_flight = true;
+    shutdown_snapshot.stream_owned = config.executor_owns_stream;
     slot->active = true;
     slot->handle = result.handle;
     slot->program = program;
@@ -392,7 +394,42 @@ public:
     return RuntimeStatus::foreign_handle;
   }
 
-  void Shutdown() noexcept override { ++shutdown_calls; }
+  open_cuda::PreparedOpenCudaShutdownSnapshot
+  RequestShutdown() noexcept override {
+    ++shutdown_calls;
+    ++shutdown_snapshot.shutdown_attempts;
+    shutdown_snapshot.shutdown_requested = true;
+    std::uint32_t pending_slots = 0;
+    for (auto &slot : slots_) {
+      if (!slot.active)
+        continue;
+      if (pending_destroy) {
+        ++pending_slots;
+        continue;
+      }
+      slot = {};
+    }
+    if (pending_slots == 0 && shutdown_snapshot.stream_owned &&
+        !shutdown_snapshot.stream_destroyed) {
+      shutdown_snapshot.stream_destroyed = true;
+      ++shutdown_snapshot.stream_destructions;
+    }
+    shutdown_snapshot.pending_prepared_slots = pending_slots;
+    shutdown_snapshot.quiescent =
+        pending_slots == 0 &&
+        (!shutdown_snapshot.stream_owned || shutdown_snapshot.stream_destroyed);
+    shutdown_snapshot.driver_context_release_permitted =
+        shutdown_snapshot.quiescent;
+    shutdown_snapshot.status = shutdown_snapshot.quiescent
+                                   ? RuntimeStatus::ready
+                                   : RuntimeStatus::completion_pending;
+    return shutdown_snapshot;
+  }
+
+  open_cuda::PreparedOpenCudaShutdownSnapshot
+  ShutdownSnapshot() const noexcept override {
+    return shutdown_snapshot;
+  }
 
   open_cuda::PreparedOpenCudaRuntimeTelemetry
   Telemetry() const noexcept override {
@@ -817,22 +854,54 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
   {
     FakeRuntime runtime;
     runtime.pending_destroy = true;
-    {
-      auto options = Options(&runtime);
-      open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
-      open_cuda::ResidentAdapter adapter(81, executor);
-      hal::PreparedProgramSession session;
-      hal::ReadinessSnapshot readiness;
-      hal::ReasonId reason = hal::ReasonId::none;
-      ok = Expect(session.Configure(Program(), adapter, &readiness, &reason) ==
-                      hal::StatusId::degraded,
-                  "pending-destroy fixture should prepare") &&
-           ok;
-      session.Shutdown();
-    }
-    ok = Expect(runtime.destroy_calls >= 1 && runtime.shutdown_calls >= 1,
-                "pending resource shutdown should route through retained "
-                "runtime ownership") &&
+    auto options = Options(&runtime);
+    open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+    open_cuda::ResidentAdapter adapter(81, executor);
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok = Expect(session.Configure(Program(), adapter, &readiness, &reason) ==
+                    hal::StatusId::degraded,
+                "pending-destroy fixture should prepare") &&
+         ok;
+    session.Shutdown();
+
+    const auto pending = executor.RequestShutdown();
+    bool driver_context_released = false;
+    if (pending.driver_context_release_permitted)
+      driver_context_released = true;
+    ok = Expect(pending.status == RuntimeStatus::completion_pending &&
+                    pending.shutdown_requested && !pending.quiescent &&
+                    pending.pending_prepared_slots == 1 &&
+                    pending.stream_owned && !pending.stream_destroyed &&
+                    pending.stream_destructions == 0 &&
+                    !pending.driver_context_release_permitted &&
+                    !driver_context_released &&
+                    executor.ShutdownSnapshot().pending_prepared_slots == 1,
+                "pending DMA must be observable and retain the complete "
+                "driver/context/stream ownership island") &&
+         ok;
+
+    runtime.pending_destroy = false;
+    const auto quiescent = executor.RequestShutdown();
+    ok = Expect(quiescent.status == RuntimeStatus::ready &&
+                    quiescent.quiescent &&
+                    quiescent.pending_prepared_slots == 0 &&
+                    quiescent.stream_destroyed &&
+                    quiescent.stream_destructions == 1 &&
+                    quiescent.driver_context_release_permitted &&
+                    quiescent.shutdown_attempts > pending.shutdown_attempts,
+                "retryable shutdown must become quiescent before allowing "
+                "driver/context release") &&
+         ok;
+
+    executor.Shutdown();
+    const auto repeated = executor.RequestShutdown();
+    ok = Expect(repeated.quiescent && repeated.stream_destructions == 1 &&
+                    repeated.shutdown_attempts > quiescent.shutdown_attempts &&
+                    runtime.destroy_calls >= 1 && runtime.shutdown_calls >= 3,
+                "compatible repeated shutdown must destroy the owned stream "
+                "exactly once") &&
          ok;
   }
   return ok;
