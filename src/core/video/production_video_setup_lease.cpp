@@ -105,7 +105,69 @@ hal::StatusId Fail(hal::ReasonId value, hal::ReasonId *reason) noexcept {
   return hal::StatusId::blocked;
 }
 
+ProductionVideoSetupLeaseShutdownResult
+CompleteShutdown(std::uint64_t attempts) noexcept {
+  ProductionVideoSetupLeaseShutdownResult result;
+  result.status = hal::StatusId::stopped;
+  result.reason = hal::ReasonId::shutdown_requested;
+  result.shutdown_attempts = attempts;
+  result.shutdown_requested = true;
+  result.quiescent = true;
+  result.driver_context_release_permitted = true;
+  return result;
+}
+
+ProductionVideoSetupLeaseShutdownResult PendingShutdown(
+    std::uint64_t attempts, hal::StatusId status = hal::StatusId::degraded,
+    hal::ReasonId reason = hal::ReasonId::synchronization_failed) noexcept {
+  ProductionVideoSetupLeaseShutdownResult result;
+  result.status =
+      status == hal::StatusId::invalid || status == hal::StatusId::stopped
+          ? hal::StatusId::degraded
+          : status;
+  result.reason = reason == hal::ReasonId::none
+                      ? hal::ReasonId::synchronization_failed
+                      : reason;
+  result.shutdown_attempts = attempts;
+  result.shutdown_requested = true;
+  result.pending = true;
+  return result;
+}
+
+ProductionVideoSetupLeaseShutdownResult
+NormalizeShutdown(const ProductionVideoSetupLeaseShutdownResult &owner_result,
+                  std::uint64_t attempts) noexcept {
+  const bool proven_complete =
+      owner_result.contract_version ==
+          kProductionVideoSetupLeaseContractVersion &&
+      owner_result.shutdown_requested && !owner_result.pending &&
+      owner_result.status == hal::StatusId::stopped &&
+      owner_result.reason == hal::ReasonId::shutdown_requested &&
+      owner_result.quiescent && owner_result.driver_context_release_permitted;
+  if (proven_complete)
+    return CompleteShutdown(attempts);
+
+  const bool truthful_pending =
+      owner_result.contract_version ==
+          kProductionVideoSetupLeaseContractVersion &&
+      owner_result.shutdown_requested && owner_result.pending &&
+      !owner_result.quiescent && !owner_result.driver_context_release_permitted;
+  if (truthful_pending) {
+    return PendingShutdown(attempts, owner_result.status, owner_result.reason);
+  }
+
+  // Malformed or contradictory shutdown evidence fails closed. In particular,
+  // an unproven release-permitted claim can never make the lease stopped.
+  return PendingShutdown(attempts);
+}
+
 } // namespace
+
+ProductionVideoSetupLeaseShutdownResult
+IProductionVideoSetupLeaseOwner::RequestShutdown() noexcept {
+  Shutdown();
+  return CompleteShutdown(1);
+}
 
 hal::StatusId ValidateProductionVideoSetupLease(
     const ProductionVideoSetupLeaseSnapshot &snapshot,
@@ -256,27 +318,33 @@ ProductionVideoSetupLease::ProductionVideoSetupLease(
     std::unique_ptr<IProductionVideoSetupLeaseOwner> owner) noexcept
     : snapshot_(std::move(snapshot)), owner_(std::move(owner)) {}
 
-ProductionVideoSetupLease::~ProductionVideoSetupLease() { Shutdown(); }
+ProductionVideoSetupLease::~ProductionVideoSetupLease() {
+  // Exactly one final bounded attempt is made. If it remains pending, the
+  // backend owner's destructor is responsible for retaining unsafe resources.
+  (void)Shutdown();
+}
 
 ProductionVideoSetupLease::ProductionVideoSetupLease(
     ProductionVideoSetupLease &&other) noexcept
     : snapshot_(std::move(other.snapshot_)), owner_(std::move(other.owner_)),
-      shutdown_called_(other.shutdown_called_) {
+      shutdown_result_(other.shutdown_result_) {
   other.snapshot_ = {};
-  other.shutdown_called_ = false;
+  other.shutdown_result_ = {};
 }
 
 ProductionVideoSetupLease &ProductionVideoSetupLease::operator=(
     ProductionVideoSetupLease &&other) noexcept {
   if (this == &other)
     return *this;
-  Shutdown();
+  (void)Shutdown();
+  if (shutdown_pending())
+    (void)Shutdown();
   owner_.reset();
   snapshot_ = std::move(other.snapshot_);
   owner_ = std::move(other.owner_);
-  shutdown_called_ = other.shutdown_called_;
+  shutdown_result_ = other.shutdown_result_;
   other.snapshot_ = {};
-  other.shutdown_called_ = false;
+  other.shutdown_result_ = {};
   return *this;
 }
 
@@ -291,15 +359,22 @@ hal::StatusId ProductionVideoSetupLease::Acquire(
   SetReason(reason, hal::ReasonId::none);
   const bool had_previous = destination != nullptr && destination->live();
   if (!candidate_owner || destination == nullptr) {
-    if (candidate_owner)
-      candidate_owner->Shutdown();
+    ProductionVideoSetupLeaseShutdownResult candidate_shutdown;
+    if (candidate_owner) {
+      candidate_shutdown =
+          NormalizeShutdown(candidate_owner->RequestShutdown(), 1);
+    }
     const auto failure = hal::ReasonId::malformed_contract;
     SetReason(reason, failure);
     if (evidence) {
       evidence->status = hal::StatusId::blocked;
       evidence->reason = failure;
       evidence->readiness = snapshot.readiness;
-      evidence->candidate_owner_rolled_back = candidate_owner != nullptr;
+      evidence->candidate_shutdown = candidate_shutdown;
+      evidence->candidate_owner_rolled_back =
+          candidate_owner != nullptr && !candidate_shutdown.pending;
+      evidence->candidate_cleanup_pending =
+          candidate_owner != nullptr && candidate_shutdown.pending;
       evidence->previous_lease_retained = had_previous;
     }
     return hal::StatusId::blocked;
@@ -309,13 +384,16 @@ hal::StatusId ProductionVideoSetupLease::Acquire(
   const auto status = ValidateProductionVideoSetupLease(
       snapshot, *candidate_owner, &validation_reason);
   if (status != hal::StatusId::ready) {
-    candidate_owner->Shutdown();
+    const auto candidate_shutdown =
+        NormalizeShutdown(candidate_owner->RequestShutdown(), 1);
     SetReason(reason, validation_reason);
     if (evidence) {
       evidence->status = status;
       evidence->reason = validation_reason;
       evidence->readiness = snapshot.readiness;
-      evidence->candidate_owner_rolled_back = true;
+      evidence->candidate_shutdown = candidate_shutdown;
+      evidence->candidate_owner_rolled_back = !candidate_shutdown.pending;
+      evidence->candidate_cleanup_pending = candidate_shutdown.pending;
       evidence->previous_lease_retained = had_previous;
     }
     return status;
@@ -333,22 +411,37 @@ hal::StatusId ProductionVideoSetupLease::Acquire(
 }
 
 bool ProductionVideoSetupLease::live() const noexcept {
-  return owner_ != nullptr && !shutdown_called_ &&
+  return owner_ != nullptr && !shutdown_result_.shutdown_requested &&
          snapshot_.state == ProductionVideoSetupLeaseState::live;
 }
 
-void ProductionVideoSetupLease::Shutdown() noexcept {
-  if (!owner_ || shutdown_called_)
-    return;
-  shutdown_called_ = true;
-  owner_->Shutdown();
-  snapshot_.state = ProductionVideoSetupLeaseState::stopped;
-  snapshot_.status = hal::StatusId::stopped;
-  snapshot_.reason = hal::ReasonId::shutdown_requested;
-  snapshot_.readiness.status = hal::StatusId::stopped;
-  snapshot_.readiness.reason = hal::ReasonId::shutdown_requested;
+bool ProductionVideoSetupLease::shutdown_pending() const noexcept {
+  return owner_ != nullptr && shutdown_result_.shutdown_requested &&
+         shutdown_result_.pending &&
+         snapshot_.state == ProductionVideoSetupLeaseState::shutdown_pending;
+}
+
+ProductionVideoSetupLeaseShutdownResult
+ProductionVideoSetupLease::Shutdown() noexcept {
+  if (!owner_)
+    return shutdown_result_.shutdown_requested ? shutdown_result_
+                                               : CompleteShutdown(0);
+  if (shutdown_result_.shutdown_requested && !shutdown_result_.pending)
+    return shutdown_result_;
+
+  const auto attempts = shutdown_result_.shutdown_attempts + 1;
+  shutdown_result_ = NormalizeShutdown(owner_->RequestShutdown(), attempts);
+  snapshot_.shutdown = shutdown_result_;
+  snapshot_.state = shutdown_result_.pending
+                        ? ProductionVideoSetupLeaseState::shutdown_pending
+                        : ProductionVideoSetupLeaseState::stopped;
+  snapshot_.status = shutdown_result_.status;
+  snapshot_.reason = shutdown_result_.reason;
+  snapshot_.readiness.status = shutdown_result_.status;
+  snapshot_.readiness.reason = shutdown_result_.reason;
   snapshot_.readiness.available = false;
-  snapshot_.readiness.degraded = false;
+  snapshot_.readiness.degraded = shutdown_result_.pending;
+  return shutdown_result_;
 }
 
 } // namespace studiocast::video

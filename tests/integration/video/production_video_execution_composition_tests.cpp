@@ -296,6 +296,9 @@ private:
 struct FakeLeaseOwnerCounters {
   std::uint64_t shutdown_calls = 0;
   std::uint64_t destructor_calls = 0;
+  std::uint64_t pending_attempts_before_complete = 0;
+  bool permanently_pending = false;
+  bool destructor_saw_pending = false;
   std::vector<int> *events = nullptr;
 };
 
@@ -307,6 +310,7 @@ public:
 
   ~FakeLeaseOwner() override {
     ++owner_counters_->destructor_calls;
+    owner_counters_->destructor_saw_pending = last_shutdown_pending_;
     if (owner_counters_->events)
       owner_counters_->events->push_back(3);
   }
@@ -324,12 +328,36 @@ public:
     if (owner_counters_->events)
       owner_counters_->events->push_back(2);
   }
+  video::ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept override {
+    Shutdown();
+    video::ProductionVideoSetupLeaseShutdownResult result;
+    result.shutdown_attempts = owner_counters_->shutdown_calls;
+    result.shutdown_requested = true;
+    const bool pending = owner_counters_->permanently_pending ||
+                         owner_counters_->shutdown_calls <=
+                             owner_counters_->pending_attempts_before_complete;
+    if (pending) {
+      result.status = hal::StatusId::degraded;
+      result.reason = hal::ReasonId::synchronization_failed;
+      result.pending = true;
+      last_shutdown_pending_ = true;
+      return result;
+    }
+    result.status = hal::StatusId::stopped;
+    result.reason = hal::ReasonId::shutdown_requested;
+    result.quiescent = true;
+    result.driver_context_release_permitted = true;
+    last_shutdown_pending_ = false;
+    return result;
+  }
 
   UnusedAdapter adapter;
   FakeFactory factory;
 
 private:
   FakeLeaseOwnerCounters *owner_counters_ = nullptr;
+  bool last_shutdown_pending_ = false;
 };
 
 hal::AdapterRegistration Registration(UnusedAdapter *adapter) {
@@ -706,13 +734,115 @@ bool TestFailedLeaseCandidatesRetainOldPlan() {
   return ok;
 }
 
+bool TestPendingLeaseShutdownIsRetriedAndReported() {
+  FakeLeaseOwnerCounters owner_counters;
+  owner_counters.pending_attempts_before_complete = 1;
+  FakeExecutorCounters executor_counters;
+  auto owner =
+      std::make_unique<FakeLeaseOwner>(&owner_counters, &executor_counters);
+  video::ProductionVideoSetupLease lease;
+  if (!Require(AcquireLease(std::move(owner), &lease),
+               "pending shutdown composition lease must acquire")) {
+    return false;
+  }
+
+  video::ProductionVideoExecutionComposition composition;
+  video::VideoExecutionPrepareEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(composition.PrepareWithSetupLease(std::move(lease), Request(),
+                                                 &evidence, &reason) ==
+                   hal::StatusId::ready,
+               "pending shutdown composition must prepare")) {
+    return false;
+  }
+
+  const auto pending = composition.Shutdown();
+  const auto pending_snapshot = composition.Snapshot();
+  bool ok =
+      Require(pending.pending && pending.shutdown_attempts == 1 &&
+                  pending.status == hal::StatusId::degraded &&
+                  pending.reason == hal::ReasonId::synchronization_failed &&
+                  !pending.quiescent &&
+                  !pending.driver_context_release_permitted,
+              "composition must expose truthful pending lease shutdown") &&
+      Require(!pending_snapshot.stopped &&
+                  pending_snapshot.readiness.status ==
+                      hal::StatusId::degraded &&
+                  pending_snapshot.readiness.reason ==
+                      hal::ReasonId::synchronization_failed,
+              "terminal snapshot must distinguish pending from stopped") &&
+      Require(executor_counters.shutdown_calls == 1 &&
+                  owner_counters.shutdown_calls == 1,
+              "coordinator must stop once before the first lease attempt");
+
+  const auto complete = composition.Shutdown();
+  ok &= Require(!complete.pending && complete.shutdown_attempts == 2 &&
+                    complete.quiescent &&
+                    complete.driver_context_release_permitted &&
+                    composition.Snapshot().stopped,
+                "retry must publish stopped only after proven completion");
+  const auto idempotent = composition.Shutdown();
+  ok &= Require(idempotent.shutdown_attempts == 2 &&
+                    owner_counters.shutdown_calls == 2 &&
+                    executor_counters.shutdown_calls == 1,
+                "completed composition shutdown must be idempotent");
+  return ok;
+}
+
+bool TestPermanentPendingCompositionUsesCallerBoundedAttempts() {
+  FakeLeaseOwnerCounters owner_counters;
+  owner_counters.permanently_pending = true;
+  FakeExecutorCounters executor_counters;
+  {
+    auto owner =
+        std::make_unique<FakeLeaseOwner>(&owner_counters, &executor_counters);
+    video::ProductionVideoSetupLease lease;
+    if (!Require(AcquireLease(std::move(owner), &lease),
+                 "permanent pending composition lease must acquire")) {
+      return false;
+    }
+    video::ProductionVideoExecutionComposition composition;
+    video::VideoExecutionPrepareEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!Require(composition.PrepareWithSetupLease(std::move(lease), Request(),
+                                                   &evidence, &reason) ==
+                     hal::StatusId::ready,
+                 "permanent pending composition must prepare")) {
+      return false;
+    }
+
+    const auto first = composition.Shutdown();
+    const auto second = composition.Shutdown();
+    if (!Require(first.pending && first.shutdown_attempts == 1 &&
+                     second.pending && second.shutdown_attempts == 2 &&
+                     owner_counters.shutdown_calls == 2 &&
+                     executor_counters.shutdown_calls == 1 &&
+                     !composition.Snapshot().stopped,
+                 "permanent pending retries must remain explicit and "
+                 "bounded")) {
+      return false;
+    }
+  }
+  return Require(owner_counters.shutdown_calls == 3,
+                 "composition destruction must make one final bounded owner "
+                 "attempt") &&
+         Require(owner_counters.destructor_calls == 1 &&
+                     owner_counters.destructor_saw_pending,
+                 "permanent pending owner must retain fail-safe destruction "
+                 "responsibility") &&
+         Require(executor_counters.shutdown_calls == 1,
+                 "coordinator teardown must not repeat during lease retries");
+}
+
 } // namespace
 
 int main() {
   return TestLifecycleAndAttribution() &&
                  TestMalformedFactoryRegistrationRollsBack() &&
                  TestOwnedLeaseLifecycleAndOrderedShutdown() &&
-                 TestFailedLeaseCandidatesRetainOldPlan()
+                 TestFailedLeaseCandidatesRetainOldPlan() &&
+                 TestPendingLeaseShutdownIsRetriedAndReported() &&
+                 TestPermanentPendingCompositionUsesCallerBoundedAttempts()
              ? 0
              : 1;
 }

@@ -9,7 +9,7 @@
 
 namespace studiocast::video {
 
-inline constexpr std::uint32_t kProductionVideoSetupLeaseContractVersion = 1;
+inline constexpr std::uint32_t kProductionVideoSetupLeaseContractVersion = 2;
 inline constexpr std::size_t kMaxProductionVideoSetupProviders =
     hal::kMaxSemanticCapabilitiesPerAdapter;
 inline constexpr std::size_t kMaxProductionVideoSetupArtifacts =
@@ -18,7 +18,23 @@ inline constexpr std::size_t kMaxProductionVideoSetupArtifacts =
 enum class ProductionVideoSetupLeaseState : std::uint8_t {
   invalid = 0,
   live,
+  shutdown_pending,
   stopped,
+};
+
+// Typed, bounded result for one shutdown attempt. A pending result is not
+// permission to release driver/context-owned resources. Callers may retry only
+// by making another explicit Shutdown() call; no implementation may spin or
+// wait unboundedly inside this contract.
+struct ProductionVideoSetupLeaseShutdownResult {
+  std::uint32_t contract_version = kProductionVideoSetupLeaseContractVersion;
+  hal::StatusId status = hal::StatusId::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  std::uint64_t shutdown_attempts = 0;
+  bool shutdown_requested = false;
+  bool pending = false;
+  bool quiescent = false;
+  bool driver_context_release_permitted = false;
 };
 
 struct ProductionVideoSetupArtifactBinding {
@@ -39,6 +55,7 @@ struct ProductionVideoSetupLeaseSnapshot {
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;
   hal::ReadinessSnapshot readiness{};
+  ProductionVideoSetupLeaseShutdownResult shutdown{};
 
   hal::BackendId backend = hal::BackendId::invalid;
   hal::ExecutionDomainId execution_domain{};
@@ -70,14 +87,21 @@ public:
   resident_adapter() const noexcept = 0;
   [[nodiscard]] virtual IVideoAdapterFactory *
   video_adapter_factory() const noexcept = 0;
+  // Compatibility hook for owners whose teardown is immediately complete.
+  // Retryable owners override RequestShutdown() and must retain unsafe native
+  // resources in their destructor if final quiescence remains unproven.
   virtual void Shutdown() noexcept = 0;
+  [[nodiscard]] virtual ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept;
 };
 
 struct ProductionVideoSetupLeaseAcquireEvidence {
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;
   hal::ReadinessSnapshot readiness{};
+  ProductionVideoSetupLeaseShutdownResult candidate_shutdown{};
   bool candidate_owner_rolled_back = false;
+  bool candidate_cleanup_pending = false;
   bool previous_lease_retained = false;
 };
 
@@ -114,14 +138,21 @@ public:
           hal::ReasonId *reason) noexcept;
 
   [[nodiscard]] bool live() const noexcept;
+  [[nodiscard]] bool shutdown_pending() const noexcept;
   [[nodiscard]] const ProductionVideoSetupLeaseSnapshot &
   snapshot() const noexcept {
     return snapshot_;
   }
 
-  // Idempotent. The owner object is intentionally retained so published typed
-  // object addresses stay valid until lease destruction.
-  void Shutdown() noexcept;
+  // Idempotent after proven completion. While pending, each explicit call
+  // performs exactly one additional bounded owner attempt. The owner object is
+  // retained so published addresses and fail-safe backend ownership remain
+  // valid until lease destruction.
+  ProductionVideoSetupLeaseShutdownResult Shutdown() noexcept;
+  [[nodiscard]] const ProductionVideoSetupLeaseShutdownResult &
+  shutdown_result() const noexcept {
+    return shutdown_result_;
+  }
 
 private:
   ProductionVideoSetupLease(
@@ -130,7 +161,7 @@ private:
 
   ProductionVideoSetupLeaseSnapshot snapshot_{};
   std::unique_ptr<IProductionVideoSetupLeaseOwner> owner_;
-  bool shutdown_called_ = false;
+  ProductionVideoSetupLeaseShutdownResult shutdown_result_{};
 };
 
 } // namespace studiocast::video

@@ -50,22 +50,44 @@ struct ProductionVideoExecutionComposition::Impl {
     std::unique_ptr<hal::StaticAdapterRegistry> registry;
     std::unique_ptr<VideoExecutionCoordinator> coordinator;
     VideoExecutionCoordinatorSnapshot terminal_snapshot{};
-    bool shutdown = false;
+    ProductionVideoSetupLeaseShutdownResult shutdown_result{};
+    bool shutdown_requested = false;
+    bool coordinator_destroyed = false;
 
-    void Shutdown() noexcept {
-      if (shutdown)
+    void DestroyCoordinator() noexcept {
+      if (coordinator_destroyed)
         return;
-      shutdown = true;
+      coordinator_destroyed = true;
       if (coordinator)
         coordinator->Shutdown();
       if (coordinator)
         terminal_snapshot = coordinator->Snapshot();
       coordinator.reset();
       registry.reset();
-      lease.Shutdown();
     }
 
-    ~RegisteredRuntime() { Shutdown(); }
+    ProductionVideoSetupLeaseShutdownResult Shutdown() noexcept {
+      if (shutdown_requested && !shutdown_result.pending)
+        return shutdown_result;
+      shutdown_requested = true;
+      // Registry/coordinator raw pointers are retired before the first owner
+      // attempt and remain retired for every pending retry.
+      DestroyCoordinator();
+      shutdown_result = lease.Shutdown();
+      terminal_snapshot.stopped = !shutdown_result.pending;
+      terminal_snapshot.prepared = false;
+      terminal_snapshot.frame_pending = false;
+      terminal_snapshot.readiness.status = shutdown_result.status;
+      terminal_snapshot.readiness.reason = shutdown_result.reason;
+      terminal_snapshot.readiness.available = false;
+      terminal_snapshot.readiness.degraded = shutdown_result.pending;
+      return shutdown_result;
+    }
+
+    ~RegisteredRuntime() {
+      // The lease destructor performs at most one final bounded attempt.
+      DestroyCoordinator();
+    }
   };
 
   std::unique_ptr<vulkan::VulkanVideoExecutionFactory> vulkan_factory;
@@ -170,9 +192,8 @@ ProductionVideoExecutionComposition::ProductionVideoExecutionComposition(
   (void)impl_->Register(adapter, factory, &ignored);
 }
 
-ProductionVideoExecutionComposition::~ProductionVideoExecutionComposition() {
-  Shutdown();
-}
+ProductionVideoExecutionComposition::~ProductionVideoExecutionComposition() =
+    default;
 
 hal::StatusId ProductionVideoExecutionComposition::Prepare(
     const VideoExecutionPlanRequest &request,
@@ -181,14 +202,18 @@ hal::StatusId ProductionVideoExecutionComposition::Prepare(
     SetReason(reason, hal::ReasonId::resource_exhausted);
     return hal::StatusId::resource_exhausted;
   }
-  if (impl_->runtime && impl_->runtime->shutdown) {
-    SetReason(reason, hal::ReasonId::shutdown_requested);
+  if (impl_->runtime && impl_->runtime->shutdown_requested) {
+    const auto shutdown = impl_->runtime->shutdown_result;
+    SetReason(reason, shutdown.pending ? shutdown.reason
+                                       : hal::ReasonId::shutdown_requested);
     if (evidence) {
       *evidence = {};
-      evidence->status = hal::StatusId::stopped;
-      evidence->reason = hal::ReasonId::shutdown_requested;
+      evidence->status =
+          shutdown.pending ? shutdown.status : hal::StatusId::stopped;
+      evidence->reason = shutdown.pending ? shutdown.reason
+                                          : hal::ReasonId::shutdown_requested;
     }
-    return hal::StatusId::stopped;
+    return shutdown.pending ? shutdown.status : hal::StatusId::stopped;
   }
   if (!impl_->EnsureProductionFactory(request, reason)) {
     if (evidence) {
@@ -229,13 +254,17 @@ hal::StatusId ProductionVideoExecutionComposition::PrepareWithSetupLease(
     SetReason(reason, hal::ReasonId::resource_exhausted);
     return hal::StatusId::resource_exhausted;
   }
-  if (impl_->runtime && impl_->runtime->shutdown) {
-    SetReason(reason, hal::ReasonId::shutdown_requested);
+  if (impl_->runtime && impl_->runtime->shutdown_requested) {
+    const auto shutdown = impl_->runtime->shutdown_result;
+    SetReason(reason, shutdown.pending ? shutdown.reason
+                                       : hal::ReasonId::shutdown_requested);
     if (evidence) {
-      evidence->status = hal::StatusId::stopped;
-      evidence->reason = hal::ReasonId::shutdown_requested;
+      evidence->status =
+          shutdown.pending ? shutdown.status : hal::StatusId::stopped;
+      evidence->reason = shutdown.pending ? shutdown.reason
+                                          : hal::ReasonId::shutdown_requested;
     }
-    return hal::StatusId::stopped;
+    return shutdown.pending ? shutdown.status : hal::StatusId::stopped;
   }
   if (impl_->runtime && impl_->runtime->coordinator &&
       impl_->runtime->coordinator->Snapshot().frame_pending) {
@@ -249,24 +278,29 @@ hal::StatusId ProductionVideoExecutionComposition::PrepareWithSetupLease(
   }
   if (!candidate_lease.live()) {
     const auto &snapshot = candidate_lease.snapshot();
+    const bool pending =
+        snapshot.state == ProductionVideoSetupLeaseState::shutdown_pending;
     const auto failure =
-        snapshot.state == ProductionVideoSetupLeaseState::stopped
-            ? hal::ReasonId::shutdown_requested
-            : hal::ReasonId::malformed_contract;
+        pending ? snapshot.reason
+                : (snapshot.state == ProductionVideoSetupLeaseState::stopped
+                       ? hal::ReasonId::shutdown_requested
+                       : hal::ReasonId::malformed_contract);
     SetReason(reason, failure);
     if (evidence) {
-      evidence->status = failure == hal::ReasonId::shutdown_requested
-                             ? hal::StatusId::stopped
-                             : hal::StatusId::blocked;
+      evidence->status = pending ? snapshot.status
+                                 : (failure == hal::ReasonId::shutdown_requested
+                                        ? hal::StatusId::stopped
+                                        : hal::StatusId::blocked);
       evidence->reason = failure;
       evidence->readiness = snapshot.readiness;
       evidence->old_plan_retained =
           impl_->runtime && impl_->runtime->coordinator &&
           impl_->runtime->coordinator->Snapshot().prepared;
     }
-    return failure == hal::ReasonId::shutdown_requested
-               ? hal::StatusId::stopped
-               : hal::StatusId::blocked;
+    return pending ? snapshot.status
+                   : (failure == hal::ReasonId::shutdown_requested
+                          ? hal::StatusId::stopped
+                          : hal::StatusId::blocked);
   }
 
   const auto &snapshot = candidate_lease.snapshot();
@@ -311,11 +345,15 @@ VideoExecutionFrameResult ProductionVideoExecutionComposition::Execute(
     const hal::HostFrameBinding &binding) noexcept {
   if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator) {
     VideoExecutionFrameResult result;
-    const bool stopped = impl_ && impl_->runtime && impl_->runtime->shutdown;
-    result.status =
-        stopped ? hal::StatusId::stopped : hal::StatusId::resource_exhausted;
-    result.reason = stopped ? hal::ReasonId::shutdown_requested
-                            : hal::ReasonId::resource_exhausted;
+    const bool shutdown =
+        impl_ && impl_->runtime && impl_->runtime->shutdown_requested;
+    const bool pending = shutdown && impl_->runtime->shutdown_result.pending;
+    result.status = pending ? impl_->runtime->shutdown_result.status
+                            : (shutdown ? hal::StatusId::stopped
+                                        : hal::StatusId::resource_exhausted);
+    result.reason = pending ? impl_->runtime->shutdown_result.reason
+                            : (shutdown ? hal::ReasonId::shutdown_requested
+                                        : hal::ReasonId::resource_exhausted);
     return result;
   }
   return impl_->runtime->coordinator->Execute(binding);
@@ -325,10 +363,15 @@ hal::StatusId ProductionVideoExecutionComposition::CommitOutput(
     const hal::CompletionToken &completion, bool output_write_succeeded,
     hal::ReasonId *reason) noexcept {
   if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator) {
-    const bool stopped = impl_ && impl_->runtime && impl_->runtime->shutdown;
-    SetReason(reason, stopped ? hal::ReasonId::shutdown_requested
-                              : hal::ReasonId::resource_exhausted);
-    return stopped ? hal::StatusId::stopped : hal::StatusId::resource_exhausted;
+    const bool shutdown =
+        impl_ && impl_->runtime && impl_->runtime->shutdown_requested;
+    const bool pending = shutdown && impl_->runtime->shutdown_result.pending;
+    SetReason(reason, pending ? impl_->runtime->shutdown_result.reason
+                              : (shutdown ? hal::ReasonId::shutdown_requested
+                                          : hal::ReasonId::resource_exhausted));
+    return pending ? impl_->runtime->shutdown_result.status
+                   : (shutdown ? hal::StatusId::stopped
+                               : hal::StatusId::resource_exhausted);
   }
   return impl_->runtime->coordinator->CommitOutput(
       completion, output_write_succeeded, reason);
@@ -343,17 +386,26 @@ void ProductionVideoExecutionComposition::Invalidate(
 hal::StatusId ProductionVideoExecutionComposition::ResetTemporal(
     hal::ReasonId reason) noexcept {
   if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator)
-    return impl_ && impl_->runtime && impl_->runtime->shutdown
-               ? hal::StatusId::stopped
+    return impl_ && impl_->runtime && impl_->runtime->shutdown_requested
+               ? (impl_->runtime->shutdown_result.pending
+                      ? impl_->runtime->shutdown_result.status
+                      : hal::StatusId::stopped)
                : hal::StatusId::resource_exhausted;
   return impl_->runtime->coordinator->ResetTemporal(reason);
 }
 
-void ProductionVideoExecutionComposition::Shutdown() noexcept {
-  if (!impl_)
-    return;
-  if (impl_->runtime)
-    impl_->runtime->Shutdown();
+ProductionVideoSetupLeaseShutdownResult
+ProductionVideoExecutionComposition::Shutdown() noexcept {
+  if (!impl_ || !impl_->runtime)
+    return {};
+  return impl_->runtime->Shutdown();
+}
+
+ProductionVideoSetupLeaseShutdownResult
+ProductionVideoExecutionComposition::ShutdownSnapshot() const noexcept {
+  if (!impl_ || !impl_->runtime)
+    return {};
+  return impl_->runtime->shutdown_result;
 }
 
 VideoExecutionCoordinatorSnapshot

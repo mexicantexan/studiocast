@@ -84,6 +84,9 @@ public:
 struct OwnerCounters {
   std::uint64_t shutdown_calls = 0;
   std::uint64_t destructor_calls = 0;
+  std::uint64_t pending_attempts_before_complete = 0;
+  bool permanently_pending = false;
+  bool destructor_saw_pending = false;
   std::vector<int> *events = nullptr;
 };
 
@@ -92,6 +95,7 @@ public:
   explicit FakeOwner(OwnerCounters *counters) : counters_(counters) {}
   ~FakeOwner() override {
     ++counters_->destructor_calls;
+    counters_->destructor_saw_pending = last_shutdown_pending_;
     if (counters_->events)
       counters_->events->push_back(3);
   }
@@ -107,12 +111,36 @@ public:
     if (counters_->events)
       counters_->events->push_back(2);
   }
+  video::ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept override {
+    Shutdown();
+    video::ProductionVideoSetupLeaseShutdownResult result;
+    result.shutdown_attempts = counters_->shutdown_calls;
+    result.shutdown_requested = true;
+    const bool pending = counters_->permanently_pending ||
+                         counters_->shutdown_calls <=
+                             counters_->pending_attempts_before_complete;
+    if (pending) {
+      result.status = hal::StatusId::degraded;
+      result.reason = hal::ReasonId::synchronization_failed;
+      result.pending = true;
+      last_shutdown_pending_ = true;
+      return result;
+    }
+    result.status = hal::StatusId::stopped;
+    result.reason = hal::ReasonId::shutdown_requested;
+    result.quiescent = true;
+    result.driver_context_release_permitted = true;
+    last_shutdown_pending_ = false;
+    return result;
+  }
 
   FakeResidentAdapter adapter;
   FakeFactory factory;
 
 private:
   OwnerCounters *counters_ = nullptr;
+  bool last_shutdown_pending_ = false;
 };
 
 hal::CapabilityEvidenceRecord Evidence(hal::CapabilityEvidenceCode code,
@@ -380,6 +408,80 @@ bool TestCoordinatorBeforeLeaseDestructionOrder() {
                  "coordinator must die before lease shutdown and owner delete");
 }
 
+bool TestPendingShutdownRetriesOnlyUntilProvenComplete() {
+  OwnerCounters counters;
+  counters.pending_attempts_before_complete = 1;
+  auto owner = std::make_unique<FakeOwner>(&counters);
+  auto *raw = owner.get();
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(Acquire(raw, std::move(owner), &lease, &evidence, &reason),
+               "retryable shutdown lease must acquire")) {
+    return false;
+  }
+
+  const auto pending = lease.Shutdown();
+  bool ok = Require(
+      pending.pending && pending.shutdown_requested && !pending.quiescent &&
+          !pending.driver_context_release_permitted &&
+          pending.status == hal::StatusId::degraded &&
+          pending.reason == hal::ReasonId::synchronization_failed &&
+          pending.shutdown_attempts == 1 && lease.shutdown_pending() &&
+          !lease.live() &&
+          lease.snapshot().state ==
+              video::ProductionVideoSetupLeaseState::shutdown_pending,
+      "first unproven shutdown must remain visibly pending");
+
+  const auto complete = lease.Shutdown();
+  ok &= Require(!complete.pending && complete.quiescent &&
+                    complete.driver_context_release_permitted &&
+                    complete.status == hal::StatusId::stopped &&
+                    complete.reason == hal::ReasonId::shutdown_requested &&
+                    complete.shutdown_attempts == 2 &&
+                    !lease.shutdown_pending() &&
+                    lease.snapshot().state ==
+                        video::ProductionVideoSetupLeaseState::stopped,
+                "second proven shutdown must become stopped");
+  const auto idempotent = lease.Shutdown();
+  ok &=
+      Require(idempotent.shutdown_attempts == 2 && counters.shutdown_calls == 2,
+              "completed shutdown must be idempotent");
+  return ok;
+}
+
+bool TestPermanentPendingHasBoundedCallsAndFinalAttempt() {
+  OwnerCounters counters;
+  counters.permanently_pending = true;
+  {
+    auto owner = std::make_unique<FakeOwner>(&counters);
+    auto *raw = owner.get();
+    video::ProductionVideoSetupLease lease;
+    video::ProductionVideoSetupLeaseAcquireEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!Require(Acquire(raw, std::move(owner), &lease, &evidence, &reason),
+                 "permanent-pending lease must acquire")) {
+      return false;
+    }
+    const auto first = lease.Shutdown();
+    const auto second = lease.Shutdown();
+    if (!Require(first.pending && first.shutdown_attempts == 1 &&
+                     second.pending && second.shutdown_attempts == 2 &&
+                     counters.shutdown_calls == 2,
+                 "explicit pending retries must perform one bounded attempt "
+                 "per call")) {
+      return false;
+    }
+  }
+  return Require(
+             counters.shutdown_calls == 3,
+             "destruction must perform exactly one final bounded attempt") &&
+         Require(counters.destructor_calls == 1 &&
+                     counters.destructor_saw_pending,
+                 "permanent pending destruction must preserve fail-safe owner "
+                 "responsibility");
+}
+
 } // namespace
 
 int main() {
@@ -388,6 +490,8 @@ int main() {
   ok &= TestMalformedAndForeignContracts();
   ok &= TestFailedCandidateRetainsOldLease();
   ok &= TestCoordinatorBeforeLeaseDestructionOrder();
+  ok &= TestPendingShutdownRetriesOnlyUntilProvenComplete();
+  ok &= TestPermanentPendingHasBoundedCallsAndFinalAttempt();
   if (!ok)
     return 1;
   std::cout << "production video setup lease tests passed\n";

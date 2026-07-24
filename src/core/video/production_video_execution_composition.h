@@ -58,7 +58,11 @@ public:
 
   void Invalidate(hal::ReasonId reason) noexcept;
   [[nodiscard]] hal::StatusId ResetTemporal(hal::ReasonId reason) noexcept;
-  void Shutdown() noexcept;
+  // Performs one bounded shutdown attempt. Calls are idempotent after proven
+  // completion and retry the setup owner only while cleanup remains pending.
+  ProductionVideoSetupLeaseShutdownResult Shutdown() noexcept;
+  [[nodiscard]] ProductionVideoSetupLeaseShutdownResult
+  ShutdownSnapshot() const noexcept;
 
   [[nodiscard]] VideoExecutionCoordinatorSnapshot Snapshot() const noexcept;
 
