@@ -41,6 +41,8 @@ void TestPublicHeaderIsBackendNeutral() {
       "PreparedMaxineHardwareExecutionSnapshot",
       "PreparedOpenCudaHardwareExecutionSnapshot",
       "PreparedHardwareExecutionSnapshot",
+      "#include \"core/video/open_vulkan_eye_contact.h\"",
+      "#include \"core/video/open_vulkan_video_noise_removal.h\"",
   };
   for (const auto *needle : forbidden)
     Check(header.find(needle) == std::string::npos,
@@ -140,6 +142,17 @@ void TestFrameLoopUsesOnlyPreparedManagerLifecycle() {
         "failed setup generation must be cached instead of retried per frame");
   Check(source.find("backend_manager.ResetTemporal(") == std::string::npos,
         "freshly prepared temporal programs must not be reset unconditionally");
+  Check(source.find("execution.output.planes[0].write_data != nullptr") !=
+            std::string::npos &&
+            source.find("execution.output.planes[0].read_data != nullptr") ==
+                std::string::npos,
+        "completed host output must consume the borrowed writable binding");
+  Check(source.find("manager_output_committed && committed->valid") !=
+            std::string::npos &&
+            source.find(
+                "committed->capture_sequence == frame.sequence") !=
+                std::string::npos,
+        "live attribution must reject a prior committed capture");
   Check(source.find("FrameDropBehavior::reset_temporal_state") !=
             std::string::npos &&
             source.find("requires_contiguous_capture_sequence = temporal") !=
@@ -175,6 +188,12 @@ void TestCpuPrimitiveLaneAndBoundedShutdown() {
   Check(mirror != std::string::npos && write != std::string::npos &&
             commit != std::string::npos && mirror < write && write < commit,
         "CPU mirror finalizer must run before writer-gated manager commit");
+  Check(source.find("LiveEffectBackendAttribution::"
+                    "LiveEffectBackendAttribution()") !=
+            std::string::npos &&
+            source.find("active_backends_.reserve(384)") !=
+                std::string::npos,
+        "bounded attribution serialization capacity must be reserved at setup");
   Check(source.find("backend_manager.Invalidate(") != std::string::npos &&
             source.find("backend_manager.Shutdown()") != std::string::npos &&
             source.find("attempt < 8 && shutdown.pending") !=

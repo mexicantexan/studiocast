@@ -13,6 +13,8 @@
 
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/effects/broadcast_effect_rules.h"
+#include "core/video/open_vulkan_eye_contact.h"
+#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/virtual_camera_service.h"
 
@@ -1848,6 +1850,87 @@ bool TestOpenVulkanVideoNoiseRemovalPlanCompatibilityIsIsolatedAndFailClosed() {
   return true;
 }
 
+bool TestCompatibilityReadyHalProjectionRequiresNonResidentManagerState() {
+  namespace hal = studiocast::hal;
+  namespace video = studiocast::video;
+
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::maxine;
+  domain.api_family = hal::ApiFamily::maxine_nvcv;
+  domain.physical_device.vendor_id = 0x10de;
+  domain.physical_device.device_id = 1;
+  domain.physical_device.stable_id[0] = 1;
+  domain.logical_context_generation = 1;
+  domain.allocator_family = hal::AllocatorFamily::maxine_nvcv;
+  domain.memory_handle_family = hal::MemoryHandleFamily::nvcv_image;
+  domain.queue_or_stream_identity = 1;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::maxine_bound_cuda_stream;
+  domain.adapter_instance_id = 1;
+
+  video::effects::BroadcastCameraEffects effects;
+  effects.virtual_background.mode =
+      video::effects::VirtualBackgroundMode::blur;
+
+  video::CameraPipelineHalStatusProjectionInput input;
+  input.effects = &effects;
+  input.lifecycle = video::VideoRuntimeLifecycle::starting;
+  input.status_generation = 1;
+  input.configuration_generation = 1;
+  input.geometry_generation = 1;
+  input.backend.state =
+      video::ProductionVideoBackendManagerState::compatibility_ready;
+  input.backend.status = hal::StatusId::ready;
+  input.backend.setup_complete = true;
+  input.backend.resident_prepared = false;
+  input.backend.readiness.status = hal::StatusId::ready;
+  input.backend.readiness.selected_backend = hal::BackendId::maxine;
+  input.backend.readiness.provider =
+      hal::SemanticEffectProviderId::maxine_vfx;
+  input.backend.readiness.execution_domain = domain;
+  input.backend.readiness.available = true;
+  input.backend.compatibility.prepared = true;
+  input.backend.compatibility.status = hal::StatusId::ready;
+  input.backend.compatibility.plan_id = 7;
+  input.backend.compatibility.execution_domain = domain;
+  input.backend.compatibility.readiness = input.backend.readiness;
+  input.backend.compatibility.telemetry.runtime_status =
+      hal::StatusId::ready;
+  input.backend.compatibility_topology.domain_count = 1;
+  input.backend.compatibility_topology.domains[0].domain = domain;
+  input.backend.compatibility_topology.domains[0].backend =
+      hal::BackendId::maxine;
+  input.backend.compatibility_topology.domains[0].provider =
+      hal::SemanticEffectProviderId::maxine_vfx;
+  input.backend.compatibility_topology.domains[0].first_stage_id = 1;
+  input.backend.compatibility_topology.domains[0].last_stage_id = 1;
+  input.backend.compatibility_topology.exact_ordered_boundaries = true;
+  input.backend.compatibility_topology.cross_adapter_residency_forbidden =
+      true;
+
+  video::MultiIslandVideoRuntimeStatusSnapshot output;
+  const auto valid =
+      video::BuildCameraPipelineHalStatusSnapshot(input, &output);
+  if (valid.code != video::MultiIslandStatusValidationCode::valid ||
+      output.island_count != 1 || !output.effects[2].selected) {
+    std::cerr << "typed compatibility must project with resident_prepared "
+                 "false\n";
+    return false;
+  }
+
+  input.backend.resident_prepared = true;
+  const auto malformed =
+      video::BuildCameraPipelineHalStatusSnapshot(input, &output);
+  if (malformed.code !=
+      video::MultiIslandStatusValidationCode::invalid_island) {
+    std::cerr << "typed compatibility must reject a contradictory resident "
+                 "prepared flag\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1912,6 +1995,8 @@ int main() {
        &TestOpenVulkanEyeContactPlanCompatibilityIsIsolatedAndFailClosed},
       {"Open Vulkan video denoise plan compatibility is isolated/fail closed",
        &TestOpenVulkanVideoNoiseRemovalPlanCompatibilityIsIsolatedAndFailClosed},
+      {"typed compatibility projection requires non-resident manager state",
+       &TestCompatibilityReadyHalProjectionRequiresNonResidentManagerState},
       {"latest-frame worker overwrites pending blocked work",
        &studiocast::tests::
            TestLatestFrameWinsOverwritesPendingWithBlockedProcessor},

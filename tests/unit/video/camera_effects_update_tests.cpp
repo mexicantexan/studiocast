@@ -1,7 +1,4 @@
-#include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -46,33 +43,6 @@ using studiocast::video::detail::CameraPipelineIssue1TestAccess;
 using studiocast::video::effects::BroadcastCameraEffects;
 using studiocast::video::effects::VirtualBackgroundMode;
 
-class ScopedReplaceImage final {
-public:
-  ScopedReplaceImage() {
-    const auto suffix =
-        std::chrono::steady_clock::now().time_since_epoch().count();
-    path_ = std::filesystem::temp_directory_path() /
-            ("studiocast-effects-update-" + std::to_string(suffix) + ".ppm");
-    std::ofstream out(path_, std::ios::binary);
-    out << "P6\n1 1\n255\n";
-    const char pixel[3] = {'\0', '\0', '\0'};
-    out.write(pixel, sizeof(pixel));
-    valid_ = out.good();
-  }
-
-  ~ScopedReplaceImage() {
-    std::error_code ec;
-    std::filesystem::remove(path_, ec);
-  }
-
-  bool valid() const { return valid_; }
-  const std::filesystem::path &path() const { return path_; }
-
-private:
-  std::filesystem::path path_;
-  bool valid_ = false;
-};
-
 bool Expect(bool condition, const std::string &message) {
   if (!condition)
     std::cerr << message << "\n";
@@ -80,22 +50,19 @@ bool Expect(bool condition, const std::string &message) {
 }
 
 bool TestIdenticalPipelineEffectsPreserveRuntimeGeneration() {
-  ScopedReplaceImage replace_image;
-  if (!Expect(replace_image.valid(), "failed to create replacement fixture"))
-    return false;
-
   CameraPipeline pipeline;
   BroadcastCameraEffects effects;
   effects.virtual_background.mode = VirtualBackgroundMode::replace;
-  effects.virtual_background.replace_path = replace_image.path().string();
+  effects.virtual_background.replace_path =
+      "/must/not/be/scanned/by/camera-pipeline/replacement.png";
   effects.auto_frame.enabled = true;
 
   pipeline.SetEffects(effects);
   auto applied = CameraPipelineIssue1TestAccess::Get(pipeline);
   if (!Expect(applied.generation == 1 && applied.applied_updates == 1,
               "first real effect change did not publish one generation") ||
-      !Expect(applied.replacement_preparations == 1,
-              "replacement source was not prepared exactly once")) {
+      !Expect(applied.replacement_preparations == 0,
+              "camera pipeline performed backend-owned replacement scanning")) {
     return false;
   }
 
@@ -135,8 +102,8 @@ bool TestIdenticalPipelineEffectsPreserveRuntimeGeneration() {
       !Expect(stable.set_requests == 9 && stable.ignored_updates == 8 &&
                   stable.applied_updates == 1,
               "stable SetEffects counters did not prove idempotence") ||
-      !Expect(stable.replacement_preparations == 1,
-              "identical replacement configuration repeated preparation") ||
+      !Expect(stable.replacement_preparations == 0,
+              "stable update performed backend-owned replacement scanning") ||
       !Expect(rebuilds == 0 && yunet_resets == 0 && temporal_resets == 0 &&
                   breaker_resets == 0,
               "stable generation crossed a runtime invalidation boundary") ||
@@ -147,8 +114,8 @@ bool TestIdenticalPipelineEffectsPreserveRuntimeGeneration() {
     return false;
   }
 
-  // An unrelated genuine effect change must publish one new generation while
-  // reusing the unchanged replacement source preparation.
+  // An unrelated genuine effect change publishes one generation. Artifact
+  // preparation remains exclusively in the backend setup source.
   effects.vignette.enabled = true;
   pipeline.SetEffects(effects);
   observe_generation();
@@ -158,8 +125,8 @@ bool TestIdenticalPipelineEffectsPreserveRuntimeGeneration() {
   const auto changed = CameraPipelineIssue1TestAccess::Get(pipeline);
   return Expect(changed.generation == 2 && changed.applied_updates == 2,
                 "real effect change did not publish exactly one generation") &&
-         Expect(changed.replacement_preparations == 1,
-                "unrelated effect change re-statted replacement source") &&
+         Expect(changed.replacement_preparations == 0,
+                "effect change performed pipeline-side replacement scanning") &&
          Expect(rebuilds == 1 && yunet_resets == 1 && temporal_resets == 1 &&
                     breaker_resets == 1,
                 "real generation did not produce exactly one invalidation") &&
@@ -168,14 +135,11 @@ bool TestIdenticalPipelineEffectsPreserveRuntimeGeneration() {
 }
 
 bool TestExplicitEffectsResourceRefreshIsSeparateInvalidation() {
-  ScopedReplaceImage replace_image;
-  if (!Expect(replace_image.valid(), "failed to create replacement fixture"))
-    return false;
-
   CameraPipeline pipeline;
   BroadcastCameraEffects effects;
   effects.virtual_background.mode = VirtualBackgroundMode::replace;
-  effects.virtual_background.replace_path = replace_image.path().string();
+  effects.virtual_background.replace_path =
+      "/must/not/be/scanned/by/camera-pipeline/replacement.png";
   pipeline.SetEffects(effects);
   const auto before = CameraPipelineIssue1TestAccess::Get(pipeline);
 
@@ -187,9 +151,9 @@ bool TestExplicitEffectsResourceRefreshIsSeparateInvalidation() {
               "explicit refresh did not create one generation boundary") ||
       !Expect(refreshed.resource_refreshes == 1,
               "explicit refresh counter was not recorded") ||
-      !Expect(refreshed.replacement_preparations ==
-                  before.replacement_preparations + 1,
-              "explicit refresh did not revalidate replacement source")) {
+      !Expect(refreshed.replacement_preparations == 0 &&
+                  before.replacement_preparations == 0,
+              "explicit refresh performed pipeline-side replacement scanning")) {
     return false;
   }
 
@@ -197,9 +161,8 @@ bool TestExplicitEffectsResourceRefreshIsSeparateInvalidation() {
   const auto stable = CameraPipelineIssue1TestAccess::Get(pipeline);
   return Expect(stable.generation == refreshed.generation,
                 "identical SetEffects repeated an explicit refresh") &&
-         Expect(stable.replacement_preparations ==
-                    refreshed.replacement_preparations,
-                "post-refresh stable update repeated replacement stat");
+         Expect(stable.replacement_preparations == 0,
+                "post-refresh update performed replacement scanning");
 }
 
 } // namespace

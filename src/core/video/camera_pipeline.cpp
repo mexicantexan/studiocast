@@ -3,6 +3,8 @@
 #include "core/video/capture_error_policy.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/mjpeg_decode.h"
+#include "core/video/open_vulkan_eye_contact.h"
+#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
 #include "core/video/yuyv_passthrough.h"
@@ -963,7 +965,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
              ProductionVideoBackendManagerState::compatibility_ready) {
     const auto &adapter = input.backend.compatibility;
     const auto &topology = input.backend.compatibility_topology;
-    if (!input.backend.setup_complete || !input.backend.resident_prepared ||
+    if (!input.backend.setup_complete || input.backend.resident_prepared ||
         !adapter.prepared || adapter.stopped || adapter.plan_id == 0 ||
         topology.domain_count != 1 || !topology.exact_ordered_boundaries ||
         !topology.cross_adapter_residency_forbidden ||
@@ -1423,6 +1425,13 @@ void EffectsFramePreparationCounters::RecordConfigSnapshot(bool rebuilt) noexcep
     ++rebuilds;
 }
 
+LiveEffectBackendAttribution::LiveEffectBackendAttribution() {
+  // Nine stable "effect:backend" records plus separators fit well below this
+  // setup-time reservation. SerializeActive therefore never grows the string
+  // in the ordinary frame path.
+  active_backends_.reserve(384);
+}
+
 void LiveEffectBackendAttribution::BeginFrame() { pending_.fill(0); }
 
 void LiveEffectBackendAttribution::MarkEffectSucceeded(
@@ -1482,13 +1491,15 @@ std::size_t LiveEffectBackendAttribution::EffectSlot(
 
 std::uint8_t LiveEffectBackendAttribution::BackendCode(
     std::string_view backend) {
-  static constexpr std::array<std::string_view, 4> ids = {
-      "vulkan", "cuda", "maxine", "cpu"};
-  const auto found = std::find(ids.begin(), ids.end(), backend);
-  return found == ids.end()
-             ? 0
-             : static_cast<std::uint8_t>(
-                   std::distance(ids.begin(), found) + 1);
+  if (backend == "vulkan" || backend == "open_vulkan")
+    return 1;
+  if (backend == "cuda" || backend == "open_cuda")
+    return 2;
+  if (backend == "maxine")
+    return 3;
+  if (backend == "cpu")
+    return 4;
+  return 0;
 }
 
 std::string_view LiveEffectBackendAttribution::EffectId(std::size_t slot) {
@@ -1501,7 +1512,7 @@ std::string_view LiveEffectBackendAttribution::EffectId(std::size_t slot) {
 
 std::string_view LiveEffectBackendAttribution::BackendId(std::uint8_t code) {
   static constexpr std::array<std::string_view, 4> ids = {
-      "vulkan", "cuda", "maxine", "cpu"};
+      "open_vulkan", "open_cuda", "maxine", "cpu"};
   return code > 0 && code <= ids.size() ? ids[code - 1]
                                         : std::string_view{};
 }
@@ -2391,9 +2402,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
            execution.status == hal::StatusId::degraded) &&
           execution.output_ready && execution.output.output_ready &&
           execution.output.plane_count == 1 &&
-          execution.output.planes[0].read_data != nullptr) {
+          execution.output.planes[0].write_data != nullptr) {
+        // Completion makes the caller-owned borrowed output buffer readable.
+        // Host output resolution carries that buffer in write_data; requiring
+        // a redundant read_data alias rejects otherwise valid adapters.
         rgb_output = reinterpret_cast<const std::uint8_t *>(
-            execution.output.planes[0].read_data);
+            execution.output.planes[0].write_data);
         rgb_stride = execution.output.planes[0].row_stride_bytes;
         rgb_bytes = execution.output.planes[0].span_bytes;
       } else {
@@ -2526,10 +2540,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
     const auto write_result =
         writer_.WriteFrameDetailed(write_data, write_bytes, &stop_);
     const bool written = write_result.FrameCommitted();
+    bool manager_output_committed = false;
     if (completion_pending) {
       hal::ReasonId commit_reason = hal::ReasonId::none;
       const auto commit_status =
           backend_manager.CommitOutput(completion, written, &commit_reason);
+      manager_output_committed =
+          written && commit_status == hal::StatusId::ready;
       if (written && commit_status != hal::StatusId::ready) {
         std::lock_guard<std::mutex> lock(mu_);
         last_error_ = "Neutral backend output attribution commit failed.";
@@ -2554,7 +2571,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
             ? &backend_snapshot.resident.latest_committed_frame
             : &backend_snapshot.compatibility.latest_committed_frame;
     const std::string_view active_backend = active_backend_name;
-    if (committed->valid) {
+    if (manager_output_committed && committed->valid &&
+        committed->capture_sequence == frame.sequence) {
       for (std::size_t index = 0; index < committed->stage_count; ++index) {
         const auto &stage = committed->stages[index];
         if (stage.status == hal::StageExecutionStatus::succeeded) {

@@ -15,8 +15,6 @@
 
 #include "core/video/effects/broadcast_effects.h"
 #include "core/video/effects/broadcast_effect_rules.h"
-#include "core/video/open_vulkan_eye_contact.h"
-#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
@@ -138,6 +136,8 @@ struct EffectsFramePreparationCounters {
 // rebuilt only when the committed attribution changes.
 class LiveEffectBackendAttribution {
 public:
+  LiveEffectBackendAttribution();
+
   void BeginFrame();
   void MarkEffectSucceeded(std::string_view effect_id,
                            std::string_view backend);
