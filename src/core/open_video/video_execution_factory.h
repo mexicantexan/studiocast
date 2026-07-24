@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/open_video/open_cuda_production_hal_owner.h"
+#include "core/video/production_video_setup_lease.h"
 #include "core/video/video_adapter_factory.h"
 
 #include <cstdint>
@@ -53,6 +54,7 @@ struct OpenCudaVideoExecutionCachedEvidence {
   hal::ExecutionDomainId execution_domain{};
   hal::ModelArtifactIdentity model{};
   hal::ProgramGenerations generations{};
+  hal::ResourceBudget reserved_budget{};
   bool model_artifact_validated = false;
   bool provider_runtime_validated = false;
   bool device_context_validated = false;
@@ -91,6 +93,9 @@ struct OpenCudaProductionVideoExecutionFactoryRequest {
   hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
   hal::ModelArtifactIdentity model{};
   hal::ProgramGenerations generations{};
+  // Exact setup-time capacity reserved for the one prepared resident slot.
+  // The lease publishes this value unchanged; frame execution cannot grow it.
+  hal::ResourceBudget reserved_budget{};
   OpenCudaProductionBackendRequest backend{};
   bool model_artifact_validated = false;
   bool provider_runtime_validated = false;
@@ -107,6 +112,7 @@ struct OpenCudaProductionVideoExecutionBootstrapResult {
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;
   OpenCudaProductionPreparationResult owner{};
+  video::ProductionVideoSetupLeaseSnapshot setup_lease{};
   bool exact_candidate_ready = false;
 };
 
@@ -122,6 +128,12 @@ public:
   CreateProduction(
       const OpenCudaProductionVideoExecutionFactoryRequest &request,
       OpenCudaProductionVideoExecutionBootstrapResult *result) noexcept;
+  [[nodiscard]] static hal::StatusId AcquireProductionSetupLease(
+      const OpenCudaProductionVideoExecutionFactoryRequest &request,
+      video::ProductionVideoSetupLease *destination,
+      OpenCudaProductionVideoExecutionBootstrapResult *bootstrap,
+      video::ProductionVideoSetupLeaseAcquireEvidence *evidence,
+      hal::ReasonId *reason) noexcept;
   ~OpenCudaVideoExecutionFactory() override;
 
   OpenCudaVideoExecutionFactory(const OpenCudaVideoExecutionFactory &) = delete;
@@ -130,6 +142,14 @@ public:
 
   [[nodiscard]] video::VideoAdapterFactoryRegistration Registration() noexcept;
   [[nodiscard]] hal::AdapterRegistration adapter_registration() const noexcept;
+
+  // Performs exactly one native bounded shutdown attempt. The adapter facade
+  // is retired only after the native owner proves context release is safe.
+  [[nodiscard]] OpenCudaProductionShutdownResult
+  RequestProductionOwnerShutdown() noexcept;
+  [[nodiscard]] OpenCudaProductionShutdownResult
+  production_shutdown_snapshot() const noexcept;
+  [[nodiscard]] bool production_owner_retired() const noexcept;
 
   [[nodiscard]] video::VideoAdapterFactoryPreflight
   Preflight(const video::VideoExecutionPlanRequest &request,

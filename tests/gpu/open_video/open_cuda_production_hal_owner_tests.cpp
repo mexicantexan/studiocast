@@ -833,6 +833,323 @@ VideoRequest(const hal::ExecutionDomainId &domain) {
   return request;
 }
 
+open_cuda::OpenCudaProductionVideoExecutionFactoryRequest
+ProductionFactoryRequest(FakeCudaState *state, PendingRuntime *runtime) {
+  auto backend = BackendRequest(state, runtime);
+  // The neutral setup lease binds its model generation to the exact validated
+  // artifact registry generation.
+  backend.model_preprocess_generation =
+      backend.model_artifact.registry_generation;
+  open_cuda::OpenCudaProductionVideoExecutionFactoryRequest setup{};
+  setup.factory_id = 7011;
+  setup.selection_priority = 5;
+  setup.semantic = hal::SemanticEffectId::virtual_background_blur;
+  setup.model.model_id_hash = backend.model_artifact.model_id_sha256;
+  setup.model.artifact_set_hash =
+      backend.model_artifact.artifact_set_sha256;
+  setup.model.artifact_generation =
+      backend.model_artifact.registry_generation;
+  setup.generations = {
+      11,
+      12,
+      backend.model_artifact.registry_generation,
+      14,
+      15,
+      0,
+  };
+  setup.reserved_budget = {128 * 1024, 64 * 1024, 4096, 4096, 32, 1};
+  setup.backend = std::move(backend);
+  setup.model_artifact_validated = true;
+  setup.provider_runtime_validated = true;
+  setup.cuda_iobinding_validated = true;
+  setup.user_stream_bound = true;
+  setup.reusable_resources_supported = true;
+  setup.device_preprocess_supported = true;
+  setup.device_postprocess_supported = true;
+  setup.stop_aware_bounded_wait = true;
+  setup.allocation_free_execute = true;
+  return setup;
+}
+
+bool ProductionSetupLeaseIsExactStableAndIdempotent() {
+  FakeCudaState state{};
+  PendingRuntime runtime{};
+  runtime.pending = false;
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence{};
+  open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto setup = ProductionFactoryRequest(&state, &runtime);
+  const auto status =
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          setup, &lease, &bootstrap, &evidence, &reason);
+  bool ok = Expect(status == hal::StatusId::ready && lease.live() &&
+                       bootstrap.exact_candidate_ready &&
+                       bootstrap.status == hal::StatusId::ready &&
+                       evidence.status == hal::StatusId::ready &&
+                       reason == hal::ReasonId::none,
+                   "exact Open CUDA setup should acquire a typed live lease");
+  if (!lease.live())
+    return false;
+
+  const auto &snapshot = lease.snapshot();
+  auto *resident = snapshot.adapter.resident_adapter;
+  auto *factory = snapshot.factory.factory;
+  ok = Expect(
+           snapshot.contract_version ==
+                   video::kProductionVideoSetupLeaseContractVersion &&
+               snapshot.backend == hal::BackendId::cuda &&
+               snapshot.execution_domain ==
+                   bootstrap.owner.execution_domain &&
+               snapshot.generations.context ==
+                   snapshot.execution_domain.logical_context_generation &&
+               snapshot.generations.model ==
+                   setup.model.artifact_generation &&
+               snapshot.providers[0] ==
+                   hal::SemanticEffectProviderId::
+                       open_video_onnxruntime_cuda &&
+               snapshot.provider_count == 1 &&
+               snapshot.artifact_count == 1 &&
+               snapshot.artifacts[0].semantic == setup.semantic &&
+               snapshot.artifacts[0].artifact.model_id_hash ==
+                   setup.model.model_id_hash &&
+               snapshot.reserved_budget.persistent_bytes ==
+                   setup.reserved_budget.persistent_bytes &&
+               snapshot.reserved_budget.scratch_bytes ==
+                   setup.reserved_budget.scratch_bytes &&
+               snapshot.reserved_budget.upload_staging_bytes ==
+                   setup.reserved_budget.upload_staging_bytes &&
+               snapshot.reserved_budget.readback_staging_bytes ==
+                   setup.reserved_budget.readback_staging_bytes &&
+               snapshot.reserved_budget.resource_count ==
+                   setup.reserved_budget.resource_count &&
+               snapshot.reserved_budget.in_flight_slots == 1 &&
+               resident != nullptr && factory != nullptr &&
+               snapshot.adapter.adapter_instance_id ==
+                   snapshot.factory.adapter_instance_id,
+           "lease snapshot must freeze exact domain, provider, model, budget, "
+           "adapter, and factory evidence") &&
+       ok;
+
+  lease.Shutdown();
+  lease.Shutdown();
+  const auto &stopped = lease.snapshot();
+  auto *typed_factory =
+      static_cast<open_cuda::OpenCudaVideoExecutionFactory *>(factory);
+  const auto stopped_adapter = typed_factory->adapter_registration();
+  const auto stopped_factory = typed_factory->Registration();
+  ok = Expect(
+           !lease.live() &&
+               stopped.state ==
+                   video::ProductionVideoSetupLeaseState::stopped &&
+               stopped.adapter.resident_adapter == resident &&
+               stopped.factory.factory == factory &&
+               stopped_adapter.resident_adapter == resident &&
+               stopped_factory.factory == factory &&
+               resident->adapter_instance_id() ==
+                   stopped.adapter.adapter_instance_id &&
+               resident->backend_id() == hal::BackendId::cuda &&
+               state.destroy_successes == 1 &&
+               runtime.stream_destructions == 1,
+           "double shutdown must retain published addresses and tear down "
+           "native streams exactly once") &&
+       ok;
+  return ok;
+}
+
+bool ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() {
+  FakeCudaState old_state{};
+  PendingRuntime old_runtime{};
+  old_runtime.pending = false;
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence{};
+  open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto valid = ProductionFactoryRequest(&old_state, &old_runtime);
+  bool ok = Expect(
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          valid, &lease, &bootstrap, &evidence, &reason) ==
+              hal::StatusId::ready &&
+          lease.live(),
+      "rollback fixture should start with one live lease");
+  if (!lease.live())
+    return false;
+  const auto old_domain = lease.snapshot().execution_domain;
+  auto *old_adapter = lease.snapshot().adapter.resident_adapter;
+
+  auto wrong_model = valid;
+  wrong_model.model.model_id_hash[0] ^= 0xff;
+  evidence = {};
+  bootstrap = {};
+  reason = hal::ReasonId::none;
+  const auto model_status =
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          wrong_model, &lease, &bootstrap, &evidence, &reason);
+  ok = Expect(model_status == hal::StatusId::blocked &&
+                  reason ==
+                      hal::ReasonId::capability_evidence_incomplete &&
+                  lease.live() &&
+                  lease.snapshot().execution_domain == old_domain &&
+                  lease.snapshot().adapter.resident_adapter == old_adapter &&
+                  evidence.previous_lease_retained &&
+                  !evidence.candidate_owner_rolled_back &&
+                  old_state.destroy_successes == 1,
+              "model mismatch must fail before CUDA work and retain the old "
+              "typed lease") &&
+       ok;
+
+  FakeCudaState stale_state{};
+  PendingRuntime stale_runtime{};
+  stale_runtime.pending = false;
+  auto stale = ProductionFactoryRequest(&stale_state, &stale_runtime);
+  ++stale.generations.model;
+  stale.backend.model_preprocess_generation = stale.generations.model;
+  evidence = {};
+  bootstrap = {};
+  reason = hal::ReasonId::none;
+  const auto stale_status =
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          stale, &lease, &bootstrap, &evidence, &reason);
+  ok = Expect(stale_status == hal::StatusId::stale &&
+                  reason == hal::ReasonId::wrong_generation &&
+                  evidence.candidate_owner_rolled_back &&
+                  evidence.previous_lease_retained && lease.live() &&
+                  lease.snapshot().execution_domain == old_domain &&
+                  lease.snapshot().adapter.resident_adapter == old_adapter &&
+                  stale_state.destroy_successes == 1 &&
+                  stale_runtime.stream_destructions == 1,
+              "model-generation mismatch must roll back the complete new "
+              "island and retain the old lease") &&
+       ok;
+
+  g_cuda = &old_state;
+  lease.Shutdown();
+  ok = Expect(old_state.destroy_successes == 1 &&
+                  old_runtime.stream_destructions == 1,
+              "retained old lease must still tear down exactly once") &&
+       ok;
+  return ok;
+}
+
+bool ProductionSetupLeaseShutdownRetriesPendingThenComplete() {
+  FakeCudaState state{};
+  PendingRuntime runtime{};
+  runtime.pending = true;
+  const auto setup = ProductionFactoryRequest(&state, &runtime);
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence{};
+  open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Expect(
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          setup, &lease, &bootstrap, &evidence, &reason) ==
+              hal::StatusId::ready &&
+          lease.live(),
+      "pending shutdown fixture should acquire one live lease");
+  if (!lease.live())
+    return false;
+
+  auto *factory = static_cast<open_cuda::OpenCudaVideoExecutionFactory *>(
+      lease.snapshot().factory.factory);
+  auto *resident = lease.snapshot().adapter.resident_adapter;
+  const auto pending = lease.Shutdown();
+  ok = Expect(
+           pending.pending && !pending.quiescent &&
+               !pending.driver_context_release_permitted &&
+               pending.shutdown_attempts == 1 && lease.shutdown_pending() &&
+               lease.snapshot().state ==
+                   video::ProductionVideoSetupLeaseState::shutdown_pending &&
+               !factory->production_owner_retired() &&
+               !factory->production_shutdown_snapshot()
+                    .driver_context_release_permitted &&
+               runtime.shutdown_calls == 2 &&
+               runtime.stream_destructions == 0 &&
+               state.primary_releases == 0 &&
+               resident == lease.snapshot().adapter.resident_adapter &&
+               resident->adapter_instance_id() ==
+                   lease.snapshot().adapter.adapter_instance_id,
+           "first lease shutdown call must remain truthfully pending without "
+           "retiring the facade or releasing the CUDA context") &&
+       ok;
+
+  runtime.pending = false;
+  const auto complete = lease.Shutdown();
+  ok = Expect(
+           !complete.pending && complete.quiescent &&
+               complete.driver_context_release_permitted &&
+               complete.status == hal::StatusId::stopped &&
+               complete.reason == hal::ReasonId::shutdown_requested &&
+               complete.shutdown_attempts == 2 && !lease.shutdown_pending() &&
+               lease.snapshot().state ==
+                   video::ProductionVideoSetupLeaseState::stopped &&
+               factory->production_owner_retired() &&
+               factory->production_shutdown_snapshot()
+                   .driver_context_release_permitted &&
+               runtime.shutdown_calls == 4 &&
+               runtime.stream_destructions == 1 &&
+               state.primary_releases == 1,
+           "second explicit lease shutdown call must retire only after native "
+           "quiescence and context-release proof") &&
+       ok;
+  return ok;
+}
+
+bool ProductionSetupLeasePermanentPendingIsTruthfulAndFailSafe() {
+  FakeCudaState state{};
+  PendingRuntime runtime{};
+  runtime.pending = true;
+  const auto setup = ProductionFactoryRequest(&state, &runtime);
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence{};
+  open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Expect(
+      open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+          setup, &lease, &bootstrap, &evidence, &reason) ==
+              hal::StatusId::ready &&
+          lease.live(),
+      "permanent pending fixture should acquire one live lease");
+  if (!lease.live())
+    return false;
+
+  auto *factory = static_cast<open_cuda::OpenCudaVideoExecutionFactory *>(
+      lease.snapshot().factory.factory);
+  for (std::uint64_t attempt = 1; attempt <= 3; ++attempt) {
+    const auto pending = lease.Shutdown();
+    ok = Expect(
+             pending.pending && !pending.quiescent &&
+                 !pending.driver_context_release_permitted &&
+                 pending.shutdown_attempts == attempt &&
+                 lease.shutdown_pending() &&
+                 lease.snapshot().state ==
+                     video::ProductionVideoSetupLeaseState::
+                         shutdown_pending &&
+                 !factory->production_owner_retired() &&
+                 runtime.shutdown_calls == attempt + 1 &&
+                 runtime.stream_destructions == 0 &&
+                 state.primary_releases == 0,
+             "each permanently-pending retry must perform one bounded native "
+             "attempt and retain the complete unsafe island") &&
+         ok;
+  }
+
+  // Make the hermetic fake quiescent only for explicit cleanup so ASan can
+  // prove the retained fail-safe island is eventually released exactly once.
+  runtime.pending = false;
+  const auto cleanup = lease.Shutdown();
+  ok = Expect(cleanup.driver_context_release_permitted &&
+                  cleanup.quiescent && !cleanup.pending &&
+                  cleanup.shutdown_attempts == 4 &&
+                  factory->production_owner_retired() &&
+                  runtime.shutdown_calls == 6 &&
+                  runtime.stream_destructions == 1 &&
+                  state.primary_releases == 1,
+              "an explicitly retried quiescent island must complete without "
+              "double release after persistent pending evidence") &&
+       ok;
+  return ok;
+}
+
 bool ProductionFactoryReprepareAndRollbackAreLifetimeSafe() {
   FakeCudaState state{};
   PendingRuntime runtime{};
@@ -846,6 +1163,7 @@ bool ProductionFactoryReprepareAndRollbackAreLifetimeSafe() {
   setup.model.artifact_set_hash = backend.model_artifact.artifact_set_sha256;
   setup.model.artifact_generation = backend.model_artifact.registry_generation;
   setup.generations = {11, 12, 13, 14, 15, 0};
+  setup.reserved_budget = {128 * 1024, 64 * 1024, 4096, 4096, 32, 1};
   setup.backend = backend;
   setup.model_artifact_validated = true;
   setup.provider_runtime_validated = true;
@@ -975,6 +1293,10 @@ int main() {
   ok = CandidateFailuresRetainOldIslandAndRollbackExactStream() && ok;
   ok = ShutdownRetainsCompleteIslandUntilQuiescent() && ok;
   ok = ProductionStreamDestroyFailureIsRetryable() && ok;
+  ok = ProductionSetupLeaseIsExactStableAndIdempotent() && ok;
+  ok = ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() && ok;
+  ok = ProductionSetupLeaseShutdownRetriesPendingThenComplete() && ok;
+  ok = ProductionSetupLeasePermanentPendingIsTruthfulAndFailSafe() && ok;
   ok = ProductionFactoryReprepareAndRollbackAreLifetimeSafe() && ok;
   g_cuda = nullptr;
   if (!ok)

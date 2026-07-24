@@ -1,5 +1,6 @@
 #include "core/open_video/video_execution_factory.h"
 
+#include <limits>
 #include <new>
 #include <utility>
 
@@ -23,6 +24,35 @@ bool SameModel(const hal::ModelArtifactIdentity &left,
   return left.model_id_hash == right.model_id_hash &&
          left.artifact_set_hash == right.artifact_set_hash &&
          left.artifact_generation == right.artifact_generation;
+}
+
+bool AddBudgetBytes(std::uint64_t left, std::uint64_t right,
+                    std::uint64_t *result) noexcept {
+  if (!result || right > std::numeric_limits<std::uint64_t>::max() - left)
+    return false;
+  *result = left + right;
+  return true;
+}
+
+bool ValidReservedBudget(const hal::ResourceBudget &budget) noexcept {
+  if (budget.resource_count == 0 || budget.in_flight_slots != 1)
+    return false;
+  std::uint64_t total = 0;
+  return AddBudgetBytes(total, budget.persistent_bytes, &total) &&
+         AddBudgetBytes(total, budget.scratch_bytes, &total) &&
+         AddBudgetBytes(total, budget.upload_staging_bytes, &total) &&
+         AddBudgetBytes(total, budget.readback_staging_bytes, &total) &&
+         total != 0;
+}
+
+bool SameBudget(const hal::ResourceBudget &left,
+                const hal::ResourceBudget &right) noexcept {
+  return left.persistent_bytes == right.persistent_bytes &&
+         left.scratch_bytes == right.scratch_bytes &&
+         left.upload_staging_bytes == right.upload_staging_bytes &&
+         left.readback_staging_bytes == right.readback_staging_bytes &&
+         left.resource_count == right.resource_count &&
+         left.in_flight_slots == right.in_flight_slots;
 }
 
 bool TightRgb24(const hal::ImageDescriptor &image,
@@ -92,6 +122,8 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       resolution.selected_backend != hal::BackendId::cuda ||
       resolution.selected_provider != kProvider ||
       request.invalidation_key.generations != cached.generations ||
+      (ValidReservedBudget(cached.reserved_budget) &&
+       !SameBudget(request.budget, cached.reserved_budget)) ||
       request.invalidation_key.generations.context !=
           cached.execution_domain.logical_context_generation ||
       request.intent.stage_count != 1 ||
@@ -452,31 +484,48 @@ struct OpenCudaVideoExecutionFactory::Impl {
 
   class BorrowedResidentAdapter final : public hal::IResidentAdapter {
   public:
-    explicit BorrowedResidentAdapter(hal::IResidentAdapter *adapter) noexcept
-        : adapter_(adapter) {}
+    explicit BorrowedResidentAdapter(
+        OpenCudaProductionHalOwner *owner) noexcept
+        : owner_(owner),
+          adapter_instance_id_(owner && owner->adapter()
+                                   ? owner->adapter()->adapter_instance_id()
+                                   : 0) {}
 
     std::uint64_t adapter_instance_id() const noexcept override {
-      return adapter_ ? adapter_->adapter_instance_id() : 0;
+      return adapter_instance_id_;
     }
     hal::BackendId backend_id() const noexcept override {
-      return adapter_ ? adapter_->backend_id() : hal::BackendId::invalid;
+      return adapter_instance_id_ != 0 ? hal::BackendId::cuda
+                                       : hal::BackendId::invalid;
     }
     hal::StatusId Prepare(const hal::PreparedProgram &program,
                           hal::PreparedProgramHandle *candidate,
                           hal::ReadinessSnapshot *readiness,
                           hal::ReasonId *reason) noexcept override {
-      return adapter_->Prepare(program, candidate, readiness, reason);
+      auto *adapter = NativeAdapter();
+      if (!adapter)
+        return Stopped(readiness, reason);
+      return adapter->Prepare(program, candidate, readiness, reason);
     }
     hal::ExecuteResult
     Execute(const hal::PreparedProgramHandle &program,
             const hal::ExecuteRequest &request) noexcept override {
-      return adapter_->Execute(program, request);
+      auto *adapter = NativeAdapter();
+      if (adapter)
+        return adapter->Execute(program, request);
+      hal::ExecuteResult result;
+      result.status = hal::StatusId::stopped;
+      result.reason = hal::ReasonId::shutdown_requested;
+      return result;
     }
     hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &program,
                                 const hal::HostFrameBinding &binding,
                                 hal::HostFrameTokens *tokens,
                                 hal::ReasonId *reason) noexcept override {
-      return adapter_->BindHostFrame(program, binding, tokens, reason);
+      auto *adapter = NativeAdapter();
+      if (!adapter)
+        return Stopped(nullptr, reason);
+      return adapter->BindHostFrame(program, binding, tokens, reason);
     }
     hal::StatusId
     ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
@@ -484,24 +533,49 @@ struct OpenCudaVideoExecutionFactory::Impl {
                            const hal::ResourceHandle &output,
                            hal::HostFrameOutputResolution *resolution,
                            hal::ReasonId *reason) noexcept override {
-      return adapter_->ResolveHostFrameOutput(program, completion, output,
-                                              resolution, reason);
+      auto *adapter = NativeAdapter();
+      if (!adapter)
+        return Stopped(nullptr, reason);
+      return adapter->ResolveHostFrameOutput(program, completion, output,
+                                             resolution, reason);
     }
     hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &program,
                                      hal::ReasonId reason) noexcept override {
-      return adapter_->ResetTemporalState(program, reason);
+      auto *adapter = NativeAdapter();
+      return adapter ? adapter->ResetTemporalState(program, reason)
+                     : hal::StatusId::stopped;
     }
     void
     DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override {
-      adapter_->DestroyPrepared(program);
+      if (auto *adapter = NativeAdapter())
+        adapter->DestroyPrepared(program);
     }
     void Shutdown() noexcept override {
       // The registry owns this view for the factory lifetime. Native adapter
       // shutdown is deferred until factory retirement.
     }
 
+    void Retire() noexcept { retired_ = true; }
+
   private:
-    hal::IResidentAdapter *adapter_ = nullptr;
+    hal::IResidentAdapter *NativeAdapter() const noexcept {
+      return !retired_ && owner_ ? owner_->adapter() : nullptr;
+    }
+
+    static hal::StatusId
+    Stopped(hal::ReadinessSnapshot *readiness,
+            hal::ReasonId *reason) noexcept {
+      if (readiness) {
+        readiness->status = hal::StatusId::stopped;
+        readiness->reason = hal::ReasonId::shutdown_requested;
+      }
+      SetReason(reason, hal::ReasonId::shutdown_requested);
+      return hal::StatusId::stopped;
+    }
+
+    OpenCudaProductionHalOwner *owner_ = nullptr;
+    std::uint64_t adapter_instance_id_ = 0;
+    bool retired_ = false;
   };
 
   static void DestroyProductionLease(void *opaque) noexcept {
@@ -575,6 +649,13 @@ struct OpenCudaVideoExecutionFactory::Impl {
       evidence->candidate_resources_rolled_back = true;
       return evidence->status;
     }
+    if (!SameBudget(plan.prepared_program.budget,
+                    self->config.cached.reserved_budget)) {
+      evidence->status = hal::StatusId::resource_exhausted;
+      evidence->reason = hal::ReasonId::resource_exhausted;
+      evidence->candidate_resources_rolled_back = true;
+      return evidence->status;
+    }
     if (plan.prepared_program.stage_count != 1 ||
         plan.prepared_program.stages[0].semantic != self->production_semantic) {
       evidence->status = hal::StatusId::blocked;
@@ -615,6 +696,69 @@ struct OpenCudaVideoExecutionFactory::Impl {
   std::unique_ptr<BorrowedResidentAdapter> production_adapter_view;
   hal::AdapterRegistration production_registration{};
   hal::SemanticEffectId production_semantic = hal::SemanticEffectId::invalid;
+  bool production_shutdown_requested = false;
+  bool production_owner_retired = false;
+};
+
+class OpenCudaProductionSetupLeaseOwner final
+    : public video::IProductionVideoSetupLeaseOwner {
+public:
+  explicit OpenCudaProductionSetupLeaseOwner(
+      std::unique_ptr<OpenCudaVideoExecutionFactory> factory) noexcept
+      : factory_(std::move(factory)) {
+    if (factory_) {
+      resident_adapter_ =
+          factory_->adapter_registration().resident_adapter;
+      video_factory_ = factory_.get();
+    }
+  }
+
+  hal::IResidentAdapter *resident_adapter() const noexcept override {
+    return resident_adapter_;
+  }
+
+  video::IVideoAdapterFactory *
+  video_adapter_factory() const noexcept override {
+    return video_factory_;
+  }
+
+  void Shutdown() noexcept override {
+    (void)RequestShutdown();
+  }
+
+  video::ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept override {
+    video::ProductionVideoSetupLeaseShutdownResult result;
+    result.shutdown_requested = true;
+    if (!factory_) {
+      result.status = hal::StatusId::stopped;
+      result.reason = hal::ReasonId::shutdown_requested;
+      result.quiescent = true;
+      result.driver_context_release_permitted = true;
+      return result;
+    }
+
+    const auto native = factory_->RequestProductionOwnerShutdown();
+    result.shutdown_attempts = native.shutdown_attempts;
+    result.pending = !native.driver_context_release_permitted;
+    result.quiescent =
+        native.driver_context_release_permitted && native.quiescent;
+    result.driver_context_release_permitted =
+        native.driver_context_release_permitted;
+    if (result.driver_context_release_permitted) {
+      result.status = hal::StatusId::stopped;
+      result.reason = hal::ReasonId::shutdown_requested;
+    } else {
+      result.status = native.hal_status;
+      result.reason = native.reason;
+    }
+    return result;
+  }
+
+private:
+  std::unique_ptr<OpenCudaVideoExecutionFactory> factory_;
+  hal::IResidentAdapter *resident_adapter_ = nullptr;
+  video::IVideoAdapterFactory *video_factory_ = nullptr;
 };
 
 OpenCudaVideoExecutionFactory::OpenCudaVideoExecutionFactory(
@@ -643,6 +787,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       request.model.artifact_generation ==
           request.backend.model_artifact.registry_generation;
   if (request.factory_id == 0 || !supported_semantic || !exact_model ||
+      !ValidReservedBudget(request.reserved_budget) ||
       request.generations.configuration == 0 ||
       request.generations.geometry == 0 || request.generations.model == 0 ||
       request.generations.provider == 0 || request.generations.device == 0 ||
@@ -684,6 +829,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.readiness.available = true;
     config.cached.model = request.model;
     config.cached.generations = request.generations;
+    config.cached.reserved_budget = request.reserved_budget;
     config.cached.generations.context =
         owner->execution_domain().logical_context_generation;
     config.cached.model_artifact_validated = true;
@@ -712,7 +858,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     impl.production_owner = std::move(owner);
     impl.production_adapter_view =
         std::make_unique<Impl::BorrowedResidentAdapter>(
-            impl.production_owner->adapter());
+            impl.production_owner.get());
     impl.production_semantic = request.semantic;
     impl.production_registration.adapter_instance_id =
         impl.config.cached.execution_domain.adapter_instance_id;
@@ -762,6 +908,25 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     result->status = hal::StatusId::ready;
     result->reason = hal::ReasonId::none;
     result->exact_candidate_ready = true;
+    auto &snapshot = result->setup_lease;
+    snapshot.contract_version =
+        video::kProductionVideoSetupLeaseContractVersion;
+    snapshot.state = video::ProductionVideoSetupLeaseState::live;
+    snapshot.status = impl.config.cached.readiness.status;
+    snapshot.reason = impl.config.cached.readiness.reason;
+    snapshot.readiness = impl.config.cached.readiness;
+    snapshot.backend = hal::BackendId::cuda;
+    snapshot.execution_domain = impl.config.cached.execution_domain;
+    snapshot.generations = impl.config.cached.generations;
+    snapshot.reserved_budget = impl.config.cached.reserved_budget;
+    snapshot.providers[0] = kProvider;
+    snapshot.provider_count = 1;
+    snapshot.artifacts[0].semantic = request.semantic;
+    snapshot.artifacts[0].provider = kProvider;
+    snapshot.artifacts[0].artifact = impl.config.cached.model;
+    snapshot.artifact_count = 1;
+    snapshot.adapter = factory->adapter_registration();
+    snapshot.factory = factory->Registration();
     return factory;
   } catch (const std::bad_alloc &) {
     result->status = hal::StatusId::resource_exhausted;
@@ -771,6 +936,89 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     result->reason = hal::ReasonId::capability_evidence_incomplete;
   }
   return nullptr;
+}
+
+hal::StatusId OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+    const OpenCudaProductionVideoExecutionFactoryRequest &request,
+    video::ProductionVideoSetupLease *destination,
+    OpenCudaProductionVideoExecutionBootstrapResult *bootstrap,
+    video::ProductionVideoSetupLeaseAcquireEvidence *evidence,
+    hal::ReasonId *reason) noexcept {
+  OpenCudaProductionVideoExecutionBootstrapResult local_bootstrap;
+  if (!bootstrap)
+    bootstrap = &local_bootstrap;
+  if (evidence)
+    *evidence = {};
+  SetReason(reason, hal::ReasonId::none);
+
+  if (!ValidReservedBudget(request.reserved_budget)) {
+    *bootstrap = {};
+    bootstrap->status = hal::StatusId::resource_exhausted;
+    bootstrap->reason = hal::ReasonId::resource_exhausted;
+    SetReason(reason, bootstrap->reason);
+    if (evidence) {
+      evidence->status = bootstrap->status;
+      evidence->reason = bootstrap->reason;
+      evidence->readiness = bootstrap->setup_lease.readiness;
+      evidence->previous_lease_retained =
+          destination != nullptr && destination->live();
+    }
+    return bootstrap->status;
+  }
+
+  auto factory = CreateProduction(request, bootstrap);
+  if (!factory) {
+    SetReason(reason, bootstrap->reason);
+    if (evidence) {
+      evidence->status = bootstrap->status;
+      evidence->reason = bootstrap->reason;
+      evidence->readiness = bootstrap->setup_lease.readiness;
+      evidence->previous_lease_retained =
+          destination != nullptr && destination->live();
+    }
+    return bootstrap->status;
+  }
+
+  std::unique_ptr<video::IProductionVideoSetupLeaseOwner> owner;
+  try {
+    owner = std::make_unique<OpenCudaProductionSetupLeaseOwner>(
+        std::move(factory));
+  } catch (const std::bad_alloc &) {
+    bootstrap->status = hal::StatusId::resource_exhausted;
+    bootstrap->reason = hal::ReasonId::resource_exhausted;
+    SetReason(reason, bootstrap->reason);
+    if (evidence) {
+      evidence->status = bootstrap->status;
+      evidence->reason = bootstrap->reason;
+      evidence->readiness = bootstrap->setup_lease.readiness;
+      evidence->candidate_owner_rolled_back = true;
+      evidence->previous_lease_retained =
+          destination != nullptr && destination->live();
+    }
+    return bootstrap->status;
+  } catch (...) {
+    bootstrap->status = hal::StatusId::blocked;
+    bootstrap->reason = hal::ReasonId::capability_evidence_incomplete;
+    SetReason(reason, bootstrap->reason);
+    if (evidence) {
+      evidence->status = bootstrap->status;
+      evidence->reason = bootstrap->reason;
+      evidence->readiness = bootstrap->setup_lease.readiness;
+      evidence->candidate_owner_rolled_back = true;
+      evidence->previous_lease_retained =
+          destination != nullptr && destination->live();
+    }
+    return bootstrap->status;
+  }
+
+  const auto status = video::ProductionVideoSetupLease::Acquire(
+      bootstrap->setup_lease, std::move(owner), destination, evidence, reason);
+  if (status != hal::StatusId::ready &&
+      status != hal::StatusId::degraded) {
+    bootstrap->status = status;
+    bootstrap->reason = reason ? *reason : hal::ReasonId::none;
+  }
+  return status;
 }
 
 video::VideoAdapterFactoryRegistration
@@ -793,6 +1041,50 @@ OpenCudaVideoExecutionFactory::Registration() noexcept {
 hal::AdapterRegistration
 OpenCudaVideoExecutionFactory::adapter_registration() const noexcept {
   return impl_ ? impl_->production_registration : hal::AdapterRegistration{};
+}
+
+OpenCudaProductionShutdownResult
+OpenCudaVideoExecutionFactory::RequestProductionOwnerShutdown() noexcept {
+  OpenCudaProductionShutdownResult result;
+  if (!impl_ || !impl_->production_owner) {
+    result.status = OpenCudaProductionOwnerStatus::stopped;
+    result.hal_status = hal::StatusId::stopped;
+    result.reason = hal::ReasonId::shutdown_requested;
+    result.shutdown_requested = true;
+    result.quiescent = true;
+    result.driver_context_release_permitted = true;
+    return result;
+  }
+  if (impl_->production_owner_retired)
+    return impl_->production_owner->ShutdownSnapshot();
+
+  impl_->production_shutdown_requested = true;
+  result = impl_->production_owner->RequestShutdown();
+  if (result.driver_context_release_permitted) {
+    if (impl_->production_adapter_view)
+      impl_->production_adapter_view->Retire();
+    impl_->production_owner_retired = true;
+  }
+  return result;
+}
+
+OpenCudaProductionShutdownResult
+OpenCudaVideoExecutionFactory::production_shutdown_snapshot() const noexcept {
+  if (!impl_ || !impl_->production_owner) {
+    OpenCudaProductionShutdownResult result;
+    result.status = OpenCudaProductionOwnerStatus::stopped;
+    result.hal_status = hal::StatusId::stopped;
+    result.reason = hal::ReasonId::shutdown_requested;
+    result.shutdown_requested = true;
+    result.quiescent = true;
+    result.driver_context_release_permitted = true;
+    return result;
+  }
+  return impl_->production_owner->ShutdownSnapshot();
+}
+
+bool OpenCudaVideoExecutionFactory::production_owner_retired() const noexcept {
+  return impl_ && impl_->production_owner_retired;
 }
 
 video::VideoAdapterFactoryPreflight OpenCudaVideoExecutionFactory::Preflight(
