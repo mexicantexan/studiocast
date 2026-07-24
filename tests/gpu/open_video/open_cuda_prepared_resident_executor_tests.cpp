@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string_view>
 
 namespace {
@@ -191,7 +192,7 @@ Options(open_cuda::IPreparedOpenCudaRuntime *runtime) {
   options.model_preprocess_generation = 13;
   options.model_artifact_hash = 0xA2;
   options.executor_owns_stream = true;
-  options.blur_radius = 4;
+  options.strength = 8;
   options.runtime = runtime;
   return options;
 }
@@ -226,7 +227,8 @@ public:
   bool fail_prepare = false;
   bool oversized_budget = false;
   bool incomplete_evidence = false;
-  bool allocate_during_frame = false;
+  bool malformed_plan = false;
+  int forbidden_frame_work = 0;
   bool no_analysis = false;
   bool pending_destroy = false;
   std::uint64_t prepare_calls = 0;
@@ -236,6 +238,9 @@ public:
   std::uint64_t shutdown_calls = 0;
   open_cuda::PreparedOpenCudaRuntimeTelemetry telemetry{};
   open_cuda::PreparedOpenCudaShutdownSnapshot shutdown_snapshot{};
+  open_cuda::PreparedOpenCudaVbPlan prepared_plan{};
+  open_cuda::PreparedOpenCudaOperationId last_failed_operation =
+      open_cuda::PreparedOpenCudaOperationId::invalid;
 
   open_cuda::PreparedOpenCudaRuntimePrepareResult
   Prepare(const hal::PreparedProgram &program,
@@ -273,12 +278,43 @@ public:
         hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
     result.evidence.execution_domain = program.execution_domain;
     result.evidence.model_artifact = config.model_artifact;
-    result.evidence.reserved_budget = program.budget;
-    result.evidence.reserved_budget.persistent_bytes = 4096;
-    result.evidence.reserved_budget.scratch_bytes = 4096;
-    result.evidence.reserved_budget.upload_staging_bytes = 384;
-    result.evidence.reserved_budget.readback_staging_bytes = 384;
-    result.evidence.reserved_budget.resource_count = 16;
+    open_cuda::PreparedOpenCudaVbPlanInput plan_input;
+    plan_input.semantic = program.stages[0].semantic;
+    plan_input.frame_width = program.host_input.width;
+    plan_input.frame_height = program.host_input.height;
+    plan_input.model_width =
+        static_cast<std::uint64_t>(config.model_pack->matting->input.width);
+    plan_input.model_height =
+        static_cast<std::uint64_t>(config.model_pack->matting->input.height);
+    plan_input.requested_strength = config.strength;
+    plan_input.input_pitch_bytes =
+        program.stages[0].input.image.planes[0].row_stride_bytes;
+    plan_input.output_pitch_bytes =
+        program.stages[0].output.image.planes[0].row_stride_bytes;
+    plan_input.model_alpha_capacity_bytes =
+        plan_input.model_width * plan_input.model_height * sizeof(float);
+    plan_input.input_tensor_capacity_bytes =
+        plan_input.model_alpha_capacity_bytes * 3;
+    plan_input.resized_alpha_pitch_bytes =
+        plan_input.frame_width * sizeof(float);
+    plan_input.alpha_scratch_pitch_bytes =
+        plan_input.frame_width * sizeof(float);
+    plan_input.alpha_feather_pitch_bytes =
+        plan_input.frame_width * sizeof(float);
+    plan_input.blur_scratch_pitch_bytes = plan_input.input_pitch_bytes;
+    plan_input.blurred_pitch_bytes = plan_input.input_pitch_bytes;
+    plan_input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
+    plan_input.readback_staging_bytes =
+        program.host_output.planes[0].size_bytes;
+    plan_input.available_budget = program.budget;
+    result.evidence.geometry_plan =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(plan_input);
+    if (malformed_plan)
+      result.evidence.geometry_plan.launches[0].operation =
+          open_cuda::PreparedOpenCudaOperationId::composite_solid;
+    prepared_plan = result.evidence.geometry_plan;
+    result.evidence.reserved_budget =
+        result.evidence.geometry_plan.required_budget;
     if (oversized_budget)
       result.evidence.reserved_budget.persistent_bytes =
           program.budget.persistent_bytes + 1;
@@ -311,8 +347,18 @@ public:
       result.reason = hal::ReasonId::stale_program;
       return result;
     }
-    if (allocate_during_frame)
+    if (forbidden_frame_work == 1)
       ++telemetry.allocation_requests;
+    else if (forbidden_frame_work == 2)
+      ++telemetry.provider_probes;
+    else if (forbidden_frame_work == 3)
+      ++telemetry.model_scans;
+    else if (forbidden_frame_work == 4)
+      ++telemetry.manifest_parses;
+    else if (forbidden_frame_work == 5)
+      ++telemetry.session_constructions;
+    else if (forbidden_frame_work == 6)
+      ++telemetry.json_serializations;
     result.status = execute_status;
     if (frame.stage_disabled)
       result.status = RuntimeStatus::executed;
@@ -327,13 +373,23 @@ public:
       result.stage_failure_status = RuntimeStatus::inference_failed;
       result.stage_failure_reason =
           hal::ReasonId::semantic_provider_unavailable;
+      result.failed_operation =
+          open_cuda::PreparedOpenCudaOperationId::inference;
     } else if (result.status == RuntimeStatus::required_failed) {
       result.stage_failure_status = RuntimeStatus::postprocess_failed;
       result.stage_failure_reason = hal::ReasonId::transfer_contract_violated;
+      result.failed_operation =
+          slot->program.stages[0].semantic ==
+                  hal::SemanticEffectId::virtual_background_remove
+              ? open_cuda::PreparedOpenCudaOperationId::composite_solid
+              : open_cuda::PreparedOpenCudaOperationId::composite_background;
     } else if (result.status == RuntimeStatus::device_lost) {
       result.stage_failure_status = RuntimeStatus::device_lost;
       result.stage_failure_reason = hal::ReasonId::device_lost;
+      result.failed_operation =
+          open_cuda::PreparedOpenCudaOperationId::completion_wait;
     }
+    last_failed_operation = result.failed_operation;
     const bool completed = result.status == RuntimeStatus::executed ||
                            result.status == RuntimeStatus::optional_failed_open;
     if (completed) {
@@ -526,6 +582,199 @@ bool ResolveAndCommit(Fixture *fixture, const hal::ExecuteResult &result,
   return ok;
 }
 
+open_cuda::PreparedOpenCudaVbPlanInput
+PlanningInput(hal::SemanticEffectId semantic, int strength) {
+  open_cuda::PreparedOpenCudaVbPlanInput input;
+  input.semantic = semantic;
+  input.frame_width = 17;
+  input.frame_height = 9;
+  input.model_width = 8;
+  input.model_height = 4;
+  input.requested_strength = strength;
+  input.input_pitch_bytes = 64;
+  input.output_pitch_bytes = 80;
+  input.model_alpha_capacity_bytes = 128;
+  input.input_tensor_capacity_bytes = 384;
+  input.resized_alpha_pitch_bytes = 96;
+  input.alpha_scratch_pitch_bytes = 112;
+  input.alpha_feather_pitch_bytes = 128;
+  input.blur_scratch_pitch_bytes = 64;
+  input.blurred_pitch_bytes = 80;
+  input.upload_staging_bytes = 459;
+  input.readback_staging_bytes = 459;
+  input.available_budget.persistent_bytes = 1'000'000;
+  input.available_budget.scratch_bytes = 1'000'000;
+  input.available_budget.upload_staging_bytes = 1'000'000;
+  input.available_budget.readback_staging_bytes = 1'000'000;
+  input.available_budget.resource_count = 100;
+  input.available_budget.in_flight_slots = 1;
+  return input;
+}
+
+bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
+  using Operation = open_cuda::PreparedOpenCudaOperationId;
+  bool ok = true;
+  struct Threshold {
+    int requested = 0;
+    std::uint32_t strength = 0;
+    std::uint32_t feather = 0;
+  };
+  for (const auto threshold :
+       {Threshold{-10, 1, 0}, Threshold{1, 1, 0}, Threshold{15, 15, 0},
+        Threshold{16, 16, 1}, Threshold{63, 63, 3}, Threshold{64, 64, 4},
+        Threshold{100, 64, 4}}) {
+    const auto blur = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+        PlanningInput(hal::SemanticEffectId::virtual_background_blur,
+                      threshold.requested));
+    const std::uint32_t expected_launches = threshold.feather == 0 ? 4 : 6;
+    ok = Expect(
+             blur.ready() && blur.frame_width == 17 && blur.frame_height == 9 &&
+                 blur.model_width == 8 && blur.model_height == 4 &&
+                 blur.strength == threshold.strength &&
+                 blur.alpha_feather_radius == threshold.feather &&
+                 blur.launch_count == expected_launches &&
+                 blur.launches[0].operation == Operation::alpha_resize &&
+                 blur.launches[0].grid_x == 2 && blur.launches[0].grid_y == 1 &&
+                 blur.launches[0].block_x == 16 &&
+                 blur.launches[0].block_y == 16 &&
+                 blur.launches[expected_launches - 3].operation ==
+                     Operation::background_blur_horizontal &&
+                 blur.launches[expected_launches - 2].operation ==
+                     Operation::background_blur_vertical &&
+                 blur.launches[expected_launches - 1].operation ==
+                     Operation::composite_background,
+             "blur strength thresholds must prepare exact resize, optional "
+             "feather, blur, and composite launch geometry") &&
+         ok;
+    if (threshold.feather != 0) {
+      ok = Expect(blur.launches[1].operation ==
+                          Operation::alpha_feather_horizontal &&
+                      blur.launches[2].operation ==
+                          Operation::alpha_feather_vertical,
+                  "enabled alpha feather must be a prepared separable pair") &&
+           ok;
+    }
+
+    const auto remove = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove,
+                      threshold.requested));
+    const std::uint32_t expected_remove_launches =
+        threshold.feather == 0 ? 2 : 4;
+    ok = Expect(remove.ready() && remove.strength == threshold.strength &&
+                    remove.alpha_feather_radius == threshold.feather &&
+                    remove.launch_count == expected_remove_launches &&
+                    remove.launches[0].operation == Operation::alpha_resize &&
+                    remove.launches[expected_remove_launches - 1].operation ==
+                        Operation::composite_solid,
+                "remove strength must affect feather only and retain exact "
+                "solid composite ordering") &&
+         ok;
+  }
+
+  const auto blur = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+      PlanningInput(hal::SemanticEffectId::virtual_background_blur, 16));
+  ok = Expect(blur.required_budget.persistent_bytes == 2672 &&
+                  blur.required_budget.scratch_bytes == 3456 &&
+                  blur.required_budget.upload_staging_bytes == 459 &&
+                  blur.required_budget.readback_staging_bytes == 459 &&
+                  blur.required_budget.resource_count == 21 &&
+                  blur.required_budget.in_flight_slots == 1,
+              "blur budget must use exact prepared pitches and capacities") &&
+       ok;
+  const auto remove = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+      PlanningInput(hal::SemanticEffectId::virtual_background_remove, 16));
+  ok = Expect(remove.required_budget.persistent_bytes == 2672 &&
+                  remove.required_budget.scratch_bytes == 2160 &&
+                  remove.required_budget.resource_count == 19,
+              "remove budget must include every prepared alpha buffer but no "
+              "RGB blur buffers") &&
+       ok;
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
+    input.model_width = input.frame_width;
+    input.model_height = input.frame_height;
+    input.model_alpha_capacity_bytes =
+        input.model_width * input.model_height * sizeof(float);
+    input.input_tensor_capacity_bytes = input.model_alpha_capacity_bytes * 3;
+    const auto same_geometry =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(same_geometry.ready() && same_geometry.launches[0].operation ==
+                                             Operation::alpha_resize,
+                "alpha resize must remain explicit even when model and frame "
+                "geometry happen to match") &&
+         ok;
+  }
+
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_blur, 8);
+    input.frame_width = std::numeric_limits<std::uint64_t>::max();
+    const auto overflow =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(overflow.status == RuntimeStatus::resource_exhausted &&
+                    overflow.reason == hal::ReasonId::resource_exhausted,
+                "geometry arithmetic overflow must fail closed") &&
+         ok;
+  }
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_blur, 8);
+    input.frame_width = 1;
+    input.frame_height = 1;
+    input.model_width = 1;
+    input.model_height = 1;
+    input.input_pitch_bytes = std::numeric_limits<std::uint64_t>::max();
+    input.output_pitch_bytes = std::numeric_limits<std::uint64_t>::max();
+    input.model_alpha_capacity_bytes = 4;
+    input.input_tensor_capacity_bytes = 12;
+    input.resized_alpha_pitch_bytes = 4;
+    input.alpha_scratch_pitch_bytes = 4;
+    input.alpha_feather_pitch_bytes = 4;
+    input.blur_scratch_pitch_bytes = 3;
+    input.blurred_pitch_bytes = 3;
+    input.upload_staging_bytes = 3;
+    input.readback_staging_bytes = 3;
+    input.available_budget.persistent_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    input.available_budget.scratch_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    input.available_budget.upload_staging_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    input.available_budget.readback_staging_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    const auto overflow =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(overflow.status == RuntimeStatus::resource_exhausted &&
+                    overflow.reason == hal::ReasonId::resource_exhausted,
+                "prepared capacity addition overflow must fail closed") &&
+         ok;
+  }
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_blur, 8);
+    input.available_budget.scratch_bytes = 1;
+    const auto exhausted =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(exhausted.status == RuntimeStatus::resource_exhausted &&
+                    exhausted.reason == hal::ReasonId::resource_exhausted,
+                "exact prepared capacity above budget must fail setup") &&
+         ok;
+  }
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_blur, 8);
+    input.resized_alpha_pitch_bytes = 1;
+    const auto malformed =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(malformed.status == RuntimeStatus::malformed_contract &&
+                    malformed.reason == hal::ReasonId::malformed_descriptor,
+                "undersized prepared pitch must fail as malformed") &&
+         ok;
+  }
+  return ok;
+}
+
 bool TestAcceptedBlurAndRemoveThroughSession() {
   bool ok = true;
   for (const auto semantic :
@@ -583,7 +832,9 @@ bool TestOptionalFailurePreservesInputWithoutAttribution() {
                   result.transfers.uploads == 1 &&
                   result.transfers.final_readbacks == 1 &&
                   result.transfers.synchronizations == 1 &&
-                  result.transfers.cpu_tail_boundaries == 1,
+                  result.transfers.cpu_tail_boundaries == 1 &&
+                  fixture.runtime.last_failed_operation ==
+                      open_cuda::PreparedOpenCudaOperationId::inference,
               "optional failure should preserve exact valid input") &&
        ok;
   ok = ResolveAndCommit(&fixture, result) && ok;
@@ -609,8 +860,23 @@ bool TestRequiredFailureDeviceLossAndForbiddenFrameWork() {
                         hal::StageExecutionStatus::required_failed &&
                     result.stages[0].reason ==
                         hal::ReasonId::transfer_contract_violated &&
+                    fixture.runtime.last_failed_operation ==
+                        open_cuda::PreparedOpenCudaOperationId::
+                            composite_background &&
                     fixture.output[0] == std::byte{0xEE},
                 "required failure must not publish or attribute output") &&
+         ok;
+  }
+  {
+    Fixture fixture(hal::SemanticEffectId::virtual_background_remove);
+    ok = Configure(&fixture) && ok;
+    fixture.runtime.execute_status = RuntimeStatus::required_failed;
+    const auto result = ExecuteBound(&fixture, 1);
+    ok = Expect(result.status == hal::StatusId::failed &&
+                    fixture.runtime.last_failed_operation ==
+                        open_cuda::PreparedOpenCudaOperationId::composite_solid,
+                "remove failure must retain exact solid-composite "
+                "attribution") &&
          ok;
   }
   {
@@ -632,17 +898,45 @@ bool TestRequiredFailureDeviceLossAndForbiddenFrameWork() {
                 "device loss should quarantine the prepared program") &&
          ok;
   }
-  {
+  for (int forbidden_work = 1; forbidden_work <= 6; ++forbidden_work) {
     Fixture fixture;
     ok = Configure(&fixture) && ok;
-    fixture.runtime.allocate_during_frame = true;
+    fixture.runtime.forbidden_frame_work = forbidden_work;
     const auto result = ExecuteBound(&fixture, 1);
-    ok = Expect(result.status == hal::StatusId::failed &&
-                    result.reason == hal::ReasonId::synchronization_failed,
-                "frame allocation evidence must fail the adapter contract") &&
+    ok = Expect(result.status == hal::StatusId::failed && !result.output_valid,
+                "frame allocation/probe/scan/manifest/session/JSON evidence "
+                "must fail the adapter contract") &&
          ok;
   }
   return ok;
+}
+
+bool TestModelAndCaptureGeometryMayDiffer() {
+  FakeRuntime runtime;
+  auto options = Options(&runtime);
+  options.model_pack.matting->input.width = 8;
+  options.model_pack.matting->input.height = 4;
+  options.model_pack.matting->output.width = 8;
+  options.model_pack.matting->output.height = 4;
+  options.strength = 100;
+  open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+  open_cuda::ResidentAdapter adapter(81, executor);
+  hal::PreparedProgramSession session;
+  hal::ReadinessSnapshot readiness;
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto status =
+      session.Configure(Program(), adapter, &readiness, &reason);
+  return Expect(
+      status == hal::StatusId::degraded && runtime.prepare_calls == 1 &&
+          runtime.shutdown_snapshot.stream_owned && session.prepared() &&
+          runtime.prepared_plan.frame_width == 16 &&
+          runtime.prepared_plan.frame_height == 8 &&
+          runtime.prepared_plan.model_width == 8 &&
+          runtime.prepared_plan.model_height == 4 &&
+          runtime.prepared_plan.strength == 64 &&
+          runtime.prepared_plan.alpha_feather_radius == 4,
+      "ordinary capture geometry must preprocess to independent model "
+      "geometry and clamp strength during prepared planning");
 }
 
 bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
@@ -680,7 +974,7 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
       program.temporal.temporal = true;
       program.temporal.history_frames = 1;
     } else if (mode == 9) {
-      options.alpha_feather_radius = 1;
+      options.model_pack.matting->input.width = 0;
     } else {
       options.prepared_stream =
           reinterpret_cast<cuda::CUstream>(std::uintptr_t{0xBEEF});
@@ -697,24 +991,6 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
                     runtime.prepare_calls == 0,
                 "unsupported/mixed/scaled/non-strict/foreign/stale "
                 "program must fail before runtime setup") &&
-         ok;
-  }
-  {
-    FakeRuntime runtime;
-    auto options = Options(&runtime);
-    options.alpha_feather_radius = 1;
-    open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
-    open_cuda::ResidentAdapter adapter(81, executor);
-    hal::PreparedProgramSession session;
-    hal::ReadinessSnapshot readiness;
-    hal::ReasonId reason = hal::ReasonId::none;
-    const auto status =
-        session.Configure(Program(), adapter, &readiness, &reason);
-    ok = Expect(status == hal::StatusId::blocked &&
-                    reason == hal::ReasonId::semantic_effect_unsupported &&
-                    runtime.prepare_calls == 0,
-                "nonzero feather must be rejected until an exact prepared "
-                "resident operation exists") &&
          ok;
   }
   {
@@ -741,6 +1017,24 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
 
 bool TestBudgetEvidenceRollbackAndOldPlanRetention() {
   bool ok = true;
+  {
+    FakeRuntime runtime;
+    runtime.malformed_plan = true;
+    auto options = Options(&runtime);
+    open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+    open_cuda::ResidentAdapter adapter(81, executor);
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status =
+        session.Configure(Program(), adapter, &readiness, &reason);
+    ok = Expect(status == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::capability_evidence_incomplete &&
+                    runtime.destroy_calls == 1,
+                "malformed prepared launch order must be rejected and rolled "
+                "back") &&
+         ok;
+  }
   {
     FakeRuntime runtime;
     runtime.oversized_budget = true;
@@ -911,9 +1205,11 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
 
 int main() {
   bool ok = true;
+  ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
   ok = TestAcceptedBlurAndRemoveThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
   ok = TestRequiredFailureDeviceLossAndForbiddenFrameWork() && ok;
+  ok = TestModelAndCaptureGeometryMayDiffer() && ok;
   ok = TestEligibilityFailsClosedBeforeRuntimeSetup() && ok;
   ok = TestBudgetEvidenceRollbackAndOldPlanRetention() && ok;
   ok = TestStaleForeignBindingReconfigurationAndReset() && ok;

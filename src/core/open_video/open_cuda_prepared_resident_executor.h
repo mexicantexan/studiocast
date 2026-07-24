@@ -13,7 +13,7 @@
 
 namespace studiocast::open_cuda {
 
-inline constexpr std::uint32_t kPreparedOpenCudaRuntimeApiVersion = 1;
+inline constexpr std::uint32_t kPreparedOpenCudaRuntimeApiVersion = 2;
 
 // Stable executor/runtime outcomes. These are deliberately independent of
 // CUDA and ONNX Runtime error values so frame-time code never parses strings.
@@ -47,6 +47,81 @@ enum class PreparedOpenCudaRuntimeStatus : std::uint16_t {
   completion_pending = 26,
 };
 
+enum class PreparedOpenCudaOperationId : std::uint16_t {
+  invalid = 0,
+  upload = 1,
+  preprocess = 2,
+  inference = 3,
+  alpha_resize = 4,
+  alpha_feather_horizontal = 5,
+  alpha_feather_vertical = 6,
+  background_blur_horizontal = 7,
+  background_blur_vertical = 8,
+  composite_background = 9,
+  composite_solid = 10,
+  final_readback = 11,
+  completion_wait = 12,
+};
+
+struct PreparedOpenCudaLaunchGeometry {
+  PreparedOpenCudaOperationId operation = PreparedOpenCudaOperationId::invalid;
+  std::uint32_t grid_x = 0;
+  std::uint32_t grid_y = 0;
+  std::uint32_t block_x = 0;
+  std::uint32_t block_y = 0;
+};
+
+struct PreparedOpenCudaVbPlanInput {
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
+  std::uint64_t frame_width = 0;
+  std::uint64_t frame_height = 0;
+  std::uint64_t model_width = 0;
+  std::uint64_t model_height = 0;
+  int requested_strength = 8;
+  std::uint64_t input_pitch_bytes = 0;
+  std::uint64_t output_pitch_bytes = 0;
+  std::uint64_t model_alpha_capacity_bytes = 0;
+  std::uint64_t input_tensor_capacity_bytes = 0;
+  std::uint64_t resized_alpha_pitch_bytes = 0;
+  std::uint64_t alpha_scratch_pitch_bytes = 0;
+  std::uint64_t alpha_feather_pitch_bytes = 0;
+  std::uint64_t blur_scratch_pitch_bytes = 0;
+  std::uint64_t blurred_pitch_bytes = 0;
+  std::uint64_t upload_staging_bytes = 0;
+  std::uint64_t readback_staging_bytes = 0;
+  hal::ResourceBudget available_budget{};
+};
+
+struct PreparedOpenCudaVbPlan {
+  static constexpr std::size_t kMaxLaunches = 6;
+
+  std::uint32_t api_version = kPreparedOpenCudaRuntimeApiVersion;
+  PreparedOpenCudaRuntimeStatus status = PreparedOpenCudaRuntimeStatus::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
+  std::uint32_t frame_width = 0;
+  std::uint32_t frame_height = 0;
+  std::uint32_t model_width = 0;
+  std::uint32_t model_height = 0;
+  std::uint32_t strength = 0;
+  std::uint32_t alpha_feather_radius = 0;
+  hal::ResourceBudget required_budget{};
+  std::array<PreparedOpenCudaLaunchGeometry, kMaxLaunches> launches{};
+  std::uint32_t launch_count = 0;
+
+  [[nodiscard]] bool ready() const noexcept {
+    return status == PreparedOpenCudaRuntimeStatus::ready &&
+           reason == hal::ReasonId::none && launch_count > 0 &&
+           launch_count <= kMaxLaunches;
+  }
+};
+
+// Pure setup-time planning seam used by the production runtime and hermetic
+// conformance tests. All pitches/capacities are the exact prepared allocation
+// values, not logical active-byte estimates.
+PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
+    const PreparedOpenCudaVbPlanInput &input) noexcept;
+
 struct PreparedOpenCudaRuntimeHandle {
   std::uint64_t handle_id = 0;
   std::uint64_t program_id = 0;
@@ -67,8 +142,7 @@ struct PreparedOpenCudaProductionConfig {
   std::uint64_t model_preprocess_generation = 0;
   std::uint64_t model_artifact_hash = 0;
   bool executor_owns_stream = false;
-  int blur_radius = 16;
-  int alpha_feather_radius = 0;
+  int strength = 8;
   std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 };
@@ -82,6 +156,7 @@ struct PreparedOpenCudaRuntimeEvidence {
   hal::ExecutionDomainId execution_domain{};
   open_video::ValidatedModelArtifactIdentity model_artifact{};
   hal::ResourceBudget reserved_budget{};
+  PreparedOpenCudaVbPlan geometry_plan{};
   bool strict_cuda_only = false;
   bool user_stream_bound = false;
   bool cpu_provider_fallback_disabled = false;
@@ -125,6 +200,8 @@ struct PreparedOpenCudaRuntimeFrameResult {
   PreparedOpenCudaRuntimeStatus stage_failure_status =
       PreparedOpenCudaRuntimeStatus::invalid;
   hal::ReasonId stage_failure_reason = hal::ReasonId::none;
+  PreparedOpenCudaOperationId failed_operation =
+      PreparedOpenCudaOperationId::invalid;
   hal::TransferCounters transfers{};
   std::uint64_t stage_elapsed_ns = 0;
   std::uint64_t frame_elapsed_ns = 0;
@@ -203,8 +280,7 @@ public:
     std::uint64_t model_preprocess_generation = 0;
     std::uint64_t model_artifact_hash = 0;
     bool executor_owns_stream = false;
-    int blur_radius = 16;
-    int alpha_feather_radius = 0;
+    int strength = 8;
     std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
