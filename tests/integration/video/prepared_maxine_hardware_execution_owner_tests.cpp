@@ -299,8 +299,7 @@ bool EligibilityPreservesTemporalAndCanonicalCompatibilityRoutes() {
         video::PreparedMaxineHardwareEligibility::eligible);
   request.temporal_reset_required = true;
   CHECK(video::EvaluatePreparedMaxineHardwareEligibility(request) ==
-        video::PreparedMaxineHardwareEligibility::
-            temporal_reset_unsupported);
+        video::PreparedMaxineHardwareEligibility::eligible);
   request.temporal_reset_required = false;
   request.single_resident_island = false;
   CHECK(video::EvaluatePreparedMaxineHardwareEligibility(request) ==

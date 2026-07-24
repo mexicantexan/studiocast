@@ -168,10 +168,13 @@ bool ProductionStageKind(hal::SemanticEffectId semantic,
 }
 
 bool IsQualifiedV1Stage(hal::SemanticEffectId semantic) noexcept {
-  return semantic == hal::SemanticEffectId::virtual_background_blur ||
+  return semantic == hal::SemanticEffectId::video_noise_removal ||
+         semantic == hal::SemanticEffectId::eye_contact ||
+         semantic == hal::SemanticEffectId::virtual_background_blur ||
          semantic == hal::SemanticEffectId::virtual_background_remove ||
          semantic == hal::SemanticEffectId::virtual_background_replace ||
          semantic == hal::SemanticEffectId::virtual_key_light ||
+         semantic == hal::SemanticEffectId::auto_frame ||
          semantic == hal::SemanticEffectId::vignette;
 }
 
@@ -223,17 +226,25 @@ hal::ImageDescriptor Image(std::uint32_t width, std::uint32_t height,
 
 hal::ResourceBudget
 DefaultInjectedBudget(const PreparedMaxineHardwareRequest &request) noexcept {
-  std::uint64_t bytes = 0;
-  if (!Multiply(request.width, request.height, &bytes) ||
-      !Multiply(bytes, 3, &bytes) ||
-      bytes > std::numeric_limits<std::uint64_t>::max() / 8u) {
+  std::uint64_t input_bytes = 0;
+  std::uint64_t output_bytes = 0;
+  const auto output_width =
+      request.output_width == 0 ? request.width : request.output_width;
+  const auto output_height =
+      request.output_height == 0 ? request.height : request.output_height;
+  if (!Multiply(request.width, request.height, &input_bytes) ||
+      !Multiply(input_bytes, 3, &input_bytes) ||
+      !Multiply(output_width, output_height, &output_bytes) ||
+      !Multiply(output_bytes, 3, &output_bytes) ||
+      input_bytes > std::numeric_limits<std::uint64_t>::max() / 8u ||
+      output_bytes > std::numeric_limits<std::uint64_t>::max() / 2u) {
     return {};
   }
   hal::ResourceBudget budget;
-  budget.persistent_bytes = bytes * 8u;
-  budget.scratch_bytes = bytes;
-  budget.upload_staging_bytes = bytes;
-  budget.readback_staging_bytes = bytes;
+  budget.persistent_bytes = input_bytes * 8u + output_bytes * 2u;
+  budget.scratch_bytes = input_bytes;
+  budget.upload_staging_bytes = input_bytes;
+  budget.readback_staging_bytes = output_bytes;
   budget.resource_count = 16;
   budget.in_flight_slots = 1;
   return budget;
@@ -244,6 +255,8 @@ HashRequest(const PreparedMaxineHardwareRequest &request) noexcept {
   std::uint64_t hash = kHashOffset;
   hash = HashValue(hash, request.width);
   hash = HashValue(hash, request.height);
+  hash = HashValue(hash, request.output_width);
+  hash = HashValue(hash, request.output_height);
   hash = HashValue(hash, request.stage_count);
   hash = HashValue(hash, static_cast<std::uint64_t>(
                              request.effects.virtual_background.strength));
@@ -349,9 +362,10 @@ hal::PreparedProgram Program(const PreparedMaxineHardwareRequest &request,
             hal::ChannelOrder::rgb, hal::HostCoherence::coherent,
             hal::Mutability::read_only);
   program.host_output =
-      Image(request.width, request.height, hal::PixelFormat::bgr_u8,
-            hal::ChannelOrder::bgr, hal::HostCoherence::coherent,
-            hal::Mutability::write_only);
+      Image(request.output_width == 0 ? request.width : request.output_width,
+            request.output_height == 0 ? request.height : request.output_height,
+            hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::HostCoherence::coherent, hal::Mutability::write_only);
   program.invalidation_key.generations = request.generations;
   program.invalidation_key.generations.context =
       domain.logical_context_generation;
@@ -418,8 +432,10 @@ ProductionSetup(const PreparedMaxineHardwareRequest &request,
   setup.configuration_generation = request.generations.configuration;
   setup.width = request.width;
   setup.height = request.height;
-  setup.output_width = request.width;
-  setup.output_height = request.height;
+  setup.output_width =
+      request.output_width == 0 ? request.width : request.output_width;
+  setup.output_height =
+      request.output_height == 0 ? request.height : request.output_height;
   setup.enabled_maxine_stage_mask = stage_mask;
   setup.vfx_model_directory = request.vfx_model_directory;
   setup.effects = request.effects;
@@ -529,11 +545,10 @@ PreparedMaxineHardwareEligibility EvaluatePreparedMaxineHardwareEligibility(
     return PreparedMaxineHardwareEligibility::no_qualified_stage;
   if (request.stage_count > request.stages.size())
     return PreparedMaxineHardwareEligibility::unsupported_stage;
-  if (request.temporal_reset_required)
-    return PreparedMaxineHardwareEligibility::temporal_reset_unsupported;
   if (!request.host_input_is_tight_rgb24 ||
       !request.host_output_is_tight_bgr24 || request.width == 0 ||
-      request.height == 0) {
+      request.height == 0 ||
+      (request.output_width == 0) != (request.output_height == 0)) {
     return PreparedMaxineHardwareEligibility::unsupported_host_layout;
   }
   if (request.generations.configuration == 0) {
@@ -804,8 +819,14 @@ PreparedMaxineHardwareExecutionOwner::ConfigureInternal(
           exact_program->stage_count != candidate_request.stage_count ||
           exact_program->host_input.width != candidate_request.width ||
           exact_program->host_input.height != candidate_request.height ||
-          exact_program->host_output.width != candidate_request.width ||
-          exact_program->host_output.height != candidate_request.height ||
+          exact_program->host_output.width !=
+              (candidate_request.output_width == 0
+                   ? candidate_request.width
+                   : candidate_request.output_width) ||
+          exact_program->host_output.height !=
+              (candidate_request.output_height == 0
+                   ? candidate_request.height
+                   : candidate_request.output_height) ||
           exact_program->budget.persistent_bytes != budget.persistent_bytes ||
           exact_program->budget.scratch_bytes != budget.scratch_bytes ||
           exact_program->budget.upload_staging_bytes !=

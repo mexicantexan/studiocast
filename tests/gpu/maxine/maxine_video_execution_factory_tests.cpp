@@ -357,10 +357,10 @@ struct Fixture {
         coordinator.RegisterFactory(factory.registration(), &reason);
   }
 
-  bool Prepare() {
+  bool Prepare(video::VideoExecutionPlanRequest request = Request()) {
     video::VideoExecutionPrepareEvidence evidence;
     hal::ReasonId reason = hal::ReasonId::none;
-    const auto status = coordinator.Prepare(Request(), &evidence, &reason);
+    const auto status = coordinator.Prepare(request, &evidence, &reason);
     return (status == hal::StatusId::ready ||
             status == hal::StatusId::degraded) &&
            evidence.selected_factory_id == 8801;
@@ -547,6 +547,44 @@ bool OptionalFailOpenWrongGenerationDeviceLossAndShutdown() {
   return true;
 }
 
+bool TemporalDiscontinuityQuarantinesUntilSetupReprepare() {
+  Fixture fixture;
+  auto request = Request();
+  request.temporal.temporal = true;
+  request.temporal.requires_contiguous_capture_sequence = true;
+  request.temporal.frame_drop_behavior =
+      hal::FrameDropBehavior::reset_temporal_state;
+  request.temporal.discontinuity_action =
+      hal::TemporalDiscontinuityAction::reset_and_continue;
+  request.temporal.history_frames = 1;
+  CHECK(fixture.Prepare(request));
+
+  std::array<std::uint8_t, 72> input{};
+  std::array<std::uint8_t, 72> output{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto first =
+      fixture.coordinator.Execute(Binding(input.data(), output.data(), 1));
+  CHECK(first.status == hal::StatusId::executed);
+  CHECK(fixture.coordinator.CommitOutput(first.completion, true, &reason) ==
+        hal::StatusId::ready);
+
+  CHECK(fixture.coordinator.ResetTemporal(
+            hal::ReasonId::temporal_discontinuity) ==
+        hal::StatusId::quarantined);
+  const auto quarantined =
+      fixture.coordinator.Execute(Binding(input.data(), output.data(), 2));
+  CHECK(quarantined.status == hal::StatusId::quarantined);
+  CHECK(quarantined.reason == hal::ReasonId::temporal_discontinuity);
+
+  CHECK(fixture.Prepare(request));
+  const auto rebuilt =
+      fixture.coordinator.Execute(Binding(input.data(), output.data(), 3));
+  CHECK(rebuilt.status == hal::StatusId::executed);
+  CHECK(fixture.coordinator.CommitOutput(rebuilt.completion, true, &reason) ==
+        hal::StatusId::ready);
+  return true;
+}
+
 } // namespace
 
 void *operator new(std::size_t size) { return Allocate(size); }
@@ -561,7 +599,8 @@ void operator delete[](void *memory, std::size_t) noexcept {
 int main() {
   if (!ExactPreflightAndMalformedForeignGenerationRejection() ||
       !TransfersCpuTailWriterAttributionAndAllocationFreeExecute() ||
-      !OptionalFailOpenWrongGenerationDeviceLossAndShutdown()) {
+      !OptionalFailOpenWrongGenerationDeviceLossAndShutdown() ||
+      !TemporalDiscontinuityQuarantinesUntilSetupReprepare()) {
     return EXIT_FAILURE;
   }
   std::cout << "Maxine video execution factory tests passed\n";

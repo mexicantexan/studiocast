@@ -59,9 +59,10 @@ struct PreparedMaxineReplacementAsset {
   std::uint64_t generation = 0;
 };
 
-// Setup-only description for one conservative, contiguous Maxine execution
-// island. The first production migration intentionally excludes temporal
-// stages because the current owner cannot reset SDK history allocation-free.
+// Setup-only description for one contiguous Maxine execution island. Temporal
+// stages are prepared normally, but a discontinuity quarantines the executor
+// and requires setup-thread reconstruction when the SDK cannot reset history
+// allocation-free.
 struct PreparedMaxineHardwareRequest {
   hal::BackendId requested_backend = hal::BackendId::invalid;
   bool strict_backend_selection = false;
@@ -74,6 +75,8 @@ struct PreparedMaxineHardwareRequest {
   std::uint64_t adapter_instance_id = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  std::uint32_t output_width = 0;
+  std::uint32_t output_height = 0;
   float vignette_center_x_px = 0.0F;
   float vignette_center_y_px = 0.0F;
   effects::BroadcastCameraEffects effects{};

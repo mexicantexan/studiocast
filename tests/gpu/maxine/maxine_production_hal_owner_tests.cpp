@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <new>
 #include <utility>
@@ -202,6 +203,11 @@ struct RuntimeFixture {
   }
 };
 
+struct SetupSourceLifetime {
+  RuntimeFixture runtime;
+  FakeDeviceOps device_ops;
+};
+
 std::uint32_t Mask(std::initializer_list<ResidentStageKind> stages) {
   std::uint32_t mask = 0;
   for (const auto stage : stages)
@@ -270,6 +276,149 @@ hal::ImageDescriptor Image(std::uint32_t width, std::uint32_t height,
   image.planes[0] =
       hal::PlaneDescriptor{0, row, row * height, width, height, 1};
   return image;
+}
+
+video::ProductionVideoResidentSetup
+SetupSourceRequest(hal::SemanticEffectId semantic,
+                   const std::filesystem::path &replacement_path = {}) {
+  video::ProductionVideoResidentSetup request;
+  request.effects.engine = video::effects::EffectsEnginePreference::maxine;
+  auto &plan = request.plan;
+  plan.plan_id = 7000 + static_cast<std::uint32_t>(semantic);
+  plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  plan.intent.backend.backend = hal::BackendId::maxine;
+  plan.intent.backend.strict = true;
+  plan.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  plan.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::maxine;
+  plan.intent.preferences.strict_effects_engine = true;
+  auto &stage = plan.intent.stages[0];
+  stage.intent.stage_id = 1;
+  stage.intent.semantic = semantic;
+  stage.intent.failure_action =
+      hal::FailureAction::fail_open_preserve_last_valid;
+  plan.intent.stage_count = 1;
+
+  const auto signed_parameter = [&](video::CanonicalVideoParameterId id,
+                                    int value) {
+    stage.parameters[stage.parameter_count++] = {
+        id, video::CanonicalVideoParameterKind::signed_integer, value};
+  };
+  const auto unsigned_parameter = [&](video::CanonicalVideoParameterId id,
+                                      std::uint64_t value) {
+    video::CanonicalVideoParameter parameter;
+    parameter.id = id;
+    parameter.kind = video::CanonicalVideoParameterKind::unsigned_integer;
+    parameter.unsigned_value = value;
+    stage.parameters[stage.parameter_count++] = parameter;
+  };
+  const auto bool_parameter = [&](video::CanonicalVideoParameterId id,
+                                  bool value) {
+    video::CanonicalVideoParameter parameter;
+    parameter.id = id;
+    parameter.kind = video::CanonicalVideoParameterKind::boolean;
+    parameter.boolean_value = value;
+    stage.parameters[stage.parameter_count++] = parameter;
+  };
+
+  switch (semantic) {
+  case hal::SemanticEffectId::video_noise_removal:
+    request.effects.video_noise_removal.enabled = true;
+    signed_parameter(video::CanonicalVideoParameterId::strength,
+                     request.effects.video_noise_removal.strength);
+    break;
+  case hal::SemanticEffectId::eye_contact:
+    request.effects.eye_contact.enabled = true;
+    signed_parameter(video::CanonicalVideoParameterId::strength,
+                     request.effects.eye_contact.strength);
+    bool_parameter(video::CanonicalVideoParameterId::look_away_enabled,
+                   request.effects.eye_contact.look_away_enabled);
+    break;
+  case hal::SemanticEffectId::virtual_background_blur:
+  case hal::SemanticEffectId::virtual_background_remove:
+  case hal::SemanticEffectId::virtual_background_replace:
+    request.effects.virtual_background.mode =
+        semantic == hal::SemanticEffectId::virtual_background_blur
+            ? video::effects::VirtualBackgroundMode::blur
+            : (semantic == hal::SemanticEffectId::virtual_background_remove
+                   ? video::effects::VirtualBackgroundMode::remove
+                   : video::effects::VirtualBackgroundMode::replace);
+    request.effects.virtual_background.greenscreen_temporal = false;
+    request.effects.virtual_background.replace_path = replacement_path.string();
+    signed_parameter(video::CanonicalVideoParameterId::strength,
+                     request.effects.virtual_background.strength);
+    unsigned_parameter(video::CanonicalVideoParameterId::remove_color_rgb, 0);
+    unsigned_parameter(video::CanonicalVideoParameterId::greenscreen_mode,
+                       request.effects.virtual_background.greenscreen_mode);
+    bool_parameter(video::CanonicalVideoParameterId::greenscreen_temporal,
+                   request.effects.virtual_background.greenscreen_temporal);
+    break;
+  case hal::SemanticEffectId::virtual_key_light:
+    request.effects.virtual_key_light.enabled = true;
+    signed_parameter(video::CanonicalVideoParameterId::intensity,
+                     request.effects.virtual_key_light.intensity);
+    signed_parameter(video::CanonicalVideoParameterId::temperature_preset,
+                     request.effects.virtual_key_light.temperature_preset);
+    signed_parameter(video::CanonicalVideoParameterId::direction_pan_degrees,
+                     request.effects.virtual_key_light.direction_pan_degrees);
+    break;
+  case hal::SemanticEffectId::auto_frame: {
+    request.effects.auto_frame.enabled = true;
+    signed_parameter(video::CanonicalVideoParameterId::strength,
+                     request.effects.auto_frame.strength);
+    signed_parameter(video::CanonicalVideoParameterId::smoothing,
+                     request.effects.auto_frame.smoothing);
+    video::CanonicalVideoParameter headroom;
+    headroom.id = video::CanonicalVideoParameterId::headroom;
+    headroom.kind = video::CanonicalVideoParameterKind::real;
+    headroom.real_value = request.effects.auto_frame.headroom;
+    stage.parameters[stage.parameter_count++] = headroom;
+    break;
+  }
+  case hal::SemanticEffectId::vignette:
+    request.effects.vignette.enabled = true;
+    request.effects.vignette.center_on_tracked_face = false;
+    signed_parameter(video::CanonicalVideoParameterId::intensity,
+                     request.effects.vignette.intensity);
+    bool_parameter(video::CanonicalVideoParameterId::center_on_tracked_face,
+                   request.effects.vignette.center_on_tracked_face);
+    break;
+  case hal::SemanticEffectId::mirror:
+  case hal::SemanticEffectId::invalid:
+    break;
+  }
+
+  plan.host_input =
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+            hal::HostCoherence::coherent, hal::Mutability::read_only);
+  plan.host_output =
+      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::HostCoherence::coherent, hal::Mutability::write_only);
+  plan.invalidation_key.generations.configuration = 7;
+  plan.invalidation_key.generations.geometry = 8;
+  plan.invalidation_key.canonical_plan_hash =
+      9000 + static_cast<std::uint32_t>(semantic);
+  plan.budget = Capacity();
+  plan.cpu_tails[0].id = semantic == hal::SemanticEffectId::auto_frame
+                             ? hal::CpuTailId::auto_frame_tracking
+                             : hal::CpuTailId::output_format_conversion;
+  plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
+  plan.cpu_tails[0].after_stage_id = 1;
+  plan.cpu_tails[0].boundary_index = 1;
+  plan.cpu_tail_count = 1;
+  if (semantic == hal::SemanticEffectId::video_noise_removal ||
+      semantic == hal::SemanticEffectId::eye_contact ||
+      semantic == hal::SemanticEffectId::auto_frame) {
+    plan.temporal.temporal = true;
+    plan.temporal.requires_contiguous_capture_sequence = true;
+    plan.temporal.frame_drop_behavior =
+        hal::FrameDropBehavior::reset_temporal_state;
+    plan.temporal.discontinuity_action =
+        hal::TemporalDiscontinuityAction::reset_and_continue;
+    plan.temporal.history_frames = 1;
+  }
+  return request;
 }
 
 hal::PreparedStage Stage(const hal::ExecutionDomainId &domain, std::uint32_t id,
@@ -1033,7 +1182,121 @@ bool TypedSetupLeaseRollsBackStaleEvidenceAndRetainsPrevious() {
   return true;
 }
 
-bool TemporalConfigurationsFailClosedWithoutResetEvidence() {
+bool BackendSetupSourceBindsEveryCurrentSemanticExactly() {
+  auto lifetime = std::make_shared<SetupSourceLifetime>();
+  CHECK(lifetime->runtime.Initialize());
+  const auto runtime = lifetime->runtime.Runtime();
+  MaxineProductionBackendSetupSourceConfiguration configuration;
+  configuration.sdk_library_path = STUDIOCAST_FAKE_MAXINE_SDK_PATH;
+  configuration.vfx_model_directory = "/fake/models";
+  configuration.injected_runtime = {
+      reinterpret_cast<std::uintptr_t>(runtime.vfx),
+      reinterpret_cast<std::uintptr_t>(runtime.nvcv),
+      reinterpret_cast<std::uintptr_t>(runtime.ar),
+      reinterpret_cast<std::uintptr_t>(runtime.cuda),
+      reinterpret_cast<std::uintptr_t>(&lifetime->device_ops),
+  };
+  configuration.injected_runtime_lifetime = lifetime;
+  configuration.bypass_system_diagnostics_for_testing = true;
+  auto source = CreateMaxineProductionVideoBackendSetupSource(configuration);
+  CHECK(source);
+
+  const auto replacement = std::filesystem::temp_directory_path() /
+                           "studiocast-maxine-setup-source-replacement.ppm";
+  {
+    std::ofstream image(replacement, std::ios::binary | std::ios::trunc);
+    CHECK(image.good());
+    image << "P6\n2 1\n255\n";
+    const std::array<char, 6> pixels{char(0xff), 0, 0, 0, char(0xff), 0};
+    image.write(pixels.data(), static_cast<std::streamsize>(pixels.size()));
+    CHECK(image.good());
+  }
+
+  const std::array semantics{
+      hal::SemanticEffectId::video_noise_removal,
+      hal::SemanticEffectId::eye_contact,
+      hal::SemanticEffectId::virtual_background_blur,
+      hal::SemanticEffectId::virtual_background_remove,
+      hal::SemanticEffectId::virtual_background_replace,
+      hal::SemanticEffectId::virtual_key_light,
+      hal::SemanticEffectId::auto_frame,
+      hal::SemanticEffectId::vignette,
+  };
+  for (const auto semantic : semantics) {
+    const auto request = SetupSourceRequest(semantic, replacement);
+    auto result = source->AcquireResidentSetup(request);
+    CHECK(result.setup_completed_outside_frame_loop);
+    CHECK(result.status == hal::StatusId::ready);
+    CHECK(result.reason == hal::ReasonId::none);
+    CHECK(result.canonical_effects == request.effects);
+    CHECK(result.lease.live());
+    CHECK(result.plan.intent.stage_count == 1);
+    CHECK(result.plan.intent.stages[0].intent.semantic == semantic);
+    CHECK(result.plan.invalidation_key.execution_domain_hash != 0);
+    CHECK(result.lease.snapshot().backend == hal::BackendId::maxine);
+    CHECK(result.lease.snapshot().execution_domain.backend ==
+          hal::BackendId::maxine);
+    CHECK(result.lease.snapshot().reserved_budget.persistent_bytes ==
+          request.plan.budget.persistent_bytes);
+    const bool has_configurable_model =
+        semantic == hal::SemanticEffectId::video_noise_removal ||
+        semantic == hal::SemanticEffectId::eye_contact ||
+        semantic == hal::SemanticEffectId::virtual_background_blur ||
+        semantic == hal::SemanticEffectId::virtual_background_remove ||
+        semantic == hal::SemanticEffectId::virtual_background_replace ||
+        semantic == hal::SemanticEffectId::auto_frame;
+    CHECK(result.model_selection_count ==
+          static_cast<std::size_t>(has_configurable_model));
+    if (has_configurable_model) {
+      CHECK(result.model_selections[0].semantic == semantic);
+      CHECK(result.model_selections[0].requested_model_id.empty());
+      CHECK(!result.model_selections[0].selected_model_id.empty());
+      CHECK(result.model_selections[0].default_selected);
+    }
+    if (semantic == hal::SemanticEffectId::vignette) {
+      CHECK(result.lease.snapshot().artifact_count == 0);
+    } else {
+      CHECK(result.plan.intent.stages[0].model.artifact_generation != 0);
+      CHECK(result.lease.snapshot().artifact_count == 1);
+      CHECK(result.lease.snapshot().artifacts[0].semantic == semantic);
+      const auto &bound = result.lease.snapshot().artifacts[0].artifact;
+      const auto &planned = result.plan.intent.stages[0].model;
+      CHECK(bound.model_id_hash == planned.model_id_hash);
+      CHECK(bound.artifact_set_hash == planned.artifact_set_hash);
+      CHECK(bound.artifact_generation == planned.artifact_generation);
+    }
+    const auto shutdown = result.lease.Shutdown();
+    CHECK(shutdown.status == hal::StatusId::stopped);
+    CHECK(shutdown.quiescent);
+    CHECK(shutdown.driver_context_release_permitted);
+  }
+  auto wrong_backend =
+      SetupSourceRequest(hal::SemanticEffectId::virtual_background_blur);
+  wrong_backend.plan.intent.backend.backend = hal::BackendId::cuda;
+  const auto rejected = source->AcquireResidentSetup(wrong_backend);
+  CHECK(rejected.status == hal::StatusId::blocked);
+  CHECK(rejected.reason == hal::ReasonId::strict_backend_unavailable);
+  auto automatic =
+      SetupSourceRequest(hal::SemanticEffectId::virtual_background_blur);
+  automatic.effects.engine =
+      video::effects::EffectsEnginePreference::auto_select;
+  automatic.plan.intent.backend.mode = hal::BackendRequestMode::automatic;
+  automatic.plan.intent.backend.backend = hal::BackendId::invalid;
+  automatic.plan.intent.backend.strict = false;
+  automatic.plan.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::automatic;
+  automatic.plan.intent.preferences.strict_effects_engine = false;
+  auto automatic_result = source->AcquireResidentSetup(automatic);
+  CHECK(automatic_result.status == hal::StatusId::ready);
+  CHECK(automatic_result.canonical_effects == automatic.effects);
+  CHECK(automatic_result.lease.Shutdown().status == hal::StatusId::stopped);
+  std::error_code cleanup_error;
+  std::filesystem::remove(replacement, cleanup_error);
+  CHECK(!cleanup_error);
+  return true;
+}
+
+bool TemporalConfigurationsPrepareButResetRequiresReconstruction() {
   RuntimeFixture runtime{};
   CHECK(runtime.Initialize());
   FakeDeviceOps ops{};
@@ -1050,9 +1313,9 @@ bool TemporalConfigurationsFailClosedWithoutResetEvidence() {
   program.temporal.temporal = true;
   program.temporal.requires_contiguous_capture_sequence = true;
   program.temporal.history_frames = 1;
-  CHECK(owner->ConfigureProgram(program, &result) == hal::StatusId::blocked);
-  CHECK(result.reason == hal::ReasonId::capability_evidence_incomplete);
-  CHECK(!owner->prepared());
+  CHECK(owner->ConfigureProgram(program, &result) == hal::StatusId::ready);
+  CHECK(result.reason == hal::ReasonId::none);
+  CHECK(owner->prepared());
   return true;
 }
 
@@ -1074,7 +1337,8 @@ int main() {
       !ProductionBootstrapReusesOwnerRollsBackAndRetainsExecutorLifetime() ||
       !TypedSetupLeasePublishesExactMixedEvidenceAndTearsDownInOrder() ||
       !TypedSetupLeaseRollsBackStaleEvidenceAndRetainsPrevious() ||
-      !TemporalConfigurationsFailClosedWithoutResetEvidence()) {
+      !BackendSetupSourceBindsEveryCurrentSemanticExactly() ||
+      !TemporalConfigurationsPrepareButResetRequiresReconstruction()) {
     return EXIT_FAILURE;
   }
   g_cuda = nullptr;

@@ -379,6 +379,7 @@ MaxineProductionHalOwner::CreateBackend(
     configuration.execution_domain = owner->execution_domain_;
     configuration.resident_key = owner->resident_key_;
     configuration.capacity = request.capacity;
+    configuration.temporal_reprepare_on_reset = true;
     MaxineHalAdapterHooks hooks{};
     hooks.owner = owner.get();
     hooks.classify_failure = ClassifyFailure;
@@ -462,11 +463,6 @@ bool MaxineProductionHalOwner::ValidateProgramStageSet(
       *reason = program.execution_domain != execution_domain_
                     ? ReasonId::wrong_execution_domain
                     : ReasonId::wrong_generation;
-    return false;
-  }
-  if (temporal_reset_required_) {
-    if (reason)
-      *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
   if (program.stage_count == 0 ||

@@ -101,6 +101,10 @@ struct MaxineHalAdapterConfiguration {
   hal::ExecutionDomainId execution_domain{};
   ResidentFrameKey resident_key{};
   hal::ResourceBudget capacity{};
+  // Some SDK stages have no proven allocation-free history reset. Production
+  // may still prepare them when its neutral executor guarantees that a
+  // discontinuity invalidates the program and requires setup-thread reprepare.
+  bool temporal_reprepare_on_reset = false;
 };
 
 // Production-shaped synchronous Maxine resident adapter. The injected executor

@@ -84,10 +84,13 @@ ProviderFor(hal::SemanticEffectId semantic) noexcept {
 }
 
 bool IsQualifiedStage(hal::SemanticEffectId semantic) noexcept {
-  return semantic == hal::SemanticEffectId::virtual_background_blur ||
+  return semantic == hal::SemanticEffectId::video_noise_removal ||
+         semantic == hal::SemanticEffectId::eye_contact ||
+         semantic == hal::SemanticEffectId::virtual_background_blur ||
          semantic == hal::SemanticEffectId::virtual_background_remove ||
          semantic == hal::SemanticEffectId::virtual_background_replace ||
          semantic == hal::SemanticEffectId::virtual_key_light ||
+         semantic == hal::SemanticEffectId::auto_frame ||
          semantic == hal::SemanticEffectId::vignette;
 }
 
@@ -116,11 +119,17 @@ hal::ImageDescriptor ResidentImage(std::uint32_t width, std::uint32_t height,
   return image;
 }
 
-bool HasExactOutputTail(const video::VideoExecutionPlanRequest &request,
-                        const hal::ResolutionResult &resolution) noexcept {
+bool HasExactCpuTail(const video::VideoExecutionPlanRequest &request,
+                     const hal::ResolutionResult &resolution) noexcept {
   if (request.cpu_tail_count != 1 || resolution.stage_count == 0)
     return false;
   std::size_t last_resolved = resolution.stage_count;
+  bool has_auto_frame = false;
+  for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+    has_auto_frame |= !resolution.stages[index].skipped_optional &&
+                      resolution.stages[index].intent.semantic ==
+                          hal::SemanticEffectId::auto_frame;
+  }
   while (last_resolved != 0 &&
          resolution.stages[last_resolved - 1].skipped_optional) {
     --last_resolved;
@@ -129,7 +138,9 @@ bool HasExactOutputTail(const video::VideoExecutionPlanRequest &request,
     return false;
   const auto &last = resolution.stages[last_resolved - 1];
   const auto &tail = request.cpu_tails[0];
-  return tail.id == hal::CpuTailId::output_format_conversion &&
+  return tail.id == (has_auto_frame
+                         ? hal::CpuTailId::auto_frame_tracking
+                         : hal::CpuTailId::output_format_conversion) &&
          tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
          tail.after_stage_id == last.intent.stage_id &&
          tail.before_stage_id == 0 && tail.boundary_index == last_resolved;
@@ -173,19 +184,13 @@ bool ExactFrozenInputs(const video::VideoExecutionPlanRequest &request,
     SetReason(reason, hal::ReasonId::malformed_descriptor);
     return false;
   }
-  if (request.host_input.width != request.host_output.width ||
-      request.host_input.height != request.host_output.height ||
-      request.temporal.temporal || request.temporal.history_frames != 0 ||
-      !HasExactOutputTail(request, resolution) ||
+  if (!HasExactCpuTail(request, resolution) ||
       domain_plan.expected_transfers.uploads != 1 ||
       domain_plan.expected_transfers.final_readbacks != 1 ||
       domain_plan.expected_transfers.intermediate_uploads != 0 ||
       domain_plan.expected_transfers.intermediate_readbacks != 0 ||
       domain_plan.expected_transfers.cpu_tail_boundaries != 1) {
-    SetReason(reason,
-              request.temporal.temporal || request.temporal.history_frames != 0
-                  ? hal::ReasonId::capability_evidence_incomplete
-                  : hal::ReasonId::malformed_contract);
+    SetReason(reason, hal::ReasonId::malformed_contract);
     return false;
   }
   std::size_t prepared_index = 0;
@@ -315,9 +320,18 @@ bool ApplyStageParameters(const video::CanonicalVideoStage &stage,
                           video::effects::BroadcastCameraEffects *effects,
                           hal::ReasonId *reason) noexcept {
   auto &background = effects->virtual_background;
+  auto &denoise = effects->video_noise_removal;
+  auto &eye_contact = effects->eye_contact;
+  auto &auto_frame = effects->auto_frame;
   auto &key_light = effects->virtual_key_light;
   auto &vignette = effects->vignette;
   switch (stage.intent.semantic) {
+  case hal::SemanticEffectId::video_noise_removal:
+    denoise.enabled = true;
+    break;
+  case hal::SemanticEffectId::eye_contact:
+    eye_contact.enabled = true;
+    break;
   case hal::SemanticEffectId::virtual_background_blur:
     background.mode = video::effects::VirtualBackgroundMode::blur;
     break;
@@ -329,6 +343,9 @@ bool ApplyStageParameters(const video::CanonicalVideoStage &stage,
     break;
   case hal::SemanticEffectId::virtual_key_light:
     key_light.enabled = true;
+    break;
+  case hal::SemanticEffectId::auto_frame:
+    auto_frame.enabled = true;
     break;
   case hal::SemanticEffectId::vignette:
     vignette.enabled = true;
@@ -352,6 +369,10 @@ bool ApplyStageParameters(const video::CanonicalVideoStage &stage,
       break;
     case video::CanonicalVideoParameterId::strength:
       if ((stage.intent.semantic !=
+               hal::SemanticEffectId::video_noise_removal &&
+           stage.intent.semantic != hal::SemanticEffectId::eye_contact &&
+           stage.intent.semantic != hal::SemanticEffectId::auto_frame &&
+           stage.intent.semantic !=
                hal::SemanticEffectId::virtual_background_blur &&
            stage.intent.semantic !=
                hal::SemanticEffectId::virtual_background_remove &&
@@ -362,7 +383,32 @@ bool ApplyStageParameters(const video::CanonicalVideoStage &stage,
         SetReason(reason, hal::ReasonId::malformed_contract);
         return false;
       }
-      background.strength = static_cast<int>(signed_value);
+      if (stage.intent.semantic == hal::SemanticEffectId::video_noise_removal) {
+        denoise.strength = static_cast<int>(signed_value);
+      } else if (stage.intent.semantic == hal::SemanticEffectId::eye_contact) {
+        eye_contact.strength = static_cast<int>(signed_value);
+      } else if (stage.intent.semantic == hal::SemanticEffectId::auto_frame) {
+        auto_frame.strength = static_cast<int>(signed_value);
+      } else {
+        background.strength = static_cast<int>(signed_value);
+      }
+      break;
+    case video::CanonicalVideoParameterId::smoothing:
+      if (stage.intent.semantic != hal::SemanticEffectId::auto_frame ||
+          !ParameterAsSigned(parameter, &signed_value) ||
+          !FitsInt(signed_value)) {
+        SetReason(reason, hal::ReasonId::malformed_contract);
+        return false;
+      }
+      auto_frame.smoothing = static_cast<int>(signed_value);
+      break;
+    case video::CanonicalVideoParameterId::headroom:
+      if (stage.intent.semantic != hal::SemanticEffectId::auto_frame ||
+          parameter.kind != video::CanonicalVideoParameterKind::real) {
+        SetReason(reason, hal::ReasonId::malformed_contract);
+        return false;
+      }
+      auto_frame.headroom = static_cast<float>(parameter.real_value);
       break;
     case video::CanonicalVideoParameterId::remove_color_rgb:
       if ((stage.intent.semantic !=
@@ -451,9 +497,14 @@ bool ApplyStageParameters(const video::CanonicalVideoStage &stage,
       }
       vignette.center_on_tracked_face = false;
       break;
-    case video::CanonicalVideoParameterId::smoothing:
-    case video::CanonicalVideoParameterId::headroom:
     case video::CanonicalVideoParameterId::look_away_enabled:
+      if (stage.intent.semantic != hal::SemanticEffectId::eye_contact ||
+          !ParameterAsBool(parameter, &bool_value)) {
+        SetReason(reason, hal::ReasonId::malformed_contract);
+        return false;
+      }
+      eye_contact.look_away_enabled = bool_value;
+      break;
     case video::CanonicalVideoParameterId::invalid:
       SetReason(reason, hal::ReasonId::malformed_contract);
       return false;
@@ -479,6 +530,8 @@ bool BuildOwnerRequest(
       plan.domain_plan.islands[0].adapter_instance_id;
   request->width = plan.host_input.width;
   request->height = plan.host_input.height;
+  request->output_width = plan.host_output.width;
+  request->output_height = plan.host_output.height;
   request->stage_count = 0;
   request->generations = plan.invalidation_key.generations;
   request->capacity = plan.budget;
@@ -520,6 +573,11 @@ public:
   video::VideoExecutionFrameResult
   Execute(const hal::HostFrameBinding &binding) noexcept override {
     video::VideoExecutionFrameResult result;
+    if (temporal_reprepare_required_) {
+      result.status = hal::StatusId::quarantined;
+      result.reason = hal::ReasonId::temporal_discontinuity;
+      return result;
+    }
     if (!owner_ || binding.input_plane_count != 1 ||
         binding.output_plane_count != 1 ||
         !SameImage(binding.input_descriptor, plan_.host_input) ||
@@ -554,6 +612,15 @@ public:
     result.output.capture_sequence = binding.capture_sequence;
     result.output.output_ready = frame.output_ready;
     result.output_ready = frame.output_ready;
+    if (frame.reason == hal::ReasonId::temporal_discontinuity &&
+        frame.status != hal::StatusId::executed &&
+        frame.status != hal::StatusId::degraded) {
+      temporal_reprepare_required_ = true;
+      owner_->Invalidate(hal::ReasonId::temporal_discontinuity);
+      result.status = hal::StatusId::quarantined;
+      result.output_ready = false;
+      result.output.output_ready = false;
+    }
     if (frame.reason == hal::ReasonId::device_lost) {
       owner_->NotifyDeviceLost();
       if (notify_device_lost_)
@@ -577,9 +644,16 @@ public:
       owner_->Invalidate(reason);
   }
 
-  hal::StatusId ResetTemporal(hal::ReasonId) noexcept override {
-    return plan_.temporal.temporal ? hal::StatusId::blocked
-                                   : hal::StatusId::ready;
+  hal::StatusId ResetTemporal(hal::ReasonId reason) noexcept override {
+    if (!plan_.temporal.temporal)
+      return hal::StatusId::ready;
+    temporal_reprepare_required_ = true;
+    if (owner_) {
+      owner_->Invalidate(reason == hal::ReasonId::none
+                             ? hal::ReasonId::temporal_discontinuity
+                             : reason);
+    }
+    return hal::StatusId::quarantined;
   }
 
   void Shutdown() noexcept override {
@@ -595,6 +669,21 @@ public:
       return result;
     }
     const auto snapshot = owner_->Snapshot();
+    if (temporal_reprepare_required_) {
+      result.status = hal::StatusId::quarantined;
+      result.reason = hal::ReasonId::temporal_discontinuity;
+      result.readiness = snapshot.readiness;
+      result.readiness.status = hal::StatusId::quarantined;
+      result.readiness.reason = hal::ReasonId::temporal_discontinuity;
+      result.readiness.available = false;
+      result.readiness.rebuild_requested = true;
+      result.telemetry = snapshot.telemetry;
+      result.latest_committed_frame = snapshot.latest_committed_frame;
+      result.execution_domain = plan_.domain_plan.islands[0].execution_domain;
+      result.plan_id = plan_.plan_id;
+      result.prepared = false;
+      return result;
+    }
     result.status = snapshot.readiness.status;
     result.reason = snapshot.readiness.reason;
     result.readiness = snapshot.readiness;
@@ -615,6 +704,7 @@ private:
   video::FrozenVideoExecutionPlan plan_{};
   void *device_loss_owner_ = nullptr;
   void (*notify_device_lost_)(void *) noexcept = nullptr;
+  bool temporal_reprepare_required_ = false;
 };
 
 } // namespace

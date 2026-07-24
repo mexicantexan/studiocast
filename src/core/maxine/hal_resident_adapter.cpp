@@ -679,7 +679,8 @@ StatusId MaxineHalResidentAdapter::Prepare(
     SetReason(reason, ReasonId::resource_exhausted);
     return StatusId::resource_exhausted;
   }
-  if (program.temporal.temporal && !hooks_.reset_temporal) {
+  if (program.temporal.temporal && !hooks_.reset_temporal &&
+      !configuration_.temporal_reprepare_on_reset) {
     SetReason(reason, ReasonId::capability_evidence_incomplete);
     return StatusId::blocked;
   }
