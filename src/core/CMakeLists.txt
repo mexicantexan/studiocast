@@ -201,7 +201,8 @@ set(_studiocast_video_execution_runtime_sources
 
 set(_studiocast_video_backend_composition_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/production_video_backend_manager.cpp
-        ${PROJECT_SOURCE_DIR}/src/core/video/production_video_execution_composition.cpp)
+        ${PROJECT_SOURCE_DIR}/src/core/video/production_video_execution_composition.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/video/static_production_video_backend_setup_source.cpp)
 
 set(_studiocast_video_runtime_sources
         # Protected implementation: source ownership only; contents remain unchanged.
@@ -336,7 +337,10 @@ target_link_libraries(studiocast_video_execution_runtime
         PUBLIC studiocast_hal_runtime)
 target_link_libraries(studiocast_video_backend_composition
         PUBLIC studiocast_video_execution_runtime
-        PRIVATE studiocast_vulkan_backend)
+        PRIVATE
+        studiocast_maxine_backend
+        studiocast_open_video_backend
+        studiocast_vulkan_backend)
 target_link_libraries(studiocast_video_runtime
         PUBLIC
         studiocast_contracts
@@ -578,7 +582,10 @@ studiocast_assert_direct_dependencies(studiocast_video_execution_runtime
         PUBLIC_STUDIOCAST_DEPS studiocast_hal_runtime)
 studiocast_assert_direct_dependencies(studiocast_video_backend_composition
         PUBLIC_STUDIOCAST_DEPS studiocast_video_execution_runtime
-        PRIVATE_STUDIOCAST_DEPS studiocast_vulkan_backend)
+        PRIVATE_STUDIOCAST_DEPS
+        studiocast_maxine_backend
+        studiocast_open_video_backend
+        studiocast_vulkan_backend)
 studiocast_assert_direct_dependencies(studiocast_video_runtime
         PUBLIC_STUDIOCAST_DEPS
         studiocast_contracts studiocast_cuda_support
@@ -634,7 +641,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 138)
+set(_studiocast_expected_source_count 139)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
