@@ -22,6 +22,24 @@ bool IsFrameSuccess(hal::StatusId status) noexcept {
          status == hal::StatusId::passthrough;
 }
 
+bool IsCompatibilityEligibleSetupFailure(
+    hal::StatusId status, hal::ReasonId reason,
+    const VideoAdapterPrepareEvidence &prepare_evidence) noexcept {
+  const bool no_candidate_attempted =
+      prepare_evidence.status == hal::StatusId::invalid;
+  if (!no_candidate_attempted &&
+      !prepare_evidence.candidate_resources_rolled_back) {
+    return false;
+  }
+  if (status == hal::StatusId::resource_exhausted)
+    return reason == hal::ReasonId::resource_exhausted;
+  if (status != hal::StatusId::unavailable)
+    return false;
+  return reason == hal::ReasonId::semantic_provider_unavailable ||
+         reason == hal::ReasonId::capability_evidence_incomplete ||
+         reason == hal::ReasonId::resource_exhausted;
+}
+
 hal::BackendId
 ExpectedRequestedBackend(const VideoExecutionPlanRequest &request,
                          const hal::ResolutionResult &resolution) noexcept {
@@ -204,6 +222,7 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
   if (program.program_id != request.plan_id ||
       program.owner_adapter_instance_id != island.adapter_instance_id ||
       program.execution_domain != island.execution_domain ||
+      program.stage_count != island.stage_count ||
       !SameImage(program.host_input, request.host_input) ||
       !SameImage(program.host_output, request.host_output) ||
       program.invalidation_key != request.invalidation_key ||
@@ -228,17 +247,21 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
     return false;
   }
   std::size_t prepared_index = 0;
+  std::size_t expected_tail_count = 0;
   for (std::size_t index = 0; index < resolution.stage_count; ++index) {
     const auto &resolved = resolution.stages[index];
     if (resolved.skipped_optional)
       continue;
-    if (prepared_index >= program.stage_count) {
+    if (prepared_index >= program.stage_count ||
+        prepared_index >= island.stage_count ||
+        island.resolved_stage_indices[prepared_index] != index) {
       SetReason(reason, hal::ReasonId::malformed_contract);
       return false;
     }
     const auto &stage = program.stages[prepared_index];
     if (stage.stage_id != resolved.intent.stage_id ||
         stage.semantic != resolved.intent.semantic ||
+        stage.primitive != hal::PrimitiveOperationId::invalid ||
         stage.backend != resolved.selected_backend ||
         stage.provider != resolved.provider ||
         stage.execution_domain != resolved.execution_domain ||
@@ -250,6 +273,28 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
                             : hal::ReasonId::malformed_contract);
       return false;
     }
+    if (resolved.cpu_tail != hal::CpuTailId::invalid) {
+      if (expected_tail_count >= program.cpu_tail_count) {
+        SetReason(reason, hal::ReasonId::malformed_contract);
+        return false;
+      }
+      const auto &tail = program.cpu_tails[expected_tail_count++];
+      const bool before = resolved.cpu_tail_placement ==
+                          hal::DeclaredCpuTail::Placement::before_stage;
+      const auto expected_boundary =
+          static_cast<std::uint32_t>(before ? index : index + 1);
+      if (tail.id != resolved.cpu_tail ||
+          tail.scratch_bytes != resolved.cpu_tail_scratch_bytes ||
+          tail.placement != resolved.cpu_tail_placement ||
+          tail.boundary_index != expected_boundary ||
+          (before && (tail.before_stage_id != resolved.intent.stage_id ||
+                      tail.after_stage_id != 0)) ||
+          (!before && (tail.after_stage_id != resolved.intent.stage_id ||
+                       tail.before_stage_id != 0))) {
+        SetReason(reason, hal::ReasonId::malformed_contract);
+        return false;
+      }
+    }
     ++prepared_index;
   }
   for (std::size_t index = 0; index < request.cpu_tail_count; ++index) {
@@ -258,9 +303,15 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
       return false;
     }
   }
-  if (prepared_index != program.stage_count)
+  if (prepared_index != program.stage_count ||
+      prepared_index != island.stage_count ||
+      expected_tail_count != program.cpu_tail_count ||
+      domain_plan.expected_transfers.cpu_tail_boundaries !=
+          program.cpu_tail_count) {
     SetReason(reason, hal::ReasonId::malformed_contract);
-  return prepared_index == program.stage_count;
+    return false;
+  }
+  return true;
 }
 
 bool ExactPreflight(const VideoAdapterFactoryRegistration &registration,
@@ -593,9 +644,8 @@ VideoExecutionCoordinator::Prepare(const VideoExecutionPlanRequest &request,
                         &preflight, &adapter_prepare, &route_reason);
     prepare_.candidate_resources_rolled_back =
         adapter_prepare.candidate_resources_rolled_back;
-    if (!IsSetupSuccess(status) &&
-        (adapter_prepare.status == hal::StatusId::invalid ||
-         adapter_prepare.candidate_resources_rolled_back) &&
+    if (IsCompatibilityEligibleSetupFailure(status, route_reason,
+                                            adapter_prepare) &&
         request.migration_policy ==
             VideoExecutionMigrationPolicy::
                 prepared_then_same_resolution_compatibility) {
@@ -807,8 +857,14 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
            plan_.domain_plan.expected_transfers.uploads ||
        frame.transfers.final_readbacks !=
            plan_.domain_plan.expected_transfers.final_readbacks ||
-       frame.transfers.intermediate_readbacks != 0 ||
-       frame.transfers.intermediate_uploads != 0)) {
+       frame.transfers.intermediate_readbacks !=
+           plan_.domain_plan.expected_transfers.intermediate_readbacks ||
+       frame.transfers.intermediate_uploads !=
+           plan_.domain_plan.expected_transfers.intermediate_uploads ||
+       frame.transfers.synchronizations !=
+           plan_.domain_plan.expected_transfers.synchronizations ||
+       frame.transfers.cpu_tail_boundaries !=
+           plan_.domain_plan.expected_transfers.cpu_tail_boundaries)) {
     frame.status = hal::StatusId::failed;
     frame.reason = hal::ReasonId::transfer_contract_violated;
     telemetry_.runtime_status = frame.status;

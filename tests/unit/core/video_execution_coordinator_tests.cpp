@@ -176,7 +176,9 @@ private:
 };
 
 hal::SemanticCapabilityEvidence
-Capability(hal::BackendId backend, hal::SemanticEffectProviderId provider) {
+Capability(hal::BackendId backend, hal::SemanticEffectProviderId provider,
+           hal::CpuTailId cpu_tail = hal::CpuTailId::invalid,
+           std::uint64_t cpu_tail_scratch_bytes = 0) {
   hal::SemanticCapabilityEvidence capability;
   capability.semantic = hal::SemanticEffectId::virtual_background_blur;
   capability.provider = provider;
@@ -184,6 +186,9 @@ Capability(hal::BackendId backend, hal::SemanticEffectProviderId provider) {
   capability.live_stage = true;
   capability.production_eligible = true;
   capability.exact_evidence = true;
+  capability.cpu_tail = cpu_tail;
+  capability.cpu_tail_scratch_bytes = cpu_tail_scratch_bytes;
+  capability.cpu_tail_placement = hal::DeclaredCpuTail::Placement::after_stage;
   capability.evidence[0] = {
       hal::CapabilityEvidenceCode::provider_runtime_available,
       hal::StatusId::ready,
@@ -199,14 +204,17 @@ bool RegisterCapability(hal::StaticAdapterRegistry *registry,
                         DummyResident *adapter,
                         const hal::ExecutionDomainId &domain,
                         hal::SemanticEffectProviderId provider,
-                        std::uint32_t priority = 10) {
+                        std::uint32_t priority = 10,
+                        hal::CpuTailId cpu_tail = hal::CpuTailId::invalid,
+                        std::uint64_t cpu_tail_scratch_bytes = 0) {
   hal::AdapterRegistration registration;
   registration.adapter_instance_id = domain.adapter_instance_id;
   registration.backend = domain.backend;
   registration.execution_domain = domain;
   registration.selection_priority = priority;
   registration.resident_adapter = adapter;
-  registration.semantic_capabilities[0] = Capability(domain.backend, provider);
+  registration.semantic_capabilities[0] =
+      Capability(domain.backend, provider, cpu_tail, cpu_tail_scratch_bytes);
   registration.semantic_capability_count = 1;
   hal::ReasonId reason = hal::ReasonId::none;
   return registry->Register(registration, &reason) == hal::StatusId::ready;
@@ -218,6 +226,7 @@ enum class ExecuteMode {
   wrong_domain,
   stale_program,
   device_loss,
+  transfer_mismatch,
 };
 
 class FakeExecutor final : public video::IVideoExecutionExecutor {
@@ -257,9 +266,7 @@ public:
     result.stages[0].semantic = hal::SemanticEffectId::virtual_background_blur;
     result.stages[0].status = hal::StageExecutionStatus::succeeded;
     result.stages[0].valid_output_preserved = true;
-    result.transfers.uploads = 1;
-    result.transfers.final_readbacks = 1;
-    result.transfers.synchronizations = 1;
+    result.transfers = plan_.domain_plan.expected_transfers;
     std::memcpy(binding.output_planes[0].write_data,
                 binding.input_planes[0].read_data, 24);
     switch (mode_) {
@@ -281,6 +288,9 @@ public:
       result.status = hal::StatusId::failed;
       result.reason = hal::ReasonId::device_lost;
       result.output_ready = false;
+      break;
+    case ExecuteMode::transfer_mismatch:
+      ++result.transfers.synchronizations;
       break;
     }
     return result;
@@ -365,8 +375,16 @@ public:
     result.readiness.provider = result.provider;
     result.readiness.execution_domain = result.execution_domain;
     result.readiness.available = preflight_status == hal::StatusId::ready;
-    if (route == video::VideoExecutionRoute::prepared_resident)
+    if (route == video::VideoExecutionRoute::prepared_resident) {
       result.prepared_program = Program(request, resolution);
+      if (malformed_prepared_program)
+        result.prepared_program.stages[0].provider =
+            hal::SemanticEffectProviderId::invalid;
+      if (malformed_prepared_tail &&
+          result.prepared_program.cpu_tail_count != 0) {
+        ++result.prepared_program.cpu_tails[0].scratch_bytes;
+      }
+    }
     return result;
   }
 
@@ -435,6 +453,8 @@ public:
   bool accepts_frozen_resolution = true;
   bool performs_selection = false;
   bool wrong_preflight_domain = false;
+  bool malformed_prepared_program = false;
+  bool malformed_prepared_tail = false;
   bool candidate_rolled_back = false;
   std::uint64_t preflight_calls = 0;
   std::uint64_t prepare_calls = 0;
@@ -860,6 +880,8 @@ bool TestFactorySelectionDeclarationFailsClosed() {
   FakeFactory factory(
       domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
   factory.performs_selection = true;
+  FakeFactory compatibility(
+      domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
   video::VideoExecutionCoordinator coordinator(registry);
   hal::ReasonId reason = hal::ReasonId::none;
   if (coordinator.RegisterFactory(
@@ -867,14 +889,108 @@ bool TestFactorySelectionDeclarationFailsClosed() {
               1, video::VideoExecutionRoute::prepared_resident, domain,
               hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
               &factory),
+          &reason) != hal::StatusId::ready ||
+      coordinator.RegisterFactory(
+          FactoryRegistration(
+              2, video::VideoExecutionRoute::legacy_compatibility, domain,
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+              &compatibility),
           &reason) != hal::StatusId::ready) {
     return false;
   }
+  auto request = Request();
+  request.migration_policy = video::VideoExecutionMigrationPolicy::
+      prepared_then_same_resolution_compatibility;
   video::VideoExecutionPrepareEvidence evidence;
-  return Require(coordinator.Prepare(Request(), &evidence, &reason) ==
+  return Require(coordinator.Prepare(request, &evidence, &reason) ==
                          hal::StatusId::blocked &&
                      reason == hal::ReasonId::malformed_contract,
-                 "factory-side selection must fail closed");
+                 "factory-side selection must fail closed") &&
+         Require(compatibility.preflight_calls == 0,
+                 "factory-side selection must never reach compatibility");
+}
+
+bool TestPreparedIntegrityFailureCannotReachCompatibility() {
+  const auto run = [](bool wrong_domain, bool malformed_program) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    if (!RegisterCapability(
+            &registry, &resident, domain,
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
+      return false;
+    }
+    FakeFactory prepared(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+    prepared.wrong_preflight_domain = wrong_domain;
+    prepared.malformed_prepared_program = malformed_program;
+    FakeFactory compatibility(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(
+                1, video::VideoExecutionRoute::prepared_resident, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &prepared),
+            &reason) != hal::StatusId::ready ||
+        coordinator.RegisterFactory(
+            FactoryRegistration(
+                2, video::VideoExecutionRoute::legacy_compatibility, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &compatibility),
+            &reason) != hal::StatusId::ready) {
+      return false;
+    }
+    auto request = Request();
+    request.migration_policy = video::VideoExecutionMigrationPolicy::
+        prepared_then_same_resolution_compatibility;
+    video::VideoExecutionPrepareEvidence evidence;
+    const auto status = coordinator.Prepare(request, &evidence, &reason);
+    return Require(status == hal::StatusId::blocked,
+                   "prepared integrity failure must remain blocked") &&
+           Require(reason == (wrong_domain
+                                  ? hal::ReasonId::wrong_execution_domain
+                                  : hal::ReasonId::malformed_contract),
+                   "prepared integrity reason must be preserved") &&
+           Require(compatibility.preflight_calls == 0,
+                   "prepared integrity failure must not reach compatibility");
+  };
+  return run(true, false) && run(false, true);
+}
+
+bool TestNoPreparedFactoryMayUseCompatibility() {
+  const auto domain = Domain();
+  DummyResident resident(domain);
+  hal::StaticAdapterRegistry registry;
+  if (!RegisterCapability(
+          &registry, &resident, domain,
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
+    return false;
+  }
+  FakeFactory compatibility(
+      domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (coordinator.RegisterFactory(
+          FactoryRegistration(
+              2, video::VideoExecutionRoute::legacy_compatibility, domain,
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+              &compatibility),
+          &reason) != hal::StatusId::ready) {
+    return false;
+  }
+  auto request = Request();
+  request.migration_policy = video::VideoExecutionMigrationPolicy::
+      prepared_then_same_resolution_compatibility;
+  video::VideoExecutionPrepareEvidence evidence;
+  return Require(coordinator.Prepare(request, &evidence, &reason) ==
+                     hal::StatusId::ready,
+                 "missing prepared factory may use explicit compatibility") &&
+         Require(evidence.selected_route ==
+                         video::VideoExecutionRoute::legacy_compatibility &&
+                     evidence.compatibility_consumed_frozen_resolution,
+                 "missing factory fallback must consume frozen resolution");
 }
 
 bool TestCompatibilityRequiresPreparedRollbackEvidence() {
@@ -918,6 +1034,87 @@ bool TestCompatibilityRequiresPreparedRollbackEvidence() {
                  "unproven candidate rollback must fail closed") &&
          Require(compatibility.preflight_calls == 0,
                  "compatibility must wait for rollback evidence");
+}
+
+bool TestPreparedTransferContractAndFinalCpuTail() {
+  const auto run = [](ExecuteMode mode, bool malformed_tail) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    constexpr std::uint64_t kTailScratch = 16;
+    if (!RegisterCapability(
+            &registry, &resident, domain,
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda, 10,
+            hal::CpuTailId::writer_copy, kTailScratch)) {
+      return false;
+    }
+    FakeFactory factory(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+        mode);
+    factory.malformed_prepared_tail = malformed_tail;
+    FakeFactory compatibility(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(
+                1, video::VideoExecutionRoute::prepared_resident, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &factory),
+            &reason) != hal::StatusId::ready ||
+        coordinator.RegisterFactory(
+            FactoryRegistration(
+                2, video::VideoExecutionRoute::legacy_compatibility, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &compatibility),
+            &reason) != hal::StatusId::ready) {
+      return false;
+    }
+    auto request = Request();
+    request.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+    request.cpu_tails[0].after_stage_id = 1;
+    request.cpu_tails[0].scratch_bytes = kTailScratch;
+    request.cpu_tails[0].required = true;
+    request.cpu_tails[0].placement =
+        hal::DeclaredCpuTail::Placement::after_stage;
+    request.cpu_tails[0].boundary_index = 1;
+    request.cpu_tail_count = 1;
+    if (malformed_tail) {
+      request.migration_policy = video::VideoExecutionMigrationPolicy::
+          prepared_then_same_resolution_compatibility;
+      video::VideoExecutionPrepareEvidence evidence;
+      return Require(coordinator.Prepare(request, &evidence, &reason) ==
+                             hal::StatusId::blocked &&
+                         reason == hal::ReasonId::malformed_contract,
+                     "malformed prepared CPU tail must fail closed") &&
+             Require(
+                 compatibility.preflight_calls == 0,
+                 "malformed prepared CPU tail must not reach compatibility");
+    }
+    if (!Configure(&coordinator, request))
+      return false;
+    std::uint8_t input[24]{};
+    std::uint8_t output[24]{};
+    const auto frame = coordinator.Execute(Binding(input, output, 1));
+    if (mode == ExecuteMode::transfer_mismatch) {
+      return Require(frame.status == hal::StatusId::failed &&
+                         frame.reason ==
+                             hal::ReasonId::transfer_contract_violated,
+                     "any prepared transfer-counter mismatch must fail");
+    }
+    return Require(frame.status == hal::StatusId::executed,
+                   "declared final CPU-tail frame must execute") &&
+           Require(frame.transfers.uploads == 1 &&
+                       frame.transfers.final_readbacks == 1 &&
+                       frame.transfers.intermediate_readbacks == 0 &&
+                       frame.transfers.intermediate_uploads == 0 &&
+                       frame.transfers.synchronizations == 1 &&
+                       frame.transfers.cpu_tail_boundaries == 1,
+                   "all six prepared transfer counters must match the plan");
+  };
+  return run(ExecuteMode::success, false) &&
+         run(ExecuteMode::transfer_mismatch, false) &&
+         run(ExecuteMode::success, true);
 }
 
 bool TestNoAllocationDuringExecute() {
@@ -992,7 +1189,10 @@ int main() {
   ok &= TestDeviceLossAndShutdown();
   ok &= TestCompatibilityConsumesFrozenResolutionWithoutReselection();
   ok &= TestFactorySelectionDeclarationFailsClosed();
+  ok &= TestPreparedIntegrityFailureCannotReachCompatibility();
+  ok &= TestNoPreparedFactoryMayUseCompatibility();
   ok &= TestCompatibilityRequiresPreparedRollbackEvidence();
+  ok &= TestPreparedTransferContractAndFinalCpuTail();
   ok &= TestNoAllocationDuringExecute();
   if (!ok)
     return 1;
