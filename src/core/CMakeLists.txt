@@ -84,6 +84,7 @@ set(_studiocast_maxine_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/maxine/paths.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/production_hal_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/production_resident_frame_executor.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/maxine/production_video_execution_bootstrap.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/resident_frame_section.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/video_execution_factory.cpp
         ${PROJECT_SOURCE_DIR}/src/core/maxine/vfx_api.cpp
@@ -629,7 +630,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 133)
+set(_studiocast_expected_source_count 134)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

@@ -537,6 +537,7 @@ if (BUILD_TESTING)
     )
     target_link_libraries(studiocast-maxine-production-hal-owner-tests PRIVATE
             studiocast_maxine_backend
+            studiocast_video_execution_runtime
             studiocast-maxine-effect-fake-sdk
     )
     target_include_directories(studiocast-maxine-production-hal-owner-tests PRIVATE
