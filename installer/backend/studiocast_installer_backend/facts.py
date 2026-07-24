@@ -46,6 +46,7 @@ from .contracts import (
 )
 from .manifest import manifest_state, validated_v4l_ownership
 from .packaged import catalog_size_summary, load_model_catalog, privilege_client_module
+from .typed_video_status import parse_typed_multi_island_video_status
 
 def parse_os_release() -> dict[str, str]:
     values: dict[str, str] = {}
@@ -817,6 +818,7 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
     ort = ort_facts(diagnostics)
     maxine = maxine_facts(diagnostics, r["data"])
     effects = effect_capabilities(diagnostics, maxine)
+    typed_video_status = parse_typed_multi_island_video_status(diagnostics)
     owned_v4l = validated_v4l_ownership(manifest)
     model_packs: dict[str, Any] = {}
     _, catalog, _, catalog_hash = load_model_catalog()
@@ -850,7 +852,8 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
             "build_dependencies": ["cmake", "ninja", "c++", "pkg-config"],
             "missing_build_dependencies": [name for name in ("cmake", "ninja", "c++", "pkg-config") if not command_exists(name)],
             "reason_codes": []},
-        "runtime": {"dependencies": {}, "onnxruntime": ort},
+        "runtime": {"dependencies": {}, "onnxruntime": ort,
+                    "typed_multi_island_video_status": typed_video_status},
         "systemd_user": {"systemctl_present": systemd_present, "manager_usable": systemd_usable,
             "reason_codes": [systemd_reason]},
         "v4l2": {"package_state": package_state, "module_available": module_available,

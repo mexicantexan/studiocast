@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -21,9 +22,15 @@ from pathlib import Path
 SOURCE = Path(os.environ.get("STUDIOCAST_SOURCE_DIR", Path(__file__).resolve().parents[3]))
 BACKEND = SOURCE / "installer/backend/studiocast-installer-backend"
 BACKEND_PACKAGE = SOURCE / "installer/backend/studiocast_installer_backend"
+sys.path.insert(0, str(BACKEND_PACKAGE.parent))
+from studiocast_installer_backend.typed_video_status import (  # noqa: E402
+    parse_typed_multi_island_video_status,
+)
+
 BACKEND_MODULES = (
     "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
     "manifest.py", "packaged.py", "plan.py", "recommendation.py",
+    "typed_video_status.py",
 )
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
@@ -260,6 +267,394 @@ def promote_production_looking_vulkan(facts, effect):
     return matrix
 
 
+def typed_pair(identifier, token):
+    return {"id": identifier, "token": token}
+
+
+def typed_domain(backend_id, adapter_id):
+    values = {
+        2: ("cuda", 2, "cuda_driver", 2, "cuda_driver", 2,
+            "cuda_device_pointer", 2, "cuda_stream_ordered"),
+        3: ("maxine", 3, "maxine_nvcv", 3, "maxine_nvcv", 3,
+            "nvcv_image", 3, "maxine_bound_cuda_stream"),
+        5: ("vulkan", 5, "vulkan", 5, "vulkan", 5,
+            "vulkan_buffer", 5, "vulkan_queue_fence"),
+    }
+    (backend, api_id, api, allocator_id, allocator, memory_id, memory,
+     sync_id, sync) = values[backend_id]
+    return {
+        "backend": typed_pair(backend_id, backend),
+        "api_family": typed_pair(api_id, api),
+        "physical_device": {
+            "vendor_id": 0x10DE, "device_id": 0x1C30,
+            "stable_id": f"{adapter_id:02x}" + "00" * 15,
+        },
+        "logical_context_generation": 14,
+        "allocator_family": typed_pair(allocator_id, allocator),
+        "memory_handle_family": typed_pair(memory_id, memory),
+        "queue_or_stream_identity": 1000 + adapter_id,
+        "ownership_model": typed_pair(1, "adapter_exclusive"),
+        "synchronization_protocol": typed_pair(sync_id, sync),
+        "adapter_instance_id": adapter_id,
+    }
+
+
+def typed_invalidation():
+    return {
+        "generations": {
+            "configuration": 11, "geometry": 21, "model": 22,
+            "provider": 12, "device": 13, "context": 14,
+        },
+        "canonical_plan_hash": 31,
+        "model_artifact_hash": 32,
+        "execution_domain_hash": 33,
+    }
+
+
+def typed_capability(effect_id, effect, lane_id=0, lane="", code_id=0,
+                     code="", provider_id=0, provider="", status_id=0,
+                     status="invalid", *, evidence=None):
+    semantic_effect = typed_pair(effect_id, effect) if lane_id else typed_pair(0, "")
+    live = lane_id != 0 and status_id in {1, 3}
+    return {
+        "lane": typed_pair(lane_id, lane),
+        "code": typed_pair(code_id, code),
+        "nested_code": typed_pair(0, ""),
+        "semantic": {
+            "effect": semantic_effect,
+            "provider": typed_pair(provider_id, provider),
+            "status": typed_pair(status_id, status),
+            "reason": typed_pair(0, ""),
+            "cpu_tail": typed_pair(0, ""),
+            "cpu_tail_scratch_bytes": 0,
+            "cpu_tail_placement": typed_pair(1, "after_stage"),
+            "live_stage": live,
+            "production_eligible": live,
+            "exact_evidence": live,
+            "supports_tracked_vignette_center": False,
+            "evidence": list(evidence or []),
+        },
+    }
+
+
+def typed_vulkan_evidence(effect_id, effect):
+    tokens = list(enumerate([
+        "vulkan_build_enabled", "vulkan_loader_available",
+        "vulkan_physical_device_available", "vulkan_non_cpu_device",
+        "vulkan_compute_queue_available", "vulkan_context_healthy",
+        "vulkan_utility_kernels_ready", "vulkan_exact_device_shared",
+        "vulkan_device_local_residency", "vulkan_bounded_allocations",
+        "vulkan_no_cpu_layers", "vulkan_no_intermediate_readbacks",
+    ], start=1))
+    tokens.append(
+        (13, "open_vulkan_mirror_production_ready") if effect == "mirror"
+        else (14, "open_vulkan_vignette_fixed_center_production_ready"))
+    return [{
+        "code": typed_pair(index, token),
+        "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
+        "effect": typed_pair(effect_id, effect),
+        "backend": typed_pair(5, "vulkan"), "satisfied": True,
+    } for index, token in tokens]
+
+
+def typed_matrix_lane(effect_id, effect, lane_id, lane, capability,
+                      selectable=False):
+    semantic = capability["semantic"]
+    return {
+        "effect": effect, "effect_id": effect_id, "lane": lane,
+        "lane_id": lane_id,
+        "disposition": "production_usable" if selectable else "unavailable",
+        "code": capability["code"],
+        "nested_code": capability["nested_code"],
+        "selectable": selectable,
+        "semantic": {
+            "provider": semantic["provider"]["token"],
+            "provider_id": semantic["provider"]["id"],
+            "status": semantic["status"]["token"],
+            "status_id": semantic["status"]["id"],
+            "reason": semantic["reason"]["token"],
+            "reason_id": semantic["reason"]["id"],
+            "live_stage": semantic["live_stage"],
+            "production_eligible": semantic["production_eligible"],
+            "exact_evidence": semantic["exact_evidence"],
+            "cpu_tail": semantic["cpu_tail"]["token"],
+            "cpu_tail_scratch_bytes": semantic["cpu_tail_scratch_bytes"],
+            "supports_tracked_vignette_center":
+                semantic["supports_tracked_vignette_center"],
+            "evidence": [{
+                "code_id": item["code"]["id"],
+                "code": item["code"]["token"],
+                "status_id": item["status"]["id"],
+                "status": item["status"]["token"],
+                "reason_id": item["reason"]["id"],
+                "reason": item["reason"]["token"],
+                "effect": item["effect"]["token"],
+                "backend": item["backend"]["token"],
+                "satisfied": item["satisfied"],
+            } for item in semantic["evidence"]],
+        },
+    }
+
+
+def typed_capability_lanes(effects):
+    unavailable = {
+        1: (2, "maxine.effect.unavailable"),
+        2: (4, "open_cuda_effect_unavailable"),
+        3: (116, "open_vulkan_runtime_diagnostics_unavailable"),
+    }
+    cpu_codes = {
+        1: "effect.video_noise_removal.cpu.no_selectable_production_path",
+        2: "effect.eye_contact.cpu.no_selectable_production_path",
+        3: "effect.virtual_background.blur.cpu.no_selectable_production_path",
+        4: "effect.virtual_background.remove.cpu.no_selectable_production_path",
+        5: "effect.virtual_background.replace.cpu.no_selectable_production_path",
+        6: "effect.virtual_key_light.cpu.no_selectable_production_path",
+        7: "effect.auto_frame.cpu.no_selectable_production_path",
+        8: "effect.vignette.cpu.no_selectable_production_path",
+        9: "effect.mirror.cpu.no_selectable_production_path",
+    }
+    lanes = []
+    for value in effects:
+        effect_id = value["effect"]["id"]
+        effect = value["effect"]["token"]
+        for lane_id, lane in (
+            (1, "maxine"), (2, "open_cuda"), (3, "open_vulkan"), (4, "cpu"),
+        ):
+            selected = value["selected"] and (
+                value["selected_capability"]["lane"]["id"] == lane_id)
+            if selected:
+                capability = value["selected_capability"]
+            elif lane_id == 4:
+                capability = typed_capability(
+                    effect_id, effect, lane_id, lane, 9 + effect_id,
+                    cpu_codes[effect_id], 0, "", 4, "unavailable")
+                capability["semantic"]["live_stage"] = False
+                capability["semantic"]["production_eligible"] = False
+                capability["semantic"]["exact_evidence"] = False
+                capability["semantic"]["reason"] = typed_pair(
+                    27, "semantic_effect_unsupported")
+            else:
+                code_id, token = unavailable[lane_id]
+                capability = typed_capability(
+                    effect_id, effect, lane_id, lane, code_id, token, 0, "",
+                    4, "unavailable")
+                capability["semantic"]["live_stage"] = False
+                capability["semantic"]["production_eligible"] = False
+                capability["semantic"]["exact_evidence"] = False
+                capability["semantic"]["reason"] = typed_pair(
+                    27, "semantic_effect_unsupported")
+            lanes.append(typed_matrix_lane(
+                effect_id, effect, lane_id, lane, capability, selected))
+    return lanes
+
+
+def typed_island(route_id, route, island_id, adapter_id, stage_id,
+                 effect_id, effect, backend_id, backend, provider_id, provider,
+                 cpu_tails=0):
+    domain = typed_domain(backend_id, adapter_id)
+    transfers = {
+        "uploads": 1, "final_readbacks": 1, "intermediate_readbacks": 0,
+        "intermediate_uploads": 0, "synchronizations": 1,
+        "cpu_tail_boundaries": cpu_tails,
+    }
+    stage = {
+        "stage_id": stage_id, "effect": typed_pair(effect_id, effect),
+        "backend": typed_pair(backend_id, backend),
+        "provider": typed_pair(provider_id, provider),
+        "status": typed_pair(6, "executed"),
+        "reason": typed_pair(0, ""),
+        "failure_action": typed_pair(2, "fail_open_preserve_input"),
+        "committed_status": typed_pair(1, "succeeded"),
+        "required": False, "resolved": True, "committed": True,
+    }
+    resolution_stage = {
+        "stage_id": stage_id, "effect": typed_pair(effect_id, effect),
+        "required": False,
+        "failure_action": typed_pair(2, "fail_open_preserve_input"),
+        "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
+        "selected_backend": typed_pair(backend_id, backend),
+        "provider": typed_pair(provider_id, provider),
+        "adapter_instance_id": adapter_id, "execution_domain": domain,
+    }
+    return {
+        "route": typed_pair(route_id, route),
+        "island_id": island_id, "adapter_instance_id": adapter_id,
+        "snapshot_generation": 100, "capability_generation": 10,
+        "backend": typed_pair(backend_id, backend),
+        "execution_domain": domain,
+        "resolution": {
+            "strict_backend_selection": True,
+            "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
+            "requested_backend": typed_pair(backend_id, backend),
+            "selected_backend": typed_pair(backend_id, backend),
+            "active_backend": typed_pair(backend_id, backend),
+            "selected_provider": typed_pair(provider_id, provider),
+            "available": True, "stages": [resolution_stage],
+        },
+        "readiness": {
+            "configured": True, "program_id": 100 + island_id,
+            "invalidation_key": typed_invalidation(),
+            "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
+            "selected_backend": typed_pair(backend_id, backend),
+            "provider": typed_pair(provider_id, provider),
+            "execution_domain": domain, "available": True,
+        },
+        "telemetry": {
+            "requested_backend": typed_pair(backend_id, backend),
+            "selected_backend": typed_pair(backend_id, backend),
+            "active_backend": typed_pair(backend_id, backend),
+            "active_provider": typed_pair(provider_id, provider),
+            "runtime_status": typed_pair(6, "executed"),
+            "runtime_reason": typed_pair(0, ""),
+            "transfers": transfers,
+        },
+        "latest_committed_frame": {
+            "valid": True, "program_id": 100 + island_id,
+            "invalidation_key": typed_invalidation(),
+            "execution_domain": domain,
+            "capture_sequence": 501, "output_commit_sequence": 9,
+            "stages": [{
+                "stage_id": stage_id, "effect": typed_pair(effect_id, effect),
+                "backend": typed_pair(backend_id, backend),
+                "provider": typed_pair(provider_id, provider),
+                "status": typed_pair(1, "succeeded"),
+                "reason": typed_pair(0, ""),
+            }],
+        },
+        "stages": [stage], "valid": True, "current": True,
+    }
+
+
+def typed_effect(effect_id, effect):
+    invalid = typed_capability(effect_id, effect)
+    return {
+        "effect": typed_pair(effect_id, effect),
+        "requested_capability": invalid,
+        "selected_capability": invalid,
+        "requested_backend": typed_pair(0, ""),
+        "requested_provider": typed_pair(0, ""),
+        "selected_backend": typed_pair(0, ""),
+        "selected_provider": typed_pair(0, ""),
+        "active_backend": typed_pair(0, ""),
+        "active_provider": typed_pair(0, ""),
+        "status": typed_pair(5, "passthrough"),
+        "reason": typed_pair(0, ""),
+        "failure_action": typed_pair(2, "fail_open_preserve_input"),
+        "commit": {
+            "valid": False, "capture_sequence": 0,
+            "output_commit_sequence": 0,
+        },
+        "selected_island_id": 0, "committed_stage_id": 0,
+        "committed_stage_status": typed_pair(0, "not_run"),
+        "strict_backend_selection": False,
+        "strict_provider_selection": False, "required": False,
+        "requested": False, "available": False, "selected": False,
+        "active": False, "degraded": False, "blocked": False,
+        "fallback": False,
+    }
+
+
+def active_typed_effect(value, lane_id, lane, code_id, code, island_id,
+                        stage_id, backend_id, backend, provider_id, provider):
+    effect_id = value["effect"]["id"]
+    effect = value["effect"]["token"]
+    evidence = (
+        typed_vulkan_evidence(effect_id, effect)
+        if lane_id == 3 else [])
+    capability = typed_capability(
+        effect_id, effect, lane_id, lane, code_id, code,
+        provider_id, provider, 1, "ready", evidence=evidence)
+    value.update({
+        "requested_capability": capability,
+        "selected_capability": capability,
+        "requested_backend": typed_pair(backend_id, backend),
+        "requested_provider": typed_pair(provider_id, provider),
+        "selected_backend": typed_pair(backend_id, backend),
+        "selected_provider": typed_pair(provider_id, provider),
+        "active_backend": typed_pair(backend_id, backend),
+        "active_provider": typed_pair(provider_id, provider),
+        "status": typed_pair(6, "executed"),
+        "commit": {
+            "valid": True, "capture_sequence": 501,
+            "output_commit_sequence": 9,
+        },
+        "selected_island_id": island_id, "committed_stage_id": stage_id,
+        "committed_stage_status": typed_pair(1, "succeeded"),
+        "strict_backend_selection": True,
+        "strict_provider_selection": True,
+        "requested": True, "available": True, "selected": True, "active": True,
+    })
+
+
+def typed_multi_island_fixture():
+    effect_order = [
+        (1, "video_noise_removal"), (2, "eye_contact"),
+        (3, "virtual_background.blur"), (4, "virtual_background.remove"),
+        (5, "virtual_background.replace"), (6, "virtual_key_light"),
+        (7, "auto_frame"), (8, "vignette"), (9, "mirror"),
+    ]
+    effects = [typed_effect(identifier, token) for identifier, token in effect_order]
+    by_name = {effect["effect"]["token"]: effect for effect in effects}
+    active_typed_effect(
+        by_name["mirror"], 3, "open_vulkan", 100,
+        "open_vulkan_mirror_production_ready", 1, 11, 5, "vulkan", 5,
+        "open_vulkan_production_kernels")
+    active_typed_effect(
+        by_name["eye_contact"], 1, "maxine", 1, "maxine.effect.usable",
+        2, 12, 3, "maxine", 2, "maxine_ar")
+    active_typed_effect(
+        by_name["virtual_background.blur"], 2, "open_cuda", 3,
+        "open_cuda_effect_available", 3, 13, 2, "cuda", 3,
+        "open_video_onnxruntime_cuda")
+    islands = [
+        typed_island(1, "final_visual", 1, 101, 11, 9, "mirror", 5,
+                     "vulkan", 5, "open_vulkan_production_kernels"),
+        typed_island(2, "maxine_resident", 2, 102, 12, 2, "eye_contact", 3,
+                     "maxine", 2, "maxine_ar", 1),
+        typed_island(
+            3, "open_cuda_virtual_background", 3, 103, 13, 3,
+            "virtual_background.blur", 2, "cuda", 3,
+            "open_video_onnxruntime_cuda", 1),
+    ]
+    return {
+        "valid": True, "schema_version": 1, "hal_contract_version": 1,
+        "reason_code_version": 1, "status_generation": 100,
+        "generations": {
+            "capability": 10, "configuration": 11, "provider": 12,
+            "device": 13, "context": 14,
+        },
+        "program_generations": typed_invalidation()["generations"],
+        "lifecycle": typed_pair(3, "running"),
+        "capabilities": {
+            "valid": True, "schema_version": 1, "hal_contract_version": 1,
+            "reason_code_version": 1,
+            "generations": {
+                "capability": 10, "configuration": 11, "provider": 12,
+                "device": 13, "context": 14,
+            },
+            "refresh": {
+                "status": "succeeded", "current": True,
+                "code": typed_pair(200, "capability_snapshot_current"),
+                "requested_generation": 10, "completed_generation": 10,
+            },
+            "lanes": typed_capability_lanes(effects),
+        },
+        "writer_commit": {
+            "valid": True, "capture_sequence": 501,
+            "output_commit_sequence": 9,
+        },
+        "islands": islands, "effects": effects,
+        "aggregate": {
+            "current_island_count": 3,
+            "transfers": {
+                "uploads": 3, "final_readbacks": 3,
+                "intermediate_readbacks": 0, "intermediate_uploads": 0,
+                "synchronizations": 3, "cpu_tail_boundaries": 2,
+            },
+        },
+    }
+
+
 def machine_recommendation_facts(vendor, vulkan_profile="valid",
                                  blocker="vulkan_no_physical_device"):
     facts = base_facts()
@@ -350,6 +745,326 @@ class InstallerBackendCoreTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_typed_multi_island_status_accepts_exact_current_evidence_shadow_only(self):
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": typed_multi_island_fixture(),
+        })
+        self.assertTrue(parsed["present"] and parsed["valid"])
+        self.assertEqual(parsed["mode"], "shadow_only")
+        self.assertFalse(parsed["recommendation_eligible"])
+        self.assertEqual(set(parsed["effects"]), set(CANONICAL_EFFECTS))
+        self.assertEqual(
+            [(entry["route"], entry["backend"], entry["provider"])
+             for entry in parsed["islands"]],
+            [
+                ("final_visual", "vulkan",
+                 "open_vulkan_production_kernels"),
+                ("maxine_resident", "maxine", "maxine_ar"),
+                ("open_cuda_virtual_background", "cuda",
+                 "open_video_onnxruntime_cuda"),
+            ],
+        )
+        self.assertEqual(parsed["aggregate"]["transfers"], {
+            "uploads": 3, "final_readbacks": 3,
+            "intermediate_readbacks": 0, "intermediate_uploads": 0,
+            "synchronizations": 3, "cpu_tail_boundaries": 2,
+        })
+        self.assertEqual(
+            parsed["effects"]["mirror"]["requested_capability"]["code"],
+            typed_pair(100, "open_vulkan_mirror_production_ready"))
+        self.assertEqual(
+            parsed["effects"]["virtual_background.blur"]["active_provider"],
+            "open_video_onnxruntime_cuda")
+
+    def test_typed_multi_island_status_rejects_versions_effect_topology_and_staleness(self):
+        cases = []
+        for field, reason in (
+            ("schema_version", "typed_status.unsupported_schema_version"),
+            ("hal_contract_version",
+             "typed_status.unsupported_hal_contract_version"),
+            ("reason_code_version",
+             "typed_status.unsupported_reason_code_version"),
+        ):
+            value = typed_multi_island_fixture()
+            value[field] = 99
+            cases.append((value, reason))
+        missing = typed_multi_island_fixture()
+        missing["effects"].pop()
+        cases.append((missing, "typed_status.effect_count_invalid"))
+        duplicate = typed_multi_island_fixture()
+        duplicate["effects"][-1] = copy.deepcopy(duplicate["effects"][0])
+        cases.append((duplicate, "typed_status.duplicate_effect"))
+        unknown = typed_multi_island_fixture()
+        unknown["effects"][-1]["effect"] = typed_pair(99, "future_effect")
+        cases.append((unknown, "typed_status.effect_invalid"))
+        stale = typed_multi_island_fixture()
+        stale["islands"][0]["snapshot_generation"] -= 1
+        cases.append((stale, "typed_status.stale_generation"))
+        mixed_generation = typed_multi_island_fixture()
+        mixed_generation["program_generations"]["provider"] += 1
+        cases.append((mixed_generation, "typed_status.mixed_generation"))
+        mixed_commit = typed_multi_island_fixture()
+        mixed_commit["islands"][1]["latest_committed_frame"][
+            "output_commit_sequence"] += 1
+        cases.append((mixed_commit, "typed_status.mixed_writer_commit"))
+        invalid_commit = typed_multi_island_fixture()
+        invalid_commit["writer_commit"]["output_commit_sequence"] = 0
+        cases.append((invalid_commit, "typed_status.invalid_commit"))
+        aggregate = typed_multi_island_fixture()
+        aggregate["aggregate"]["transfers"]["uploads"] += 1
+        cases.append((aggregate, "typed_status.aggregate_mismatch"))
+        domain = typed_multi_island_fixture()
+        domain["islands"][2]["execution_domain"]["api_family"] = typed_pair(
+            5, "vulkan")
+        cases.append((domain, "typed_status.island_invalid"))
+        strict = typed_multi_island_fixture()
+        strict_effect = next(
+            effect for effect in strict["effects"]
+            if effect["effect"]["token"] == "virtual_background.blur")
+        strict_effect["requested_backend"] = typed_pair(
+            4, "open_video_onnxruntime")
+        cases.append((strict, "typed_status.strict_backend_substitution"))
+
+        for value, reason in cases:
+            with self.subTest(reason=reason):
+                parsed = parse_typed_multi_island_video_status({
+                    "typed_multi_island_video_status": value,
+                })
+                self.assertTrue(parsed["present"])
+                self.assertFalse(parsed["valid"])
+                self.assertFalse(parsed["recommendation_eligible"])
+                self.assertEqual(parsed["reason_codes"], [reason])
+                self.assertEqual(parsed["effects"], {})
+
+    def test_typed_multi_island_status_preserves_blockers_without_promotion(self):
+        value = typed_multi_island_fixture()
+        effects = {
+            entry["effect"]["token"]: entry for entry in value["effects"]
+        }
+        vignette = effects["vignette"]
+        vignette_capability = typed_capability(
+            8, "vignette", 3, "open_vulkan", 124,
+            "vulkan_vignette_tracked_center_not_supported", 5,
+            "open_vulkan_production_kernels", 2, "blocked")
+        vignette_capability["semantic"]["reason"] = typed_pair(
+            27, "semantic_effect_unsupported")
+        vignette.update({
+            "requested_capability": vignette_capability,
+            "requested_backend": typed_pair(5, "vulkan"),
+            "requested_provider": typed_pair(
+                5, "open_vulkan_production_kernels"),
+            "status": typed_pair(2, "blocked"),
+            "reason": typed_pair(27, "semantic_effect_unsupported"),
+            "strict_backend_selection": True,
+            "strict_provider_selection": True,
+            "requested": True, "blocked": True,
+        })
+        denoise = effects["video_noise_removal"]
+        denoise_capability = typed_capability(
+            1, "video_noise_removal", 1, "maxine", 2,
+            "maxine.effect.unavailable", 1, "maxine_vfx", 4,
+            "unavailable")
+        denoise_capability["semantic"]["reason"] = typed_pair(
+            28, "capability_evidence_incomplete")
+        denoise.update({
+            "requested_capability": denoise_capability,
+            "requested_backend": typed_pair(3, "maxine"),
+            "requested_provider": typed_pair(1, "maxine_vfx"),
+            "status": typed_pair(2, "blocked"),
+            "reason": typed_pair(28, "capability_evidence_incomplete"),
+            "strict_backend_selection": True,
+            "strict_provider_selection": True,
+            "requested": True, "blocked": True,
+        })
+        key_light = effects["virtual_key_light"]
+        key_light_capability = typed_capability(
+            6, "virtual_key_light", 3, "open_vulkan", 117,
+            "open_vulkan_matting_unavailable", 0, "", 4, "unavailable")
+        key_light_capability["nested_code"] = typed_pair(
+            118, "open_vulkan_matting_adapter_unavailable")
+        key_light_capability["semantic"]["reason"] = typed_pair(
+            27, "semantic_effect_unsupported")
+        key_light.update({
+            "requested_capability": key_light_capability,
+            "requested_backend": typed_pair(5, "vulkan"),
+            "status": typed_pair(4, "unavailable"),
+            "reason": typed_pair(27, "semantic_effect_unsupported"),
+            "strict_backend_selection": True,
+            "requested": True, "blocked": True,
+        })
+        for index, lane in enumerate(value["capabilities"]["lanes"]):
+            identity = (lane["effect"], lane["lane_id"])
+            replacement = None
+            if identity == ("vignette", 3):
+                replacement = vignette_capability
+            elif identity == ("video_noise_removal", 1):
+                replacement = denoise_capability
+            elif identity == ("virtual_key_light", 3):
+                replacement = key_light_capability
+            if replacement is not None:
+                updated = typed_matrix_lane(
+                    lane["effect_id"], lane["effect"], lane["lane_id"],
+                    lane["lane"], replacement, False)
+                if identity == ("virtual_key_light", 3):
+                    updated["disposition"] = "experimental"
+                value["capabilities"]["lanes"][index] = updated
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertTrue(parsed["valid"])
+        self.assertFalse(parsed["recommendation_eligible"])
+        self.assertEqual(
+            parsed["effects"]["vignette"]["requested_capability"]["code"],
+            typed_pair(124, "vulkan_vignette_tracked_center_not_supported"))
+        self.assertEqual(
+            parsed["effects"]["video_noise_removal"]
+            ["requested_capability"]["code"],
+            typed_pair(2, "maxine.effect.unavailable"))
+        self.assertTrue(parsed["effects"]["vignette"]["blocked"])
+        self.assertTrue(parsed["effects"]["video_noise_removal"]["blocked"])
+        self.assertEqual(
+            parsed["effects"]["virtual_key_light"]
+            ["requested_capability"]["disposition"], "experimental")
+        self.assertEqual(
+            parsed["effects"]["virtual_key_light"]
+            ["requested_capability"]["nested_code"],
+            typed_pair(118, "open_vulkan_matting_adapter_unavailable"))
+
+    def test_typed_multi_island_status_accepts_maxine_zero_numeric_device_identity(self):
+        value = typed_multi_island_fixture()
+        maxine = value["islands"][1]
+        # Production Maxine binds the stable CUDA/NvCV identity; PCI-style
+        # numeric vendor/device fields may remain informational zeros.
+        maxine["execution_domain"]["physical_device"]["vendor_id"] = 0
+        maxine["execution_domain"]["physical_device"]["device_id"] = 0
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertTrue(parsed["valid"], parsed["reason_codes"])
+        self.assertEqual(
+            parsed["islands"][1]["execution_domain"]["physical_device"]
+            ["device_id"], 0)
+
+        value["islands"][1]["execution_domain"]["physical_device"][
+            "stable_id"] = "0" * 32
+        rejected = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertFalse(rejected["valid"])
+        self.assertEqual(
+            rejected["reason_codes"], ["typed_status.island_invalid"])
+
+    def test_typed_multi_island_status_accepts_committed_optional_fail_open_without_active_effect(self):
+        value = typed_multi_island_fixture()
+        for island in value["islands"]:
+            island["stages"][0]["committed_status"] = typed_pair(
+                2, "optional_failed_open")
+            island["latest_committed_frame"]["stages"][0]["status"] = typed_pair(
+                2, "optional_failed_open")
+            island["latest_committed_frame"]["stages"][0]["reason"] = typed_pair(
+                12, "optional_stage_failed_open")
+        for effect in value["effects"]:
+            if not effect["active"]:
+                continue
+            effect.update({
+                "active_backend": typed_pair(0, ""),
+                "active_provider": typed_pair(0, ""),
+                "status": typed_pair(3, "degraded"),
+                "reason": typed_pair(12, "optional_stage_failed_open"),
+                "committed_stage_status": typed_pair(
+                    2, "optional_failed_open"),
+                "active": False, "degraded": True, "fallback": True,
+            })
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertTrue(parsed["valid"], parsed["reason_codes"])
+        self.assertTrue(parsed["writer_commit"]["valid"])
+        self.assertFalse(any(
+            effect["active"] for effect in parsed["effects"].values()))
+        self.assertTrue(all(
+            not effect["requested"] or effect["degraded"]
+            for effect in parsed["effects"].values()))
+
+    def test_typed_multi_island_status_rejects_selected_partial_capability_proof(self):
+        value = typed_multi_island_fixture()
+        mirror = next(
+            effect for effect in value["effects"]
+            if effect["effect"]["token"] == "mirror")
+        mirror["selected_capability"] = copy.deepcopy(
+            mirror["selected_capability"])
+        mirror["selected_capability"]["semantic"]["exact_evidence"] = False
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertFalse(parsed["valid"])
+        self.assertEqual(
+            parsed["reason_codes"],
+            ["typed_status.selected_capability_incomplete"])
+
+    def test_untyped_and_malformed_status_never_promote_installer_effects(self):
+        absent = parse_typed_multi_island_video_status({
+            "engines": {"open_vulkan": {"ok": True}},
+        })
+        malformed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": "legacy-ready",
+        })
+        self.assertEqual(absent["reason_codes"], ["typed_status.absent"])
+        self.assertFalse(absent["present"] or absent["valid"])
+        self.assertEqual(
+            malformed["reason_codes"], ["typed_status.root_invalid"])
+        self.assertTrue(malformed["present"])
+        self.assertFalse(malformed["valid"])
+        facts = base_facts()
+        original = copy.deepcopy(facts["effects"]["capabilities"])
+        facts["runtime"]["typed_multi_island_video_status"] = absent
+        self.s.write_facts(facts)
+        self.recommendation(facts)
+        self.assertEqual(facts["effects"]["capabilities"], original)
+
+    def test_host_analyze_exposes_typed_status_only_as_shadow_facts(self):
+        current_bin = (
+            Path(self.s.env["XDG_DATA_HOME"]) /
+            "studiocast/current/bin")
+        current_bin.mkdir(parents=True)
+        ctl = current_bin / "studiocastctl"
+        legacy = {
+            "engines": {
+                "open_vulkan": {
+                    "compiled_enabled": False,
+                    "blocked_reason": "vulkan_backend_disabled_in_build",
+                },
+            },
+        }
+        status = copy.deepcopy(legacy)
+        status["typed_multi_island_video_status"] = (
+            typed_multi_island_fixture())
+
+        def write_status(value):
+            ctl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' " +
+                repr(json.dumps(value, separators=(",", ":"))) + "\n",
+                encoding="utf-8")
+            ctl.chmod(0o755)
+
+        write_status(status)
+        typed_facts = self.s.json(
+            "analyze", "--target-version", "0.2.9")
+        typed = typed_facts["runtime"]["typed_multi_island_video_status"]
+        self.assertTrue(typed["present"] and typed["valid"])
+        self.assertEqual(typed["mode"], "shadow_only")
+        self.assertFalse(typed["recommendation_eligible"])
+
+        write_status(legacy)
+        legacy_facts = self.s.json(
+            "analyze", "--target-version", "0.2.9")
+        self.assertFalse(
+            legacy_facts["runtime"]["typed_multi_island_video_status"]
+            ["present"])
+        self.assertEqual(
+            typed_facts["effects"]["capabilities"],
+            legacy_facts["effects"]["capabilities"])
 
     def test_fixture_analysis_is_exact_no_host_probe(self):
         marker = self.s.root / "marker"
