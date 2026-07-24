@@ -165,8 +165,8 @@ hal::ImageDescriptor Image(std::uint32_t width, std::uint32_t height,
   return image;
 }
 
-hal::ResourceBudget DefaultInjectedBudget(
-    const PreparedMaxineHardwareRequest &request) noexcept {
+hal::ResourceBudget
+DefaultInjectedBudget(const PreparedMaxineHardwareRequest &request) noexcept {
   std::uint64_t bytes = 0;
   if (!Multiply(request.width, request.height, &bytes) ||
       !Multiply(bytes, 3, &bytes) ||
@@ -183,27 +183,25 @@ hal::ResourceBudget DefaultInjectedBudget(
   return budget;
 }
 
-std::uint64_t HashRequest(const PreparedMaxineHardwareRequest &request) noexcept {
+std::uint64_t
+HashRequest(const PreparedMaxineHardwareRequest &request) noexcept {
   std::uint64_t hash = kHashOffset;
   hash = HashValue(hash, request.width);
   hash = HashValue(hash, request.height);
   hash = HashValue(hash, request.stage_count);
-  hash = HashValue(
-      hash, static_cast<std::uint64_t>(
-                request.effects.virtual_background.strength));
-  hash = HashValue(
-      hash, static_cast<std::uint64_t>(request.effects.virtual_background.mode));
-  hash = HashValue(
-      hash,
-      static_cast<std::uint64_t>(
-          request.effects.virtual_key_light.intensity));
+  hash = HashValue(hash, static_cast<std::uint64_t>(
+                             request.effects.virtual_background.strength));
+  hash = HashValue(hash, static_cast<std::uint64_t>(
+                             request.effects.virtual_background.mode));
+  hash = HashValue(hash, static_cast<std::uint64_t>(
+                             request.effects.virtual_key_light.intensity));
   hash = HashValue(
       hash, static_cast<std::uint64_t>(request.effects.vignette.intensity));
   hash = HashText(hash, request.vfx_model_directory);
   for (std::size_t index = 0; index < request.stage_count; ++index) {
     hash = HashValue(hash, request.stages[index].stage_id);
-    hash = HashValue(hash,
-                     static_cast<std::uint64_t>(request.stages[index].semantic));
+    hash = HashValue(
+        hash, static_cast<std::uint64_t>(request.stages[index].semantic));
   }
   return hash == 0 ? 1 : hash;
 }
@@ -222,15 +220,15 @@ std::uint64_t HashDomain(const hal::ExecutionDomainId &domain) noexcept {
       HashValue(hash, static_cast<std::uint64_t>(domain.memory_handle_family));
   hash = HashValue(hash, domain.queue_or_stream_identity);
   hash = HashValue(hash, static_cast<std::uint64_t>(domain.ownership_model));
-  hash = HashValue(
-      hash, static_cast<std::uint64_t>(domain.synchronization_protocol));
+  hash = HashValue(hash,
+                   static_cast<std::uint64_t>(domain.synchronization_protocol));
   hash = HashValue(hash, domain.adapter_instance_id);
   return hash == 0 ? 1 : hash;
 }
 
-hal::ProgramGenerations AuthoritativeGenerations(
-    const PreparedMaxineHardwareRequest &request,
-    const hal::ExecutionDomainId &domain) noexcept {
+hal::ProgramGenerations
+AuthoritativeGenerations(const PreparedMaxineHardwareRequest &request,
+                         const hal::ExecutionDomainId &domain) noexcept {
   hal::ProgramGenerations generations;
   generations.configuration = request.generations.configuration;
   generations.geometry =
@@ -239,15 +237,13 @@ hal::ProgramGenerations AuthoritativeGenerations(
   for (std::size_t index = 0; index < request.stage_count; ++index) {
     model = HashValue(
         model, static_cast<std::uint64_t>(request.stages[index].semantic));
-    model = HashValue(model,
-                      request.stages[index].model.artifact_generation);
+    model = HashValue(model, request.stages[index].model.artifact_generation);
     for (const auto byte : request.stages[index].model.model_id_hash)
       model = HashValue(model, byte);
     for (const auto byte : request.stages[index].model.artifact_set_hash)
       model = HashValue(model, byte);
   }
-  generations.model =
-      HashValue(model, request.replacement.generation);
+  generations.model = HashValue(model, request.replacement.generation);
   std::uint64_t provider = kHashOffset;
   provider = HashValue(provider, request.runtime.vfx);
   provider = HashValue(provider, request.runtime.nvcv);
@@ -340,9 +336,8 @@ hal::PreparedProgram Program(const PreparedMaxineHardwareRequest &request,
     stage.output.image = resident_output;
     stage.required = intent.required;
     stage.failure_action =
-        intent.required
-            ? hal::FailureAction::fail_closed
-            : hal::FailureAction::fail_open_preserve_last_valid;
+        intent.required ? hal::FailureAction::fail_closed
+                        : hal::FailureAction::fail_open_preserve_last_valid;
     stage.circuit_breaker.consecutive_failure_limit = 1;
     stage.circuit_breaker.cooldown_frames = 30;
     stage.circuit_breaker.action =
@@ -375,10 +370,8 @@ ProductionSetup(const PreparedMaxineHardwareRequest &request,
   setup.vignette_center_x_px = request.vignette_center_x_px;
   setup.vignette_center_y_px = request.vignette_center_y_px;
   setup.replacement_background = {
-      request.replacement.rgb,
-      request.replacement.width,
-      request.replacement.height,
-      request.replacement.stride_bytes,
+      request.replacement.rgb,        request.replacement.width,
+      request.replacement.height,     request.replacement.stride_bytes,
       request.replacement.generation,
   };
   return setup;
@@ -392,14 +385,13 @@ bool Delta(std::uint64_t before, std::uint64_t after,
   return true;
 }
 
-PreparedMaxineCompatibilityTelemetry CompatibilityDelta(
-    const maxine::ProductionResidentTelemetry &before,
-    const maxine::ProductionResidentTelemetry &after,
-    const PreparedMaxineHardwareRequest &request) noexcept {
+PreparedMaxineCompatibilityTelemetry
+CompatibilityDelta(const maxine::ProductionResidentTelemetry &before,
+                   const maxine::ProductionResidentTelemetry &after,
+                   const PreparedMaxineHardwareRequest &request) noexcept {
   PreparedMaxineCompatibilityTelemetry result;
   const auto transfer = [&](maxine::ProductionTransferKind kind,
-                            std::uint64_t *attempts,
-                            std::uint64_t *successes) {
+                            std::uint64_t *attempts, std::uint64_t *successes) {
     const auto index = static_cast<std::size_t>(kind);
     return Delta(before.transfers[index].attempts,
                  after.transfers[index].attempts, attempts) &&
@@ -409,8 +401,7 @@ PreparedMaxineCompatibilityTelemetry CompatibilityDelta(
   const auto cpu_index = static_cast<std::size_t>(
       maxine::ProductionCpuStageKind::rgb_to_bgr_staging);
   if (!Delta(before.cpu_stages[cpu_index].successes,
-             after.cpu_stages[cpu_index].successes,
-             &result.rgb_to_bgr_calls) ||
+             after.cpu_stages[cpu_index].successes, &result.rgb_to_bgr_calls) ||
       !transfer(maxine::ProductionTransferKind::host_upload,
                 &result.upload_attempts, &result.upload_calls) ||
       !transfer(maxine::ProductionTransferKind::final_download,
@@ -420,22 +411,17 @@ PreparedMaxineCompatibilityTelemetry CompatibilityDelta(
                 &result.cpu_continuation_download_attempts,
                 &result.cpu_continuation_download_calls) ||
       !transfer(maxine::ProductionTransferKind::device_format_bridge,
-                &result.device_bridge_attempts,
-                &result.device_bridge_calls) ||
-      !Delta(before.matte_inferences.attempts,
-             after.matte_inferences.attempts,
+                &result.device_bridge_attempts, &result.device_bridge_calls) ||
+      !Delta(before.matte_inferences.attempts, after.matte_inferences.attempts,
              &result.matte_inference_attempts) ||
       !Delta(before.matte_inferences.successes,
-             after.matte_inferences.successes,
-             &result.matte_inference_calls) ||
+             after.matte_inferences.successes, &result.matte_inference_calls) ||
       !Delta(before.shared_matte_reuses, after.shared_matte_reuses,
              &result.shared_matte_reuses) ||
       !Delta(before.explicit_synchronizations.attempts,
-             after.explicit_synchronizations.attempts,
-             &result.sync_attempts) ||
+             after.explicit_synchronizations.attempts, &result.sync_attempts) ||
       !Delta(before.explicit_synchronizations.successes,
-             after.explicit_synchronizations.successes,
-             &result.sync_calls) ||
+             after.explicit_synchronizations.successes, &result.sync_calls) ||
       !Delta(before.composites.attempts, after.composites.attempts,
              &result.composite_attempts) ||
       !Delta(before.composites.successes, after.composites.successes,
@@ -508,8 +494,7 @@ PreparedMaxineHardwareEligibility EvaluatePreparedMaxineHardwareEligibility(
         stage.semantic == hal::SemanticEffectId::virtual_background_remove ||
         stage.semantic == hal::SemanticEffectId::virtual_background_replace;
     if (stage.stage_id == 0 || !IsQualifiedV1Stage(stage.semantic) ||
-        ProviderFor(stage.semantic) ==
-            hal::SemanticEffectProviderId::invalid ||
+        ProviderFor(stage.semantic) == hal::SemanticEffectProviderId::invalid ||
         semantic >= 32 || semantic <= previous_semantic ||
         (seen & (std::uint32_t{1} << semantic)) != 0 ||
         (virtual_background && has_virtual_background)) {
@@ -603,8 +588,7 @@ struct PreparedMaxineHardwareExecutionOwner::Impl {
   }
 };
 
-PreparedMaxineHardwareExecutionOwner::
-    PreparedMaxineHardwareExecutionOwner()
+PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner()
     : impl_(std::make_unique<Impl>()) {}
 
 PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner(
@@ -614,28 +598,39 @@ PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner(
   impl_->injected_session = std::make_unique<hal::PreparedProgramSession>();
 }
 
-PreparedMaxineHardwareExecutionOwner::
-    ~PreparedMaxineHardwareExecutionOwner() = default;
+PreparedMaxineHardwareExecutionOwner::~PreparedMaxineHardwareExecutionOwner() =
+    default;
 
 PreparedMaxineHardwareSetupResult
 PreparedMaxineHardwareExecutionOwner::Configure(
     const PreparedMaxineHardwareRequest &request) noexcept {
+  return ConfigureInternal(request, nullptr);
+}
+
+PreparedMaxineHardwareSetupResult
+PreparedMaxineHardwareExecutionOwner::ConfigureExact(
+    const PreparedMaxineHardwareRequest &request,
+    const hal::PreparedProgram &program) noexcept {
+  return ConfigureInternal(request, &program);
+}
+
+PreparedMaxineHardwareSetupResult
+PreparedMaxineHardwareExecutionOwner::ConfigureInternal(
+    const PreparedMaxineHardwareRequest &request,
+    const hal::PreparedProgram *exact_program) noexcept {
   PreparedMaxineHardwareSetupResult result;
   PreparedMaxineHardwareRequest candidate_request = request;
-  const auto eligibility =
-      EvaluatePreparedMaxineHardwareEligibility(request);
+  const auto eligibility = EvaluatePreparedMaxineHardwareEligibility(request);
   result.eligibility = eligibility;
   if (eligibility != PreparedMaxineHardwareEligibility::eligible) {
     result.status = hal::StatusId::blocked;
-    result.reason =
-        eligibility ==
-                    PreparedMaxineHardwareEligibility::
-                        temporal_reset_unsupported ||
-                eligibility ==
-                    PreparedMaxineHardwareEligibility::
-                        model_artifact_evidence_incomplete
-            ? hal::ReasonId::capability_evidence_incomplete
-            : hal::ReasonId::semantic_effect_unsupported;
+    result.reason = eligibility == PreparedMaxineHardwareEligibility::
+                                       temporal_reset_unsupported ||
+                            eligibility ==
+                                PreparedMaxineHardwareEligibility::
+                                    model_artifact_evidence_incomplete
+                        ? hal::ReasonId::capability_evidence_incomplete
+                        : hal::ReasonId::semantic_effect_unsupported;
     impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::legacy_compatibility,
                            eligibility);
     return result;
@@ -649,8 +644,7 @@ PreparedMaxineHardwareExecutionOwner::Configure(
 
     if (impl_->injected_registration) {
       const auto &registration = *impl_->injected_registration;
-      candidate_request.adapter_instance_id =
-          registration.adapter_instance_id;
+      candidate_request.adapter_instance_id = registration.adapter_instance_id;
       if (registration.backend != hal::BackendId::maxine ||
           registration.resident_adapter == nullptr ||
           registration.execution_domain.backend != hal::BackendId::maxine ||
@@ -668,8 +662,7 @@ PreparedMaxineHardwareExecutionOwner::Configure(
       if (IsZeroBudget(budget))
         budget = DefaultInjectedBudget(candidate_request);
     } else {
-      candidate_request.adapter_instance_id =
-          impl_->stable_adapter_instance_id;
+      candidate_request.adapter_instance_id = impl_->stable_adapter_instance_id;
       maxine::ProductionResidentRuntime runtime;
       runtime.vfx = reinterpret_cast<maxine::vfx::VfxApi *>(
           candidate_request.runtime.vfx);
@@ -677,9 +670,8 @@ PreparedMaxineHardwareExecutionOwner::Configure(
           reinterpret_cast<maxine::NvcvApi *>(candidate_request.runtime.nvcv);
       runtime.ar =
           reinterpret_cast<maxine::ar::ArApi *>(candidate_request.runtime.ar);
-      runtime.cuda =
-          reinterpret_cast<cuda::CudaDriverApi *>(
-              candidate_request.runtime.cuda);
+      runtime.cuda = reinterpret_cast<cuda::CudaDriverApi *>(
+          candidate_request.runtime.cuda);
 
       std::uint32_t stage_mask = 0;
       for (std::size_t index = 0; index < candidate_request.stage_count;
@@ -729,12 +721,79 @@ PreparedMaxineHardwareExecutionOwner::Configure(
       result.known_minimum_budget = candidate->known_minimum_budget();
     }
 
-    candidate_request.generations =
-        AuthoritativeGenerations(candidate_request, domain);
-    auto program =
-        Program(candidate_request, domain, budget, impl_->next_program_id++);
-    if (program.program_id == 0)
-      program.program_id = impl_->next_program_id++;
+    hal::PreparedProgram program;
+    if (exact_program) {
+      hal::ReasonId validation_reason = hal::ReasonId::none;
+      if (!hal::ValidatePreparedProgram(*exact_program, &validation_reason) ||
+          exact_program->execution_domain != domain ||
+          exact_program->owner_adapter_instance_id !=
+              domain.adapter_instance_id ||
+          exact_program->requested_backend != hal::BackendId::maxine ||
+          !exact_program->strict_backend_selection ||
+          exact_program->requested_execution_domain != domain ||
+          !exact_program->strict_execution_domain ||
+          exact_program->stage_count != candidate_request.stage_count ||
+          exact_program->host_input.width != candidate_request.width ||
+          exact_program->host_input.height != candidate_request.height ||
+          exact_program->host_output.width != candidate_request.width ||
+          exact_program->host_output.height != candidate_request.height ||
+          exact_program->budget.persistent_bytes != budget.persistent_bytes ||
+          exact_program->budget.scratch_bytes != budget.scratch_bytes ||
+          exact_program->budget.upload_staging_bytes !=
+              budget.upload_staging_bytes ||
+          exact_program->budget.readback_staging_bytes !=
+              budget.readback_staging_bytes ||
+          exact_program->budget.resource_count != budget.resource_count ||
+          exact_program->budget.in_flight_slots != budget.in_flight_slots) {
+        result.status = hal::StatusId::blocked;
+        result.reason = exact_program->execution_domain != domain
+                            ? hal::ReasonId::wrong_execution_domain
+                            : (validation_reason != hal::ReasonId::none
+                                   ? validation_reason
+                                   : hal::ReasonId::malformed_contract);
+        result.execution_domain = domain;
+        return result;
+      }
+      if (exact_program->invalidation_key.generations !=
+          candidate_request.generations) {
+        result.status = hal::StatusId::stale;
+        result.reason = hal::ReasonId::wrong_generation;
+        result.execution_domain = domain;
+        return result;
+      }
+      for (std::size_t index = 0; index < candidate_request.stage_count;
+           ++index) {
+        const auto &prepared_stage = exact_program->stages[index];
+        const auto &requested_stage = candidate_request.stages[index];
+        if (prepared_stage.stage_id != requested_stage.stage_id ||
+            prepared_stage.semantic != requested_stage.semantic ||
+            prepared_stage.backend != hal::BackendId::maxine ||
+            prepared_stage.provider != ProviderFor(requested_stage.semantic) ||
+            prepared_stage.execution_domain != domain ||
+            prepared_stage.required != requested_stage.required ||
+            prepared_stage.model.model_id_hash !=
+                requested_stage.model.model_id_hash ||
+            prepared_stage.model.artifact_set_hash !=
+                requested_stage.model.artifact_set_hash ||
+            prepared_stage.model.artifact_generation !=
+                requested_stage.model.artifact_generation) {
+          result.status = hal::StatusId::blocked;
+          result.reason = prepared_stage.execution_domain != domain
+                              ? hal::ReasonId::wrong_execution_domain
+                              : hal::ReasonId::malformed_contract;
+          result.execution_domain = domain;
+          return result;
+        }
+      }
+      program = *exact_program;
+    } else {
+      candidate_request.generations =
+          AuthoritativeGenerations(candidate_request, domain);
+      program =
+          Program(candidate_request, domain, budget, impl_->next_program_id++);
+      if (program.program_id == 0)
+        program.program_id = impl_->next_program_id++;
+    }
 
     hal::StatusId status = hal::StatusId::blocked;
     hal::ReasonId reason = hal::ReasonId::none;
@@ -746,8 +805,7 @@ PreparedMaxineHardwareExecutionOwner::Configure(
       status = impl_->injected_session->Configure(
           program, *impl_->InjectedAdapter(), &readiness, &reason);
     }
-    if (status != hal::StatusId::ready &&
-        status != hal::StatusId::degraded) {
+    if (status != hal::StatusId::ready && status != hal::StatusId::degraded) {
       result.status = status;
       result.reason = reason;
       result.execution_domain = domain;
@@ -776,8 +834,9 @@ PreparedMaxineHardwareExecutionOwner::Configure(
     result.status = hal::StatusId::blocked;
     result.reason = hal::ReasonId::capability_evidence_incomplete;
   }
-  impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::legacy_compatibility,
-                         PreparedMaxineHardwareEligibility::runtime_unavailable);
+  impl_->RefreshSnapshot(
+      PreparedMaxineHardwareRoute::legacy_compatibility,
+      PreparedMaxineHardwareEligibility::runtime_unavailable);
   return result;
 }
 
@@ -795,8 +854,7 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
     return frame;
   }
   const auto &program = session->program();
-  const std::uint64_t expected_bytes =
-      program.host_input.planes[0].size_bytes;
+  const std::uint64_t expected_bytes = program.host_input.planes[0].size_bytes;
   const std::uint64_t expected_stride =
       program.host_input.planes[0].row_stride_bytes;
   if (!input || !output_bgr || capture_sequence == 0 ||
@@ -885,9 +943,9 @@ PreparedMaxineHardwareExecutionOwner::ExecuteHostFrame(
   frame.output_ready = true;
 
   if (have_production_telemetry && impl_->production->executor()) {
-    frame.compatibility = CompatibilityDelta(
-        before, impl_->production->executor()->telemetry(),
-        impl_->active_request);
+    frame.compatibility =
+        CompatibilityDelta(before, impl_->production->executor()->telemetry(),
+                           impl_->active_request);
   }
   impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::hal_live,
                          PreparedMaxineHardwareEligibility::eligible);
@@ -923,16 +981,18 @@ void PreparedMaxineHardwareExecutionOwner::Invalidate(
     hal::ReasonId reason) noexcept {
   if (auto *session = impl_->Session())
     session->Invalidate(reason);
-  impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::legacy_compatibility,
-                         PreparedMaxineHardwareEligibility::runtime_unavailable);
+  impl_->RefreshSnapshot(
+      PreparedMaxineHardwareRoute::legacy_compatibility,
+      PreparedMaxineHardwareEligibility::runtime_unavailable);
 }
 
 void PreparedMaxineHardwareExecutionOwner::Shutdown() noexcept {
   if (auto *session = impl_->Session(); session && !session->stopped())
     session->Shutdown();
   impl_->production.reset();
-  impl_->RefreshSnapshot(PreparedMaxineHardwareRoute::legacy_compatibility,
-                         PreparedMaxineHardwareEligibility::runtime_unavailable);
+  impl_->RefreshSnapshot(
+      PreparedMaxineHardwareRoute::legacy_compatibility,
+      PreparedMaxineHardwareEligibility::runtime_unavailable);
   impl_->snapshot.prepared = false;
   impl_->snapshot.stopped = true;
 }

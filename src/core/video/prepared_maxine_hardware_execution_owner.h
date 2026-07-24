@@ -180,11 +180,19 @@ public:
   [[nodiscard]] PreparedMaxineHardwareSetupResult
   Configure(const PreparedMaxineHardwareRequest &request) noexcept;
 
-  [[nodiscard]] PreparedMaxineHardwareFrameResult ExecuteHostFrame(
-      const std::uint8_t *input, std::size_t input_size_bytes,
-      std::size_t input_row_stride_bytes, std::uint8_t *output_bgr,
-      std::size_t output_size_bytes, std::size_t output_row_stride_bytes,
-      std::uint64_t capture_sequence) noexcept;
+  // Coordinator integration supplies the already-frozen exact program.
+  // The owner still constructs/rolls back backend resources, but it must not
+  // regenerate plan, provider, domain, or invalidation identity.
+  [[nodiscard]] PreparedMaxineHardwareSetupResult
+  ConfigureExact(const PreparedMaxineHardwareRequest &request,
+                 const hal::PreparedProgram &program) noexcept;
+
+  [[nodiscard]] PreparedMaxineHardwareFrameResult
+  ExecuteHostFrame(const std::uint8_t *input, std::size_t input_size_bytes,
+                   std::size_t input_row_stride_bytes, std::uint8_t *output_bgr,
+                   std::size_t output_size_bytes,
+                   std::size_t output_row_stride_bytes,
+                   std::uint64_t capture_sequence) noexcept;
 
   [[nodiscard]] hal::StatusId
   CommitOutput(const hal::CompletionToken &completion,
@@ -200,6 +208,10 @@ public:
   active_request() const noexcept;
 
 private:
+  [[nodiscard]] PreparedMaxineHardwareSetupResult
+  ConfigureInternal(const PreparedMaxineHardwareRequest &request,
+                    const hal::PreparedProgram *exact_program) noexcept;
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
