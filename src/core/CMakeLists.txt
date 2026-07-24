@@ -159,6 +159,7 @@ set(_studiocast_vulkan_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/open_vulkan_video_noise_removal.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/prepared_hardware_execution_owner.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/hal_resident_adapter.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/production_video_backend_setup_source.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/video_execution_factory.cpp)
 
 set(_studiocast_vulkan_backend_optional_sources
@@ -633,7 +634,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 137)
+set(_studiocast_expected_source_count 138)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
