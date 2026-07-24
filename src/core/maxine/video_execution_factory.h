@@ -4,15 +4,23 @@
 #include "core/video/video_adapter_factory.h"
 
 #include <cstdint>
+#include <memory>
 
 namespace studiocast::maxine {
 
 // Setup-time configuration for the coordinator-facing Maxine factory. The
-// pointed-to cached registration must outlive the factory; the request
-// template is copied. This surface deliberately contains no NvCV, VFX, AR,
-// CUDA SDK, or provider types.
+// pointed-to cached registration must outlive the factory unless
+// adapter_lifetime owns it; the request template is copied. This surface
+// deliberately contains no NvCV, VFX, AR, CUDA SDK, or provider types.
 struct MaxineVideoExecutionFactoryConfiguration {
   const hal::AdapterRegistration *adapter_registration = nullptr;
+  // Keeps a backend-owned adapter and its cached registration alive for every
+  // executor prepared by this factory. Tests and legacy injected factories may
+  // leave this empty when they own the registration for the full coordinator
+  // lifetime.
+  std::shared_ptr<void> adapter_lifetime;
+  void *device_loss_owner = nullptr;
+  void (*notify_device_lost)(void *owner) noexcept = nullptr;
   video::PreparedMaxineHardwareRequest setup_template{};
   std::uint64_t factory_id = 0;
   std::uint32_t selection_priority = 0;

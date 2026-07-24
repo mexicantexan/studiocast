@@ -170,6 +170,9 @@ public:
   PreparedMaxineHardwareExecutionOwner();
   explicit PreparedMaxineHardwareExecutionOwner(
       const hal::AdapterRegistration &registration);
+  PreparedMaxineHardwareExecutionOwner(
+      const hal::AdapterRegistration &registration,
+      bool adapter_lifetime_is_borrowed);
   ~PreparedMaxineHardwareExecutionOwner();
 
   PreparedMaxineHardwareExecutionOwner(

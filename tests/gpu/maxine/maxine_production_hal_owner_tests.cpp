@@ -1,4 +1,6 @@
 #include "core/maxine/production_hal_owner.h"
+#include "core/maxine/production_video_execution_bootstrap.h"
+#include "core/video/video_execution_coordinator.h"
 #include "maxine_effect_runtime_fake_control.h"
 
 #include <array>
@@ -375,6 +377,93 @@ CreateOwner(RuntimeFixture &runtime, FakeDeviceOps &ops,
   return MaxineProductionHalOwner::CreateBackend(request, result);
 }
 
+video::PreparedMaxineHardwareRequest
+BootstrapRequest(RuntimeFixture &runtime, FakeDeviceOps &ops) {
+  video::PreparedMaxineHardwareRequest request;
+  request.requested_backend = hal::BackendId::maxine;
+  request.strict_backend_selection = true;
+  request.single_resident_island = true;
+  request.host_input_is_tight_rgb24 = true;
+  request.host_output_is_tight_bgr24 = true;
+  request.declares_output_format_cpu_tail = true;
+  // Mirrors the production camera request; the backend bootstrap owns stable
+  // adapter identity assignment.
+  request.adapter_instance_id = 0;
+  request.width = 8;
+  request.height = 6;
+  request.effects = Setup(
+      Mask({ResidentStageKind::background_blur})).effects;
+  request.stages[0].stage_id = 1;
+  request.stages[0].semantic =
+      hal::SemanticEffectId::virtual_background_blur;
+  request.stages[0].model.model_id_hash[0] = 0x31;
+  request.stages[0].model.artifact_set_hash[0] = 0x57;
+  request.stages[0].model.artifact_generation = 1;
+  request.stage_count = 1;
+  request.generations = {7, 1, 1, 1, 1,
+                         runtime.cuda.context_identity()->logical_generation};
+  request.capacity = Capacity();
+  request.runtime.vfx = reinterpret_cast<std::uintptr_t>(&runtime.vfx);
+  request.runtime.nvcv = reinterpret_cast<std::uintptr_t>(&runtime.nvcv);
+  request.runtime.ar = reinterpret_cast<std::uintptr_t>(&runtime.ar);
+  request.runtime.cuda = reinterpret_cast<std::uintptr_t>(&runtime.cuda);
+  request.runtime.device_ops = reinterpret_cast<std::uintptr_t>(&ops);
+  request.vfx_model_directory = "/fake/models";
+  return request;
+}
+
+video::VideoExecutionPlanRequest
+CoordinatorRequest(const hal::ExecutionDomainId &domain,
+                   std::uint64_t plan_id) {
+  video::VideoExecutionPlanRequest request;
+  request.plan_id = plan_id;
+  request.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  request.intent.backend.backend = hal::BackendId::maxine;
+  request.intent.backend.strict = true;
+  request.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  request.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::maxine;
+  request.intent.preferences.strict_effects_engine = true;
+  request.intent.requested_provider =
+      hal::SemanticEffectProviderId::maxine_vfx;
+  request.intent.strict_provider_selection = true;
+  request.intent.stages[0].intent.stage_id = 1;
+  request.intent.stages[0].intent.semantic =
+      hal::SemanticEffectId::virtual_background_blur;
+  request.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_open_preserve_last_valid;
+  request.intent.stages[0].parameters[0] = {
+      video::CanonicalVideoParameterId::strength,
+      video::CanonicalVideoParameterKind::signed_integer,
+      50,
+  };
+  request.intent.stages[0].parameter_count = 1;
+  request.intent.stages[0].model.model_id_hash[0] = 0x31;
+  request.intent.stages[0].model.artifact_set_hash[0] = 0x57;
+  request.intent.stages[0].model.artifact_generation = 1;
+  request.intent.stage_count = 1;
+  request.host_input =
+      Image(8, 6, hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+            hal::HostCoherence::coherent, hal::Mutability::read_only);
+  request.host_output =
+      Image(8, 6, hal::PixelFormat::bgr_u8, hal::ChannelOrder::bgr,
+            hal::HostCoherence::coherent, hal::Mutability::write_only);
+  request.invalidation_key.generations = {
+      7, 1, 1, 1, 1, domain.logical_context_generation};
+  request.invalidation_key.canonical_plan_hash = plan_id + 100;
+  request.invalidation_key.model_artifact_hash = 0xBB;
+  request.invalidation_key.execution_domain_hash = 0xCC;
+  request.budget = Capacity();
+  request.cpu_tails[0].id = hal::CpuTailId::output_format_conversion;
+  request.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  request.cpu_tails[0].after_stage_id = 1;
+  request.cpu_tails[0].boundary_index = 1;
+  request.cpu_tail_count = 1;
+  return request;
+}
+
 bool ExactDomainAndPreparedExecutionAreAllocationFree() {
   RuntimeFixture runtime{};
   CHECK(runtime.Initialize());
@@ -634,6 +723,95 @@ bool OptionalFailureCommitDeviceLossAndShutdownAreSafe() {
   return true;
 }
 
+bool ProductionBootstrapReusesOwnerRollsBackAndRetainsExecutorLifetime() {
+  RuntimeFixture runtime{};
+  CHECK(runtime.Initialize());
+  FakeDeviceOps ops{};
+  MaxineProductionVideoExecutionBootstrapRequest bootstrap_request;
+  bootstrap_request.prepared_request = BootstrapRequest(runtime, ops);
+  bootstrap_request.factory_id = 9101;
+  bootstrap_request.selection_priority = 10;
+  bootstrap_request.minimum_synchronizations_per_frame = 1;
+  bootstrap_request.maximum_synchronizations_per_frame = 16;
+  MaxineProductionVideoExecutionBootstrapResult bootstrap_result;
+  auto bootstrap = MaxineProductionVideoExecutionBootstrap::Create(
+      bootstrap_request, &bootstrap_result);
+  CHECK(bootstrap);
+  CHECK(bootstrap_result.status == hal::StatusId::ready);
+  CHECK(bootstrap->adapter_registration().adapter_instance_id != 0);
+  CHECK(bootstrap->adapter_registration().resident_adapter ==
+        bootstrap->production_owner()->adapter());
+  CHECK(bootstrap->adapter_registration().execution_domain ==
+        bootstrap->production_owner()->execution_domain());
+  CHECK(bootstrap->adapter_registration().semantic_capability_count == 1);
+  CHECK(bootstrap->adapter_registration()
+            .semantic_capabilities[0]
+            .cpu_tail == hal::CpuTailId::output_format_conversion);
+  auto *const native_executor = bootstrap->production_owner()->executor();
+  CHECK(native_executor != nullptr);
+
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(registry.Register(bootstrap->adapter_registration(), &reason) ==
+        hal::StatusId::ready);
+  video::VideoExecutionCoordinator coordinator(registry);
+  CHECK(coordinator.RegisterFactory(bootstrap->factory_registration(),
+                                    &reason) == hal::StatusId::ready);
+  const auto domain = bootstrap->adapter_registration().execution_domain;
+  auto request = CoordinatorRequest(domain, 1001);
+  video::VideoExecutionPrepareEvidence prepare;
+  CHECK(coordinator.Prepare(request, &prepare, &reason) ==
+        hal::StatusId::degraded);
+  CHECK(prepare.selected_factory_id == bootstrap_request.factory_id);
+  CHECK(bootstrap->production_owner()->executor() == native_executor);
+  CHECK(!bootstrap->production_owner()->stopped());
+
+  auto replacement = CoordinatorRequest(domain, 1002);
+  CHECK(coordinator.Prepare(replacement, &prepare, &reason) ==
+        hal::StatusId::degraded);
+  CHECK(bootstrap->production_owner()->executor() == native_executor);
+  CHECK(!bootstrap->production_owner()->stopped());
+
+  auto malformed_candidate = coordinator.Snapshot().plan;
+  ++malformed_candidate.prepared_program.execution_domain
+        .logical_context_generation;
+  video::VideoAdapterPrepareEvidence failed_prepare;
+  CHECK(!bootstrap->factory().Prepare(malformed_candidate, &failed_prepare));
+  CHECK(failed_prepare.status == hal::StatusId::blocked);
+  CHECK(failed_prepare.reason == hal::ReasonId::malformed_contract);
+  CHECK(failed_prepare.candidate_resources_rolled_back);
+  CHECK(coordinator.Snapshot().plan.plan_id == replacement.plan_id);
+  CHECK(bootstrap->production_owner()->executor() == native_executor);
+
+  HostFrames frames{};
+  frames.input.fill(0x62);
+  auto binding = frames.Binding(
+      CombinedProgram(*bootstrap->production_owner()), 1);
+  binding.input_descriptor = replacement.host_input;
+  binding.output_descriptor = replacement.host_output;
+  const auto frame = coordinator.Execute(binding);
+  CHECK(frame.status == hal::StatusId::executed);
+  CHECK(frame.output_ready);
+  CHECK(frame.transfers.uploads == 1);
+  CHECK(frame.transfers.final_readbacks == 1);
+  CHECK(frame.transfers.intermediate_uploads == 0);
+  CHECK(frame.transfers.intermediate_readbacks == 0);
+  CHECK(frame.transfers.cpu_tail_boundaries == 1);
+  CHECK(coordinator.CommitOutput(frame.completion, true, &reason) ==
+        hal::StatusId::ready);
+  CHECK(coordinator.Snapshot().latest_committed_frame.valid);
+  CHECK(coordinator.Snapshot().telemetry.active_backend ==
+        hal::BackendId::maxine);
+
+  // The prepared executor retains the production state. The coordinator must
+  // be able to tear its per-plan slot down after the external bootstrap and
+  // factory references have gone away.
+  bootstrap.reset();
+  coordinator.Shutdown();
+  CHECK(coordinator.Snapshot().stopped);
+  return true;
+}
+
 bool TemporalConfigurationsFailClosedWithoutResetEvidence() {
   RuntimeFixture runtime{};
   CHECK(runtime.Initialize());
@@ -674,6 +852,7 @@ int main() {
   if (!ExactDomainAndPreparedExecutionAreAllocationFree() ||
       !IdentityStageBudgetAndRollbackFailuresAreTyped() ||
       !OptionalFailureCommitDeviceLossAndShutdownAreSafe() ||
+      !ProductionBootstrapReusesOwnerRollsBackAndRetainsExecutorLifetime() ||
       !TemporalConfigurationsFailClosedWithoutResetEvidence()) {
     return EXIT_FAILURE;
   }

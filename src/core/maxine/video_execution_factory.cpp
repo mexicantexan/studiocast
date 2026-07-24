@@ -509,8 +509,13 @@ class MaxineVideoExecutionExecutor final
 public:
   MaxineVideoExecutionExecutor(
       std::unique_ptr<video::PreparedMaxineHardwareExecutionOwner> owner,
-      video::FrozenVideoExecutionPlan plan) noexcept
-      : owner_(std::move(owner)), plan_(std::move(plan)) {}
+      video::FrozenVideoExecutionPlan plan,
+      std::shared_ptr<void> adapter_lifetime, void *device_loss_owner,
+      void (*notify_device_lost)(void *) noexcept) noexcept
+      : adapter_lifetime_(std::move(adapter_lifetime)),
+        owner_(std::move(owner)), plan_(std::move(plan)),
+        device_loss_owner_(device_loss_owner),
+        notify_device_lost_(notify_device_lost) {}
 
   video::VideoExecutionFrameResult
   Execute(const hal::HostFrameBinding &binding) noexcept override {
@@ -549,8 +554,11 @@ public:
     result.output.capture_sequence = binding.capture_sequence;
     result.output.output_ready = frame.output_ready;
     result.output_ready = frame.output_ready;
-    if (frame.reason == hal::ReasonId::device_lost)
+    if (frame.reason == hal::ReasonId::device_lost) {
       owner_->NotifyDeviceLost();
+      if (notify_device_lost_)
+        notify_device_lost_(device_loss_owner_);
+    }
     return result;
   }
 
@@ -600,8 +608,13 @@ public:
   }
 
 private:
+  // Declared before owner_ so reverse member destruction tears down the
+  // borrowed per-plan session while its production adapter is still alive.
+  std::shared_ptr<void> adapter_lifetime_;
   std::unique_ptr<video::PreparedMaxineHardwareExecutionOwner> owner_;
   video::FrozenVideoExecutionPlan plan_{};
+  void *device_loss_owner_ = nullptr;
+  void (*notify_device_lost_)(void *) noexcept = nullptr;
 };
 
 } // namespace
@@ -761,7 +774,8 @@ MaxineVideoExecutionFactory::Prepare(
       return Fail(hal::StatusId::blocked, reason, true);
     }
     auto owner = std::make_unique<video::PreparedMaxineHardwareExecutionOwner>(
-        *configuration_.adapter_registration);
+        *configuration_.adapter_registration,
+        static_cast<bool>(configuration_.adapter_lifetime));
     const auto setup =
         owner->ConfigureExact(owner_request, plan.prepared_program);
     if (setup.status != hal::StatusId::ready &&
@@ -789,8 +803,10 @@ MaxineVideoExecutionFactory::Prepare(
       evidence->readiness = snapshot.readiness;
       evidence->candidate_resources_rolled_back = false;
     }
-    return std::make_unique<MaxineVideoExecutionExecutor>(std::move(owner),
-                                                          plan);
+    return std::make_unique<MaxineVideoExecutionExecutor>(
+        std::move(owner), plan, configuration_.adapter_lifetime,
+        configuration_.device_loss_owner,
+        configuration_.notify_device_lost);
   } catch (const std::bad_alloc &) {
     return Fail(hal::StatusId::resource_exhausted,
                 hal::ReasonId::resource_exhausted, true);

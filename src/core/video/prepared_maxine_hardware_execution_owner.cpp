@@ -14,6 +14,62 @@ namespace {
 constexpr std::uint64_t kHashOffset = UINT64_C(1469598103934665603);
 constexpr std::uint64_t kHashPrime = UINT64_C(1099511628211);
 
+// A production bootstrap owns the adapter for longer than any one frozen
+// program. PreparedProgramSession::Shutdown normally shuts its adapter, which
+// would tear down a newly prepared slot when the coordinator retires the old
+// executor. This forwarding view gives each injected program independent slot
+// lifetime while leaving whole-adapter shutdown to the bootstrap owner.
+class BorrowedResidentAdapter final : public hal::IResidentAdapter {
+public:
+  explicit BorrowedResidentAdapter(hal::IResidentAdapter &delegate) noexcept
+      : delegate_(&delegate) {}
+
+  [[nodiscard]] std::uint64_t adapter_instance_id() const noexcept override {
+    return delegate_->adapter_instance_id();
+  }
+  [[nodiscard]] hal::BackendId backend_id() const noexcept override {
+    return delegate_->backend_id();
+  }
+  hal::StatusId Prepare(const hal::PreparedProgram &program,
+                        hal::PreparedProgramHandle *candidate,
+                        hal::ReadinessSnapshot *readiness,
+                        hal::ReasonId *reason) noexcept override {
+    return delegate_->Prepare(program, candidate, readiness, reason);
+  }
+  hal::ExecuteResult
+  Execute(const hal::PreparedProgramHandle &program,
+          const hal::ExecuteRequest &request) noexcept override {
+    return delegate_->Execute(program, request);
+  }
+  hal::StatusId
+  ResetTemporalState(const hal::PreparedProgramHandle &program,
+                     hal::ReasonId reason) noexcept override {
+    return delegate_->ResetTemporalState(program, reason);
+  }
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override {
+    return delegate_->BindHostFrame(program, binding, tokens, reason);
+  }
+  hal::StatusId ResolveHostFrameOutput(
+      const hal::PreparedProgramHandle &program,
+      const hal::CompletionToken &completion,
+      const hal::ResourceHandle &resource,
+      hal::HostFrameOutputResolution *resolution,
+      hal::ReasonId *reason) noexcept override {
+    return delegate_->ResolveHostFrameOutput(program, completion, resource,
+                                             resolution, reason);
+  }
+  void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override {
+    delegate_->DestroyPrepared(program);
+  }
+  void Shutdown() noexcept override {}
+
+private:
+  hal::IResidentAdapter *delegate_;
+};
+
 std::uint64_t NextAdapterInstanceId() noexcept {
   static std::atomic<std::uint64_t> next{UINT64_C(0x4d580000)};
   std::uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
@@ -543,6 +599,7 @@ PreparedMaxineHardwareReasonCode(hal::ReasonId reason) noexcept {
 
 struct PreparedMaxineHardwareExecutionOwner::Impl {
   const hal::AdapterRegistration *injected_registration = nullptr;
+  std::unique_ptr<BorrowedResidentAdapter> borrowed_adapter;
   std::unique_ptr<hal::PreparedProgramSession> injected_session;
   std::unique_ptr<maxine::MaxineProductionHalOwner> production;
   PreparedMaxineHardwareRequest active_request{};
@@ -557,8 +614,11 @@ struct PreparedMaxineHardwareExecutionOwner::Impl {
     return production ? production->session() : injected_session.get();
   }
   [[nodiscard]] hal::IResidentAdapter *InjectedAdapter() const noexcept {
-    return injected_registration ? injected_registration->resident_adapter
-                                 : nullptr;
+    return borrowed_adapter
+               ? static_cast<hal::IResidentAdapter *>(borrowed_adapter.get())
+               : (injected_registration
+                      ? injected_registration->resident_adapter
+                      : nullptr);
   }
 
   void RefreshSnapshot(PreparedMaxineHardwareRoute route,
@@ -593,8 +653,17 @@ PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner()
 
 PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner(
     const hal::AdapterRegistration &registration)
+    : PreparedMaxineHardwareExecutionOwner(registration, false) {}
+
+PreparedMaxineHardwareExecutionOwner::PreparedMaxineHardwareExecutionOwner(
+    const hal::AdapterRegistration &registration,
+    bool adapter_lifetime_is_borrowed)
     : impl_(std::make_unique<Impl>()) {
   impl_->injected_registration = &registration;
+  if (adapter_lifetime_is_borrowed && registration.resident_adapter) {
+    impl_->borrowed_adapter = std::make_unique<BorrowedResidentAdapter>(
+        *registration.resident_adapter);
+  }
   impl_->injected_session = std::make_unique<hal::PreparedProgramSession>();
 }
 
