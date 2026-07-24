@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace studiocast::open_cuda {
 
@@ -64,6 +65,12 @@ struct OpenCudaProductionBackendRequest {
   std::uint64_t model_artifact_hash = 0;
   int strength = 8;
   std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
+  std::vector<std::uint8_t> replacement_rgb{};
+  int replacement_width = 0;
+  int replacement_height = 0;
+  int key_light_intensity = 50;
+  int key_light_temperature_preset = 0;
+  int key_light_direction_pan_degrees = 0;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 
   // Null selects the production CUDA/ORT runtime owned by the executor.

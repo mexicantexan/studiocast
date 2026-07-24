@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace studiocast::open_cuda {
 
@@ -61,6 +62,8 @@ enum class PreparedOpenCudaOperationId : std::uint16_t {
   composite_solid = 10,
   final_readback = 11,
   completion_wait = 12,
+  composite_replace = 13,
+  key_light = 14,
 };
 
 struct PreparedOpenCudaLaunchGeometry {
@@ -87,6 +90,9 @@ struct PreparedOpenCudaVbPlanInput {
   std::uint64_t alpha_feather_pitch_bytes = 0;
   std::uint64_t blur_scratch_pitch_bytes = 0;
   std::uint64_t blurred_pitch_bytes = 0;
+  std::uint64_t replacement_source_pitch_bytes = 0;
+  std::uint64_t replacement_source_height = 0;
+  std::uint64_t replacement_frame_pitch_bytes = 0;
   std::uint64_t upload_staging_bytes = 0;
   std::uint64_t readback_staging_bytes = 0;
   hal::ResourceBudget available_budget{};
@@ -144,6 +150,12 @@ struct PreparedOpenCudaProductionConfig {
   bool executor_owns_stream = false;
   int strength = 8;
   std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
+  std::vector<std::uint8_t> replacement_rgb{};
+  int replacement_width = 0;
+  int replacement_height = 0;
+  int key_light_intensity = 50;
+  int key_light_temperature_preset = 0;
+  int key_light_direction_pan_degrees = 0;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 };
 
@@ -282,6 +294,12 @@ public:
     bool executor_owns_stream = false;
     int strength = 8;
     std::array<std::uint8_t, 3> remove_background_rgb{0, 0, 0};
+    std::vector<std::uint8_t> replacement_rgb{};
+    int replacement_width = 0;
+    int replacement_height = 0;
+    int key_light_intensity = 50;
+    int key_light_temperature_preset = 0;
+    int key_light_direction_pan_degrees = 0;
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
     IPreparedOpenCudaRuntime *runtime = nullptr;

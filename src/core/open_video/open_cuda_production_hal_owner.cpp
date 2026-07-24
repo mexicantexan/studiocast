@@ -124,7 +124,9 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
     return false;
   }
   if (stage.semantic != hal::SemanticEffectId::virtual_background_blur &&
-      stage.semantic != hal::SemanticEffectId::virtual_background_remove) {
+      stage.semantic != hal::SemanticEffectId::virtual_background_remove &&
+      stage.semantic != hal::SemanticEffectId::virtual_background_replace &&
+      stage.semantic != hal::SemanticEffectId::virtual_key_light) {
     if (reason)
       *reason = ReasonId::semantic_effect_unsupported;
     return false;
@@ -384,6 +386,14 @@ OpenCudaProductionHalOwner::CreateBackend(
     options.executor_owns_stream = true;
     options.strength = request.strength;
     options.remove_background_rgb = request.remove_background_rgb;
+    options.replacement_rgb = request.replacement_rgb;
+    options.replacement_width = request.replacement_width;
+    options.replacement_height = request.replacement_height;
+    options.key_light_intensity = request.key_light_intensity;
+    options.key_light_temperature_preset =
+        request.key_light_temperature_preset;
+    options.key_light_direction_pan_degrees =
+        request.key_light_direction_pan_degrees;
     options.wait_policy = request.wait_policy;
     options.runtime = request.runtime;
     state.executor =

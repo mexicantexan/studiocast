@@ -5,6 +5,7 @@
 #include "core/cuda/kernels/open_cuda_vb_kernels.h"
 #include "core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.h"
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
+#include "core/cuda/kernels/resize_bilinear.h"
 #include "core/open_video/matting_session.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 
@@ -37,12 +38,15 @@ constexpr std::uint32_t kBaseRuntimeResourceCount = 16;
 constexpr std::uint32_t kPreparedResizedAlphaImageCount = 1;
 constexpr std::uint32_t kPreparedFeatherImageCount = 2;
 constexpr std::uint32_t kPreparedRgbBlurImageCount = 2;
+constexpr std::uint32_t kPreparedReplacementImageCount = 2;
 
 constexpr std::uint32_t PreparedResourceCount(bool blur,
-                                              bool feather) noexcept {
+                                              bool feather,
+                                              bool replace) noexcept {
   return kBaseRuntimeResourceCount + kPreparedResizedAlphaImageCount +
          (feather ? kPreparedFeatherImageCount : 0) +
-         (blur ? kPreparedRgbBlurImageCount : 0);
+         (blur ? kPreparedRgbBlurImageCount : 0) +
+         (replace ? kPreparedReplacementImageCount : 0);
 }
 
 bool SameHalModel(
@@ -122,7 +126,11 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
   const bool blur = input.semantic == SemanticEffectId::virtual_background_blur;
   const bool remove =
       input.semantic == SemanticEffectId::virtual_background_remove;
-  if (!blur && !remove) {
+  const bool replace =
+      input.semantic == SemanticEffectId::virtual_background_replace;
+  const bool key_light =
+      input.semantic == SemanticEffectId::virtual_key_light;
+  if (!blur && !remove && !replace && !key_light) {
     result.status = RuntimeStatus::unsupported_effect;
     result.reason = ReasonId::semantic_effect_unsupported;
     return result;
@@ -132,7 +140,7 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       video::effects::contract::kVbStrengthMax);
   const std::uint32_t feather_radius =
       static_cast<std::uint32_t>(std::min(4, clamped_strength / 16));
-  const bool feather = feather_radius != 0;
+  const bool feather = !key_light && feather_radius != 0;
   if (input.frame_width == 0 || input.frame_height == 0 ||
       input.model_width == 0 || input.model_height == 0 ||
       input.frame_width >
@@ -174,7 +182,11 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       input.upload_staging_bytes < frame_rgb_active ||
       input.readback_staging_bytes < frame_rgb_active ||
       (blur && (input.blur_scratch_pitch_bytes < frame_rgb_row ||
-                input.blurred_pitch_bytes < frame_rgb_row))) {
+                input.blurred_pitch_bytes < frame_rgb_row)) ||
+      (replace &&
+       (input.replacement_source_pitch_bytes == 0 ||
+        input.replacement_source_height == 0 ||
+        input.replacement_frame_pitch_bytes < frame_rgb_row))) {
     result.status = RuntimeStatus::malformed_contract;
     result.reason = ReasonId::malformed_descriptor;
     return result;
@@ -187,6 +199,8 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
   std::uint64_t alpha_feather_capacity = 0;
   std::uint64_t blur_scratch_capacity = 0;
   std::uint64_t blurred_capacity = 0;
+  std::uint64_t replacement_source_capacity = 0;
+  std::uint64_t replacement_frame_capacity = 0;
   if (!CheckedMul(input.input_pitch_bytes, input.frame_height,
                   &input_capacity) ||
       !CheckedMul(input.output_pitch_bytes, input.frame_height,
@@ -201,7 +215,13 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       (blur && (!CheckedMul(input.blur_scratch_pitch_bytes, input.frame_height,
                             &blur_scratch_capacity) ||
                 !CheckedMul(input.blurred_pitch_bytes, input.frame_height,
-                            &blurred_capacity)))) {
+                            &blurred_capacity))) ||
+      (replace &&
+       (!CheckedMul(input.replacement_source_pitch_bytes,
+                    input.replacement_source_height,
+                    &replacement_source_capacity) ||
+        !CheckedMul(input.replacement_frame_pitch_bytes, input.frame_height,
+                    &replacement_frame_capacity)))) {
     result.status = RuntimeStatus::resource_exhausted;
     result.reason = ReasonId::resource_exhausted;
     return result;
@@ -220,14 +240,17 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
        (!add(alpha_scratch_capacity, &required.scratch_bytes) ||
         !add(alpha_feather_capacity, &required.scratch_bytes))) ||
       (blur && (!add(blur_scratch_capacity, &required.scratch_bytes) ||
-                !add(blurred_capacity, &required.scratch_bytes)))) {
+                !add(blurred_capacity, &required.scratch_bytes))) ||
+      (replace &&
+       (!add(replacement_source_capacity, &required.persistent_bytes) ||
+        !add(replacement_frame_capacity, &required.persistent_bytes)))) {
     result.status = RuntimeStatus::resource_exhausted;
     result.reason = ReasonId::resource_exhausted;
     return result;
   }
   required.upload_staging_bytes = input.upload_staging_bytes;
   required.readback_staging_bytes = input.readback_staging_bytes;
-  required.resource_count = PreparedResourceCount(blur, feather);
+  required.resource_count = PreparedResourceCount(blur, feather, replace);
   required.in_flight_slots = 1;
   if (!BudgetContains(input.available_budget, required)) {
     result.status = RuntimeStatus::resource_exhausted;
@@ -240,7 +263,7 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
   result.model_width = static_cast<std::uint32_t>(input.model_width);
   result.model_height = static_cast<std::uint32_t>(input.model_height);
   result.strength = static_cast<std::uint32_t>(clamped_strength);
-  result.alpha_feather_radius = feather_radius;
+  result.alpha_feather_radius = feather ? feather_radius : 0;
 
   const std::uint32_t grid_x =
       result.frame_width / kKernelBlock +
@@ -265,8 +288,12 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
     append(PreparedOpenCudaOperationId::background_blur_horizontal);
     append(PreparedOpenCudaOperationId::background_blur_vertical);
     append(PreparedOpenCudaOperationId::composite_background);
-  } else {
+  } else if (remove) {
     append(PreparedOpenCudaOperationId::composite_solid);
+  } else if (replace) {
+    append(PreparedOpenCudaOperationId::composite_replace);
+  } else {
+    append(PreparedOpenCudaOperationId::key_light);
   }
   result.status = RuntimeStatus::ready;
   result.reason = ReasonId::none;
@@ -279,6 +306,10 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
       plan.semantic == SemanticEffectId::virtual_background_blur;
   const bool remove =
       plan.semantic == SemanticEffectId::virtual_background_remove;
+  const bool replace =
+      plan.semantic == SemanticEffectId::virtual_background_replace;
+  const bool key_light =
+      plan.semantic == SemanticEffectId::virtual_key_light;
   const bool feather = plan.alpha_feather_radius != 0;
   if (!plan.ready() || plan.frame_width == 0 || plan.frame_height == 0 ||
       plan.model_width == 0 || plan.model_height == 0 ||
@@ -291,10 +322,11 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
                           video::effects::contract::kVbStrengthMin) ||
       plan.strength > static_cast<std::uint32_t>(
                           video::effects::contract::kVbStrengthMax) ||
-      plan.alpha_feather_radius != std::min(4u, plan.strength / 16u) ||
-      (!blur && !remove) ||
+      plan.alpha_feather_radius !=
+          (key_light ? 0u : std::min(4u, plan.strength / 16u)) ||
+      (!blur && !remove && !replace && !key_light) ||
       plan.required_budget.resource_count !=
-          PreparedResourceCount(blur, feather)) {
+          PreparedResourceCount(blur, feather, replace)) {
     return false;
   }
   std::array<PreparedOpenCudaOperationId, PreparedOpenCudaVbPlan::kMaxLaunches>
@@ -316,6 +348,10 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
         PreparedOpenCudaOperationId::composite_background;
   } else if (remove) {
     expected[expected_count++] = PreparedOpenCudaOperationId::composite_solid;
+  } else if (replace) {
+    expected[expected_count++] = PreparedOpenCudaOperationId::composite_replace;
+  } else if (key_light) {
+    expected[expected_count++] = PreparedOpenCudaOperationId::key_light;
   } else {
     return false;
   }
@@ -434,7 +470,9 @@ ReasonId ValidateProductionProgram(
     return ReasonId::semantic_provider_unavailable;
   }
   if (stage.semantic != SemanticEffectId::virtual_background_blur &&
-      stage.semantic != SemanticEffectId::virtual_background_remove) {
+      stage.semantic != SemanticEffectId::virtual_background_remove &&
+      stage.semantic != SemanticEffectId::virtual_background_replace &&
+      stage.semantic != SemanticEffectId::virtual_key_light) {
     return ReasonId::semantic_effect_unsupported;
   }
   if ((stage.required && stage.failure_action != FailureAction::fail_closed) ||
@@ -830,13 +868,37 @@ public:
       const int clamped_strength = std::clamp(
           config.strength, video::effects::contract::kVbStrengthMin,
           video::effects::contract::kVbStrengthMax);
-      const bool feather = std::min(4, clamped_strength / 16) != 0;
+      const bool replace = program.stages[0].semantic ==
+                           SemanticEffectId::virtual_background_replace;
+      const bool key_light = program.stages[0].semantic ==
+                             SemanticEffectId::virtual_key_light;
+      const bool feather =
+          !key_light && std::min(4, clamped_strength / 16) != 0;
       preflight.alpha_scratch_pitch_bytes =
           feather ? frame_alpha_row : 0;
       preflight.alpha_feather_pitch_bytes =
           feather ? frame_alpha_row : 0;
       preflight.blur_scratch_pitch_bytes = image.planes[0].row_stride_bytes;
       preflight.blurred_pitch_bytes = image.planes[0].row_stride_bytes;
+      if (replace) {
+        std::uint64_t replacement_bytes = 0;
+        if (config.replacement_width <= 0 ||
+            config.replacement_height <= 0 ||
+            !CheckedMul(
+                static_cast<std::uint64_t>(config.replacement_width), 3u,
+                &preflight.replacement_source_pitch_bytes) ||
+            !CheckedMul(preflight.replacement_source_pitch_bytes,
+                        static_cast<std::uint64_t>(config.replacement_height),
+                        &replacement_bytes) ||
+            replacement_bytes != config.replacement_rgb.size()) {
+          return SetupFailure(RuntimeStatus::malformed_contract,
+                              ReasonId::malformed_descriptor);
+        }
+        preflight.replacement_source_height =
+            static_cast<std::uint64_t>(config.replacement_height);
+        preflight.replacement_frame_pitch_bytes =
+            image.planes[0].row_stride_bytes;
+      }
       preflight.upload_staging_bytes = program.host_input.planes[0].size_bytes;
       preflight.readback_staging_bytes =
           program.host_output.planes[0].size_bytes;
@@ -872,6 +934,40 @@ public:
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::resource_exhausted,
                             ReasonId::resource_exhausted);
+      }
+      if (replace &&
+          (!candidate->replacement_source.Allocate(
+               config.driver, config.replacement_width,
+               config.replacement_height, cuda::PixelFormatGpu::rgb_u8,
+               &error) ||
+           !candidate->replacement_frame.Allocate(
+               config.driver, width, height, cuda::PixelFormatGpu::rgb_u8,
+               &error) ||
+           !candidate->replacement_source.UploadFromCpuRgb24(
+               config.driver, config.replacement_rgb.data(),
+               static_cast<std::size_t>(config.replacement_width) * 3u,
+               candidate->stream, &error) ||
+           !cuda::kernels::ResizeBilinear(
+               candidate->replacement_source, candidate->replacement_frame,
+               candidate->stream, &error))) {
+        if (!config.driver->StreamSynchronize(candidate->stream, nullptr)) {
+          candidate->setup_completion_unproven = true;
+          candidate->retired = true;
+          *destination = std::move(candidate);
+          return SetupFailure(RuntimeStatus::completion_pending,
+                              ReasonId::synchronization_failed);
+        }
+        CleanupCandidate(candidate.get());
+        return SetupFailure(RuntimeStatus::not_prepared,
+                            ReasonId::capability_evidence_incomplete);
+      }
+      if (replace &&
+          !config.driver->StreamSynchronize(candidate->stream, nullptr)) {
+        candidate->setup_completion_unproven = true;
+        candidate->retired = true;
+        *destination = std::move(candidate);
+        return SetupFailure(RuntimeStatus::completion_pending,
+                            ReasonId::synchronization_failed);
       }
       if (!candidate->alpha.AllocateNchwF32(config.driver, 1, 1, model_h,
                                             model_w, &error) ||
@@ -1039,6 +1135,12 @@ public:
           candidate->alpha_feather.pitch;
       exact_plan_input.blur_scratch_pitch_bytes = candidate->blur_tmp.pitch;
       exact_plan_input.blurred_pitch_bytes = candidate->blurred.pitch;
+      exact_plan_input.replacement_source_pitch_bytes =
+          candidate->replacement_source.pitch;
+      exact_plan_input.replacement_source_height =
+          static_cast<std::uint64_t>(candidate->replacement_source.h);
+      exact_plan_input.replacement_frame_pitch_bytes =
+          candidate->replacement_frame.pitch;
       candidate->postprocess_plan =
           BuildPreparedOpenCudaVirtualBackgroundPlan(exact_plan_input);
       if (!candidate->postprocess_plan.ready()) {
@@ -1394,7 +1496,7 @@ private:
       PreparedOpenCudaOperationId operation =
           PreparedOpenCudaOperationId::invalid;
       cuda::kernels::PreparedOpenCudaVbLaunch request{};
-      std::array<void *, 11> parameters{};
+      std::array<void *, 13> parameters{};
     };
 
     hal::PreparedProgram program{};
@@ -1408,6 +1510,8 @@ private:
     cuda::CudaImage output{};
     cuda::CudaImage blur_tmp{};
     cuda::CudaImage blurred{};
+    cuda::CudaImage replacement_source{};
+    cuda::CudaImage replacement_frame{};
     cuda::CudaTensor alpha{};
     cuda::CudaImage alpha_image{};
     cuda::CudaImage alpha_resized{};
@@ -1432,6 +1536,7 @@ private:
     unsigned long long alpha_feather_ptr_arg = 0;
     unsigned long long blur_tmp_ptr_arg = 0;
     unsigned long long blurred_ptr_arg = 0;
+    unsigned long long replacement_frame_ptr_arg = 0;
     std::uint32_t input_pitch_arg = 0;
     std::uint32_t output_pitch_arg = 0;
     std::uint32_t model_alpha_pitch_arg = 0;
@@ -1440,6 +1545,7 @@ private:
     std::uint32_t alpha_feather_pitch_arg = 0;
     std::uint32_t blur_tmp_pitch_arg = 0;
     std::uint32_t blurred_pitch_arg = 0;
+    std::uint32_t replacement_frame_pitch_arg = 0;
     std::uint32_t frame_width_arg = 0;
     std::uint32_t frame_height_arg = 0;
     std::uint32_t model_width_arg = 0;
@@ -1447,6 +1553,11 @@ private:
     int strength_arg = 0;
     int alpha_feather_radius_arg = 0;
     std::array<std::uint8_t, 3> remove_background_rgb_arg{};
+    float key_light_r_arg = 255.0f;
+    float key_light_g_arg = 255.0f;
+    float key_light_b_arg = 255.0f;
+    float key_light_intensity_arg = 0.5f;
+    float key_light_direction_arg = 0.0f;
     cuda::CudaPreparedTransferCompletion::Binding transfer_binding{};
     cuda::CudaPreparedTransferCompletion transfer{};
     bool quarantined = false;
@@ -1498,6 +1609,8 @@ private:
     FreeImage(slot->config.driver, &slot->alpha_resized);
     FreeImage(slot->config.driver, &slot->blurred);
     FreeImage(slot->config.driver, &slot->blur_tmp);
+    FreeImage(slot->config.driver, &slot->replacement_frame);
+    FreeImage(slot->config.driver, &slot->replacement_source);
     FreeImage(slot->config.driver, &slot->output);
     FreeImage(slot->config.driver, &slot->input);
     slot->stream = nullptr;
@@ -1524,6 +1637,8 @@ private:
     FreeImage(slot->config.driver, &slot->alpha_resized);
     FreeImage(slot->config.driver, &slot->blurred);
     FreeImage(slot->config.driver, &slot->blur_tmp);
+    FreeImage(slot->config.driver, &slot->replacement_frame);
+    FreeImage(slot->config.driver, &slot->replacement_source);
     FreeImage(slot->config.driver, &slot->output);
     FreeImage(slot->config.driver, &slot->input);
     slot->stream = nullptr;
@@ -1561,6 +1676,9 @@ private:
       return pitch <= std::numeric_limits<std::uint32_t>::max();
     };
     const bool feather = slot->postprocess_plan.alpha_feather_radius != 0;
+    const bool replace =
+        slot->program.stages[0].semantic ==
+        SemanticEffectId::virtual_background_replace;
     if (!slot->alpha_resized.Valid() ||
         (feather &&
          (!slot->alpha_tmp.Valid() || !slot->alpha_feather.Valid())) ||
@@ -1578,7 +1696,11 @@ private:
         (slot->program.stages[0].semantic ==
              SemanticEffectId::virtual_background_blur &&
          (!fits_pitch(slot->blur_tmp.pitch) ||
-          !fits_pitch(slot->blurred.pitch)))) {
+          !fits_pitch(slot->blurred.pitch))) ||
+        (replace &&
+         (!slot->replacement_source.Valid() ||
+          !slot->replacement_frame.Valid() ||
+          !fits_pitch(slot->replacement_frame.pitch)))) {
       return false;
     }
 
@@ -1590,6 +1712,7 @@ private:
     slot->alpha_feather_ptr_arg = slot->alpha_feather.ptr;
     slot->blur_tmp_ptr_arg = slot->blur_tmp.ptr;
     slot->blurred_ptr_arg = slot->blurred.ptr;
+    slot->replacement_frame_ptr_arg = slot->replacement_frame.ptr;
     slot->input_pitch_arg = static_cast<std::uint32_t>(slot->input.pitch);
     slot->output_pitch_arg = static_cast<std::uint32_t>(slot->output.pitch);
     slot->model_alpha_pitch_arg =
@@ -1602,6 +1725,8 @@ private:
         static_cast<std::uint32_t>(slot->alpha_feather.pitch);
     slot->blur_tmp_pitch_arg = static_cast<std::uint32_t>(slot->blur_tmp.pitch);
     slot->blurred_pitch_arg = static_cast<std::uint32_t>(slot->blurred.pitch);
+    slot->replacement_frame_pitch_arg =
+        static_cast<std::uint32_t>(slot->replacement_frame.pitch);
     slot->frame_width_arg = slot->postprocess_plan.frame_width;
     slot->frame_height_arg = slot->postprocess_plan.frame_height;
     slot->model_width_arg = slot->postprocess_plan.model_width;
@@ -1610,6 +1735,21 @@ private:
     slot->alpha_feather_radius_arg =
         static_cast<int>(slot->postprocess_plan.alpha_feather_radius);
     slot->remove_background_rgb_arg = slot->config.remove_background_rgb;
+    const int preset =
+        std::clamp(slot->config.key_light_temperature_preset, 0, 2);
+    slot->key_light_r_arg = preset == 2 ? 228.0f : 255.0f;
+    slot->key_light_g_arg = preset == 0 ? 255.0f : 242.0f;
+    slot->key_light_b_arg = preset == 1 ? 228.0f : 255.0f;
+    slot->key_light_intensity_arg =
+        std::clamp(static_cast<float>(slot->config.key_light_intensity) /
+                       100.0f,
+                   0.0f, 1.0f);
+    slot->key_light_direction_arg =
+        std::clamp(
+            static_cast<float>(
+                slot->config.key_light_direction_pan_degrees) /
+                90.0f,
+            -1.0f, 1.0f);
 
     for (std::uint32_t index = 0; index < slot->postprocess_plan.launch_count;
          ++index) {
@@ -1705,6 +1845,37 @@ private:
         parameters[9] = &slot->output_ptr_arg;
         parameters[10] = &slot->output_pitch_arg;
         break;
+      case PreparedOpenCudaOperationId::composite_replace:
+        prepared.request.kernel = OpenCudaVbKernelId::composite_background;
+        parameters[0] = &slot->input_ptr_arg;
+        parameters[1] = &slot->input_pitch_arg;
+        parameters[2] = &slot->replacement_frame_ptr_arg;
+        parameters[3] = &slot->replacement_frame_pitch_arg;
+        parameters[4] = feather ? &slot->alpha_feather_ptr_arg
+                                : &slot->resized_alpha_ptr_arg;
+        parameters[5] = feather ? &slot->alpha_feather_pitch_arg
+                                : &slot->resized_alpha_pitch_arg;
+        parameters[6] = &slot->frame_width_arg;
+        parameters[7] = &slot->frame_height_arg;
+        parameters[8] = &slot->output_ptr_arg;
+        parameters[9] = &slot->output_pitch_arg;
+        break;
+      case PreparedOpenCudaOperationId::key_light:
+        prepared.request.kernel = OpenCudaVbKernelId::key_light;
+        parameters[0] = &slot->input_ptr_arg;
+        parameters[1] = &slot->input_pitch_arg;
+        parameters[2] = &slot->resized_alpha_ptr_arg;
+        parameters[3] = &slot->resized_alpha_pitch_arg;
+        parameters[4] = &slot->frame_width_arg;
+        parameters[5] = &slot->frame_height_arg;
+        parameters[6] = &slot->key_light_r_arg;
+        parameters[7] = &slot->key_light_g_arg;
+        parameters[8] = &slot->key_light_b_arg;
+        parameters[9] = &slot->key_light_intensity_arg;
+        parameters[10] = &slot->key_light_direction_arg;
+        parameters[11] = &slot->output_ptr_arg;
+        parameters[12] = &slot->output_pitch_arg;
+        break;
       case PreparedOpenCudaOperationId::invalid:
       case PreparedOpenCudaOperationId::upload:
       case PreparedOpenCudaOperationId::preprocess:
@@ -1787,6 +1958,14 @@ struct OpenCudaPreparedResidentExecutor::Impl {
     config.executor_owns_stream = options.executor_owns_stream;
     config.strength = options.strength;
     config.remove_background_rgb = options.remove_background_rgb;
+    config.replacement_rgb = options.replacement_rgb;
+    config.replacement_width = options.replacement_width;
+    config.replacement_height = options.replacement_height;
+    config.key_light_intensity = options.key_light_intensity;
+    config.key_light_temperature_preset =
+        options.key_light_temperature_preset;
+    config.key_light_direction_pan_degrees =
+        options.key_light_direction_pan_degrees;
     config.wait_policy = options.wait_policy;
     if (options.runtime) {
       runtime = options.runtime;
@@ -1960,6 +2139,11 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
       program.stages[0].semantic == SemanticEffectId::virtual_background_blur;
   result.evidence.capability.virtual_background_remove =
       program.stages[0].semantic == SemanticEffectId::virtual_background_remove;
+  result.evidence.capability.virtual_background_replace =
+      program.stages[0].semantic ==
+      SemanticEffectId::virtual_background_replace;
+  result.evidence.capability.virtual_key_light =
+      program.stages[0].semantic == SemanticEffectId::virtual_key_light;
   result.evidence.stage_count = 1;
   auto &stage_evidence = result.evidence.stages[0];
   stage_evidence.stage_id = program.stages[0].stage_id;

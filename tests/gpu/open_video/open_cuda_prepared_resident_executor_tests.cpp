@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -197,6 +198,25 @@ Options(open_cuda::IPreparedOpenCudaRuntime *runtime) {
   return options;
 }
 
+open_cuda::OpenCudaPreparedResidentExecutor::Options
+OptionsFor(open_cuda::IPreparedOpenCudaRuntime *runtime,
+           hal::SemanticEffectId semantic) {
+  auto options = Options(runtime);
+  if (semantic == hal::SemanticEffectId::virtual_background_replace) {
+    options.replacement_width = 2;
+    options.replacement_height = 2;
+    options.replacement_rgb = {
+        255, 0,   0,   0, 255, 0,
+        0,   0,   255, 255, 255, 255,
+    };
+  } else if (semantic == hal::SemanticEffectId::virtual_key_light) {
+    options.key_light_intensity = 75;
+    options.key_light_temperature_preset = 2;
+    options.key_light_direction_pan_degrees = -35;
+  }
+  return options;
+}
+
 hal::HostFrameBinding HostBinding(const hal::PreparedProgram &program,
                                   const std::byte *input, std::byte *output,
                                   std::uint64_t sequence) {
@@ -303,6 +323,15 @@ public:
         plan_input.frame_width * sizeof(float);
     plan_input.blur_scratch_pitch_bytes = plan_input.input_pitch_bytes;
     plan_input.blurred_pitch_bytes = plan_input.input_pitch_bytes;
+    if (program.stages[0].semantic ==
+        hal::SemanticEffectId::virtual_background_replace) {
+      plan_input.replacement_source_pitch_bytes =
+          static_cast<std::uint64_t>(config.replacement_width) * 3u;
+      plan_input.replacement_source_height =
+          static_cast<std::uint64_t>(config.replacement_height);
+      plan_input.replacement_frame_pitch_bytes =
+          plan_input.input_pitch_bytes;
+    }
     plan_input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
     plan_input.readback_staging_bytes =
         program.host_output.planes[0].size_bytes;
@@ -378,11 +407,24 @@ public:
     } else if (result.status == RuntimeStatus::required_failed) {
       result.stage_failure_status = RuntimeStatus::postprocess_failed;
       result.stage_failure_reason = hal::ReasonId::transfer_contract_violated;
-      result.failed_operation =
-          slot->program.stages[0].semantic ==
-                  hal::SemanticEffectId::virtual_background_remove
-              ? open_cuda::PreparedOpenCudaOperationId::composite_solid
-              : open_cuda::PreparedOpenCudaOperationId::composite_background;
+      switch (slot->program.stages[0].semantic) {
+      case hal::SemanticEffectId::virtual_background_remove:
+        result.failed_operation =
+            open_cuda::PreparedOpenCudaOperationId::composite_solid;
+        break;
+      case hal::SemanticEffectId::virtual_background_replace:
+        result.failed_operation =
+            open_cuda::PreparedOpenCudaOperationId::composite_replace;
+        break;
+      case hal::SemanticEffectId::virtual_key_light:
+        result.failed_operation =
+            open_cuda::PreparedOpenCudaOperationId::key_light;
+        break;
+      default:
+        result.failed_operation =
+            open_cuda::PreparedOpenCudaOperationId::composite_background;
+        break;
+      }
     } else if (result.status == RuntimeStatus::device_lost) {
       result.stage_failure_status = RuntimeStatus::device_lost;
       result.stage_failure_reason = hal::ReasonId::device_lost;
@@ -515,7 +557,8 @@ struct Fixture {
   explicit Fixture(hal::SemanticEffectId semantic =
                        hal::SemanticEffectId::virtual_background_blur,
                    bool required = true)
-      : program(Program(semantic, required)), executor(Options(&runtime)),
+      : program(Program(semantic, required)),
+        executor(OptionsFor(&runtime, semantic)),
         adapter(81, executor) {}
 
   FakeRuntime runtime;
@@ -600,6 +643,11 @@ PlanningInput(hal::SemanticEffectId semantic, int strength) {
   input.alpha_feather_pitch_bytes = 128;
   input.blur_scratch_pitch_bytes = 64;
   input.blurred_pitch_bytes = 80;
+  if (semantic == hal::SemanticEffectId::virtual_background_replace) {
+    input.replacement_source_pitch_bytes = 12;
+    input.replacement_source_height = 5;
+    input.replacement_frame_pitch_bytes = 80;
+  }
   input.upload_staging_bytes = 459;
   input.readback_staging_bytes = 459;
   input.available_budget.persistent_bytes = 1'000'000;
@@ -700,6 +748,41 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
               "remove budget must include every prepared alpha buffer but no "
               "RGB blur buffers") &&
        ok;
+  const auto replace = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+      PlanningInput(hal::SemanticEffectId::virtual_background_replace, 16));
+  ok = Expect(replace.ready() &&
+                  replace.required_budget.persistent_bytes == 3452 &&
+                  replace.required_budget.scratch_bytes == 2160 &&
+                  replace.required_budget.resource_count == 21 &&
+                  replace.launch_count == 4 &&
+                  replace.launches[3].operation ==
+                      Operation::composite_replace,
+              "replace budget must include setup-sized replacement source "
+              "and frame resources with exact composite ordering") &&
+       ok;
+  const auto key_light = open_cuda::PlanPreparedOpenCudaVirtualBackground(
+      PlanningInput(hal::SemanticEffectId::virtual_key_light, 64));
+  ok = Expect(key_light.ready() && key_light.alpha_feather_radius == 0 &&
+                  key_light.required_budget.persistent_bytes == 2672 &&
+                  key_light.required_budget.scratch_bytes == 0 &&
+                  key_light.required_budget.resource_count == 17 &&
+                  key_light.launch_count == 2 &&
+                  key_light.launches[1].operation == Operation::key_light,
+              "key light must use the shared resized matte without hidden "
+              "feather scratch or launches") &&
+       ok;
+  {
+    auto input =
+        PlanningInput(hal::SemanticEffectId::virtual_background_replace, 8);
+    input.replacement_source_pitch_bytes = 0;
+    const auto malformed =
+        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+    ok = Expect(malformed.status == RuntimeStatus::malformed_contract &&
+                    malformed.reason == hal::ReasonId::malformed_descriptor,
+                "replace must reject missing setup-time replacement "
+                "resources") &&
+         ok;
+  }
   {
     auto input =
         PlanningInput(hal::SemanticEffectId::virtual_background_remove, 15);
@@ -842,11 +925,13 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
   return ok;
 }
 
-bool TestAcceptedBlurAndRemoveThroughSession() {
+bool TestAcceptedResidentEffectsThroughSession() {
   bool ok = true;
   for (const auto semantic :
        {hal::SemanticEffectId::virtual_background_blur,
-        hal::SemanticEffectId::virtual_background_remove}) {
+        hal::SemanticEffectId::virtual_background_remove,
+        hal::SemanticEffectId::virtual_background_replace,
+        hal::SemanticEffectId::virtual_key_light}) {
     Fixture fixture(semantic);
     ok = Configure(&fixture) && ok;
     const auto result = ExecuteBound(&fixture, 1);
@@ -862,7 +947,8 @@ bool TestAcceptedBlurAndRemoveThroughSession() {
                     result.transfers.cpu_tail_boundaries == 1 &&
                     result.frame_elapsed_ns >= result.stages[0].elapsed_ns &&
                     fixture.output[0] == (fixture.input[0] ^ std::byte{0x7F}),
-                "blur/remove should execute one exact resident island") &&
+                "each accepted effect should execute one exact resident "
+                "island") &&
          ok;
     ok = Expect(fixture.session.telemetry().active_backend ==
                         hal::BackendId::invalid &&
@@ -884,32 +970,44 @@ bool TestAcceptedBlurAndRemoveThroughSession() {
 }
 
 bool TestOptionalFailurePreservesInputWithoutAttribution() {
-  Fixture fixture(hal::SemanticEffectId::virtual_background_blur, false);
-  bool ok = Configure(&fixture);
-  fixture.runtime.execute_status = RuntimeStatus::optional_failed_open;
-  const auto result = ExecuteBound(&fixture, 1);
-  ok = Expect(result.status == hal::StatusId::degraded &&
-                  result.reason == hal::ReasonId::optional_stage_failed_open &&
-                  result.stages[0].status ==
-                      hal::StageExecutionStatus::optional_failed_open &&
-                  result.stages[0].reason ==
-                      hal::ReasonId::semantic_provider_unavailable &&
-                  result.stages[0].valid_output_preserved &&
-                  fixture.output == fixture.input &&
-                  result.transfers.uploads == 1 &&
-                  result.transfers.final_readbacks == 1 &&
-                  result.transfers.synchronizations == 1 &&
-                  result.transfers.cpu_tail_boundaries == 1 &&
-                  fixture.runtime.last_failed_operation ==
-                      open_cuda::PreparedOpenCudaOperationId::inference,
-              "optional failure should preserve exact valid input") &&
-       ok;
-  ok = ResolveAndCommit(&fixture, result) && ok;
-  ok = Expect(fixture.session.telemetry().active_backend ==
-                      hal::BackendId::invalid &&
-                  fixture.session.telemetry().optional_fail_open_stages == 1,
-              "optional fail-open commit must not claim backend success") &&
-       ok;
+  bool ok = true;
+  for (const auto semantic :
+       {hal::SemanticEffectId::virtual_background_blur,
+        hal::SemanticEffectId::virtual_background_remove,
+        hal::SemanticEffectId::virtual_background_replace,
+        hal::SemanticEffectId::virtual_key_light}) {
+    Fixture fixture(semantic, false);
+    ok = Configure(&fixture) && ok;
+    fixture.runtime.execute_status = RuntimeStatus::optional_failed_open;
+    const auto result = ExecuteBound(&fixture, 1);
+    ok = Expect(
+             result.status == hal::StatusId::degraded &&
+                 result.reason == hal::ReasonId::optional_stage_failed_open &&
+                 result.stages[0].status ==
+                     hal::StageExecutionStatus::optional_failed_open &&
+                 result.stages[0].reason ==
+                     hal::ReasonId::semantic_provider_unavailable &&
+                 result.stages[0].valid_output_preserved &&
+                 fixture.output == fixture.input &&
+                 result.transfers.uploads == 1 &&
+                 result.transfers.final_readbacks == 1 &&
+                 result.transfers.intermediate_readbacks == 0 &&
+                 result.transfers.intermediate_uploads == 0 &&
+                 result.transfers.synchronizations == 1 &&
+                 result.transfers.cpu_tail_boundaries == 1 &&
+                 fixture.runtime.last_failed_operation ==
+                     open_cuda::PreparedOpenCudaOperationId::inference,
+             "optional failure should preserve exact valid input without "
+             "hidden crossings") &&
+         ok;
+    ok = ResolveAndCommit(&fixture, result) && ok;
+    ok = Expect(
+             fixture.session.telemetry().active_backend ==
+                     hal::BackendId::invalid &&
+                 fixture.session.telemetry().optional_fail_open_stages == 1,
+             "optional fail-open commit must not claim backend success") &&
+         ok;
+  }
   return ok;
 }
 
@@ -943,6 +1041,21 @@ bool TestRequiredFailureDeviceLossAndForbiddenFrameWork() {
                     fixture.runtime.last_failed_operation ==
                         open_cuda::PreparedOpenCudaOperationId::composite_solid,
                 "remove failure must retain exact solid-composite "
+                "attribution") &&
+         ok;
+  }
+  for (const auto &[semantic, operation] :
+       {std::pair{hal::SemanticEffectId::virtual_background_replace,
+                  open_cuda::PreparedOpenCudaOperationId::composite_replace},
+        std::pair{hal::SemanticEffectId::virtual_key_light,
+                  open_cuda::PreparedOpenCudaOperationId::key_light}}) {
+    Fixture fixture(semantic);
+    ok = Configure(&fixture) && ok;
+    fixture.runtime.execute_status = RuntimeStatus::required_failed;
+    const auto result = ExecuteBound(&fixture, 1);
+    ok = Expect(result.status == hal::StatusId::failed &&
+                    fixture.runtime.last_failed_operation == operation,
+                "new resident effects must retain exact postprocess failure "
                 "attribution") &&
          ok;
   }
@@ -1008,39 +1121,34 @@ bool TestModelAndCaptureGeometryMayDiffer() {
 
 bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
   bool ok = true;
-  for (int mode = 0; mode < 11; ++mode) {
+  for (int mode = 0; mode < 9; ++mode) {
     FakeRuntime runtime;
     auto program = Program();
     auto options = Options(&runtime);
-    if (mode == 0)
-      program.stages[0].semantic =
-          hal::SemanticEffectId::virtual_background_replace;
-    else if (mode == 1)
-      program.stages[0].semantic = hal::SemanticEffectId::virtual_key_light;
-    else if (mode == 2) {
+    if (mode == 0) {
       program.stages[1] = program.stages[0];
       program.stages[1].stage_id = 2;
       program.stage_count = 2;
-    } else if (mode == 3) {
+    } else if (mode == 1) {
       program.host_output.width = 8;
       program.host_output.planes[0].width = 8;
       program.host_output.planes[0].row_stride_bytes = 24;
       program.host_output.planes[0].size_bytes = 192;
-    } else if (mode == 4) {
+    } else if (mode == 2) {
       program.strict_provider_selection = false;
-    } else if (mode == 5) {
+    } else if (mode == 3) {
       program.requested_provider =
           hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
-    } else if (mode == 6) {
+    } else if (mode == 4) {
       ++program.execution_domain.queue_or_stream_identity;
       program.requested_execution_domain = program.execution_domain;
       program.stages[0].execution_domain = program.execution_domain;
-    } else if (mode == 7) {
+    } else if (mode == 5) {
       ++program.stages[0].model.artifact_generation;
-    } else if (mode == 8) {
+    } else if (mode == 6) {
       program.temporal.temporal = true;
       program.temporal.history_frames = 1;
-    } else if (mode == 9) {
+    } else if (mode == 7) {
       options.model_pack.matting->input.width = 0;
     } else {
       options.prepared_stream =
@@ -1056,7 +1164,7 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
     ok = Expect(status != hal::StatusId::ready &&
                     status != hal::StatusId::degraded &&
                     runtime.prepare_calls == 0,
-                "unsupported/mixed/scaled/non-strict/foreign/stale "
+                "mixed/scaled/non-strict/foreign/stale "
                 "program must fail before runtime setup") &&
          ok;
   }
@@ -1273,7 +1381,7 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
 int main() {
   bool ok = true;
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
-  ok = TestAcceptedBlurAndRemoveThroughSession() && ok;
+  ok = TestAcceptedResidentEffectsThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
   ok = TestRequiredFailureDeviceLossAndForbiddenFrameWork() && ok;
   ok = TestModelAndCaptureGeometryMayDiffer() && ok;
