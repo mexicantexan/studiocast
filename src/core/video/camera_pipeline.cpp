@@ -55,6 +55,7 @@
 #include "core/video/image_ppm.h"
 #include "core/video/mjpeg_decode.h"
 #include "core/video/open_vulkan_matting_setup_policy.h"
+#include "core/video/production_video_execution_composition.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
@@ -9378,12 +9379,47 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::uint64_t maxine_resident_setup_successes = 0;
 
   LiveEffectBackendAttribution live_effect_attribution;
-  PreparedHardwareExecutionOwner prepared_hardware_owner;
+  ProductionVideoExecutionComposition prepared_hardware_composition;
   bool prepared_hardware_final_live = false;
   bool prepared_hardware_runtime_suspended = false;
   std::uint64_t prepared_hardware_geometry_generation = 1;
+  std::uint64_t prepared_hardware_next_plan_id = 1;
+  auto prepared_hardware_snapshot = [&] {
+    const auto source = prepared_hardware_composition.Snapshot();
+    PreparedHardwareExecutionSnapshot snapshot;
+    snapshot.route = source.prepared ? PreparedHardwareRoute::hal_live
+                                     : PreparedHardwareRoute::legacy_shadow;
+    snapshot.eligibility = source.prepared
+                               ? PreparedHardwareEligibility::eligible
+                               : PreparedHardwareEligibility::unavailable;
+    snapshot.setup.mode = HardwareExecutionSetupMode::hal_live;
+    snapshot.setup.status = source.prepare.status;
+    snapshot.setup.reason = source.prepare.reason;
+    snapshot.setup.resolution = source.plan.resolution;
+    snapshot.setup.domain_plan = source.plan.domain_plan;
+    snapshot.setup.legacy_path_retained_for_setup_rollback =
+        source.prepare.old_plan_retained;
+    snapshot.readiness = source.readiness;
+    snapshot.telemetry = source.telemetry;
+    snapshot.latest_committed_frame = source.latest_committed_frame;
+    snapshot.prepared = source.prepared;
+    if (source.prepared) {
+      snapshot.active_program.valid = true;
+      snapshot.active_program.program_id =
+          source.plan.prepared_program.program_id;
+      snapshot.active_program.owner_adapter_instance_id =
+          source.plan.prepared_program.owner_adapter_instance_id;
+      snapshot.active_program.invalidation_key =
+          source.plan.prepared_program.invalidation_key;
+      snapshot.active_program.execution_domain =
+          source.plan.prepared_program.execution_domain;
+      snapshot.active_program.stage_count =
+          source.plan.prepared_program.stage_count;
+    }
+    return snapshot;
+  };
   auto publish_prepared_hardware_status = [&] {
-    const auto snapshot = prepared_hardware_owner.Snapshot();
+    const auto snapshot = prepared_hardware_snapshot();
     std::lock_guard<std::mutex> lock(mu_);
     prepared_hardware_execution_ = snapshot;
   };
@@ -9423,7 +9459,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             configuration_generation == 0 ? 1 : configuration_generation;
         projection.geometry_generation =
             prepared_hardware_geometry_generation;
-        projection.final_visual = prepared_hardware_owner.Snapshot();
+        projection.final_visual = prepared_hardware_snapshot();
         projection.maxine_resident =
             prepared_maxine_hardware_owner.Snapshot();
         projection.open_cuda_virtual_background =
@@ -10848,51 +10884,183 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           static_cast<std::size_t>(capA.width) * 3u;
       const std::size_t tight_input_bytes =
           tight_input_stride * static_cast<std::size_t>(capA.height);
-      PreparedFinalHardwareRequest request;
-      request.requested_backend =
-          cfg.compute_backend == ComputeBackendPreference::vulkan
-              ? hal::BackendId::vulkan
-              : hal::BackendId::invalid;
-      request.strict_backend_selection =
-          cfg.compute_backend == ComputeBackendPreference::vulkan;
-      request.request_fixed_center_vignette = has(vignette_id);
-      request.request_mirror = has(mirror_id);
-      request.contains_unqualified_stage = contains_unqualified_stage;
-      request.tracked_vignette_center =
-          request.request_fixed_center_vignette &&
-          fx.vignette.center_on_tracked_face;
-      request.host_input_is_tight_rgb24 =
-          rgbStride == tight_input_stride && rgb.size() == tight_input_bytes;
-      request.host_output_is_tight_rgb24 =
+      const bool exact_vulkan_request =
+          cfg.compute_backend == ComputeBackendPreference::vulkan &&
+          !contains_unqualified_stage && (has(vignette_id) || has(mirror_id)) &&
+          !(has(vignette_id) && fx.vignette.center_on_tracked_face) &&
+          rgbStride == tight_input_stride && rgb.size() == tight_input_bytes &&
           outA.format == PixelFormat::rgb24 &&
           outA.bytes_per_line ==
               static_cast<std::size_t>(outA.width) * 3u &&
           outA.size_image == tight_output_bytes;
-      request.input_width = static_cast<std::uint32_t>(capA.width);
-      request.input_height = static_cast<std::uint32_t>(capA.height);
-      request.output_width = static_cast<std::uint32_t>(outA.width);
-      request.output_height = static_cast<std::uint32_t>(outA.height);
-      request.vignette_intensity_percent = fx.vignette.intensity;
-      request.generations.configuration = effects_generation;
-      request.generations.geometry =
+      VideoExecutionPlanRequest request;
+      request.plan_id = prepared_hardware_next_plan_id++;
+      if (prepared_hardware_next_plan_id == 0)
+        prepared_hardware_next_plan_id = 1;
+      request.intent.backend.mode =
+          hal::BackendRequestMode::explicit_backend;
+      request.intent.backend.backend = hal::BackendId::vulkan;
+      request.intent.backend.strict = true;
+      request.intent.preferences.compute_family =
+          hal::ComputeFamilyAllowance::vulkan_only;
+      request.intent.requested_provider =
+          hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      request.intent.strict_provider_selection = true;
+      const auto add_final_stage =
+          [&](hal::SemanticEffectId semantic) -> CanonicalVideoStage & {
+        auto &stage = request.intent.stages[request.intent.stage_count++];
+        stage.intent.stage_id = static_cast<std::uint32_t>(semantic);
+        stage.intent.semantic = semantic;
+        stage.intent.required = false;
+        stage.intent.failure_action =
+            hal::FailureAction::fail_open_preserve_input;
+        return stage;
+      };
+      if (has(vignette_id)) {
+        auto &stage = add_final_stage(hal::SemanticEffectId::vignette);
+        stage.parameters[0] = {CanonicalVideoParameterId::intensity,
+                               CanonicalVideoParameterKind::signed_integer,
+                               fx.vignette.intensity};
+        stage.parameters[1].id =
+            CanonicalVideoParameterId::center_on_tracked_face;
+        stage.parameters[1].kind = CanonicalVideoParameterKind::boolean;
+        stage.parameters[1].boolean_value =
+            fx.vignette.center_on_tracked_face;
+        stage.parameter_count = 2;
+      }
+      if (has(mirror_id))
+        (void)add_final_stage(hal::SemanticEffectId::mirror);
+      const auto host_image = [](std::uint32_t width, std::uint32_t height,
+                                 hal::Mutability mutability) {
+        hal::ImageDescriptor image;
+        image.width = width;
+        image.height = height;
+        image.plane_count = 1;
+        image.format = hal::PixelFormat::rgb_u8;
+        image.channel_order = hal::ChannelOrder::rgb;
+        image.color_space = hal::ColorSpace::srgb;
+        image.color_range = hal::ColorRange::full;
+        image.alpha_meaning = hal::AlphaMeaning::none;
+        image.orientation = hal::Orientation::top_left;
+        image.host_coherence = hal::HostCoherence::coherent;
+        image.mutability = mutability;
+        image.aliasing = hal::AliasingPermission::forbidden;
+        image.in_place_permitted = false;
+        image.base_alignment_bytes = 1;
+        const auto stride = static_cast<std::uint64_t>(width) * 3u;
+        image.planes[0].row_stride_bytes = stride;
+        image.planes[0].size_bytes = stride * height;
+        image.planes[0].width = width;
+        image.planes[0].height = height;
+        image.planes[0].alignment_bytes = 1;
+        return image;
+      };
+      request.host_input =
+          host_image(static_cast<std::uint32_t>(capA.width),
+                     static_cast<std::uint32_t>(capA.height),
+                     hal::Mutability::read_only);
+      request.host_output =
+          host_image(static_cast<std::uint32_t>(outA.width),
+                     static_cast<std::uint32_t>(outA.height),
+                     hal::Mutability::write_only);
+      request.invalidation_key.generations.configuration = effects_generation;
+      request.invalidation_key.generations.geometry =
           prepared_hardware_geometry_generation;
+      request.invalidation_key.generations.model = 1;
+      request.invalidation_key.generations.provider = 1;
+      request.invalidation_key.generations.device = 1;
+      std::uint64_t canonical_plan_hash = UINT64_C(1469598103934665603);
+      const auto mix_plan_hash = [&](std::uint64_t value) {
+        canonical_plan_hash ^= value;
+        canonical_plan_hash *= UINT64_C(1099511628211);
+      };
+      mix_plan_hash(has(vignette_id) ? 1u : 0u);
+      mix_plan_hash(has(mirror_id) ? 1u : 0u);
+      mix_plan_hash(static_cast<std::uint64_t>(
+          static_cast<std::int64_t>(fx.vignette.intensity)));
+      mix_plan_hash(fx.vignette.center_on_tracked_face ? 1u : 0u);
+      mix_plan_hash(static_cast<std::uint32_t>(capA.width));
+      mix_plan_hash(static_cast<std::uint32_t>(capA.height));
+      mix_plan_hash(static_cast<std::uint32_t>(outA.width));
+      mix_plan_hash(static_cast<std::uint32_t>(outA.height));
+      request.invalidation_key.canonical_plan_hash =
+          canonical_plan_hash == 0 ? 1 : canonical_plan_hash;
+      const auto input_bytes = request.host_input.planes[0].size_bytes;
+      const auto output_bytes = request.host_output.planes[0].size_bytes;
+      std::uint64_t mask_bytes = 0;
+      bool budget_valid = outA.width > 0 && outA.height > 0;
+      const auto checked_multiply =
+          [](std::uint64_t left, std::uint64_t right, std::uint64_t *result) {
+        if (!result ||
+            (right != 0 &&
+             left > std::numeric_limits<std::uint64_t>::max() / right)) {
+          return false;
+        }
+        *result = left * right;
+        return true;
+      };
+      const auto checked_add = [](std::uint64_t *value,
+                                  std::uint64_t increment) {
+        if (!value ||
+            *value > std::numeric_limits<std::uint64_t>::max() - increment) {
+          return false;
+        }
+        *value += increment;
+        return true;
+      };
+      budget_valid &=
+          checked_multiply(static_cast<std::uint64_t>(outA.width),
+                           static_cast<std::uint64_t>(outA.height),
+                           &mask_bytes) &&
+          checked_multiply(mask_bytes, sizeof(float), &mask_bytes);
+      request.budget.upload_staging_bytes = input_bytes;
+      request.budget.readback_staging_bytes = output_bytes;
+      request.budget.scratch_bytes = output_bytes;
+      request.budget.persistent_bytes = input_bytes;
+      request.budget.resource_count = 4;
+      request.budget.in_flight_slots = 1;
+      if (has(vignette_id)) {
+        budget_valid &=
+            checked_add(&request.budget.persistent_bytes, output_bytes);
+        budget_valid &=
+            checked_add(&request.budget.persistent_bytes, mask_bytes);
+        request.budget.resource_count += 2;
+      }
+      if (has(mirror_id)) {
+        budget_valid &=
+            checked_add(&request.budget.persistent_bytes, output_bytes);
+        ++request.budget.resource_count;
+      }
+      request.migration_policy = VideoExecutionMigrationPolicy::prepared_only;
+      request.setup_failure_policy =
+          hal::SetupFailurePolicy::retain_old_program;
 
-      const auto setup = prepared_hardware_owner.ConfigureFinal(request);
+      VideoExecutionPrepareEvidence setup;
+      hal::ReasonId setup_reason = hal::ReasonId::none;
+      const auto setup_status =
+          exact_vulkan_request && budget_valid
+              ? prepared_hardware_composition.Prepare(request, &setup,
+                                                      &setup_reason)
+              : hal::StatusId::blocked;
+      if (!exact_vulkan_request || !budget_valid)
+        prepared_hardware_composition.Invalidate(
+            hal::ReasonId::reconfiguration_required);
+      const auto composition_snapshot =
+          prepared_hardware_composition.Snapshot();
       prepared_hardware_final_live =
-          setup.route == PreparedHardwareRoute::hal_live;
+          setup_status == hal::StatusId::ready ||
+          setup_status == hal::StatusId::degraded ||
+          (setup.old_plan_retained && composition_snapshot.prepared);
       prepared_hardware_runtime_suspended = false;
       if (prepared_hardware_final_live) {
-        const auto &active = prepared_hardware_owner.active_request();
-        have_open_vulkan_vignette =
-            active.request_fixed_center_vignette;
-        want_open_vulkan_vignette =
-            active.request_fixed_center_vignette;
-        have_open_vulkan_mirror = active.request_mirror;
-        want_open_vulkan_mirror = active.request_mirror;
+        have_open_vulkan_vignette = has(vignette_id);
+        want_open_vulkan_vignette = has(vignette_id);
+        have_open_vulkan_mirror = has(mirror_id);
+        want_open_vulkan_mirror = has(mirror_id);
         compute_available.vulkan_available = true;
-        if (active.request_fixed_center_vignette)
+        if (has(vignette_id))
           set_backend(vignette_id, "open_vulkan");
-        if (active.request_mirror)
+        if (has(mirror_id))
           set_backend(mirror_id, "open_vulkan");
         append_note(
             "Open Vulkan HAL: prepared final resident section owns one "
@@ -11808,7 +11976,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                        static_cast<std::size_t>(outA.height) * 3u);
     }
     if (prepared_hardware_final_live) {
-      prepared_hardware_owner.Invalidate(
+      prepared_hardware_composition.Invalidate(
           hal::ReasonId::reconfiguration_required);
       prepared_hardware_final_live = false;
       have_open_vulkan_vignette = false;
@@ -14473,43 +14641,75 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       const std::size_t tight_stride = static_cast<std::size_t>(outW) * 3u;
       const std::size_t tight_bytes =
           tight_stride * static_cast<std::size_t>(outH);
-      const auto prepared_frame = prepared_hardware_owner.ExecuteHostFrame(
-          rgb.data(), rgb.size(), rgbStride, rgbScaled.data(), tight_bytes,
-          tight_stride, f.sequence);
+      hal::HostFrameBinding binding;
+      const auto plan = prepared_hardware_composition.Snapshot().plan;
+      binding.input_descriptor = plan.host_input;
+      binding.output_descriptor = plan.host_output;
+      binding.input_planes[0].read_data =
+          reinterpret_cast<const std::byte *>(rgb.data());
+      binding.input_planes[0].span_bytes = rgb.size();
+      binding.input_planes[0].row_stride_bytes = rgbStride;
+      binding.output_planes[0].write_data =
+          reinterpret_cast<std::byte *>(rgbScaled.data());
+      binding.output_planes[0].span_bytes = tight_bytes;
+      binding.output_planes[0].row_stride_bytes = tight_stride;
+      binding.input_plane_count = 1;
+      binding.output_plane_count = 1;
+      binding.capture_sequence = f.sequence;
+      binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+      binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+      const auto prepared_frame =
+          prepared_hardware_composition.Execute(binding);
+      const auto execution_snapshot =
+          prepared_hardware_composition.Snapshot();
       publish_prepared_hardware_status();
+      const bool prepared_frame_succeeded =
+          prepared_frame.status == hal::StatusId::executed ||
+          prepared_frame.status == hal::StatusId::degraded;
+      const bool prepared_output_valid =
+          prepared_frame_succeeded && execution_snapshot.frame_pending &&
+          prepared_frame.output_ready &&
+          prepared_frame.output.output_ready &&
+          prepared_frame.output.planes[0].read_data ==
+              reinterpret_cast<const std::byte *>(rgbScaled.data()) &&
+          prepared_frame.output.planes[0].span_bytes == tight_bytes &&
+          prepared_frame.output.planes[0].row_stride_bytes == tight_stride;
       prepared_hardware_completion = prepared_frame.completion;
-      prepared_hardware_completion_pending =
-          prepared_frame.completion_pending;
-      if (prepared_frame.output_ready &&
-          prepared_frame.output == rgbScaled.data() &&
-          prepared_frame.output_size_bytes == tight_bytes &&
-          prepared_frame.output_row_stride_bytes == tight_stride) {
+      prepared_hardware_completion_pending = prepared_output_valid;
+      if (prepared_output_valid) {
         frameW = outW;
         frameH = outH;
-        rgbOut = prepared_frame.output;
-        rgbOutStride = prepared_frame.output_row_stride_bytes;
-        rgbOutBytes = prepared_frame.output_size_bytes;
-      } else if (prepared_hardware_completion_pending) {
+        rgbOut = rgbScaled.data();
+        rgbOutStride = tight_stride;
+        rgbOutBytes = tight_bytes;
+      } else if (execution_snapshot.frame_pending) {
         hal::ReasonId reason = hal::ReasonId::none;
-        (void)prepared_hardware_owner.CommitOutput(
+        (void)prepared_hardware_composition.CommitOutput(
             prepared_hardware_completion, false, &reason);
         prepared_hardware_completion_pending = false;
         publish_prepared_hardware_status();
       }
-      if (!prepared_frame.output_ready) {
+      if (!prepared_output_valid) {
         prepared_hardware_runtime_suspended = true;
-        const auto &active = prepared_hardware_owner.active_request();
+        bool active_vignette = false;
+        bool active_mirror = false;
+        for (std::size_t index = 0; index < plan.intent.stage_count; ++index) {
+          active_vignette |= plan.intent.stages[index].intent.semantic ==
+                             hal::SemanticEffectId::vignette;
+          active_mirror |= plan.intent.stages[index].intent.semantic ==
+                           hal::SemanticEffectId::mirror;
+        }
         const std::string failure =
             "Prepared Vulkan HAL runtime failure [" +
             std::string(PreparedHardwareReasonCode(prepared_frame.reason)) +
             "].";
-        if (active.request_fixed_center_vignette) {
+        if (active_vignette) {
           block_optional_effect(
               OptionalEffectSlot::vignette,
               studiocast::video::effects::contract::kEffectIdVignette,
               "open_vulkan", failure, f.sequence);
         }
-        if (active.request_mirror) {
+        if (active_mirror) {
           block_optional_effect(
               OptionalEffectSlot::mirror,
               studiocast::video::effects::contract::kEffectIdMirror,
@@ -15419,7 +15619,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (prepared_hardware_completion_pending) {
             hal::ReasonId reason = hal::ReasonId::none;
             const hal::StatusId status =
-                prepared_hardware_owner.CommitOutput(
+                prepared_hardware_composition.CommitOutput(
                     prepared_hardware_completion, output_write_succeeded,
                     &reason);
             prepared_hardware_completion_pending = false;
@@ -15594,7 +15794,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       }
       if (had_prepared_vulkan_completion) {
         const auto committed =
-            prepared_hardware_owner.Snapshot().latest_committed_frame;
+            prepared_hardware_snapshot().latest_committed_frame;
         for (std::size_t index = 0; index < committed.stage_count; ++index) {
           const auto &stage = committed.stages[index];
           if (stage.status != hal::StageExecutionStatus::succeeded) {
@@ -15947,7 +16147,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
       const auto prepared_vulkan_compat =
           ProjectPreparedHardwareCompatibilityTelemetry(
-              prepared_hardware_owner.Snapshot());
+              prepared_hardware_snapshot());
       open_vulkan_transfers_.active_frames =
           open_vulkan_active_frames + prepared_vulkan_compat.active_frames;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -16228,7 +16428,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   prepared_maxine_hardware_owner.Shutdown();
   prepared_maxine_hardware_live = false;
   publish_prepared_maxine_status();
-  prepared_hardware_owner.Shutdown();
+  prepared_hardware_composition.Shutdown();
   prepared_hardware_final_live = false;
   prepared_open_cuda_hardware_live = false;
   publish_prepared_hardware_status();
