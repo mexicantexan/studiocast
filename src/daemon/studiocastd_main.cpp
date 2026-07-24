@@ -3125,6 +3125,24 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   return oss.str();
 }
 
+std::string ErrorJson(const std::string &msg);
+
+std::string VideoHalStatusV1Response(
+    const studiocast::video::VirtualCameraServiceStatus &status) {
+  const auto result =
+      studiocast::daemon::SerializeMultiIslandVideoRuntimeStatusJson(
+          status.pipeline.video_hal_status);
+  if (!result.ok) {
+    return std::string("ERR ") +
+           ErrorJson(
+               "typed video HAL status unavailable (validation_code=" +
+               std::to_string(static_cast<unsigned int>(
+                   result.validation.code)) +
+               ")");
+  }
+  return std::string("OK ") + result.json;
+}
+
 std::string
 ConfigToJson(const studiocast::video::VirtualCameraServiceConfig &cfg,
              const studiocast::config::DaemonConfig *daemonConfig = nullptr) {
@@ -3719,6 +3737,10 @@ int main(int argc, char **argv) {
                                   diagnostics.open_vulkan,
                                   diagnostics.open_audio, diagnostics.loopback,
                                   &daemonCfg);
+            }
+
+            if (pc.cmd == "GET_VIDEO_HAL_STATUS_V1") {
+              return VideoHalStatusV1Response(svc.Status());
             }
 
             if (pc.cmd == "GET_DIAGNOSTICS" ||

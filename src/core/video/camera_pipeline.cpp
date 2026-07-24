@@ -1116,6 +1116,624 @@ bool PreparedOpenCudaPipelineShouldSuspend(
          status == hal::StatusId::stopped;
 }
 
+MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
+    const CameraPipelineHalStatusProjectionInput &input,
+    MultiIslandVideoRuntimeStatusSnapshot *output) noexcept {
+  using CapabilityCode = effects::EffectCapabilityCode;
+  using Lane = ProductCapabilityLaneId;
+  if (!output || !input.effects) {
+    if (output)
+      *output = {};
+    MultiIslandStatusValidationResult invalid;
+    invalid.code = MultiIslandStatusValidationCode::invalid_generation;
+    return invalid;
+  }
+
+  const auto requested = [&](hal::SemanticEffectId effect) {
+    switch (effect) {
+    case hal::SemanticEffectId::video_noise_removal:
+      return input.effects->video_noise_removal.enabled;
+    case hal::SemanticEffectId::eye_contact:
+      return input.effects->eye_contact.enabled;
+    case hal::SemanticEffectId::virtual_background_blur:
+      return input.effects->virtual_background.mode ==
+             effects::VirtualBackgroundMode::blur;
+    case hal::SemanticEffectId::virtual_background_remove:
+      return input.effects->virtual_background.mode ==
+             effects::VirtualBackgroundMode::remove;
+    case hal::SemanticEffectId::virtual_background_replace:
+      return input.effects->virtual_background.mode ==
+             effects::VirtualBackgroundMode::replace;
+    case hal::SemanticEffectId::virtual_key_light:
+      return input.effects->virtual_key_light.enabled;
+    case hal::SemanticEffectId::auto_frame:
+      return input.effects->auto_frame.enabled;
+    case hal::SemanticEffectId::vignette:
+      return input.effects->vignette.enabled;
+    case hal::SemanticEffectId::mirror:
+      return input.effects->mirror;
+    case hal::SemanticEffectId::invalid:
+      return false;
+    }
+    return false;
+  };
+  const auto lane_for_backend = [](hal::BackendId backend) {
+    switch (backend) {
+    case hal::BackendId::maxine:
+      return Lane::maxine;
+    case hal::BackendId::cuda:
+    case hal::BackendId::open_video_onnxruntime:
+      return Lane::open_cuda;
+    case hal::BackendId::vulkan:
+      return Lane::open_vulkan;
+    case hal::BackendId::cpu:
+      return Lane::cpu;
+    case hal::BackendId::invalid:
+    case hal::BackendId::test_fake:
+      return Lane::invalid;
+    }
+    return Lane::invalid;
+  };
+  const auto capability_code = [](Lane lane, hal::SemanticEffectId effect) {
+    switch (lane) {
+    case Lane::maxine:
+      return CapabilityCode::maxine_effect_usable;
+    case Lane::open_cuda:
+      return CapabilityCode::open_cuda_effect_available;
+    case Lane::open_vulkan:
+      if (effect == hal::SemanticEffectId::mirror)
+        return CapabilityCode::open_vulkan_mirror_production_ready;
+      if (effect == hal::SemanticEffectId::vignette) {
+        return CapabilityCode::
+            open_vulkan_vignette_fixed_center_production_ready;
+      }
+      return CapabilityCode::none;
+    case Lane::cpu:
+    case Lane::invalid:
+      return CapabilityCode::none;
+    }
+    return CapabilityCode::none;
+  };
+  const auto requested_provider =
+      [](hal::BackendId backend, hal::SemanticEffectId effect) {
+        if (backend == hal::BackendId::vulkan) {
+          return hal::SemanticEffectProviderId::
+              open_vulkan_production_kernels;
+        }
+        if (backend == hal::BackendId::cuda ||
+            backend == hal::BackendId::open_video_onnxruntime) {
+          return hal::SemanticEffectProviderId::
+              open_video_onnxruntime_cuda;
+        }
+        if (backend == hal::BackendId::maxine) {
+          if (effect == hal::SemanticEffectId::eye_contact ||
+              effect == hal::SemanticEffectId::auto_frame) {
+            return hal::SemanticEffectProviderId::maxine_ar;
+          }
+          return effect == hal::SemanticEffectId::vignette
+                     ? hal::SemanticEffectProviderId::maxine_cuda_utility
+                     : hal::SemanticEffectProviderId::maxine_vfx;
+        }
+        return hal::SemanticEffectProviderId::invalid;
+      };
+  const auto desired_backend = [&](hal::SemanticEffectId effect) {
+    if ((effect == hal::SemanticEffectId::mirror ||
+         effect == hal::SemanticEffectId::vignette) &&
+        input.compute_backend == ComputeBackendPreference::vulkan) {
+      return hal::BackendId::vulkan;
+    }
+    if (input.effects->engine == effects::EffectsEnginePreference::open_cuda)
+      return hal::BackendId::cuda;
+    if (input.effects->engine == effects::EffectsEnginePreference::maxine)
+      return hal::BackendId::maxine;
+    if (input.compute_backend == ComputeBackendPreference::cuda)
+      return hal::BackendId::cuda;
+    return hal::BackendId::maxine;
+  };
+
+  MultiIslandVideoRuntimeStatusBuildInput build;
+  build.status_generation = input.status_generation;
+  build.lifecycle = input.lifecycle;
+  build.effect_count = kCanonicalVideoEffectCount;
+  for (std::size_t index = 0; index < build.effect_count; ++index) {
+    build.effects[index].effect = kCanonicalVideoEffects[index];
+    build.effects[index].status = hal::StatusId::passthrough;
+  }
+
+  struct IslandSource {
+    PreparedExecutionRouteId route = PreparedExecutionRouteId::invalid;
+    hal::PreparedProgram program{};
+    hal::ResolutionResult resolution{};
+    hal::ReadinessSnapshot readiness{};
+    hal::ExecutionTelemetry telemetry{};
+    hal::CommittedFrameSnapshot committed{};
+    bool current = false;
+  };
+  std::array<IslandSource, 3> sources{};
+  std::size_t source_count = 0;
+
+  const auto reject_malformed_source =
+      [&](MultiIslandStatusValidationCode code) {
+        *output = {};
+        MultiIslandStatusValidationResult invalid;
+        invalid.code = code;
+        return invalid;
+      };
+
+  if (input.final_visual_live) {
+    if (!input.final_visual.prepared ||
+        input.final_visual.route != PreparedHardwareRoute::hal_live ||
+        !input.final_visual.active_program.valid ||
+        !hal::ValidateExecutionDomain(
+            input.final_visual.active_program.execution_domain)) {
+      return reject_malformed_source(
+          MultiIslandStatusValidationCode::invalid_island);
+    }
+    if (input.final_visual.setup.resolution.stage_count == 0 ||
+        input.final_visual.setup.resolution.stage_count >
+            input.final_visual.setup.resolution.stages.size() ||
+        input.final_visual.latest_committed_frame.stage_count >
+            input.final_visual.latest_committed_frame.stages.size()) {
+      return reject_malformed_source(
+          MultiIslandStatusValidationCode::malformed_island_stages);
+    }
+    IslandSource source;
+    source.route = PreparedExecutionRouteId::final_visual;
+    source.program.contract_version = hal::kContractVersion;
+    source.program.program_id =
+        input.final_visual.active_program.program_id;
+    source.program.owner_adapter_instance_id =
+        input.final_visual.active_program.owner_adapter_instance_id;
+    source.program.execution_domain =
+        input.final_visual.active_program.execution_domain;
+    source.program.invalidation_key =
+        input.final_visual.active_program.invalidation_key;
+    source.program.requested_backend =
+        input.final_visual.readiness.requested_backend;
+    source.program.strict_backend_selection =
+        input.final_visual.setup.resolution.strict_backend_selection;
+    source.program.requested_provider =
+        input.final_visual.setup.resolution.selected_provider;
+    source.program.strict_provider_selection = false;
+    source.program.stage_count =
+        input.final_visual.setup.resolution.stage_count;
+    for (std::size_t index = 0; index < source.program.stage_count; ++index) {
+      const auto &resolved =
+          input.final_visual.setup.resolution.stages[index];
+      if (resolved.intent.semantic != hal::SemanticEffectId::mirror &&
+          resolved.intent.semantic != hal::SemanticEffectId::vignette) {
+        return reject_malformed_source(
+            MultiIslandStatusValidationCode::invalid_capability_evidence);
+      }
+      auto &stage = source.program.stages[index];
+      stage.stage_id = resolved.intent.stage_id;
+      stage.semantic = resolved.intent.semantic;
+      stage.provider = resolved.provider;
+      stage.backend = resolved.selected_backend;
+      stage.execution_domain = resolved.execution_domain;
+      stage.required = resolved.intent.required;
+      stage.failure_action = resolved.intent.failure_action;
+    }
+    source.resolution = input.final_visual.setup.resolution;
+    source.readiness = input.final_visual.readiness;
+    source.telemetry = input.final_visual.telemetry;
+    source.committed = input.final_visual.latest_committed_frame;
+    source.current = true;
+    sources[source_count++] = source;
+  }
+
+  const auto add_program_source =
+      [&](PreparedExecutionRouteId route, const hal::PreparedProgram &program,
+          const hal::ReadinessSnapshot &readiness,
+          const hal::ExecutionTelemetry &telemetry,
+          const hal::CommittedFrameSnapshot &committed) {
+        if (source_count >= sources.size() || program.program_id == 0 ||
+            program.stage_count == 0 ||
+            program.stage_count > program.stages.size() ||
+            committed.stage_count > committed.stages.size() ||
+            !hal::ValidateExecutionDomain(program.execution_domain)) {
+          return false;
+        }
+        IslandSource source;
+        source.route = route;
+        source.program = program;
+        source.readiness = readiness;
+        source.telemetry = telemetry;
+        source.committed = committed;
+        source.current = true;
+        source.resolution.request_mode =
+            program.strict_backend_selection
+                ? hal::BackendRequestMode::explicit_backend
+                : hal::BackendRequestMode::automatic;
+        source.resolution.strict_backend_selection =
+            program.strict_backend_selection;
+        source.resolution.status = readiness.status;
+        source.resolution.reason = readiness.reason;
+        source.resolution.requested_backend = program.requested_backend;
+        source.resolution.selected_backend = readiness.selected_backend;
+        source.resolution.selected_provider = readiness.provider;
+        source.resolution.stage_count = program.stage_count;
+        source.resolution.available = readiness.available;
+        source.resolution.degraded = readiness.degraded;
+        source.resolution.fallback =
+            program.requested_backend != program.execution_domain.backend;
+        for (std::size_t index = 0; index < program.stage_count; ++index) {
+          const auto &stage = program.stages[index];
+          auto &resolved = source.resolution.stages[index];
+          resolved.intent.stage_id = stage.stage_id;
+          resolved.intent.semantic = stage.semantic;
+          resolved.intent.required = stage.required;
+          resolved.intent.failure_action = stage.failure_action;
+          resolved.status = readiness.degraded ? hal::StatusId::degraded
+                                               : hal::StatusId::ready;
+          resolved.reason = readiness.reason;
+          resolved.selected_backend = stage.backend;
+          resolved.provider = stage.provider;
+          resolved.adapter_instance_id =
+              program.owner_adapter_instance_id;
+          resolved.execution_domain = stage.execution_domain;
+          resolved.cpu_tail =
+              index + 1 == program.stage_count && program.cpu_tail_count != 0
+                  ? program.cpu_tails[0].id
+                  : hal::CpuTailId::invalid;
+          resolved.cpu_tail_scratch_bytes =
+              resolved.cpu_tail == hal::CpuTailId::invalid
+                  ? 0
+                  : program.cpu_tails[0].scratch_bytes;
+          resolved.cpu_tail_placement =
+              resolved.cpu_tail == hal::CpuTailId::invalid
+                  ? hal::DeclaredCpuTail::Placement::after_stage
+                  : program.cpu_tails[0].placement;
+          resolved.fallback_selected = source.resolution.fallback;
+        }
+        sources[source_count++] = source;
+        return true;
+      };
+  const auto readiness_is_qualified =
+      [](const hal::ReadinessSnapshot &readiness) {
+        return readiness.available &&
+               (readiness.status == hal::StatusId::ready ||
+                readiness.status == hal::StatusId::degraded ||
+                readiness.status == hal::StatusId::executed) &&
+               readiness.selected_backend != hal::BackendId::invalid &&
+               readiness.provider !=
+                   hal::SemanticEffectProviderId::invalid &&
+               hal::ValidateExecutionDomain(readiness.execution_domain);
+      };
+
+  if (input.maxine_resident_live) {
+    if (!input.maxine_resident.prepared ||
+        input.maxine_resident.route !=
+            PreparedMaxineHardwareRoute::hal_live ||
+        input.maxine_resident.eligibility !=
+            PreparedMaxineHardwareEligibility::eligible ||
+        !readiness_is_qualified(input.maxine_resident.readiness) ||
+        input.maxine_resident.quarantined ||
+        input.maxine_resident.stopped ||
+        !add_program_source(
+            PreparedExecutionRouteId::maxine_resident,
+            input.maxine_resident.active_program,
+            input.maxine_resident.readiness,
+            input.maxine_resident.telemetry,
+            input.maxine_resident.latest_committed_frame)) {
+      return reject_malformed_source(
+          MultiIslandStatusValidationCode::invalid_island);
+    }
+  }
+  if (input.open_cuda_virtual_background_live) {
+    if (!input.open_cuda_virtual_background.prepared ||
+        input.open_cuda_virtual_background.route !=
+            PreparedOpenCudaHardwareRoute::hal_live ||
+        input.open_cuda_virtual_background.eligibility !=
+            PreparedOpenCudaHardwareEligibility::eligible ||
+        !input.open_cuda_virtual_background.production
+             .prepared_capability_committed ||
+        !readiness_is_qualified(
+            input.open_cuda_virtual_background.readiness) ||
+        input.open_cuda_virtual_background.quarantined ||
+        input.open_cuda_virtual_background.stopped ||
+        input.open_cuda_virtual_background.shutdown_pending ||
+        !add_program_source(
+            PreparedExecutionRouteId::open_cuda_virtual_background,
+            input.open_cuda_virtual_background.active_program,
+            input.open_cuda_virtual_background.readiness,
+            input.open_cuda_virtual_background.telemetry,
+            input.open_cuda_virtual_background.latest_committed_frame)) {
+      return reject_malformed_source(
+          MultiIslandStatusValidationCode::invalid_island);
+    }
+    const auto &program =
+        input.open_cuda_virtual_background.active_program;
+    for (std::size_t index = 0; index < program.stage_count; ++index) {
+      const hal::SemanticEffectId semantic = program.stages[index].semantic;
+      if (semantic != hal::SemanticEffectId::virtual_background_blur &&
+          semantic != hal::SemanticEffectId::virtual_background_remove &&
+          semantic != hal::SemanticEffectId::virtual_background_replace) {
+        return reject_malformed_source(
+            MultiIslandStatusValidationCode::invalid_capability_evidence);
+      }
+    }
+  }
+
+  hal::ProgramGenerations generations;
+  if (source_count != 0) {
+    generations = sources[0].program.invalidation_key.generations;
+  } else {
+    generations.configuration =
+        input.configuration_generation == 0 ? 1
+                                            : input.configuration_generation;
+    generations.geometry =
+        input.geometry_generation == 0 ? 1 : input.geometry_generation;
+    generations.model = 1;
+    generations.provider = 1;
+    generations.device = 1;
+    generations.context = 1;
+  }
+  build.program_generations = generations;
+  build.generations.capability = input.status_generation;
+  build.generations.configuration = generations.configuration;
+  build.generations.provider = generations.provider;
+  build.generations.device = generations.device;
+  build.generations.context = generations.context;
+  CapabilityRefreshSnapshot refresh;
+  refresh.status = CapabilityRefreshStatus::succeeded;
+  refresh.code = CapabilityCode::capability_snapshot_current;
+  refresh.requested_generation = input.status_generation;
+  refresh.completed_generation = input.status_generation;
+  build.capabilities =
+      MakeFailClosedProductCapabilitySnapshot(build.generations, refresh);
+
+  for (std::size_t source_index = 0; source_index < source_count;
+       ++source_index) {
+    const IslandSource &source = sources[source_index];
+    if (build.island_count >= build.islands.size())
+      break;
+    PreparedExecutionIslandStatus &island =
+        build.islands[build.island_count++];
+    island.route = source.route;
+    island.island_id =
+        (static_cast<std::uint64_t>(source.route) << 56u) ^
+        source.program.program_id;
+    if (island.island_id == 0)
+      island.island_id = source.program.program_id;
+    island.adapter_instance_id =
+        source.program.owner_adapter_instance_id;
+    island.snapshot_generation = input.status_generation;
+    island.capability_generation = input.status_generation;
+    island.backend = source.program.execution_domain.backend;
+    island.execution_domain = source.program.execution_domain;
+    island.resolution = source.resolution;
+    island.readiness.configured = true;
+    island.readiness.program_id = source.program.program_id;
+    island.readiness.invalidation_key =
+        source.program.invalidation_key;
+    island.readiness.value = source.readiness;
+    island.telemetry = source.telemetry;
+    island.latest_committed_frame = source.committed;
+    island.valid = true;
+    island.current = true;
+    island.stage_count = source.resolution.stage_count;
+
+    for (std::size_t stage_index = 0;
+         stage_index < island.stage_count; ++stage_index) {
+      const auto &resolved = source.resolution.stages[stage_index];
+      auto &record = island.stages[stage_index];
+      record.stage_id = resolved.intent.stage_id;
+      record.effect = resolved.intent.semantic;
+      record.backend = resolved.selected_backend;
+      record.provider = resolved.provider;
+      record.status = resolved.status;
+      record.reason = resolved.reason;
+      record.failure_action = resolved.intent.failure_action;
+      record.required = resolved.intent.required;
+      record.resolved = true;
+      for (std::size_t committed_index = 0;
+           committed_index < source.committed.stage_count;
+           ++committed_index) {
+        const auto &committed = source.committed.stages[committed_index];
+        if (committed.stage_id == record.stage_id &&
+            committed.semantic == record.effect) {
+          record.committed = true;
+          record.committed_status = committed.status;
+          break;
+        }
+      }
+
+      const Lane lane = lane_for_backend(record.backend);
+      ProductCapabilityLane *capability = FindProductCapabilityLane(
+          &build.capabilities, record.effect, lane);
+      const CapabilityCode selected_code =
+          capability_code(lane, record.effect);
+      if (!capability || lane == Lane::invalid || lane == Lane::cpu ||
+          selected_code == CapabilityCode::none) {
+        continue;
+      }
+      capability->disposition =
+          resolved.status == hal::StatusId::degraded
+              ? ProductCapabilityDisposition::
+                    usable_with_degraded_behavior
+              : ProductCapabilityDisposition::production_usable;
+      capability->code = selected_code;
+      capability->nested_code = CapabilityCode::none;
+      capability->semantic.semantic = record.effect;
+      capability->semantic.provider = record.provider;
+      capability->semantic.status = resolved.status;
+      capability->semantic.reason = resolved.reason;
+      capability->semantic.cpu_tail = resolved.cpu_tail;
+      capability->semantic.cpu_tail_scratch_bytes =
+          resolved.cpu_tail_scratch_bytes;
+      capability->semantic.cpu_tail_placement =
+          resolved.cpu_tail_placement;
+      capability->semantic.live_stage = true;
+      capability->semantic.production_eligible = true;
+      capability->semantic.exact_evidence = true;
+      capability->semantic.supports_tracked_vignette_center = false;
+      capability->semantic.evidence_count =
+          std::min(resolved.evidence_count,
+                   capability->semantic.evidence.size());
+      for (std::size_t evidence_index = 0;
+           evidence_index < capability->semantic.evidence_count;
+           ++evidence_index) {
+        capability->semantic.evidence[evidence_index] =
+            resolved.evidence[evidence_index];
+      }
+    }
+  }
+
+  bool have_writer_commit = false;
+  for (std::size_t island_index = 0; island_index < build.island_count;
+       ++island_index) {
+    const auto &committed =
+        build.islands[island_index].latest_committed_frame;
+    if (!committed.valid)
+      continue;
+    const WriterOutputCommitIdentity identity{
+        true, committed.capture_sequence,
+        committed.output_commit_sequence};
+    if (!have_writer_commit) {
+      build.writer_commit = identity;
+      have_writer_commit = true;
+    } else if (build.writer_commit != identity) {
+      // Preserve every current typed island and let the shared validator
+      // reject mixed output commits without publishing partial attribution.
+      build.writer_commit = identity;
+    }
+  }
+
+  for (std::size_t effect_index = 0; effect_index < build.effect_count;
+       ++effect_index) {
+    StableEffectRuntimeState &state = build.effects[effect_index];
+    if (!requested(state.effect))
+      continue;
+
+    const hal::BackendId desired = desired_backend(state.effect);
+    const Lane desired_lane = lane_for_backend(desired);
+    const ProductCapabilityLane *desired_capability =
+        FindProductCapabilityLane(build.capabilities, state.effect,
+                                  desired_lane);
+    state.requested = true;
+    state.requested_backend = desired;
+    state.requested_provider = requested_provider(desired, state.effect);
+    state.capability_lane = desired_lane;
+    if (desired_capability) {
+      state.capability_code = desired_capability->code;
+      state.nested_capability_code = desired_capability->nested_code;
+      state.capability = desired_capability->semantic;
+      state.available =
+          IsProductCapabilityLaneEligible(build.capabilities,
+                                          *desired_capability);
+    }
+    state.strict_backend_selection =
+        input.effects->engine !=
+            effects::EffectsEnginePreference::auto_select ||
+        input.compute_backend == ComputeBackendPreference::vulkan;
+    state.strict_provider_selection =
+        input.effects->engine ==
+        effects::EffectsEnginePreference::open_cuda;
+    state.status = hal::StatusId::unavailable;
+    state.reason = hal::ReasonId::capability_evidence_incomplete;
+    state.blocked = true;
+
+    for (std::size_t island_index = 0;
+         island_index < build.island_count; ++island_index) {
+      const auto &island = build.islands[island_index];
+      for (std::size_t stage_index = 0;
+           stage_index < island.stage_count; ++stage_index) {
+        const auto &stage = island.stages[stage_index];
+        if (stage.effect != state.effect)
+          continue;
+        const ProductCapabilityLaneId selected_lane =
+            lane_for_backend(stage.backend);
+        const ProductCapabilityLane *selected_capability =
+            FindProductCapabilityLane(build.capabilities, state.effect,
+                                      selected_lane);
+        if (!selected_capability)
+          continue;
+        // StableEffectRuntimeState represents the user's canonical request,
+        // not the adapter-local exact choice made after automatic resolution.
+        // Automatic engine intent uses Maxine as the documented first
+        // preference but remains non-strict, so a later selected lane is
+        // reported as fallback rather than a strict substitution.
+        state.strict_backend_selection =
+            (state.requested_backend == hal::BackendId::vulkan &&
+             input.compute_backend == ComputeBackendPreference::vulkan) ||
+            (state.requested_backend == hal::BackendId::maxine &&
+             input.effects->engine ==
+                 effects::EffectsEnginePreference::maxine) ||
+            ((state.requested_backend == hal::BackendId::cuda ||
+              state.requested_backend ==
+                  hal::BackendId::open_video_onnxruntime) &&
+             input.effects->engine ==
+                 effects::EffectsEnginePreference::open_cuda);
+        state.strict_provider_selection =
+            input.effects->engine ==
+            effects::EffectsEnginePreference::open_cuda;
+        state.capability_lane =
+            lane_for_backend(state.requested_backend);
+        const ProductCapabilityLane *requested_capability =
+            FindProductCapabilityLane(build.capabilities, state.effect,
+                                      state.capability_lane);
+        if (requested_capability) {
+          state.capability_code = requested_capability->code;
+          state.nested_capability_code =
+              requested_capability->nested_code;
+          state.capability = requested_capability->semantic;
+        }
+        state.selected_capability_lane = selected_lane;
+        state.selected_capability_code = selected_capability->code;
+        state.selected_nested_capability_code =
+            selected_capability->nested_code;
+        state.selected_capability = selected_capability->semantic;
+        state.selected_backend = stage.backend;
+        state.selected_provider = stage.provider;
+        state.status = stage.status;
+        state.reason = stage.reason;
+        state.failure_action = stage.failure_action;
+        state.required = stage.required;
+        state.available = true;
+        state.selected = true;
+        state.blocked = false;
+        state.selected_island_id = island.island_id;
+        state.fallback =
+            state.selected_backend != state.requested_backend ||
+            (state.requested_provider !=
+                 hal::SemanticEffectProviderId::invalid &&
+             state.selected_provider != state.requested_provider);
+        if (stage.committed) {
+          state.commit = build.writer_commit;
+          state.committed_stage_id = stage.stage_id;
+          state.committed_stage_status = stage.committed_status;
+          if (stage.committed_status ==
+              hal::StageExecutionStatus::succeeded) {
+            const bool runtime_healthy =
+                island.telemetry.runtime_status == hal::StatusId::ready ||
+                island.telemetry.runtime_status == hal::StatusId::degraded ||
+                island.telemetry.runtime_status == hal::StatusId::executed;
+            state.active =
+                input.lifecycle == VideoRuntimeLifecycle::running &&
+                build.writer_commit.valid && runtime_healthy;
+            if (state.active) {
+              state.active_backend = stage.backend;
+              state.active_provider = stage.provider;
+              state.status = hal::StatusId::executed;
+              state.reason = hal::ReasonId::none;
+            }
+          } else if (stage.committed_status ==
+                     hal::StageExecutionStatus::optional_failed_open) {
+            state.degraded = true;
+            state.fallback = true;
+            state.status = hal::StatusId::degraded;
+            state.reason =
+                hal::ReasonId::optional_stage_failed_open;
+          }
+        }
+      }
+    }
+  }
+
+  return BuildMultiIslandVideoRuntimeStatusSnapshot(build, output);
+}
+
 int OptionalEffectBreaker::CooldownFramesForFailureCount(int failure_count) {
   if (failure_count <= 0)
     return 0;
@@ -1204,6 +1822,17 @@ OptionalEffectBreaker::ToStatus(std::uint64_t frame_index) const {
             : static_cast<int>(remaining);
   }
   return s;
+}
+
+CameraPipeline::CameraPipeline() {
+  CameraPipelineHalStatusProjectionInput projection;
+  projection.effects = &effects_;
+  projection.lifecycle = VideoRuntimeLifecycle::disabled;
+  projection.status_generation = ++video_hal_status_generation_;
+  projection.configuration_generation = 1;
+  projection.geometry_generation = 1;
+  (void)BuildCameraPipelineHalStatusSnapshot(projection,
+                                             &video_hal_status_);
 }
 
 CameraPipeline::~CameraPipeline() { Stop(); }
@@ -1328,6 +1957,9 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.prepared_hardware_execution = prepared_hardware_execution_;
     s.prepared_open_cuda_hardware_execution =
         prepared_open_cuda_hardware_execution_;
+    s.prepared_maxine_hardware_execution =
+        prepared_maxine_hardware_execution_;
+    s.video_hal_status = video_hal_status_;
   } else {
     // Avoid exposing stale negotiated formats when the pipeline is idle.
     //
@@ -1357,6 +1989,9 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.prepared_hardware_execution = PreparedHardwareExecutionSnapshot{};
     s.prepared_open_cuda_hardware_execution =
         PreparedOpenCudaHardwareExecutionSnapshot{};
+    s.prepared_maxine_hardware_execution =
+        PreparedMaxineHardwareExecutionSnapshot{};
+    s.video_hal_status = video_hal_status_;
   }
   s.frame_index = frame_index_;
   // Live attribution is meaningful only while a successfully-started pipeline
@@ -1456,6 +2091,20 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   prepared_hardware_execution_ = PreparedHardwareExecutionSnapshot{};
   prepared_open_cuda_hardware_execution_ =
       PreparedOpenCudaHardwareExecutionSnapshot{};
+  prepared_maxine_hardware_execution_ =
+      PreparedMaxineHardwareExecutionSnapshot{};
+  CameraPipelineHalStatusProjectionInput starting_projection;
+  starting_projection.effects = &cfg.effects;
+  starting_projection.compute_backend = cfg.compute_backend;
+  starting_projection.lifecycle = VideoRuntimeLifecycle::starting;
+  ++video_hal_status_generation_;
+  if (video_hal_status_generation_ == 0)
+    ++video_hal_status_generation_;
+  starting_projection.status_generation = video_hal_status_generation_;
+  starting_projection.configuration_generation = effects_generation_;
+  starting_projection.geometry_generation = 1;
+  (void)BuildCameraPipelineHalStatusSnapshot(starting_projection,
+                                             &video_hal_status_);
 
   effects_backends_.clear();
   effects_note_.clear();
@@ -1476,6 +2125,21 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
     lock.unlock();
     if (th_.joinable())
       th_.join();
+    lock.lock();
+    CameraPipelineHalStatusProjectionInput failed_projection;
+    failed_projection.effects = &cfg.effects;
+    failed_projection.compute_backend = cfg.compute_backend;
+    failed_projection.lifecycle = VideoRuntimeLifecycle::failed;
+    ++video_hal_status_generation_;
+    if (video_hal_status_generation_ == 0)
+      ++video_hal_status_generation_;
+    failed_projection.status_generation = video_hal_status_generation_;
+    failed_projection.configuration_generation =
+        effects_generation_ == 0 ? 1 : effects_generation_;
+    failed_projection.geometry_generation = 1;
+    (void)BuildCameraPipelineHalStatusSnapshot(failed_projection,
+                                               &video_hal_status_);
+    lock.unlock();
     if (error)
       *error = err;
     return false;
@@ -8733,6 +9397,66 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     prepared_open_cuda_hardware_execution_ = snapshot;
   };
+  auto publish_prepared_maxine_status = [&] {
+    const auto snapshot = prepared_maxine_hardware_owner.Snapshot();
+    std::lock_guard<std::mutex> lock(mu_);
+    prepared_maxine_hardware_execution_ = snapshot;
+  };
+  std::uint64_t video_hal_status_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    video_hal_status_generation = video_hal_status_generation_;
+  }
+  auto publish_video_hal_status =
+      [&](const effects::BroadcastCameraEffects &status_effects,
+          std::uint64_t configuration_generation,
+          VideoRuntimeLifecycle lifecycle) {
+        ++video_hal_status_generation;
+        if (video_hal_status_generation == 0)
+          ++video_hal_status_generation;
+        CameraPipelineHalStatusProjectionInput projection;
+        projection.effects = &status_effects;
+        projection.compute_backend = cfg.compute_backend;
+        projection.lifecycle = lifecycle;
+        projection.status_generation = video_hal_status_generation;
+        projection.configuration_generation =
+            configuration_generation == 0 ? 1 : configuration_generation;
+        projection.geometry_generation =
+            prepared_hardware_geometry_generation;
+        projection.final_visual = prepared_hardware_owner.Snapshot();
+        projection.maxine_resident =
+            prepared_maxine_hardware_owner.Snapshot();
+        projection.open_cuda_virtual_background =
+            prepared_open_cuda_hardware_owner.Snapshot();
+        projection.final_visual_live =
+            prepared_hardware_final_live &&
+            !prepared_hardware_runtime_suspended;
+        projection.maxine_resident_live =
+            prepared_maxine_hardware_live &&
+            !prepared_maxine_hardware_suspended &&
+            !projection.maxine_resident.quarantined &&
+            !projection.maxine_resident.stopped;
+        projection.open_cuda_virtual_background_live =
+            prepared_open_cuda_hardware_live &&
+            !prepared_open_cuda_hardware_suspended &&
+            !projection.open_cuda_virtual_background.quarantined &&
+            !projection.open_cuda_virtual_background.stopped &&
+            !projection.open_cuda_virtual_background.shutdown_pending;
+        MultiIslandVideoRuntimeStatusSnapshot snapshot;
+        const auto validation =
+            BuildCameraPipelineHalStatusSnapshot(projection, &snapshot);
+        std::lock_guard<std::mutex> lock(mu_);
+        video_hal_status_generation_ = video_hal_status_generation;
+        prepared_hardware_execution_ = projection.final_visual;
+        prepared_maxine_hardware_execution_ =
+            projection.maxine_resident;
+        prepared_open_cuda_hardware_execution_ =
+            projection.open_cuda_virtual_background;
+        video_hal_status_ =
+            validation.code == MultiIslandStatusValidationCode::valid
+                ? snapshot
+                : MultiIslandVideoRuntimeStatusSnapshot{};
+      };
 
   enum class OptionalEffectSlot : std::size_t {
     denoise = 0,
@@ -10418,6 +11142,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     if (prepared_maxine_hardware_live) {
       prepared_maxine_hardware_owner.Invalidate(
           hal::ReasonId::reconfiguration_required);
+      publish_prepared_maxine_status();
     }
     prepared_maxine_hardware_live = false;
     prepared_maxine_hardware_suspended = false;
@@ -10624,6 +11349,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
         const auto hal_setup =
             prepared_maxine_hardware_owner.Configure(request);
+        publish_prepared_maxine_status();
         prepared_maxine_hardware_live =
             hal_setup.route == PreparedMaxineHardwareRoute::hal_live;
         if (prepared_maxine_hardware_live) {
@@ -10761,6 +11487,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     appliedFx = fx;
     appliedEffectsGeneration = effects_generation;
     raw_yuyv_plan = PrepareRawYuyvPassthroughPlan(capA, outA, appliedFx);
+    publish_video_hal_status(appliedFx, appliedEffectsGeneration,
+                             VideoRuntimeLifecycle::running);
   };
 
   // Initial chain based on config at pipeline start.
@@ -11094,9 +11822,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       prepared_open_cuda_hardware_suspended = false;
       publish_prepared_open_cuda_status();
     }
+    if (prepared_maxine_hardware_live) {
+      prepared_maxine_hardware_owner.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+      prepared_maxine_hardware_live = false;
+      prepared_maxine_hardware_suspended = false;
+      publish_prepared_maxine_status();
+    }
     ++prepared_hardware_geometry_generation;
     if (prepared_hardware_geometry_generation == 0)
       prepared_hardware_geometry_generation = 1;
+    publish_video_hal_status(appliedFx, appliedEffectsGeneration,
+                             VideoRuntimeLifecycle::running);
     // The next frame must rebuild against the renegotiated layout. This also
     // prepares the retained legacy final stage when the new layout is not HAL
     // eligible; no silently missing vignette/mirror interval is permitted.
@@ -12514,6 +13251,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   PreparedOpenCudaPipelineShouldSuspend(
                       prepared_frame.status, prepared_frame.reason);
               publish_prepared_open_cuda_status();
+              publish_video_hal_status(
+                  appliedFx, appliedEffectsGeneration,
+                  VideoRuntimeLifecycle::running);
               block_optional_effect(
                   OptionalEffectSlot::virtual_background, stage_id,
                   "open_cuda",
@@ -13329,11 +14069,16 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 (void)prepared_maxine_hardware_owner.CommitOutput(
                     prepared_maxine_completion, false, &commit_reason);
                 prepared_maxine_completion_pending = false;
+                publish_prepared_maxine_status();
               }
               if (frame.reason == hal::ReasonId::device_lost) {
                 prepared_maxine_hardware_owner.NotifyDeviceLost();
                 prepared_maxine_hardware_suspended = true;
+                publish_prepared_maxine_status();
               }
+              publish_video_hal_status(
+                  appliedFx, appliedEffectsGeneration,
+                  VideoRuntimeLifecycle::running);
               for (std::size_t index = 0; index < active.stage_count;
                    ++index) {
                 const auto slot =
@@ -13770,6 +14515,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               studiocast::video::effects::contract::kEffectIdMirror,
               "open_vulkan", failure, f.sequence);
         }
+        publish_video_hal_status(appliedFx, appliedEffectsGeneration,
+                                 VideoRuntimeLifecycle::running);
       }
       // No legacy Vulkan retry is attempted here. Optional-stage or device
       // failure leaves the last valid CPU frame intact; typed HAL status
@@ -14664,6 +15411,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
 
     const auto finish_prepared_hardware_frame =
         [&](bool output_write_succeeded) {
+          const bool prepared_transition =
+              prepared_hardware_completion_pending ||
+              prepared_maxine_completion_pending ||
+              prepared_open_cuda_completion_pending;
           bool committed = output_write_succeeded;
           if (prepared_hardware_completion_pending) {
             hal::ReasonId reason = hal::ReasonId::none;
@@ -14672,7 +15423,6 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     prepared_hardware_completion, output_write_succeeded,
                     &reason);
             prepared_hardware_completion_pending = false;
-            publish_prepared_hardware_status();
             committed &= status == hal::StatusId::ready;
           }
           if (prepared_maxine_completion_pending) {
@@ -14691,8 +15441,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                     prepared_open_cuda_completion, output_write_succeeded,
                     &reason);
             prepared_open_cuda_completion_pending = false;
-            publish_prepared_open_cuda_status();
             committed &= status == hal::StatusId::ready;
+          }
+          if (prepared_transition) {
+            publish_video_hal_status(appliedFx,
+                                     appliedEffectsGeneration,
+                                     VideoRuntimeLifecycle::running);
           }
           return committed;
         };
@@ -15471,6 +16225,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     prepared_open_cuda_hardware_owner.Shutdown();
   }
   publish_prepared_open_cuda_status();
+  prepared_maxine_hardware_owner.Shutdown();
+  prepared_maxine_hardware_live = false;
+  publish_prepared_maxine_status();
+  prepared_hardware_owner.Shutdown();
+  prepared_hardware_final_live = false;
+  prepared_open_cuda_hardware_live = false;
+  publish_prepared_hardware_status();
+  publish_video_hal_status(appliedFx, appliedEffectsGeneration,
+                           VideoRuntimeLifecycle::idle);
 
   {
     std::lock_guard<std::mutex> lock(mu_);

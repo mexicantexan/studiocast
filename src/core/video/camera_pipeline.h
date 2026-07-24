@@ -25,6 +25,7 @@
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
 #include "core/video/video_config_types.h"
+#include "core/video/video_runtime_status.h"
 
 namespace studiocast::video {
 
@@ -102,6 +103,31 @@ bool PreparedOpenCudaPipelineMayCommitAttribution(
     hal::StatusId output_commit_status) noexcept;
 bool PreparedOpenCudaPipelineShouldSuspend(
     hal::StatusId status, hal::ReasonId reason) noexcept;
+
+// Setup/control-plane projection input for the versioned daemon HAL status.
+// It consumes only cached typed owner snapshots and canonical configuration;
+// no probing, model discovery, JSON, synchronization, or backend construction
+// is permitted here.
+struct CameraPipelineHalStatusProjectionInput {
+  const effects::BroadcastCameraEffects *effects = nullptr;
+  ComputeBackendPreference compute_backend =
+      ComputeBackendPreference::auto_select;
+  VideoRuntimeLifecycle lifecycle = VideoRuntimeLifecycle::disabled;
+  std::uint64_t status_generation = 0;
+  std::uint64_t configuration_generation = 0;
+  std::uint64_t geometry_generation = 0;
+  bool final_visual_live = false;
+  bool maxine_resident_live = false;
+  bool open_cuda_virtual_background_live = false;
+  PreparedHardwareExecutionSnapshot final_visual{};
+  PreparedMaxineHardwareExecutionSnapshot maxine_resident{};
+  PreparedOpenCudaHardwareExecutionSnapshot open_cuda_virtual_background{};
+};
+
+[[nodiscard]] MultiIslandStatusValidationResult
+BuildCameraPipelineHalStatusSnapshot(
+    const CameraPipelineHalStatusProjectionInput &input,
+    MultiIslandVideoRuntimeStatusSnapshot *output) noexcept;
 
 inline constexpr std::size_t kMaxPreparedMaxineResidentIslands = 9;
 
@@ -577,6 +603,11 @@ struct CameraPipelineStatus {
   // integration.
   PreparedOpenCudaHardwareExecutionSnapshot
       prepared_open_cuda_hardware_execution{};
+  PreparedMaxineHardwareExecutionSnapshot
+      prepared_maxine_hardware_execution{};
+  // Cached typed status consumed only by the explicitly versioned
+  // GET_VIDEO_HAL_STATUS_V1 command. Legacy GET_STATUS does not serialize it.
+  MultiIslandVideoRuntimeStatusSnapshot video_hal_status{};
 
   std::string last_error;
 };
@@ -634,7 +665,7 @@ public:
 
 class CameraPipeline final : public CameraPipelineRunner {
 public:
-  CameraPipeline() = default;
+  CameraPipeline();
   ~CameraPipeline();
 
   CameraPipeline(const CameraPipeline &) = delete;
@@ -717,6 +748,10 @@ private:
   PreparedHardwareExecutionSnapshot prepared_hardware_execution_{};
   PreparedOpenCudaHardwareExecutionSnapshot
       prepared_open_cuda_hardware_execution_{};
+  PreparedMaxineHardwareExecutionSnapshot
+      prepared_maxine_hardware_execution_{};
+  MultiIslandVideoRuntimeStatusSnapshot video_hal_status_{};
+  std::uint64_t video_hal_status_generation_ = 0;
 
   // Effects: updated live by SetEffects.
   //

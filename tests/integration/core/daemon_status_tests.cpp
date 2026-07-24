@@ -2454,6 +2454,76 @@ bool TestUnavailableVulkanRequestUsesRequestedEffectBlocker() {
                 "fallback must use the requested effect blocker only");
 }
 
+bool TestVersionedVideoHalStatusAndLegacyByteStability() {
+  studiocast::video::CameraPipeline pipeline;
+  studiocast::video::VirtualCameraServiceStatus videoStatus;
+  videoStatus.pipeline = pipeline.Status();
+  studiocast::video::VirtualCameraServiceConfig videoConfig;
+  studiocast::audio::VirtualAudioServiceStatus audioStatus;
+  studiocast::audio::VirtualAudioServiceConfig audioConfig;
+  const auto socket =
+      std::filesystem::path("/tmp/studiocastd-test.sock");
+
+  const std::string legacy_before =
+      StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig, socket,
+                   /*maxineJson=*/"", /*openCudaJson=*/"",
+                   /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                   /*loopbackJson=*/"");
+  const std::string response = VideoHalStatusV1Response(videoStatus);
+  const std::string legacy_after =
+      StatusToJson(videoStatus, videoConfig, audioStatus, audioConfig, socket,
+                   /*maxineJson=*/"", /*openCudaJson=*/"",
+                   /*openVulkanJson=*/"", /*openAudioJson=*/"",
+                   /*loopbackJson=*/"");
+
+  bool ok =
+      Expect(legacy_before == legacy_after,
+             "versioned HAL status must not mutate or alter GET_STATUS bytes");
+  ok &= Expect(
+      legacy_before.find("typed_multi_island_video_status") ==
+              std::string::npos &&
+          legacy_before.find("video_hal_status") == std::string::npos,
+      "legacy GET_STATUS must not gain the versioned typed HAL subtree");
+  ok &= Expect(response.rfind("OK ", 0) == 0,
+               "GET_VIDEO_HAL_STATUS_V1 must return a standalone OK payload");
+  if (response.rfind("OK ", 0) == 0) {
+    studiocast::util::json::Value parsed;
+    std::string error;
+    ok &= Expect(studiocast::util::json::Parse(response.substr(3), &parsed,
+                                               &error),
+                 "versioned HAL status response must be valid JSON");
+    const JsonObject *root = parsed.AsObject();
+    ok &= Expect(root != nullptr,
+                 "versioned HAL status root must be an object");
+    if (root) {
+      ok &= Expect(JsonBoolField(*root, "valid", false),
+                   "versioned HAL status must carry valid=true");
+      const JsonArray *islands =
+          ArrayAt(*root, "islands", "versioned islands must exist");
+      const JsonArray *effects =
+          ArrayAt(*root, "effects", "versioned effects must exist");
+      ok &= Expect(islands && islands->empty(),
+                   "new pipeline must publish valid zero-GPU passthrough");
+      ok &= Expect(
+          effects &&
+              effects->size() ==
+                  studiocast::video::kCanonicalVideoEffectCount,
+          "versioned HAL status must publish all nine stable effects");
+    }
+  }
+
+  studiocast::video::VirtualCameraServiceStatus malformed;
+  const std::string rejected = VideoHalStatusV1Response(malformed);
+  ok &= Expect(
+      rejected.rfind("ERR ", 0) == 0 &&
+          rejected.find("validation_code=") != std::string::npos,
+      "malformed cached typed status must fail closed with an ERR response");
+  const ParsedCommand parsed_command = ParseLine("GET_VIDEO_HAL_STATUS_V1");
+  ok &= Expect(parsed_command.cmd == "GET_VIDEO_HAL_STATUS_V1",
+               "versioned daemon command token must remain exact");
+  return ok;
+}
+
 bool TestAudioStatusReportsResolvedSourceAndWarnings() {
   studiocast::video::VirtualCameraServiceStatus videoStatus;
   studiocast::video::VirtualCameraServiceConfig videoConfig;
@@ -2595,6 +2665,7 @@ int main() {
   ok = TestTrackedCenterVignetteFailsClosedWhenAutoFrameIsRetained() && ok;
   ok = TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() && ok;
   ok = TestUnavailableVulkanRequestUsesRequestedEffectBlocker() && ok;
+  ok = TestVersionedVideoHalStatusAndLegacyByteStability() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;
   return ok ? 0 : 1;
