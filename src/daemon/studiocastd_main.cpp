@@ -845,6 +845,240 @@ const std::string &AuthoritativeLiveEffectBackends(
              : empty;
 }
 
+studiocast::video::PreparedHardwareExecutionSnapshot
+PreparedHardwareCompatibilitySnapshot(
+    const studiocast::video::ProductionVideoBackendManagerSnapshot &manager) {
+  const auto &source = manager.resident;
+  studiocast::video::PreparedHardwareExecutionSnapshot snapshot;
+  snapshot.route =
+      source.prepared
+          ? studiocast::video::PreparedHardwareRoute::hal_live
+          : studiocast::video::PreparedHardwareRoute::legacy_shadow;
+  snapshot.eligibility =
+      source.prepared
+          ? studiocast::video::PreparedHardwareEligibility::eligible
+          : studiocast::video::PreparedHardwareEligibility::unavailable;
+  snapshot.setup.mode =
+      studiocast::video::HardwareExecutionSetupMode::hal_live;
+  snapshot.setup.status = source.prepare.status;
+  snapshot.setup.reason = source.prepare.reason;
+  snapshot.setup.resolution = source.plan.resolution;
+  snapshot.setup.domain_plan = source.plan.domain_plan;
+  snapshot.setup.legacy_path_retained_for_setup_rollback =
+      source.prepare.old_plan_retained;
+  snapshot.readiness = source.readiness;
+  snapshot.telemetry = source.telemetry;
+  snapshot.latest_committed_frame = source.latest_committed_frame;
+  snapshot.prepared = source.prepared;
+  if (source.prepared) {
+    snapshot.active_program.valid = true;
+    snapshot.active_program.program_id =
+        source.plan.prepared_program.program_id;
+    snapshot.active_program.owner_adapter_instance_id =
+        source.plan.prepared_program.owner_adapter_instance_id;
+    snapshot.active_program.invalidation_key =
+        source.plan.prepared_program.invalidation_key;
+    snapshot.active_program.execution_domain =
+        source.plan.prepared_program.execution_domain;
+    snapshot.active_program.stage_count =
+        source.plan.prepared_program.stage_count;
+  }
+  return snapshot;
+}
+
+struct TypedProductionComputeAuthority {
+  bool authoritative = false;
+  bool selected = false;
+  bool active = false;
+  bool fallback = false;
+  bool degraded = false;
+  bool blocked = false;
+  studiocast::hal::ReasonId reason = studiocast::hal::ReasonId::none;
+  studiocast::hal::BackendId requested_backend =
+      studiocast::hal::BackendId::invalid;
+  studiocast::hal::BackendId selected_backend =
+      studiocast::hal::BackendId::invalid;
+  studiocast::hal::SemanticEffectProviderId provider =
+      studiocast::hal::SemanticEffectProviderId::invalid;
+  std::string active_effect_backends;
+};
+
+std::string TypedLegacyResolvedBackend(studiocast::hal::BackendId backend) {
+  switch (backend) {
+  case studiocast::hal::BackendId::cuda:
+  case studiocast::hal::BackendId::maxine:
+  case studiocast::hal::BackendId::open_video_onnxruntime:
+    return "cuda";
+  case studiocast::hal::BackendId::vulkan:
+    return "vulkan";
+  case studiocast::hal::BackendId::cpu:
+    return "cpu";
+  case studiocast::hal::BackendId::invalid:
+  case studiocast::hal::BackendId::test_fake:
+    return {};
+  }
+  return {};
+}
+
+std::string TypedLegacyActiveBackend(studiocast::hal::BackendId backend) {
+  if (backend == studiocast::hal::BackendId::maxine)
+    return "maxine";
+  return TypedLegacyResolvedBackend(backend);
+}
+
+std::string_view
+TypedLegacyEffectBackend(studiocast::hal::BackendId backend) {
+  switch (backend) {
+  case studiocast::hal::BackendId::cpu:
+    return "cpu";
+  case studiocast::hal::BackendId::cuda:
+  case studiocast::hal::BackendId::open_video_onnxruntime:
+    return "open_cuda";
+  case studiocast::hal::BackendId::maxine:
+    return "maxine";
+  case studiocast::hal::BackendId::vulkan:
+    return "open_vulkan";
+  case studiocast::hal::BackendId::invalid:
+  case studiocast::hal::BackendId::test_fake:
+    return {};
+  }
+  return {};
+}
+
+bool HasCommittedSuccessfulStage(
+    const studiocast::hal::CommittedFrameSnapshot &commit,
+    const studiocast::hal::ExecutionDomainId &executionDomain,
+    std::uint64_t programId, studiocast::hal::BackendId selectedBackend) {
+  if (!commit.valid || commit.capture_sequence == 0 ||
+      commit.output_commit_sequence == 0 || commit.stage_count == 0 ||
+      commit.stage_count > commit.stages.size() || programId == 0 ||
+      commit.program_id != programId ||
+      !studiocast::hal::ValidateExecutionDomain(commit.execution_domain) ||
+      commit.execution_domain != executionDomain) {
+    return false;
+  }
+  return std::any_of(
+      commit.stages.begin(), commit.stages.begin() + commit.stage_count,
+      [selectedBackend](
+          const studiocast::hal::CommittedStageActivity &stage) {
+        return stage.status ==
+                   studiocast::hal::StageExecutionStatus::succeeded &&
+               stage.backend == selectedBackend;
+      });
+}
+
+TypedProductionComputeAuthority TypedProductionAuthority(
+    const studiocast::video::VirtualCameraServiceStatus &status) {
+  using ManagerState =
+      studiocast::video::ProductionVideoBackendManagerState;
+  const auto &manager = status.pipeline.production_backend;
+  TypedProductionComputeAuthority out;
+
+  // A manager attempt is the authority boundary even when setup failed. Raw
+  // engine diagnostics remain legacy/idle evidence, but may not replace this
+  // request's selected, active, degraded, or fallback facts.
+  if (manager.contract_version !=
+          studiocast::video::kProductionVideoBackendManagerContractVersion ||
+      manager.setup_attempts == 0 ||
+      manager.readiness.requested_backend ==
+          studiocast::hal::BackendId::invalid) {
+    return out;
+  }
+
+  out.authoritative = true;
+  out.requested_backend = manager.readiness.requested_backend;
+  out.selected_backend = manager.readiness.selected_backend;
+  out.provider = manager.readiness.provider;
+  out.reason = manager.reason != studiocast::hal::ReasonId::none
+                   ? manager.reason
+                   : manager.readiness.reason;
+  const bool residentReady =
+      manager.state == ManagerState::resident_ready &&
+      manager.resident_prepared && manager.resident.prepared &&
+      !manager.resident.stopped &&
+      manager.readiness.execution_domain ==
+          manager.resident.readiness.execution_domain &&
+      manager.readiness.selected_backend ==
+          manager.resident.readiness.selected_backend &&
+      manager.resident.plan.prepared_program.program_id != 0 &&
+      manager.resident.plan.prepared_program.execution_domain ==
+          manager.readiness.execution_domain;
+  const bool compatibilityReady =
+      manager.state == ManagerState::compatibility_ready &&
+      !manager.resident_prepared && manager.compatibility.prepared &&
+      !manager.compatibility.stopped &&
+      manager.compatibility.plan_id != 0 &&
+      manager.readiness.execution_domain ==
+          manager.compatibility.execution_domain &&
+      manager.readiness.selected_backend ==
+          manager.compatibility.readiness.selected_backend;
+  out.selected =
+      out.selected_backend != studiocast::hal::BackendId::invalid &&
+      (residentReady || compatibilityReady) && manager.setup_complete &&
+      (manager.status == studiocast::hal::StatusId::ready ||
+       manager.status == studiocast::hal::StatusId::degraded ||
+       manager.status == studiocast::hal::StatusId::executed) &&
+      manager.readiness.available &&
+      studiocast::hal::ValidateExecutionDomain(
+          manager.readiness.execution_domain) &&
+      manager.readiness.execution_domain.backend == out.selected_backend;
+  out.degraded = manager.status == studiocast::hal::StatusId::degraded ||
+                 manager.readiness.degraded;
+  out.blocked = manager.status == studiocast::hal::StatusId::blocked ||
+                manager.status == studiocast::hal::StatusId::unavailable ||
+                manager.status == studiocast::hal::StatusId::failed ||
+                manager.status == studiocast::hal::StatusId::quarantined ||
+                manager.status == studiocast::hal::StatusId::resource_exhausted;
+  out.fallback =
+      out.selected &&
+      out.requested_backend != studiocast::hal::BackendId::invalid &&
+      out.requested_backend != out.selected_backend;
+
+  const studiocast::hal::CommittedFrameSnapshot *commit = nullptr;
+  const studiocast::hal::ExecutionDomainId *commitDomain = nullptr;
+  std::uint64_t commitProgramId = 0;
+  if (residentReady) {
+    commit = &manager.resident.latest_committed_frame;
+    commitDomain = &manager.resident.plan.prepared_program.execution_domain;
+    commitProgramId = manager.resident.plan.prepared_program.program_id;
+  } else if (compatibilityReady) {
+    commit = &manager.compatibility.latest_committed_frame;
+    commitDomain = &manager.compatibility.execution_domain;
+    commitProgramId = manager.compatibility.plan_id;
+  }
+  out.active = out.selected && HasAuthoritativeRunningVideoFrame(status) &&
+               commit && commitDomain &&
+               HasCommittedSuccessfulStage(*commit, *commitDomain,
+                                           commitProgramId,
+                                           out.selected_backend);
+  if (out.active) {
+    for (std::size_t index = 0; index < commit->stage_count; ++index) {
+      const auto &stage = commit->stages[index];
+      if (stage.status !=
+              studiocast::hal::StageExecutionStatus::succeeded ||
+          stage.backend != out.selected_backend) {
+        continue;
+      }
+      const std::string_view effect =
+          studiocast::hal::StableEffectId(stage.semantic);
+      const std::string_view backend =
+          TypedLegacyEffectBackend(stage.backend);
+      if (effect.empty() || backend.empty())
+        continue;
+      if (!out.active_effect_backends.empty())
+        out.active_effect_backends.push_back(',');
+      out.active_effect_backends.append(effect);
+      out.active_effect_backends.push_back(':');
+      out.active_effect_backends.append(backend);
+      if (out.provider ==
+          studiocast::hal::SemanticEffectProviderId::invalid) {
+        out.provider = stage.provider;
+      }
+    }
+  }
+  return out;
+}
+
 std::string VideoEffectLabel(const std::string &id) {
   using namespace studiocast::video::effects::contract;
   if (id == kEffectIdMirror)
@@ -1911,6 +2145,55 @@ ComputeProviderStatus BuildComputeProviderStatus(
   return out;
 }
 
+ComputeProviderStatus BuildTypedComputeProviderStatus(
+    const TypedProductionComputeAuthority &authority) {
+  ComputeProviderStatus out;
+  if (!authority.active)
+    return out;
+
+  using Provider = studiocast::hal::SemanticEffectProviderId;
+  switch (authority.provider) {
+  case Provider::maxine_vfx:
+  case Provider::maxine_ar:
+  case Provider::maxine_cuda_utility:
+    out.mode = "maxine";
+    out.active_provider = "NVIDIA Maxine";
+    out.device = "cuda";
+    out.tensor_io_mode = "cuda_device";
+    break;
+  case Provider::open_video_onnxruntime_cuda:
+    out.mode = "open_cuda";
+    out.active_provider = "CUDAExecutionProvider";
+    out.device = "cuda";
+    out.tensor_io_mode = "cuda_device_iobinding";
+    break;
+  case Provider::open_video_onnxruntime_cpu:
+    out.mode = "cpu";
+    out.active_provider = "CPUExecutionProvider";
+    out.device = "host";
+    out.tensor_io_mode = "host";
+    break;
+  case Provider::open_vulkan_production_kernels:
+    out.mode = "open_vulkan";
+    out.active_provider = "Vulkan";
+    out.device = "vulkan";
+    out.tensor_io_mode = "vulkan_device_kernels";
+    break;
+  case Provider::invalid:
+    if (authority.selected_backend == studiocast::hal::BackendId::cpu) {
+      out.mode = "cpu";
+      out.active_provider = "CPU";
+      out.device = "host";
+      out.tensor_io_mode = "host";
+    }
+    break;
+  case Provider::test_fake:
+    // Test-only providers cannot become a production-looking daemon claim.
+    break;
+  }
+  return out;
+}
+
 void AppendCpuTailStages(std::ostringstream &oss,
                          const studiocast::video::CameraPipelineStatus &p) {
   std::vector<std::string> stages;
@@ -1945,9 +2228,33 @@ void AppendVideoComputeStatusJson(
     const std::string &fallbackReason, const std::string &degradedReason,
     const EngineDiagnosticsSummary &maxineDiag,
     const EngineDiagnosticsSummary &openCudaDiag,
-    const EngineDiagnosticsSummary &openVulkanDiag) {
-  const std::vector<std::string> activeEngines =
+    const EngineDiagnosticsSummary &openVulkanDiag,
+    const TypedProductionComputeAuthority *typedAuthority = nullptr) {
+  std::vector<std::string> activeEngines =
       ActiveComputeEngines(liveEffectBackends, active);
+  if (typedAuthority && typedAuthority->authoritative) {
+    activeEngines.clear();
+    if (typedAuthority->active) {
+      switch (typedAuthority->selected_backend) {
+      case studiocast::hal::BackendId::maxine:
+        activeEngines.emplace_back("maxine");
+        break;
+      case studiocast::hal::BackendId::cuda:
+      case studiocast::hal::BackendId::open_video_onnxruntime:
+        activeEngines.emplace_back("open_cuda");
+        break;
+      case studiocast::hal::BackendId::vulkan:
+        activeEngines.emplace_back("open_vulkan");
+        break;
+      case studiocast::hal::BackendId::cpu:
+        activeEngines.emplace_back("cpu");
+        break;
+      case studiocast::hal::BackendId::invalid:
+      case studiocast::hal::BackendId::test_fake:
+        break;
+      }
+    }
+  }
   std::string cudaUnavailable = DiagnosticUnavailableReason(openCudaDiag);
   std::string vulkanUnavailable = DiagnosticUnavailableReason(openVulkanDiag);
   std::string maxineUnavailable = DiagnosticUnavailableReason(maxineDiag);
@@ -1968,8 +2275,10 @@ void AppendVideoComputeStatusJson(
   const std::string fallbackCode =
       fallbackActive ? ComputeFallbackCode(preference, resolved, active)
                      : std::string();
-  const ComputeProviderStatus provider = BuildComputeProviderStatus(
+  ComputeProviderStatus provider = BuildComputeProviderStatus(
       active, activeEngines, maxineDiag, openCudaDiag, openVulkanDiag);
+  if (typedAuthority && typedAuthority->authoritative)
+    provider = BuildTypedComputeProviderStatus(*typedAuthority);
 
   const auto &cu = pipeline.open_cuda_transfers;
   const auto &vk = pipeline.open_vulkan_transfers;
@@ -2191,7 +2500,7 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
                                     ? std::string("cpu")
                                     : st.pipeline.compute_backend_resolved;
   const bool pipelineHasLiveFrame = HasAuthoritativeRunningVideoFrame(st);
-  const std::string &liveEffectBackends = AuthoritativeLiveEffectBackends(st);
+  std::string liveEffectBackends = AuthoritativeLiveEffectBackends(st);
   // Active means executing in a successfully written running frame. Aggregate
   // setup fields and maps from any other lifecycle state are not live evidence.
   std::string computeActive = pipelineHasLiveFrame
@@ -2298,6 +2607,39 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
     }
   }
 
+  const TypedProductionComputeAuthority typedProduction =
+      TypedProductionAuthority(st);
+  if (typedProduction.authoritative) {
+    // Compatibility diagnostics above are intentionally retained so idle
+    // GET_STATUS bytes and exact installer Vulkan facts remain stable. Once a
+    // neutral manager has attempted this canonical request, however, they may
+    // not override its typed setup/live result.
+    if (typedProduction.selected) {
+      computeResolved =
+          TypedLegacyResolvedBackend(typedProduction.selected_backend);
+    } else if (!st.pipeline.compute_backend_resolved.empty()) {
+      computeResolved = st.pipeline.compute_backend_resolved;
+    }
+    computeActive =
+        typedProduction.active
+            ? TypedLegacyActiveBackend(typedProduction.selected_backend)
+            : std::string{};
+    liveEffectBackends = typedProduction.active_effect_backends;
+
+    const std::string typedReason(
+        studiocast::daemon::StableHalReasonToken(typedProduction.reason));
+    computeFallback.clear();
+    computeDegraded.clear();
+    if (typedProduction.fallback || typedProduction.blocked) {
+      computeFallback =
+          typedReason.empty() ? std::string("backend_changed") : typedReason;
+    }
+    if (typedProduction.degraded || typedProduction.blocked) {
+      computeDegraded =
+          typedReason.empty() ? std::string("backend_degraded") : typedReason;
+    }
+  }
+
   oss << "\"video\":{";
   oss << "\"enabled\":" << BoolJson(cfg.enabled) << ",";
   oss << "\"always_on\":" << BoolJson(cfg.always_on) << ",";
@@ -2315,7 +2657,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
   AppendVideoComputeStatusJson(
       oss, st.pipeline, liveEffectBackends, computePreference, computeResolved,
       computeActive, computeFallback, computeDegraded, computeMaxineDiag,
-      computeOpenCudaDiag, computeOpenVulkanDiag);
+      computeOpenCudaDiag, computeOpenVulkanDiag,
+      typedProduction.authoritative ? &typedProduction : nullptr);
   oss << ",";
   oss << "\"output_format_requested\":\""
       << JsonEscape(
@@ -2434,7 +2777,8 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
 
   const auto preparedHardwareJson =
       studiocast::daemon::SerializePreparedHardwareExecutionJson(
-          st.pipeline.prepared_hardware_execution,
+          PreparedHardwareCompatibilitySnapshot(
+              st.pipeline.production_backend),
           HasAuthoritativeRunningVideoFrame(st), st.pipeline.starting);
 
   oss << "\"pipeline\":{";
@@ -2787,14 +3131,15 @@ StatusToJson(const studiocast::video::VirtualCameraServiceStatus &st,
     oss << "\"runtime_failure_frames\":"
         << st.pipeline.maxine_transfers.runtime_failure_frames << ",";
     oss << "\"stages\":{";
+    constexpr std::array<std::string_view, 9> kLegacyResidentStageNames{
+        "denoise",           "eye_contact",      "background_blur",
+        "background_remove", "background_replace", "relighting",
+        "transfer",          "auto_frame",       "vignette"};
     for (std::size_t i = 0;
          i < st.pipeline.maxine_transfers.stage_attempts.size(); ++i) {
       if (i != 0)
         oss << ",";
-      const auto kind =
-          static_cast<studiocast::maxine::ResidentStageKind>(i);
-      oss << "\"" << studiocast::maxine::ResidentStageKindName(kind)
-          << "\":{";
+      oss << "\"" << kLegacyResidentStageNames[i] << "\":{";
       oss << "\"attempts\":"
           << st.pipeline.maxine_transfers.stage_attempts[i] << ",";
       oss << "\"successes\":"

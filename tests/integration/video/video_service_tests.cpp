@@ -497,6 +497,48 @@ bool TestVideoServiceDeliversOnlyGenuineLiveEffectChanges() {
   return true;
 }
 
+bool TestVideoServicePreservesBackendIntentForPipelineAuthority() {
+  using studiocast::video::ComputeBackendPreference;
+  using studiocast::video::effects::EffectsEnginePreference;
+  using studiocast::video::effects::VirtualBackgroundMode;
+
+  ServiceHarness h;
+  h.consumer_present.store(true, std::memory_order_relaxed);
+  VirtualCameraService service(h.Hooks());
+  auto cfg = TestConfig();
+  cfg.pipeline.compute_backend = ComputeBackendPreference::cpu;
+  cfg.pipeline.effects.engine = EffectsEnginePreference::open_cuda;
+  cfg.pipeline.effects.virtual_background.mode = VirtualBackgroundMode::blur;
+  cfg.pipeline.effects.video_noise_removal.enabled = true;
+  cfg.pipeline.effects.auto_frame.enabled = true;
+  cfg.pipeline.effects.eye_contact.enabled = true;
+  cfg.pipeline.effects.virtual_key_light.enabled = true;
+  cfg.pipeline.effects.vignette.enabled = true;
+
+  std::string err;
+  if (!service.Start(cfg, &err)) {
+    std::cerr << "service.Start failed: " << err << "\n";
+    return false;
+  }
+
+  const bool started = WaitUntil(
+      [&] {
+        return service.Status().pipeline_state == "running" &&
+               h.pipeline->start_calls.load(std::memory_order_relaxed) == 1;
+      },
+      250ms);
+  const auto applied = h.pipeline->AppliedEffects();
+  service.Stop();
+
+  if (!started || applied != cfg.pipeline.effects) {
+    std::cerr
+        << "service rewrote canonical effects instead of forwarding strict "
+           "backend intent to the pipeline manager\n";
+    return false;
+  }
+  return true;
+}
+
 bool TestVideoPipelineDoesNotStartWithoutConsumer() {
   ServiceHarness h;
   VirtualCameraService service(h.Hooks());
@@ -1819,6 +1861,8 @@ int main() {
        &TestVideoServiceSanitizesEffectBackendsAcrossLifecycle},
       {"video service delivers only genuine live effect changes",
        &TestVideoServiceDeliversOnlyGenuineLiveEffectChanges},
+      {"video service preserves backend intent for pipeline authority",
+       &TestVideoServicePreservesBackendIntentForPipelineAuthority},
       {"identical pipeline effects preserve runtime generation",
        &studiocast::tests::
            TestCameraPipelineIdenticalEffectsPreserveRuntimeGeneration},

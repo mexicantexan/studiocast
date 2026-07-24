@@ -4,6 +4,7 @@
 #include "core/video/video_runtime_status.h"
 
 #include <string>
+#include <string_view>
 
 namespace studiocast::daemon {
 
@@ -32,6 +33,12 @@ struct PreparedHardwareExecutionJsonResult {
   std::string validation_code;
   std::string json;
 };
+
+// Stable typed tokens shared by versioned and legacy compatibility status
+// projection. Keeping this mapping in one place prevents backend-specific
+// daemon consumers from inventing parallel reason vocabularies.
+[[nodiscard]] std::string_view
+StableHalReasonToken(hal::ReasonId reason) noexcept;
 
 // Pure control-plane serializers. They consume an already-cached snapshot and
 // perform no probing, refresh, model discovery, session work, synchronization,

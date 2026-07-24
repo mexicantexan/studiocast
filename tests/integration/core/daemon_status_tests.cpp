@@ -695,10 +695,9 @@ bool TestVideoComputeTransferTotalsDoNotDoubleCountSubcounters() {
   mx.setup_successes = 2;
   mx.cpu_tail_stage_calls = 61;
   mx.runtime_failure_frames = 67;
-  mx.stage_attempts[static_cast<std::size_t>(
-      studiocast::maxine::ResidentStageKind::denoise)] = 71;
-  mx.stage_successes[static_cast<std::size_t>(
-      studiocast::maxine::ResidentStageKind::denoise)] = 69;
+  constexpr std::size_t kDenoiseStageIndex = 0;
+  mx.stage_attempts[kDenoiseStageIndex] = 71;
+  mx.stage_successes[kDenoiseStageIndex] = 69;
   mx.standalone_scaler_upload_calls = 13;
   mx.standalone_scaler_download_calls = 17;
 
@@ -2552,6 +2551,171 @@ bool TestVersionedVideoHalStatusAndLegacyByteStability() {
   return ok;
 }
 
+studiocast::hal::ExecutionDomainId TypedStatusCudaDomain() {
+  studiocast::hal::ExecutionDomainId domain;
+  domain.backend = studiocast::hal::BackendId::cuda;
+  domain.api_family = studiocast::hal::ApiFamily::cuda_driver;
+  domain.physical_device.vendor_id = 0x10de;
+  domain.physical_device.device_id = 0x1cb3;
+  domain.physical_device.stable_id[0] = 0x42;
+  domain.logical_context_generation = 7;
+  domain.allocator_family = studiocast::hal::AllocatorFamily::cuda_driver;
+  domain.memory_handle_family =
+      studiocast::hal::MemoryHandleFamily::cuda_device_pointer;
+  domain.queue_or_stream_identity = 19;
+  domain.ownership_model =
+      studiocast::hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      studiocast::hal::SynchronizationProtocol::cuda_stream_ordered;
+  domain.adapter_instance_id = 23;
+  return domain;
+}
+
+bool TestTypedManagerStatusOverridesLegacyDiagnosticResolution() {
+  namespace hal = studiocast::hal;
+  namespace video = studiocast::video;
+
+  video::VirtualCameraServiceStatus status;
+  status.service_running = true;
+  status.virtual_device_present = true;
+  status.virtual_device_available = true;
+  status.pipeline_state = "running";
+  status.pipeline.running = true;
+  status.pipeline.compute_backend_resolved = "cpu";
+  status.pipeline.compute_backend_active = "cpu";
+  status.pipeline.compute_backend_fallback_reason =
+      "stale legacy diagnostic fallback";
+  status.pipeline.compute_backend_degraded_reason =
+      "stale legacy diagnostic degradation";
+  status.pipeline.effects_backends =
+      "virtual_background.blur:open_vulkan";
+
+  auto &manager = status.pipeline.production_backend;
+  manager.state = video::ProductionVideoBackendManagerState::resident_ready;
+  manager.status = hal::StatusId::ready;
+  manager.setup_attempts = 1;
+  manager.setup_successes = 1;
+  manager.setup_complete = true;
+  manager.resident_prepared = true;
+  manager.readiness.status = hal::StatusId::ready;
+  manager.readiness.requested_backend = hal::BackendId::cuda;
+  manager.readiness.selected_backend = hal::BackendId::cuda;
+  manager.readiness.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  manager.readiness.execution_domain = TypedStatusCudaDomain();
+  manager.readiness.available = true;
+  manager.resident.prepared = true;
+  manager.resident.readiness = manager.readiness;
+  manager.resident.plan.plan_id = 41;
+  manager.resident.plan.prepared_program.program_id = 41;
+  manager.resident.plan.prepared_program.owner_adapter_instance_id = 23;
+  manager.resident.plan.prepared_program.execution_domain =
+      manager.readiness.execution_domain;
+  auto &programKey =
+      manager.resident.plan.prepared_program.invalidation_key;
+  programKey.generations.configuration = 1;
+  programKey.generations.geometry = 1;
+  programKey.generations.model = 1;
+  programKey.generations.provider = 1;
+  programKey.generations.device = 1;
+  programKey.generations.context = 7;
+  programKey.canonical_plan_hash = 11;
+  programKey.model_artifact_hash = 13;
+  programKey.execution_domain_hash = 17;
+  auto &commit = manager.resident.latest_committed_frame;
+  commit.valid = true;
+  commit.program_id = 41;
+  commit.invalidation_key = programKey;
+  commit.execution_domain = manager.readiness.execution_domain;
+  commit.capture_sequence = 101;
+  commit.output_commit_sequence = 51;
+  commit.stage_count = 1;
+  commit.stages[0].stage_id = 1;
+  commit.stages[0].semantic = hal::SemanticEffectId::virtual_background_blur;
+  commit.stages[0].backend = hal::BackendId::cuda;
+  commit.stages[0].provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  commit.stages[0].status = hal::StageExecutionStatus::succeeded;
+
+  video::VirtualCameraServiceConfig config;
+  config.enabled = true;
+  config.pipeline.compute_backend = video::ComputeBackendPreference::cuda;
+  config.pipeline.effects.engine =
+      video::effects::EffectsEnginePreference::open_cuda;
+  config.pipeline.effects.virtual_background.mode =
+      video::effects::VirtualBackgroundMode::blur;
+
+  const std::string contradictoryOpenCuda =
+      "{\"compiled\":false,\"ok\":false,\"blocked_reason\":"
+      "\"open_cuda_backend_disabled_in_build\",\"available_effects\":[]}";
+  const std::string contradictoryVulkan = ReadyOpenVulkanPixelDiagnostics(
+      "[\"virtual_background.blur\"]",
+      "\"typed_authority_fixture\":true");
+  const std::string typedStatus = StatusForVideoStateWithDiagnostics(
+      status, config, /*maxineJson=*/"", contradictoryOpenCuda,
+      contradictoryVulkan);
+  const ComputeFields typed = ComputeFieldsFor(typedStatus);
+  bool ok =
+      Expect(typed.present && typed.resolved == "cuda" &&
+                 typed.active == "cuda" && typed.active_engine_count == 1 &&
+                 typed.provider_mode == "open_cuda" &&
+                 typed.active_provider == "CUDAExecutionProvider" &&
+                 typed.fallback.empty() && typed.degraded.empty() &&
+                 !typed.fallback_active &&
+                 PipelineEffectsBackendsFor(typedStatus) ==
+                     "virtual_background.blur:open_cuda",
+             "typed manager selection/commit must override contradictory "
+             "legacy diagnostics and stale compatibility fields");
+
+  // A successful-looking commit from a different queue/domain may not provide
+  // active attribution for the selected manager program.
+  ++commit.execution_domain.queue_or_stream_identity;
+  const ComputeFields foreignCommit =
+      ComputeFieldsFor(StatusForVideoStateWithDiagnostics(
+          status, config, /*maxineJson=*/"", contradictoryOpenCuda,
+          contradictoryVulkan));
+  ok &= Expect(foreignCommit.present &&
+                   foreignCommit.resolved == "cuda" &&
+                   foreignCommit.active.empty() &&
+                   foreignCommit.provider_mode.empty(),
+               "foreign-domain committed activity must fail closed");
+  commit.execution_domain = manager.readiness.execution_domain;
+
+  // Exact-domain validation is part of the authority projection. A malformed
+  // selected domain may not claim live CUDA even with a successful-looking
+  // cached commit.
+  status.pipeline.production_backend.readiness.execution_domain = {};
+  const ComputeFields malformed =
+      ComputeFieldsFor(StatusForVideoStateWithDiagnostics(
+          status, config, /*maxineJson=*/"", contradictoryOpenCuda,
+          contradictoryVulkan));
+  ok &= Expect(malformed.present && malformed.active.empty() &&
+                   malformed.resolved == "cpu",
+               "malformed typed execution domain must fail closed without "
+               "legacy diagnostic promotion");
+
+  auto &blocked = status.pipeline.production_backend;
+  blocked.state = video::ProductionVideoBackendManagerState::invalidated;
+  blocked.status = hal::StatusId::blocked;
+  blocked.reason = hal::ReasonId::strict_backend_unavailable;
+  blocked.setup_complete = false;
+  blocked.resident_prepared = false;
+  blocked.readiness.selected_backend = hal::BackendId::invalid;
+  blocked.readiness.execution_domain = {};
+  status.pipeline.compute_backend_resolved = "cpu";
+  const ComputeFields blockedFields =
+      ComputeFieldsFor(StatusForVideoStateWithDiagnostics(
+          status, config, /*maxineJson=*/"", contradictoryOpenCuda,
+          contradictoryVulkan));
+  ok &= Expect(blockedFields.present && blockedFields.resolved == "cpu" &&
+                   blockedFields.active.empty() &&
+                   blockedFields.fallback == "strict_backend_unavailable" &&
+                   blockedFields.degraded == "strict_backend_unavailable",
+               "typed strict-backend blocker must remain authoritative over "
+               "legacy availability evidence");
+  return ok;
+}
+
 bool TestAudioStatusReportsResolvedSourceAndWarnings() {
   studiocast::video::VirtualCameraServiceStatus videoStatus;
   studiocast::video::VirtualCameraServiceConfig videoConfig;
@@ -2694,6 +2858,7 @@ int main() {
   ok = TestMixedVulkanRequestKeepsReadyPixelEffectAndExactBlocker() && ok;
   ok = TestUnavailableVulkanRequestUsesRequestedEffectBlocker() && ok;
   ok = TestVersionedVideoHalStatusAndLegacyByteStability() && ok;
+  ok = TestTypedManagerStatusOverridesLegacyDiagnosticResolution() && ok;
   ok = TestAudioStatusReportsResolvedSourceAndWarnings() && ok;
   ok = TestAudioStatusPropagatesSourceErrorFromService() && ok;
   return ok ? 0 : 1;

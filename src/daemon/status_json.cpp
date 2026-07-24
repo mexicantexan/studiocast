@@ -2606,6 +2606,10 @@ void AppendPreparedTelemetry(std::ostream &out,
 
 } // namespace
 
+std::string_view StableHalReasonToken(hal::ReasonId reason) noexcept {
+  return ReasonToken(reason);
+}
+
 ProductCapabilityJsonResult SerializeProductCapabilityStatusJson(
     const video::ProductCapabilitySnapshot &snapshot) {
   ProductCapabilityJsonResult result;
