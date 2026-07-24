@@ -2,6 +2,7 @@
 
 #include "core/maxine/production_hal_owner.h"
 #include "core/maxine/video_execution_factory.h"
+#include "core/video/production_video_setup_lease.h"
 
 #include <cstdint>
 #include <memory>
@@ -37,10 +38,19 @@ struct MaxineProductionVideoExecutionBootstrapResult {
 // cannot leave their borrowed adapter/session dangling.
 class MaxineProductionVideoExecutionBootstrap final {
 public:
-  [[nodiscard]] static std::unique_ptr<
-      MaxineProductionVideoExecutionBootstrap>
+  [[nodiscard]] static std::unique_ptr<MaxineProductionVideoExecutionBootstrap>
   Create(const MaxineProductionVideoExecutionBootstrapRequest &request,
          MaxineProductionVideoExecutionBootstrapResult *result) noexcept;
+
+  // Creates and transactionally acquires one exact typed setup lease. A
+  // rejected candidate is shut down and destroyed while an existing live
+  // destination remains untouched.
+  [[nodiscard]] static hal::StatusId AcquireSetupLease(
+      const MaxineProductionVideoExecutionBootstrapRequest &request,
+      video::ProductionVideoSetupLease *destination,
+      video::ProductionVideoSetupLeaseAcquireEvidence *evidence,
+      MaxineProductionVideoExecutionBootstrapResult *result,
+      hal::ReasonId *reason) noexcept;
 
   ~MaxineProductionVideoExecutionBootstrap();
 
@@ -56,6 +66,11 @@ public:
   [[nodiscard]] MaxineVideoExecutionFactory &factory() noexcept;
   [[nodiscard]] const MaxineProductionHalOwner *
   production_owner() const noexcept;
+  [[nodiscard]] bool stopped() const noexcept;
+
+  // Idempotently releases native Maxine resources while retaining the
+  // published adapter and factory objects at stable addresses.
+  void Shutdown() noexcept;
 
 private:
   struct State;
