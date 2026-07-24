@@ -25,18 +25,18 @@ bool Require(bool condition, const char *message) {
 
 hal::ExecutionDomainId Domain() {
   hal::ExecutionDomainId domain;
-  domain.backend = hal::BackendId::vulkan;
-  domain.api_family = hal::ApiFamily::vulkan;
+  domain.backend = hal::BackendId::maxine;
+  domain.api_family = hal::ApiFamily::maxine_nvcv;
   domain.physical_device.vendor_id = 0x1234;
   domain.physical_device.device_id = 0x5678;
   domain.physical_device.stable_id[0] = 0x42;
   domain.logical_context_generation = 7;
-  domain.allocator_family = hal::AllocatorFamily::vulkan;
-  domain.memory_handle_family = hal::MemoryHandleFamily::vulkan_buffer;
+  domain.allocator_family = hal::AllocatorFamily::maxine_nvcv;
+  domain.memory_handle_family = hal::MemoryHandleFamily::nvcv_image;
   domain.queue_or_stream_identity = 0x99;
   domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
   domain.synchronization_protocol =
-      hal::SynchronizationProtocol::vulkan_queue_fence;
+      hal::SynchronizationProtocol::maxine_bound_cuda_stream;
   domain.adapter_instance_id = kAdapterId;
   return domain;
 }
@@ -68,17 +68,35 @@ video::VideoExecutionPlanRequest Plan() {
   video::VideoExecutionPlanRequest plan;
   plan.plan_id = 101;
   plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-  plan.intent.backend.backend = hal::BackendId::vulkan;
+  plan.intent.backend.backend = hal::BackendId::maxine;
   plan.intent.backend.strict = true;
   plan.intent.preferences.compute_family =
-      hal::ComputeFamilyAllowance::vulkan_only;
+      hal::ComputeFamilyAllowance::cuda_family;
   plan.intent.requested_provider =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   plan.intent.strict_provider_selection = true;
   plan.intent.stages[0].intent.stage_id = 1;
-  plan.intent.stages[0].intent.semantic = hal::SemanticEffectId::mirror;
+  plan.intent.stages[0].intent.semantic =
+      hal::SemanticEffectId::virtual_background_blur;
   plan.intent.stages[0].intent.failure_action =
       hal::FailureAction::fail_open_preserve_input;
+  plan.intent.stages[0].parameters[0] = {
+      video::CanonicalVideoParameterId::strength,
+      video::CanonicalVideoParameterKind::signed_integer, 8};
+  plan.intent.stages[0].parameters[1].id =
+      video::CanonicalVideoParameterId::remove_color_rgb;
+  plan.intent.stages[0].parameters[1].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  plan.intent.stages[0].parameters[2].id =
+      video::CanonicalVideoParameterId::greenscreen_mode;
+  plan.intent.stages[0].parameters[2].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  plan.intent.stages[0].parameters[3].id =
+      video::CanonicalVideoParameterId::greenscreen_temporal;
+  plan.intent.stages[0].parameters[3].kind =
+      video::CanonicalVideoParameterKind::boolean;
+  plan.intent.stages[0].parameters[3].boolean_value = true;
+  plan.intent.stages[0].parameter_count = 4;
   plan.intent.stage_count = 1;
   plan.host_input = Image(hal::Mutability::read_only);
   plan.host_output = Image(hal::Mutability::write_only);
@@ -96,6 +114,23 @@ video::VideoExecutionPlanRequest Plan() {
   return plan;
 }
 
+struct WaitContext {
+  bool stop = false;
+  std::uint64_t now = 1;
+};
+
+bool StopRequested(void *context) noexcept {
+  return static_cast<WaitContext *>(context)->stop;
+}
+
+std::uint64_t NowNanoseconds(void *context) noexcept {
+  return static_cast<WaitContext *>(context)->now;
+}
+
+void PollWait(void *context, std::uint64_t wait_nanoseconds) noexcept {
+  static_cast<WaitContext *>(context)->now += wait_nanoseconds;
+}
+
 hal::ModelArtifactIdentity ModelIdentity(std::uint8_t value = 0x31) {
   hal::ModelArtifactIdentity model;
   model.model_id_hash[0] = value;
@@ -105,9 +140,23 @@ hal::ModelArtifactIdentity ModelIdentity(std::uint8_t value = 0x31) {
 }
 
 video::ProductionVideoBackendSetupRequest ResidentRequest() {
+  static WaitContext wait_context;
   video::ProductionVideoBackendSetupRequest request;
   request.kind = video::ProductionVideoBackendSetupKind::resident_island;
+  request.resident.effects.virtual_background.mode =
+      video::effects::VirtualBackgroundMode::blur;
   request.resident.plan = Plan();
+  request.resident.wait.timeout_nanoseconds = 1000;
+  request.resident.wait.poll_interval_nanoseconds = 10;
+  request.resident.wait.maximum_poll_count = 100;
+  request.resident.wait.stop_requested = &StopRequested;
+  request.resident.wait.cancel_requested = &StopRequested;
+  request.resident.wait.now_nanoseconds = &NowNanoseconds;
+  request.resident.wait.poll_wait = &PollWait;
+  request.resident.wait.callback_context = &wait_context;
+  request.resident.wait.callback_context_generation = 1;
+  request.resident.wait.callback_context_lifetime =
+      hal::ResourceLifetime::adapter_context;
   return request;
 }
 
@@ -138,6 +187,7 @@ struct Counters {
   std::uint64_t owner_shutdown_calls = 0;
   std::uint64_t owner_destructor_calls = 0;
   std::uint64_t pending_shutdown_attempts = 0;
+  hal::StatusId reset_status = hal::StatusId::ready;
 };
 
 class FakeResidentAdapter final : public hal::IResidentAdapter {
@@ -146,7 +196,7 @@ public:
     return kAdapterId;
   }
   hal::BackendId backend_id() const noexcept override {
-    return hal::BackendId::vulkan;
+    return hal::BackendId::maxine;
   }
   hal::StatusId Prepare(const hal::PreparedProgram &,
                         hal::PreparedProgramHandle *, hal::ReadinessSnapshot *,
@@ -171,10 +221,10 @@ public:
       : plan_(std::move(plan)), counters_(counters) {
     snapshot_.status = hal::StatusId::ready;
     snapshot_.readiness.status = hal::StatusId::ready;
-    snapshot_.readiness.requested_backend = hal::BackendId::vulkan;
-    snapshot_.readiness.selected_backend = hal::BackendId::vulkan;
+    snapshot_.readiness.requested_backend = hal::BackendId::maxine;
+    snapshot_.readiness.selected_backend = hal::BackendId::maxine;
     snapshot_.readiness.provider =
-        hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+        hal::SemanticEffectProviderId::maxine_vfx;
     snapshot_.readiness.execution_domain = Domain();
     snapshot_.readiness.ready_stage_mask = 1;
     snapshot_.readiness.available = true;
@@ -199,7 +249,8 @@ public:
     result.output.output_ready = true;
     result.execution_domain = Domain();
     result.stages[0].stage_id = 1;
-    result.stages[0].semantic = hal::SemanticEffectId::mirror;
+    result.stages[0].semantic =
+        hal::SemanticEffectId::virtual_background_blur;
     result.stages[0].status = hal::StageExecutionStatus::succeeded;
     result.stages[0].valid_output_preserved = true;
     result.stage_count = 1;
@@ -233,7 +284,7 @@ public:
     snapshot_.prepared = false;
   }
   hal::StatusId ResetTemporal(hal::ReasonId) noexcept override {
-    return hal::StatusId::ready;
+    return counters_->reset_status;
   }
   void Shutdown() noexcept override { snapshot_.stopped = true; }
   video::VideoExecutionAdapterSnapshot Snapshot() const noexcept override {
@@ -259,13 +310,13 @@ public:
             video::VideoExecutionRoute route) noexcept override {
     video::VideoAdapterFactoryPreflight result;
     result.status = hal::StatusId::ready;
-    result.backend = hal::BackendId::vulkan;
+    result.backend = hal::BackendId::maxine;
     result.provider =
-        hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+        hal::SemanticEffectProviderId::maxine_vfx;
     result.execution_domain = Domain();
     result.readiness.status = hal::StatusId::ready;
-    result.readiness.requested_backend = hal::BackendId::vulkan;
-    result.readiness.selected_backend = hal::BackendId::vulkan;
+    result.readiness.requested_backend = hal::BackendId::maxine;
+    result.readiness.selected_backend = hal::BackendId::maxine;
     result.readiness.provider = result.provider;
     result.readiness.execution_domain = Domain();
     result.readiness.ready_stage_mask = 1;
@@ -288,7 +339,7 @@ public:
     program.temporal = request.temporal;
     program.budget = request.budget;
     program.setup_failure_policy = request.setup_failure_policy;
-    program.requested_backend = hal::BackendId::vulkan;
+    program.requested_backend = hal::BackendId::maxine;
     program.strict_backend_selection = true;
     program.requested_provider = result.provider;
     program.strict_provider_selection = true;
@@ -299,10 +350,10 @@ public:
     program.stage_count = 1;
     auto &stage = program.stages[0];
     stage.stage_id = 1;
-    stage.semantic = hal::SemanticEffectId::mirror;
+    stage.semantic = hal::SemanticEffectId::virtual_background_blur;
     stage.model = request.intent.stages[0].model;
     stage.provider = result.provider;
-    stage.backend = hal::BackendId::vulkan;
+    stage.backend = hal::BackendId::maxine;
     stage.execution_domain = Domain();
     stage.input.kind = hal::StageIoKind::image;
     stage.input.image = request.host_input;
@@ -372,18 +423,26 @@ private:
 hal::AdapterRegistration AdapterRegistration(FakeLeaseOwner *owner) {
   hal::AdapterRegistration registration;
   registration.adapter_instance_id = kAdapterId;
-  registration.backend = hal::BackendId::vulkan;
+  registration.backend = hal::BackendId::maxine;
   registration.execution_domain = Domain();
   registration.selection_priority = 100;
   registration.resident_adapter = owner != nullptr ? &owner->adapter : nullptr;
   auto &capability = registration.semantic_capabilities[0];
-  capability.semantic = hal::SemanticEffectId::mirror;
+  capability.semantic = hal::SemanticEffectId::virtual_background_blur;
   capability.provider =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   capability.status = hal::StatusId::ready;
   capability.live_stage = true;
   capability.production_eligible = true;
   capability.exact_evidence = true;
+  capability.evidence[0].code =
+      hal::CapabilityEvidenceCode::model_artifact_identity_valid;
+  capability.evidence[0].status = hal::StatusId::ready;
+  capability.evidence[0].semantic =
+      hal::SemanticEffectId::virtual_background_blur;
+  capability.evidence[0].backend = hal::BackendId::maxine;
+  capability.evidence[0].satisfied = true;
+  capability.evidence_count = 1;
   registration.semantic_capability_count = 1;
   return registration;
 }
@@ -393,33 +452,34 @@ video::ProductionVideoSetupLeaseSnapshot LeaseSnapshot(
   video::ProductionVideoSetupLeaseSnapshot snapshot;
   snapshot.state = video::ProductionVideoSetupLeaseState::live;
   snapshot.status = hal::StatusId::ready;
-  snapshot.backend = hal::BackendId::vulkan;
+  snapshot.backend = hal::BackendId::maxine;
   snapshot.execution_domain = Domain();
   snapshot.generations = {1, 2, 3, 4, 5, 7};
   snapshot.reserved_budget = Plan().budget;
   snapshot.providers[0] =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   snapshot.provider_count = 1;
-  snapshot.artifacts[0].semantic = hal::SemanticEffectId::mirror;
+  snapshot.artifacts[0].semantic =
+      hal::SemanticEffectId::virtual_background_blur;
   snapshot.artifacts[0].provider =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   snapshot.artifacts[0].artifact = ModelIdentity();
   snapshot.artifact_count = 1;
   snapshot.adapter = AdapterRegistration(owner);
   snapshot.factory.factory_id = kFactoryId;
   snapshot.factory.route = video::VideoExecutionRoute::prepared_resident;
-  snapshot.factory.backend = hal::BackendId::vulkan;
+  snapshot.factory.backend = hal::BackendId::maxine;
   snapshot.factory.provider =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   snapshot.factory.adapter_instance_id = kAdapterId;
   snapshot.factory.execution_domain = Domain();
   snapshot.factory.selection_priority = 100;
   snapshot.factory.factory = owner != nullptr ? &owner->factory : nullptr;
   snapshot.readiness.status = hal::StatusId::ready;
-  snapshot.readiness.requested_backend = hal::BackendId::vulkan;
-  snapshot.readiness.selected_backend = hal::BackendId::vulkan;
+  snapshot.readiness.requested_backend = hal::BackendId::maxine;
+  snapshot.readiness.selected_backend = hal::BackendId::maxine;
   snapshot.readiness.provider =
-      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      hal::SemanticEffectProviderId::maxine_vfx;
   snapshot.readiness.execution_domain = Domain();
   snapshot.readiness.ready_stage_mask = 1;
   snapshot.readiness.available = true;
@@ -442,6 +502,7 @@ public:
     ++counters_->source_calls;
     video::ProductionVideoResidentSetupSourceResult result;
     result.plan = request.plan;
+    result.canonical_effects = request.effects;
     if (result.plan.invalidation_key.generations.model == 0)
       result.plan.invalidation_key.generations.model = 3;
     if (result.plan.invalidation_key.generations.provider == 0)
@@ -475,6 +536,17 @@ public:
     result.readiness = snapshot.readiness;
     result.lease_acquire = acquire;
     result.setup_completed_outside_frame_loop = true;
+    auto &selection = result.model_selections[0];
+    selection.semantic = hal::SemanticEffectId::virtual_background_blur;
+    selection.requested_model_id = request.effects.virtual_background.model_id;
+    selection.selected_model_id =
+        request.effects.virtual_background.model_id.empty()
+            ? "default_matting_model"
+            : "substituted_matting_model";
+    selection.artifact = ModelIdentity();
+    selection.default_selected =
+        request.effects.virtual_background.model_id.empty();
+    result.model_selection_count = 1;
     return result;
   }
 
@@ -582,8 +654,8 @@ bool TestPreparedExecutionAndWriterGatedCommit() {
   auto request = ResidentRequest();
   video::ProductionVideoBackendSetupEvidence evidence;
   hal::ReasonId reason = hal::ReasonId::none;
-  bool ok = Require(manager.Setup(request, &evidence, &reason) ==
-                        hal::StatusId::ready &&
+  const auto setup_status = manager.Setup(request, &evidence, &reason);
+  bool ok = Require(setup_status == hal::StatusId::ready &&
                         evidence.setup_source_called &&
                         evidence.candidate_setup_only,
                     "resident setup must acquire and compose once");
@@ -644,6 +716,8 @@ bool TestSourceBindsDefaultModelWithinCallerBudget() {
       "bound plan must publish exact model generation/hash and reserved budget");
 
   auto exact_substitution = ResidentRequest();
+  exact_substitution.resident.effects.virtual_background.model_id =
+      "explicit_matting_model";
   exact_substitution.resident.plan.intent.stages[0].model =
       ModelIdentity(0x71);
   exact_substitution.resident.plan.invalidation_key.model_artifact_hash =
@@ -655,6 +729,8 @@ bool TestSourceBindsDefaultModelWithinCallerBudget() {
                 "source must not substitute an explicit artifact identity");
 
   auto selector_substitution = ResidentRequest();
+  selector_substitution.resident.effects.virtual_background.model_id =
+      "other_explicit_model";
   selector_substitution.resident.plan.intent.stages[0].model.model_id_hash[0] =
       0x72;
   selector_substitution.resident.plan.invalidation_key.generations.model = 0;
@@ -681,6 +757,39 @@ bool TestMalformedStaleWrongDomainAndStrictSubstitution() {
                         reason == hal::ReasonId::malformed_contract &&
                         counters.source_calls == 0,
                     "malformed request must fail before setup source");
+
+  auto null_callback = ResidentRequest();
+  null_callback.resident.wait.stop_requested = nullptr;
+  ok &= Require(manager.Setup(null_callback, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    counters.source_calls == 0,
+                "missing stop callback must fail before setup source");
+
+  auto null_context = ResidentRequest();
+  null_context.resident.wait.callback_context = nullptr;
+  ok &= Require(manager.Setup(null_context, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    counters.source_calls == 0,
+                "null callback context must fail before setup source");
+
+  auto stale_lifetime = ResidentRequest();
+  stale_lifetime.resident.wait.callback_context_generation = 0;
+  ok &= Require(manager.Setup(stale_lifetime, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    counters.source_calls == 0,
+                "unbound callback lifetime generation must fail closed");
+
+  auto short_lifetime = ResidentRequest();
+  short_lifetime.resident.wait.callback_context_lifetime =
+      hal::ResourceLifetime::frame_borrowed;
+  ok &= Require(manager.Setup(short_lifetime, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    counters.source_calls == 0,
+                "frame-scoped wait context must not escape setup");
 
   const auto valid = ResidentRequest();
   ok &= Require(manager.Setup(valid, &evidence, &reason) ==
@@ -772,6 +881,51 @@ bool TestInvalidationAndRetryableShutdownAreTyped() {
   return ok;
 }
 
+bool TestFailedTemporalResetRequiresSetupReprepare() {
+  Counters counters;
+  auto source = std::make_unique<FakeSetupSource>(&counters);
+  video::ProductionVideoBackendManager manager(std::move(source));
+  auto request = ResidentRequest();
+  video::ProductionVideoBackendSetupEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(manager.Setup(request, &evidence, &reason) ==
+                   hal::StatusId::ready,
+               "temporal reset test setup must prepare")) {
+    return false;
+  }
+  counters.reset_status = hal::StatusId::failed;
+  const auto reset_status =
+      manager.ResetTemporal(hal::ReasonId::temporal_discontinuity);
+  bool ok =
+      Require(reset_status == hal::StatusId::failed,
+              "backend temporal reset failure must propagate");
+  const auto failed = manager.Snapshot();
+  ok &= Require(
+      failed.state ==
+              video::ProductionVideoBackendManagerState::invalidated &&
+          failed.reason == hal::ReasonId::temporal_discontinuity &&
+          !failed.resident_prepared && !failed.setup_complete,
+      "failed temporal reset must invalidate resident setup immediately");
+  std::array<std::byte, kFrameBytes> input{};
+  std::array<std::byte, kFrameBytes> output{};
+  ok &= Require(manager.Execute(Binding(&input, &output, 1)).status ==
+                        hal::StatusId::stale,
+                "Execute must require setup-thread reprepare after reset failure");
+
+  counters.reset_status = hal::StatusId::ready;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::ready,
+                "setup thread must be able to reprepare invalidated manager");
+  counters.reset_status = hal::StatusId::quarantined;
+  ok &= Require(manager.ResetTemporal(hal::ReasonId::device_lost) ==
+                        hal::StatusId::quarantined &&
+                    manager.Snapshot().reason ==
+                        hal::ReasonId::device_lost &&
+                    manager.Snapshot().resident.quarantined,
+                "device-loss reset failure must retain quarantine reason");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -781,6 +935,7 @@ int main() {
   ok &= TestSourceBindsDefaultModelWithinCallerBudget();
   ok &= TestMalformedStaleWrongDomainAndStrictSubstitution();
   ok &= TestInvalidationAndRetryableShutdownAreTyped();
+  ok &= TestFailedTemporalResetRequiresSetupReprepare();
   if (!ok)
     return 1;
   std::cout << "Production video backend manager tests passed\n";

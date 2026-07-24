@@ -1,15 +1,18 @@
 #pragma once
 
 #include "core/video/cpu_primitive_hal.h"
+#include "core/video/effects/broadcast_effects.h"
 #include "core/video/production_video_execution_composition.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace studiocast::video {
 
 inline constexpr std::uint32_t kProductionVideoBackendManagerContractVersion =
-    1;
+    2;
 
 enum class ProductionVideoBackendSetupKind : std::uint8_t {
   invalid = 0,
@@ -27,13 +30,44 @@ struct ProductionVideoCpuPrimitiveSetup {
   std::uint64_t required_primitive_bits = 0;
 };
 
+using ProductionVideoWaitPredicate = bool (*)(void *context) noexcept;
+using ProductionVideoNowNanoseconds =
+    std::uint64_t (*)(void *context) noexcept;
+using ProductionVideoPollWait =
+    void (*)(void *context, std::uint64_t wait_nanoseconds) noexcept;
+
+// Backend-neutral bounded completion policy. Callbacks and context are
+// borrowed until Shutdown proves driver_context_release_permitted; the
+// generation lets setup sources reject a stale context without dereferencing
+// it. V1 execution remains synchronous and completion-shaped.
+struct ProductionVideoBoundedWaitPolicy {
+  std::uint32_t contract_version =
+      kProductionVideoBackendManagerContractVersion;
+  std::uint64_t timeout_nanoseconds = 0;
+  std::uint64_t poll_interval_nanoseconds = 0;
+  std::uint32_t maximum_poll_count = 0;
+  ProductionVideoWaitPredicate stop_requested = nullptr;
+  ProductionVideoWaitPredicate cancel_requested = nullptr;
+  ProductionVideoNowNanoseconds now_nanoseconds = nullptr;
+  ProductionVideoPollWait poll_wait = nullptr;
+  void *callback_context = nullptr;
+  std::uint64_t callback_context_generation = 0;
+  hal::ResourceLifetime callback_context_lifetime =
+      hal::ResourceLifetime::invalid;
+};
+
 // The caller supplies canonical semantics, host descriptors, generations, and
 // policy, but leaves execution_domain_hash zero. Backend discovery and exact
 // adapter/context/queue domain binding belong exclusively to the setup source.
 struct ProductionVideoResidentSetup {
   std::uint32_t contract_version =
       kProductionVideoBackendManagerContractVersion;
+  // Setup owns a value copy, so model IDs, replacement/HDRI paths, colors, and
+  // every Maxine/Open Video parameter remain valid for the complete source
+  // call without borrowing GUI/config string storage.
+  effects::BroadcastCameraEffects effects{};
   VideoExecutionPlanRequest plan{};
+  ProductionVideoBoundedWaitPolicy wait{};
 };
 
 struct ProductionVideoBackendSetupRequest {
@@ -46,9 +80,16 @@ struct ProductionVideoBackendSetupRequest {
 };
 
 struct ProductionVideoResidentSetupSourceResult {
+  enum class ExecutionKind : std::uint8_t {
+    invalid = 0,
+    resident_island,
+    typed_compatibility,
+  };
+  ExecutionKind execution_kind = ExecutionKind::resident_island;
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;
   hal::ReadinessSnapshot readiness{};
+  effects::BroadcastCameraEffects canonical_effects{};
   // The source freezes model/provider/device/context generations and resource
   // sizing into the neutral plan returned with its lease. The manager verifies
   // that this plan preserves the caller's canonical request before composing
@@ -60,6 +101,41 @@ struct ProductionVideoResidentSetupSourceResult {
   // readiness is the immutable result of that setup attempt and that Execute()
   // needs no discovery, probing, session construction, or allocation.
   bool setup_completed_outside_frame_loop = false;
+  struct ModelSelection {
+    hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
+    std::string requested_model_id;
+    std::string selected_model_id;
+    hal::ModelArtifactIdentity artifact{};
+    bool default_selected = false;
+  };
+  std::array<ModelSelection, hal::kMaxPreparedStages> model_selections{};
+  std::size_t model_selection_count = 0;
+
+  static constexpr std::size_t kMaxCompatibilityDomains = 4;
+  struct CompatibilityDomain {
+    hal::ExecutionDomainId domain{};
+    hal::BackendId backend = hal::BackendId::invalid;
+    hal::SemanticEffectProviderId provider =
+        hal::SemanticEffectProviderId::invalid;
+    std::uint32_t first_stage_id = 0;
+    std::uint32_t last_stage_id = 0;
+  };
+  struct CompatibilityExecutionTopology {
+    std::uint32_t contract_version =
+        kProductionVideoBackendManagerContractVersion;
+    std::array<CompatibilityDomain, kMaxCompatibilityDomains> domains{};
+    std::size_t domain_count = 0;
+    std::array<hal::ExecutionBoundary, hal::kMaxExecutionBoundaries>
+        boundaries{};
+    std::size_t boundary_count = 0;
+    hal::TransferCounters expected_transfers{};
+    bool exact_ordered_boundaries = false;
+    bool cross_adapter_residency_forbidden = true;
+  };
+  CompatibilityExecutionTopology compatibility_topology{};
+  // Mutually exclusive with lease. The source prepares all sessions,
+  // buffers, boundaries, and scratch before returning this neutral executor.
+  std::unique_ptr<IVideoExecutionExecutor> compatibility_executor;
 };
 
 // Backend/runtime composition implements this interface. CameraPipeline gives
@@ -91,6 +167,7 @@ enum class ProductionVideoBackendManagerState : std::uint8_t {
   invalid = 0,
   cpu_primitives_only,
   resident_ready,
+  compatibility_ready,
   invalidated,
   shutdown_pending,
   stopped,
@@ -107,6 +184,9 @@ struct ProductionVideoBackendManagerSnapshot {
   hal::ReasonId reason = hal::ReasonId::none;
   hal::ReadinessSnapshot readiness{};
   VideoExecutionCoordinatorSnapshot resident{};
+  ProductionVideoResidentSetupSourceResult::CompatibilityExecutionTopology
+      compatibility_topology{};
+  VideoExecutionAdapterSnapshot compatibility{};
   ProductionVideoSetupLeaseShutdownResult shutdown{};
   std::uint64_t cpu_primitive_bits = 0;
   std::uint64_t setup_attempts = 0;
@@ -182,6 +262,7 @@ private:
 
   std::unique_ptr<IProductionVideoBackendSetupSource> setup_source_;
   ProductionVideoExecutionComposition composition_;
+  std::unique_ptr<IVideoExecutionExecutor> compatibility_executor_;
   ProductionVideoBackendManagerSnapshot snapshot_{};
   bool resident_selected_ = false;
 };
