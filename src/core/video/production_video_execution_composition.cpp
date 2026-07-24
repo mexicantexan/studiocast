@@ -42,50 +42,89 @@ std::uint64_t HashDomain(const hal::ExecutionDomainId &domain) noexcept {
 } // namespace
 
 struct ProductionVideoExecutionComposition::Impl {
-  std::unique_ptr<vulkan::VulkanVideoExecutionFactory> vulkan_factory;
-  // Declared after the factory so it is destroyed first. Production Vulkan
-  // executors hold a non-owning resident-adapter view into the factory.
-  std::unique_ptr<hal::StaticAdapterRegistry> registry;
-  std::unique_ptr<VideoExecutionCoordinator> coordinator;
-  bool injected = false;
-  bool registered = false;
+  struct RegisteredRuntime {
+    // The lease is declared before the registry and coordinator so reverse
+    // destruction cannot release the owner while either still retains its
+    // published adapter/factory pointers.
+    ProductionVideoSetupLease lease;
+    std::unique_ptr<hal::StaticAdapterRegistry> registry;
+    std::unique_ptr<VideoExecutionCoordinator> coordinator;
+    VideoExecutionCoordinatorSnapshot terminal_snapshot{};
+    bool shutdown = false;
 
-  bool Register(const hal::AdapterRegistration &adapter,
-                const VideoAdapterFactoryRegistration &factory,
-                hal::ReasonId *reason) noexcept {
-    if (registered) {
-      SetReason(reason, hal::ReasonId::none);
-      return true;
-    }
-    try {
-      auto candidate_registry = std::make_unique<hal::StaticAdapterRegistry>();
-      auto status = candidate_registry->Register(adapter, reason);
-      if (!IsSetupSuccess(status))
-        return false;
-      auto candidate_coordinator =
-          std::make_unique<VideoExecutionCoordinator>(*candidate_registry);
-      status = candidate_coordinator->RegisterFactory(factory, reason);
-      if (!IsSetupSuccess(status))
-        return false;
-
+    void Shutdown() noexcept {
+      if (shutdown)
+        return;
+      shutdown = true;
       if (coordinator)
         coordinator->Shutdown();
-      coordinator = std::move(candidate_coordinator);
-      registry = std::move(candidate_registry);
-      registered = true;
-      return true;
+      if (coordinator)
+        terminal_snapshot = coordinator->Snapshot();
+      coordinator.reset();
+      registry.reset();
+      lease.Shutdown();
+    }
+
+    ~RegisteredRuntime() { Shutdown(); }
+  };
+
+  std::unique_ptr<vulkan::VulkanVideoExecutionFactory> vulkan_factory;
+  // Declared after the default factory so it is destroyed first. Production
+  // Vulkan executors hold a non-owning resident-adapter view into the factory.
+  std::unique_ptr<RegisteredRuntime> runtime;
+  bool injected = false;
+
+  hal::StatusId BuildRuntime(const hal::AdapterRegistration &adapter,
+                             const VideoAdapterFactoryRegistration &factory,
+                             ProductionVideoSetupLease candidate_lease,
+                             std::unique_ptr<RegisteredRuntime> *candidate,
+                             hal::ReasonId *reason) noexcept {
+    if (candidate == nullptr) {
+      SetReason(reason, hal::ReasonId::malformed_contract);
+      return hal::StatusId::blocked;
+    }
+    *candidate = nullptr;
+    try {
+      auto next = std::make_unique<RegisteredRuntime>();
+      next->lease = std::move(candidate_lease);
+      next->registry = std::make_unique<hal::StaticAdapterRegistry>();
+      auto status = next->registry->Register(adapter, reason);
+      if (!IsSetupSuccess(status))
+        return status;
+      next->coordinator =
+          std::make_unique<VideoExecutionCoordinator>(*next->registry);
+      status = next->coordinator->RegisterFactory(factory, reason);
+      if (!IsSetupSuccess(status))
+        return status;
+      *candidate = std::move(next);
+      return status;
     } catch (const std::bad_alloc &) {
       SetReason(reason, hal::ReasonId::resource_exhausted);
-      return false;
+      return hal::StatusId::resource_exhausted;
     } catch (...) {
       SetReason(reason, hal::ReasonId::malformed_contract);
-      return false;
+      return hal::StatusId::blocked;
     }
+  }
+
+  hal::StatusId Register(const hal::AdapterRegistration &adapter,
+                         const VideoAdapterFactoryRegistration &factory,
+                         hal::ReasonId *reason) noexcept {
+    if (runtime) {
+      SetReason(reason, hal::ReasonId::none);
+      return hal::StatusId::ready;
+    }
+    std::unique_ptr<RegisteredRuntime> candidate;
+    const auto status = BuildRuntime(adapter, factory, {}, &candidate, reason);
+    if (!IsSetupSuccess(status))
+      return status;
+    runtime = std::move(candidate);
+    return status;
   }
 
   bool EnsureProductionFactory(const VideoExecutionPlanRequest &request,
                                hal::ReasonId *reason) noexcept {
-    if (registered)
+    if (runtime)
       return true;
     if (injected) {
       SetReason(reason, hal::ReasonId::capability_evidence_incomplete);
@@ -109,8 +148,9 @@ struct ProductionVideoExecutionComposition::Impl {
       vulkan_factory.reset();
       return false;
     }
-    if (!Register(vulkan_factory->adapter_registration(),
-                  vulkan_factory->factory_registration(), reason)) {
+    if (!IsSetupSuccess(Register(vulkan_factory->adapter_registration(),
+                                 vulkan_factory->factory_registration(),
+                                 reason))) {
       vulkan_factory.reset();
       return false;
     }
@@ -141,6 +181,15 @@ hal::StatusId ProductionVideoExecutionComposition::Prepare(
     SetReason(reason, hal::ReasonId::resource_exhausted);
     return hal::StatusId::resource_exhausted;
   }
+  if (impl_->runtime && impl_->runtime->shutdown) {
+    SetReason(reason, hal::ReasonId::shutdown_requested);
+    if (evidence) {
+      *evidence = {};
+      evidence->status = hal::StatusId::stopped;
+      evidence->reason = hal::ReasonId::shutdown_requested;
+    }
+    return hal::StatusId::stopped;
+  }
   if (!impl_->EnsureProductionFactory(request, reason)) {
     if (evidence) {
       *evidence = {};
@@ -150,7 +199,7 @@ hal::StatusId ProductionVideoExecutionComposition::Prepare(
     }
     return hal::StatusId::unavailable;
   }
-  if (!impl_->coordinator) {
+  if (!impl_->runtime || !impl_->runtime->coordinator) {
     SetReason(reason, hal::ReasonId::capability_evidence_incomplete);
     return hal::StatusId::unavailable;
   }
@@ -167,56 +216,153 @@ hal::StatusId ProductionVideoExecutionComposition::Prepare(
     exact.invalidation_key.execution_domain_hash =
         HashDomain(adapter.execution_domain);
   }
-  return impl_->coordinator->Prepare(exact, evidence, reason);
+  return impl_->runtime->coordinator->Prepare(exact, evidence, reason);
+}
+
+hal::StatusId ProductionVideoExecutionComposition::PrepareWithSetupLease(
+    ProductionVideoSetupLease candidate_lease,
+    const VideoExecutionPlanRequest &request,
+    VideoExecutionPrepareEvidence *evidence, hal::ReasonId *reason) noexcept {
+  if (evidence)
+    *evidence = {};
+  if (!impl_) {
+    SetReason(reason, hal::ReasonId::resource_exhausted);
+    return hal::StatusId::resource_exhausted;
+  }
+  if (impl_->runtime && impl_->runtime->shutdown) {
+    SetReason(reason, hal::ReasonId::shutdown_requested);
+    if (evidence) {
+      evidence->status = hal::StatusId::stopped;
+      evidence->reason = hal::ReasonId::shutdown_requested;
+    }
+    return hal::StatusId::stopped;
+  }
+  if (impl_->runtime && impl_->runtime->coordinator &&
+      impl_->runtime->coordinator->Snapshot().frame_pending) {
+    SetReason(reason, hal::ReasonId::output_not_committed);
+    if (evidence) {
+      evidence->status = hal::StatusId::blocked;
+      evidence->reason = hal::ReasonId::output_not_committed;
+      evidence->old_plan_retained = true;
+    }
+    return hal::StatusId::blocked;
+  }
+  if (!candidate_lease.live()) {
+    const auto &snapshot = candidate_lease.snapshot();
+    const auto failure =
+        snapshot.state == ProductionVideoSetupLeaseState::stopped
+            ? hal::ReasonId::shutdown_requested
+            : hal::ReasonId::malformed_contract;
+    SetReason(reason, failure);
+    if (evidence) {
+      evidence->status = failure == hal::ReasonId::shutdown_requested
+                             ? hal::StatusId::stopped
+                             : hal::StatusId::blocked;
+      evidence->reason = failure;
+      evidence->readiness = snapshot.readiness;
+      evidence->old_plan_retained =
+          impl_->runtime && impl_->runtime->coordinator &&
+          impl_->runtime->coordinator->Snapshot().prepared;
+    }
+    return failure == hal::ReasonId::shutdown_requested
+               ? hal::StatusId::stopped
+               : hal::StatusId::blocked;
+  }
+
+  const auto &snapshot = candidate_lease.snapshot();
+  const auto adapter = snapshot.adapter;
+  const auto factory = snapshot.factory;
+  std::unique_ptr<Impl::RegisteredRuntime> candidate;
+  hal::ReasonId registration_reason = hal::ReasonId::none;
+  const auto registration_status =
+      impl_->BuildRuntime(adapter, factory, std::move(candidate_lease),
+                          &candidate, &registration_reason);
+  SetReason(reason, registration_reason);
+  if (!IsSetupSuccess(registration_status)) {
+    if (evidence) {
+      evidence->status = registration_status;
+      evidence->reason = registration_reason;
+      evidence->old_plan_retained =
+          impl_->runtime && impl_->runtime->coordinator &&
+          impl_->runtime->coordinator->Snapshot().prepared;
+    }
+    return registration_status;
+  }
+
+  const auto prepare_status =
+      candidate->coordinator->Prepare(request, evidence, reason);
+  if (!IsSetupSuccess(prepare_status)) {
+    if (evidence)
+      evidence->old_plan_retained =
+          impl_->runtime && impl_->runtime->coordinator &&
+          impl_->runtime->coordinator->Snapshot().prepared;
+    return prepare_status;
+  }
+
+  impl_->runtime = std::move(candidate);
+  // Any lazily created default factory was retained until its coordinator had
+  // been destroyed by the runtime replacement above.
+  impl_->vulkan_factory.reset();
+  impl_->injected = true;
+  return prepare_status;
 }
 
 VideoExecutionFrameResult ProductionVideoExecutionComposition::Execute(
     const hal::HostFrameBinding &binding) noexcept {
-  if (!impl_ || !impl_->coordinator) {
+  if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator) {
     VideoExecutionFrameResult result;
-    result.status = hal::StatusId::resource_exhausted;
-    result.reason = hal::ReasonId::resource_exhausted;
+    const bool stopped = impl_ && impl_->runtime && impl_->runtime->shutdown;
+    result.status =
+        stopped ? hal::StatusId::stopped : hal::StatusId::resource_exhausted;
+    result.reason = stopped ? hal::ReasonId::shutdown_requested
+                            : hal::ReasonId::resource_exhausted;
     return result;
   }
-  return impl_->coordinator->Execute(binding);
+  return impl_->runtime->coordinator->Execute(binding);
 }
 
 hal::StatusId ProductionVideoExecutionComposition::CommitOutput(
     const hal::CompletionToken &completion, bool output_write_succeeded,
     hal::ReasonId *reason) noexcept {
-  if (!impl_ || !impl_->coordinator) {
-    SetReason(reason, hal::ReasonId::resource_exhausted);
-    return hal::StatusId::resource_exhausted;
+  if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator) {
+    const bool stopped = impl_ && impl_->runtime && impl_->runtime->shutdown;
+    SetReason(reason, stopped ? hal::ReasonId::shutdown_requested
+                              : hal::ReasonId::resource_exhausted);
+    return stopped ? hal::StatusId::stopped : hal::StatusId::resource_exhausted;
   }
-  return impl_->coordinator->CommitOutput(completion, output_write_succeeded,
-                                          reason);
+  return impl_->runtime->coordinator->CommitOutput(
+      completion, output_write_succeeded, reason);
 }
 
 void ProductionVideoExecutionComposition::Invalidate(
     hal::ReasonId reason) noexcept {
-  if (impl_ && impl_->coordinator)
-    impl_->coordinator->Invalidate(reason);
+  if (impl_ && impl_->runtime && impl_->runtime->coordinator)
+    impl_->runtime->coordinator->Invalidate(reason);
 }
 
 hal::StatusId ProductionVideoExecutionComposition::ResetTemporal(
     hal::ReasonId reason) noexcept {
-  if (!impl_ || !impl_->coordinator)
-    return hal::StatusId::resource_exhausted;
-  return impl_->coordinator->ResetTemporal(reason);
+  if (!impl_ || !impl_->runtime || !impl_->runtime->coordinator)
+    return impl_ && impl_->runtime && impl_->runtime->shutdown
+               ? hal::StatusId::stopped
+               : hal::StatusId::resource_exhausted;
+  return impl_->runtime->coordinator->ResetTemporal(reason);
 }
 
 void ProductionVideoExecutionComposition::Shutdown() noexcept {
   if (!impl_)
     return;
-  if (impl_->coordinator)
-    impl_->coordinator->Shutdown();
+  if (impl_->runtime)
+    impl_->runtime->Shutdown();
 }
 
 VideoExecutionCoordinatorSnapshot
 ProductionVideoExecutionComposition::Snapshot() const noexcept {
-  if (!impl_ || !impl_->coordinator)
+  if (!impl_ || !impl_->runtime)
     return {};
-  return impl_->coordinator->Snapshot();
+  if (impl_->runtime->coordinator)
+    return impl_->runtime->coordinator->Snapshot();
+  return impl_->runtime->terminal_snapshot;
 }
 
 } // namespace studiocast::video

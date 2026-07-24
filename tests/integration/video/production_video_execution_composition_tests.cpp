@@ -1,11 +1,14 @@
 #include "core/video/production_video_execution_composition.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -66,7 +69,7 @@ hal::ImageDescriptor Image(hal::Mutability mutability) {
 class UnusedAdapter final : public hal::IResidentAdapter {
 public:
   std::uint64_t adapter_instance_id() const noexcept override {
-    return kAdapterId;
+    return reported_adapter_id;
   }
   hal::BackendId backend_id() const noexcept override {
     return hal::BackendId::vulkan;
@@ -86,6 +89,8 @@ public:
   }
   void DestroyPrepared(hal::PreparedProgramHandle *) noexcept override {}
   void Shutdown() noexcept override {}
+
+  std::uint64_t reported_adapter_id = kAdapterId;
 };
 
 struct FakeExecutorCounters {
@@ -94,6 +99,7 @@ struct FakeExecutorCounters {
   std::uint64_t invalidate_calls = 0;
   std::uint64_t reset_calls = 0;
   std::uint64_t shutdown_calls = 0;
+  std::vector<int> *events = nullptr;
 };
 
 class FakeExecutor final : public video::IVideoExecutionExecutor {
@@ -177,6 +183,8 @@ public:
   }
   void Shutdown() noexcept override {
     ++counters_->shutdown_calls;
+    if (counters_->events)
+      counters_->events->push_back(1);
     stopped_ = true;
     snapshot_.stopped = true;
   }
@@ -196,6 +204,9 @@ private:
 
 class FakeFactory final : public video::IVideoAdapterFactory {
 public:
+  explicit FakeFactory(FakeExecutorCounters *external_counters = nullptr)
+      : counters_(external_counters ? external_counters : &counters) {}
+
   video::VideoAdapterFactoryPreflight
   Preflight(const video::VideoExecutionPlanRequest &request,
             const hal::ResolutionResult &resolution,
@@ -265,11 +276,60 @@ public:
   std::unique_ptr<video::IVideoExecutionExecutor>
   Prepare(const video::FrozenVideoExecutionPlan &plan,
           video::VideoAdapterPrepareEvidence *evidence) noexcept override {
+    if (fail_prepare) {
+      evidence->status = hal::StatusId::unavailable;
+      evidence->reason = hal::ReasonId::semantic_provider_unavailable;
+      evidence->candidate_resources_rolled_back = true;
+      return nullptr;
+    }
     evidence->status = hal::StatusId::ready;
-    return std::make_unique<FakeExecutor>(plan, &counters);
+    return std::make_unique<FakeExecutor>(plan, counters_);
   }
 
+  bool fail_prepare = false;
   FakeExecutorCounters counters{};
+
+private:
+  FakeExecutorCounters *counters_ = nullptr;
+};
+
+struct FakeLeaseOwnerCounters {
+  std::uint64_t shutdown_calls = 0;
+  std::uint64_t destructor_calls = 0;
+  std::vector<int> *events = nullptr;
+};
+
+class FakeLeaseOwner final : public video::IProductionVideoSetupLeaseOwner {
+public:
+  FakeLeaseOwner(FakeLeaseOwnerCounters *owner_counters,
+                 FakeExecutorCounters *executor_counters)
+      : factory(executor_counters), owner_counters_(owner_counters) {}
+
+  ~FakeLeaseOwner() override {
+    ++owner_counters_->destructor_calls;
+    if (owner_counters_->events)
+      owner_counters_->events->push_back(3);
+  }
+
+  hal::IResidentAdapter *resident_adapter() const noexcept override {
+    return const_cast<UnusedAdapter *>(&adapter);
+  }
+
+  video::IVideoAdapterFactory *video_adapter_factory() const noexcept override {
+    return const_cast<FakeFactory *>(&factory);
+  }
+
+  void Shutdown() noexcept override {
+    ++owner_counters_->shutdown_calls;
+    if (owner_counters_->events)
+      owner_counters_->events->push_back(2);
+  }
+
+  UnusedAdapter adapter;
+  FakeFactory factory;
+
+private:
+  FakeLeaseOwnerCounters *owner_counters_ = nullptr;
 };
 
 hal::AdapterRegistration Registration(UnusedAdapter *adapter) {
@@ -304,6 +364,49 @@ FactoryRegistration(FakeFactory *factory) {
   registration.selection_priority = 1;
   registration.factory = factory;
   return registration;
+}
+
+video::ProductionVideoSetupLeaseSnapshot LeaseSnapshot(FakeLeaseOwner *owner) {
+  video::ProductionVideoSetupLeaseSnapshot snapshot;
+  snapshot.state = video::ProductionVideoSetupLeaseState::live;
+  snapshot.status = hal::StatusId::ready;
+  snapshot.backend = hal::BackendId::vulkan;
+  snapshot.execution_domain = Domain();
+  snapshot.generations = {1, 1, 1, 1, 1, 7};
+  snapshot.reserved_budget.persistent_bytes = 128;
+  snapshot.reserved_budget.scratch_bytes = 128;
+  snapshot.reserved_budget.upload_staging_bytes = kBytes;
+  snapshot.reserved_budget.readback_staging_bytes = kBytes;
+  snapshot.reserved_budget.resource_count = 4;
+  snapshot.reserved_budget.in_flight_slots = 1;
+  snapshot.providers[0] =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  snapshot.provider_count = 1;
+  snapshot.adapter = Registration(owner ? &owner->adapter : nullptr);
+  snapshot.factory = FactoryRegistration(owner ? &owner->factory : nullptr);
+  snapshot.readiness.status = hal::StatusId::ready;
+  snapshot.readiness.requested_backend = hal::BackendId::vulkan;
+  snapshot.readiness.selected_backend = hal::BackendId::vulkan;
+  snapshot.readiness.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  snapshot.readiness.execution_domain = Domain();
+  snapshot.readiness.ready_stage_mask = 1;
+  snapshot.readiness.available = true;
+  return snapshot;
+}
+
+bool AcquireLease(std::unique_ptr<FakeLeaseOwner> owner,
+                  video::ProductionVideoSetupLease *lease,
+                  FakeLeaseOwner **raw_owner = nullptr) {
+  if (raw_owner)
+    *raw_owner = owner.get();
+  const auto snapshot = LeaseSnapshot(owner.get());
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  return video::ProductionVideoSetupLease::Acquire(snapshot, std::move(owner),
+                                                   lease, &evidence, &reason) ==
+             hal::StatusId::ready &&
+         reason == hal::ReasonId::none;
 }
 
 video::VideoExecutionPlanRequest Request() {
@@ -458,11 +561,158 @@ bool TestMalformedFactoryRegistrationRollsBack() {
   return ok;
 }
 
+bool TestOwnedLeaseLifecycleAndOrderedShutdown() {
+  std::vector<int> events;
+  FakeLeaseOwnerCounters owner_counters;
+  owner_counters.events = &events;
+  FakeExecutorCounters executor_counters;
+  executor_counters.events = &events;
+  {
+    auto owner =
+        std::make_unique<FakeLeaseOwner>(&owner_counters, &executor_counters);
+    video::ProductionVideoSetupLease lease;
+    if (!Require(AcquireLease(std::move(owner), &lease),
+                 "valid production lease must acquire")) {
+      return false;
+    }
+
+    video::ProductionVideoExecutionComposition composition;
+    video::VideoExecutionPrepareEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    bool ok =
+        Require(composition.PrepareWithSetupLease(std::move(lease), Request(),
+                                                  &evidence, &reason) ==
+                        hal::StatusId::ready &&
+                    evidence.selected_route ==
+                        video::VideoExecutionRoute::prepared_resident,
+                "owned lease must prepare through its frozen registrations");
+
+    std::array<std::uint8_t, kBytes> input{};
+    std::array<std::uint8_t, kBytes> output{};
+    for (std::size_t index = 0; index < input.size(); ++index)
+      input[index] = static_cast<std::uint8_t>(index + 3);
+    const auto frame = composition.Execute(Binding(&input, &output, 10));
+    ok &= Require(frame.output_ready && output == input,
+                  "owned lease must execute with stable owner addresses");
+    ok &= Require(composition.CommitOutput(frame.completion, true, &reason) ==
+                          hal::StatusId::ready &&
+                      composition.Snapshot().latest_committed_frame.valid,
+                  "owned lease must preserve writer-gated attribution");
+
+    composition.Shutdown();
+    composition.Shutdown();
+    ok &= Require(composition.Snapshot().stopped &&
+                      executor_counters.shutdown_calls == 1 &&
+                      owner_counters.shutdown_calls == 1,
+                  "composition shutdown must be idempotent across executor "
+                  "and lease owner");
+    if (!ok)
+      return false;
+  }
+
+  const std::array<int, 3> expected{1, 2, 3};
+  return Require(events.size() == expected.size(),
+                 "ordered owned teardown must emit exactly three events") &&
+         Require(std::equal(events.begin(), events.end(), expected.begin()),
+                 "coordinator must shut down before owner shutdown and "
+                 "destruction") &&
+         Require(owner_counters.destructor_calls == 1,
+                 "owned lease owner must be destroyed exactly once");
+}
+
+bool TestFailedLeaseCandidatesRetainOldPlan() {
+  FakeLeaseOwnerCounters old_owner_counters;
+  FakeExecutorCounters old_executor_counters;
+  auto old_owner = std::make_unique<FakeLeaseOwner>(&old_owner_counters,
+                                                    &old_executor_counters);
+  video::ProductionVideoSetupLease old_lease;
+  if (!Require(AcquireLease(std::move(old_owner), &old_lease),
+               "old production lease must acquire")) {
+    return false;
+  }
+
+  video::ProductionVideoExecutionComposition composition;
+  video::VideoExecutionPrepareEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(composition.PrepareWithSetupLease(
+                   std::move(old_lease), Request(), &evidence, &reason) ==
+                   hal::StatusId::ready,
+               "old lease must prepare before rollback checks")) {
+    return false;
+  }
+
+  FakeLeaseOwnerCounters registration_owner_counters;
+  FakeExecutorCounters registration_executor_counters;
+  auto registration_owner = std::make_unique<FakeLeaseOwner>(
+      &registration_owner_counters, &registration_executor_counters);
+  video::ProductionVideoSetupLease registration_lease;
+  FakeLeaseOwner *registration_raw = nullptr;
+  if (!Require(AcquireLease(std::move(registration_owner), &registration_lease,
+                            &registration_raw),
+               "registration candidate must first acquire validly")) {
+    return false;
+  }
+  ++registration_raw->adapter.reported_adapter_id;
+  reason = hal::ReasonId::none;
+  const auto registration_status = composition.PrepareWithSetupLease(
+      std::move(registration_lease), Request(), &evidence, &reason);
+  bool ok =
+      Require(registration_status == hal::StatusId::blocked &&
+                  reason == hal::ReasonId::foreign_adapter &&
+                  evidence.old_plan_retained,
+              "foreign post-acquire registration must fail exactly and "
+              "retain the old plan") &&
+      Require(registration_owner_counters.shutdown_calls == 1 &&
+                  registration_owner_counters.destructor_calls == 1,
+              "failed registration candidate must roll back its owner once") &&
+      Require(old_owner_counters.shutdown_calls == 0,
+              "failed registration must not stop the old lease");
+
+  FakeLeaseOwnerCounters prepare_owner_counters;
+  FakeExecutorCounters prepare_executor_counters;
+  auto prepare_owner = std::make_unique<FakeLeaseOwner>(
+      &prepare_owner_counters, &prepare_executor_counters);
+  prepare_owner->factory.fail_prepare = true;
+  video::ProductionVideoSetupLease prepare_lease;
+  if (!Require(AcquireLease(std::move(prepare_owner), &prepare_lease),
+               "prepare-failure candidate must acquire validly")) {
+    return false;
+  }
+  reason = hal::ReasonId::none;
+  const auto prepare_status = composition.PrepareWithSetupLease(
+      std::move(prepare_lease), Request(), &evidence, &reason);
+  ok &= Require(prepare_status == hal::StatusId::unavailable &&
+                    reason == hal::ReasonId::semantic_provider_unavailable &&
+                    evidence.old_plan_retained,
+                "candidate prepare failure must retain exact reason and old "
+                "plan") &&
+        Require(prepare_owner_counters.shutdown_calls == 1 &&
+                    prepare_owner_counters.destructor_calls == 1,
+                "failed prepare candidate must roll back its owner once") &&
+        Require(old_owner_counters.shutdown_calls == 0,
+                "failed candidate prepare must not stop the old lease");
+
+  std::array<std::uint8_t, kBytes> input{};
+  std::array<std::uint8_t, kBytes> output{};
+  input.fill(0xa5);
+  const auto frame = composition.Execute(Binding(&input, &output, 20));
+  ok &= Require(frame.output_ready && output == input,
+                "old plan must remain executable after both candidate "
+                "failures") &&
+        Require(composition.CommitOutput(frame.completion, true, &reason) ==
+                    hal::StatusId::ready,
+                "old plan must remain committable after candidate failures");
+  composition.Shutdown();
+  return ok;
+}
+
 } // namespace
 
 int main() {
   return TestLifecycleAndAttribution() &&
-                 TestMalformedFactoryRegistrationRollsBack()
+                 TestMalformedFactoryRegistrationRollsBack() &&
+                 TestOwnedLeaseLifecycleAndOrderedShutdown() &&
+                 TestFailedLeaseCandidatesRetainOldPlan()
              ? 0
              : 1;
 }

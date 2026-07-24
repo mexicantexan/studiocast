@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/video/production_video_setup_lease.h"
 #include "core/video/video_execution_coordinator.h"
 
 #include <cstdint>
@@ -36,6 +37,17 @@ public:
   [[nodiscard]] hal::StatusId Prepare(const VideoExecutionPlanRequest &request,
                                       VideoExecutionPrepareEvidence *evidence,
                                       hal::ReasonId *reason) noexcept;
+
+  // Transactionally composes and prepares one already-validated production
+  // setup lease. The candidate registry, coordinator, and prepared executor
+  // become active only after exact registration and preparation succeed.
+  // Failure shuts down the candidate owner while retaining the current
+  // prepared plan and its lease.
+  [[nodiscard]] hal::StatusId
+  PrepareWithSetupLease(ProductionVideoSetupLease candidate_lease,
+                        const VideoExecutionPlanRequest &request,
+                        VideoExecutionPrepareEvidence *evidence,
+                        hal::ReasonId *reason) noexcept;
 
   [[nodiscard]] VideoExecutionFrameResult
   Execute(const hal::HostFrameBinding &binding) noexcept;
