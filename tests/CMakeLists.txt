@@ -183,6 +183,40 @@ if (BUILD_TESTING)
             studiocast-prepared-open-cuda-hardware-execution-owner-tests
             integration core video gpu model)
 
+    add_executable(studiocast-prepared-open-cuda-pipeline-migration-tests
+            ${PROJECT_SOURCE_DIR}/tests/integration/video/prepared_open_cuda_pipeline_migration_tests.cpp
+    )
+
+    target_link_libraries(studiocast-prepared-open-cuda-pipeline-migration-tests PRIVATE
+            studiocast_video_runtime)
+
+    target_include_directories(studiocast-prepared-open-cuda-pipeline-migration-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    target_compile_definitions(
+            studiocast-prepared-open-cuda-pipeline-migration-tests PRIVATE
+            STUDIOCAST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    studiocast_set_project_warnings(
+            studiocast-prepared-open-cuda-pipeline-migration-tests)
+    studiocast_enable_sanitizers(
+            studiocast-prepared-open-cuda-pipeline-migration-tests)
+
+    set_target_properties(
+            studiocast-prepared-open-cuda-pipeline-migration-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(NAME studiocast-prepared-open-cuda-pipeline-migration-tests
+            COMMAND studiocast-prepared-open-cuda-pipeline-migration-tests)
+    studiocast_set_test_labels(
+            studiocast-prepared-open-cuda-pipeline-migration-tests
+            integration core video gpu model)
+
     add_executable(studiocast-video-runtime-status-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/video_runtime_status_tests.cpp
     )
