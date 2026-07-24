@@ -58,6 +58,25 @@ bool SameCompletion(const hal::CompletionToken &left,
          left.complete == right.complete;
 }
 
+bool ProviderMatchesDomain(
+    hal::SemanticEffectProviderId provider, hal::BackendId backend,
+    const hal::ExecutionDomainId &domain) noexcept {
+  if (backend != domain.backend)
+    return false;
+  const auto residency = hal::ClassifyExecutionResidency(domain);
+  if (provider ==
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu) {
+    return backend == hal::BackendId::open_video_onnxruntime &&
+           residency == hal::ExecutionResidencyClass::host;
+  }
+  if (provider ==
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+    return backend == hal::BackendId::cuda &&
+           residency == hal::ExecutionResidencyClass::device;
+  }
+  return false;
+}
+
 std::uint64_t
 Elapsed(const std::chrono::steady_clock::time_point &start) noexcept {
   return static_cast<std::uint64_t>(
@@ -95,7 +114,10 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
     const int height = static_cast<int>(config.plan.host_input.height);
     if (config.selected_backend == hal::BackendId::invalid ||
         config.selected_provider == hal::SemanticEffectProviderId::invalid ||
-        !hal::ValidateExecutionDomain(config.execution_domain)) {
+        !hal::ValidateExecutionDomain(config.execution_domain) ||
+        !ProviderMatchesDomain(config.selected_provider,
+                               config.selected_backend,
+                               config.execution_domain)) {
       result->status = hal::StatusId::blocked;
       result->reason = hal::ReasonId::malformed_execution_domain;
       return false;
@@ -146,15 +168,11 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
       }
       // CPU-tensor Open Video stages remain explicitly host-provider stages
       // even when ORT internally activates CUDA EP.
-      if (config.providers[index] !=
-              hal::SemanticEffectProviderId::open_video_onnxruntime_cpu &&
-          config.providers[index] !=
-              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
-        result->status = hal::StatusId::blocked;
-        result->reason = hal::ReasonId::semantic_provider_unavailable;
-        return false;
-      }
-      if (config.backends[index] == hal::BackendId::invalid) {
+      if (config.providers[index] != config.selected_provider ||
+          config.backends[index] != config.selected_backend ||
+          !ProviderMatchesDomain(config.providers[index],
+                                 config.backends[index],
+                                 config.execution_domain)) {
         result->status = hal::StatusId::blocked;
         result->reason = hal::ReasonId::semantic_provider_unavailable;
         return false;

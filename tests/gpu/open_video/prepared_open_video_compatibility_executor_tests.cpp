@@ -199,6 +199,54 @@ bool TestFailOpenPreservesAndExecuteDoesNotAllocate() {
   return ok;
 }
 
+bool TestMixedOrMalformedAttributionIsRejected() {
+  RunnerState state;
+  open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+
+  auto malformed_domain = Config(&state);
+  malformed_domain.selected_backend = hal::BackendId::cuda;
+  bool ok = Require(
+      !open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+          malformed_domain, &setup) &&
+          setup.status == hal::StatusId::blocked &&
+          setup.reason == hal::ReasonId::malformed_execution_domain,
+      "selected backend must equal the exact execution-domain backend");
+
+  auto mixed_backend = Config(&state);
+  mixed_backend.backends[1] = hal::BackendId::cuda;
+  ok &= Require(
+      !open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+          mixed_backend, &setup) &&
+          setup.status == hal::StatusId::blocked &&
+          setup.reason == hal::ReasonId::semantic_provider_unavailable,
+      "one-domain executor must reject a forged mixed backend array");
+
+  auto mixed_provider = Config(&state);
+  mixed_provider.providers[1] =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  ok &= Require(
+      !open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+          mixed_provider, &setup) &&
+          setup.status == hal::StatusId::blocked &&
+          setup.reason == hal::ReasonId::semantic_provider_unavailable,
+      "one-domain executor must reject a forged mixed provider array");
+
+  auto provider_domain_mismatch = Config(&state);
+  provider_domain_mismatch.selected_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  provider_domain_mismatch.providers[0] =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  provider_domain_mismatch.providers[1] =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  ok &= Require(
+      !open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+          provider_domain_mismatch, &setup) &&
+          setup.status == hal::StatusId::blocked &&
+          setup.reason == hal::ReasonId::malformed_execution_domain,
+      "provider residency must match the selected execution domain");
+  return ok;
+}
+
 } // namespace
 
 void *operator new(std::size_t size) { return Allocate(size); }
@@ -211,7 +259,8 @@ void operator delete[](void *memory, std::size_t) noexcept {
 }
 
 int main() {
-  if (!TestFailOpenPreservesAndExecuteDoesNotAllocate())
+  if (!TestFailOpenPreservesAndExecuteDoesNotAllocate() ||
+      !TestMixedOrMalformedAttributionIsRejected())
     return 1;
   std::cout << "Prepared Open Video compatibility executor tests passed\n";
   return 0;
