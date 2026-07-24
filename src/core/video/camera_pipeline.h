@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -14,13 +15,7 @@
 
 #include "core/video/effects/broadcast_effects.h"
 #include "core/video/effects/broadcast_effect_rules.h"
-#include "core/maxine/resident_frame_section.h"
-#include "core/maxine/production_resident_frame_executor.h"
-#include "core/video/open_vulkan_eye_contact.h"
-#include "core/video/open_vulkan_video_noise_removal.h"
-#include "core/video/prepared_hardware_execution_owner.h"
-#include "core/video/prepared_maxine_hardware_execution_owner.h"
-#include "core/video/prepared_open_cuda_hardware_execution_owner.h"
+#include "core/video/production_video_backend_manager.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
@@ -90,24 +85,10 @@ std::string ResolveActiveComputeBackendName(
 bool MarkGpuBackendActiveFrame(bool &active_this_frame,
                                std::uint64_t &active_frames);
 
-// Pure setup/commit seams for the first live Open CUDA migration. Budget
-// construction uses conservative checked pitch bounds; the executor replaces
-// them with exact allocation evidence before publishing readiness.
-bool BuildPreparedOpenCudaPipelineResourceBudget(
-    std::uint32_t frame_width, std::uint32_t frame_height,
-    std::uint32_t model_width, std::uint32_t model_height,
-    hal::SemanticEffectId semantic, int strength,
-    hal::ResourceBudget *budget) noexcept;
-bool PreparedOpenCudaPipelineMayCommitAttribution(
-    hal::StageExecutionStatus stage_status, bool writer_frame_committed,
-    hal::StatusId output_commit_status) noexcept;
-bool PreparedOpenCudaPipelineShouldSuspend(
-    hal::StatusId status, hal::ReasonId reason) noexcept;
-
-// Setup/control-plane projection input for the versioned daemon HAL status.
-// It consumes only cached typed owner snapshots and canonical configuration;
-// no probing, model discovery, JSON, synchronization, or backend construction
-// is permitted here.
+// Setup/control-plane projection input for the versioned daemon HAL status. It
+// consumes only the manager's cached neutral snapshot and canonical
+// configuration. No probing, model discovery, JSON, synchronization, or
+// backend construction is permitted here.
 struct CameraPipelineHalStatusProjectionInput {
   const effects::BroadcastCameraEffects *effects = nullptr;
   ComputeBackendPreference compute_backend =
@@ -116,85 +97,13 @@ struct CameraPipelineHalStatusProjectionInput {
   std::uint64_t status_generation = 0;
   std::uint64_t configuration_generation = 0;
   std::uint64_t geometry_generation = 0;
-  bool final_visual_live = false;
-  bool maxine_resident_live = false;
-  bool open_cuda_virtual_background_live = false;
-  PreparedHardwareExecutionSnapshot final_visual{};
-  PreparedMaxineHardwareExecutionSnapshot maxine_resident{};
-  PreparedOpenCudaHardwareExecutionSnapshot open_cuda_virtual_background{};
+  ProductionVideoBackendManagerSnapshot backend{};
 };
 
 [[nodiscard]] MultiIslandStatusValidationResult
 BuildCameraPipelineHalStatusSnapshot(
     const CameraPipelineHalStatusProjectionInput &input,
     MultiIslandVideoRuntimeStatusSnapshot *output) noexcept;
-
-inline constexpr std::size_t kMaxPreparedMaxineResidentIslands = 9;
-
-[[nodiscard]] constexpr std::uint32_t MaxineResolvedStageBit(
-    effects::BroadcastEffectStage stage) noexcept {
-  return stage < effects::BroadcastEffectStage::none
-             ? (std::uint32_t{1} << static_cast<std::uint32_t>(stage))
-             : 0u;
-}
-
-struct PreparedMaxineResidentIsland {
-  std::size_t first_frame_stage = 0;
-  std::size_t end_frame_stage = 0;
-  maxine::ResidentFramePlan plan{};
-};
-
-struct PreparedMaxineResidentIslands {
-  std::array<PreparedMaxineResidentIsland,
-             kMaxPreparedMaxineResidentIslands>
-      islands{};
-  std::size_t count = 0;
-  std::uint32_t enabled_resident_stage_mask = 0;
-  bool valid = true;
-};
-
-// Compiles maximal contiguous islands only after setup has resolved each
-// canonical effect to a concrete backend. The mask uses BroadcastEffectStage
-// bits. Island storage is fixed and frame execution performs no allocation.
-PreparedMaxineResidentIslands CompileMaxineResidentIslands(
-    const effects::PreparedBroadcastEffectsFramePlan &frame_plan,
-    std::uint32_t resolved_maxine_stage_mask,
-    std::uint64_t matte_fingerprint) noexcept;
-
-struct MaxineResidentTelemetryDelta {
-  std::uint64_t rgb_to_bgr_calls = 0;
-  std::uint64_t upload_attempts = 0;
-  std::uint64_t upload_calls = 0;
-  std::uint64_t final_download_attempts = 0;
-  std::uint64_t final_download_calls = 0;
-  std::uint64_t cpu_continuation_download_attempts = 0;
-  std::uint64_t cpu_continuation_download_calls = 0;
-  std::uint64_t device_bridge_attempts = 0;
-  std::uint64_t device_bridge_calls = 0;
-  std::uint64_t matte_inference_attempts = 0;
-  std::uint64_t matte_inference_calls = 0;
-  std::uint64_t shared_matte_reuses = 0;
-  std::uint64_t sync_attempts = 0;
-  std::uint64_t sync_calls = 0;
-  std::uint64_t composite_attempts = 0;
-  std::uint64_t composite_calls = 0;
-  std::uint64_t synchronous_sdk_run_attempts = 0;
-  std::uint64_t synchronous_sdk_run_calls = 0;
-  std::uint64_t asynchronous_sdk_run_attempts = 0;
-  std::uint64_t asynchronous_sdk_run_calls = 0;
-  std::array<std::uint64_t,
-             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
-      stage_attempts{};
-  std::array<std::uint64_t,
-             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
-      stage_successes{};
-};
-
-// Computes monotonic callsite-counter deltas used by the live camera status
-// rollup. Invalid/non-monotonic snapshots fail closed to a zero delta.
-MaxineResidentTelemetryDelta ComputeMaxineResidentTelemetryDelta(
-    const maxine::ProductionResidentTelemetry &current,
-    const maxine::ProductionResidentTelemetry &previous) noexcept;
 
 bool EffectsPlanRequiresRebuild(
     const effects::BroadcastCameraEffects &applied_effects,
@@ -256,55 +165,8 @@ private:
   std::string active_backends_;
 };
 
-inline constexpr std::string_view
-    kOpenVulkanVignetteTrackedCenterNotSupportedReason =
-        "vulkan_vignette_tracked_center_not_supported";
-inline constexpr std::string_view
-    kOpenVulkanVignetteTrackedCenterNotSupportedDetail =
-        "tracked-center semantics require a device-resident center/mask "
-        "implementation";
-
-struct OpenVulkanVignettePlanCompatibility {
-  bool blocked = false;
-  std::string_view reason_code;
-  std::string_view detail;
-};
-
-// Applies the explicit-Vulkan compatibility rule after backend setup has
-// removed unavailable stages. Only a still-retained Auto Frame stage makes a
-// default-true tracked-center vignette incompatible; standalone vignette stays
-// fixed-center production behavior. A blocked result removes only vignette.
-OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
-    const effects::BroadcastCameraEffects &fx,
-    effects::BroadcastEffectsPlan *retained_plan);
-
-struct OpenVulkanEyeContactPlanCompatibility {
-  bool blocked = false;
-  std::string_view reason_code;
-  std::string_view blocker_code;
-  std::string_view detail;
-};
-
-// Eye contact has no callable Open Vulkan production runtime. Explicit Vulkan
-// removes only this stage, records the exact nested blocker in the retained
-// plan, and leaves every independent effect untouched.
-OpenVulkanEyeContactPlanCompatibility
-ApplyOpenVulkanEyeContactPlanCompatibility(
-    effects::BroadcastEffectsPlan *retained_plan);
-
-struct OpenVulkanVideoNoiseRemovalPlanCompatibility {
-  bool blocked = false;
-  std::string_view reason_code;
-  std::string_view blocker_code;
-  std::string_view detail;
-};
-
-// Video noise removal has no callable Open Vulkan production runtime. Explicit
-// Vulkan removes only this stage, records the exact nested blocker in the
-// retained plan, and leaves every independent effect untouched.
-OpenVulkanVideoNoiseRemovalPlanCompatibility
-ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
-    effects::BroadcastEffectsPlan *retained_plan);
+using ProductionVideoBackendSetupSourceFactory =
+    std::unique_ptr<IProductionVideoBackendSetupSource> (*)() noexcept;
 
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0
@@ -348,6 +210,12 @@ struct CameraPipelineConfig {
   bool allow_cpu_resize = true;
 
   studiocast::video::effects::BroadcastCameraEffects effects{};
+
+  // Production uses CreateStaticProductionVideoBackendSetupSource(). Tests
+  // may inject a hermetic setup source without exposing a backend factory,
+  // adapter, model registry, provider probe, or setup lease to the pipeline.
+  ProductionVideoBackendSetupSourceFactory backend_setup_source_factory =
+      nullptr;
 };
 
 struct CameraPipelineStatus {
@@ -564,12 +432,10 @@ struct CameraPipelineStatus {
     std::uint64_t setup_successes = 0;
     std::uint64_t cpu_tail_stage_calls = 0;
     std::uint64_t runtime_failure_frames = 0;
-    std::array<std::uint64_t,
-               static_cast<std::size_t>(maxine::ResidentStageKind::count)>
-        stage_attempts{};
-    std::array<std::uint64_t,
-               static_cast<std::size_t>(maxine::ResidentStageKind::count)>
-        stage_successes{};
+    // Legacy field names retained for status compatibility. Indices follow
+    // canonical semantic stage order rather than a backend SDK enum.
+    std::array<std::uint64_t, 9> stage_attempts{};
+    std::array<std::uint64_t, 9> stage_successes{};
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
   } maxine_transfers{};
@@ -594,17 +460,9 @@ struct CameraPipelineStatus {
   // effect has been bypassed and the frame loop is continuing pass-through.
   DegradedEffect degraded_effect{};
 
-  // Typed status for the bounded prepared-hardware migration. GET_STATUS
-  // publishes it additively without changing the existing daemon IPC fields.
-  PreparedHardwareExecutionSnapshot prepared_hardware_execution{};
-  // Internal cached typed shadow for the prepared Open CUDA migration. The
-  // current GET_STATUS serializer intentionally does not consume this field,
-  // so legacy IPC bytes remain unchanged until a separately versioned status
-  // integration.
-  PreparedOpenCudaHardwareExecutionSnapshot
-      prepared_open_cuda_hardware_execution{};
-  PreparedMaxineHardwareExecutionSnapshot
-      prepared_maxine_hardware_execution{};
+  // Backend-neutral cached setup/live snapshot. Legacy status fields above are
+  // compatibility projections from this typed authority.
+  ProductionVideoBackendManagerSnapshot production_backend{};
   // Cached typed status consumed only by the explicitly versioned
   // GET_VIDEO_HAL_STATUS_V1 command. Legacy GET_STATUS does not serialize it.
   MultiIslandVideoRuntimeStatusSnapshot video_hal_status{};
@@ -745,11 +603,7 @@ private:
   CameraPipelineStatus::OpenCudaTransfers open_cuda_transfers_{};
   CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
-  PreparedHardwareExecutionSnapshot prepared_hardware_execution_{};
-  PreparedOpenCudaHardwareExecutionSnapshot
-      prepared_open_cuda_hardware_execution_{};
-  PreparedMaxineHardwareExecutionSnapshot
-      prepared_maxine_hardware_execution_{};
+  ProductionVideoBackendManagerSnapshot production_backend_{};
   MultiIslandVideoRuntimeStatusSnapshot video_hal_status_{};
   std::uint64_t video_hal_status_generation_ = 0;
 

@@ -41,6 +41,7 @@
 #include "core/maxine/nvcv_api.h"
 #include "core/maxine/production_video_execution_bootstrap.h"
 #include "core/maxine/production_resident_frame_executor.h"
+#include "core/maxine/resident_frame_section.h"
 #include "core/maxine/vfx_api.h"
 #include "core/open_video/fastdvdnet_denoiser.h"
 #include "core/open_video/frame_analysis_cache.h"
@@ -56,8 +57,13 @@
 #include "core/video/effects/effect_chain.h"
 #include "core/video/image_ppm.h"
 #include "core/video/mjpeg_decode.h"
+#include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_matting_setup_policy.h"
+#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/production_video_execution_composition.h"
+#include "core/video/prepared_hardware_execution_owner.h"
+#include "core/video/prepared_maxine_hardware_execution_owner.h"
+#include "core/video/prepared_open_cuda_hardware_execution_owner.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
@@ -247,6 +253,63 @@ bool MarkGpuBackendActiveFrame(bool &active_this_frame,
   ++active_frames;
   return true;
 }
+
+namespace {
+
+inline constexpr std::size_t kMaxPreparedMaxineResidentIslands = 9;
+
+constexpr std::uint32_t
+MaxineResolvedStageBit(effects::BroadcastEffectStage stage) noexcept {
+  return stage < effects::BroadcastEffectStage::none
+             ? (std::uint32_t{1} << static_cast<std::uint32_t>(stage))
+             : 0u;
+}
+
+struct PreparedMaxineResidentIsland {
+  std::size_t first_frame_stage = 0;
+  std::size_t end_frame_stage = 0;
+  maxine::ResidentFramePlan plan{};
+};
+
+struct PreparedMaxineResidentIslands {
+  std::array<PreparedMaxineResidentIsland,
+             kMaxPreparedMaxineResidentIslands>
+      islands{};
+  std::size_t count = 0;
+  std::uint32_t enabled_resident_stage_mask = 0;
+  bool valid = true;
+};
+
+struct MaxineResidentTelemetryDelta {
+  std::uint64_t rgb_to_bgr_calls = 0;
+  std::uint64_t upload_attempts = 0;
+  std::uint64_t upload_calls = 0;
+  std::uint64_t final_download_attempts = 0;
+  std::uint64_t final_download_calls = 0;
+  std::uint64_t cpu_continuation_download_attempts = 0;
+  std::uint64_t cpu_continuation_download_calls = 0;
+  std::uint64_t device_bridge_attempts = 0;
+  std::uint64_t device_bridge_calls = 0;
+  std::uint64_t matte_inference_attempts = 0;
+  std::uint64_t matte_inference_calls = 0;
+  std::uint64_t shared_matte_reuses = 0;
+  std::uint64_t sync_attempts = 0;
+  std::uint64_t sync_calls = 0;
+  std::uint64_t composite_attempts = 0;
+  std::uint64_t composite_calls = 0;
+  std::uint64_t synchronous_sdk_run_attempts = 0;
+  std::uint64_t synchronous_sdk_run_calls = 0;
+  std::uint64_t asynchronous_sdk_run_attempts = 0;
+  std::uint64_t asynchronous_sdk_run_calls = 0;
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+      stage_attempts{};
+  std::array<std::uint64_t,
+             static_cast<std::size_t>(maxine::ResidentStageKind::count)>
+      stage_successes{};
+};
+
+} // namespace
 
 PreparedMaxineResidentIslands CompileMaxineResidentIslands(
     const effects::PreparedBroadcastEffectsFramePlan &frame_plan,
@@ -554,6 +617,38 @@ void LiveEffectBackendAttribution::SerializeActive() {
     active_backends_.append(BackendId(active_[slot]));
   }
 }
+
+namespace {
+
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedReason =
+        "vulkan_vignette_tracked_center_not_supported";
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedDetail =
+        "tracked-center semantics require a device-resident center/mask "
+        "implementation";
+
+struct OpenVulkanVignettePlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view detail;
+};
+
+struct OpenVulkanEyeContactPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+struct OpenVulkanVideoNoiseRemovalPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+} // namespace
 
 OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
     const effects::BroadcastCameraEffects &fx,
@@ -1252,7 +1347,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
     hal::CommittedFrameSnapshot committed{};
     bool current = false;
   };
-  std::array<IslandSource, 3> sources{};
+  std::array<IslandSource, 1> sources{};
   std::size_t source_count = 0;
 
   const auto reject_malformed_source =
@@ -1262,68 +1357,6 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
         invalid.code = code;
         return invalid;
       };
-
-  if (input.final_visual_live) {
-    if (!input.final_visual.prepared ||
-        input.final_visual.route != PreparedHardwareRoute::hal_live ||
-        !input.final_visual.active_program.valid ||
-        !hal::ValidateExecutionDomain(
-            input.final_visual.active_program.execution_domain)) {
-      return reject_malformed_source(
-          MultiIslandStatusValidationCode::invalid_island);
-    }
-    if (input.final_visual.setup.resolution.stage_count == 0 ||
-        input.final_visual.setup.resolution.stage_count >
-            input.final_visual.setup.resolution.stages.size() ||
-        input.final_visual.latest_committed_frame.stage_count >
-            input.final_visual.latest_committed_frame.stages.size()) {
-      return reject_malformed_source(
-          MultiIslandStatusValidationCode::malformed_island_stages);
-    }
-    IslandSource source;
-    source.route = PreparedExecutionRouteId::final_visual;
-    source.program.contract_version = hal::kContractVersion;
-    source.program.program_id =
-        input.final_visual.active_program.program_id;
-    source.program.owner_adapter_instance_id =
-        input.final_visual.active_program.owner_adapter_instance_id;
-    source.program.execution_domain =
-        input.final_visual.active_program.execution_domain;
-    source.program.invalidation_key =
-        input.final_visual.active_program.invalidation_key;
-    source.program.requested_backend =
-        input.final_visual.readiness.requested_backend;
-    source.program.strict_backend_selection =
-        input.final_visual.setup.resolution.strict_backend_selection;
-    source.program.requested_provider =
-        input.final_visual.setup.resolution.selected_provider;
-    source.program.strict_provider_selection = false;
-    source.program.stage_count =
-        input.final_visual.setup.resolution.stage_count;
-    for (std::size_t index = 0; index < source.program.stage_count; ++index) {
-      const auto &resolved =
-          input.final_visual.setup.resolution.stages[index];
-      if (resolved.intent.semantic != hal::SemanticEffectId::mirror &&
-          resolved.intent.semantic != hal::SemanticEffectId::vignette) {
-        return reject_malformed_source(
-            MultiIslandStatusValidationCode::invalid_capability_evidence);
-      }
-      auto &stage = source.program.stages[index];
-      stage.stage_id = resolved.intent.stage_id;
-      stage.semantic = resolved.intent.semantic;
-      stage.provider = resolved.provider;
-      stage.backend = resolved.selected_backend;
-      stage.execution_domain = resolved.execution_domain;
-      stage.required = resolved.intent.required;
-      stage.failure_action = resolved.intent.failure_action;
-    }
-    source.resolution = input.final_visual.setup.resolution;
-    source.readiness = input.final_visual.readiness;
-    source.telemetry = input.final_visual.telemetry;
-    source.committed = input.final_visual.latest_committed_frame;
-    source.current = true;
-    sources[source_count++] = source;
-  }
 
   const auto add_program_source =
       [&](PreparedExecutionRouteId route, const hal::PreparedProgram &program,
@@ -1392,69 +1425,35 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
         sources[source_count++] = source;
         return true;
       };
-  const auto readiness_is_qualified =
-      [](const hal::ReadinessSnapshot &readiness) {
-        return readiness.available &&
-               (readiness.status == hal::StatusId::ready ||
-                readiness.status == hal::StatusId::degraded ||
-                readiness.status == hal::StatusId::executed) &&
-               readiness.selected_backend != hal::BackendId::invalid &&
-               readiness.provider !=
-                   hal::SemanticEffectProviderId::invalid &&
-               hal::ValidateExecutionDomain(readiness.execution_domain);
-      };
-
-  if (input.maxine_resident_live) {
-    if (!input.maxine_resident.prepared ||
-        input.maxine_resident.route !=
-            PreparedMaxineHardwareRoute::hal_live ||
-        input.maxine_resident.eligibility !=
-            PreparedMaxineHardwareEligibility::eligible ||
-        !readiness_is_qualified(input.maxine_resident.readiness) ||
-        input.maxine_resident.quarantined ||
-        input.maxine_resident.stopped ||
-        !add_program_source(
-            PreparedExecutionRouteId::maxine_resident,
-            input.maxine_resident.active_program,
-            input.maxine_resident.readiness,
-            input.maxine_resident.telemetry,
-            input.maxine_resident.latest_committed_frame)) {
-      return reject_malformed_source(
-          MultiIslandStatusValidationCode::invalid_island);
-    }
-  }
-  if (input.open_cuda_virtual_background_live) {
-    if (!input.open_cuda_virtual_background.prepared ||
-        input.open_cuda_virtual_background.route !=
-            PreparedOpenCudaHardwareRoute::hal_live ||
-        input.open_cuda_virtual_background.eligibility !=
-            PreparedOpenCudaHardwareEligibility::eligible ||
-        !input.open_cuda_virtual_background.production
-             .prepared_capability_committed ||
-        !readiness_is_qualified(
-            input.open_cuda_virtual_background.readiness) ||
-        input.open_cuda_virtual_background.quarantined ||
-        input.open_cuda_virtual_background.stopped ||
-        input.open_cuda_virtual_background.shutdown_pending ||
-        !add_program_source(
-            PreparedExecutionRouteId::open_cuda_virtual_background,
-            input.open_cuda_virtual_background.active_program,
-            input.open_cuda_virtual_background.readiness,
-            input.open_cuda_virtual_background.telemetry,
-            input.open_cuda_virtual_background.latest_committed_frame)) {
-      return reject_malformed_source(
-          MultiIslandStatusValidationCode::invalid_island);
-    }
-    const auto &program =
-        input.open_cuda_virtual_background.active_program;
-    for (std::size_t index = 0; index < program.stage_count; ++index) {
-      const hal::SemanticEffectId semantic = program.stages[index].semantic;
-      if (semantic != hal::SemanticEffectId::virtual_background_blur &&
-          semantic != hal::SemanticEffectId::virtual_background_remove &&
-          semantic != hal::SemanticEffectId::virtual_background_replace) {
-        return reject_malformed_source(
-            MultiIslandStatusValidationCode::invalid_capability_evidence);
+  if (input.backend.state ==
+      ProductionVideoBackendManagerState::resident_ready) {
+    const auto &resident = input.backend.resident;
+    const auto route_for_backend = [](hal::BackendId backend) {
+      switch (backend) {
+      case hal::BackendId::vulkan:
+        return PreparedExecutionRouteId::final_visual;
+      case hal::BackendId::maxine:
+        return PreparedExecutionRouteId::maxine_resident;
+      case hal::BackendId::cuda:
+      case hal::BackendId::open_video_onnxruntime:
+        return PreparedExecutionRouteId::open_cuda_virtual_background;
+      case hal::BackendId::cpu:
+      case hal::BackendId::invalid:
+      case hal::BackendId::test_fake:
+        return PreparedExecutionRouteId::invalid;
       }
+      return PreparedExecutionRouteId::invalid;
+    };
+    const auto route =
+        route_for_backend(resident.readiness.selected_backend);
+    if (!input.backend.setup_complete || !input.backend.resident_prepared ||
+        !resident.prepared || resident.quarantined || resident.stopped ||
+        route == PreparedExecutionRouteId::invalid ||
+        !add_program_source(route, resident.plan.prepared_program,
+                            resident.readiness, resident.telemetry,
+                            resident.latest_committed_frame)) {
+      return reject_malformed_source(
+          MultiIslandStatusValidationCode::invalid_island);
     }
   }
 
@@ -1957,11 +1956,7 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_cuda_transfers = open_cuda_transfers_;
     s.open_vulkan_transfers = open_vulkan_transfers_;
     s.maxine_transfers = maxine_transfers_;
-    s.prepared_hardware_execution = prepared_hardware_execution_;
-    s.prepared_open_cuda_hardware_execution =
-        prepared_open_cuda_hardware_execution_;
-    s.prepared_maxine_hardware_execution =
-        prepared_maxine_hardware_execution_;
+    s.production_backend = production_backend_;
     s.video_hal_status = video_hal_status_;
   } else {
     // Avoid exposing stale negotiated formats when the pipeline is idle.
@@ -1989,11 +1984,7 @@ CameraPipelineStatus CameraPipeline::Status() const {
     s.open_cuda_transfers = CameraPipelineStatus::OpenCudaTransfers{};
     s.open_vulkan_transfers = CameraPipelineStatus::OpenVulkanTransfers{};
     s.maxine_transfers = CameraPipelineStatus::MaxineTransfers{};
-    s.prepared_hardware_execution = PreparedHardwareExecutionSnapshot{};
-    s.prepared_open_cuda_hardware_execution =
-        PreparedOpenCudaHardwareExecutionSnapshot{};
-    s.prepared_maxine_hardware_execution =
-        PreparedMaxineHardwareExecutionSnapshot{};
+    s.production_backend = ProductionVideoBackendManagerSnapshot{};
     s.video_hal_status = video_hal_status_;
   }
   s.frame_index = frame_index_;
@@ -2091,11 +2082,7 @@ bool CameraPipeline::Start(const CameraPipelineConfig &cfg,
   open_cuda_transfers_ = CameraPipelineStatus::OpenCudaTransfers{};
   open_vulkan_transfers_ = CameraPipelineStatus::OpenVulkanTransfers{};
   maxine_transfers_ = CameraPipelineStatus::MaxineTransfers{};
-  prepared_hardware_execution_ = PreparedHardwareExecutionSnapshot{};
-  prepared_open_cuda_hardware_execution_ =
-      PreparedOpenCudaHardwareExecutionSnapshot{};
-  prepared_maxine_hardware_execution_ =
-      PreparedMaxineHardwareExecutionSnapshot{};
+  production_backend_ = ProductionVideoBackendManagerSnapshot{};
   CameraPipelineHalStatusProjectionInput starting_projection;
   starting_projection.effects = &cfg.effects;
   starting_projection.compute_backend = cfg.compute_backend;
@@ -9421,9 +9408,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     return snapshot;
   };
   auto publish_prepared_hardware_status = [&] {
-    const auto snapshot = prepared_hardware_snapshot();
-    std::lock_guard<std::mutex> lock(mu_);
-    prepared_hardware_execution_ = snapshot;
+    (void)prepared_hardware_snapshot();
   };
   ProductionVideoExecutionComposition open_cuda_hardware_composition;
   bool prepared_open_cuda_hardware_live = false;
@@ -9511,14 +9496,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     return snapshot;
   };
   auto publish_prepared_open_cuda_status = [&] {
-    const auto snapshot = prepared_open_cuda_snapshot();
-    std::lock_guard<std::mutex> lock(mu_);
-    prepared_open_cuda_hardware_execution_ = snapshot;
+    (void)prepared_open_cuda_snapshot();
   };
   auto publish_prepared_maxine_status = [&] {
-    const auto snapshot = prepared_maxine_snapshot();
-    std::lock_guard<std::mutex> lock(mu_);
-    prepared_maxine_hardware_execution_ = snapshot;
+    (void)prepared_maxine_snapshot();
   };
   std::uint64_t video_hal_status_generation = 0;
   {
@@ -9541,34 +9522,15 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             configuration_generation == 0 ? 1 : configuration_generation;
         projection.geometry_generation =
             prepared_hardware_geometry_generation;
-        projection.final_visual = prepared_hardware_snapshot();
-        projection.maxine_resident = prepared_maxine_snapshot();
-        projection.open_cuda_virtual_background =
-            prepared_open_cuda_snapshot();
-        projection.final_visual_live =
-            prepared_hardware_final_live &&
-            !prepared_hardware_runtime_suspended;
-        projection.maxine_resident_live =
-            prepared_maxine_hardware_live &&
-            !prepared_maxine_hardware_suspended &&
-            !projection.maxine_resident.quarantined &&
-            !projection.maxine_resident.stopped;
-        projection.open_cuda_virtual_background_live =
-            prepared_open_cuda_hardware_live &&
-            !prepared_open_cuda_hardware_suspended &&
-            !projection.open_cuda_virtual_background.quarantined &&
-            !projection.open_cuda_virtual_background.stopped &&
-            !projection.open_cuda_virtual_background.shutdown_pending;
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          projection.backend = production_backend_;
+        }
         MultiIslandVideoRuntimeStatusSnapshot snapshot;
         const auto validation =
             BuildCameraPipelineHalStatusSnapshot(projection, &snapshot);
         std::lock_guard<std::mutex> lock(mu_);
         video_hal_status_generation_ = video_hal_status_generation;
-        prepared_hardware_execution_ = projection.final_visual;
-        prepared_maxine_hardware_execution_ =
-            projection.maxine_resident;
-        prepared_open_cuda_hardware_execution_ =
-            projection.open_cuda_virtual_background;
         video_hal_status_ =
             validation.code == MultiIslandStatusValidationCode::valid
                 ? snapshot
