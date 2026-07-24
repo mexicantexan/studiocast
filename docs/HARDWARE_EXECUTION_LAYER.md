@@ -3,7 +3,7 @@
 - Status: Active contract with a staged production migration
 - Applies To: StudioCast v0.2.9 and the current source tree
 - Audience: Video-pipeline, backend, daemon, installer, and test maintainers
-- Last Verified: 2026-07-23
+- Last Verified: 2026-07-24
 
 The StudioCast Hardware Execution Layer (HAL) separates canonical effect
 planning from backend-specific resource ownership and execution. It is an
@@ -149,10 +149,14 @@ real hardware.
 
 ## Current production adapters and migration gates
 
-The camera pipeline uses backend-hidden owner/facade classes. It sees neutral
-prepared requests, host-frame bindings, completion tokens, transfer counters,
-and snapshots rather than backend SDK objects. The current live migration is
-intentionally narrower than the full compatibility pipeline:
+The camera pipeline uses neutral production compositions backed by typed setup
+leases. Backend factories own native sessions, contexts, streams/queues,
+buffers, and adapters; the pipeline sees prepared requests, host-frame
+bindings, completion tokens, transfer counters, and snapshots rather than
+backend SDK objects. Candidate compositions replace a live composition only
+after registration and preparation succeed, so failed reconfiguration retains
+the prior valid plan. The current live migration is intentionally narrower than
+the full compatibility pipeline:
 
 | Route | Current prepared live eligibility | Compatibility behavior |
 | --- | --- | --- |
@@ -169,6 +173,14 @@ ONNX Runtime CUDA IoBinding, validated artifact identity, reusable device
 resources, bounded completion waiting, and retryable shutdown. Model discovery,
 manifest parsing, artifact validation, provider selection, session creation,
 and resource sizing happen at setup.
+
+Setup-lease shutdown is typed and retryable. The composition retires its
+coordinator and registry before requesting native shutdown, and it marks the
+lease stopped only after the owner proves quiescence and permission to release
+its driver context. Open CUDA performs one bounded native shutdown attempt per
+explicit lease retry and retains the complete execution island while release is
+pending; immediate owners such as the current Maxine bootstrap return an
+already-complete result.
 
 The Vulkan adapter may advertise product capability only for mirror and
 fixed-center vignette, with the exact evidence described in
