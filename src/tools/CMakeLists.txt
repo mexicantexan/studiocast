@@ -249,6 +249,28 @@ if (STUDIOCAST_BUILD_BENCHMARKS)
             AUTOUIC OFF
             AUTORCC OFF
     )
+
+    add_executable(studiocast-prepared-open-cuda-facade-bench
+            ${PROJECT_SOURCE_DIR}/src/tools/studiocast_prepared_open_cuda_facade_bench_main.cpp
+    )
+
+    target_link_libraries(studiocast-prepared-open-cuda-facade-bench PRIVATE
+            studiocast_video_runtime
+    )
+
+    target_include_directories(studiocast-prepared-open-cuda-facade-bench PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-prepared-open-cuda-facade-bench)
+    studiocast_enable_sanitizers(studiocast-prepared-open-cuda-facade-bench)
+
+    set_target_properties(studiocast-prepared-open-cuda-facade-bench PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
 endif()
 
 
