@@ -594,6 +594,31 @@ bool ExecuteCommitFailuresAndAllocationFreeFramePath() {
   CHECK(succeeded);
   CHECK(g_allocations.load(std::memory_order_relaxed) == 0);
   CHECK(adapter.prepare_calls == prepare_calls);
+
+  CHECK(owner.Snapshot().latest_committed_frame.valid);
+  owner.Invalidate(hal::ReasonId::reconfiguration_required);
+  const auto retired = owner.Snapshot();
+  CHECK(!retired.prepared);
+  CHECK(!retired.readiness.available);
+  CHECK(retired.readiness.status == hal::StatusId::invalid);
+  CHECK(!retired.latest_committed_frame.valid);
+  CHECK(retired.active_program.program_id == 0);
+  CHECK(retired.execution_domain.backend == hal::BackendId::invalid);
+  CHECK(retired.telemetry.active_backend == hal::BackendId::invalid);
+  CHECK(retired.telemetry.active_provider ==
+        hal::SemanticEffectProviderId::invalid);
+  CHECK(retired.telemetry.runtime_status == hal::StatusId::stale);
+  CHECK(retired.telemetry.runtime_reason ==
+        hal::ReasonId::reconfiguration_required);
+
+  video::PreparedOpenCudaHardwareExecutionOwner unavailable;
+  unavailable.Shutdown();
+  const auto unavailable_stopped = unavailable.Snapshot();
+  CHECK(unavailable_stopped.stopped);
+  CHECK(unavailable_stopped.production.status == hal::StatusId::stopped);
+  CHECK(unavailable_stopped.production.shutdown_requested);
+  CHECK(unavailable_stopped.production.quiescent);
+  CHECK(unavailable_stopped.production.driver_context_release_permitted);
   return true;
 }
 

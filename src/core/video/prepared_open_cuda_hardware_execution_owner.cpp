@@ -480,6 +480,7 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
   bool frame_pending = false;
   bool shutdown_requested = false;
   bool device_lost_latched = false;
+  hal::ReasonId terminal_reason = hal::ReasonId::none;
 
   hal::PreparedProgramSession *Session() noexcept {
     if (injected)
@@ -581,11 +582,38 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
       } else {
         snapshot.active_program = {};
         snapshot.execution_domain = {};
+        snapshot.readiness = {};
+        snapshot.latest_committed_frame = {};
+        snapshot.telemetry.active_backend = hal::BackendId::invalid;
+        snapshot.telemetry.active_provider =
+            hal::SemanticEffectProviderId::invalid;
+        snapshot.telemetry.runtime_status =
+            session->stopped() ? hal::StatusId::stopped
+                               : (snapshot.quarantined || device_lost_latched
+                                      ? hal::StatusId::quarantined
+                                      : hal::StatusId::stale);
+        snapshot.telemetry.runtime_reason =
+            terminal_reason != hal::ReasonId::none
+                ? terminal_reason
+                : (session->stopped() ? hal::ReasonId::shutdown_requested
+                                      : hal::ReasonId::stale_program);
       }
     } else {
       snapshot.prepared = false;
       snapshot.active_program = {};
       snapshot.execution_domain = {};
+      snapshot.readiness = {};
+      snapshot.latest_committed_frame = {};
+      snapshot.telemetry = {};
+      snapshot.telemetry.runtime_status =
+          shutdown_requested ? hal::StatusId::stopped
+                             : (device_lost_latched ? hal::StatusId::quarantined
+                                                    : hal::StatusId::stale);
+      snapshot.telemetry.runtime_reason =
+          terminal_reason != hal::ReasonId::none
+              ? terminal_reason
+              : (shutdown_requested ? hal::ReasonId::shutdown_requested
+                                    : hal::ReasonId::stale_program);
     }
     snapshot.quarantined = snapshot.quarantined || device_lost_latched;
     if (injected) {
@@ -633,11 +661,22 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
         snapshot.production.shutdown_pending || pending_cleanup != nullptr;
 #else
     snapshot.shutdown_pending = false;
+    if (shutdown_requested) {
+      snapshot.production = {};
+      snapshot.production.status = hal::StatusId::stopped;
+      snapshot.production.reason = hal::ReasonId::shutdown_requested;
+      snapshot.production.shutdown_requested = true;
+      snapshot.production.quiescent = true;
+      snapshot.production.driver_context_release_permitted = true;
+      snapshot.production.stopped = true;
+      snapshot.stopped = true;
+    }
 #endif
   }
 
   void RetireActive(hal::ReasonId reason) noexcept {
     frame_pending = false;
+    terminal_reason = reason;
     if (injected) {
       if (injected_session)
         injected_session->Invalidate(reason);
@@ -764,6 +803,7 @@ PreparedOpenCudaHardwareExecutionOwner::Configure(
           if (ExactPreparedReadiness(program, readiness)) {
             impl_->active_request = request;
             impl_->device_lost_latched = false;
+            impl_->terminal_reason = hal::ReasonId::none;
             result.route = PreparedOpenCudaHardwareRoute::hal_live;
             impl_->Refresh(result.route, eligibility);
             return result;
@@ -847,6 +887,7 @@ PreparedOpenCudaHardwareExecutionOwner::Configure(
           impl_->production_session = std::move(candidate_session);
           impl_->active_request = request;
           impl_->device_lost_latched = false;
+          impl_->terminal_reason = hal::ReasonId::none;
           result.route = PreparedOpenCudaHardwareRoute::hal_live;
           result.status = capability.hal_status;
           result.reason = capability.reason;
@@ -1043,6 +1084,7 @@ void PreparedOpenCudaHardwareExecutionOwner::Invalidate(
 
 void PreparedOpenCudaHardwareExecutionOwner::ObserveDeviceLoss() noexcept {
   impl_->device_lost_latched = true;
+  impl_->terminal_reason = hal::ReasonId::device_lost;
   auto *session = impl_->Session();
   if (session)
     session->Invalidate(hal::ReasonId::device_lost);
@@ -1059,6 +1101,7 @@ void PreparedOpenCudaHardwareExecutionOwner::ObserveDeviceLoss() noexcept {
 
 void PreparedOpenCudaHardwareExecutionOwner::Shutdown() noexcept {
   impl_->shutdown_requested = true;
+  impl_->terminal_reason = hal::ReasonId::shutdown_requested;
   impl_->frame_pending = false;
   if (impl_->injected) {
     if (impl_->injected_session && !impl_->injected_session->stopped())
