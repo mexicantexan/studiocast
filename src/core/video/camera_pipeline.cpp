@@ -39,12 +39,14 @@
 #include "core/maxine/effects/vfx_relighting_effect.h"
 #include "core/maxine/maxine_manager.h"
 #include "core/maxine/nvcv_api.h"
+#include "core/maxine/production_video_execution_bootstrap.h"
 #include "core/maxine/production_resident_frame_executor.h"
 #include "core/maxine/vfx_api.h"
 #include "core/open_video/fastdvdnet_denoiser.h"
 #include "core/open_video/frame_analysis_cache.h"
 #include "core/open_video/gaze_correction_eye_contact.h"
 #include "core/open_video/model_pack_registry.h"
+#include "core/open_video/video_execution_factory.h"
 #include "core/open_video/yunet_face_detector.h"
 #include "core/video/capture_error_policy.h"
 #include "core/video/convert.h"
@@ -9366,7 +9368,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   std::unique_ptr<studiocast::maxine::ProductionResidentFrameExecutor>
       maxine_resident_executor;
   studiocast::maxine::ResidentFrameSection maxine_resident_section;
-  PreparedMaxineHardwareExecutionOwner prepared_maxine_hardware_owner;
+  ProductionVideoExecutionComposition maxine_hardware_composition;
   bool prepared_maxine_hardware_live = false;
   bool prepared_maxine_hardware_suspended = false;
   std::vector<std::uint8_t> prepared_maxine_bgr_output;
@@ -9423,18 +9425,98 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     prepared_hardware_execution_ = snapshot;
   };
-  PreparedOpenCudaHardwareExecutionOwner prepared_open_cuda_hardware_owner;
+  ProductionVideoExecutionComposition open_cuda_hardware_composition;
   bool prepared_open_cuda_hardware_live = false;
   bool prepared_open_cuda_hardware_suspended = false;
   bool prepared_open_cuda_setup_attempted = false;
   std::vector<std::uint8_t> prepared_open_cuda_rgb_output;
+  std::uint64_t prepared_maxine_next_plan_id = 1;
+  std::uint64_t prepared_open_cuda_next_plan_id = 1;
+  auto prepared_maxine_snapshot = [&] {
+    const auto source = maxine_hardware_composition.Snapshot();
+    PreparedMaxineHardwareExecutionSnapshot snapshot;
+    snapshot.route = source.prepared
+                         ? PreparedMaxineHardwareRoute::hal_live
+                         : PreparedMaxineHardwareRoute::legacy_compatibility;
+    snapshot.eligibility =
+        source.prepared ? PreparedMaxineHardwareEligibility::eligible
+                        : PreparedMaxineHardwareEligibility::runtime_unavailable;
+    snapshot.readiness = source.readiness;
+    snapshot.telemetry = source.telemetry;
+    snapshot.latest_committed_frame = source.latest_committed_frame;
+    snapshot.active_program = source.plan.prepared_program;
+    snapshot.execution_domain =
+        source.prepared ? source.plan.prepared_program.execution_domain
+                        : hal::ExecutionDomainId{};
+    snapshot.prepared = source.prepared;
+    snapshot.quarantined = source.quarantined;
+    snapshot.stopped = source.stopped;
+    return snapshot;
+  };
+  auto prepared_open_cuda_snapshot = [&] {
+    const auto source = open_cuda_hardware_composition.Snapshot();
+    const auto shutdown =
+        open_cuda_hardware_composition.ShutdownSnapshot();
+    PreparedOpenCudaHardwareExecutionSnapshot snapshot;
+    snapshot.route =
+        source.prepared
+            ? PreparedOpenCudaHardwareRoute::hal_live
+            : PreparedOpenCudaHardwareRoute::legacy_compatibility;
+    snapshot.eligibility =
+        source.prepared
+            ? PreparedOpenCudaHardwareEligibility::eligible
+            : PreparedOpenCudaHardwareEligibility::runtime_unavailable;
+    snapshot.active_program = source.plan.prepared_program;
+    snapshot.readiness = source.readiness;
+    snapshot.telemetry = source.telemetry;
+    snapshot.latest_committed_frame = source.latest_committed_frame;
+    snapshot.execution_domain =
+        source.prepared ? source.plan.prepared_program.execution_domain
+                        : hal::ExecutionDomainId{};
+    snapshot.prepared = source.prepared;
+    snapshot.quarantined = source.quarantined;
+    snapshot.stopped =
+        source.stopped && shutdown.shutdown_requested && !shutdown.pending &&
+        shutdown.quiescent && shutdown.driver_context_release_permitted;
+    snapshot.shutdown_pending = shutdown.pending;
+    snapshot.production.status =
+        shutdown.pending
+            ? shutdown.status
+            : (snapshot.stopped
+                   ? hal::StatusId::stopped
+                   : (source.prepared ? source.readiness.status
+                                      : hal::StatusId::unavailable));
+    snapshot.production.reason =
+        shutdown.pending
+            ? shutdown.reason
+            : (snapshot.stopped ? hal::ReasonId::shutdown_requested
+                                : source.readiness.reason);
+    snapshot.production.shutdown_attempts = shutdown.shutdown_attempts;
+    snapshot.production.bootstrap_domain_ready =
+        source.prepared &&
+        hal::ValidateExecutionDomain(
+            source.plan.prepared_program.execution_domain);
+    snapshot.production.prepared_capability_committed = source.prepared;
+    snapshot.production.quarantined = source.quarantined;
+    snapshot.production.device_lost =
+        source.quarantined &&
+        (source.telemetry.runtime_reason == hal::ReasonId::device_lost ||
+         source.readiness.reason == hal::ReasonId::device_lost);
+    snapshot.production.shutdown_requested = shutdown.shutdown_requested;
+    snapshot.production.shutdown_pending = shutdown.pending;
+    snapshot.production.quiescent = shutdown.quiescent;
+    snapshot.production.driver_context_release_permitted =
+        shutdown.driver_context_release_permitted;
+    snapshot.production.stopped = snapshot.stopped;
+    return snapshot;
+  };
   auto publish_prepared_open_cuda_status = [&] {
-    const auto snapshot = prepared_open_cuda_hardware_owner.Snapshot();
+    const auto snapshot = prepared_open_cuda_snapshot();
     std::lock_guard<std::mutex> lock(mu_);
     prepared_open_cuda_hardware_execution_ = snapshot;
   };
   auto publish_prepared_maxine_status = [&] {
-    const auto snapshot = prepared_maxine_hardware_owner.Snapshot();
+    const auto snapshot = prepared_maxine_snapshot();
     std::lock_guard<std::mutex> lock(mu_);
     prepared_maxine_hardware_execution_ = snapshot;
   };
@@ -9460,10 +9542,9 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         projection.geometry_generation =
             prepared_hardware_geometry_generation;
         projection.final_visual = prepared_hardware_snapshot();
-        projection.maxine_resident =
-            prepared_maxine_hardware_owner.Snapshot();
+        projection.maxine_resident = prepared_maxine_snapshot();
         projection.open_cuda_virtual_background =
-            prepared_open_cuda_hardware_owner.Snapshot();
+            prepared_open_cuda_snapshot();
         projection.final_visual_live =
             prepared_hardware_final_live &&
             !prepared_hardware_runtime_suspended;
@@ -9666,7 +9747,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     want_open_cuda_vb = false;
     have_open_cuda_vb = false;
     prepared_open_cuda_hardware_live =
-        prepared_open_cuda_hardware_owner.Snapshot().prepared;
+        open_cuda_hardware_composition.Snapshot().prepared;
     prepared_open_cuda_hardware_suspended = false;
     prepared_open_cuda_setup_attempted = false;
 
@@ -10049,8 +10130,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (setup_error)
             setup_error->clear();
           const auto retire_unmatched_prepared = [&] {
-            if (prepared_open_cuda_hardware_owner.Snapshot().prepared) {
-              prepared_open_cuda_hardware_owner.Invalidate(
+            if (open_cuda_hardware_composition.Snapshot().prepared) {
+              open_cuda_hardware_composition.Invalidate(
                   hal::ReasonId::reconfiguration_required);
               publish_prepared_open_cuda_status();
             }
@@ -10256,14 +10337,288 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           }
 
           prepared_open_cuda_rgb_output.resize(output_bytes);
-          const auto setup =
-              prepared_open_cuda_hardware_owner.Configure(request);
+          constexpr std::uint64_t hash_offset =
+              UINT64_C(1469598103934665603);
+          constexpr std::uint64_t hash_prime = UINT64_C(1099511628211);
+          const auto hash_value = [&](std::uint64_t hash,
+                                      std::uint64_t value) {
+            for (unsigned shift = 0; shift != 64; shift += 8) {
+              hash ^= static_cast<std::uint8_t>(value >> shift);
+              hash *= hash_prime;
+            }
+            return hash;
+          };
+          const auto hash_bytes = [&](std::uint64_t hash,
+                                      const auto &bytes) {
+            for (const auto value : bytes) {
+              hash ^= value;
+              hash *= hash_prime;
+            }
+            return hash;
+          };
+          const auto hash_artifact = [&] {
+            std::uint64_t hash = hash_offset;
+            hash = hash_value(hash, request.model_artifact.schema_version);
+            hash =
+                hash_value(hash, request.model_artifact.registry_generation);
+            hash =
+                hash_bytes(hash, request.model_artifact.model_id_sha256);
+            hash =
+                hash_bytes(hash, request.model_artifact.manifest_sha256);
+            hash =
+                hash_bytes(hash, request.model_artifact.artifact_sha256);
+            hash = hash_bytes(
+                hash, request.model_artifact.artifact_set_sha256);
+            return hash == 0 ? UINT64_C(1) : hash;
+          };
+          static std::atomic<std::uint64_t> next_adapter_instance_id{
+              UINT64_C(0x4f434c500000)};
+          std::uint64_t adapter_instance_id =
+              next_adapter_instance_id.fetch_add(
+                  1, std::memory_order_relaxed);
+          if (adapter_instance_id == 0) {
+            adapter_instance_id = next_adapter_instance_id.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+
+          studiocast::open_cuda::
+              OpenCudaProductionVideoExecutionFactoryRequest
+                  factory_request;
+          factory_request.factory_id =
+              adapter_instance_id ^ UINT64_C(0x4f43464143544f52);
+          if (factory_request.factory_id == 0)
+            factory_request.factory_id = 1;
+          factory_request.selection_priority = 100;
+          factory_request.semantic = request.semantic;
+          factory_request.model.model_id_hash =
+              request.model_artifact.model_id_sha256;
+          factory_request.model.artifact_set_hash =
+              request.model_artifact.artifact_set_sha256;
+          factory_request.model.artifact_generation =
+              request.model_artifact.registry_generation;
+          factory_request.generations = request.generations;
+          factory_request.reserved_budget = request.capacity;
+          factory_request.backend.adapter_instance_id =
+              adapter_instance_id;
+          factory_request.backend.cuda_device_id = request.cuda_device_id;
+          factory_request.backend.model_pack = request.model_pack;
+          factory_request.backend.model_artifact =
+              request.model_artifact;
+          factory_request.backend.configuration_generation =
+              request.generations.configuration;
+          factory_request.backend.model_preprocess_generation =
+              request.generations.model;
+          factory_request.backend.model_artifact_hash = hash_artifact();
+          factory_request.backend.strength = std::clamp(
+              request.strength, effects::contract::kVbStrengthMin,
+              effects::contract::kVbStrengthMax);
+          factory_request.backend.remove_background_rgb =
+              request.remove_background_rgb;
+          factory_request.backend.wait_policy.timeout_nanoseconds =
+              request.wait.timeout_nanoseconds;
+          factory_request.backend.wait_policy.poll_interval_nanoseconds =
+              request.wait.poll_interval_nanoseconds;
+          factory_request.backend.wait_policy.maximum_poll_count =
+              request.wait.maximum_poll_count;
+          factory_request.backend.wait_policy.stop_requested =
+              request.wait.stop_requested;
+          factory_request.backend.wait_policy.cancel_requested =
+              request.wait.cancel_requested;
+          factory_request.backend.wait_policy.now_nanoseconds =
+              request.wait.now_nanoseconds;
+          factory_request.backend.wait_policy.poll_wait =
+              request.wait.poll_wait;
+          factory_request.backend.wait_policy.callback_context =
+              request.wait.callback_context;
+          factory_request.model_artifact_validated = true;
+          factory_request.provider_runtime_validated = true;
+          factory_request.cuda_iobinding_validated = true;
+          factory_request.user_stream_bound = true;
+          factory_request.reusable_resources_supported = true;
+          factory_request.device_preprocess_supported = true;
+          factory_request.device_postprocess_supported = true;
+          factory_request.stop_aware_bounded_wait = true;
+          factory_request.allocation_free_execute = true;
+
+          ProductionVideoSetupLease setup_lease;
+          ProductionVideoSetupLeaseAcquireEvidence acquire_evidence;
+          studiocast::open_cuda::
+              OpenCudaProductionVideoExecutionBootstrapResult
+                  bootstrap;
+          hal::ReasonId setup_reason = hal::ReasonId::none;
+          const auto lease_status =
+              studiocast::open_cuda::OpenCudaVideoExecutionFactory::
+                  AcquireProductionSetupLease(
+                      factory_request, &setup_lease, &bootstrap,
+                      &acquire_evidence, &setup_reason);
+          VideoExecutionPrepareEvidence prepare_evidence;
+          hal::StatusId setup_status = lease_status;
+          VideoExecutionPlanRequest execution_request;
+          if ((lease_status == hal::StatusId::ready ||
+               lease_status == hal::StatusId::degraded) &&
+              setup_lease.live()) {
+            const auto &lease_snapshot = setup_lease.snapshot();
+            execution_request.plan_id =
+                prepared_open_cuda_next_plan_id++;
+            if (prepared_open_cuda_next_plan_id == 0)
+              prepared_open_cuda_next_plan_id = 1;
+            execution_request.intent.backend.mode =
+                hal::BackendRequestMode::explicit_backend;
+            execution_request.intent.backend.backend =
+                hal::BackendId::cuda;
+            execution_request.intent.backend.strict = true;
+            execution_request.intent.preferences.compute_family =
+                hal::ComputeFamilyAllowance::cuda_family;
+            execution_request.intent.preferences.effects_engine =
+                hal::EffectsEnginePreferenceConstraint::open_cuda;
+            execution_request.intent.preferences.strict_effects_engine =
+                true;
+            execution_request.intent.requested_provider =
+                hal::SemanticEffectProviderId::
+                    open_video_onnxruntime_cuda;
+            execution_request.intent.strict_provider_selection = true;
+            auto &stage = execution_request.intent.stages[0];
+            stage.intent.stage_id = request.stage_id;
+            stage.intent.semantic = request.semantic;
+            stage.intent.required = request.required;
+            stage.intent.failure_action =
+                request.required
+                    ? hal::FailureAction::fail_closed
+                    : hal::FailureAction::fail_open_preserve_input;
+            stage.parameters[0] = {
+                CanonicalVideoParameterId::strength,
+                CanonicalVideoParameterKind::signed_integer,
+                request.strength};
+            const std::uint64_t remove_color =
+                (static_cast<std::uint64_t>(
+                     request.remove_background_rgb[0])
+                 << 16u) |
+                (static_cast<std::uint64_t>(
+                     request.remove_background_rgb[1])
+                 << 8u) |
+                static_cast<std::uint64_t>(
+                    request.remove_background_rgb[2]);
+            stage.parameters[1].id =
+                CanonicalVideoParameterId::remove_color_rgb;
+            stage.parameters[1].kind =
+                CanonicalVideoParameterKind::unsigned_integer;
+            stage.parameters[1].unsigned_value = remove_color;
+            stage.parameter_count = 2;
+            stage.model = lease_snapshot.artifacts[0].artifact;
+            execution_request.intent.stage_count = 1;
+            const auto host_image =
+                [](std::uint32_t width, std::uint32_t height,
+                   hal::PixelFormat format, hal::ChannelOrder order,
+                   hal::Mutability mutability) {
+                  hal::ImageDescriptor image;
+                  image.width = width;
+                  image.height = height;
+                  image.plane_count = 1;
+                  image.format = format;
+                  image.channel_order = order;
+                  image.color_space = hal::ColorSpace::srgb;
+                  image.color_range = hal::ColorRange::full;
+                  image.alpha_meaning = hal::AlphaMeaning::none;
+                  image.orientation = hal::Orientation::top_left;
+                  image.host_coherence = hal::HostCoherence::coherent;
+                  image.mutability = mutability;
+                  image.aliasing = hal::AliasingPermission::forbidden;
+                  image.in_place_permitted = false;
+                  image.base_alignment_bytes = 1;
+                  const auto stride =
+                      static_cast<std::uint64_t>(width) * 3u;
+                  image.planes[0].row_stride_bytes = stride;
+                  image.planes[0].size_bytes = stride * height;
+                  image.planes[0].width = width;
+                  image.planes[0].height = height;
+                  image.planes[0].alignment_bytes = 1;
+                  return image;
+                };
+            execution_request.host_input = host_image(
+                request.capture_width, request.capture_height,
+                hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+                hal::Mutability::read_only);
+            execution_request.host_output = host_image(
+                request.output_width, request.output_height,
+                hal::PixelFormat::rgb_u8, hal::ChannelOrder::rgb,
+                hal::Mutability::write_only);
+            execution_request.invalidation_key.generations =
+                lease_snapshot.generations;
+            std::uint64_t canonical_hash = hash_offset;
+            canonical_hash =
+                hash_value(canonical_hash, request.stage_id);
+            canonical_hash = hash_value(
+                canonical_hash,
+                static_cast<std::uint64_t>(request.semantic));
+            canonical_hash = hash_value(
+                canonical_hash,
+                static_cast<std::uint64_t>(factory_request.backend.strength));
+            canonical_hash =
+                hash_value(canonical_hash, remove_color);
+            canonical_hash =
+                hash_value(canonical_hash, request.capture_width);
+            canonical_hash =
+                hash_value(canonical_hash, request.capture_height);
+            canonical_hash =
+                hash_value(canonical_hash, hash_artifact());
+            execution_request.invalidation_key.canonical_plan_hash =
+                canonical_hash == 0 ? 1 : canonical_hash;
+            execution_request.invalidation_key.model_artifact_hash =
+                hash_artifact();
+            std::uint64_t domain_hash = hash_offset;
+            const auto &domain = lease_snapshot.execution_domain;
+            domain_hash = hash_value(
+                domain_hash, static_cast<std::uint64_t>(domain.backend));
+            domain_hash = hash_value(
+                domain_hash, static_cast<std::uint64_t>(domain.api_family));
+            domain_hash =
+                hash_bytes(domain_hash, domain.physical_device.stable_id);
+            domain_hash = hash_value(
+                domain_hash, domain.logical_context_generation);
+            domain_hash =
+                hash_value(domain_hash, domain.queue_or_stream_identity);
+            domain_hash =
+                hash_value(domain_hash, domain.adapter_instance_id);
+            execution_request.invalidation_key.execution_domain_hash =
+                domain_hash == 0 ? 1 : domain_hash;
+            execution_request.temporal.frame_drop_behavior =
+                hal::FrameDropBehavior::latest_frame_wins;
+            execution_request.budget = lease_snapshot.reserved_budget;
+            execution_request.cpu_tails[0].id =
+                hal::CpuTailId::writer_copy;
+            execution_request.cpu_tails[0].after_stage_id =
+                request.stage_id;
+            execution_request.cpu_tails[0].required = true;
+            execution_request.cpu_tails[0].placement =
+                hal::DeclaredCpuTail::Placement::after_stage;
+            execution_request.cpu_tails[0].boundary_index = 1;
+            execution_request.cpu_tail_count = 1;
+            execution_request.setup_failure_policy =
+                hal::SetupFailurePolicy::retain_old_program;
+            execution_request.migration_policy =
+                VideoExecutionMigrationPolicy::prepared_only;
+            setup_status =
+                open_cuda_hardware_composition.PrepareWithSetupLease(
+                    std::move(setup_lease), execution_request,
+                    &prepare_evidence, &setup_reason);
+          }
           publish_prepared_open_cuda_status();
-          if (setup.route != PreparedOpenCudaHardwareRoute::hal_live) {
+          const auto composition_snapshot =
+              open_cuda_hardware_composition.Snapshot();
+          const bool exact_old_retained =
+              prepare_evidence.old_plan_retained &&
+              composition_snapshot.prepared &&
+              composition_snapshot.plan.prepared_program.invalidation_key ==
+                  execution_request.invalidation_key;
+          if (setup_status != hal::StatusId::ready &&
+              setup_status != hal::StatusId::degraded &&
+              !exact_old_retained) {
+            retire_unmatched_prepared();
             if (setup_error) {
               *setup_error =
                   "Prepared Open CUDA HAL setup failed [" +
-                  std::string(PreparedHardwareReasonCode(setup.reason)) +
+                  std::string(
+                      PreparedHardwareReasonCode(setup_reason)) +
                   "].";
             }
             return false;
@@ -11229,8 +11584,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
     }
 
     if (!prepared_open_cuda_setup_attempted &&
-        prepared_open_cuda_hardware_owner.Snapshot().prepared) {
-      prepared_open_cuda_hardware_owner.Invalidate(
+        open_cuda_hardware_composition.Snapshot().prepared) {
+      open_cuda_hardware_composition.Invalidate(
           hal::ReasonId::reconfiguration_required);
       prepared_open_cuda_hardware_live = false;
       publish_prepared_open_cuda_status();
@@ -11307,12 +11662,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         prepared_frame_plan, resolved_maxine_stage_mask, matte_fingerprint);
     maxine_resident_executor.reset();
     maxine_resident_section.ResetSessionStateAndCounters();
-    if (prepared_maxine_hardware_live) {
-      prepared_maxine_hardware_owner.Invalidate(
-          hal::ReasonId::reconfiguration_required);
-      publish_prepared_maxine_status();
-    }
-    prepared_maxine_hardware_live = false;
+    prepared_maxine_hardware_live =
+        maxine_hardware_composition.Snapshot().prepared;
     prepared_maxine_hardware_suspended = false;
     prepared_maxine_bgr_output.clear();
     maxine_resident_background_rgb.clear();
@@ -11426,6 +11777,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             resident_setup.vignette_center_y_px;
         request.effects = resident_setup.effects;
         request.generations.configuration = effects_generation;
+        request.generations.geometry =
+            prepared_hardware_geometry_generation;
+        request.generations.model = effects_generation;
+        request.generations.provider = 1;
+        request.generations.device = 1;
         request.host_input_is_tight_rgb24 =
             rgbStride == static_cast<std::size_t>(capA.width) * 3u &&
             rgb.size() ==
@@ -11515,11 +11871,303 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               !only_island.plan.stages[index].optional,
           };
         }
-        const auto hal_setup =
-            prepared_maxine_hardware_owner.Configure(request);
+        studiocast::maxine::
+            MaxineProductionVideoExecutionBootstrapRequest
+                bootstrap_request;
+        bootstrap_request.prepared_request = request;
+        bootstrap_request.factory_id =
+            prepared_maxine_next_plan_id ^ UINT64_C(0x4d58464143544f52);
+        if (bootstrap_request.factory_id == 0)
+          bootstrap_request.factory_id = 1;
+        bootstrap_request.selection_priority = 100;
+        bootstrap_request.minimum_synchronizations_per_frame = 1;
+        bootstrap_request.maximum_synchronizations_per_frame = 16;
+        ProductionVideoSetupLease setup_lease;
+        ProductionVideoSetupLeaseAcquireEvidence acquire_evidence;
+        studiocast::maxine::
+            MaxineProductionVideoExecutionBootstrapResult
+                bootstrap_result;
+        hal::ReasonId setup_reason = hal::ReasonId::none;
+        const auto lease_status =
+            studiocast::maxine::
+                MaxineProductionVideoExecutionBootstrap::AcquireSetupLease(
+                    bootstrap_request, &setup_lease, &acquire_evidence,
+                    &bootstrap_result, &setup_reason);
+        VideoExecutionPrepareEvidence prepare_evidence;
+        hal::StatusId setup_status = lease_status;
+        VideoExecutionPlanRequest execution_request;
+        if ((lease_status == hal::StatusId::ready ||
+             lease_status == hal::StatusId::degraded) &&
+            setup_lease.live()) {
+          const auto &lease_snapshot = setup_lease.snapshot();
+          execution_request.plan_id = prepared_maxine_next_plan_id++;
+          if (prepared_maxine_next_plan_id == 0)
+            prepared_maxine_next_plan_id = 1;
+          execution_request.intent.backend.mode =
+              hal::BackendRequestMode::explicit_backend;
+          execution_request.intent.backend.backend =
+              hal::BackendId::maxine;
+          execution_request.intent.backend.strict = true;
+          execution_request.intent.preferences.compute_family =
+              hal::ComputeFamilyAllowance::cuda_family;
+          execution_request.intent.preferences.effects_engine =
+              hal::EffectsEnginePreferenceConstraint::maxine;
+          execution_request.intent.preferences.strict_effects_engine =
+              true;
+          const auto provider_for_semantic =
+              [](hal::SemanticEffectId semantic) {
+                switch (semantic) {
+                case hal::SemanticEffectId::virtual_background_blur:
+                case hal::SemanticEffectId::virtual_background_remove:
+                case hal::SemanticEffectId::virtual_background_replace:
+                case hal::SemanticEffectId::virtual_key_light:
+                case hal::SemanticEffectId::video_noise_removal:
+                  return hal::SemanticEffectProviderId::maxine_vfx;
+                case hal::SemanticEffectId::eye_contact:
+                case hal::SemanticEffectId::auto_frame:
+                  return hal::SemanticEffectProviderId::maxine_ar;
+                case hal::SemanticEffectId::vignette:
+                  return hal::SemanticEffectProviderId::
+                      maxine_cuda_utility;
+                case hal::SemanticEffectId::mirror:
+                case hal::SemanticEffectId::invalid:
+                  return hal::SemanticEffectProviderId::invalid;
+                }
+                return hal::SemanticEffectProviderId::invalid;
+              };
+          hal::SemanticEffectProviderId single_provider =
+              hal::SemanticEffectProviderId::invalid;
+          bool mixed_providers = false;
+          for (std::size_t index = 0; index < request.stage_count;
+               ++index) {
+            const auto provider =
+                provider_for_semantic(request.stages[index].semantic);
+            if (index == 0)
+              single_provider = provider;
+            else
+              mixed_providers |= provider != single_provider;
+          }
+          execution_request.intent.requested_provider =
+              mixed_providers
+                  ? hal::SemanticEffectProviderId::invalid
+                  : single_provider;
+          execution_request.intent.strict_provider_selection =
+              !mixed_providers;
+
+          std::uint64_t canonical_hash =
+              UINT64_C(1469598103934665603);
+          const auto mix_hash = [&](std::uint64_t value) {
+            canonical_hash ^= value;
+            canonical_hash *= UINT64_C(1099511628211);
+          };
+          std::uint64_t model_hash =
+              UINT64_C(1469598103934665603);
+          const auto mix_model_bytes = [&](const auto &bytes) {
+            for (const auto value : bytes) {
+              model_hash ^= value;
+              model_hash *= UINT64_C(1099511628211);
+            }
+          };
+          for (std::size_t index = 0; index < request.stage_count;
+               ++index) {
+            const auto &source_stage = request.stages[index];
+            auto &stage =
+                execution_request.intent
+                    .stages[execution_request.intent.stage_count++];
+            stage.intent.stage_id = source_stage.stage_id;
+            stage.intent.semantic = source_stage.semantic;
+            stage.intent.required = source_stage.required;
+            stage.intent.failure_action =
+                source_stage.required
+                    ? hal::FailureAction::fail_closed
+                    : hal::FailureAction::
+                          fail_open_preserve_last_valid;
+            stage.model = source_stage.model;
+            switch (source_stage.semantic) {
+            case hal::SemanticEffectId::virtual_background_blur:
+            case hal::SemanticEffectId::virtual_background_remove:
+            case hal::SemanticEffectId::virtual_background_replace: {
+              stage.parameters[0] = {
+                  CanonicalVideoParameterId::strength,
+                  CanonicalVideoParameterKind::signed_integer,
+                  request.effects.virtual_background.strength};
+              std::uint32_t remove_rgb = 0;
+              (void)ParseRgbHex(
+                  request.effects.virtual_background.remove_color,
+                  &remove_rgb);
+              stage.parameters[1].id =
+                  CanonicalVideoParameterId::remove_color_rgb;
+              stage.parameters[1].kind =
+                  CanonicalVideoParameterKind::unsigned_integer;
+              stage.parameters[1].unsigned_value = remove_rgb;
+              stage.parameters[2].id =
+                  CanonicalVideoParameterId::greenscreen_mode;
+              stage.parameters[2].kind =
+                  CanonicalVideoParameterKind::unsigned_integer;
+              stage.parameters[2].unsigned_value =
+                  request.effects.virtual_background.greenscreen_mode;
+              stage.parameters[3].id =
+                  CanonicalVideoParameterId::greenscreen_temporal;
+              stage.parameters[3].kind =
+                  CanonicalVideoParameterKind::boolean;
+              stage.parameters[3].boolean_value =
+                  request.effects.virtual_background.greenscreen_temporal;
+              stage.parameter_count = 4;
+              break;
+            }
+            case hal::SemanticEffectId::virtual_key_light:
+              stage.parameters[0] = {
+                  CanonicalVideoParameterId::intensity,
+                  CanonicalVideoParameterKind::signed_integer,
+                  request.effects.virtual_key_light.intensity};
+              stage.parameters[1] = {
+                  CanonicalVideoParameterId::temperature_preset,
+                  CanonicalVideoParameterKind::signed_integer,
+                  request.effects.virtual_key_light.temperature_preset};
+              stage.parameters[2] = {
+                  CanonicalVideoParameterId::direction_pan_degrees,
+                  CanonicalVideoParameterKind::signed_integer,
+                  request.effects.virtual_key_light
+                      .direction_pan_degrees};
+              stage.parameter_count = 3;
+              break;
+            case hal::SemanticEffectId::vignette:
+              stage.parameters[0] = {
+                  CanonicalVideoParameterId::intensity,
+                  CanonicalVideoParameterKind::signed_integer,
+                  request.effects.vignette.intensity};
+              stage.parameters[1].id =
+                  CanonicalVideoParameterId::center_on_tracked_face;
+              stage.parameters[1].kind =
+                  CanonicalVideoParameterKind::boolean;
+              stage.parameters[1].boolean_value =
+                  request.effects.vignette.center_on_tracked_face;
+              stage.parameter_count = 2;
+              break;
+            case hal::SemanticEffectId::video_noise_removal:
+            case hal::SemanticEffectId::eye_contact:
+            case hal::SemanticEffectId::auto_frame:
+            case hal::SemanticEffectId::mirror:
+            case hal::SemanticEffectId::invalid:
+              break;
+            }
+            mix_hash(source_stage.stage_id);
+            mix_hash(static_cast<std::uint64_t>(
+                source_stage.semantic));
+            mix_hash(static_cast<std::uint64_t>(
+                provider_for_semantic(source_stage.semantic)));
+            for (std::size_t parameter_index = 0;
+                 parameter_index < stage.parameter_count;
+                 ++parameter_index) {
+              const auto &parameter =
+                  stage.parameters[parameter_index];
+              mix_hash(static_cast<std::uint64_t>(parameter.id));
+              mix_hash(static_cast<std::uint64_t>(parameter.kind));
+              mix_hash(static_cast<std::uint64_t>(
+                  parameter.signed_value));
+              mix_hash(parameter.unsigned_value);
+              mix_hash(parameter.boolean_value ? 1 : 0);
+            }
+            mix_model_bytes(source_stage.model.model_id_hash);
+            mix_model_bytes(source_stage.model.artifact_set_hash);
+            mix_hash(source_stage.model.artifact_generation);
+          }
+          const auto host_image =
+              [](std::uint32_t width, std::uint32_t height,
+                 hal::PixelFormat format, hal::ChannelOrder order,
+                 hal::Mutability mutability) {
+                hal::ImageDescriptor image;
+                image.width = width;
+                image.height = height;
+                image.plane_count = 1;
+                image.format = format;
+                image.channel_order = order;
+                image.color_space = hal::ColorSpace::srgb;
+                image.color_range = hal::ColorRange::full;
+                image.alpha_meaning = hal::AlphaMeaning::none;
+                image.orientation = hal::Orientation::top_left;
+                image.host_coherence = hal::HostCoherence::coherent;
+                image.mutability = mutability;
+                image.aliasing = hal::AliasingPermission::forbidden;
+                image.in_place_permitted = false;
+                image.base_alignment_bytes = 1;
+                const auto stride =
+                    static_cast<std::uint64_t>(width) * 3u;
+                image.planes[0].row_stride_bytes = stride;
+                image.planes[0].size_bytes = stride * height;
+                image.planes[0].width = width;
+                image.planes[0].height = height;
+                image.planes[0].alignment_bytes = 1;
+                return image;
+              };
+          execution_request.host_input = host_image(
+              request.width, request.height, hal::PixelFormat::rgb_u8,
+              hal::ChannelOrder::rgb, hal::Mutability::read_only);
+          execution_request.host_output = host_image(
+              request.width, request.height, hal::PixelFormat::bgr_u8,
+              hal::ChannelOrder::bgr, hal::Mutability::write_only);
+          execution_request.invalidation_key.generations =
+              lease_snapshot.generations;
+          mix_hash(request.width);
+          mix_hash(request.height);
+          execution_request.invalidation_key.canonical_plan_hash =
+              canonical_hash == 0 ? 1 : canonical_hash;
+          execution_request.invalidation_key.model_artifact_hash =
+              model_hash == 0 ? 1 : model_hash;
+          std::uint64_t domain_hash =
+              UINT64_C(1469598103934665603);
+          const auto mix_domain = [&](std::uint64_t value) {
+            domain_hash ^= value;
+            domain_hash *= UINT64_C(1099511628211);
+          };
+          const auto &domain = lease_snapshot.execution_domain;
+          mix_domain(static_cast<std::uint64_t>(domain.backend));
+          mix_domain(static_cast<std::uint64_t>(domain.api_family));
+          for (const auto value : domain.physical_device.stable_id)
+            mix_domain(value);
+          mix_domain(domain.logical_context_generation);
+          mix_domain(domain.queue_or_stream_identity);
+          mix_domain(domain.adapter_instance_id);
+          execution_request.invalidation_key.execution_domain_hash =
+              domain_hash == 0 ? 1 : domain_hash;
+          execution_request.budget = lease_snapshot.reserved_budget;
+          execution_request.cpu_tails[0].id =
+              hal::CpuTailId::output_format_conversion;
+          execution_request.cpu_tails[0].after_stage_id =
+              request.stages[request.stage_count - 1].stage_id;
+          execution_request.cpu_tails[0].required = true;
+          execution_request.cpu_tails[0].placement =
+              hal::DeclaredCpuTail::Placement::after_stage;
+          execution_request.cpu_tails[0].boundary_index =
+              static_cast<std::uint32_t>(request.stage_count);
+          execution_request.cpu_tail_count = 1;
+          execution_request.setup_failure_policy =
+              hal::SetupFailurePolicy::retain_old_program;
+          execution_request.migration_policy =
+              VideoExecutionMigrationPolicy::prepared_only;
+          setup_status =
+              maxine_hardware_composition.PrepareWithSetupLease(
+                  std::move(setup_lease), execution_request,
+                  &prepare_evidence, &setup_reason);
+        }
         publish_prepared_maxine_status();
+        const auto composition_snapshot =
+            maxine_hardware_composition.Snapshot();
+        const bool exact_old_retained =
+            prepare_evidence.old_plan_retained &&
+            composition_snapshot.prepared &&
+            composition_snapshot.plan.prepared_program.invalidation_key ==
+                execution_request.invalidation_key;
         prepared_maxine_hardware_live =
-            hal_setup.route == PreparedMaxineHardwareRoute::hal_live;
+            setup_status == hal::StatusId::ready ||
+            setup_status == hal::StatusId::degraded ||
+            exact_old_retained;
+        if (!prepared_maxine_hardware_live &&
+            composition_snapshot.prepared) {
+          maxine_hardware_composition.Invalidate(
+              hal::ReasonId::reconfiguration_required);
+          publish_prepared_maxine_status();
+        }
         if (prepared_maxine_hardware_live) {
           if (!note.empty())
             note += "\n";
@@ -11530,6 +12178,12 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       }
 
+      if (!prepared_maxine_hardware_live &&
+          maxine_hardware_composition.Snapshot().prepared) {
+        maxine_hardware_composition.Invalidate(
+            hal::ReasonId::reconfiguration_required);
+        publish_prepared_maxine_status();
+      }
       if (!prepared_maxine_hardware_live && resident_error.empty() &&
           resident_runtime.nvcv &&
           resident_runtime.cuda) {
@@ -11583,6 +12237,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         note += "Maxine: compatible stages share one prepared resident frame "
                 "section, stream, upload, matte, and readback per island.";
       }
+    } else if (maxine_hardware_composition.Snapshot().prepared) {
+      maxine_hardware_composition.Invalidate(
+          hal::ReasonId::reconfiguration_required);
+      prepared_maxine_hardware_live = false;
+      publish_prepared_maxine_status();
     }
 
     {
@@ -11984,14 +12643,14 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
       publish_prepared_hardware_status();
     }
     if (prepared_open_cuda_hardware_live) {
-      prepared_open_cuda_hardware_owner.Invalidate(
+      open_cuda_hardware_composition.Invalidate(
           hal::ReasonId::reconfiguration_required);
       prepared_open_cuda_hardware_live = false;
       prepared_open_cuda_hardware_suspended = false;
       publish_prepared_open_cuda_status();
     }
     if (prepared_maxine_hardware_live) {
-      prepared_maxine_hardware_owner.Invalidate(
+      maxine_hardware_composition.Invalidate(
           hal::ReasonId::reconfiguration_required);
       prepared_maxine_hardware_live = false;
       prepared_maxine_hardware_suspended = false;
@@ -13371,15 +14030,38 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   static_cast<std::size_t>(capA.width) * 3u;
               const std::size_t tight_bytes =
                   tight_stride * static_cast<std::size_t>(capA.height);
+              const auto execution_plan =
+                  open_cuda_hardware_composition.Snapshot().plan;
+              hal::HostFrameBinding binding;
+              binding.input_descriptor = execution_plan.host_input;
+              binding.output_descriptor = execution_plan.host_output;
+              binding.input_planes[0].read_data =
+                  reinterpret_cast<const std::byte *>(rgb.data());
+              binding.input_planes[0].span_bytes = rgb.size();
+              binding.input_planes[0].row_stride_bytes = rgbStride;
+              binding.output_planes[0].write_data =
+                  reinterpret_cast<std::byte *>(
+                      prepared_open_cuda_rgb_output.data());
+              binding.output_planes[0].span_bytes = tight_bytes;
+              binding.output_planes[0].row_stride_bytes =
+                  tight_stride;
+              binding.input_plane_count = 1;
+              binding.output_plane_count = 1;
+              binding.capture_sequence = capture_sequence;
+              binding.ownership =
+                  hal::OwnershipModel::borrowed_until_completion;
+              binding.lifetime = hal::ResourceLifetime::frame_borrowed;
               const auto prepared_frame =
-                  prepared_open_cuda_hardware_owner.ExecuteHostFrame(
-                      rgb.data(), rgb.size(), rgbStride,
-                      prepared_open_cuda_rgb_output.data(), tight_bytes,
-                      tight_stride, capture_sequence);
+                  open_cuda_hardware_composition.Execute(binding);
+              const auto execution_snapshot =
+                  open_cuda_hardware_composition.Snapshot();
               publish_prepared_open_cuda_status();
               prepared_open_cuda_completion = prepared_frame.completion;
               prepared_open_cuda_completion_pending =
-                  prepared_frame.completion_pending;
+                  execution_snapshot.frame_pending;
+              const bool execution_succeeded =
+                  prepared_frame.status == hal::StatusId::executed ||
+                  prepared_frame.status == hal::StatusId::degraded;
               const bool exact_transfer_shape =
                   prepared_frame.transfers.uploads == 1 &&
                   prepared_frame.transfers.final_readbacks == 1 &&
@@ -13388,11 +14070,18 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   prepared_frame.transfers.synchronizations == 1 &&
                   prepared_frame.transfers.cpu_tail_boundaries == 1;
               prepared_open_cuda_output_ready =
-                  prepared_frame.output_ready && exact_transfer_shape &&
-                  prepared_frame.output ==
-                      prepared_open_cuda_rgb_output.data() &&
-                  prepared_frame.output_size_bytes == tight_bytes &&
-                  prepared_frame.output_row_stride_bytes == tight_stride;
+                  execution_succeeded &&
+                  execution_snapshot.frame_pending &&
+                  prepared_frame.output_ready &&
+                  prepared_frame.output.output_ready &&
+                  exact_transfer_shape &&
+                  prepared_frame.output.planes[0].read_data ==
+                      reinterpret_cast<const std::byte *>(
+                          prepared_open_cuda_rgb_output.data()) &&
+                  prepared_frame.output.planes[0].span_bytes ==
+                      tight_bytes &&
+                  prepared_frame.output.planes[0].row_stride_bytes ==
+                      tight_stride;
               if (prepared_open_cuda_output_ready) {
                 open_cuda_frame_upload_calls +=
                     prepared_frame.transfers.uploads;
@@ -13408,12 +14097,13 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
               }
               if (prepared_open_cuda_completion_pending) {
                 hal::ReasonId commit_reason = hal::ReasonId::none;
-                (void)prepared_open_cuda_hardware_owner.CommitOutput(
+                (void)open_cuda_hardware_composition.CommitOutput(
                     prepared_open_cuda_completion, false, &commit_reason);
                 prepared_open_cuda_completion_pending = false;
               }
               if (prepared_frame.reason == hal::ReasonId::device_lost) {
-                prepared_open_cuda_hardware_owner.ObserveDeviceLoss();
+                open_cuda_hardware_composition.Invalidate(
+                    hal::ReasonId::device_lost);
               }
               prepared_open_cuda_hardware_suspended =
                   PreparedOpenCudaPipelineShouldSuspend(
@@ -14158,59 +14848,60 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                   return Kind::count;
                 };
 
-            const auto &active =
-                prepared_maxine_hardware_owner.active_request();
+            const auto active =
+                maxine_hardware_composition.Snapshot()
+                    .plan.prepared_program;
             const std::size_t tight_stride =
                 static_cast<std::size_t>(capA.width) * 3u;
             const std::size_t tight_bytes =
                 tight_stride * static_cast<std::size_t>(capA.height);
+            hal::HostFrameBinding binding;
+            binding.input_descriptor = active.host_input;
+            binding.output_descriptor = active.host_output;
+            binding.input_planes[0].read_data =
+                reinterpret_cast<const std::byte *>(rgb.data());
+            binding.input_planes[0].span_bytes = rgb.size();
+            binding.input_planes[0].row_stride_bytes = rgbStride;
+            binding.output_planes[0].write_data =
+                reinterpret_cast<std::byte *>(
+                    prepared_maxine_bgr_output.data());
+            binding.output_planes[0].span_bytes =
+                prepared_maxine_bgr_output.size();
+            binding.output_planes[0].row_stride_bytes = tight_stride;
+            binding.input_plane_count = 1;
+            binding.output_plane_count = 1;
+            binding.capture_sequence = capture_sequence;
+            binding.ownership =
+                hal::OwnershipModel::borrowed_until_completion;
+            binding.lifetime = hal::ResourceLifetime::frame_borrowed;
             const auto frame =
-                prepared_maxine_hardware_owner.ExecuteHostFrame(
-                    rgb.data(), rgb.size(), rgbStride,
-                    prepared_maxine_bgr_output.data(),
-                    prepared_maxine_bgr_output.size(), tight_stride,
-                    capture_sequence);
-
-            maxine_rgb_to_bgr_calls +=
-                frame.compatibility.rgb_to_bgr_calls;
-            maxine_upload_attempts +=
-                frame.compatibility.upload_attempts;
-            maxine_upload_calls += frame.compatibility.upload_calls;
+                maxine_hardware_composition.Execute(binding);
+            const auto execution_snapshot =
+                maxine_hardware_composition.Snapshot();
+            publish_prepared_maxine_status();
+            const bool execution_succeeded =
+                frame.status == hal::StatusId::executed ||
+                frame.status == hal::StatusId::degraded;
+            const bool exact_transfer_shape =
+                frame.transfers.uploads == 1 &&
+                frame.transfers.final_readbacks == 1 &&
+                frame.transfers.intermediate_uploads == 0 &&
+                frame.transfers.intermediate_readbacks == 0 &&
+                frame.transfers.cpu_tail_boundaries == 1 &&
+                frame.transfers.synchronizations >= 1 &&
+                frame.transfers.synchronizations <= 16;
+            maxine_rgb_to_bgr_calls += execution_succeeded ? 1 : 0;
+            maxine_upload_attempts += frame.transfers.uploads;
+            maxine_upload_calls += frame.transfers.uploads;
             maxine_final_download_attempts +=
-                frame.compatibility.final_download_attempts;
+                frame.transfers.final_readbacks;
             maxine_final_download_calls +=
-                frame.compatibility.final_download_calls;
-            maxine_cpu_continuation_download_attempts +=
-                frame.compatibility.cpu_continuation_download_attempts;
-            maxine_cpu_continuation_download_calls +=
-                frame.compatibility.cpu_continuation_download_calls;
-            maxine_download_calls +=
-                frame.compatibility.final_download_calls +
-                frame.compatibility.cpu_continuation_download_calls;
-            maxine_device_bridge_attempts +=
-                frame.compatibility.device_bridge_attempts;
-            maxine_device_bridge_calls +=
-                frame.compatibility.device_bridge_calls;
-            maxine_matte_inference_attempts +=
-                frame.compatibility.matte_inference_attempts;
-            maxine_green_screen_calls +=
-                frame.compatibility.matte_inference_calls;
-            maxine_shared_green_screen_matte_reuse_calls +=
-                frame.compatibility.shared_matte_reuses;
+                frame.transfers.final_readbacks;
+            maxine_download_calls += frame.transfers.final_readbacks;
             maxine_forced_sync_attempts +=
-                frame.compatibility.sync_attempts;
-            maxine_forced_sync_calls += frame.compatibility.sync_calls;
-            maxine_composite_attempts +=
-                frame.compatibility.composite_attempts;
-            maxine_composite_calls += frame.compatibility.composite_calls;
-            maxine_synchronous_sdk_run_attempts +=
-                frame.compatibility.synchronous_sdk_run_attempts;
-            maxine_synchronous_sdk_run_calls +=
-                frame.compatibility.synchronous_sdk_run_calls;
-            maxine_asynchronous_sdk_run_attempts +=
-                frame.compatibility.asynchronous_sdk_run_attempts;
-            maxine_asynchronous_sdk_run_calls +=
-                frame.compatibility.asynchronous_sdk_run_calls;
+                frame.transfers.synchronizations;
+            maxine_forced_sync_calls +=
+                frame.transfers.synchronizations;
             for (std::size_t index = 0; index < active.stage_count; ++index) {
               const auto kind =
                   resident_kind_for_semantic(active.stages[index].semantic);
@@ -14219,28 +14910,39 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
                 continue;
               }
               const auto kind_index = static_cast<std::size_t>(kind);
-              maxine_stage_attempts[kind_index] +=
-                  frame.compatibility.stage_attempts[index];
-              maxine_stage_successes[kind_index] +=
-                  frame.compatibility.stage_successes[index];
+              ++maxine_stage_attempts[kind_index];
+              if (index < frame.stage_count &&
+                  frame.stages[index].status ==
+                      hal::StageExecutionStatus::succeeded) {
+                ++maxine_stage_successes[kind_index];
+              }
             }
 
             prepared_maxine_completion = frame.completion;
             prepared_maxine_completion_pending =
-                frame.completion_pending;
-            if (!frame.output_ready || frame.output == nullptr ||
-                frame.output_size_bytes != tight_bytes ||
-                frame.output_row_stride_bytes != tight_stride) {
+                execution_snapshot.frame_pending;
+            const bool output_ready =
+                execution_succeeded && execution_snapshot.frame_pending &&
+                frame.output_ready && frame.output.output_ready &&
+                exact_transfer_shape &&
+                frame.output.planes[0].read_data ==
+                    reinterpret_cast<const std::byte *>(
+                        prepared_maxine_bgr_output.data()) &&
+                frame.output.planes[0].span_bytes == tight_bytes &&
+                frame.output.planes[0].row_stride_bytes ==
+                    tight_stride;
+            if (!output_ready) {
               ++maxine_runtime_failure_frames;
               if (prepared_maxine_completion_pending) {
                 hal::ReasonId commit_reason = hal::ReasonId::none;
-                (void)prepared_maxine_hardware_owner.CommitOutput(
+                (void)maxine_hardware_composition.CommitOutput(
                     prepared_maxine_completion, false, &commit_reason);
                 prepared_maxine_completion_pending = false;
                 publish_prepared_maxine_status();
               }
               if (frame.reason == hal::ReasonId::device_lost) {
-                prepared_maxine_hardware_owner.NotifyDeviceLost();
+                maxine_hardware_composition.Invalidate(
+                    hal::ReasonId::device_lost);
                 prepared_maxine_hardware_suspended = true;
                 publish_prepared_maxine_status();
               }
@@ -14270,8 +14972,10 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
             }
 
             studiocast::video::Bgr24ToRgb24(
-                frame.output, rgb.data(), capA.width, capA.height,
-                frame.output_row_stride_bytes, rgbStride);
+                reinterpret_cast<const std::uint8_t *>(
+                    frame.output.planes[0].read_data),
+                rgb.data(), capA.width, capA.height,
+                frame.output.planes[0].row_stride_bytes, rgbStride);
             ++maxine_bgr_to_rgb_calls;
             ++maxine_cpu_tail_stage_calls;
 
@@ -15628,7 +16332,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (prepared_maxine_completion_pending) {
             hal::ReasonId reason = hal::ReasonId::none;
             const hal::StatusId status =
-                prepared_maxine_hardware_owner.CommitOutput(
+                maxine_hardware_composition.CommitOutput(
                     prepared_maxine_completion, output_write_succeeded,
                     &reason);
             prepared_maxine_completion_pending = false;
@@ -15637,7 +16341,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
           if (prepared_open_cuda_completion_pending) {
             hal::ReasonId reason = hal::ReasonId::none;
             const hal::StatusId status =
-                prepared_open_cuda_hardware_owner.CommitOutput(
+                open_cuda_hardware_composition.CommitOutput(
                     prepared_open_cuda_completion, output_write_succeeded,
                     &reason);
             prepared_open_cuda_completion_pending = false;
@@ -15834,8 +16538,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       }
       if (had_prepared_maxine_completion) {
-        const auto maxine_snapshot =
-            prepared_maxine_hardware_owner.Snapshot();
+        const auto maxine_snapshot = prepared_maxine_snapshot();
         const auto &committed =
             maxine_snapshot.latest_committed_frame;
         const auto &active_program = maxine_snapshot.active_program;
@@ -15914,8 +16617,7 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
         }
       }
       if (had_prepared_open_cuda_completion) {
-        const auto snapshot =
-            prepared_open_cuda_hardware_owner.Snapshot();
+        const auto snapshot = prepared_open_cuda_snapshot();
         const auto &committed = snapshot.latest_committed_frame;
         const auto &active_program = snapshot.active_program;
         if (!committed.valid ||
@@ -16416,16 +17118,23 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig cfg) {
   open_cuda_next = nullptr;
   open_cuda_uploaded_this_frame = false;
 
-  prepared_open_cuda_hardware_owner.Shutdown();
+  (void)open_cuda_hardware_composition.Shutdown();
   for (int attempt = 0;
        attempt < 8 &&
-       prepared_open_cuda_hardware_owner.Snapshot().shutdown_pending;
+       open_cuda_hardware_composition.ShutdownSnapshot().pending;
        ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    prepared_open_cuda_hardware_owner.Shutdown();
+    (void)open_cuda_hardware_composition.Shutdown();
   }
   publish_prepared_open_cuda_status();
-  prepared_maxine_hardware_owner.Shutdown();
+  (void)maxine_hardware_composition.Shutdown();
+  for (int attempt = 0;
+       attempt < 8 &&
+       maxine_hardware_composition.ShutdownSnapshot().pending;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    (void)maxine_hardware_composition.Shutdown();
+  }
   prepared_maxine_hardware_live = false;
   publish_prepared_maxine_status();
   prepared_hardware_composition.Shutdown();

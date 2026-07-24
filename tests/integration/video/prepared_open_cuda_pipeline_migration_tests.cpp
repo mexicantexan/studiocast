@@ -548,7 +548,7 @@ void TestMigrationStructuralGuards() {
       "try_prepare_open_cuda_virtual_background");
   const auto loop = source.find("while (!stop_.load())");
   const auto execute = source.find(
-      "prepared_open_cuda_hardware_owner.ExecuteHostFrame");
+      "open_cuda_hardware_composition.Execute(binding)");
   const auto write = source.find("writer_.WriteFrameDetailed");
   const auto commit_gate = source.find(
       "PreparedOpenCudaPipelineMayCommitAttribution", write);
@@ -575,22 +575,39 @@ void TestMigrationStructuralGuards() {
   CHECK(source.find("request.output_format_conversion_required =") !=
         std::string::npos);
   CHECK(source.find("ValidateModelArtifactIdentity") != std::string::npos);
-  CHECK(source.find("prepared_open_cuda_hardware_owner.ObserveDeviceLoss") !=
+  CHECK(source.find("AcquireProductionSetupLease") !=
         std::string::npos);
-  CHECK(source.find("prepared_open_cuda_hardware_owner.Shutdown") !=
+  CHECK(source.find(
+            "open_cuda_hardware_composition.PrepareWithSetupLease") !=
+        std::string::npos);
+  CHECK(source.find(
+            "open_cuda_hardware_composition.Invalidate") !=
+        std::string::npos);
+  CHECK(source.find("open_cuda_hardware_composition.Shutdown") !=
+        std::string::npos);
+  CHECK(source.find("PreparedOpenCudaHardwareExecutionOwner "
+                    "prepared_open_cuda_hardware_owner") ==
+        std::string::npos);
+  CHECK(source.find(
+            "prepared_open_cuda_hardware_owner.ExecuteHostFrame") ==
+        std::string::npos);
+  CHECK(source.find(
+            "prepared_open_cuda_hardware_owner.CommitOutput") ==
         std::string::npos);
   CHECK(source.find("Never retry through the legacy context") !=
         std::string::npos);
   CHECK(source.find("breaker.AllowsAttempt(capture_sequence)") !=
         std::string::npos);
 
-  // Provider probing, model scanning, artifact hashing, Configure and JSON
-  // must remain before the capture loop. ExecuteHostFrame is the sole facade
-  // call in the live section.
+  // Provider probing, model scanning, artifact hashing, setup-lease
+  // acquisition and JSON must remain before the capture loop. The neutral
+  // composition is the sole facade in the live section.
   const std::string live = source.substr(loop);
   CHECK(live.find("ModelPackRegistry::ScanDefault") == std::string::npos);
   CHECK(live.find("ValidateModelArtifactIdentity") == std::string::npos);
-  CHECK(live.find("prepared_open_cuda_hardware_owner.Configure") ==
+  CHECK(live.find("AcquireProductionSetupLease") ==
+        std::string::npos);
+  CHECK(live.find("PrepareWithSetupLease") ==
         std::string::npos);
   CHECK(live.find("Json") == std::string::npos);
   CHECK(live.find("JSON") == std::string::npos);
