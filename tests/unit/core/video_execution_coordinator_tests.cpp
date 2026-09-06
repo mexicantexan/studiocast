@@ -229,7 +229,10 @@ enum class ExecuteMode {
   transfer_mismatch,
   legacy_boundary_mismatch,
   variable_maximum,
-  variable_outside,
+  variable_outside_readback,
+  variable_outside_upload,
+  variable_outside_cpu_tail,
+  variable_below_cpu_tail,
 };
 
 class FakeExecutor final : public video::IVideoExecutionExecutor {
@@ -317,9 +320,20 @@ public:
       result.transfers.cpu_tail_boundaries =
           plan_.per_frame_transfers.maximum_cpu_tail_boundaries;
       break;
-    case ExecuteMode::variable_outside:
+    case ExecuteMode::variable_outside_readback:
       result.transfers.intermediate_readbacks =
           plan_.per_frame_transfers.maximum_intermediate_readbacks + 1;
+      break;
+    case ExecuteMode::variable_outside_upload:
+      result.transfers.intermediate_uploads =
+          plan_.per_frame_transfers.maximum_intermediate_uploads + 1;
+      break;
+    case ExecuteMode::variable_outside_cpu_tail:
+      result.transfers.cpu_tail_boundaries =
+          plan_.per_frame_transfers.maximum_cpu_tail_boundaries + 1;
+      break;
+    case ExecuteMode::variable_below_cpu_tail:
+      result.transfers.cpu_tail_boundaries = 0;
       break;
     }
     return result;
@@ -410,6 +424,8 @@ public:
       ++result.per_frame_transfers.intermediate_readbacks;
     if (malformed_transfer_version)
       ++result.per_frame_transfers.contract_version;
+    if (undeclared_variable_bound)
+      result.per_frame_transfers.maximum_intermediate_readbacks = 1;
     result.readiness.status = preflight_status;
     result.readiness.requested_backend = resolution.requested_backend;
     result.readiness.selected_backend = result.backend;
@@ -498,6 +514,7 @@ public:
   bool malformed_prepared_tail = false;
   bool malformed_transfer_boundary = false;
   bool malformed_transfer_version = false;
+  bool undeclared_variable_bound = false;
   bool variable_boundaries = false;
   video::VariablePerFrameTransferBounds variable_bounds{};
   bool candidate_rolled_back = false;
@@ -1246,13 +1263,15 @@ bool TestTransferContractValidation() {
 
 bool TestVariableTransferBoundaryContract() {
   const auto run = [](ExecuteMode mode, int malformed,
-                      hal::StatusId expected_status) {
+                      hal::StatusId expected_status, bool with_tail = false) {
     const auto domain = Domain();
     DummyResident resident(domain);
     hal::StaticAdapterRegistry registry;
     if (!RegisterCapability(
             &registry, &resident, domain,
-            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda))
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda, 10,
+            with_tail ? hal::CpuTailId::writer_copy
+                      : hal::CpuTailId::invalid))
       return false;
     FakeFactory factory(
         domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
@@ -1261,11 +1280,19 @@ bool TestVariableTransferBoundaryContract() {
     factory.variable_bounds.maximum_intermediate_readbacks = 12;
     factory.variable_bounds.maximum_intermediate_uploads = 1;
     factory.variable_bounds.maximum_cpu_tail_boundaries = 1;
+    if (with_tail)
+      factory.variable_bounds.minimum_cpu_tail_boundaries = 1;
     if (malformed == 1)
       factory.variable_bounds.minimum_intermediate_readbacks = 13;
     if (malformed == 2)
       factory.variable_bounds.maximum_intermediate_readbacks =
           hal::kMaxExecutionBoundaries + 1;
+    if (malformed == 3)
+      factory.variable_bounds.minimum_intermediate_readbacks = 1;
+    if (malformed == 4) {
+      factory.variable_boundaries = false;
+      factory.undeclared_variable_bound = true;
+    }
     video::VideoExecutionCoordinator coordinator(registry);
     hal::ReasonId reason = hal::ReasonId::none;
     if (coordinator.RegisterFactory(
@@ -1276,7 +1303,17 @@ bool TestVariableTransferBoundaryContract() {
             &reason) != hal::StatusId::ready)
       return false;
     video::VideoExecutionPrepareEvidence evidence;
-    const auto prepared = coordinator.Prepare(Request(), &evidence, &reason);
+    auto request = Request();
+    if (with_tail) {
+      request.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+      request.cpu_tails[0].after_stage_id = 1;
+      request.cpu_tails[0].required = true;
+      request.cpu_tails[0].placement =
+          hal::DeclaredCpuTail::Placement::after_stage;
+      request.cpu_tails[0].boundary_index = 1;
+      request.cpu_tail_count = 1;
+    }
+    const auto prepared = coordinator.Prepare(request, &evidence, &reason);
     if (malformed)
       return Require(prepared == hal::StatusId::blocked &&
                          reason == hal::ReasonId::malformed_contract &&
@@ -1299,9 +1336,18 @@ bool TestVariableTransferBoundaryContract() {
   ok &= run(ExecuteMode::optional_fail_open, 0, hal::StatusId::degraded);
   ok &= run(ExecuteMode::variable_maximum, 0,
             hal::StatusId::executed);
-  ok &= run(ExecuteMode::variable_outside, 0, hal::StatusId::failed);
+  ok &= run(ExecuteMode::variable_outside_readback, 0,
+            hal::StatusId::failed);
+  ok &= run(ExecuteMode::variable_outside_upload, 0,
+            hal::StatusId::failed);
+  ok &= run(ExecuteMode::variable_outside_cpu_tail, 0,
+            hal::StatusId::failed);
+  ok &= run(ExecuteMode::variable_below_cpu_tail, 0,
+            hal::StatusId::failed, true);
   ok &= run(ExecuteMode::success, 1, hal::StatusId::blocked);
   ok &= run(ExecuteMode::success, 2, hal::StatusId::blocked);
+  ok &= run(ExecuteMode::success, 3, hal::StatusId::blocked);
+  ok &= run(ExecuteMode::success, 4, hal::StatusId::blocked);
 
   return ok;
 }
