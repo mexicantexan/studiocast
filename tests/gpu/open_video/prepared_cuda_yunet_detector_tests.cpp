@@ -1,11 +1,29 @@
 #include "core/open_video/prepared_cuda_yunet_detector.h"
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 using namespace studiocast;
+
+std::atomic<std::size_t> g_heap_allocations{0};
+void *operator new(std::size_t size) {
+  g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void *memory = std::malloc(size))
+    return memory;
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 namespace {
 struct State {
   cuda::CUcontext ctx = nullptr;
@@ -260,12 +278,16 @@ int main() {
   wait.poll_interval_nanoseconds = 1;
   wait.maximum_poll_count = 2;
   const auto allocations = state.memory.size();
+  const auto heap_allocations =
+      g_heap_allocations.load(std::memory_order_relaxed);
   auto r = d.Execute(setup.binding, image, 1, &cache, wait);
-  bool ok = state.memory.size() == allocations &&
-            r.status == open_video::PreparedCudaYunetStatus::success_no_faces &&
-            r.enqueued_readbacks == 12 && r.completed_readbacks == 12 &&
-            r.completion_waits == 1 && r.cpu_tail_boundaries == 1 &&
-            state.runs == 2 && state.copies == 12 && !r.pending_work;
+  bool ok =
+      state.memory.size() == allocations &&
+      g_heap_allocations.load(std::memory_order_relaxed) == heap_allocations &&
+      r.status == open_video::PreparedCudaYunetStatus::success_no_faces &&
+      r.enqueued_readbacks == 12 && r.completed_readbacks == 12 &&
+      r.completion_waits == 1 && r.cpu_tail_boundaries == 1 &&
+      state.runs == 2 && state.copies == 12 && !r.pending_work;
   state.fail_copy = state.copies + 3;
   auto partial = d.Execute(setup.binding, image, 2, &cache, wait);
   ok &=
