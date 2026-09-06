@@ -533,14 +533,17 @@ ReasonId ValidateProductionProgramInternal(
   }
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
+    const auto &expected_output =
+        index + 1 == program.stage_count ? program.host_output
+                                         : program.host_input;
     if (stage.input.kind != hal::StageIoKind::image ||
         stage.output.kind != hal::StageIoKind::image ||
         !ResidentRgb(stage.input.image, hal::Mutability::read_only) ||
         !ResidentRgb(stage.output.image, hal::Mutability::read_write) ||
         stage.input.image.width != program.host_input.width ||
         stage.input.image.height != program.host_input.height ||
-        stage.output.image.width != program.host_input.width ||
-        stage.output.image.height != program.host_input.height)
+        stage.output.image.width != expected_output.width ||
+        stage.output.image.height != expected_output.height)
       return ReasonId::malformed_descriptor;
   }
   const auto &stage = program.stages[program.stage_count - 1];
@@ -900,7 +903,7 @@ public:
       preflight.requested_strength = config.strength;
       preflight.input_pitch_bytes = image.planes[0].row_stride_bytes;
       preflight.output_pitch_bytes =
-          program.stages[0].output.image.planes[0].row_stride_bytes;
+          program.stages[0].input.image.planes[0].row_stride_bytes;
       preflight.final_output_width = program.host_output.width;
       preflight.final_output_height = program.host_output.height;
       preflight.final_output_pitch_bytes =
@@ -957,7 +960,7 @@ public:
                                       cuda::PixelFormatGpu::rgb_u8, &error) ||
           candidate->input.pitch != image.planes[0].row_stride_bytes ||
           candidate->output.pitch !=
-              program.stages[0].output.image.planes[0].row_stride_bytes) {
+              program.stages[0].input.image.planes[0].row_stride_bytes) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::resource_exhausted,
                             ReasonId::resource_exhausted);
@@ -1195,7 +1198,13 @@ public:
       exact_plan_input.final_output_pitch_bytes =
           candidate->final_output.Valid() ? candidate->final_output.pitch
                                           : candidate->output.pitch;
-      exact_plan_input.model_alpha_capacity_bytes = candidate->alpha.pitch;
+      if (!CheckedMul(candidate->alpha.pitch,
+                      static_cast<std::uint64_t>(model_h),
+                      &exact_plan_input.model_alpha_capacity_bytes)) {
+        CleanupCandidate(candidate.get());
+        return SetupFailure(RuntimeStatus::resource_exhausted,
+                            ReasonId::resource_exhausted);
+      }
       exact_plan_input.input_tensor_capacity_bytes =
           input_view.allocation_capacity_bytes;
       exact_plan_input.resized_alpha_pitch_bytes =

@@ -263,7 +263,10 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.input.image = resident;
     stage.input.image.mutability = hal::Mutability::read_only;
     stage.output.kind = hal::StageIoKind::image;
-    stage.output.image = resident;
+    stage.output.image = index + 1 == request.intent.stage_count
+                             ? ResidentImage(request.host_output,
+                                             hal::Mutability::read_write)
+                             : resident;
     stage.model = request.intent.stages[index].model;
     stage.required = intent.required;
     stage.failure_action = intent.failure_action;
@@ -943,7 +946,9 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       capability.provider = kProvider;
       capability.status = hal::StatusId::ready;
       capability.reason = hal::ReasonId::none;
-      capability.cpu_tail = hal::CpuTailId::writer_copy;
+      capability.cpu_tail = index + 1 == request.stage_count
+                                ? hal::CpuTailId::writer_copy
+                                : hal::CpuTailId::invalid;
       capability.cpu_tail_placement =
           hal::DeclaredCpuTail::Placement::after_stage;
       capability.live_stage = true;

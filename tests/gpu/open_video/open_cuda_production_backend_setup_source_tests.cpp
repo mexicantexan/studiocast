@@ -247,7 +247,11 @@ public:
       stage.input.image = request.host_input;
       stage.input.image.host_coherence = hal::HostCoherence::not_host_visible;
       stage.output.kind = hal::StageIoKind::image;
-      stage.output.image = stage.input.image;
+      stage.output.image =
+          index + 1 == request.intent.stage_count
+              ? request.host_output
+              : request.host_input;
+      stage.output.image.host_coherence = hal::HostCoherence::not_host_visible;
       stage.output.image.mutability = hal::Mutability::read_write;
       stage.model = request.intent.stages[index].model;
       stage.required = resolved.intent.required;
@@ -355,7 +359,9 @@ hal::StatusId AcquireFakeLease(
     capability.live_stage = true;
     capability.production_eligible = true;
     capability.exact_evidence = true;
-    capability.cpu_tail = hal::CpuTailId::writer_copy;
+    capability.cpu_tail = index + 1 == request.stage_count
+                              ? hal::CpuTailId::writer_copy
+                              : hal::CpuTailId::invalid;
     capability.cpu_tail_placement =
         hal::DeclaredCpuTail::Placement::after_stage;
     capability.evidence[0].code =
@@ -823,6 +829,9 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
     dependencies.resolve_model = &ResolveFakeModel;
     dependencies.acquire_lease = &AcquireFakeLease;
     dependencies.context = &state;
+    auto probe_source =
+        open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+            dependencies);
     video::ProductionVideoBackendManager manager(
         open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
             dependencies));
@@ -851,7 +860,10 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
     resident.plan.budget.readback_staging_bytes = UINT64_C(1) << 20;
     resident.plan.budget.resource_count = 128;
     resident.plan.intent.stages[0].intent.stage_id = 1;
-    resident.plan.cpu_tails[0].after_stage_id = 1;
+    resident.plan.cpu_tails[0].after_stage_id =
+        resident.plan.intent.stages[resident.plan.intent.stage_count - 1]
+            .intent.stage_id;
+    resident.plan.cpu_tails[0].boundary_index = resident.plan.intent.stage_count;
     resident.effects.virtual_background.mode =
         video::effects::VirtualBackgroundMode::blur;
     auto &stage = resident.plan.intent.stages[0];
@@ -869,6 +881,10 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
         video::CanonicalVideoParameterKind::boolean;
     stage.parameters[3].boolean_value = true;
     stage.parameter_count = 4;
+    const auto probe = probe_source->AcquireResidentSetup(resident);
+    if (!Check(probe.status == hal::StatusId::ready,
+               "source probe rejected canonical resident request"))
+      return false;
     const auto original = resident.plan.intent;
     video::ProductionVideoBackendSetupRequest request;
     request.kind = video::ProductionVideoBackendSetupKind::resident_island;
@@ -895,17 +911,20 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
                                 .model.artifact_generation == 13,
                     "source changed canonical intent or lost bound evidence");
     std::array<std::byte, 64 * 48 * 3> input{};
-    std::array<std::byte, 64 * 48 * 3> output{};
+    std::array<std::byte, 128 * 96 * 3> output{};
     input[0] = std::byte{0x5a};
     hal::HostFrameBinding binding;
     binding.input_descriptor = resident.plan.host_input;
     binding.output_descriptor = resident.plan.host_output;
     binding.input_planes[0].read_data = input.data();
-    binding.input_planes[0].span_bytes = input.size();
+    binding.input_planes[0].span_bytes =
+        binding.input_descriptor.planes[0].size_bytes;
     binding.input_planes[0].row_stride_bytes = 64 * 3;
     binding.output_planes[0].write_data = output.data();
-    binding.output_planes[0].span_bytes = output.size();
-    binding.output_planes[0].row_stride_bytes = 64 * 3;
+    binding.output_planes[0].span_bytes =
+        binding.output_descriptor.planes[0].size_bytes;
+    binding.output_planes[0].row_stride_bytes =
+        binding.output_descriptor.planes[0].row_stride_bytes;
     binding.input_plane_count = binding.output_plane_count = 1;
     binding.ownership = hal::OwnershipModel::borrowed_until_completion;
     binding.lifetime = hal::ResourceLifetime::frame_borrowed;
@@ -1000,7 +1019,15 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
   combined.plan.intent.stage_count = 2;
   combined.plan.cpu_tails[0].after_stage_id = 2;
   combined.plan.cpu_tails[0].boundary_index = 2;
-  (void)combined;
+  ok &= run(combined);
+  auto downscale = StrictRequest();
+  downscale.plan.host_output =
+      HostRgb(31, 23, hal::Mutability::write_only);
+  ok &= run(downscale);
+  auto upscale = StrictRequest();
+  upscale.plan.host_output =
+      HostRgb(79, 53, hal::Mutability::write_only);
+  ok &= run(upscale);
   return ok;
 }
 

@@ -628,7 +628,11 @@ bool ExactPreflightAndMalformedRejection() {
   malformed.host_output.planes[0].size_bytes = 48;
   malformed.budget.readback_staging_bytes = 48;
   REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
-  REQUIRE(preflight.status == hal::StatusId::blocked);
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.host_output.width == 8);
+  REQUIRE(preflight.prepared_program.host_output.height == 2);
+  REQUIRE(preflight.prepared_program.stages[0].output.image.width == 8);
+  REQUIRE(preflight.prepared_program.stages[0].output.image.height == 2);
 
   auto malformed_config = FactoryConfig(&context, request);
   malformed_config.cached.minimum_synchronizations_per_frame = 2;
