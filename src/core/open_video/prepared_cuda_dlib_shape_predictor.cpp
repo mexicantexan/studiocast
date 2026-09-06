@@ -26,6 +26,8 @@ bool Same(const PreparedCudaDlibBinding &a, const PreparedCudaDlibBinding &b) {
 struct Buffer {
   cuda::CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
+  std::size_t reserved_bytes = 0;
+  std::vector<std::byte> staging;
 };
 #if STUDIOCAST_HAVE_DLIB
 bool Charge(std::size_t count, std::size_t size, std::size_t budget,
@@ -125,8 +127,8 @@ bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
     return false;
   constexpr std::size_t row_bytes = 8192;
   const std::size_t rows = (n + row_bytes - 1) / row_bytes;
-  std::vector<std::byte> staging(rows * row_bytes);
-  std::memcpy(staging.data(), p, n);
+  out->staging.resize(rows * row_bytes);
+  std::memcpy(out->staging.data(), p, n);
   cuda::CudaDriverApi::PitchAllocation a{};
   if (!d->AllocatePitch(row_bytes, rows, &a, e, 4) || a.pitch != row_bytes) {
     if (a.ptr) {
@@ -139,21 +141,21 @@ bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
   }
   out->ptr = a.ptr;
   out->bytes = n;
-  if (!d->MemcpyHtoD2DAsync(a.ptr, a.pitch, staging.data(), row_bytes,
+  out->reserved_bytes = a.pitch * rows;
+  *pending = true;
+  if (!d->MemcpyHtoD2DAsync(a.ptr, a.pitch, out->staging.data(), row_bytes,
                             row_bytes, rows, s, e)) {
-    std::string x;
-    (void)d->Free(a.ptr, &x);
-    out->ptr = 0;
     return false;
   }
-  // Setup owns the temporary deserialization vectors.  Complete each upload
-  // before its host storage can unwind on a later validation/allocation error.
+  // Retain staging in the candidate until completion is known so a failed
+  // submission or synchronization can be quarantined and retried safely.
   if (d->f().cuStreamSynchronize(s) != cuda::CUDA_SUCCESS) {
-    *pending = true;
     if (e)
       *e = "dlib table upload synchronization failed";
     return false;
   }
+  *pending = false;
+  out->staging = {};
   return true;
 }
 } // namespace
@@ -360,6 +362,14 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   std::size_t sizes[] = {iv.size() * 4, ct.size() * 4,         ts.size() * 4,
                          tl.size() * 4, sv.size() * sizeof(S), lv.size() * 4,
                          cf.size() * 4, av.size() * 4,         dv.size() * 4};
+  std::size_t reserved_bytes = 0;
+  const auto charge_reserved = [&](std::size_t amount) {
+    if (reserved_bytes > s.resource_budget_bytes ||
+        amount > s.resource_budget_bytes - reserved_bytes)
+      return false;
+    reserved_bytes += amount;
+    return true;
+  };
   for (int i = 0; i < 9; ++i)
     if (!AllocUpload(s.binding.driver, s.binding.stream, ptrs[i], sizes[i],
                      &candidate->buffers[i], &candidate->pending, e)) {
@@ -370,12 +380,22 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
         impl_ = std::move(candidate);
       }
       return false;
+    } else if (!charge_reserved(candidate->buffers[i].reserved_bytes)) {
+      if (e)
+        *e = "dlib prepared resource budget exceeded";
+      return false;
     }
   if (!candidate->shape.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
+      !charge_reserved(candidate->shape.pitch) ||
       !candidate->features.AllocateNchwF32(s.binding.driver, 1, 1, 1, (int)maxf,
                                            e) ||
-      !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e))
+      !charge_reserved(candidate->features.pitch) ||
+      !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
+      !charge_reserved(candidate->output.pitch)) {
+    if (e && e->empty())
+      *e = "dlib prepared resource budget exceeded";
     return false;
+  }
   if (!cuda::kernels::PrepareDlibShapePredictorKernel(
           *s.binding.driver, s.binding.owner_context, s.binding.stream,
           &candidate->kernel, e)) {
@@ -444,16 +464,17 @@ PreparedCudaDlibResult PreparedCudaDlibShapePredictor::Execute(
   }
   const auto &m = to_image.get_m();
   const auto &translation = to_image.get_b();
+  impl_->pending = true;
   if (!cuda::kernels::LaunchDlibShapePredictor(
           impl_->kernel, im, m(0, 0), m(0, 1), m(1, 0), m(1, 1),
           translation.x(), translation.y(), p[0].ptr, p[1].ptr, p[2].ptr,
           p[3].ptr, p[4].ptr, p[5].ptr, p[6].ptr, p[7].ptr, p[8].ptr,
           (unsigned)(p[1].bytes / 4 - 1), impl_->shape.ptr, impl_->features.ptr,
           impl_->output.ptr, e)) {
+    impl_->setup_quarantined = true;
     r.status = PreparedCudaDlibStatus::launch_failed;
     return r;
   }
-  impl_->pending = true;
   r.pending_work = true;
   r.status = PreparedCudaDlibStatus::success;
   return r;
@@ -475,6 +496,8 @@ bool PreparedCudaDlibShapePredictor::Shutdown(std::string *e) noexcept {
       return false;
     }
     impl_->pending = false;
+    for (auto &b : impl_->buffers)
+      b.staging = {};
   }
   if (!cuda::kernels::DestroyDlibShapePredictorKernel(&impl_->kernel, e))
     return false;

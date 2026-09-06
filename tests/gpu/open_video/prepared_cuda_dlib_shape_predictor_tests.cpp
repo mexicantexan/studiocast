@@ -14,7 +14,11 @@ namespace {
 CUcontext ctx = reinterpret_cast<CUcontext>(1);
 int loads, gets, launches, unloads;
 CUresult launch_result = CUDA_SUCCESS;
+CUresult copy_result = CUDA_SUCCESS;
 int allocations, frees, syncs, fail_sync_from, fail_sync_through;
+std::size_t tensor_pitch_extra;
+const volatile std::byte *pending_copy_source;
+bool inspect_pending_copy_source;
 CUresult Current(CUcontext *c) {
   *c = ctx;
   return 0;
@@ -42,20 +46,26 @@ CUresult Alloc(CUdeviceptr *p, std::size_t *q, std::size_t n, std::size_t,
                unsigned) {
   *p = 1;
   *p = static_cast<CUdeviceptr>(0x1000 + (++allocations) * 0x1000);
-  *q = n;
+  *q = n == 8192 ? n : n + tensor_pitch_extra;
   return 0;
 }
 CUresult Free(CUdeviceptr) {
   ++frees;
   return 0;
 }
-CUresult Copy(const CUDA_MEMCPY2D *, CUstream) { return 0; }
+CUresult Copy(const CUDA_MEMCPY2D *copy, CUstream) {
+  if (copy_result != CUDA_SUCCESS)
+    pending_copy_source = static_cast<const std::byte *>(copy->srcHost);
+  return copy_result;
+}
 CUresult Set(CUdeviceptr, unsigned char, std::size_t, CUstream) { return 0; }
 CUresult SC(CUstream *s, unsigned) {
   *s = reinterpret_cast<CUstream>(4);
   return 0;
 }
 CUresult S(CUstream) {
+  if (inspect_pending_copy_source)
+    (void)*pending_copy_source;
   ++syncs;
   return syncs >= fail_sync_from && syncs <= fail_sync_through
              ? CUDA_ERROR_LAUNCH_FAILED
@@ -225,6 +235,67 @@ int main() {
                  frees == retained_allocations - allocations_before,
              "shutdown retry did not release complete candidate");
   std::filesystem::remove_all(root);
+  const auto padded_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor padded;
+  setup.models_root = padded_root;
+  setup.model_id = "tiny-dlib68";
+  tensor_pitch_extra = 1u << 20;
+  const int before_padded_allocations = allocations;
+  const int before_padded_frees = frees;
+  ok &= Need(!padded.Prepare(setup, &e),
+             "pitched allocations exceeding budget must fail");
+  ok &= Need(frees - before_padded_frees ==
+                 allocations - before_padded_allocations,
+             "budget rejection leaked padded allocations");
+  tensor_pitch_extra = 0;
+  std::filesystem::remove_all(padded_root);
+  const auto partial_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor partial;
+  setup.models_root = partial_root;
+  setup.model_id = "tiny-dlib68";
+  copy_result = CUDA_ERROR_LAUNCH_FAILED;
+  const int before_partial_allocations = allocations;
+  const int before_partial_frees = frees;
+  ok &= Need(!partial.Prepare(setup, &e) &&
+                 allocations == before_partial_allocations + 1 &&
+                 frees == before_partial_frees,
+             "partial upload failure released pending storage");
+  ok &= Need(!partial.Prepare(setup, &e) &&
+                 allocations == before_partial_allocations + 1,
+             "partial upload failure did not quarantine candidate");
+  fail_sync_from = syncs + 1;
+  fail_sync_through = fail_sync_from;
+  inspect_pending_copy_source = true;
+  ok &= Need(!partial.Shutdown(&e) && frees == before_partial_frees,
+             "failed partial-upload shutdown released pending storage");
+  fail_sync_from = 0;
+  fail_sync_through = 0;
+  inspect_pending_copy_source = false;
+  copy_result = CUDA_SUCCESS;
+  ok &= Need(partial.Shutdown(&e) && frees == before_partial_frees + 1,
+             "partial-upload shutdown retry did not release storage");
+  std::filesystem::remove_all(partial_root);
+  const auto launch_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor failed_launch;
+  setup.models_root = launch_root;
+  const int before_launch_frees = frees;
+  ok &= Need(failed_launch.Prepare(setup, &e), e.c_str());
+  launch_result = CUDA_ERROR_LAUNCH_FAILED;
+  const auto failed = failed_launch.Execute(binding, image, {1, 1, 8, 8}, 1,
+                                             &e);
+  ok &= Need(failed.status ==
+                 studiocast::open_video::PreparedCudaDlibStatus::launch_failed,
+             "failed launch was not reported");
+  fail_sync_from = syncs + 1;
+  fail_sync_through = fail_sync_from;
+  ok &= Need(!failed_launch.Shutdown(&e) && frees == before_launch_frees,
+             "failed launch shutdown released possibly pending storage");
+  fail_sync_from = 0;
+  fail_sync_through = 0;
+  ok &= Need(failed_launch.Shutdown(&e) && frees > before_launch_frees,
+             "failed launch shutdown retry did not release storage");
+  launch_result = CUDA_SUCCESS;
+  std::filesystem::remove_all(launch_root);
   const auto oversized_root = OversizedPack();
   studiocast::open_video::PreparedCudaDlibShapePredictor oversized;
   setup.models_root = oversized_root;
