@@ -1,9 +1,15 @@
 #include "core/open_video/native_prepared_cuda_eye_contact_runtime.h"
 #include "core/open_video/prepared_cuda_eye_contact.h"
 
+#include <dlib/image_processing/shape_predictor.h>
+#include <dlib/serialize.h>
+
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <unistd.h>
 
 using namespace studiocast;
 using namespace studiocast::open_video;
@@ -114,6 +120,7 @@ struct NativeState {
   std::uint64_t next = 0x1000;
   int runs = 0, records = 0, queries = 0, frees = 0, destroys = 0;
   int fail_run_at = 0, not_ready = 0, fail_free_at = 0;
+  int yunet_runs = 0, yunet_invalidates = 0;
 } * native;
 cuda::CUresult CInit(unsigned) { return 0; }
 cuda::CUresult CLoad(cuda::CUmodule *m, const void *) {
@@ -131,22 +138,32 @@ cuda::CUresult CLaunch(cuda::CUfunction, unsigned, unsigned, unsigned, unsigned,
   return 0;
 }
 cuda::CUresult CAlloc(cuda::CUdeviceptr *p, std::size_t *pitch, std::size_t w,
-                      std::size_t, unsigned) {
-  *p = native->next;
-  native->next += 0x100000;
+                      std::size_t h, unsigned) {
+  *p = reinterpret_cast<cuda::CUdeviceptr>(std::calloc(1, w * h));
+  if (!*p)
+    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
   *pitch = w;
   return 0;
 }
-cuda::CUresult CFree(cuda::CUdeviceptr) {
+cuda::CUresult CFree(cuda::CUdeviceptr p) {
   ++native->frees;
-  return native->fail_free_at == native->frees
-             ? cuda::CUDA_ERROR_INVALID_CONTEXT
-             : cuda::CUDA_SUCCESS;
+  if (native->fail_free_at == native->frees)
+    return cuda::CUDA_ERROR_INVALID_CONTEXT;
+  std::free(reinterpret_cast<void *>(static_cast<std::uintptr_t>(p)));
+  return cuda::CUDA_SUCCESS;
 }
 cuda::CUresult CCopy(const cuda::CUDA_MEMCPY2D *, cuda::CUstream) { return 0; }
 cuda::CUresult CMemset(cuda::CUdeviceptr, unsigned char, std::size_t,
                        cuda::CUstream) {
   return 0;
+}
+cuda::CUresult CHostAlloc(void **p, std::size_t n, unsigned) {
+  *p = std::calloc(1, n);
+  return *p ? cuda::CUDA_SUCCESS : cuda::CUDA_ERROR_OUT_OF_MEMORY;
+}
+cuda::CUresult CHostFree(void *p) {
+  std::free(p);
+  return cuda::CUDA_SUCCESS;
 }
 cuda::CUresult CStream(cuda::CUstream *s, unsigned) {
   *s = reinterpret_cast<cuda::CUstream>(9);
@@ -226,6 +243,8 @@ cuda::CudaDriverApi::Functions CudaFunctions() {
   f.cuMemFree = CFree;
   f.cuMemcpy2DAsync = CCopy;
   f.cuMemsetD8Async = CMemset;
+  f.cuMemHostAlloc = CHostAlloc;
+  f.cuMemFreeHost = CHostFree;
   f.cuStreamCreate = CStream;
   f.cuStreamDestroy = CDestroyStream;
   f.cuStreamSynchronize = CSync;
@@ -244,6 +263,85 @@ cuda::CudaDriverApi::Functions CudaFunctions() {
   f.cuEventQuery = CEventQuery;
   f.cuEventElapsedTime = CElapsed;
   return f;
+}
+struct YunetSession final : internal::IPreparedCudaYunetSession {
+  onnx::OrtSessionInfo info_;
+  YunetSession() {
+    info_.strict_provider_validation_passed = true;
+    info_.input_names = {"input"};
+    info_.input_shapes = {{1, 3, 320, 320}};
+    info_.input_elem_types = {1};
+    for (auto name : {"cls_8", "cls_16", "cls_32", "obj_8", "obj_16",
+                      "obj_32", "bbox_8", "bbox_16", "bbox_32", "kps_8",
+                      "kps_16", "kps_32"})
+      info_.output_names.emplace_back(name);
+    for (int index = 0; index < 12; ++index) {
+      const int stride = index % 3 == 0 ? 8 : (index % 3 == 1 ? 16 : 32);
+      const int channels = index < 6 ? 1 : (index < 9 ? 4 : 10);
+      info_.output_shapes.push_back(
+          {1, (320 / stride) * (320 / stride), channels});
+    }
+    auto &provider = info_.prepared_provider_evidence;
+    provider.provider = onnx::OrtExecutionProviderId::cuda;
+    provider.cuda_device_id = 0;
+    provider.cuda_context_generation = 1;
+    provider.requested_stream_identity = 9;
+    provider.user_stream_bound = true;
+    provider.cpu_ep_fallback_disabled = true;
+  }
+  const onnx::OrtSessionInfo &info() const noexcept override { return info_; }
+  bool Prepare(const onnx::OrtSession::CudaBindingInput *, std::size_t ni,
+               const onnx::OrtSession::CudaBindingOutput *, std::size_t no,
+               std::string *) override {
+    return ni == 1 && no == 12;
+  }
+  onnx::OrtPreparedCudaRunEvidence evidence() const noexcept override {
+    onnx::OrtPreparedCudaRunEvidence evidence;
+    evidence.provider = info_.prepared_provider_evidence;
+    evidence.session_generation = 1;
+    return evidence;
+  }
+  onnx::OrtPreparedRunResult Execute(
+      const onnx::OrtSession::CudaBindingInput *, std::size_t,
+      const onnx::OrtSession::CudaBindingOutput *outputs, std::size_t count,
+      const onnx::OrtPreparedCudaRunEvidence &) noexcept override {
+    ++native->yunet_runs;
+    for (std::size_t i = 0; i < count; ++i)
+      std::memset(outputs[i].device_ptr, 0,
+                  outputs[i].num_floats * sizeof(float));
+    onnx::OrtPreparedRunResult result;
+    result.status = onnx::OrtPreparedRunStatus::success;
+    return result;
+  }
+  void Invalidate() noexcept override { ++native->yunet_invalidates; }
+};
+
+std::filesystem::path TinyDlibPack() {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("studiocast-eye-shared-dlib-" +
+                     std::to_string(::getpid()));
+  const auto dir = root / "face_landmarks" / "tiny-dlib68";
+  std::filesystem::create_directories(dir);
+  dlib::matrix<float, 0, 1> shape(136);
+  for (long i = 0; i < 68; ++i) {
+    shape(2 * i) = 0.2F + 0.005F * static_cast<float>(i);
+    shape(2 * i + 1) = 0.3F + 0.004F * static_cast<float>(i);
+  }
+  dlib::impl::regression_tree tree;
+  tree.splits.push_back({0, 1, 0.0F});
+  tree.leaf_values.emplace_back(136);
+  tree.leaf_values.emplace_back(136);
+  tree.leaf_values[0] = 0;
+  tree.leaf_values[1] = 0;
+  std::vector<std::vector<dlib::impl::regression_tree>> forests{{tree}};
+  std::vector<std::vector<dlib::vector<float, 2>>> pixels{
+      {{0.5F, 0.5F}, {0.25F, 0.25F}}};
+  dlib::serialize((dir / "model.dat").string())
+      << dlib::shape_predictor(shape, forests, pixels);
+  std::ofstream(dir / "LICENSE.txt") << "synthetic test fixture\n";
+  std::ofstream(dir / "model.json")
+      << R"({"schema_version":2,"id":"tiny-dlib68","display_name":"tiny","task":"face_landmarks","files":[{"name":"model.dat","kind":"dlib_shape_predictor","role":"main","sha256":""}],"dlib":{"predictor_kind":"shape_predictor_68_face_landmarks","num_landmarks":68}})";
+  return root;
 }
 struct EyeSession final : IPreparedEyeContactOrtSession {
   onnx::OrtSessionInfo metadata;
@@ -411,9 +509,11 @@ bool ContractsAndBehavior() {
   runtime.next.status = PreparedCudaEyeContactStatus::inference_failed;
   runtime.next.output = &input;
   runtime.next.pending_work = false;
+  runtime.next.completion_waits = 2;
   r = eye.Execute(h, setup.binding, 3, input);
   CHECK(r.status == PreparedCudaEyeContactStatus::inference_failed &&
-        r.valid_input_preserved && r.output == &input);
+        r.valid_input_preserved && r.output == &input &&
+        r.completion_waits == 3);
   auto stale = setup.binding;
   ++stale.model_generation;
   r = eye.Execute(h, stale, 4, input);
@@ -442,12 +542,18 @@ bool FailureAndDisabled() {
         runtime.execute == 0);
   CHECK(eye.Shutdown(&error));
   runtime.prepare_status = PreparedCudaEyeContactStatus::provider_mismatch;
-  CHECK(!eye.Prepare(Setup(&cache), &h, &error));
+  PreparedCudaEyeContactStatus prepare_status;
+  CHECK(!eye.Prepare(Setup(&cache), &h, &error, &prepare_status));
+  CHECK(prepare_status == PreparedCudaEyeContactStatus::provider_mismatch);
   CHECK(!eye.ready());
+  runtime.prepare_status = PreparedCudaEyeContactStatus::graph_mismatch;
+  CHECK(!eye.Prepare(Setup(&cache), &h, &error, &prepare_status));
+  CHECK(prepare_status == PreparedCudaEyeContactStatus::graph_mismatch);
   setup = Setup(&cache);
   setup.resource_budget_bytes = setup.yunet_setup.resource_budget_bytes +
-                                setup.dlib_setup.resource_budget_bytes;
-  CHECK(!eye.Prepare(setup, &h, &error));
+                                setup.dlib_setup.resource_budget_bytes - 1;
+  CHECK(!eye.Prepare(setup, &h, &error, &prepare_status));
+  CHECK(prepare_status == PreparedCudaEyeContactStatus::resource_exhausted);
   int analysis_destructions = 0, runtime_destructions = 0;
   {
     auto owned_analysis = std::make_unique<Analysis>();
@@ -486,6 +592,96 @@ bool FailureAndDisabled() {
   CHECK(shared_eye.Shutdown(&error));
   setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes - 1;
   CHECK(!shared_eye.Prepare(setup, &h, &error));
+  return true;
+}
+bool ConcreteSharedAnalysis() {
+  NativeState state;
+  native = &state;
+  cuda::CudaDriverApi driver;
+  std::string error;
+  CHECK(driver.InitializeForTesting(CudaFunctions(), &error));
+  CHECK(driver.EnsureContextForDevice(0, &error));
+  const auto dlib_root = TinyDlibPack();
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::filesystem::remove_all(path); }
+  } cleanup{dlib_root};
+  auto registry = ModelPackRegistry::Scan(dlib_root);
+  auto dlib_pack = registry.Find("face_landmarks", "tiny-dlib68");
+  CHECK(dlib_pack && !dlib_pack->files.empty());
+  const auto dlib_identity =
+      ValidateModelArtifactIdentity(*dlib_pack, dlib_pack->files.front());
+  CHECK(dlib_identity.ok());
+
+  PreparedCudaYunetSetup yunet_setup;
+  yunet_setup.binding = {&driver, *driver.context_identity(),
+                         reinterpret_cast<cuda::CUstream>(9), 9, 7, 8};
+  yunet_setup.frame_width = 64;
+  yunet_setup.frame_height = 48;
+  yunet_setup.resource_budget_bytes =
+      PreparedCudaYunetDetector::RequiredResourceBytes();
+  yunet_setup.declared_input = {"input", "nchw", "float32", 320, 320, 3};
+  const auto yunet_identity = Identity(11);
+  PreparedCudaYunetDetector yunet;
+  CHECK(yunet.PrepareForTesting(yunet_setup, yunet_identity,
+                                std::make_unique<YunetSession>(), &error));
+  FrameAnalysisCache cache;
+  CHECK(yunet.PrepareCache(&cache, &error));
+  PreparedCudaYunetPreparedBinding shared;
+  CHECK(yunet.ExportPreparedBinding(&cache, &shared));
+  const int runs_after_warmup = state.yunet_runs;
+
+  Runtime runtime;
+  PreparedCudaEyeContact eye(&runtime);
+  auto setup = Setup(&cache);
+  setup.binding = {&driver,
+                   *driver.context_identity(),
+                   state.current,
+                   reinterpret_cast<cuda::CUstream>(9),
+                   9,
+                   7,
+                   8,
+                   9};
+  setup.frame_width = 64;
+  setup.frame_height = 48;
+  setup.models.yunet = yunet_identity;
+  setup.models.landmarks = dlib_identity.identity;
+  ++setup.models.landmarks.registry_generation;
+  setup.shared_yunet = &shared;
+  setup.dlib_setup.models_root = dlib_root;
+  setup.dlib_setup.model_id = "tiny-dlib68";
+  setup.dlib_setup.resource_budget_bytes = 1U << 20;
+  setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes + 4096;
+  PreparedCudaEyeContactHandle handle;
+  if (!eye.Prepare(setup, &handle, &error)) { std::cerr << "concrete shared prepare: " << error << '\n'; return false; }
+  CHECK(state.yunet_runs == runs_after_warmup);
+  cuda::CudaImage input;
+  input.ptr = 1;
+  input.pitch = 192;
+  input.w = 64;
+  input.h = 48;
+  input.format = cuda::PixelFormatGpu::rgb_u8;
+  auto result = eye.Execute(handle, setup.binding, 50, input);
+  CHECK(result.status == PreparedCudaEyeContactStatus::preserved_input &&
+        !result.face_found && state.yunet_runs == runs_after_warmup + 1);
+  const auto direct = yunet.Execute(yunet_setup.binding, input, 50, &cache,
+                                    setup.wait);
+  CHECK(direct.status == PreparedCudaYunetStatus::success_no_faces &&
+        direct.enqueued_readbacks == 0 && direct.completion_waits == 0 &&
+        state.yunet_runs == runs_after_warmup + 1);
+  CHECK(eye.Shutdown(&error));
+  CHECK(yunet.ready() && state.yunet_invalidates == 0);
+  CHECK(yunet.Shutdown(&error) && state.yunet_invalidates == 1);
+  CHECK(yunet.PrepareForTesting(yunet_setup, yunet_identity,
+                                std::make_unique<YunetSession>(), &error));
+  CHECK(yunet.PrepareCache(&cache, &error));
+  Runtime stale_runtime;
+  PreparedCudaEyeContact stale_eye(&stale_runtime);
+  PreparedCudaEyeContactStatus stale_status;
+  CHECK(!stale_eye.Prepare(setup, &handle, &error, &stale_status));
+  CHECK(stale_status == PreparedCudaEyeContactStatus::model_invalid &&
+        stale_runtime.prepare == 0);
+  CHECK(yunet.Shutdown(&error));
   return true;
 }
 bool NativeBoundaries() {
@@ -560,7 +756,8 @@ bool NativeBoundaries() {
   state.fail_run_at = 4;
   auto result = runtime.Execute(config.binding, input, landmarks, 0.5F);
   CHECK(result.status == PreparedCudaEyeContactStatus::inference_failed &&
-        result.output == &input && !result.pending_work && factory.runs == 4);
+        result.output == &input && !result.pending_work && factory.runs == 4 &&
+        result.completion_waits == 1);
   CHECK(runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown);
   CHECK(factory.session_destructions == 2 && state.frees == 10);
 
@@ -578,7 +775,8 @@ bool NativeBoundaries() {
   state.fail_run_at = 4;
   result = timeout_runtime.Execute(config.binding, input, landmarks, 0.5F);
   CHECK(result.status == PreparedCudaEyeContactStatus::timeout &&
-        result.pending_work && result.output == nullptr);
+        result.pending_work && result.output == nullptr &&
+        result.completion_waits == 1);
   CHECK(timeout_runtime.Shutdown() ==
         PreparedCudaEyeContactStatus::shutdown_failed);
   CHECK(timeout_runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown);
@@ -629,7 +827,8 @@ bool NativeBoundaries() {
 }
 } // namespace
 int main() {
-  return ContractsAndBehavior() && FailureAndDisabled() && NativeBoundaries()
+  return ContractsAndBehavior() && FailureAndDisabled() &&
+                 ConcreteSharedAnalysis() && NativeBoundaries()
              ? EXIT_SUCCESS
              : EXIT_FAILURE;
 }

@@ -145,6 +145,7 @@ struct PreparedCudaEyeContactRuntimeFrameResult {
   bool device_lost = false;
   std::uint32_t inference_attempts = 0;
   std::uint32_t inference_successes = 0;
+  std::uint32_t completion_waits = 0;
 };
 
 class IPreparedCudaEyeContactRuntime {
@@ -177,6 +178,8 @@ struct PreparedCudaEyeContactFrameResult {
 class PreparedCudaEyeContact {
 public:
   PreparedCudaEyeContact();
+  explicit PreparedCudaEyeContact(
+      IPreparedCudaEyeContactRuntime *runtime) noexcept;
   PreparedCudaEyeContact(IPreparedCudaEyeContactAnalysis *,
                          IPreparedCudaEyeContactRuntime *) noexcept;
   PreparedCudaEyeContact(
@@ -187,7 +190,8 @@ public:
   PreparedCudaEyeContact &operator=(const PreparedCudaEyeContact &) = delete;
 
   bool Prepare(const PreparedCudaEyeContactSetup &,
-               PreparedCudaEyeContactHandle *, std::string *);
+               PreparedCudaEyeContactHandle *, std::string *,
+               PreparedCudaEyeContactStatus *status_out = nullptr);
   PreparedCudaEyeContactFrameResult
   Execute(const PreparedCudaEyeContactHandle &,
           const PreparedCudaEyeContactBinding &, std::uint64_t capture_sequence,

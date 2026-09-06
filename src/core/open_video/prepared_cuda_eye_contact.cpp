@@ -211,6 +211,13 @@ PreparedCudaEyeContact::PreparedCudaEyeContact()
   impl_->runtime = impl_->owned_runtime.get();
 }
 PreparedCudaEyeContact::PreparedCudaEyeContact(
+    IPreparedCudaEyeContactRuntime *runtime) noexcept
+    : impl_(std::make_unique<Impl>()) {
+  impl_->owned_analysis = std::make_unique<PreparedAnalysis>();
+  impl_->analysis = impl_->owned_analysis.get();
+  impl_->runtime = runtime;
+}
+PreparedCudaEyeContact::PreparedCudaEyeContact(
     IPreparedCudaEyeContactAnalysis *analysis,
     IPreparedCudaEyeContactRuntime *runtime) noexcept
     : impl_(std::make_unique<Impl>()) {
@@ -236,7 +243,10 @@ PreparedCudaEyeContact::~PreparedCudaEyeContact() {
 
 bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
                                      PreparedCudaEyeContactHandle *handle,
-                                     std::string *error) {
+                                     std::string *error,
+                                     PreparedCudaEyeContactStatus *status_out) {
+  if (status_out)
+    *status_out = PreparedCudaEyeContactStatus::invalid_setup;
   if (error)
     error->clear();
   if (handle)
@@ -256,6 +266,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
       accounted > s.resource_budget_bytes) {
     if (error)
       *error = "prepared Eye Contact aggregate resource budget exceeded";
+    if (status_out)
+      *status_out = PreparedCudaEyeContactStatus::resource_exhausted;
     return false;
   }
   frozen.yunet_setup.binding = {
@@ -296,6 +308,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
         analysis_shutdown == PreparedCudaEyeContactStatus::shutdown_failed;
     if (error)
       *error = "prepared Eye Contact setup failed";
+    if (status_out)
+      *status_out = status;
     return false;
   }
   impl_->setup = std::move(frozen);
@@ -306,6 +320,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
   impl_->cleanup_pending = false;
   if (handle)
     *handle = impl_->handle;
+  if (status_out)
+    *status_out = PreparedCudaEyeContactStatus::executed;
   return true;
 }
 
@@ -377,6 +393,7 @@ PreparedCudaEyeContact::Execute(const PreparedCudaEyeContactHandle &h,
   out.device_lost = runtime.device_lost;
   out.inference_attempts = runtime.inference_attempts;
   out.inference_successes = runtime.inference_successes;
+  out.completion_waits += runtime.completion_waits;
   if (runtime.output == &input && !runtime.pending_work &&
       !runtime.device_lost) {
     out.output = &input;
