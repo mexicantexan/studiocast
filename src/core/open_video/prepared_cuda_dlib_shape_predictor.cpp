@@ -392,8 +392,9 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
       if (candidate->pending) {
         candidate->setup_quarantined = true;
         impl_ = std::move(candidate);
+        return false;
       }
-      return false;
+      return reject_candidate(e ? *e : std::string{});
     } else if (!charge_reserved(candidate->buffers[i].reserved_bytes)) {
       return reject_candidate("dlib prepared resource budget exceeded");
     }
@@ -538,7 +539,7 @@ bool PreparedCudaDlibShapePredictor::Shutdown(std::string *e) noexcept {
   return true;
 }
 bool PreparedCudaDlibShapePredictor::ready() const noexcept {
-  return impl_ && impl_->ready && !impl_->stopped;
+  return impl_ && impl_->ready && !impl_->setup_quarantined && !impl_->stopped;
 }
 const ValidatedModelArtifactIdentity &
 PreparedCudaDlibShapePredictor::artifact() const noexcept {
