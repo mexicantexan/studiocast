@@ -1964,6 +1964,25 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-prepared-cuda-fastdvdnet-denoiser-tests
             integration video gpu model)
 
+    add_executable(studiocast-cuda-prepared-matte-bounds-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_matte_bounds_tests.cpp)
+    target_link_libraries(studiocast-cuda-prepared-matte-bounds-tests PRIVATE
+            studiocast_cuda_support)
+    target_include_directories(studiocast-cuda-prepared-matte-bounds-tests PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+    studiocast_set_project_warnings(studiocast-cuda-prepared-matte-bounds-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-matte-bounds-tests)
+    add_test(NAME studiocast-cuda-prepared-matte-bounds-tests
+            COMMAND studiocast-cuda-prepared-matte-bounds-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-matte-bounds-tests
+            unit video gpu)
+    add_test(NAME studiocast-cuda-prepared-matte-bounds-native-tests
+            COMMAND studiocast-cuda-prepared-matte-bounds-tests --native)
+    set_tests_properties(studiocast-cuda-prepared-matte-bounds-native-tests PROPERTIES
+            SKIP_RETURN_CODE 77)
+    studiocast_set_test_labels(studiocast-cuda-prepared-matte-bounds-native-tests
+            integration video gpu)
+
     add_executable(studiocast-cuda-prepared-mirror-kernels-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_mirror_tests.cpp)
     target_link_libraries(studiocast-cuda-prepared-mirror-kernels-tests PRIVATE
