@@ -63,7 +63,7 @@
       "default": true,
       "pack_path": "face_detection/Best Quality (YuNet FP32)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/model.json", "destination": "model.json", "sha256": "9653d7343375addac7bb8272cd4810eb38e81a8d6cdcbab1dc1914082b6cb56e"},
+        {"source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/model.json", "destination": "model.json", "sha256": "d9c66b74a5d785a2c63315e917077d0b1620fd57b17c7075dd2dd82c6bdfa8c3"},
         {"source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "69c55937f939aaa08ec46097d441bdabbd3d2576707cc6880408c719bdd94d42"}
       ],
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "OpenCV Zoo YuNet model; upstream MIT terms are summarized in LICENSE.txt."},
