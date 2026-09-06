@@ -910,20 +910,21 @@ public:
                             ReasonId::wrong_execution_domain);
       candidate->stream = config.prepared_stream;
 
+      if (config.driver->BindPreparedContext(candidate->context) !=
+          cuda::CUDA_SUCCESS) {
+        return SetupFailure(RuntimeStatus::wrong_execution_domain,
+                            ReasonId::wrong_execution_domain);
+      }
+      cuda::CUcontext native_context = nullptr;
+      if (!config.driver->f().cuCtxGetCurrent ||
+          config.driver->f().cuCtxGetCurrent(&native_context) !=
+              cuda::CUDA_SUCCESS ||
+          !native_context) {
+        return SetupFailure(RuntimeStatus::wrong_execution_domain,
+                            ReasonId::wrong_execution_domain);
+      }
+
       if (model_free) {
-        if (config.driver->BindPreparedContext(candidate->context) !=
-            cuda::CUDA_SUCCESS) {
-          return SetupFailure(RuntimeStatus::wrong_execution_domain,
-                              ReasonId::wrong_execution_domain);
-        }
-        cuda::CUcontext native_context = nullptr;
-        if (!config.driver->f().cuCtxGetCurrent ||
-            config.driver->f().cuCtxGetCurrent(&native_context) !=
-                cuda::CUDA_SUCCESS ||
-            !native_context) {
-          return SetupFailure(RuntimeStatus::wrong_execution_domain,
-                              ReasonId::wrong_execution_domain);
-        }
         const int width = static_cast<int>(program.host_input.width);
         const int height = static_cast<int>(program.host_input.height);
         if (!candidate->input.Allocate(config.driver, width, height,
@@ -1094,10 +1095,7 @@ public:
                                 program.host_output.height != image.height;
       if ((final_resize || replace) &&
           !cuda::kernels::PrepareResizeBilinearKernel(
-              *config.driver,
-              reinterpret_cast<cuda::CUcontext>(
-                  static_cast<std::uintptr_t>(context->retained_context_id)),
-              candidate->stream,
+              *config.driver, native_context, candidate->stream,
               &candidate->resize, &error)) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::not_prepared,
@@ -1282,9 +1280,7 @@ public:
       if (program.stages[program.stage_count - 1].semantic ==
               SemanticEffectId::vignette &&
           !cuda::kernels::PrepareVignetteKernel(
-              *config.driver,
-              reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
-                  context->retained_context_id)), candidate->stream,
+              *config.driver, native_context, candidate->stream,
               &candidate->vignette, &error)) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::not_prepared,
