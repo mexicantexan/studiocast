@@ -184,10 +184,12 @@ cuda::CudaDriverApi::Functions Functions() {
 struct Session final : open_video::internal::IPreparedCudaYunetSession {
   onnx::OrtSessionInfo i;
   State *s;
-  explicit Session(State *x, bool valid = true, bool rank4 = false) : s(x) {
+  explicit Session(State *x, bool valid = true, bool rank4 = false,
+                   int dim = 320)
+      : s(x) {
     i.strict_provider_validation_passed = valid;
     i.input_names = {"input"};
-    i.input_shapes = {{1, 3, 320, 320}};
+    i.input_shapes = {{1, 3, dim, dim}};
     for (auto n : {"cls_8", "cls_16", "cls_32", "obj_8", "obj_16", "obj_32",
                    "bbox_8", "bbox_16", "bbox_32", "kps_8", "kps_16", "kps_32"})
       i.output_names.emplace_back(n);
@@ -195,9 +197,9 @@ struct Session final : open_video::internal::IPreparedCudaYunetSession {
       int st = k % 3 == 0 ? 8 : (k % 3 == 1 ? 16 : 32),
           ch = k < 6 ? 1 : (k < 9 ? 4 : 10);
       if (rank4)
-        i.output_shapes.push_back({1, 320 / st, 320 / st, ch});
+        i.output_shapes.push_back({1, dim / st, dim / st, ch});
       else
-        i.output_shapes.push_back({1, (320 / st) * (320 / st), ch});
+        i.output_shapes.push_back({1, (dim / st) * (dim / st), ch});
     }
     i.prepared_provider_evidence = {};
     i.prepared_provider_evidence.provider = onnx::OrtExecutionProviderId::cuda;
@@ -315,6 +317,11 @@ int main() {
       timed.pending_work && !first_shutdown;
   state.query = cuda::CUDA_SUCCESS;
   ok &= retry.Shutdown(&error);
+  open_video::PreparedCudaYunetDetector size640;
+  ok &= size640.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state, true, false, 640),
+            &error) &&
+        size640.Shutdown(&error);
   open_video::PreparedCudaYunetDetector rank4;
   ok &= rank4.PrepareForTesting(
             setup, id, std::make_unique<Session>(&state, true, true), &error) &&

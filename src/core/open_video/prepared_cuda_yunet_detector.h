@@ -77,8 +77,17 @@ public:
 
 class PreparedCudaYunetDetector {
 public:
-  static constexpr std::size_t RequiredResourceBytes() noexcept {
-    return (3u * 320u * 320u + 2u * 33600u) * sizeof(float);
+  static constexpr std::size_t
+  RequiredResourceBytes(int width = 640, int height = 640) noexcept {
+    return (3u * static_cast<std::size_t>(width) *
+                static_cast<std::size_t>(height) +
+            32u * (static_cast<std::size_t>(width / 8) *
+                       static_cast<std::size_t>(height / 8) +
+                   static_cast<std::size_t>(width / 16) *
+                       static_cast<std::size_t>(height / 16) +
+                   static_cast<std::size_t>(width / 32) *
+                       static_cast<std::size_t>(height / 32))) *
+           sizeof(float);
   }
   PreparedCudaYunetDetector();
   ~PreparedCudaYunetDetector();

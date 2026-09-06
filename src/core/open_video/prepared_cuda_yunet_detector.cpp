@@ -14,7 +14,6 @@
 
 namespace studiocast::open_video {
 namespace {
-constexpr int kInput = 320;
 constexpr std::size_t kOutputs = 12;
 constexpr std::size_t kTopK = 5000;
 const std::array<const char *, kOutputs> kNames = {
@@ -89,7 +88,9 @@ struct PreparedCudaYunetDetector::Impl {
   onnx::OrtPreparedCudaRunEvidence run_evidence;
   cuda::CudaTensor input;
   std::string input_name;
-  std::array<int64_t, 4> input_shape{1, 3, kInput, kInput};
+  std::array<int64_t, 4> input_shape{};
+  int input_w = 0;
+  int input_h = 0;
   std::array<Output, kOutputs> outputs;
   std::array<onnx::OrtSession::CudaBindingInput, 1> ort_input{};
   std::array<onnx::OrtSession::CudaBindingOutput, kOutputs> ort_outputs{};
@@ -129,8 +130,7 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
       !setup.binding.context.Valid() || !setup.binding.stream ||
       setup.binding.stream_identity == 0 || setup.binding.owner_identity == 0 ||
       setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
-      setup.frame_height <= 0 ||
-      setup.resource_budget_bytes < RequiredResourceBytes()) {
+      setup.frame_height <= 0) {
     if (error)
       *error = "invalid prepared YuNet setup";
     return false;
@@ -212,12 +212,21 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     return false;
   }
   const auto &info = session->info();
+  if (info.input_shapes.size() != 1 || info.input_shapes[0].size() != 4 ||
+      info.input_shapes[0][2] <= 0 || info.input_shapes[0][3] <= 0 ||
+      info.input_shapes[0][2] > 2048 || info.input_shapes[0][3] > 2048) {
+    if (error)
+      *error = "YuNet requires fixed bounded NCHW input geometry";
+    return false;
+  }
+  const int input_h = static_cast<int>(info.input_shapes[0][2]);
+  const int input_w = static_cast<int>(info.input_shapes[0][3]);
   if (!setup.binding.driver || !setup.binding.context.Valid() ||
       !setup.binding.stream || setup.binding.stream_identity == 0 ||
       setup.binding.owner_identity == 0 ||
       setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
       setup.frame_height <= 0 ||
-      setup.resource_budget_bytes < RequiredResourceBytes() ||
+      setup.resource_budget_bytes < RequiredResourceBytes(input_w, input_h) ||
       !info.strict_provider_validation_passed ||
       !onnx::OrtPreparedProviderEvidenceMatches(
           info.prepared_provider_evidence, setup.cuda_device_id,
@@ -230,8 +239,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     return false;
   }
   std::string geometry_error;
-  if (!ValidateYunetInputTensorContract(info.input_shapes[0], false, kInput,
-                                        kInput, &geometry_error)) {
+  if (!ValidateYunetInputTensorContract(info.input_shapes[0], false, input_w,
+                                        input_h, &geometry_error)) {
     if (error)
       *error = geometry_error;
     return false;
@@ -239,9 +248,12 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   auto candidate = std::make_unique<Impl>();
   candidate->setup = setup;
   candidate->artifact = validated_artifact;
+  candidate->input_w = input_w;
+  candidate->input_h = input_h;
+  candidate->input_shape = {1, 3, input_h, input_w};
   candidate->session = std::move(session);
-  if (!candidate->input.AllocateNchwF32(setup.binding.driver, 1, 3, kInput,
-                                        kInput, error))
+  if (!candidate->input.AllocateNchwF32(setup.binding.driver, 1, 3, input_h,
+                                        input_w, error))
     return false;
   std::size_t host_offset = 0;
   for (std::size_t index = 0; index < kOutputs; ++index) {
@@ -256,7 +268,9 @@ bool PreparedCudaYunetDetector::PrepareValidated(
         std::distance(info.output_names.begin(), found));
     const int stride = Stride(kNames[index]);
     const int channels = Channels(kNames[index]);
-    const int anchors = (kInput / stride) * (kInput / stride);
+    const int rows = input_h / stride;
+    const int cols = input_w / stride;
+    const int anchors = rows * cols;
     if (graph_index >= info.output_shapes.size()) {
       if (error)
         *error = "YuNet output tensor shape mismatch";
@@ -271,16 +285,14 @@ bool PreparedCudaYunetDetector::PrepareValidated(
         matches(declared[1], anchors) && matches(declared[2], channels)) {
       out.shape = {1, anchors, channels};
     } else if (declared.size() == 4 && matches(declared[0], 1) &&
-               matches(declared[1], channels) &&
-               matches(declared[2], kInput / stride) &&
-               matches(declared[3], kInput / stride) && declared[1] > 0) {
-      out.shape = {1, channels, kInput / stride, kInput / stride};
+               matches(declared[1], channels) && matches(declared[2], rows) &&
+               matches(declared[3], cols) && declared[1] > 0) {
+      out.shape = {1, channels, rows, cols};
       out.channels_first = true;
     } else if (declared.size() == 4 && matches(declared[0], 1) &&
-               matches(declared[1], kInput / stride) &&
-               matches(declared[2], kInput / stride) &&
+               matches(declared[1], rows) && matches(declared[2], cols) &&
                matches(declared[3], channels) && declared[3] > 0) {
-      out.shape = {1, kInput / stride, kInput / stride, channels};
+      out.shape = {1, rows, cols, channels};
     } else {
       if (error)
         *error = "YuNet output tensor shape mismatch";
@@ -329,8 +341,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
       setup.binding.configuration_generation,
       validated_artifact.registry_generation};
   cuda::kernels::ModelPreprocessSpec spec;
-  spec.dst_w = kInput;
-  spec.dst_h = kInput;
+  spec.dst_w = input_w;
+  spec.dst_h = input_h;
   spec.dst_order = cuda::kernels::ChannelOrder::bgr;
   if (!candidate->preprocess.Prepare(
           preprocess_binding, spec,
@@ -391,15 +403,16 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
       source.h != impl_->setup.frame_height)
     return result;
   cache->BeginFrame(sequence);
-  const float scale =
-      std::min(static_cast<float>(kInput) / static_cast<float>(source.w),
-               static_cast<float>(kInput) / static_cast<float>(source.h));
+  const float scale = std::min(
+      static_cast<float>(impl_->input_w) / static_cast<float>(source.w),
+      static_cast<float>(impl_->input_h) / static_cast<float>(source.h));
   const int scaled_w = std::max(
       1, static_cast<int>(std::lround(static_cast<float>(source.w) * scale)));
   const int scaled_h = std::max(
       1, static_cast<int>(std::lround(static_cast<float>(source.h) * scale)));
   const cuda::kernels::LetterboxGeometry geometry{
-      scaled_w, scaled_h, (kInput - scaled_w) / 2, (kInput - scaled_h) / 2, 0};
+      scaled_w, scaled_h, (impl_->input_w - scaled_w) / 2,
+      (impl_->input_h - scaled_h) / 2, 0};
   const cuda::CudaPreparedTransferCompletion::Binding completion_binding{
       binding.context, binding.stream, binding.stream_identity,
       binding.owner_identity, binding.configuration_generation};
@@ -417,8 +430,8 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
       binding.configuration_generation,
       impl_->artifact.registry_generation};
   cuda::kernels::ModelPreprocessSpec spec;
-  spec.dst_w = kInput;
-  spec.dst_h = kInput;
+  spec.dst_w = impl_->input_w;
+  spec.dst_h = impl_->input_h;
   spec.dst_order = cuda::kernels::ChannelOrder::bgr;
   cuda::kernels::PreparedPreprocessKernelStatus preprocess_status{};
   if (!impl_->preprocess.ExecuteLetterboxed(preprocess_binding, spec, geometry,
@@ -473,7 +486,7 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
       static_cast<const std::byte *>(impl_->completion.readback_data());
   for (int si = 0; si < 3; ++si) {
     const int stride = si == 0 ? 8 : (si == 1 ? 16 : 32),
-              cols = kInput / stride, rows = kInput / stride;
+              cols = impl_->input_w / stride, rows = impl_->input_h / stride;
     const auto *cls = reinterpret_cast<const float *>(
         host + impl_->outputs[static_cast<std::size_t>(si)].host_offset);
     const auto *obj = reinterpret_cast<const float *>(
