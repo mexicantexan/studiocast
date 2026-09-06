@@ -41,7 +41,7 @@ MODEL_PACK_SIZE_ROWS = [
 def catalog_size_summary() -> dict:
     return {
         "schema_version": 1, "catalog_version": "2026-07-19",
-        "catalog_sha256": "sha256:9f85beb84803fd4f7df7a10052ed62b1c471f64185ff7beaf5405f32be94aa9f",
+        "catalog_sha256": "sha256:d2b23cab9ddad91adfe5cac4b2ad4433fa624714d40cb0d7ebdb8deebe93414d",
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
         "pack_count": 7, "artifact_count": 8, "download_bytes": 131224287,

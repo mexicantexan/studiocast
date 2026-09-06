@@ -95,7 +95,7 @@
       "default": true,
       "pack_path": "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/model.json", "destination": "model.json", "sha256": "f9b98d958d2c4c36f1f5470d36760935b108993c4fd343a6d1515a315d1de784"},
+        {"source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/model.json", "destination": "model.json", "sha256": "c3143c5be8b20080c9bd6661a196564a3eed09058ecad3825ad93a1a77c7ef4b"},
         {"source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "e7cf82d67f571ca7adac6522dd5f4cc7d20ad786c2a3488299058f59952f8072"}
       ],
       "license": {"spdx": "BSD-3-Clause", "redistribution": "permitted", "notes": "Depends on the separately licensed non-commercial dlib iBUG landmark pack."},

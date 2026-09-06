@@ -122,10 +122,14 @@ std::filesystem::path TinyPack() {
     shape(2 * i + 1) = 0.3f + 0.004f * i;
   }
   dlib::impl::regression_tree tree;
+  tree.splits.push_back({0, 1, 0.0f});
+  tree.leaf_values.emplace_back(136);
   tree.leaf_values.emplace_back(136);
   tree.leaf_values[0] = 0;
+  tree.leaf_values[1] = 0;
   std::vector<std::vector<dlib::impl::regression_tree>> forests{{tree}};
-  std::vector<std::vector<dlib::vector<float, 2>>> pixels{{{0.5f, 0.5f}}};
+  std::vector<std::vector<dlib::vector<float, 2>>> pixels{
+      {{0.5f, 0.5f}, {0.25f, 0.25f}}};
   dlib::shape_predictor predictor(shape, forests, pixels);
   dlib::serialize((dir / "model.dat").string()) << predictor;
   std::ofstream(dir / "LICENSE.txt") << "synthetic test fixture\n";
