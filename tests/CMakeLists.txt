@@ -1010,6 +1010,21 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-cuda-prepared-preprocess-kernel-tests
             unit gpu)
 
+    add_executable(studiocast-cuda-prepared-vignette-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_vignette_tests.cpp)
+    target_link_libraries(studiocast-cuda-prepared-vignette-tests PRIVATE
+            studiocast_cuda_support)
+    target_include_directories(studiocast-cuda-prepared-vignette-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}")
+    studiocast_set_project_warnings(studiocast-cuda-prepared-vignette-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-vignette-tests)
+    set_target_properties(studiocast-cuda-prepared-vignette-tests PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME studiocast-cuda-prepared-vignette-tests
+            COMMAND studiocast-cuda-prepared-vignette-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-vignette-tests unit gpu)
+
     add_executable(studiocast-cuda-prepared-vb-kernel-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_open_cuda_vb_kernel_bundle_tests.cpp
     )

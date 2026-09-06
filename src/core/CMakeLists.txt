@@ -52,6 +52,7 @@ set(_studiocast_cuda_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/open_cuda_vb_kernels_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_preprocess_kernel_bundle.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_vignette.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/preprocess_to_nchw_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/resize_bilinear_ptx.cpp)
 
