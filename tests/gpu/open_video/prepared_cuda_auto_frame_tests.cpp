@@ -293,10 +293,12 @@ bool MatteCadenceCountersAndFailures() {
               "matte cadence/cache mismatch");
   ok &= Check(a.transfers.intermediate_readbacks == 13 &&
                   a.transfers.synchronizations == 2 &&
-                  a.completion_waits == 2 && a.cpu_tail_boundaries == 2,
+                  a.completion_waits == 2 && a.cpu_tail_boundaries == 3 &&
+                  a.transfers.cpu_tail_boundaries == 3,
               "face plus matte counters were not summed exactly once");
   ok &= Check(b.transfers.intermediate_readbacks == 12 &&
-                  b.completion_waits == 1 && b.cpu_tail_boundaries == 1,
+                  b.completion_waits == 1 && b.cpu_tail_boundaries == 2 &&
+                  b.transfers.cpu_tail_boundaries == 2,
               "cached matte added counters");
   crop.crop_ok = false;
   auto drop = af.Execute(h, s.binding, 12, image);
@@ -324,7 +326,9 @@ bool StrictFailureAndRetryableShutdown() {
   auto r = af.Execute(h, s.binding, 1, image);
   ok &= Check(r.status == PreparedCudaAutoFrameStatus::preserved_input &&
                   r.valid_input_preserved && matte.calls == 0 &&
-                  r.transfers.intermediate_readbacks == 4,
+                  r.transfers.intermediate_readbacks == 4 &&
+                  r.cpu_tail_boundaries == 0 &&
+                  r.transfers.cpu_tail_boundaries == 0,
               "strict face failure fell back");
   crop.shutdown_ok = false;
   ok &= Check(!af.Shutdown(&e), "shutdown failure hidden");

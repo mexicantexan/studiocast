@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -18,6 +19,7 @@ namespace studiocast::open_video {
 namespace {
 constexpr std::size_t kOutputs = 12;
 constexpr std::size_t kTopK = 5000;
+std::atomic<std::uint64_t> g_cache_revision{1};
 const std::array<const char *, kOutputs> kNames = {
     "cls_8",  "cls_16",  "cls_32",  "obj_8", "obj_16", "obj_32",
     "bbox_8", "bbox_16", "bbox_32", "kps_8", "kps_16", "kps_32"};
@@ -179,6 +181,7 @@ struct PreparedCudaYunetDetector::Impl {
   bool stopped = false;
   bool warmup_pending = false;
   FrameAnalysisCache *prepared_cache = nullptr;
+  std::uint64_t cache_revision = 0;
   ~Impl() {
     // Live prepared generations require explicit after-quiescence Shutdown().
     // Candidate setup rollback is safe here on the setup thread/context.
@@ -352,6 +355,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   }
   auto candidate = std::make_unique<Impl>();
   candidate->setup = setup;
+  candidate->cache_revision =
+      g_cache_revision.fetch_add(1, std::memory_order_relaxed);
   candidate->artifact = validated_artifact;
   candidate->input_w = input_w;
   candidate->input_h = input_h;
@@ -522,10 +527,20 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
   PreparedCudaYunetExecutionResult result;
   if (!ready() || !cache || cache != impl_->prepared_cache ||
       !SameBinding(binding, impl_->setup.binding) ||
+      !source.Valid() || source.format != cuda::PixelFormatGpu::rgb_u8 ||
       source.w != impl_->setup.frame_width ||
       source.h != impl_->setup.frame_height)
     return result;
   cache->BeginFrame(sequence);
+  const auto &provenance = cache->face_detections_provenance;
+  if (provenance.complete && provenance.producer == this &&
+      provenance.producer_revision == impl_->cache_revision &&
+      cache->face_detections) {
+    result.status = cache->face_detections->empty()
+                        ? PreparedCudaYunetStatus::success_no_faces
+                        : PreparedCudaYunetStatus::success_faces;
+    return result;
+  }
   const float scale = std::min(
       static_cast<float>(impl_->input_w) / static_cast<float>(source.w),
       static_cast<float>(impl_->input_h) / static_cast<float>(source.h));
@@ -693,6 +708,7 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
       scale, geometry.pad_x, geometry.pad_y, source.w, source.h, .3f);
   auto &cached = cache->PrepareFaceDetections(kTopK);
   cached.assign(faces.begin(), faces.end());
+  cache->face_detections_provenance = {this, impl_->cache_revision, true};
   result.cpu_tail_boundaries = 1;
   result.status = faces.empty() ? PreparedCudaYunetStatus::success_no_faces
                                 : PreparedCudaYunetStatus::success_faces;
