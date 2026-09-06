@@ -50,6 +50,7 @@ struct PreparedCudaYunetPreparedBinding {
   PreparedCudaYunetDetector *producer = nullptr;
   PreparedCudaYunetBinding binding{};
   ValidatedModelArtifactIdentity artifact{};
+  std::uint64_t producer_revision = 0;
   FrameAnalysisCache *cache = nullptr;
   int frame_width = 0;
   int frame_height = 0;

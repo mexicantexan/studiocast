@@ -422,7 +422,8 @@ int main() {
       d.MatchesPreparedBinding(prepared_binding) &&
       prepared_binding.producer == &d && prepared_binding.cache == &cache &&
       prepared_binding.artifact == id && prepared_binding.frame_width == 4 &&
-      prepared_binding.frame_height == 3;
+      prepared_binding.frame_height == 3 &&
+      prepared_binding.producer_revision != 0;
   auto stale_prepared_binding = prepared_binding;
   ++stale_prepared_binding.binding.configuration_generation;
   prepared_binding_ok &= !d.MatchesPreparedBinding(stale_prepared_binding);
@@ -691,6 +692,22 @@ int main() {
   missing_setup.models_root = "/definitely/missing/studiocast-yunet";
   missing_setup.requested_model_id = "missing";
   ok &= !missing.Prepare(missing_setup, &error) && !missing.ready();
+  open_video::PreparedCudaYunetDetector reprepared;
+  open_video::FrameAnalysisCache reprepare_cache;
+  open_video::PreparedCudaYunetPreparedBinding old_binding, new_binding;
+  ok &= reprepared.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error) &&
+        reprepared.PrepareCache(&reprepare_cache, &error) &&
+        reprepared.ExportPreparedBinding(&reprepare_cache, &old_binding) &&
+        reprepared.Shutdown(&error) &&
+        reprepared.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error) &&
+        reprepared.PrepareCache(&reprepare_cache, &error) &&
+        reprepared.ExportPreparedBinding(&reprepare_cache, &new_binding) &&
+        old_binding.producer_revision != new_binding.producer_revision &&
+        !reprepared.MatchesPreparedBinding(old_binding) &&
+        reprepared.MatchesPreparedBinding(new_binding) &&
+        reprepared.Shutdown(&error);
   if (!ok) {
     std::cerr << "lifecycle failed runs=" << state.runs
               << " copies=" << state.copies << " syncs=" << state.syncs

@@ -523,9 +523,10 @@ bool PreparedCudaYunetDetector::ExportPreparedBinding(
     FrameAnalysisCache *cache, PreparedCudaYunetPreparedBinding *out) noexcept {
   if (out)
     *out = {};
-  if (!out || !impl_ || !impl_->ready || cache != impl_->prepared_cache)
+  if (!out || !cache || !impl_ || !impl_->ready || !impl_->prepared_cache ||
+      cache != impl_->prepared_cache)
     return false;
-  *out = {this,  impl_->setup.binding,     impl_->artifact,
+  *out = {this, impl_->setup.binding, impl_->artifact, impl_->cache_revision,
           cache, impl_->setup.frame_width, impl_->setup.frame_height};
   return true;
 }
@@ -536,6 +537,7 @@ bool PreparedCudaYunetDetector::MatchesPreparedBinding(
          binding.cache == impl_->prepared_cache &&
          SameBinding(binding.binding, impl_->setup.binding) &&
          binding.artifact == impl_->artifact &&
+         binding.producer_revision == impl_->cache_revision &&
          binding.frame_width == impl_->setup.frame_width &&
          binding.frame_height == impl_->setup.frame_height;
 }
