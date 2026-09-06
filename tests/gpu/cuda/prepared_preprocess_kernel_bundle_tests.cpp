@@ -2,6 +2,7 @@
 #include "core/cuda/kernels/resize_bilinear.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 std::atomic<std::size_t> g_heap_allocations{0};
 
@@ -443,6 +445,64 @@ bool TestPreparedLetterboxLaunchGeometry() {
   return ok;
 }
 
+bool TestNativeLetterboxWhenRequired() {
+  if (!std::getenv("STUDIOCAST_REQUIRE_CUDA_LETTERBOX_TEST")) {
+    std::cout << "[SKIP] native CUDA letterbox check not requested\n";
+    return true;
+  }
+  CudaDriverApi driver;
+  std::string error;
+  if (!driver.Initialize(&error) || !driver.EnsureContextForDevice(0, &error))
+    return Expect(false, error);
+  CUstream stream = nullptr;
+  CudaImage source;
+  CudaTensor destination;
+  const std::vector<std::uint8_t> pixels(3u * 2u * 3u, 64u);
+  bool ok = driver.CreateStream(&stream, &error) &&
+            source.Allocate(&driver, 3, 2, PixelFormatGpu::rgb_u8, &error) &&
+            destination.AllocateNchwF32(&driver, 1, 3, 4, 4, &error) &&
+            source.UploadFromCpuRgb24(&driver, pixels.data(), 9, stream,
+                                      &error);
+  ModelPreprocessSpec spec;
+  spec.dst_w = 4;
+  spec.dst_h = 4;
+  PreparedPreprocessBinding binding;
+  binding.driver = &driver;
+  binding.context_identity = *driver.context_identity();
+  binding.stream = stream;
+  binding.stream_identity = 1;
+  binding.configuration_generation = 1;
+  binding.model_preprocess_generation = 1;
+  PreparedPreprocessKernelBundle bundle;
+  PreparedPreprocessKernelStatus status{};
+  const LetterboxGeometry geometry{4, 3, 0, 0, 0};
+  ok = ok && bundle.Prepare(binding, spec, bundle.RequiredResourceBytes(),
+                            &error) &&
+       bundle.ExecuteLetterboxed(binding, spec, geometry, source, destination,
+                                 &status);
+  std::vector<float> output;
+  ok = ok && destination.DownloadToCpuF32(&driver, &output, stream, &error) &&
+       driver.StreamSynchronize(stream, &error);
+  if (ok) {
+    constexpr float expected = 64.0f / 255.0f;
+    for (int channel = 0; channel < 3; ++channel) {
+      for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+          const float want = y < 3 ? expected : 0.0f;
+          const auto index = static_cast<std::size_t>(channel * 16 + y * 4 + x);
+          ok &= std::abs(output[index] - want) <= 1.0e-6f;
+        }
+      }
+    }
+  }
+  ok &= Expect(ok, error.empty() ? "native CUDA letterbox output mismatch"
+                                 : error);
+  (void)destination.Free(&driver, &error);
+  (void)source.Free(&driver, &error);
+  (void)driver.DestroyStream(stream, &error);
+  return ok;
+}
+
 bool TestBudgetAndBindingFailuresFailClosed() {
   Fixture fixture;
   if (!fixture.Initialize())
@@ -844,6 +904,7 @@ int main() {
   bool ok = true;
   ok &= TestSetupOnlyAndCompatibilityLaunchParity();
   ok &= TestPreparedLetterboxLaunchGeometry();
+  ok &= TestNativeLetterboxWhenRequired();
   ok &= TestBudgetAndBindingFailuresFailClosed();
   ok &= TestTypedSetupFailuresAndLifecycle();
   ok &= TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence();

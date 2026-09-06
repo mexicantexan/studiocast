@@ -297,9 +297,13 @@ OUTPUT_PIXEL:
     ld.param.u32 %r5, [dstW];
     ld.param.u32 %r6, [dstH];
     mov.u32 %r10, %ctaid.x;
-    mad.lo.s32 %r10, %r10, %ntid.x, %tid.x;
+    mov.u32 %r85, %ntid.x;
+    mov.u32 %r86, %tid.x;
+    mad.lo.s32 %r10, %r10, %r85, %r86;
     mov.u32 %r14, %ctaid.y;
-    mad.lo.s32 %r14, %r14, %ntid.y, %tid.y;
+    mov.u32 %r85, %ntid.y;
+    mov.u32 %r86, %tid.y;
+    mad.lo.s32 %r14, %r14, %r85, %r86;
     mul.lo.u32 %r80, %r5, %r6;        // hw = dstW*dstH
     mad.lo.u32 %r81, %r14, %r5, %r10; // index
 
