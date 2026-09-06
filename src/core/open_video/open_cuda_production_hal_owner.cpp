@@ -93,13 +93,9 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
     return false;
   }
   if (program.requested_backend != hal::BackendId::cuda ||
-      program.requested_provider !=
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda ||
       !program.strict_execution_domain ||
       readiness.requested_backend != hal::BackendId::cuda ||
       readiness.selected_backend != hal::BackendId::cuda ||
-      readiness.provider !=
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda ||
       !readiness.available ||
       (readiness.status != StatusId::ready &&
        readiness.status != StatusId::degraded)) {
@@ -107,7 +103,7 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
       *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
-  if (program.stage_count == 0 || program.stage_count > 2 ||
+  if (program.stage_count == 0 || program.stage_count > 3 ||
       readiness.ready_stage_mask !=
           ((std::uint32_t{1} << program.stage_count) - 1u) ||
       readiness.blocked_stage_mask != 0 || readiness.disabled_stage_mask != 0) {
@@ -120,11 +116,17 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
            semantic == hal::SemanticEffectId::virtual_background_remove ||
            semantic == hal::SemanticEffectId::virtual_background_replace;
   };
-  if (!((program.stage_count == 1 &&
+  const bool vignette_last =
+      program.stages[program.stage_count - 1].semantic ==
+      hal::SemanticEffectId::vignette;
+  const std::size_t model_count =
+      program.stage_count - (vignette_last ? 1u : 0u);
+  if (!((model_count == 0 && vignette_last) ||
+        (model_count == 1 &&
          (vb(program.stages[0].semantic) ||
           program.stages[0].semantic ==
               hal::SemanticEffectId::virtual_key_light)) ||
-        (program.stage_count == 2 && vb(program.stages[0].semantic) &&
+        (model_count == 2 && vb(program.stages[0].semantic) &&
          program.stages[1].semantic ==
              hal::SemanticEffectId::virtual_key_light))) {
     if (reason)
@@ -136,11 +138,25 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
     if (stage.backend != hal::BackendId::cuda ||
         stage.execution_domain != domain ||
         stage.provider !=
-            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+            (stage.semantic == hal::SemanticEffectId::vignette
+                 ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+                 : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
       if (reason)
         *reason = ReasonId::semantic_provider_unavailable;
       return false;
     }
+  }
+  const auto aggregate_provider =
+      model_count != 0 && vignette_last
+          ? hal::SemanticEffectProviderId::invalid
+          : model_count != 0
+                ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
+                : hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  if (program.requested_provider != aggregate_provider ||
+      readiness.provider != aggregate_provider) {
+    if (reason)
+      *reason = ReasonId::semantic_provider_unavailable;
+    return false;
   }
   return true;
 }
@@ -255,8 +271,9 @@ OpenCudaProductionHalOwner::CreateBackend(
     if (request.api_version != kOpenCudaProductionOwnerApiVersion ||
         request.adapter_instance_id == 0 || request.cuda_device_id < 0 ||
         request.configuration_generation == 0 ||
-        request.model_preprocess_generation == 0 ||
-        request.model_artifact_hash == 0 ||
+        ((request.model_artifact.Valid()) !=
+         (request.model_preprocess_generation != 0 &&
+          request.model_artifact_hash != 0)) ||
         (request.require_expected_context &&
          !request.expected_context.Valid())) {
       SetResult(result, OwnerStatus::malformed_request, StatusId::blocked,
@@ -404,6 +421,7 @@ OpenCudaProductionHalOwner::CreateBackend(
     options.key_light_temperature_preset = request.key_light_temperature_preset;
     options.key_light_direction_pan_degrees =
         request.key_light_direction_pan_degrees;
+    options.vignette_intensity = request.vignette_intensity;
     options.wait_policy = request.wait_policy;
     options.runtime = request.runtime;
     state.executor =

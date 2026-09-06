@@ -10,6 +10,8 @@ namespace {
 
 constexpr auto kProvider =
     hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+constexpr auto kNativeProvider =
+    hal::SemanticEffectProviderId::open_cuda_production_kernels;
 
 void SetReason(hal::ReasonId *reason, hal::ReasonId value) noexcept {
   if (reason != nullptr)
@@ -25,6 +27,32 @@ bool SameModel(const hal::ModelArtifactIdentity &left,
   return left.model_id_hash == right.model_id_hash &&
          left.artifact_set_hash == right.artifact_set_hash &&
          left.artifact_generation == right.artifact_generation;
+}
+
+bool UsesMatting(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::virtual_background_blur ||
+         semantic == hal::SemanticEffectId::virtual_background_remove ||
+         semantic == hal::SemanticEffectId::virtual_background_replace ||
+         semantic == hal::SemanticEffectId::virtual_key_light;
+}
+
+hal::SemanticEffectProviderId ProviderFor(hal::SemanticEffectId semantic) noexcept {
+  return UsesMatting(semantic) ? kProvider : kNativeProvider;
+}
+
+hal::SemanticEffectProviderId AggregateProvider(
+    const video::NormalizedVideoExecutionIntent &intent) noexcept {
+  const auto first = ProviderFor(intent.stages[0].intent.semantic);
+  for (std::size_t index = 1; index < intent.stage_count; ++index)
+    if (ProviderFor(intent.stages[index].intent.semantic) != first)
+      return hal::SemanticEffectProviderId::invalid;
+  return first;
+}
+
+bool ZeroModel(const hal::ModelArtifactIdentity &model) noexcept {
+  return model.model_id_hash == std::array<std::uint8_t, 32>{} &&
+         model.artifact_set_hash == std::array<std::uint8_t, 32>{} &&
+         model.artifact_generation == 0;
 }
 
 bool AddBudgetBytes(std::uint64_t left, std::uint64_t right,
@@ -91,20 +119,26 @@ hal::ImageDescriptor ResidentImage(const hal::ImageDescriptor &host,
 
 bool SupportedStages(
     const video::NormalizedVideoExecutionIntent &intent) noexcept {
-  if (intent.stage_count == 0 || intent.stage_count > 2)
+  if (intent.stage_count == 0 || intent.stage_count > 3)
     return false;
   const auto vb = [](hal::SemanticEffectId semantic) {
     return semantic == hal::SemanticEffectId::virtual_background_blur ||
            semantic == hal::SemanticEffectId::virtual_background_remove ||
            semantic == hal::SemanticEffectId::virtual_background_replace;
   };
-  return (intent.stage_count == 1 &&
+  const bool vignette_last = intent.stages[intent.stage_count - 1].intent.semantic ==
+                             hal::SemanticEffectId::vignette;
+  const std::size_t resident_count = intent.stage_count - (vignette_last ? 1u : 0u);
+  if (resident_count == 0)
+    return vignette_last;
+  return ((resident_count == 1 &&
           (vb(intent.stages[0].intent.semantic) ||
            intent.stages[0].intent.semantic ==
                hal::SemanticEffectId::virtual_key_light)) ||
-         (intent.stage_count == 2 && vb(intent.stages[0].intent.semantic) &&
+         (resident_count == 2 && vb(intent.stages[0].intent.semantic) &&
           intent.stages[1].intent.semantic ==
-              hal::SemanticEffectId::virtual_key_light);
+              hal::SemanticEffectId::virtual_key_light)) &&
+         resident_count + (vignette_last ? 1u : 0u) == intent.stage_count;
 }
 
 bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
@@ -115,10 +149,15 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       domain_plan, cached.minimum_synchronizations_per_frame,
       cached.maximum_synchronizations_per_frame);
   hal::ReasonId transfer_reason = hal::ReasonId::none;
-  if (!cached.model_artifact_validated || !cached.provider_runtime_validated ||
-      !cached.device_context_validated || !cached.cuda_iobinding_validated ||
+  bool has_model_consumer = false;
+  for (std::size_t index = 0; index < request.intent.stage_count; ++index)
+    has_model_consumer |= UsesMatting(request.intent.stages[index].intent.semantic);
+  if ((has_model_consumer && !cached.model_artifact_validated) ||
+      !cached.provider_runtime_validated ||
+      !cached.device_context_validated ||
+      (has_model_consumer && !cached.cuda_iobinding_validated) ||
       !cached.user_stream_bound || !cached.reusable_resources_supported ||
-      !cached.device_preprocess_supported ||
+      (has_model_consumer && !cached.device_preprocess_supported) ||
       !cached.device_postprocess_supported || !cached.one_upload_one_readback ||
       !cached.no_intermediate_crossings || !cached.stop_aware_bounded_wait ||
       !cached.allocation_free_execute ||
@@ -129,7 +168,8 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       cached.readiness.execution_domain != cached.execution_domain ||
       cached.readiness.requested_backend != hal::BackendId::cuda ||
       cached.readiness.selected_backend != hal::BackendId::cuda ||
-      cached.readiness.provider != kProvider || !cached.readiness.available ||
+      cached.readiness.provider != AggregateProvider(request.intent) ||
+      !cached.readiness.available ||
       (cached.readiness.status != hal::StatusId::ready &&
        cached.readiness.status != hal::StatusId::degraded) ||
       // Readiness masks use prepared-stage slots, not stable stage_id values.
@@ -141,7 +181,7 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       cached.readiness.blocked_stage_mask != 0 ||
       cached.readiness.disabled_stage_mask != 0 ||
       resolution.selected_backend != hal::BackendId::cuda ||
-      resolution.selected_provider != kProvider ||
+      resolution.selected_provider != AggregateProvider(request.intent) ||
       request.invalidation_key.generations != cached.generations ||
       (ValidReservedBudget(cached.reserved_budget) &&
        !SameBudget(request.budget, cached.reserved_budget)) ||
@@ -152,7 +192,12 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
     return false;
   }
   for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
-    if (!SameModel(request.intent.stages[index].model, cached.models[index]))
+    const auto semantic = request.intent.stages[index].intent.semantic;
+    if ((UsesMatting(semantic) &&
+         !SameModel(request.intent.stages[index].model, cached.models[index])) ||
+        (!UsesMatting(semantic) &&
+         (!ZeroModel(request.intent.stages[index].model) ||
+          !ZeroModel(cached.models[index]))))
       return false;
   }
   return true;
@@ -179,7 +224,7 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
     const auto &intent = request.intent.stages[index].intent;
     if (resolution.stages[index].skipped_optional ||
         resolution.stages[index].selected_backend != hal::BackendId::cuda ||
-        resolution.stages[index].provider != kProvider ||
+        resolution.stages[index].provider != ProviderFor(intent.semantic) ||
         intent.stage_id == 0 || intent.requires_tracked_vignette_center ||
         (intent.required &&
          intent.failure_action != hal::FailureAction::fail_closed) ||
@@ -300,7 +345,8 @@ bool ExactRegistration(const hal::AdapterRegistration &registration,
       const auto &capability = registration.semantic_capabilities[index];
       found |=
           capability.semantic == plan.prepared_program.stages[stage].semantic &&
-          capability.provider == kProvider &&
+          capability.provider == ProviderFor(
+              plan.prepared_program.stages[stage].semantic) &&
           hal::IsSelectableSemanticCapability(capability);
     }
     if (!found)
@@ -316,7 +362,7 @@ bool ExactReadiness(const hal::ReadinessSnapshot &readiness,
          readiness.available &&
          readiness.requested_backend == hal::BackendId::cuda &&
          readiness.selected_backend == hal::BackendId::cuda &&
-         readiness.provider == kProvider &&
+         readiness.provider == plan.prepared_program.requested_provider &&
          readiness.execution_domain == plan.prepared_program.execution_domain &&
          readiness.ready_stage_mask ==
              ((std::uint32_t{1} << plan.prepared_program.stage_count) - 1u) &&
@@ -843,8 +889,14 @@ OpenCudaVideoExecutionFactory::CreateProduction(
        request.backend.key_light_temperature_preset <= 2 &&
        request.backend.key_light_direction_pan_degrees >= -90 &&
        request.backend.key_light_direction_pan_degrees <= 90);
-  bool exact_model = request.backend.model_artifact.Valid();
+  bool has_model_consumer = false;
+  bool exact_model = true;
   for (std::size_t i = 0; i < request.stage_count; ++i) {
+    if (!UsesMatting(request.semantics[i])) {
+      exact_model &= ZeroModel(request.models[i]);
+      continue;
+    }
+    has_model_consumer = true;
     exact_model &= request.models[i].model_id_hash ==
                        request.backend.model_artifact.model_id_sha256 &&
                    request.models[i].artifact_set_hash ==
@@ -852,21 +904,24 @@ OpenCudaVideoExecutionFactory::CreateProduction(
                    request.models[i].artifact_generation ==
                        request.backend.model_artifact.registry_generation;
   }
+  exact_model &= has_model_consumer ? request.backend.model_artifact.Valid()
+                                    : !request.backend.model_artifact.Valid();
   if (request.factory_id == 0 || !supported_semantic || !replacement_contract ||
       !key_light_contract || !exact_model ||
       !ValidReservedBudget(request.reserved_budget) ||
       request.generations.configuration == 0 ||
-      request.generations.geometry == 0 || request.generations.model == 0 ||
+      request.generations.geometry == 0 ||
+      (has_model_consumer && request.generations.model == 0) ||
       request.generations.provider == 0 || request.generations.device == 0 ||
       request.backend.configuration_generation !=
           request.generations.configuration ||
-      request.backend.model_preprocess_generation !=
-          request.generations.model ||
-      !request.model_artifact_validated ||
+      (has_model_consumer && request.backend.model_preprocess_generation !=
+                                 request.generations.model) ||
+      (has_model_consumer && !request.model_artifact_validated) ||
       !request.provider_runtime_validated ||
-      !request.cuda_iobinding_validated || !request.user_stream_bound ||
+      (has_model_consumer && !request.cuda_iobinding_validated) || !request.user_stream_bound ||
       !request.reusable_resources_supported ||
-      !request.device_preprocess_supported ||
+      (has_model_consumer && !request.device_preprocess_supported) ||
       !request.device_postprocess_supported ||
       !request.stop_aware_bounded_wait || !request.allocation_free_execute) {
     result->status = hal::StatusId::blocked;
@@ -890,7 +945,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.readiness.status = hal::StatusId::ready;
     config.cached.readiness.requested_backend = hal::BackendId::cuda;
     config.cached.readiness.selected_backend = hal::BackendId::cuda;
-    config.cached.readiness.provider = kProvider;
+    config.cached.readiness.provider = AggregateProvider(supported_intent);
     config.cached.readiness.execution_domain = owner->execution_domain();
     config.cached.readiness.ready_stage_mask =
         (std::uint32_t{1} << request.stage_count) - 1u;
@@ -901,13 +956,13 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.reserved_budget = request.reserved_budget;
     config.cached.generations.context =
         owner->execution_domain().logical_context_generation;
-    config.cached.model_artifact_validated = true;
+    config.cached.model_artifact_validated = request.model_artifact_validated;
     config.cached.provider_runtime_validated = true;
     config.cached.device_context_validated = true;
-    config.cached.cuda_iobinding_validated = true;
+    config.cached.cuda_iobinding_validated = request.cuda_iobinding_validated;
     config.cached.user_stream_bound = true;
     config.cached.reusable_resources_supported = true;
-    config.cached.device_preprocess_supported = true;
+    config.cached.device_preprocess_supported = request.device_preprocess_supported;
     config.cached.device_postprocess_supported = true;
     config.cached.one_upload_one_readback = true;
     config.cached.no_intermediate_crossings = true;
@@ -943,7 +998,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       auto &capability =
           impl.production_registration.semantic_capabilities[index];
       capability.semantic = request.semantics[index];
-      capability.provider = kProvider;
+      capability.provider = ProviderFor(request.semantics[index]);
       capability.status = hal::StatusId::ready;
       capability.reason = hal::ReasonId::none;
       capability.cpu_tail = index + 1 == request.stage_count
@@ -962,7 +1017,9 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           hal::BackendId::cuda,
           true};
       capability.evidence[1] = {
-          hal::CapabilityEvidenceCode::model_artifact_identity_valid,
+          UsesMatting(request.semantics[index])
+              ? hal::CapabilityEvidenceCode::model_artifact_identity_valid
+              : hal::CapabilityEvidenceCode::synchronization_evidence_valid,
           hal::StatusId::ready,
           hal::ReasonId::none,
           request.semantics[index],
@@ -975,7 +1032,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           request.semantics[index],
           hal::BackendId::cuda,
           true};
-      capability.evidence_count = 3;
+      capability.evidence_count = UsesMatting(request.semantics[index]) ? 3 : 2;
     }
     impl.production_registration.semantic_capability_count =
         request.stage_count;
@@ -995,14 +1052,21 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     snapshot.execution_domain = impl.config.cached.execution_domain;
     snapshot.generations = impl.config.cached.generations;
     snapshot.reserved_budget = impl.config.cached.reserved_budget;
-    snapshot.providers[0] = kProvider;
+    snapshot.providers[0] = ProviderFor(request.semantics[0]);
     snapshot.provider_count = 1;
-    for (std::size_t index = 0; index < request.stage_count; ++index) {
-      snapshot.artifacts[index].semantic = request.semantics[index];
-      snapshot.artifacts[index].provider = kProvider;
-      snapshot.artifacts[index].artifact = impl.config.cached.models[index];
+    for (std::size_t index = 1; index < request.stage_count; ++index) {
+      const auto provider = ProviderFor(request.semantics[index]);
+      if (provider != snapshot.providers[0])
+        snapshot.providers[snapshot.provider_count++] = provider;
     }
-    snapshot.artifact_count = request.stage_count;
+    for (std::size_t index = 0; index < request.stage_count; ++index) {
+      if (!UsesMatting(request.semantics[index]))
+        continue;
+      auto &leased = snapshot.artifacts[snapshot.artifact_count++];
+      leased.semantic = request.semantics[index];
+      leased.provider = ProviderFor(request.semantics[index]);
+      leased.artifact = impl.config.cached.models[index];
+    }
     snapshot.adapter = factory->adapter_registration();
     snapshot.factory = factory->Registration();
     return factory;
@@ -1106,7 +1170,7 @@ OpenCudaVideoExecutionFactory::Registration() noexcept {
   registration.factory_id = impl_->config.factory_id;
   registration.route = video::VideoExecutionRoute::prepared_resident;
   registration.backend = hal::BackendId::cuda;
-  registration.provider = kProvider;
+  registration.provider = impl_->config.cached.readiness.provider;
   registration.adapter_instance_id =
       impl_->config.cached.execution_domain.adapter_instance_id;
   registration.execution_domain = impl_->config.cached.execution_domain;
@@ -1171,7 +1235,8 @@ video::VideoAdapterFactoryPreflight OpenCudaVideoExecutionFactory::Preflight(
     video::VideoExecutionRoute route) noexcept {
   video::VideoAdapterFactoryPreflight result;
   result.backend = hal::BackendId::cuda;
-  result.provider = kProvider;
+  result.provider = impl_ ? impl_->config.cached.readiness.provider
+                          : hal::SemanticEffectProviderId::invalid;
   result.cached_evidence_only = true;
   result.accepts_frozen_resolution = true;
   result.performs_selection = false;
@@ -1233,7 +1298,8 @@ OpenCudaVideoExecutionFactory::Prepare(
   }
   if (plan.route != video::VideoExecutionRoute::prepared_resident ||
       plan.prepared_program.requested_backend != hal::BackendId::cuda ||
-      plan.prepared_program.requested_provider != kProvider ||
+      plan.prepared_program.requested_provider !=
+          impl_->config.cached.readiness.provider ||
       !video::ValidatePerFrameTransferContract(plan.per_frame_transfers,
                                                plan.domain_plan, nullptr) ||
       plan.prepared_program.stage_count != impl_->config.cached.stage_count) {

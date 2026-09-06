@@ -748,6 +748,16 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
               "combined VB/key-light planning must reserve the second stage "
               "events and terminal device resize exactly") &&
        ok;
+  auto triple_resize = combined_resize;
+  triple_resize.island_stage_count = 3;
+  const auto triple_plan =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(triple_resize);
+  ok = Expect(triple_plan.ready() && triple_plan.island_stage_count == 3 &&
+                  triple_plan.required_budget.resource_count == 22 &&
+                  triple_plan.required_budget.persistent_bytes == 4112,
+              "VB/key-light/vignette planning must admit the bounded third "
+              "stage and reserve its completion events exactly") &&
+       ok;
   struct Threshold {
     int requested = 0;
     std::uint32_t strength = 0;
@@ -1005,6 +1015,98 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
                 "undersized prepared pitch must fail as malformed") &&
          ok;
   }
+  return ok;
+}
+
+bool TestContiguousTensorPitchBudgetBoundary() {
+  constexpr std::uint64_t active = 256u * 256u * sizeof(float);
+  constexpr std::uint64_t pitch = active + 256u;
+  std::uint64_t capacity = 0;
+  bool ok = Expect(open_cuda::PreparedContiguousTensorCapacityBytes(
+                       pitch, active, &capacity) &&
+                       capacity == pitch,
+                   "one-row CudaTensor pitch must be counted once as its exact "
+                   "allocation capacity");
+
+  auto accepted = PlanningInput(
+      hal::SemanticEffectId::virtual_background_remove, 8);
+  accepted.model_width = 256;
+  accepted.model_height = 256;
+  accepted.model_alpha_capacity_bytes = capacity;
+  accepted.input_tensor_capacity_bytes = active * 3u;
+  accepted.available_budget.persistent_bytes = 2u * 1024u * 1024u;
+  const auto baseline =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted);
+  ok = Expect(baseline.ready(),
+              "exact contiguous tensor resources must produce a ready plan") &&
+       ok;
+  accepted.available_budget.persistent_bytes =
+      baseline.required_budget.persistent_bytes;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted).ready(),
+              "an exact tight persistent budget must remain eligible") &&
+       ok;
+  --accepted.available_budget.persistent_bytes;
+  const auto under =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted);
+  ok = Expect(under.status == RuntimeStatus::resource_exhausted &&
+                  under.reason == hal::ReasonId::resource_exhausted,
+              "one byte below the exact allocation budget must fail closed") &&
+       ok;
+  ok = Expect(!open_cuda::PreparedContiguousTensorCapacityBytes(
+                  active - 1u, active, &capacity),
+              "invalid allocation metadata must be rejected") &&
+       ok;
+  return ok;
+}
+
+bool TestNativeVignetteExactAllocationBudgetBoundary() {
+  open_cuda::PreparedOpenCudaVignetteBudgetInput input;
+  input.input_pitch_bytes = 256;
+  input.input_height = 49;
+  input.output_pitch_bytes = 320;
+  input.output_height = 49;
+  input.final_output_pitch_bytes = 384;
+  input.final_output_height = 51;
+  input.upload_staging_bytes = 65u * 49u * 3u;
+  input.readback_staging_bytes = 67u * 51u * 3u;
+  input.available_budget.persistent_bytes = 1u << 20;
+  input.available_budget.scratch_bytes = 1;
+  input.available_budget.upload_staging_bytes = input.upload_staging_bytes;
+  input.available_budget.readback_staging_bytes = input.readback_staging_bytes;
+  input.available_budget.resource_count = 8;
+  input.available_budget.in_flight_slots = 1;
+  hal::ResourceBudget required;
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Expect(
+      open_cuda::PlanPreparedOpenCudaVignetteBudget(input, &required, &reason) ==
+              RuntimeStatus::ready &&
+          reason == hal::ReasonId::none &&
+          required.persistent_bytes == 256u * 49u + 320u * 49u + 384u * 51u &&
+          required.resource_count == 8,
+      "native vignette must reserve exact pitched input/output/final storage");
+  input.available_budget = required;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) == RuntimeStatus::ready,
+              "native vignette exact allocation budget must be accepted") &&
+       ok;
+  --input.available_budget.persistent_bytes;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) ==
+                      RuntimeStatus::resource_exhausted &&
+                  reason == hal::ReasonId::resource_exhausted,
+              "native vignette exact-minus-one budget must fail closed with "
+              "resource exhaustion") &&
+       ok;
+  input.available_budget.persistent_bytes =
+      std::numeric_limits<std::uint64_t>::max();
+  input.input_pitch_bytes = std::numeric_limits<std::uint64_t>::max();
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) ==
+                      RuntimeStatus::resource_exhausted &&
+                  reason == hal::ReasonId::resource_exhausted,
+              "native vignette allocation overflow must remain resource "
+              "exhaustion") &&
+       ok;
   return ok;
 }
 
@@ -1438,6 +1540,7 @@ bool TestBudgetEvidenceRollbackAndOldPlanRetention() {
     const auto status = fixture.session.Configure(replacement, fixture.adapter,
                                                   &readiness, &reason);
     ok = Expect(status == hal::StatusId::resource_exhausted &&
+                    reason == hal::ReasonId::resource_exhausted &&
                     fixture.session.prepared() &&
                     fixture.session.program().program_id ==
                         fixture.program.program_id &&
@@ -1579,6 +1682,8 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
 int main() {
   bool ok = true;
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
+  ok = TestContiguousTensorPitchBudgetBoundary() && ok;
+  ok = TestNativeVignetteExactAllocationBudgetBoundary() && ok;
   ok = TestAcceptedResidentEffectsThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
   ok = TestCombinedOptionalFirstFailureContinuesSecondStage() && ok;

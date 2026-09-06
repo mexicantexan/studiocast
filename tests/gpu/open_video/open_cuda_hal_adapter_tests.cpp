@@ -212,6 +212,8 @@ open_cuda::ResidentCapabilityFacts CompleteFacts() {
   facts.virtual_background_remove = true;
   facts.virtual_background_replace = true;
   facts.virtual_key_light = true;
+  facts.vignette = true;
+  facts.native_vignette_kernel_prepared = true;
   return facts;
 }
 
@@ -362,7 +364,6 @@ public:
       ++result.output.size_bytes;
     result.output_valid = !required_stage_failed;
     result.stage_count = slot->program.stage_count;
-    bool any_stage_ran = false;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
       const auto &stage = slot->program.stages[index];
       result.stages[index].stage_id = stage.stage_id;
@@ -381,7 +382,6 @@ public:
             hal::StageExecutionStatus::required_failed;
         result.stages[index].reason = hal::ReasonId::required_stage_failed;
         result.stages[index].elapsed_ns = 100 + index;
-        any_stage_ran = true;
         ++executed_stage_calls;
       } else if (required_stage_failed) {
         result.stages[index].status = hal::StageExecutionStatus::not_run;
@@ -391,12 +391,10 @@ public:
         result.stages[index].reason = hal::ReasonId::optional_stage_failed_open;
         result.stages[index].valid_output_preserved = true;
         result.stages[index].elapsed_ns = 100 + index;
-        any_stage_ran = true;
         ++executed_stage_calls;
       } else {
         result.stages[index].status = hal::StageExecutionStatus::succeeded;
         result.stages[index].elapsed_ns = 100 + index;
-        any_stage_ran = true;
         ++executed_stage_calls;
       }
     }
@@ -415,7 +413,16 @@ public:
       ++telemetry.synchronizations;
       result.transfers.synchronizations = 1;
     }
-    if (any_stage_ran)
+    bool model_stage_ran = false;
+    for (std::size_t index = 0; index < result.stage_count; ++index) {
+      const auto semantic = result.stages[index].semantic;
+      model_stage_ran |=
+          result.stages[index].status != hal::StageExecutionStatus::not_run &&
+          result.stages[index].status !=
+              hal::StageExecutionStatus::disabled_preserved &&
+          semantic != hal::SemanticEffectId::vignette;
+    }
+    if (model_stage_ran)
       ++telemetry.shared_analysis_runs;
     return result;
   }
@@ -559,7 +566,8 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
   for (const auto semantic : {hal::SemanticEffectId::virtual_background_blur,
                               hal::SemanticEffectId::virtual_background_remove,
                               hal::SemanticEffectId::virtual_background_replace,
-                              hal::SemanticEffectId::virtual_key_light}) {
+                              hal::SemanticEffectId::virtual_key_light,
+                              hal::SemanticEffectId::vignette}) {
     const auto capability =
         open_cuda::EvaluateResidentCapability(semantic, facts);
     ok &=
@@ -570,7 +578,7 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
   for (const auto semantic :
        {hal::SemanticEffectId::video_noise_removal,
         hal::SemanticEffectId::eye_contact, hal::SemanticEffectId::auto_frame,
-        hal::SemanticEffectId::mirror, hal::SemanticEffectId::vignette}) {
+        hal::SemanticEffectId::mirror}) {
     const auto capability =
         open_cuda::EvaluateResidentCapability(semantic, facts);
     ok &= Require(capability.status == hal::StatusId::blocked &&
@@ -616,6 +624,28 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
               .production_eligible,
       "missing key-light evidence must not demote independently proven remove");
   return ok;
+}
+
+bool TestNativeVignetteDoesNotRequireModelAnalysisTelemetry() {
+  FakeExecutor executor;
+  open_cuda::ResidentAdapter adapter(81, executor);
+  auto program = Program(102);
+  program.stages[0] =
+      Stage(1, hal::SemanticEffectId::vignette, true,
+            hal::FailureAction::fail_closed);
+  program.stages[0].provider =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  program.stages[0].model = {};
+  program.invalidation_key.generations.model = 0;
+  program.invalidation_key.model_artifact_hash = 0;
+  hal::PreparedProgramSession session;
+  if (!Configure(&session, &adapter, program))
+    return false;
+  const auto result = session.Execute(Request(program));
+  return Require(result.status == hal::StatusId::executed &&
+                     result.output_valid &&
+                     executor.telemetry.shared_analysis_runs == 0,
+                 "native vignette must execute without model-analysis work");
 }
 
 bool TestPreparedExecutionAndCommittedAttribution() {
@@ -1488,6 +1518,7 @@ bool TestMattingExecutionRequiresExactSetupPreparation() {
 int main() {
   bool ok = true;
   ok &= TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders();
+  ok &= TestNativeVignetteDoesNotRequireModelAnalysisTelemetry();
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestMalformedAndForeignProgramsFailClosed();
   ok &= TestStaleDomainGenerationAndResourceChecks();

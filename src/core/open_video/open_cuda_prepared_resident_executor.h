@@ -65,6 +65,7 @@ enum class PreparedOpenCudaOperationId : std::uint16_t {
   composite_replace = 13,
   key_light = 14,
   final_resize = 15,
+  vignette = 16,
 };
 
 struct PreparedOpenCudaLaunchGeometry {
@@ -136,6 +137,29 @@ struct PreparedOpenCudaVbPlan {
 PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
     const PreparedOpenCudaVbPlanInput &input) noexcept;
 
+// CudaTensor stores NCHW data in one pitched allocation row. This converts
+// that exact allocation metadata into the capacity consumed by setup budgets.
+bool PreparedContiguousTensorCapacityBytes(std::uint64_t allocation_pitch_bytes,
+                                           std::uint64_t active_bytes,
+                                           std::uint64_t *capacity_bytes) noexcept;
+
+struct PreparedOpenCudaVignetteBudgetInput {
+  std::uint64_t input_pitch_bytes = 0;
+  std::uint64_t input_height = 0;
+  std::uint64_t output_pitch_bytes = 0;
+  std::uint64_t output_height = 0;
+  std::uint64_t final_output_pitch_bytes = 0;
+  std::uint64_t final_output_height = 0;
+  std::uint64_t upload_staging_bytes = 0;
+  std::uint64_t readback_staging_bytes = 0;
+  hal::ResourceBudget available_budget{};
+};
+
+PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
+    const PreparedOpenCudaVignetteBudgetInput &input,
+    hal::ResourceBudget *required_budget,
+    hal::ReasonId *reason) noexcept;
+
 struct PreparedOpenCudaProductionConfig;
 hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
     const hal::PreparedProgram &program,
@@ -169,6 +193,7 @@ struct PreparedOpenCudaProductionConfig {
   int key_light_intensity = 50;
   int key_light_temperature_preset = 0;
   int key_light_direction_pan_degrees = 0;
+  int vignette_intensity = 35;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 };
 
@@ -316,6 +341,7 @@ public:
     int key_light_intensity = 50;
     int key_light_temperature_preset = 0;
     int key_light_direction_pan_degrees = 0;
+    int vignette_intensity = 35;
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
     IPreparedOpenCudaRuntime *runtime = nullptr;
