@@ -543,6 +543,62 @@ bool ExactPreflightAndMalformedRejection() {
   REQUIRE(preflight.per_frame_transfers.minimum_synchronizations == 1);
   REQUIRE(preflight.per_frame_transfers.maximum_synchronizations == 1);
 
+  auto automatic = request;
+  automatic.intent.backend.mode = hal::BackendRequestMode::automatic;
+  automatic.intent.backend.backend = hal::BackendId::invalid;
+  automatic.intent.backend.strict = false;
+  automatic.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::any;
+  automatic.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::automatic;
+  automatic.intent.preferences.strict_effects_engine = false;
+  automatic.intent.requested_provider =
+      hal::SemanticEffectProviderId::invalid;
+  automatic.intent.strict_provider_selection = false;
+  REQUIRE(BuildFrozen(automatic, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(plan.intent.backend.mode == hal::BackendRequestMode::automatic);
+  REQUIRE(plan.intent.backend.backend == hal::BackendId::invalid);
+  REQUIRE(preflight.prepared_program.requested_backend ==
+          hal::BackendId::cuda);
+  REQUIRE(!preflight.prepared_program.strict_backend_selection);
+  REQUIRE(preflight.prepared_program.requested_provider ==
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
+  REQUIRE(!preflight.prepared_program.strict_provider_selection);
+  video::VideoAdapterPrepareEvidence automatic_evidence;
+  auto automatic_executor = factory.Prepare(plan, &automatic_evidence);
+  REQUIRE(automatic_executor != nullptr);
+  std::array<std::uint8_t, 24> automatic_input{};
+  std::array<std::uint8_t, 24> automatic_output{};
+  automatic_input[0] = 0x5a;
+  auto automatic_frame = automatic_executor->Execute(
+      Binding(&automatic_input, &automatic_output, 77));
+  REQUIRE(automatic_frame.status == hal::StatusId::executed);
+  REQUIRE(automatic_frame.output_ready);
+  hal::ReasonId automatic_reason = hal::ReasonId::none;
+  REQUIRE(automatic_executor->CommitOutput(automatic_frame.completion, false,
+                                           &automatic_reason) ==
+          hal::StatusId::failed);
+  REQUIRE(!automatic_executor->Snapshot().latest_committed_frame.valid);
+  automatic_frame = automatic_executor->Execute(
+      Binding(&automatic_input, &automatic_output, 78));
+  REQUIRE(automatic_executor->CommitOutput(automatic_frame.completion, true,
+                                           &automatic_reason) ==
+          hal::StatusId::ready);
+  REQUIRE(automatic_executor->Snapshot().latest_committed_frame.capture_sequence ==
+          78);
+
+  auto forced_cuda = automatic;
+  forced_cuda.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  forced_cuda.intent.backend.backend = hal::BackendId::cuda;
+  forced_cuda.intent.backend.strict = true;
+  forced_cuda.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  REQUIRE(BuildFrozen(forced_cuda, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.strict_backend_selection);
+  REQUIRE(!preflight.prepared_program.strict_provider_selection);
+
   auto malformed = request;
   malformed.intent.backend.strict = false;
   REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
