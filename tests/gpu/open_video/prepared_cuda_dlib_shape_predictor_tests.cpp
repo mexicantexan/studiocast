@@ -16,6 +16,7 @@ int loads, gets, launches, unloads;
 CUresult launch_result = CUDA_SUCCESS;
 CUresult copy_result = CUDA_SUCCESS;
 int allocations, frees, syncs, fail_sync_from, fail_sync_through;
+int fail_free_from, fail_free_through;
 std::size_t tensor_pitch_extra;
 const volatile std::byte *pending_copy_source;
 bool inspect_pending_copy_source;
@@ -51,7 +52,9 @@ CUresult Alloc(CUdeviceptr *p, std::size_t *q, std::size_t n, std::size_t,
 }
 CUresult Free(CUdeviceptr) {
   ++frees;
-  return 0;
+  return frees >= fail_free_from && frees <= fail_free_through
+             ? CUDA_ERROR_LAUNCH_FAILED
+             : CUDA_SUCCESS;
 }
 CUresult Copy(const CUDA_MEMCPY2D *copy, CUstream) {
   if (copy_result != CUDA_SUCCESS)
@@ -249,6 +252,29 @@ int main() {
              "budget rejection leaked padded allocations");
   tensor_pitch_extra = 0;
   std::filesystem::remove_all(padded_root);
+  const auto cleanup_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor failed_cleanup;
+  setup.models_root = cleanup_root;
+  setup.model_id = "tiny-dlib68";
+  tensor_pitch_extra = 1u << 20;
+  fail_free_from = frees + 1;
+  fail_free_through = fail_free_from;
+  const int before_cleanup_allocations = allocations;
+  ok &= Need(!failed_cleanup.Prepare(setup, &e),
+             "budget failure with failed cleanup must reject setup");
+  const int after_failed_cleanup_allocations = allocations;
+  const int after_failed_cleanup_frees = frees;
+  ok &= Need(!failed_cleanup.Prepare(setup, &e) &&
+                 after_failed_cleanup_allocations > before_cleanup_allocations &&
+                 allocations == after_failed_cleanup_allocations,
+             "failed setup cleanup did not retain retry state");
+  fail_free_from = 0;
+  fail_free_through = 0;
+  ok &= Need(failed_cleanup.Shutdown(&e) &&
+                 frees > after_failed_cleanup_frees,
+             "failed setup cleanup was not retryable");
+  tensor_pitch_extra = 0;
+  std::filesystem::remove_all(cleanup_root);
   const auto partial_root = TinyPack();
   studiocast::open_video::PreparedCudaDlibShapePredictor partial;
   setup.models_root = partial_root;
@@ -286,6 +312,11 @@ int main() {
   ok &= Need(failed.status ==
                  studiocast::open_video::PreparedCudaDlibStatus::launch_failed,
              "failed launch was not reported");
+  ok &= Need(failed.pending_work,
+             "failed launch did not expose possibly pending work");
+  ok &= Need(failed_launch.Execute(binding, image, {1, 1, 8, 8}, 2, &e).status ==
+                 studiocast::open_video::PreparedCudaDlibStatus::shutdown,
+             "failed launch did not quarantine subsequent execution");
   fail_sync_from = syncs + 1;
   fail_sync_through = fail_sync_from;
   ok &= Need(!failed_launch.Shutdown(&e) && frees == before_launch_frees,
