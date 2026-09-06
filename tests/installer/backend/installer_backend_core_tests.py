@@ -37,7 +37,7 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
-MODEL_CATALOG_SHA256 = "sha256:130ac3b35680c4adbd6cd0471770150b7d813ad0e11b226dbc216f689ba8058c"
+MODEL_CATALOG_SHA256 = "sha256:9f85beb84803fd4f7df7a10052ed62b1c471f64185ff7beaf5405f32be94aa9f"
 MODEL_PACK_SIZE_ROWS = [
     ("fastenhancer_s_vd_v1", 1, 832775),
     ("fastenhancer_m_vd_v1", 1, 2033628),
