@@ -1,0 +1,237 @@
+#include "core/cuda/kernels/dlib_shape_predictor.h"
+#include "core/open_video/prepared_cuda_dlib_shape_predictor.h"
+#include <cstdlib>
+#include <cstring>
+#include <dlib/image_processing/shape_predictor.h>
+#include <dlib/serialize.h>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <unistd.h>
+using namespace studiocast::cuda;
+namespace {
+CUcontext ctx = reinterpret_cast<CUcontext>(1);
+int loads, gets, launches, unloads;
+CUresult launch_result = CUDA_SUCCESS;
+int allocations, frees, syncs, fail_sync_from, fail_sync_through;
+CUresult Current(CUcontext *c) {
+  *c = ctx;
+  return 0;
+}
+CUresult Load(CUmodule *m, const void *) {
+  ++loads;
+  *m = reinterpret_cast<CUmodule>(2);
+  return 0;
+}
+CUresult Get(CUfunction *f, CUmodule, const char *) {
+  ++gets;
+  *f = reinterpret_cast<CUfunction>(3);
+  return 0;
+}
+CUresult Unload(CUmodule) {
+  ++unloads;
+  return 0;
+}
+CUresult Launch(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
+                unsigned, unsigned, CUstream, void **, void **) {
+  ++launches;
+  return launch_result;
+}
+CUresult Alloc(CUdeviceptr *p, std::size_t *q, std::size_t n, std::size_t,
+               unsigned) {
+  *p = 1;
+  *p = static_cast<CUdeviceptr>(0x1000 + (++allocations) * 0x1000);
+  *q = n;
+  return 0;
+}
+CUresult Free(CUdeviceptr) {
+  ++frees;
+  return 0;
+}
+CUresult Copy(const CUDA_MEMCPY2D *, CUstream) { return 0; }
+CUresult Set(CUdeviceptr, unsigned char, std::size_t, CUstream) { return 0; }
+CUresult SC(CUstream *s, unsigned) {
+  *s = reinterpret_cast<CUstream>(4);
+  return 0;
+}
+CUresult S(CUstream) {
+  ++syncs;
+  return syncs >= fail_sync_from && syncs <= fail_sync_through
+             ? CUDA_ERROR_LAUNCH_FAILED
+             : CUDA_SUCCESS;
+}
+CUresult DC(int *n) {
+  *n = 1;
+  return 0;
+}
+CUresult DG(CUdevice *d, int n) {
+  *d = n;
+  return 0;
+}
+CUresult DU(CUuuid *u, CUdevice) {
+  std::memset(u, 0, sizeof(*u));
+  u->bytes[0] = 1;
+  return 0;
+}
+CUresult DR(CUcontext *c, CUdevice) {
+  *c = ctx;
+  return 0;
+}
+CUresult DD(CUdevice) { return 0; }
+CUresult CS(CUcontext c) {
+  ctx = c;
+  return 0;
+}
+CUresult CD(CUdevice *d) {
+  *d = 0;
+  return 0;
+}
+bool Need(bool x, const char *m) {
+  if (!x)
+    std::cerr << m << '\n';
+  return x;
+}
+std::filesystem::path TinyPack() {
+  auto root = std::filesystem::temp_directory_path() /
+              ("studiocast-dlib-" + std::to_string(::getpid()));
+  auto dir = root / "face_landmarks" / "tiny-dlib68";
+  std::filesystem::create_directories(dir);
+  dlib::matrix<float, 0, 1> shape(136);
+  for (long i = 0; i < 68; ++i) {
+    shape(2 * i) = 0.2f + 0.005f * i;
+    shape(2 * i + 1) = 0.3f + 0.004f * i;
+  }
+  dlib::impl::regression_tree tree;
+  tree.leaf_values.emplace_back(136);
+  tree.leaf_values[0] = 0;
+  std::vector<std::vector<dlib::impl::regression_tree>> forests{{tree}};
+  std::vector<std::vector<dlib::vector<float, 2>>> pixels{{{0.5f, 0.5f}}};
+  dlib::shape_predictor predictor(shape, forests, pixels);
+  dlib::serialize((dir / "model.dat").string()) << predictor;
+  std::ofstream(dir / "LICENSE.txt") << "synthetic test fixture\n";
+  std::ofstream(dir / "model.json")
+      << R"({"schema_version":2,"id":"tiny-dlib68","display_name":"tiny","task":"face_landmarks","files":[{"name":"model.dat","kind":"dlib_shape_predictor","role":"main","sha256":""}],"dlib":{"predictor_kind":"shape_predictor_68_face_landmarks","num_landmarks":68}})";
+  return root;
+}
+std::filesystem::path OversizedPack() {
+  auto root = std::filesystem::temp_directory_path() /
+              ("studiocast-dlib-oversized-" + std::to_string(::getpid()));
+  auto dir = root / "face_landmarks" / "oversized-dlib68";
+  std::filesystem::create_directories(dir);
+  std::ofstream artifact(dir / "model.dat", std::ios::binary);
+  int version = 1;
+  long nr = -136, nc = -1;
+  dlib::serialize(version, artifact);
+  dlib::serialize(nr, artifact);
+  dlib::serialize(nc, artifact);
+  for (int i = 0; i < 136; ++i)
+    dlib::serialize(0.0f, artifact);
+  dlib::serialize(std::numeric_limits<unsigned long>::max(), artifact);
+  artifact.close();
+  std::ofstream(dir / "LICENSE.txt") << "synthetic test fixture\n";
+  std::ofstream(dir / "model.json")
+      << R"({"schema_version":2,"id":"oversized-dlib68","display_name":"oversized","task":"face_landmarks","files":[{"name":"model.dat","kind":"dlib_shape_predictor","role":"main","sha256":""}],"dlib":{"predictor_kind":"shape_predictor_68_face_landmarks","num_landmarks":68}})";
+  return root;
+}
+} // namespace
+int main() {
+  CudaDriverApi d;
+  CudaDriverApi::Functions f{};
+  f.cuInit = [](unsigned) { return 0; };
+  f.cuModuleLoadData = Load;
+  f.cuModuleGetFunction = Get;
+  f.cuModuleUnload = Unload;
+  f.cuLaunchKernel = Launch;
+  f.cuMemAllocPitch = Alloc;
+  f.cuMemFree = Free;
+  f.cuMemcpy2DAsync = Copy;
+  f.cuMemsetD8Async = Set;
+  f.cuStreamCreate = SC;
+  f.cuStreamDestroy = S;
+  f.cuStreamSynchronize = S;
+  f.cuDeviceGetCount = DC;
+  f.cuDeviceGet = DG;
+  f.cuDeviceGetUuid = DU;
+  f.cuDevicePrimaryCtxRetain = DR;
+  f.cuDevicePrimaryCtxRelease = DD;
+  f.cuCtxSetCurrent = CS;
+  f.cuCtxGetCurrent = Current;
+  f.cuCtxGetDevice = CD;
+  std::string e;
+  bool ok = Need(d.InitializeForTesting(f, &e), e.c_str());
+  kernels::PreparedDlibShapePredictorKernel k;
+  auto s = reinterpret_cast<CUstream>(4);
+  ok &= Need(kernels::PrepareDlibShapePredictorKernel(d, ctx, s, &k, &e),
+             e.c_str());
+  CudaImage image;
+  image.ptr = 100;
+  image.pitch = 30;
+  image.w = 10;
+  image.h = 10;
+  image.format = PixelFormatGpu::rgb_u8;
+  ok &=
+      Need(kernels::LaunchDlibShapePredictor(k, image, 1, 1, 8, 8, 1, 2, 3, 4,
+                                             5, 6, 7, 8, 9, 1, 10, 11, 12, &e),
+           e.c_str());
+  launch_result = CUDA_ERROR_LAUNCH_FAILED;
+  ok &=
+      Need(!kernels::LaunchDlibShapePredictor(k, image, 1, 1, 8, 8, 1, 2, 3, 4,
+                                              5, 6, 7, 8, 9, 1, 10, 11, 12, &e),
+           "launch failure must be reported");
+  ctx = reinterpret_cast<CUcontext>(9);
+  ok &= Need(!kernels::DestroyDlibShapePredictorKernel(&k, &e) && k.module,
+             "failed shutdown must retain module");
+  ctx = reinterpret_cast<CUcontext>(1);
+  ok &= Need(kernels::DestroyDlibShapePredictorKernel(&k, &e) && !k.module,
+             "retry shutdown must release module");
+  ok &= Need(loads == 1 && gets == 1 && launches == 2 && unloads == 1,
+             "unexpected lifecycle counts");
+  const auto root = TinyPack();
+  CudaPhysicalDeviceIdentity physical;
+  physical.uuid[0] = 1;
+  CudaContextIdentity identity{physical, 1, 1};
+  studiocast::open_video::PreparedCudaDlibBinding binding{&d, identity, ctx, s,
+                                                          1,  2,        3};
+  studiocast::open_video::PreparedCudaDlibSetup setup{binding, root,
+                                                      "tiny-dlib68", 1u << 20};
+  studiocast::open_video::PreparedCudaDlibShapePredictor predictor;
+  const int allocations_before = allocations;
+  syncs = 0;
+  fail_sync_from = 2;
+  fail_sync_through = 3;
+  ok &= Need(!predictor.Prepare(setup, &e),
+             "injected setup synchronization must fail");
+  if (allocations == allocations_before)
+    std::cerr << "Prepare failed before CUDA injection: " << e << '\n';
+  ok &= Need(allocations > allocations_before,
+             "production Prepare did not reach injected CUDA upload");
+  const int retained_allocations = allocations;
+  const int retained_frees = frees;
+  ok &= Need(retained_frees == 0, "pending setup failure released resources");
+  ok &=
+      Need(!predictor.Prepare(setup, &e) && allocations == retained_allocations,
+           "quarantined candidate allowed another Prepare allocation");
+  const bool first_shutdown = predictor.Shutdown(&e);
+  if (first_shutdown || frees != retained_frees)
+    std::cerr << "shutdown evidence success=" << first_shutdown
+              << " frees=" << frees << " retained=" << retained_frees
+              << " syncs=" << syncs << '\n';
+  ok &= Need(!first_shutdown && frees == retained_frees,
+             "failed shutdown released pending resources");
+  fail_sync_from = 0;
+  fail_sync_through = 0;
+  ok &= Need(predictor.Shutdown(&e) &&
+                 frees == retained_allocations - allocations_before,
+             "shutdown retry did not release complete candidate");
+  std::filesystem::remove_all(root);
+  const auto oversized_root = OversizedPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor oversized;
+  setup.models_root = oversized_root;
+  setup.model_id = "oversized-dlib68";
+  const int before_oversized = allocations;
+  ok &= Need(!oversized.Prepare(setup, &e) && allocations == before_oversized,
+             "oversized wire cardinality reached GPU allocation");
+  std::filesystem::remove_all(oversized_root);
+  return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
