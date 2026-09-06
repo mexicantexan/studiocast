@@ -729,7 +729,11 @@ public:
         const auto &leased = bootstrap.setup_lease.artifacts[index];
         if (leased.semantic != caller.intent.stages[index].intent.semantic ||
             leased.provider != kProvider ||
-            !(leased.artifact == expected_artifact)) {
+            leased.artifact.model_id_hash != expected_artifact.model_id_hash ||
+            leased.artifact.artifact_set_hash !=
+                expected_artifact.artifact_set_hash ||
+            leased.artifact.artifact_generation !=
+                expected_artifact.artifact_generation) {
           return Failure(hal::StatusId::blocked,
                          hal::ReasonId::capability_evidence_incomplete);
         }
