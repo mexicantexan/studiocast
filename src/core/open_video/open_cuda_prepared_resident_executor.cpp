@@ -6,6 +6,7 @@
 #include "core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.h"
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
 #include "core/cuda/kernels/resize_bilinear.h"
+#include "core/cuda/kernels/prepared_vignette.h"
 #include "core/open_video/matting_session.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 
@@ -39,6 +40,10 @@ constexpr std::uint32_t kPreparedResizedAlphaImageCount = 1;
 constexpr std::uint32_t kPreparedFeatherImageCount = 2;
 constexpr std::uint32_t kPreparedRgbBlurImageCount = 2;
 constexpr std::uint32_t kPreparedReplacementImageCount = 2;
+constexpr auto kOrtProvider =
+    SemanticEffectProviderId::open_video_onnxruntime_cuda;
+constexpr auto kNativeProvider =
+    SemanticEffectProviderId::open_cuda_production_kernels;
 
 constexpr std::uint32_t
 PreparedResourceCount(bool blur, bool feather, bool replace,
@@ -56,6 +61,20 @@ bool SameHalModel(
   return artifact.Valid() && model.model_id_hash == artifact.model_id_sha256 &&
          model.artifact_set_hash == artifact.artifact_set_sha256 &&
          model.artifact_generation == artifact.registry_generation;
+}
+
+bool UsesMatting(SemanticEffectId semantic) noexcept {
+  return semantic != SemanticEffectId::vignette;
+}
+
+SemanticEffectProviderId ProviderFor(SemanticEffectId semantic) noexcept {
+  return UsesMatting(semantic) ? kOrtProvider : kNativeProvider;
+}
+
+bool ZeroModel(const hal::ModelArtifactIdentity &model) noexcept {
+  return model.model_id_hash == std::array<std::uint8_t, 32>{} &&
+         model.artifact_set_hash == std::array<std::uint8_t, 32>{} &&
+         model.artifact_generation == 0;
 }
 
 bool SameResource(const hal::ResourceHandle &lhs,
@@ -467,13 +486,11 @@ bool ExactCudaDomain(const hal::ExecutionDomainId &domain,
 ReasonId ValidateProductionProgramInternal(
     const hal::PreparedProgram &program,
     const PreparedOpenCudaProductionConfig &config) noexcept {
-  if (program.stage_count == 0 || program.stage_count > 2 ||
+  if (program.stage_count == 0 || program.stage_count > 3 ||
       program.cpu_tail_count != 1 || program.temporal.temporal ||
       program.temporal.history_frames != 0 || !program.requires_upload ||
       !program.requires_final_readback ||
       program.requested_backend != BackendId::cuda ||
-      program.requested_provider !=
-          SemanticEffectProviderId::open_video_onnxruntime_cuda ||
       !program.strict_execution_domain ||
       program.requested_execution_domain != program.execution_domain) {
     return ReasonId::malformed_contract;
@@ -491,18 +508,26 @@ ReasonId ValidateProductionProgramInternal(
            semantic == SemanticEffectId::virtual_background_remove ||
            semantic == SemanticEffectId::virtual_background_replace;
   };
-  if (!((program.stage_count == 1 &&
+  const bool vignette_last = program.stages[program.stage_count - 1].semantic ==
+                             SemanticEffectId::vignette;
+  const std::size_t model_count = program.stage_count - (vignette_last ? 1u : 0u);
+  if (!((model_count == 0 && vignette_last) ||
+        (model_count == 1 &&
          (vb(program.stages[0].semantic) ||
           program.stages[0].semantic == SemanticEffectId::virtual_key_light)) ||
-        (program.stage_count == 2 && vb(program.stages[0].semantic) &&
+        (model_count == 2 && vb(program.stages[0].semantic) &&
          program.stages[1].semantic == SemanticEffectId::virtual_key_light))) {
     return ReasonId::semantic_effect_unsupported;
   }
+  const auto aggregate_provider =
+      model_count != 0 && vignette_last ? SemanticEffectProviderId::invalid
+      : model_count != 0 ? kOrtProvider : kNativeProvider;
+  if (program.requested_provider != aggregate_provider)
+    return ReasonId::semantic_provider_unavailable;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
     if (stage.backend != BackendId::cuda ||
-        stage.provider !=
-            SemanticEffectProviderId::open_video_onnxruntime_cuda ||
+        stage.provider != ProviderFor(stage.semantic) ||
         stage.execution_domain != program.execution_domain)
       return ReasonId::semantic_provider_unavailable;
     if ((stage.required &&
@@ -510,12 +535,17 @@ ReasonId ValidateProductionProgramInternal(
         (!stage.required &&
          stage.failure_action != FailureAction::fail_open_preserve_input))
       return ReasonId::malformed_contract;
-    if (!SameHalModel(stage.model, config.model_artifact))
+    if ((UsesMatting(stage.semantic) &&
+         !SameHalModel(stage.model, config.model_artifact)) ||
+        (!UsesMatting(stage.semantic) && !ZeroModel(stage.model)))
       return ReasonId::reconfiguration_required;
   }
-  if (program.invalidation_key.model_artifact_hash == 0 ||
-      program.invalidation_key.model_artifact_hash !=
-          config.model_artifact_hash ||
+  if ((model_count != 0 &&
+       (program.invalidation_key.model_artifact_hash == 0 ||
+        program.invalidation_key.model_artifact_hash != config.model_artifact_hash)) ||
+      (model_count == 0 &&
+       (program.invalidation_key.model_artifact_hash != 0 ||
+        config.model_artifact_hash != 0)) ||
       program.invalidation_key.generations.configuration !=
           config.configuration_generation ||
       program.invalidation_key.generations.model !=
@@ -555,6 +585,10 @@ ReasonId ValidateProductionProgramInternal(
        tail.boundary_index != program.stage_count)) {
     return ReasonId::cpu_tail_required;
   }
+  if (model_count == 0)
+    return (!config.model_artifact.Valid() && config.model_preprocess_generation == 0)
+               ? ReasonId::none
+               : ReasonId::capability_evidence_incomplete;
   if (!config.model_pack || !config.model_artifact.Valid() ||
       config.model_pack->registry_generation !=
           config.model_artifact.registry_generation ||
@@ -843,9 +877,12 @@ public:
       candidate->program = program;
       candidate->config = config;
       candidate->config.model_pack = nullptr;
-      candidate->model_pack = *config.model_pack;
-      ++telemetry_.allocation_requests;
-      candidate->config.model_pack = &candidate->model_pack;
+      const bool model_free = program.stages[0].semantic == SemanticEffectId::vignette;
+      if (!model_free) {
+        candidate->model_pack = *config.model_pack;
+        ++telemetry_.allocation_requests;
+        candidate->config.model_pack = &candidate->model_pack;
+      }
 
       std::string error;
       if (!config.driver || !config.driver->IsInitialized() ||
@@ -871,6 +908,87 @@ public:
         return SetupFailure(RuntimeStatus::wrong_execution_domain,
                             ReasonId::wrong_execution_domain);
       candidate->stream = config.prepared_stream;
+
+      if (model_free) {
+        const int width = static_cast<int>(program.host_input.width);
+        const int height = static_cast<int>(program.host_input.height);
+        if (!candidate->input.Allocate(config.driver, width, height,
+                                       cuda::PixelFormatGpu::rgb_u8, &error) ||
+            !candidate->output.Allocate(config.driver, width, height,
+                                        cuda::PixelFormatGpu::rgb_u8, &error) ||
+            !cuda::kernels::PrepareVignetteKernel(
+                *config.driver,
+                reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
+                    context->retained_context_id)), candidate->stream,
+                &candidate->vignette, &error)) {
+          CleanupCandidate(candidate.get());
+          return SetupFailure(RuntimeStatus::not_prepared,
+                              ReasonId::capability_evidence_incomplete);
+        }
+        const bool final_resize = program.host_output.width != program.host_input.width ||
+                                  program.host_output.height != program.host_input.height;
+        if (final_resize &&
+            (!cuda::kernels::PrepareResizeBilinearKernel(
+                 *config.driver,
+                 reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
+                     context->retained_context_id)), candidate->stream,
+                 &candidate->resize, &error) ||
+             !candidate->final_output.Allocate(
+                 config.driver, static_cast<int>(program.host_output.width),
+                 static_cast<int>(program.host_output.height),
+                 cuda::PixelFormatGpu::rgb_u8, &error))) {
+          CleanupCandidate(candidate.get());
+          return SetupFailure(RuntimeStatus::not_prepared,
+                              ReasonId::capability_evidence_incomplete);
+        }
+        cuda::CudaPreparedTransferCompletion::PrepareOptions transfer_options;
+        transfer_options.binding.context = *context;
+        transfer_options.binding.stream = candidate->stream;
+        transfer_options.binding.stream_identity = config.stream_identity;
+        transfer_options.binding.owner_identity = config.adapter_instance_id;
+        transfer_options.binding.configuration_generation = config.configuration_generation;
+        transfer_options.upload_row_bytes = program.host_input.planes[0].row_stride_bytes;
+        transfer_options.upload_rows = program.host_input.height;
+        transfer_options.readback_row_bytes = program.host_output.planes[0].row_stride_bytes;
+        transfer_options.readback_rows = program.host_output.height;
+        transfer_options.timed_stage_count = static_cast<std::uint32_t>(program.stage_count);
+        transfer_options.budget.max_pinned_host_bytes =
+            program.host_input.planes[0].size_bytes + program.host_output.planes[0].size_bytes;
+        transfer_options.budget.max_events =
+            static_cast<std::uint32_t>(program.stage_count * 2u + 1u);
+        const auto prepared = candidate->transfer.Prepare(config.driver, transfer_options);
+        if (!prepared.ok()) {
+          CleanupCandidate(candidate.get());
+          return SetupFailure(TransferStatus(prepared.status),
+                              HalReason(TransferStatus(prepared.status)));
+        }
+        candidate->transfer_binding = transfer_options.binding;
+        candidate->reserved_budget = program.budget;
+        candidate->handle.handle_id = next_handle_id_++;
+        candidate->handle.program_id = program.program_id;
+        candidate->handle.invalidation_key = program.invalidation_key;
+        candidate->handle.execution_domain = program.execution_domain;
+        candidate->handle.opaque[0] = reinterpret_cast<std::uintptr_t>(candidate->stream);
+        result.status = RuntimeStatus::ready;
+        result.reason = ReasonId::none;
+        result.handle = candidate->handle;
+        result.evidence.status = RuntimeStatus::ready;
+        result.evidence.semantic = SemanticEffectId::vignette;
+        result.evidence.provider = kNativeProvider;
+        result.evidence.execution_domain = program.execution_domain;
+        result.evidence.reserved_budget = program.budget;
+        result.evidence.strict_cuda_only = true;
+        result.evidence.user_stream_bound = true;
+        result.evidence.cpu_provider_fallback_disabled = true;
+        result.evidence.reusable_resources_prepared = true;
+        result.evidence.setup_warmup_complete = true;
+        result.evidence.device_postprocess = true;
+        result.evidence.one_upload_one_readback = true;
+        result.evidence.no_intermediate_crossings = true;
+        result.evidence.single_in_flight = true;
+        *destination = std::move(candidate);
+        return result;
+      }
 
       const auto &image = program.stages[0].input.image;
       const auto &matting = *candidate->model_pack.matting;
@@ -1151,6 +1269,17 @@ public:
         return SetupFailure(RuntimeStatus::not_prepared,
                             ReasonId::capability_evidence_incomplete);
       }
+      if (program.stages[program.stage_count - 1].semantic ==
+              SemanticEffectId::vignette &&
+          !cuda::kernels::PrepareVignetteKernel(
+              *config.driver,
+              reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
+                  context->retained_context_id)), candidate->stream,
+              &candidate->vignette, &error)) {
+        CleanupCandidate(candidate.get());
+        return SetupFailure(RuntimeStatus::not_prepared,
+                            ReasonId::capability_evidence_incomplete);
+      }
 
       cuda::CudaPreparedTransferCompletion::PrepareOptions transfer_options;
       transfer_options.binding.context = *context;
@@ -1218,6 +1347,8 @@ public:
       exact_plan_input.replacement_frame_pitch_bytes =
           candidate->replacement_frame.pitch;
       for (std::size_t index = 0; index < program.stage_count; ++index) {
+        if (program.stages[index].semantic == SemanticEffectId::vignette)
+          continue;
         exact_plan_input.semantic = program.stages[index].semantic;
         candidate->postprocess_plans[index] =
             BuildPreparedOpenCudaVirtualBackgroundPlan(exact_plan_input);
@@ -1253,7 +1384,10 @@ public:
       result.evidence.status = RuntimeStatus::ready;
       result.evidence.semantic = program.stages[0].semantic;
       result.evidence.provider =
-          SemanticEffectProviderId::open_video_onnxruntime_cuda;
+          program.stages[program.stage_count - 1].semantic ==
+                  SemanticEffectId::vignette
+              ? SemanticEffectProviderId::invalid
+              : kOrtProvider;
       result.evidence.execution_domain = program.execution_domain;
       result.evidence.model_artifact = config.model_artifact;
       result.evidence.reserved_budget = required;
@@ -1358,9 +1492,11 @@ public:
     bool inference_only = false;
     const std::uint32_t disabled_mask =
         frame.disabled_stage_mask | (frame.stage_disabled ? 1u : 0u);
-    const bool any_enabled =
-        disabled_mask != ((std::uint32_t{1} << slot->program.stage_count) - 1u);
-    if (any_enabled) {
+    bool model_stage_enabled = false;
+    for (std::size_t index = 0; index < slot->program.stage_count; ++index)
+      model_stage_enabled |= UsesMatting(slot->program.stages[index].semantic) &&
+          (disabled_mask & (std::uint32_t{1} << index)) == 0;
+    if (model_stage_enabled) {
       analysis_ran = true;
       cuda::kernels::PreparedPreprocessKernelStatus preprocess_status{};
       if (!slot->preprocess.Execute(slot->preprocess_binding,
@@ -1439,6 +1575,9 @@ public:
         stage_result.status = StageExecutionStatus::disabled_preserved;
         stage_result.reason = ReasonId::circuit_breaker_open;
         stage_result.valid_output_preserved = true;
+      } else if (stage.semantic == SemanticEffectId::vignette) {
+        // Terminal fixed-center vignette is launched after any final resize.
+        stage_result.status = StageExecutionStatus::succeeded;
       } else if (analysis_status == RuntimeStatus::executed) {
         const auto &current = current_is_output ? slot->output : slot->input;
         const auto &next = current_is_output ? slot->input : slot->output;
@@ -1498,6 +1637,34 @@ public:
         return finish(result);
       }
       readback_source = &slot->final_output;
+    }
+    const std::size_t vignette_index = slot->program.stage_count - 1;
+    if (slot->program.stages[vignette_index].semantic == SemanticEffectId::vignette &&
+        (disabled_mask & (std::uint32_t{1} << vignette_index)) == 0 &&
+        !required_failed) {
+      std::string vignette_error;
+      const float intensity = std::clamp(
+          static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f, 1.0f);
+      if (!cuda::kernels::LaunchVignettePrepared(
+              slot->vignette, *readback_source, *readback_source, intensity,
+              (static_cast<float>(readback_source->w) - 1.0f) * 0.5f,
+              (static_cast<float>(readback_source->h) - 1.0f) * 0.5f,
+              &vignette_error)) {
+        auto &stage_result = result.stages[vignette_index];
+        stage_result.reason = ReasonId::optional_stage_failed_open;
+        result.stage_failure_status = RuntimeStatus::postprocess_failed;
+        result.stage_failure_reason = stage_result.reason;
+        result.failed_operation = PreparedOpenCudaOperationId::vignette;
+        if (slot->program.stages[vignette_index].required) {
+          stage_result.status = StageExecutionStatus::required_failed;
+          stage_result.valid_output_preserved = false;
+          required_failed = true;
+        } else {
+          stage_result.status = StageExecutionStatus::optional_failed_open;
+          stage_result.valid_output_preserved = true;
+          optional_failed = true;
+        }
+      }
     }
     const auto readback = slot->transfer.EnqueueReadback(
         slot->transfer_binding, readback_source->ptr, readback_source->pitch);
@@ -1656,6 +1823,7 @@ private:
     cuda::CudaImage output{};
     cuda::CudaImage final_output{};
     cuda::kernels::PreparedResizeBilinearKernel resize{};
+    cuda::kernels::PreparedVignetteKernel vignette{};
     cuda::CudaImage blur_tmp{};
     cuda::CudaImage blurred{};
     cuda::CudaImage replacement_source{};
@@ -1673,9 +1841,9 @@ private:
     cuda::kernels::PreparedPreprocessKernelBundle preprocess{};
     cuda::kernels::PreparedOpenCudaVbBinding postprocess_binding{};
     cuda::kernels::PreparedOpenCudaVbKernelBundle postprocess{};
-    std::array<PreparedOpenCudaVbPlan, 2> postprocess_plans{};
+    std::array<PreparedOpenCudaVbPlan, hal::kMaxPreparedStages> postprocess_plans{};
     std::array<std::array<PreparedLaunch, PreparedOpenCudaVbPlan::kMaxLaunches>,
-               2>
+               hal::kMaxPreparedStages>
         postprocess_launches{};
     unsigned long long input_ptr_arg = 0;
     unsigned long long output_ptr_arg = 0;
@@ -1754,6 +1922,8 @@ private:
     (void)slot->transfer.Shutdown();
     std::string resize_error;
     (void)slot->config.driver->BindPreparedContext(slot->context);
+    (void)cuda::kernels::DestroyVignetteKernelPrepared(&slot->vignette,
+                                                        &resize_error);
     (void)cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
                                                               &resize_error);
     FreeTensor(slot->config.driver, &slot->alpha);
@@ -1788,6 +1958,10 @@ private:
     std::string resize_error;
     if (slot->config.driver->BindPreparedContext(slot->context) !=
         cuda::CUDA_SUCCESS) {
+      return RuntimeStatus::completion_pending;
+    }
+    if (!cuda::kernels::DestroyVignetteKernelPrepared(&slot->vignette,
+                                                       &resize_error)) {
       return RuntimeStatus::completion_pending;
     }
     if (!cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
@@ -2043,6 +2217,7 @@ private:
       case PreparedOpenCudaOperationId::final_readback:
       case PreparedOpenCudaOperationId::completion_wait:
       case PreparedOpenCudaOperationId::final_resize:
+      case PreparedOpenCudaOperationId::vignette:
         return false;
       }
       prepared.request.parameters = prepared.parameters.data();
@@ -2132,6 +2307,7 @@ struct OpenCudaPreparedResidentExecutor::Impl {
     config.key_light_temperature_preset = options.key_light_temperature_preset;
     config.key_light_direction_pan_degrees =
         options.key_light_direction_pan_degrees;
+    config.vignette_intensity = options.vignette_intensity;
     config.wait_policy = options.wait_policy;
     if (options.runtime) {
       runtime = options.runtime;
@@ -2216,23 +2392,29 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
 
   const auto prepared = impl_->runtime->Prepare(program, impl_->config);
   const auto &evidence = prepared.evidence;
+  const bool model_free = program.stages[0].semantic == SemanticEffectId::vignette;
+  const auto expected_provider = model_free ? kNativeProvider
+      : (program.stages[program.stage_count - 1].semantic ==
+                 SemanticEffectId::vignette
+             ? SemanticEffectProviderId::invalid
+             : kOrtProvider);
   const bool exact =
       prepared.status == RuntimeStatus::ready &&
       evidence.api_version == kPreparedOpenCudaRuntimeApiVersion &&
       evidence.status == RuntimeStatus::ready &&
       evidence.semantic == program.stages[0].semantic &&
-      evidence.provider ==
-          SemanticEffectProviderId::open_video_onnxruntime_cuda &&
+      evidence.provider == expected_provider &&
       evidence.execution_domain == program.execution_domain &&
       evidence.model_artifact == impl_->config.model_artifact &&
       evidence.strict_cuda_only && evidence.user_stream_bound &&
       evidence.cpu_provider_fallback_disabled &&
       evidence.reusable_resources_prepared && evidence.setup_warmup_complete &&
-      evidence.inference_only_frame_path && evidence.device_preprocess &&
+      (model_free || evidence.inference_only_frame_path) &&
+      (model_free || evidence.device_preprocess) &&
       evidence.device_postprocess && evidence.one_upload_one_readback &&
       evidence.no_intermediate_crossings && evidence.single_in_flight &&
-      ExactPreparedOpenCudaVirtualBackgroundPlan(evidence.geometry_plan) &&
-      evidence.geometry_plan.api_version ==
+      (model_free || ExactPreparedOpenCudaVirtualBackgroundPlan(evidence.geometry_plan)) &&
+      (model_free || evidence.geometry_plan.api_version ==
           kPreparedOpenCudaRuntimeApiVersion &&
       evidence.geometry_plan.semantic == program.stages[0].semantic &&
       evidence.geometry_plan.frame_width == program.host_input.width &&
@@ -2244,9 +2426,9 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
       evidence.geometry_plan.strength ==
           static_cast<std::uint32_t>(std::clamp(
               impl_->config.strength, video::effects::contract::kVbStrengthMin,
-              video::effects::contract::kVbStrengthMax)) &&
-      SameBudget(evidence.geometry_plan.required_budget,
-                 evidence.reserved_budget) &&
+          video::effects::contract::kVbStrengthMax))) &&
+      (model_free || SameBudget(evidence.geometry_plan.required_budget,
+                                evidence.reserved_budget)) &&
       evidence.reserved_budget.in_flight_slots == 1 &&
       BudgetContains(program.budget, evidence.reserved_budget) &&
       prepared.handle.handle_id != 0 &&

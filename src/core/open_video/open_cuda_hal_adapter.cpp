@@ -28,7 +28,8 @@ bool IsVirtualBackground(SemanticEffectId semantic) noexcept {
 
 bool IsSupportedResidentSemantic(SemanticEffectId semantic) noexcept {
   return IsVirtualBackground(semantic) ||
-         semantic == SemanticEffectId::virtual_key_light;
+         semantic == SemanticEffectId::virtual_key_light ||
+         semantic == SemanticEffectId::vignette;
 }
 
 bool HasIdentity(const std::array<std::uint8_t, 32> &identity) noexcept {
@@ -160,17 +161,21 @@ bool ExactCudaProgramImages(const PreparedProgram &program) noexcept {
 bool CompleteCapability(const ResidentCapabilityFacts &facts) noexcept {
   return facts.cuda_driver_ready && facts.stable_device_identity &&
          facts.exact_context_generation && facts.adapter_owned_allocator &&
-         facts.adapter_owned_stream && facts.ort_cuda_provider_ready &&
+         facts.adapter_owned_stream && facts.reusable_buffers_prepared &&
+         facts.bounded_resources && facts.steady_state_allocation_free &&
+         facts.steady_state_probe_free && facts.no_cpu_fallback &&
+         facts.completion_synchronizations_per_frame != 0 &&
+         facts.completion_synchronizations_per_frame <= 4 &&
+         facts.device_postprocess;
+}
+
+bool CompleteOrtCapability(const ResidentCapabilityFacts &facts) noexcept {
+  return CompleteCapability(facts) && facts.ort_cuda_provider_ready &&
          facts.ort_cuda_iobinding_ready &&
          (facts.ort_user_stream_bound ||
           facts.explicit_ort_boundary_synchronization) &&
-         facts.sessions_prepared && facts.reusable_buffers_prepared &&
-         facts.bounded_resources && facts.steady_state_allocation_free &&
-         facts.steady_state_probe_free && facts.no_cpu_fallback &&
-         facts.shared_frame_analysis &&
-         facts.completion_synchronizations_per_frame != 0 &&
-         facts.completion_synchronizations_per_frame <= 4 &&
-         facts.device_preprocess && facts.device_postprocess;
+         facts.sessions_prepared && facts.shared_frame_analysis &&
+         facts.device_preprocess;
 }
 
 const PreparedStageEvidence *
@@ -354,10 +359,14 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
     SetReason(reason, prepared.reason);
     return false;
   }
+  bool has_model_consumer = false;
+  for (std::size_t index = 0; index < program.stage_count; ++index)
+    has_model_consumer |= program.stages[index].semantic != SemanticEffectId::vignette;
   if (!CompleteCapability(prepared.evidence.capability) ||
+      (has_model_consumer && !CompleteOrtCapability(prepared.evidence.capability)) ||
       prepared.evidence.stage_count != program.stage_count ||
-      program.invalidation_key.generations.model == 0 ||
-      program.invalidation_key.model_artifact_hash == 0) {
+      (has_model_consumer && (program.invalidation_key.generations.model == 0 ||
+                              program.invalidation_key.model_artifact_hash == 0))) {
     SetReason(reason, ReasonId::capability_evidence_incomplete);
     return false;
   }
@@ -385,11 +394,14 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
         !SameIo(evidence->input, stage.input) ||
         !SameIo(evidence->output, stage.output) ||
         !SameModel(evidence->model, stage.model) ||
-        !SameModel(stage.model, island_model) ||
+        (stage.semantic != SemanticEffectId::vignette &&
+         !SameModel(stage.model, island_model)) ||
         !evidence->production_qualified || !evidence->cuda_device_input ||
-        !evidence->cuda_device_output || !evidence->cuda_iobinding ||
-        !evidence->device_preprocess || !evidence->device_postprocess ||
-        !evidence->shared_analysis || !evidence->cpu_fallback_disabled) {
+        !evidence->cuda_device_output ||
+        (stage.semantic != SemanticEffectId::vignette &&
+         (!evidence->cuda_iobinding || !evidence->device_preprocess ||
+          !evidence->shared_analysis)) ||
+        !evidence->device_postprocess || !evidence->cpu_fallback_disabled) {
       SetReason(reason, ReasonId::capability_evidence_incomplete);
       return false;
     }
@@ -399,11 +411,15 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
       return false;
     }
     if (!IsSupportedResidentSemantic(stage.semantic) ||
-        stage.provider !=
-            SemanticEffectProviderId::open_video_onnxruntime_cuda ||
-        !HasIdentity(stage.model.model_id_hash) ||
-        !HasIdentity(stage.model.artifact_set_hash) ||
-        stage.model.artifact_generation == 0) {
+        (stage.semantic == SemanticEffectId::vignette
+             ? stage.provider != SemanticEffectProviderId::open_cuda_production_kernels ||
+                   HasIdentity(stage.model.model_id_hash) ||
+                   HasIdentity(stage.model.artifact_set_hash) ||
+                   stage.model.artifact_generation != 0
+             : stage.provider != SemanticEffectProviderId::open_video_onnxruntime_cuda ||
+                   !HasIdentity(stage.model.model_id_hash) ||
+                   !HasIdentity(stage.model.artifact_set_hash) ||
+                   stage.model.artifact_generation == 0)) {
       SetReason(reason, !IsSupportedResidentSemantic(stage.semantic)
                             ? ReasonId::semantic_effect_unsupported
                             : ReasonId::capability_evidence_incomplete);
@@ -508,20 +524,26 @@ EvaluateResidentCapability(SemanticEffectId semantic,
   case SemanticEffectId::virtual_key_light:
     semantic_ready = facts.virtual_key_light;
     break;
+  case SemanticEffectId::vignette:
+    semantic_ready = facts.vignette && facts.native_vignette_kernel_prepared;
+    capability.provider = SemanticEffectProviderId::open_cuda_production_kernels;
+    break;
   case SemanticEffectId::video_noise_removal:
   case SemanticEffectId::eye_contact:
   case SemanticEffectId::auto_frame:
-  case SemanticEffectId::vignette:
   case SemanticEffectId::mirror:
   case SemanticEffectId::invalid:
     break;
   }
-  if (!facts.cuda_driver_ready || !facts.ort_cuda_provider_ready ||
-      !facts.ort_cuda_iobinding_ready) {
+  const bool native = semantic == SemanticEffectId::vignette;
+  if (!facts.cuda_driver_ready ||
+      (!native && (!facts.ort_cuda_provider_ready ||
+                   !facts.ort_cuda_iobinding_ready))) {
     capability.reason = ReasonId::semantic_provider_unavailable;
     return capability;
   }
-  if (!semantic_ready || !CompleteCapability(facts)) {
+  if (!semantic_ready || !CompleteCapability(facts) ||
+      (!native && !CompleteOrtCapability(facts))) {
     capability.reason = ReasonId::capability_evidence_incomplete;
     return capability;
   }

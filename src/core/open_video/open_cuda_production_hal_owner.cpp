@@ -255,8 +255,9 @@ OpenCudaProductionHalOwner::CreateBackend(
     if (request.api_version != kOpenCudaProductionOwnerApiVersion ||
         request.adapter_instance_id == 0 || request.cuda_device_id < 0 ||
         request.configuration_generation == 0 ||
-        request.model_preprocess_generation == 0 ||
-        request.model_artifact_hash == 0 ||
+        ((request.model_artifact.Valid()) !=
+         (request.model_preprocess_generation != 0 &&
+          request.model_artifact_hash != 0)) ||
         (request.require_expected_context &&
          !request.expected_context.Valid())) {
       SetResult(result, OwnerStatus::malformed_request, StatusId::blocked,
@@ -404,6 +405,7 @@ OpenCudaProductionHalOwner::CreateBackend(
     options.key_light_temperature_preset = request.key_light_temperature_preset;
     options.key_light_direction_pan_degrees =
         request.key_light_direction_pan_degrees;
+    options.vignette_intensity = request.vignette_intensity;
     options.wait_policy = request.wait_policy;
     options.runtime = request.runtime;
     state.executor =

@@ -65,6 +65,7 @@ enum class PreparedOpenCudaOperationId : std::uint16_t {
   composite_replace = 13,
   key_light = 14,
   final_resize = 15,
+  vignette = 16,
 };
 
 struct PreparedOpenCudaLaunchGeometry {
@@ -169,6 +170,7 @@ struct PreparedOpenCudaProductionConfig {
   int key_light_intensity = 50;
   int key_light_temperature_preset = 0;
   int key_light_direction_pan_degrees = 0;
+  int vignette_intensity = 35;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 };
 
@@ -316,6 +318,7 @@ public:
     int key_light_intensity = 50;
     int key_light_temperature_preset = 0;
     int key_light_direction_pan_degrees = 0;
+    int vignette_intensity = 35;
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
     IPreparedOpenCudaRuntime *runtime = nullptr;
