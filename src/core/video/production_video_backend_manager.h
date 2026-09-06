@@ -14,6 +14,12 @@ namespace studiocast::video {
 inline constexpr std::uint32_t kProductionVideoBackendManagerContractVersion =
     2;
 
+// Reserved invalidation identity for the lease-free neutral host transport.
+// It identifies no execution domain; the remaining invalidation-key fields
+// identify the exact canonical plan, models, generations, and geometry.
+inline constexpr std::uint64_t kProductionVideoNeutralPassthroughExecutionHash =
+    UINT64_C(0x6e65757472616c01);
+
 enum class ProductionVideoBackendSetupKind : std::uint8_t {
   invalid = 0,
   cpu_primitives_only,
@@ -95,6 +101,10 @@ struct ProductionVideoResidentSetupSourceResult {
   // that this plan preserves the caller's canonical request before composing
   // it.
   VideoExecutionPlanRequest plan{};
+  // Setup-only capability evidence used to independently resolve an
+  // all-optional unavailable request to neutral passthrough. It owns no
+  // resident adapter and is never consulted from the frame loop.
+  hal::AdapterRegistration resolution_registration{};
   ProductionVideoSetupLease lease{};
   ProductionVideoSetupLeaseAcquireEvidence lease_acquire{};
   // The source is called only from Setup(). This flag attests that its

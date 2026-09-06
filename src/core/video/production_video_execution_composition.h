@@ -49,6 +49,12 @@ public:
                         VideoExecutionPrepareEvidence *evidence,
                         hal::ReasonId *reason) noexcept;
 
+  [[nodiscard]] hal::StatusId
+  PreparePassthrough(const hal::AdapterRegistration &registration,
+                     const VideoExecutionPlanRequest &request,
+                     VideoExecutionPrepareEvidence *evidence,
+                     hal::ReasonId *reason) noexcept;
+
   [[nodiscard]] VideoExecutionFrameResult
   Execute(const hal::HostFrameBinding &binding) noexcept;
 

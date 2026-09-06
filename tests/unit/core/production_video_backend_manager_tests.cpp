@@ -491,6 +491,9 @@ video::ProductionVideoSetupLeaseSnapshot LeaseSnapshot(
 
 enum class SourceMode {
   ready,
+  optional_passthrough,
+  malformed_optional_passthrough,
+  nondeterministic_optional_passthrough_hash,
   malformed_returned_plan,
   foreign_returned_domain,
   single_domain_compatibility,
@@ -519,6 +522,48 @@ public:
     video::ProductionVideoResidentSetupSourceResult result;
     result.plan = request.plan;
     result.canonical_effects = request.effects;
+    if (mode == SourceMode::optional_passthrough ||
+        mode == SourceMode::malformed_optional_passthrough ||
+        mode == SourceMode::nondeterministic_optional_passthrough_hash) {
+      auto domain = Domain();
+      domain.backend = hal::BackendId::cuda;
+      domain.api_family = hal::ApiFamily::cuda_driver;
+      domain.logical_context_generation =
+          request.plan.invalidation_key.generations.context;
+      domain.allocator_family = hal::AllocatorFamily::cuda_driver;
+      domain.memory_handle_family =
+          hal::MemoryHandleFamily::cuda_device_pointer;
+      domain.synchronization_protocol =
+          hal::SynchronizationProtocol::cuda_stream_ordered;
+      auto &registration = result.resolution_registration;
+      registration.adapter_instance_id = domain.adapter_instance_id;
+      registration.backend = domain.backend;
+      registration.execution_domain = domain;
+      registration.selection_priority = 100;
+      auto &capability = registration.semantic_capabilities[0];
+      capability.semantic = request.plan.intent.stages[0].intent.semantic;
+      capability.provider =
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+      capability.status = hal::StatusId::unavailable;
+      capability.reason = hal::ReasonId::capability_evidence_incomplete;
+      registration.semantic_capability_count = 1;
+      result.plan.invalidation_key.execution_domain_hash =
+          video::kProductionVideoNeutralPassthroughExecutionHash;
+      if (mode == SourceMode::malformed_optional_passthrough)
+        registration.adapter_instance_id = 0;
+      if (mode == SourceMode::nondeterministic_optional_passthrough_hash)
+        result.plan.invalidation_key.execution_domain_hash +=
+            counters_->source_calls;
+      result.status = hal::StatusId::degraded;
+      result.reason = hal::ReasonId::capability_evidence_incomplete;
+      result.readiness.status = hal::StatusId::degraded;
+      result.readiness.reason = result.reason;
+      result.readiness.requested_backend = hal::BackendId::cuda;
+      result.readiness.available = true;
+      result.readiness.degraded = true;
+      result.setup_completed_outside_frame_loop = true;
+      return result;
+    }
     if (result.plan.invalidation_key.generations.model == 0)
       result.plan.invalidation_key.generations.model = 3;
     if (result.plan.invalidation_key.generations.provider == 0)
@@ -776,6 +821,94 @@ bool TestPreparedExecutionAndWriterGatedCommit() {
   ok &= Require(counters.source_calls == 1 && counters.execute_calls == 2 &&
                     counters.commit_calls == 2,
                 "frame calls must not perform setup or discovery");
+  return ok;
+}
+
+bool TestOptionalUnavailableUsesNeutralPassthrough() {
+  Counters counters;
+  auto source = std::make_unique<FakeSetupSource>(&counters);
+  auto *raw_source = source.get();
+  raw_source->mode = SourceMode::optional_passthrough;
+  video::ProductionVideoBackendManager manager(std::move(source));
+  auto request = ResidentRequest();
+  request.resident.plan.intent.backend.backend = hal::BackendId::cuda;
+  request.resident.plan.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::open_cuda;
+  request.resident.plan.intent.requested_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  video::ProductionVideoBackendSetupEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto setup = manager.Setup(request, &evidence, &reason);
+  bool ok =
+      Require(setup == hal::StatusId::degraded &&
+                  reason == hal::ReasonId::capability_evidence_incomplete,
+              "all optional unavailable setup must degrade to passthrough");
+  const auto prepared = manager.Snapshot();
+  ok &= Require(
+      prepared.state ==
+              video::ProductionVideoBackendManagerState::resident_ready &&
+          prepared.resident.plan.route ==
+              video::VideoExecutionRoute::passthrough &&
+          prepared.resident.prepare.resolution.stages[0].skipped_optional &&
+          prepared.readiness.selected_backend == hal::BackendId::invalid &&
+          prepared.readiness.provider == hal::SemanticEffectProviderId::invalid,
+      "manager must retain typed resolution without selecting CUDA");
+
+  std::array<std::byte, kFrameBytes> input{}, output{};
+  auto frame = manager.Execute(Binding(&input, &output, 1));
+  ok &=
+      Require(frame.status == hal::StatusId::passthrough && frame.passthrough &&
+                  !frame.output_ready && frame.transfers.uploads == 0 &&
+                  frame.transfers.final_readbacks == 0,
+              "manager passthrough must publish with zero GPU transfers");
+  ok &= Require(manager.CommitOutput(frame.completion, false, &reason) ==
+                        hal::StatusId::failed &&
+                    !manager.Snapshot().resident.latest_committed_frame.valid,
+                "writer failure must leave passthrough uncommitted");
+  frame = manager.Execute(Binding(&input, &output, 2));
+  ok &= Require(
+      manager.CommitOutput(frame.completion, true, &reason) ==
+              hal::StatusId::ready &&
+          manager.Snapshot().resident.latest_committed_frame.valid &&
+          manager.Snapshot().resident.latest_committed_frame.stage_count == 0 &&
+          manager.Snapshot().resident.telemetry.active_backend ==
+              hal::BackendId::invalid,
+      "writer success must commit without backend attribution");
+
+  auto bad_binding = Binding(&input, &output, 3);
+  bad_binding.output_descriptor.width = 8;
+  ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
+                "passthrough must preserve exact geometry binding");
+
+  bad_binding = Binding(&input, &output, 4);
+  --bad_binding.input_planes[0].span_bytes;
+  ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
+                "passthrough must reject a short borrowed input plane");
+  bad_binding = Binding(&input, &output, 5);
+  ++bad_binding.output_planes[0].row_stride_bytes;
+  ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
+                "passthrough must reject a wrong borrowed output stride");
+
+  raw_source->mode = SourceMode::nondeterministic_optional_passthrough_hash;
+  ++request.resident.plan.plan_id;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    evidence.old_plan_retained,
+                "source-defined neutral route hashes must be rejected");
+
+  raw_source->mode = SourceMode::malformed_optional_passthrough;
+  ++request.resident.plan.plan_id;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    evidence.old_plan_retained &&
+                    manager.Snapshot().resident.plan.route ==
+                        video::VideoExecutionRoute::passthrough,
+                "malformed reconfiguration must retain active passthrough");
+  const auto stopped = manager.Shutdown();
+  ok &= Require(stopped.quiescent && stopped.driver_context_release_permitted &&
+                    manager.Snapshot().state ==
+                        video::ProductionVideoBackendManagerState::stopped,
+                "neutral passthrough shutdown must be complete");
   return ok;
 }
 
@@ -1124,6 +1257,7 @@ int main() {
   bool ok = true;
   ok &= TestCpuPrimitiveOnlyIsExplicitAndNonSemantic();
   ok &= TestPreparedExecutionAndWriterGatedCommit();
+  ok &= TestOptionalUnavailableUsesNeutralPassthrough();
   ok &= TestSetupOnlyOutputTailRefinementIsExact();
   ok &= TestSourceBindsDefaultModelWithinCallerBudget();
   ok &= TestMalformedStaleWrongDomainAndStrictSubstitution();

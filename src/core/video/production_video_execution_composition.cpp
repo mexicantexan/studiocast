@@ -129,6 +129,34 @@ struct ProductionVideoExecutionComposition::Impl {
     }
   }
 
+  hal::StatusId
+  BuildPassthroughRuntime(const hal::AdapterRegistration &registration,
+                          std::unique_ptr<RegisteredRuntime> *candidate,
+                          hal::ReasonId *reason) noexcept {
+    if (candidate == nullptr) {
+      SetReason(reason, hal::ReasonId::malformed_contract);
+      return hal::StatusId::blocked;
+    }
+    *candidate = nullptr;
+    try {
+      auto next = std::make_unique<RegisteredRuntime>();
+      next->registry = std::make_unique<hal::StaticAdapterRegistry>();
+      const auto status = next->registry->Register(registration, reason);
+      if (!IsSetupSuccess(status))
+        return status;
+      next->coordinator =
+          std::make_unique<VideoExecutionCoordinator>(*next->registry);
+      *candidate = std::move(next);
+      return status;
+    } catch (const std::bad_alloc &) {
+      SetReason(reason, hal::ReasonId::resource_exhausted);
+      return hal::StatusId::resource_exhausted;
+    } catch (...) {
+      SetReason(reason, hal::ReasonId::malformed_contract);
+      return hal::StatusId::blocked;
+    }
+  }
+
   hal::StatusId Register(const hal::AdapterRegistration &adapter,
                          const VideoAdapterFactoryRegistration &factory,
                          hal::ReasonId *reason) noexcept {
@@ -339,6 +367,51 @@ hal::StatusId ProductionVideoExecutionComposition::PrepareWithSetupLease(
   impl_->vulkan_factory.reset();
   impl_->injected = true;
   return prepare_status;
+}
+
+hal::StatusId ProductionVideoExecutionComposition::PreparePassthrough(
+    const hal::AdapterRegistration &registration,
+    const VideoExecutionPlanRequest &request,
+    VideoExecutionPrepareEvidence *evidence, hal::ReasonId *reason) noexcept {
+  if (evidence)
+    *evidence = {};
+  if (!impl_) {
+    SetReason(reason, hal::ReasonId::resource_exhausted);
+    return hal::StatusId::resource_exhausted;
+  }
+  if (impl_->runtime && impl_->runtime->shutdown_requested) {
+    SetReason(reason, hal::ReasonId::shutdown_requested);
+    return hal::StatusId::stopped;
+  }
+  if (impl_->runtime && impl_->runtime->coordinator &&
+      impl_->runtime->coordinator->Snapshot().frame_pending) {
+    SetReason(reason, hal::ReasonId::output_not_committed);
+    if (evidence) {
+      evidence->status = hal::StatusId::blocked;
+      evidence->reason = hal::ReasonId::output_not_committed;
+      evidence->old_plan_retained = true;
+    }
+    return hal::StatusId::blocked;
+  }
+
+  std::unique_ptr<Impl::RegisteredRuntime> candidate;
+  const auto registration_status =
+      impl_->BuildPassthroughRuntime(registration, &candidate, reason);
+  if (!IsSetupSuccess(registration_status))
+    return registration_status;
+  const auto status =
+      candidate->coordinator->Prepare(request, evidence, reason);
+  if (status != hal::StatusId::passthrough) {
+    if (evidence)
+      evidence->old_plan_retained =
+          impl_->runtime && impl_->runtime->coordinator &&
+          impl_->runtime->coordinator->Snapshot().prepared;
+    return status;
+  }
+  impl_->runtime = std::move(candidate);
+  impl_->vulkan_factory.reset();
+  impl_->injected = true;
+  return status;
 }
 
 VideoExecutionFrameResult ProductionVideoExecutionComposition::Execute(
