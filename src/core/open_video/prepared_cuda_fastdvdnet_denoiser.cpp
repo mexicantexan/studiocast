@@ -93,17 +93,6 @@ PreparedCudaFastDvdnetDenoiser::Prepare(
     result.reason = hal::ReasonId::wrong_execution_domain;
     return result;
   }
-  const auto &p = config.ort_evidence.provider;
-  if (!config.ort_evidence.Valid() || !p.ValidStrictCuda() ||
-      p.cuda_context_generation !=
-          config.execution_domain.logical_context_generation ||
-      p.requested_stream_identity !=
-          config.execution_domain.queue_or_stream_identity) {
-    result.status = PreparedCudaFastDvdnetStatus::wrong_provider;
-    result.reason = hal::ReasonId::strict_backend_unavailable;
-    return result;
-  }
-
   const auto prepared = runtime_->Prepare(config);
   result.status = prepared.status;
   result.reserved_budget = prepared.reserved_budget;
@@ -119,14 +108,37 @@ PreparedCudaFastDvdnetDenoiser::Prepare(
     result.reason = hal::ReasonId::synchronization_failed;
     return result;
   }
+  const bool evidence_matches =
+      prepared.ort_evidence.Valid() &&
+      prepared.ort_evidence.provider.ValidStrictCuda() &&
+      prepared.ort_evidence.provider.cuda_context_generation ==
+          config.execution_domain.logical_context_generation &&
+      prepared.ort_evidence.provider.requested_stream_identity ==
+          config.execution_domain.queue_or_stream_identity;
   if (prepared.status != PreparedCudaFastDvdnetStatus::ready ||
       prepared.runtime_handle == 0 || !prepared.reusable_bindings ||
       !prepared.warmup_complete || !prepared.strict_cuda_only ||
       !prepared.user_stream_bound || !prepared.cpu_fallback_disabled ||
+      !evidence_matches ||
       !BudgetFits(prepared.reserved_budget, config.available_budget)) {
-    result.status = prepared.status == PreparedCudaFastDvdnetStatus::ready
-                        ? PreparedCudaFastDvdnetStatus::malformed_contract
-                        : prepared.status;
+    result.status = prepared.status != PreparedCudaFastDvdnetStatus::ready
+                        ? prepared.status
+                        : (!evidence_matches
+                               ? PreparedCudaFastDvdnetStatus::wrong_provider
+                               : PreparedCudaFastDvdnetStatus::malformed_contract);
+    const auto rollback = prepared.runtime_handle == 0
+                              ? PreparedCudaFastDvdnetShutdownSnapshot{}
+                              : runtime_->Shutdown(prepared.runtime_handle);
+    if (prepared.runtime_handle != 0 && !rollback.quiescent) {
+      config_ = config;
+      runtime_handle_ = prepared.runtime_handle;
+      handle_ = {runtime_handle_, config.configuration_generation,
+                 config.model_generation};
+      prepared_ = true;
+      shutdown_requested_ = true;
+      result.status = PreparedCudaFastDvdnetStatus::completion_pending;
+      result.handle = handle_;
+    }
     result.reason = FailureReason(result.status);
     return result;
   }

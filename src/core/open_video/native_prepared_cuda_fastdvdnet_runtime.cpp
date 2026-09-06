@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 
 namespace studiocast::open_video {
 namespace {
@@ -75,14 +76,11 @@ const ModelFile *MainOnnx(const ModelPack &pack) noexcept {
   return fallback;
 }
 
-bool SameProvider(const onnx::OrtPreparedCudaRunEvidence &a,
-                  const onnx::OrtPreparedCudaRunEvidence &b) noexcept {
-  return a.Valid() && b.Valid() && a.provider == b.provider;
-}
 } // namespace
 
 NativePreparedCudaFastDvdnetRuntime::NativePreparedCudaFastDvdnetRuntime(
-    IPreparedFastDvdnetOrtFactory *factory) noexcept : factory_(factory) {
+    IPreparedFastDvdnetOrtFactory *factory) noexcept
+    : factory_(factory), injected_factory_(factory != nullptr) {
   if (!factory_) {
     owned_factory_ = std::make_unique<OrtFactory>();
     factory_ = owned_factory_.get();
@@ -102,11 +100,7 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   PreparedCudaFastDvdnetRuntimePrepareResult result;
   ++telemetry_.allocation_requests; // candidate/session owner
   if (prepared_ || work_pending_ || !factory_ || !config.driver || !config.owner_context ||
-      !config.owner_stream || !config.model_pack || !config.artifact.Valid() ||
-      !config.ort_evidence.provider.ValidStrictCuda() ||
-      config.ort_evidence.provider.explicit_stream_synchronization ||
-      config.ort_evidence.provider.requested_stream_identity !=
-          reinterpret_cast<std::uintptr_t>(config.owner_stream)) {
+      !config.owner_stream || !config.model_pack || !config.artifact.Valid()) {
     result.status = PreparedCudaFastDvdnetStatus::malformed_contract;
     return result;
   }
@@ -124,8 +118,41 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
     return result;
   }
-  const int w = static_cast<int>(config.tensors.noisy_shape[3]);
-  const int h = static_cast<int>(config.tensors.noisy_shape[2]);
+  if (!injected_factory_) {
+    const auto validated = ValidateModelArtifactIdentity(*config.model_pack, *model);
+    if (!validated.ok() ||
+        !ModelArtifactIdentityMatches(validated.identity, config.artifact)) {
+      result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
+      return result;
+    }
+  }
+  const auto tensor_w = config.tensors.noisy_shape[3];
+  const auto tensor_h = config.tensors.noisy_shape[2];
+  if (tensor_w <= 0 || tensor_h <= 0 ||
+      tensor_w > std::numeric_limits<int>::max() ||
+      tensor_h > std::numeric_limits<int>::max()) {
+    result.status = PreparedCudaFastDvdnetStatus::malformed_contract;
+    return result;
+  }
+  const int w = static_cast<int>(tensor_w);
+  const int h = static_cast<int>(tensor_h);
+  constexpr std::uint64_t kFloatBytesPerPixel = 28u * sizeof(float);
+  if (w <= 0 || h <= 0 || static_cast<std::uint64_t>(w) >
+                              UINT64_MAX / static_cast<std::uint64_t>(h) ||
+      static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h) >
+          UINT64_MAX / kFloatBytesPerPixel) {
+    result.status = PreparedCudaFastDvdnetStatus::malformed_contract;
+    return result;
+  }
+  const std::uint64_t required_bytes = static_cast<std::uint64_t>(w) *
+                                       static_cast<std::uint64_t>(h) *
+                                       kFloatBytesPerPixel;
+  if (required_bytes > config.available_budget.persistent_bytes ||
+      config.available_budget.resource_count < 8 ||
+      config.available_budget.in_flight_slots < 1) {
+    result.status = PreparedCudaFastDvdnetStatus::resource_exhausted;
+    return result;
+  }
   config_ = config;
   prepared_context_identity_ = *identity;
   tensor_names_ = {config.tensors.noisy_name, config.tensors.noise_map_name,
@@ -143,8 +170,9 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     slot = std::make_unique<cuda::CudaTensor>();
     ++telemetry_.allocation_requests;
     if (!slot->AllocateNchwF32(config.driver, 1, 3, h, w, &error)) {
-      result.status = PreparedCudaFastDvdnetStatus::resource_exhausted;
-      Release(); return result;
+      FinishFailedPrepare(PreparedCudaFastDvdnetStatus::resource_exhausted,
+                          &result);
+      return result;
     }
   }
   if (!noisy_.AllocateNchwF32(config.driver, 1, 15, h, w, &error) ||
@@ -153,16 +181,18 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
       !cuda::kernels::PrepareFastDvdnetKernels(
           *config.driver, config.owner_context, config.owner_stream, &kernels_,
           &error)) {
-    result.status = PreparedCudaFastDvdnetStatus::resource_exhausted;
-    Release(); return result;
+    FinishFailedPrepare(PreparedCudaFastDvdnetStatus::resource_exhausted,
+                        &result);
+    return result;
   }
   telemetry_.allocation_requests += 3;
   if (!config.driver->f().cuEventCreate || !config.driver->f().cuEventRecord ||
       !config.driver->f().cuEventQuery || !config.driver->f().cuEventDestroy ||
       config.driver->f().cuEventCreate(&completion_event_, 0) !=
           cuda::CUDA_SUCCESS) {
-    result.status = PreparedCudaFastDvdnetStatus::synchronization_failed;
-    Release(); return result;
+    FinishFailedPrepare(PreparedCudaFastDvdnetStatus::synchronization_failed,
+                        &result);
+    return result;
   }
 
   onnx::OrtSessionOptions options;
@@ -175,9 +205,14 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   options.user_compute_stream = config.owner_stream;
   ++telemetry_.session_constructions;
   session_ = factory_->Create(model->path, options, config.tensors);
-  if (!session_ || !SameProvider(session_->evidence(), config.ort_evidence)) {
-    result.status = PreparedCudaFastDvdnetStatus::wrong_provider;
-    Release(); return result;
+  if (!session_ || !session_->evidence().Valid() ||
+      !session_->evidence().provider.ValidStrictCuda() ||
+      session_->evidence().provider.cuda_context_generation !=
+          config.execution_domain.logical_context_generation ||
+      session_->evidence().provider.requested_stream_identity !=
+          reinterpret_cast<std::uintptr_t>(config.owner_stream)) {
+    FinishFailedPrepare(PreparedCudaFastDvdnetStatus::wrong_provider, &result);
+    return result;
   }
   active_ort_evidence_ = session_->evidence();
   inputs_[0] = {config_.tensors.noisy_name,
@@ -192,8 +227,9 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   ++telemetry_.binding_constructions;
   if (!session_->PrepareBinding(inputs_.data(), inputs_.size(), outputs_.data(),
                                 outputs_.size())) {
-    result.status = PreparedCudaFastDvdnetStatus::inference_failed;
-    Release(); return result;
+    FinishFailedPrepare(PreparedCudaFastDvdnetStatus::inference_failed,
+                        &result);
+    return result;
   }
   // Warmup uses zeroed resident tensors; no host tensor or image is involved.
   work_pending_ = true;
@@ -208,7 +244,7 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   const bool warmup_quiescent = QuiescePending();
   if (!warmup_ok || !warmup_quiescent) {
     result.status = PreparedCudaFastDvdnetStatus::inference_failed;
-    if (warmup_quiescent) Release();
+    if (warmup_quiescent) FinishFailedPrepare(result.status, &result);
     else {
       handle_ = g_next_handle.fetch_add(1, std::memory_order_relaxed);
       if (handle_ == 0) handle_ = g_next_handle.fetch_add(1);
@@ -235,6 +271,7 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   result.strict_cuda_only = true;
   result.user_stream_bound = true;
   result.cpu_fallback_disabled = true;
+  result.ort_evidence = active_ort_evidence_;
   return result;
 }
 
@@ -362,9 +399,27 @@ bool NativePreparedCudaFastDvdnetRuntime::Release() noexcept {
   if (noisy_.owns_memory) ok = noisy_.Free(config_.driver, nullptr) && ok;
   if (noise_map_.owns_memory) ok = noise_map_.Free(config_.driver, nullptr) && ok;
   if (denoised_.owns_memory) ok = denoised_.Free(config_.driver, nullptr) && ok;
-  if (ok) { prepared_ = false; handle_ = 0; config_ = {}; active_ort_evidence_ = {};
-    prepared_context_identity_ = {}; tensor_names_ = {}; tensor_shapes_ = {}; }
+  if (ok) {
+    prepared_ = false; handle_ = 0; config_ = {}; active_ort_evidence_ = {};
+    prepared_context_identity_ = {}; tensor_names_ = {}; tensor_shapes_ = {};
+    shutdown_requested_ = false; work_pending_ = false;
+    completion_recorded_ = false; reset_requested_ = true;
+    last_copy_result_ = cuda::CUDA_SUCCESS;
+  }
   return ok;
+}
+
+void NativePreparedCudaFastDvdnetRuntime::FinishFailedPrepare(
+    PreparedCudaFastDvdnetStatus status,
+    PreparedCudaFastDvdnetRuntimePrepareResult *result) noexcept {
+  result->status = status;
+  if (Release()) return;
+  handle_ = g_next_handle.fetch_add(1, std::memory_order_relaxed);
+  if (handle_ == 0) handle_ = g_next_handle.fetch_add(1);
+  prepared_ = true;
+  shutdown_requested_ = true;
+  result->status = PreparedCudaFastDvdnetStatus::completion_pending;
+  result->runtime_handle = handle_;
 }
 
 void NativePreparedCudaFastDvdnetRuntime::Quarantine() noexcept {

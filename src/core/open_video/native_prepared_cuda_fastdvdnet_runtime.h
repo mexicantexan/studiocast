@@ -59,9 +59,12 @@ private:
                    const cuda::CudaTensor &destination) noexcept;
   bool QuiescePending() noexcept;
   bool Release() noexcept;
+  void FinishFailedPrepare(PreparedCudaFastDvdnetStatus status,
+                           PreparedCudaFastDvdnetRuntimePrepareResult *result) noexcept;
   void Quarantine() noexcept;
 
   IPreparedFastDvdnetOrtFactory *factory_ = nullptr;
+  bool injected_factory_ = false;
   std::unique_ptr<IPreparedFastDvdnetOrtFactory> owned_factory_;
   std::unique_ptr<IPreparedFastDvdnetOrtSession> session_;
   PreparedCudaFastDvdnetConfig config_{};

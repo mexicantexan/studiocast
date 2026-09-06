@@ -67,7 +67,6 @@ struct PreparedCudaFastDvdnetConfig {
   const ModelPack *model_pack = nullptr;
   ValidatedModelArtifactIdentity artifact{};
   hal::ExecutionDomainId execution_domain{};
-  onnx::OrtPreparedCudaRunEvidence ort_evidence{};
   PreparedCudaFastDvdnetTensorContract tensors{};
   std::uint64_t configuration_generation = 0;
   std::uint64_t model_generation = 0;
@@ -100,6 +99,7 @@ struct PreparedCudaFastDvdnetRuntimePrepareResult {
   bool strict_cuda_only = false;
   bool user_stream_bound = false;
   bool cpu_fallback_disabled = false;
+  onnx::OrtPreparedCudaRunEvidence ort_evidence{};
 };
 
 struct PreparedCudaFastDvdnetRuntimeFrameResult {
