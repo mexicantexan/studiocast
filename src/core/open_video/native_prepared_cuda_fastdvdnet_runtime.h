@@ -76,6 +76,7 @@ public:
 private:
   bool CopyHistory(const cuda::CudaTensor &source,
                    const cuda::CudaTensor &destination) noexcept;
+  PreparedCudaFastDvdnetStatus QuiesceFrame() noexcept;
   bool QuiescePending() noexcept;
   bool Release() noexcept;
   void FinishFailedPrepare(PreparedCudaFastDvdnetStatus status,

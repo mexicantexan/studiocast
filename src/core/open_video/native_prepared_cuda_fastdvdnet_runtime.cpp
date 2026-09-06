@@ -451,45 +451,62 @@ NativePreparedCudaFastDvdnetRuntime::Execute(
   }
   work_pending_ = true;
   completion_recorded_ = false;
+  const auto finish_failure = [&](PreparedCudaFastDvdnetStatus original,
+                                  PreparedCudaFastDvdnetOperation operation) {
+    result.status = original;
+    result.failed_operation = operation;
+    if (original == PreparedCudaFastDvdnetStatus::device_lost) {
+      result.pending_work = true;
+      return result;
+    }
+    ++result.transfers.synchronizations;
+    const auto quiesced = QuiesceFrame();
+    result.pending_work = quiesced != PreparedCudaFastDvdnetStatus::ready;
+    if (quiesced != PreparedCudaFastDvdnetStatus::ready)
+      result.status = quiesced;
+    return result;
+  };
   const bool reset = temporal.reset || reset_requested_;
   if (!cuda::kernels::LaunchFastDvdnetPreprocess(
           kernels_, input, *history_[0], *history_[1], *history_[2], noisy_,
           noise_map_, reset, sigma, nullptr)) {
-    result.status = cuda::IsCudaDeviceLossResult(kernels_.last_result)
-                        ? PreparedCudaFastDvdnetStatus::device_lost
-                        : PreparedCudaFastDvdnetStatus::preprocess_failed;
-    result.failed_operation = PreparedCudaFastDvdnetOperation::temporal_preprocess;
-    return result;
+    return finish_failure(cuda::IsCudaDeviceLossResult(kernels_.last_result)
+                              ? PreparedCudaFastDvdnetStatus::device_lost
+                              : PreparedCudaFastDvdnetStatus::preprocess_failed,
+                          PreparedCudaFastDvdnetOperation::temporal_preprocess);
   }
   if (reset && (!CopyHistory(*history_[2], *history_[0]) ||
                 !CopyHistory(*history_[2], *history_[1]))) {
-    result.status = cuda::IsCudaDeviceLossResult(last_copy_result_)
-                        ? PreparedCudaFastDvdnetStatus::device_lost
-                        : PreparedCudaFastDvdnetStatus::preprocess_failed;
-    result.failed_operation = PreparedCudaFastDvdnetOperation::temporal_preprocess;
-    return result;
+    return finish_failure(cuda::IsCudaDeviceLossResult(last_copy_result_)
+                              ? PreparedCudaFastDvdnetStatus::device_lost
+                              : PreparedCudaFastDvdnetStatus::preprocess_failed,
+                          PreparedCudaFastDvdnetOperation::temporal_preprocess);
   }
   result.ort = session_->Execute(inputs_.data(), inputs_.size(), outputs_.data(),
                                  outputs_.size(), active_ort_evidence_);
   if (!result.ort.ok()) {
-    result.status = result.ort.status == onnx::OrtPreparedRunStatus::provider_failure_quarantine
-                        ? PreparedCudaFastDvdnetStatus::device_lost
-                        : PreparedCudaFastDvdnetStatus::inference_failed;
-    result.failed_operation = PreparedCudaFastDvdnetOperation::inference;
-    return result;
+    return finish_failure(
+        result.ort.status == onnx::OrtPreparedRunStatus::provider_failure_quarantine
+            ? PreparedCudaFastDvdnetStatus::device_lost
+            : PreparedCudaFastDvdnetStatus::inference_failed,
+        PreparedCudaFastDvdnetOperation::inference);
   }
   if (!cuda::kernels::LaunchFastDvdnetPostprocess(kernels_, denoised_, *output,
                                                   nullptr)) {
-    result.status = cuda::IsCudaDeviceLossResult(kernels_.last_result)
-                        ? PreparedCudaFastDvdnetStatus::device_lost
-                        : PreparedCudaFastDvdnetStatus::postprocess_failed;
-    result.failed_operation = PreparedCudaFastDvdnetOperation::postprocess;
-    return result;
+    return finish_failure(cuda::IsCudaDeviceLossResult(kernels_.last_result)
+                              ? PreparedCudaFastDvdnetStatus::device_lost
+                              : PreparedCudaFastDvdnetStatus::postprocess_failed,
+                          PreparedCudaFastDvdnetOperation::postprocess);
   }
-  if (config_.driver->f().cuEventRecord(completion_event_, config_.owner_stream) !=
-      cuda::CUDA_SUCCESS) {
-    result.status = PreparedCudaFastDvdnetStatus::synchronization_failed;
+  const auto completion_record =
+      config_.driver->f().cuEventRecord(completion_event_, config_.owner_stream);
+  if (completion_record != cuda::CUDA_SUCCESS) {
+    result.status = cuda::IsCudaDeviceLossResult(completion_record)
+                        ? PreparedCudaFastDvdnetStatus::device_lost
+                        : PreparedCudaFastDvdnetStatus::synchronization_failed;
     result.failed_operation = PreparedCudaFastDvdnetOperation::completion_wait;
+    result.pending_work = true;
+    ++result.transfers.synchronizations;
     return result;
   }
   completion_recorded_ = true;
@@ -498,6 +515,7 @@ NativePreparedCudaFastDvdnetRuntime::Execute(
   reset_requested_ = false;
   result.status = PreparedCudaFastDvdnetStatus::executed;
   result.output_valid = true;
+  result.pending_work = true;
   return result;
 }
 
@@ -506,6 +524,31 @@ PreparedCudaFastDvdnetStatus NativePreparedCudaFastDvdnetRuntime::ResetTemporalS
   if (!prepared_ || handle != handle_) return PreparedCudaFastDvdnetStatus::foreign_handle;
   reset_requested_ = true;
   return PreparedCudaFastDvdnetStatus::ready;
+}
+
+PreparedCudaFastDvdnetStatus
+NativePreparedCudaFastDvdnetRuntime::QuiesceFrame() noexcept {
+  if (!work_pending_) return PreparedCudaFastDvdnetStatus::ready;
+  if (!completion_recorded_) {
+    const auto recorded = config_.driver->f().cuEventRecord(
+        completion_event_, config_.owner_stream);
+    if (recorded != cuda::CUDA_SUCCESS)
+      return cuda::IsCudaDeviceLossResult(recorded)
+                 ? PreparedCudaFastDvdnetStatus::device_lost
+                 : PreparedCudaFastDvdnetStatus::synchronization_failed;
+    completion_recorded_ = true;
+  }
+  const auto query = config_.driver->f().cuEventQuery(completion_event_);
+  if (query == cuda::CUDA_SUCCESS) {
+    work_pending_ = false;
+    completion_recorded_ = false;
+    return PreparedCudaFastDvdnetStatus::ready;
+  }
+  if (cuda::IsCudaDeviceLossResult(query))
+    return PreparedCudaFastDvdnetStatus::device_lost;
+  return query == cuda::CUDA_ERROR_NOT_READY
+             ? PreparedCudaFastDvdnetStatus::completion_pending
+             : PreparedCudaFastDvdnetStatus::synchronization_failed;
 }
 
 bool NativePreparedCudaFastDvdnetRuntime::QuiescePending() noexcept {
