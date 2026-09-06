@@ -712,6 +712,27 @@ public:
       result.readiness = bootstrap.setup_lease.readiness;
       if (!IsSetupSuccess(result.status) || !result.lease.live())
         return result;
+      if (bootstrap.setup_lease.artifact_count != caller.intent.stage_count ||
+          bootstrap.setup_lease.generations.configuration != factory.generations.configuration ||
+          bootstrap.setup_lease.generations.geometry != factory.generations.geometry ||
+          bootstrap.setup_lease.generations.model != factory.generations.model ||
+          bootstrap.setup_lease.generations.provider != factory.generations.provider ||
+          bootstrap.setup_lease.generations.device != factory.generations.device) {
+        return Failure(hal::StatusId::blocked,
+                       hal::ReasonId::capability_evidence_incomplete);
+      }
+      hal::ModelArtifactIdentity expected_artifact;
+      expected_artifact.model_id_hash = artifact.model_id_sha256;
+      expected_artifact.artifact_set_hash = artifact.artifact_set_sha256;
+      expected_artifact.artifact_generation = artifact.registry_generation;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        const auto &leased = bootstrap.setup_lease.artifacts[index];
+        if (leased.semantic != caller.intent.stages[index].intent.semantic ||
+            leased.provider != kProvider || leased.artifact != expected_artifact) {
+          return Failure(hal::StatusId::blocked,
+                         hal::ReasonId::capability_evidence_incomplete);
+        }
+      }
 
       result.plan = caller;
       if (setup_output_tail)
