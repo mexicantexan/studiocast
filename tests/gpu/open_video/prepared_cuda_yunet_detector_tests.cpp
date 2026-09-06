@@ -36,6 +36,7 @@ struct State {
   std::vector<std::unique_ptr<std::byte[]>> memory;
   std::vector<std::size_t> sizes;
   int copies = 0, launches = 0, syncs = 0, runs = 0, invalidates = 0, frees = 0;
+  int allocations = 0, fail_allocation = -1;
   int fail_copy = -1;
   cuda::CUresult fail_copy_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
   int fail_run = -1;
@@ -64,6 +65,8 @@ cuda::CUresult Launch(cuda::CUfunction, unsigned, unsigned, unsigned, unsigned,
 }
 cuda::CUresult Alloc(cuda::CUdeviceptr *p, std::size_t *pi, std::size_t w,
                      std::size_t h, unsigned) {
+  if (g->allocations++ == g->fail_allocation)
+    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
   auto m = std::make_unique<std::byte[]>(w * h);
   *p = reinterpret_cast<cuda::CUdeviceptr>(m.get());
   *pi = w;
@@ -522,6 +525,14 @@ int main() {
         state.copies == face_copies;
   state.face = false;
   ok &= d.Shutdown(&error) && d.Shutdown(&error) && state.invalidates == 1;
+  open_video::PreparedCudaYunetDetector allocation_failed;
+  open_video::PreparedCudaYunetStatus allocation_status{};
+  state.fail_allocation = state.allocations;
+  ok &= !allocation_failed.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error,
+            &allocation_status) &&
+        allocation_status == open_video::PreparedCudaYunetStatus::invalid_setup;
+  state.fail_allocation = -1;
   open_video::PreparedCudaYunetDetector retry;
   auto retry_session = std::make_unique<Session>(&state);
   ok &= retry.PrepareForTesting(setup, id, std::move(retry_session), &error);

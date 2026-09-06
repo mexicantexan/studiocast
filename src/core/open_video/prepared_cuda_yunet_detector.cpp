@@ -391,6 +391,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
       *error = geometry_error;
     return false;
   }
+  if (status_out)
+    *status_out = PreparedCudaYunetStatus::invalid_setup;
   auto candidate = std::make_unique<Impl>();
   candidate->setup = setup;
   candidate->cache_revision =
@@ -402,8 +404,6 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   candidate->session = std::move(session);
   if (!candidate->input.AllocateNchwF32(setup.binding.driver, 1, 3, input_h,
                                         input_w, error)) {
-    if (status_out)
-      *status_out = PreparedCudaYunetStatus::resource_exhausted;
     return false;
   }
   std::size_t host_offset = 0;
@@ -457,8 +457,6 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     out.host_offset = host_offset;
     if (!out.tensor.AllocateNchwF32(setup.binding.driver, 1, 1, 1,
                                     anchors * channels, error)) {
-      if (status_out)
-        *status_out = PreparedCudaYunetStatus::resource_exhausted;
       return false;
     }
     host_offset += out.tensor.bytes;
