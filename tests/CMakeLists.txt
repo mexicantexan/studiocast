@@ -1569,7 +1569,7 @@ if (BUILD_TESTING)
             COMMAND studiocast-open-cuda-production-backend-setup-source-tests)
     studiocast_set_test_labels(
             studiocast-open-cuda-production-backend-setup-source-tests
-            unit gpu video model)
+            integration gpu video model)
 
     add_executable(
             studiocast-prepared-open-video-compatibility-executor-tests
