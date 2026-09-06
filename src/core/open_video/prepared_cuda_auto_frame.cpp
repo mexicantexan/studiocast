@@ -414,6 +414,8 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
       out.output = nullptr;
     return out;
   }
+  ++out.cpu_tail_boundaries;
+  ++out.transfers.cpu_tail_boundaries;
   out.found = ar.found && Usable(ar.box, input.w, input.h);
   out.source = out.found ? ar.box.source : PreparedCudaAutoFrameSource::none;
   if (out.source != impl_->last_source) {

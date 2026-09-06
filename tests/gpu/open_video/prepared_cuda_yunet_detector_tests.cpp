@@ -432,12 +432,49 @@ int main() {
       r.completion_waits == 1 && r.cpu_tail_boundaries == 1 &&
       state.runs == 2 && state.copies == 12 && !r.pending_work &&
       std::abs(state.preprocess_inverse_std - 255.0F) < 0.001F;
+  const int cached_runs = state.runs;
+  const int cached_copies = state.copies;
+  auto cached_no_face = d.Execute(setup.binding, image, 1, &cache, wait);
+  ok &= cached_no_face.status ==
+            open_video::PreparedCudaYunetStatus::success_no_faces &&
+        cached_no_face.enqueued_readbacks == 0 &&
+        cached_no_face.completed_readbacks == 0 &&
+        cached_no_face.completion_waits == 0 &&
+        cached_no_face.cpu_tail_boundaries == 0 &&
+        state.runs == cached_runs && state.copies == cached_copies;
+  cuda::CudaImage invalid_cached_input;
+  invalid_cached_input.w = image.w;
+  invalid_cached_input.h = image.h;
+  invalid_cached_input.pitch = image.pitch;
+  invalid_cached_input.format = cuda::PixelFormatGpu::rgb_u8;
+  auto invalid_cached =
+      d.Execute(setup.binding, invalid_cached_input, 1, &cache, wait);
+  ok &= invalid_cached.status ==
+            open_video::PreparedCudaYunetStatus::stale_binding &&
+        state.runs == cached_runs && state.copies == cached_copies;
+  cache.face_detections_provenance.producer = nullptr;
+  auto wrong_producer = d.Execute(setup.binding, image, 1, &cache, wait);
+  ok &= wrong_producer.status ==
+            open_video::PreparedCudaYunetStatus::success_no_faces &&
+        wrong_producer.enqueued_readbacks == 12 && state.runs == cached_runs + 1;
+  ++cache.face_detections_provenance.producer_revision;
+  const int stale_revision_runs = state.runs;
+  auto stale_revision = d.Execute(setup.binding, image, 1, &cache, wait);
+  ok &= stale_revision.enqueued_readbacks == 12 &&
+        state.runs == stale_revision_runs + 1;
+  cache.BeginFrame(99);
+  (void)cache.PrepareFaceDetections(16);
+  const int empty_runs = state.runs;
+  auto empty_unproven = d.Execute(setup.binding, image, 99, &cache, wait);
+  ok &= empty_unproven.enqueued_readbacks == 12 &&
+        state.runs == empty_runs + 1;
   state.fail_copy = state.copies + 3;
   auto partial = d.Execute(setup.binding, image, 2, &cache, wait);
   ok &=
       partial.status == open_video::PreparedCudaYunetStatus::readback_failed &&
       partial.enqueued_readbacks == 3 && partial.completed_readbacks == 3 &&
-      partial.completion_waits == 1 && !partial.pending_work &&
+      partial.completion_waits == 1 && partial.cpu_tail_boundaries == 0 &&
+      !partial.pending_work &&
       state.memory.size() == allocations;
   state.fail_copy = -1;
   state.face = true;
@@ -445,6 +482,16 @@ int main() {
   ok &=
       recovered.status == open_video::PreparedCudaYunetStatus::success_faces &&
       cache.face_detections && cache.face_detections->size() == 1;
+  const int face_runs = state.runs;
+  const int face_copies = state.copies;
+  auto cached_face = d.Execute(setup.binding, image, 3, &cache, wait);
+  ok &= cached_face.status ==
+            open_video::PreparedCudaYunetStatus::success_faces &&
+        cached_face.enqueued_readbacks == 0 &&
+        cached_face.completed_readbacks == 0 &&
+        cached_face.completion_waits == 0 &&
+        cached_face.cpu_tail_boundaries == 0 && state.runs == face_runs &&
+        state.copies == face_copies;
   state.face = false;
   ok &= d.Shutdown(&error) && d.Shutdown(&error) && state.invalidates == 1;
   open_video::PreparedCudaYunetDetector retry;
