@@ -78,6 +78,9 @@ struct PreparedCudaEyeContactSetup {
   std::size_t resource_budget_bytes = 0;
   FrameAnalysisCache *analysis_cache = nullptr;
   PreparedCudaYunetSetup yunet_setup{};
+  // When present, borrow this already-prepared detector/cache instead of
+  // preparing and owning a private YuNet producer.
+  const PreparedCudaYunetPreparedBinding *shared_yunet = nullptr;
   PreparedCudaDlibSetup dlib_setup{};
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait{};
 };
@@ -101,8 +104,9 @@ struct PreparedCudaEyeContactAnalysisResult {
   std::uint32_t cpu_tail_boundaries = 0;
 };
 
-PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
-    const PreparedCudaDlibResult &, const cuda::CudaTensor &) noexcept;
+PreparedCudaEyeContactStatus
+ValidateResidentDlibLandmarks(const PreparedCudaDlibResult &,
+                              const cuda::CudaTensor &) noexcept;
 
 class IPreparedCudaEyeContactAnalysis {
 public:
@@ -141,6 +145,7 @@ struct PreparedCudaEyeContactRuntimeFrameResult {
   bool device_lost = false;
   std::uint32_t inference_attempts = 0;
   std::uint32_t inference_successes = 0;
+  std::uint32_t completion_waits = 0;
 };
 
 class IPreparedCudaEyeContactRuntime {
@@ -173,6 +178,8 @@ struct PreparedCudaEyeContactFrameResult {
 class PreparedCudaEyeContact {
 public:
   PreparedCudaEyeContact();
+  explicit PreparedCudaEyeContact(
+      IPreparedCudaEyeContactRuntime *runtime) noexcept;
   PreparedCudaEyeContact(IPreparedCudaEyeContactAnalysis *,
                          IPreparedCudaEyeContactRuntime *) noexcept;
   PreparedCudaEyeContact(
@@ -183,7 +190,8 @@ public:
   PreparedCudaEyeContact &operator=(const PreparedCudaEyeContact &) = delete;
 
   bool Prepare(const PreparedCudaEyeContactSetup &,
-               PreparedCudaEyeContactHandle *, std::string *);
+               PreparedCudaEyeContactHandle *, std::string *,
+               PreparedCudaEyeContactStatus *status_out = nullptr);
   PreparedCudaEyeContactFrameResult
   Execute(const PreparedCudaEyeContactHandle &,
           const PreparedCudaEyeContactBinding &, std::uint64_t capture_sequence,
