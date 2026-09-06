@@ -606,6 +606,27 @@ that the remaining Vulkan effects are available. In particular, Vulkan
 matting stays blocked until reviewed shared-device GPU-only inference and
 converted, checksummed model artifacts satisfy the resident-runtime contract.
 
+Keep implementation, production routing, hardware qualification, and release
+publication as separate evidence. At source checkpoint `0225a358`, prepared
+denoise, Auto Frame, Eye Contact, and mirror components are present, but their
+full production routing is incomplete; the fixed-center vignette production
+stage and its alpha-capacity correction are still an unintegrated candidate.
+Strict MODNet inference succeeds after setup-time free-dimension
+specialization, so an earlier CPU graph-partition diagnosis is obsolete. The
+remaining observed production-smoke failure at this checkpoint is the
+resident alpha capacity calculation, before a successful writer commit.
+
+On a Quadro P1000 with NVIDIA driver 535.309.01, component evidence includes
+exact dlib landmark parity across 20 generated cases, YuNet metadata/readback
+accounting, mirror, geometry, and Eye Contact execution with both FP32 eye
+models. The Eye Contact run used generated input and synthetic landmarks;
+strength zero was an exact identity and strength 0.5 changed pixels without a
+CPU provider fallback. These results do not qualify face detection, the full
+camera route, visual quality, or latency. The curated FastDVDnet artifact still
+fails graph validation despite matching its hash and size. Do not quarantine,
+remove, replace, or change the seven-pack catalog contract without the pending
+explicit product decision.
+
 The daemon persists Vulkan adapter intent as `video.vulkan.device` and
 `video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection
 and retains `STUDIOCAST_VULKAN_DEVICE_INDEX` as a compatibility override. A

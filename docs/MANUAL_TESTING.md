@@ -555,6 +555,32 @@ Expected:
 
 ## Open Vulkan Adapter Selection
 
+Before recording HAL parity or release qualification, capture the source
+commit, build options, exact model identities, GPU and driver, command and exit
+status, writer-commit evidence, and transfer, synchronization, and CPU-tail
+counters. A component oracle, skipped opt-in test, successful session setup, or
+loader enumeration is not a successful production camera run.
+
+- [ ] Run strict Open CUDA production smoke cases for each supported effect and
+  combination on every claimed NVIDIA configuration.
+- [ ] Confirm output publication and a successful writer commit before calling
+  a route active.
+- [ ] Exercise automatic Maxine preference and CUDA fallback, Auto Frame
+  dependencies, missing and invalid models, optional-stage failure, provider or
+  device loss, reconfiguration, stop, cleanup retry, and rollback.
+- [ ] Run the final Vulkan matrix on every NVIDIA, AMD, or Intel family claimed
+  by the release. Do not extrapolate one vendor's result to another.
+
+Current checkpoint evidence is partial. Quadro P1000 / driver 535.309.01 runs
+cover selected CUDA and Vulkan components, including both FP32 Eye Contact
+models with generated input and synthetic landmarks. They do not cover the
+full production route or camera/quality/latency behavior. Strict MODNet runs
+after free-dimension specialization, but the main-checkpoint production smoke
+still fails before writer commit on the resident alpha capacity calculation;
+its correction is only in an unintegrated candidate. The final Vulkan matrix
+has not run, `vulkaninfo` is absent on the test host, and no AMD or Intel
+hardware has been qualified.
+
 - [ ] On a system with multiple Vulkan devices, inspect
   `engines.open_vulkan.device_candidates` in daemon status.
 
