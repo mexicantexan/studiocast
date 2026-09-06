@@ -11,9 +11,9 @@ namespace studiocast::video {
 inline constexpr std::size_t kMaxCanonicalStageParameters = 16;
 inline constexpr std::uint64_t kMaxPerFrameSynchronizationsV1 = 16;
 
-// Fixed setup-time contract for one synchronous v1 frame. Transfer boundaries
-// are exact; synchronization calls may vary only inside the cached,
-// factory-declared range. The coordinator freezes this POD before Execute.
+// Fixed setup-time contract for one synchronous v1 frame. Legacy transfer
+// counts remain exact. A factory may explicitly declare bounded variability
+// for setup-proven conditional work; camera upload/final readback stay exact.
 struct PerFrameTransferContract {
   std::uint32_t contract_version = hal::kContractVersion;
   std::uint64_t uploads = 0;
@@ -23,6 +23,22 @@ struct PerFrameTransferContract {
   std::uint64_t cpu_tail_boundaries = 0;
   std::uint64_t minimum_synchronizations = 0;
   std::uint64_t maximum_synchronizations = 0;
+  bool variable_boundaries_declared = false;
+  std::uint64_t minimum_intermediate_readbacks = 0;
+  std::uint64_t maximum_intermediate_readbacks = 0;
+  std::uint64_t minimum_intermediate_uploads = 0;
+  std::uint64_t maximum_intermediate_uploads = 0;
+  std::uint64_t minimum_cpu_tail_boundaries = 0;
+  std::uint64_t maximum_cpu_tail_boundaries = 0;
+};
+
+struct VariablePerFrameTransferBounds {
+  std::uint64_t minimum_intermediate_readbacks = 0;
+  std::uint64_t maximum_intermediate_readbacks = 0;
+  std::uint64_t minimum_intermediate_uploads = 0;
+  std::uint64_t maximum_intermediate_uploads = 0;
+  std::uint64_t minimum_cpu_tail_boundaries = 0;
+  std::uint64_t maximum_cpu_tail_boundaries = 0;
 };
 
 // Numeric counterparts of the stable Broadcast parameter IDs. These values
@@ -143,6 +159,12 @@ ValidateVideoExecutionPlanRequest(const VideoExecutionPlanRequest &request,
 BuildPerFrameTransferContract(const hal::DomainPlan &domain_plan,
                               std::uint64_t minimum_synchronizations,
                               std::uint64_t maximum_synchronizations) noexcept;
+
+[[nodiscard]] PerFrameTransferContract BuildVariablePerFrameTransferContract(
+    const hal::DomainPlan &domain_plan,
+    std::uint64_t minimum_synchronizations,
+    std::uint64_t maximum_synchronizations,
+    const VariablePerFrameTransferBounds &bounds) noexcept;
 
 [[nodiscard]] bool
 ValidatePerFrameTransferContract(const PerFrameTransferContract &contract,

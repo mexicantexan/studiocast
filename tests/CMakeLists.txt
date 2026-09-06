@@ -1572,6 +1572,43 @@ if (BUILD_TESTING)
             integration gpu video model)
 
     add_executable(
+            studiocast-open-cuda-production-smoke-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/open_cuda_production_smoke_tests.cpp
+    )
+
+    target_link_libraries(
+            studiocast-open-cuda-production-smoke-tests PRIVATE
+            studiocast_open_video_backend
+            studiocast_video_execution_runtime
+            studiocast_video_backend_composition)
+
+    target_include_directories(
+            studiocast-open-cuda-production-smoke-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src"
+            "${STUDIOCAST_GENERATED_DIR}"
+    )
+
+    studiocast_set_project_warnings(studiocast-open-cuda-production-smoke-tests)
+    studiocast_enable_sanitizers(studiocast-open-cuda-production-smoke-tests)
+
+    set_target_properties(
+            studiocast-open-cuda-production-smoke-tests PROPERTIES
+            AUTOMOC OFF
+            AUTOUIC OFF
+            AUTORCC OFF
+    )
+
+    add_test(
+            NAME studiocast-open-cuda-production-smoke-tests
+            COMMAND studiocast-open-cuda-production-smoke-tests)
+    set_tests_properties(
+            studiocast-open-cuda-production-smoke-tests PROPERTIES
+            SKIP_RETURN_CODE 77)
+    studiocast_set_test_labels(
+            studiocast-open-cuda-production-smoke-tests
+            integration gpu video model)
+
+    add_executable(
             studiocast-prepared-open-video-compatibility-executor-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_open_video_compatibility_executor_tests.cpp
     )
