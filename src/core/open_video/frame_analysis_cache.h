@@ -28,6 +28,12 @@ struct FaceLandmarks {
   std::vector<std::pair<float, float>> points;
 };
 
+struct FaceDetectionCacheProvenance {
+  const void *producer = nullptr;
+  std::uint64_t producer_revision = 0;
+  bool complete = false;
+};
+
 enum class FrameMatteStorage {
   cpu_f32_alpha,
   device_f32_alpha,
@@ -226,6 +232,7 @@ struct FrameAnalysisCache {
   }
 
   std::vector<FaceDetection> &PrepareFaceDetections(std::size_t capacity) {
+    face_detections_provenance = {};
     if (!face_detections) {
       face_detections.emplace();
       face_detections->swap(recycled_face_detections_);
@@ -248,10 +255,12 @@ struct FrameAnalysisCache {
   }
 
   std::optional<std::vector<FaceDetection>> face_detections;
+  FaceDetectionCacheProvenance face_detections_provenance;
   std::optional<FaceLandmarks> face_landmarks;
 
 private:
   void RecycleFaceDetections() {
+    face_detections_provenance = {};
     if (!face_detections)
       return;
     recycled_face_detections_.clear();
