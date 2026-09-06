@@ -706,6 +706,31 @@ PlanningInput(hal::SemanticEffectId semantic, int strength) {
 bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
   using Operation = open_cuda::PreparedOpenCudaOperationId;
   bool ok = true;
+  auto driver_pitched = PlanningInput(
+      hal::SemanticEffectId::virtual_background_remove, 8);
+  driver_pitched.frame_width = 64;
+  driver_pitched.frame_height = 48;
+  driver_pitched.model_width = 256;
+  driver_pitched.model_height = 256;
+  driver_pitched.input_pitch_bytes = 512;
+  driver_pitched.output_pitch_bytes = 512;
+  driver_pitched.model_alpha_capacity_bytes = 256u * 256u * sizeof(float);
+  driver_pitched.input_tensor_capacity_bytes =
+      3u * 256u * 256u * sizeof(float);
+  driver_pitched.resized_alpha_pitch_bytes = 256;
+  driver_pitched.upload_staging_bytes = 64u * 48u * 3u;
+  driver_pitched.readback_staging_bytes = 64u * 48u * 3u;
+  driver_pitched.available_budget.persistent_bytes = 4u * 1024u * 1024u;
+  const auto pitched_plan =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(driver_pitched);
+  ok = Expect(pitched_plan.ready() &&
+                  pitched_plan.required_budget.persistent_bytes >=
+                      2u * 512u * 48u &&
+                  pitched_plan.required_budget.persistent_bytes <=
+                      driver_pitched.available_budget.persistent_bytes,
+              "native planning must accept a driver-selected 512-byte pitch "
+              "for a 192-byte logical row and reserve its full height") &&
+       ok;
   auto combined_resize =
       PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
   combined_resize.island_stage_count = 2;
