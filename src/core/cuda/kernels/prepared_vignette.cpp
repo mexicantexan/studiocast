@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace studiocast::cuda::kernels {
 namespace {
@@ -60,6 +61,23 @@ bool Fail(std::string *error, const char *message) {
   if (error)
     *error = message;
   return false;
+}
+
+bool ImageSpan(const CudaImage &image, std::uint64_t *begin,
+               std::uint64_t *end) noexcept {
+  const auto base = static_cast<std::uint64_t>(image.ptr);
+  const auto rows = static_cast<std::uint64_t>(image.h - 1);
+  if (rows != 0 && image.pitch > std::numeric_limits<std::uint64_t>::max() / rows)
+    return false;
+  const auto row_offset = static_cast<std::uint64_t>(image.pitch) * rows;
+  const auto row_bytes = static_cast<std::uint64_t>(image.RowBytes());
+  if (row_offset > std::numeric_limits<std::uint64_t>::max() - row_bytes ||
+      base > std::numeric_limits<std::uint64_t>::max() -
+                 (row_offset + row_bytes))
+    return false;
+  *begin = base;
+  *end = base + row_offset + row_bytes;
+  return true;
 }
 } // namespace
 
@@ -135,6 +153,18 @@ bool LaunchVignettePrepared(const PreparedVignetteKernel &kernel,
                                         destination.RowBytes(),
                                         "LaunchVignettePrepared(destination)", error))
     return false;
+  std::uint64_t source_begin = 0, source_end = 0, destination_begin = 0,
+                destination_end = 0;
+  if (!ImageSpan(source, &source_begin, &source_end) ||
+      !ImageSpan(destination, &destination_begin, &destination_end))
+    return Fail(error, "LaunchVignettePrepared: device image span overflow.");
+  const bool exact_in_place = source.ptr == destination.ptr &&
+                              source.pitch == destination.pitch;
+  const bool overlaps = source_begin < destination_end &&
+                        destination_begin < source_end;
+  if (overlaps && !exact_in_place)
+    return Fail(error,
+                "LaunchVignettePrepared: partial device image overlap is unsupported.");
   if (!std::isfinite(intensity) || intensity < 0.0f || intensity > 1.0f ||
       !std::isfinite(center_x) || !std::isfinite(center_y) || center_x < 0.0f ||
       center_y < 0.0f || center_x > static_cast<float>(source.w) ||

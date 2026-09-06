@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -159,6 +160,23 @@ bool LifecycleAndLaunchContract() {
                                      23.0F, &error) &&
                   storage.launches == 2 && storage.src == storage.dst,
               "exact in-place/no-op boundary launch failed");
+  auto mismatched_pitch = Image(source.ptr, 31, 23, PixelFormatGpu::rgb_u8);
+  mismatched_pitch.pitch += 3;
+  ok &= Check(!LaunchVignettePrepared(kernel, source, mismatched_pitch, 0.5F,
+                                      7.5F, 11.0F, &error) &&
+                  storage.launches == 2,
+              "same pointer with different pitch was launched");
+  auto partial_overlap = Image(source.ptr + 1, 31, 23, PixelFormatGpu::rgb_u8);
+  ok &= Check(!LaunchVignettePrepared(kernel, source, partial_overlap, 0.5F,
+                                      7.5F, 11.0F, &error) &&
+                  storage.launches == 2,
+              "partially overlapping images were launched");
+  auto wrapping = Image(std::numeric_limits<CUdeviceptr>::max() - 8u, 31, 23,
+                        PixelFormatGpu::rgb_u8);
+  ok &= Check(!LaunchVignettePrepared(kernel, wrapping, destination, 0.5F,
+                                      7.5F, 11.0F, &error) &&
+                  storage.launches == 2,
+              "wrapping device image extent was launched");
   ok &= Check(!LaunchVignettePrepared(kernel, source, destination, 1.1F,
                                       7.5F, 11.0F, &error),
               "invalid intensity accepted");
