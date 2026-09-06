@@ -55,6 +55,8 @@ set(_studiocast_cuda_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_vignette.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/dlib_shape_predictor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/dlib_shape_predictor_ptx.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_matte_bounds.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_matte_bounds_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_mirror.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_mirror_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_eye_contact_kernels.cpp
@@ -643,7 +645,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 155)
+set(_studiocast_expected_source_count 157)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})
