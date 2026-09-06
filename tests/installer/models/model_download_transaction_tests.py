@@ -260,6 +260,57 @@ class CatalogContractTests(TempTest):
         self.assertEqual({stride: (640 // stride) ** 2 for stride in (8, 16, 32)},
                          {8: 6400, 16: 1600, 32: 400})
 
+    def test_curated_gaze_fp32_artifacts_have_verified_tensor_contract(self):
+        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        pack = next(
+            item for item in catalog["packs"]
+            if item["id"] == "gaze_correction_cam_flx_v0_1_1"
+        )
+        expected_artifacts = {
+            "gaze_flx_left.onnx":
+                "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00",
+            "gaze_flx_right.onnx":
+                "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1",
+        }
+        self.assertEqual(
+            {item["name"]: item["sha256"] for item in pack["artifacts"]},
+            expected_artifacts,
+        )
+
+        model_metadata = next(
+            item for item in pack["metadata"] if item["destination"] == "model.json"
+        )
+        metadata_path = REPO_ROOT / model_metadata["source"]
+        self.assertEqual(model_tx.sha256_path(metadata_path), model_metadata["sha256"])
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["id"], pack["id"])
+        self.assertEqual(
+            {item["name"]: item["sha256"] for item in metadata["files"]},
+            expected_artifacts,
+        )
+        self.assertEqual(metadata["onnx"]["inputs"], [
+            {
+                "name": "eye_rgb:0", "layout": "nchw", "dtype": "float32",
+                "width": 64, "height": 48, "channels": 3,
+                "note": "Normalized eye crop (48x64).",
+            },
+            {
+                "name": "anchors:0", "layout": "nchw", "dtype": "float32",
+                "width": 64, "height": 48, "channels": 12,
+                "note": "Six landmark-guidance points encoded as paired x/y offset maps.",
+            },
+            {
+                "name": "angles:0", "layout": "nc", "dtype": "float32",
+                "dim": 2,
+                "note": "Yaw/pitch target delta. Exact convention matches the upstream FLX model conversion.",
+            },
+        ])
+        self.assertEqual(metadata["onnx"]["outputs"], [{
+            "name": "rgb:0", "kind": "rgb", "dtype": "float32",
+            "width": 64, "height": 48, "channels": 3,
+            "note": "Corrected RGB eye crop in NCHW layout and the 0..1 range.",
+        }])
+
     def test_recommended_untrusted_known_sizes_block_before_filesystem_mutation(self):
         fixture = Fixture(self.root)
         raw = json.loads(fixture.catalog_path.read_text())
