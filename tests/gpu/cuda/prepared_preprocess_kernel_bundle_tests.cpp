@@ -92,6 +92,7 @@ struct FakeState {
   CUresult context_query_result = CUDA_SUCCESS;
   CUresult module_load_result = CUDA_SUCCESS;
   CUresult function_resolution_result = CUDA_SUCCESS;
+  CUresult module_unload_result = CUDA_SUCCESS;
   CUresult launch_result = CUDA_SUCCESS;
   LaunchCapture capture;
 };
@@ -127,7 +128,7 @@ CUresult FakeModuleGetFunction(CUfunction *function, CUmodule,
 }
 CUresult FakeModuleUnload(CUmodule) {
   ++g_state->module_unloads;
-  return CUDA_SUCCESS;
+  return g_state->module_unload_result;
 }
 CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
                     unsigned int grid_y, unsigned int, unsigned int block_x,
@@ -706,6 +707,91 @@ bool TestPreparedResizeHasNoFrameTimeSetup() {
   return ok;
 }
 
+bool TestPreparedResizeCleanupIsRetryable() {
+  Fixture fixture;
+  if (!fixture.Initialize())
+    return false;
+  PreparedResizeBilinearKernel kernel;
+  bool ok = Expect(PrepareResizeBilinearKernel(
+                       fixture.driver, fixture.state.current,
+                       fixture.binding.stream, &kernel, &fixture.error),
+                   "resize lifecycle fixture should prepare");
+  const int loads = fixture.state.module_loads;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, fixture.state.current,
+                    fixture.binding.stream, &kernel, &fixture.error) &&
+                   fixture.state.module_loads == loads,
+               "prepare on live handle loaded another module");
+
+  const auto owner_context = fixture.state.current;
+  fixture.state.current = reinterpret_cast<CUcontext>(
+      static_cast<std::uintptr_t>(0xdead));
+  PreparedResizeBilinearKernel wrong_context;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, owner_context, fixture.binding.stream,
+                    &wrong_context, &fixture.error) &&
+                   fixture.state.module_loads == loads,
+               "wrong-context prepare reached module loading");
+  ok &= Expect(!DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   kernel.live && fixture.state.module_unloads == 0,
+               "wrong-context destroy lost the live module");
+  fixture.state.current = owner_context;
+
+  fixture.state.module_unload_result = 3;
+  ok &= Expect(!DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   kernel.live && fixture.state.module_unloads == 1,
+               "unload failure did not preserve retry state");
+  fixture.state.module_unload_result = CUDA_SUCCESS;
+  ok &= Expect(DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   !kernel.live && fixture.state.module_unloads == 2,
+               "unload retry did not release the module");
+
+  fixture.state.function_resolution_result = 3;
+  fixture.state.module_unload_result = 3;
+  PreparedResizeBilinearKernel partial;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, owner_context, fixture.binding.stream,
+                    &partial, &fixture.error) &&
+                   partial.live && partial.module && !partial.function,
+               "partial prepare did not retain failed-cleanup handle");
+  CudaImage source;
+  source.ptr = 0x1000;
+  source.pitch = 3;
+  source.w = source.h = 1;
+  source.format = PixelFormatGpu::rgb_u8;
+  CudaImage destination;
+  destination.ptr = 0x2000;
+  destination.pitch = 3;
+  destination.w = destination.h = 1;
+  destination.format = PixelFormatGpu::rgb_u8;
+  const int launches = fixture.state.launches;
+  ok &= Expect(!LaunchResizeBilinearPrepared(
+                    partial, source, destination, &fixture.error) &&
+                   fixture.state.launches == launches,
+               "partial prepared handle reached launch");
+  fixture.state.module_unload_result = CUDA_SUCCESS;
+  ok &= Expect(DestroyResizeBilinearKernelPrepared(&partial, &fixture.error),
+               "partial prepared handle could not retry cleanup");
+
+  fixture.state.function_resolution_result = CUDA_SUCCESS;
+  PreparedResizeBilinearKernel movable;
+  ok &= Expect(PrepareResizeBilinearKernel(
+                   fixture.driver, owner_context, fixture.binding.stream,
+                   &movable, &fixture.error),
+               "move lifecycle fixture should prepare");
+  PreparedResizeBilinearKernel moved(std::move(movable));
+  const int unloads = fixture.state.module_unloads;
+  ok &= Expect(!movable.live && movable.module == nullptr && moved.live &&
+                   DestroyResizeBilinearKernelPrepared(&movable,
+                                                       &fixture.error) &&
+                   fixture.state.module_unloads == unloads &&
+                   DestroyResizeBilinearKernelPrepared(&moved,
+                                                       &fixture.error) &&
+                   fixture.state.module_unloads == unloads + 1,
+               "move construction did not transfer sole cleanup ownership");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -715,6 +801,7 @@ int main() {
   ok &= TestTypedSetupFailuresAndLifecycle();
   ok &= TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence();
   ok &= TestPreparedResizeHasNoFrameTimeSetup();
+  ok &= TestPreparedResizeCleanupIsRetryable();
   if (ok)
     std::cout << "Prepared preprocess kernel bundle tests passed.\n";
   return ok ? 0 : 1;
