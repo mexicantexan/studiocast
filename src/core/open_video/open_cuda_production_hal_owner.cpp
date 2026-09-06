@@ -107,28 +107,40 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
       *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
-  if (program.stage_count != 1 || readiness.ready_stage_mask != 1 ||
+  if (program.stage_count == 0 || program.stage_count > 2 ||
+      readiness.ready_stage_mask !=
+          ((std::uint32_t{1} << program.stage_count) - 1u) ||
       readiness.blocked_stage_mask != 0 || readiness.disabled_stage_mask != 0) {
     if (reason)
       *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
-  const auto &stage = program.stages[0];
-  if (stage.backend != hal::BackendId::cuda ||
-      stage.execution_domain != domain ||
-      stage.provider !=
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
-    if (reason)
-      *reason = ReasonId::semantic_provider_unavailable;
-    return false;
-  }
-  if (stage.semantic != hal::SemanticEffectId::virtual_background_blur &&
-      stage.semantic != hal::SemanticEffectId::virtual_background_remove &&
-      stage.semantic != hal::SemanticEffectId::virtual_background_replace &&
-      stage.semantic != hal::SemanticEffectId::virtual_key_light) {
+  const auto vb = [](hal::SemanticEffectId semantic) {
+    return semantic == hal::SemanticEffectId::virtual_background_blur ||
+           semantic == hal::SemanticEffectId::virtual_background_remove ||
+           semantic == hal::SemanticEffectId::virtual_background_replace;
+  };
+  if (!((program.stage_count == 1 &&
+         (vb(program.stages[0].semantic) ||
+          program.stages[0].semantic ==
+              hal::SemanticEffectId::virtual_key_light)) ||
+        (program.stage_count == 2 && vb(program.stages[0].semantic) &&
+         program.stages[1].semantic ==
+             hal::SemanticEffectId::virtual_key_light))) {
     if (reason)
       *reason = ReasonId::semantic_effect_unsupported;
     return false;
+  }
+  for (std::size_t index = 0; index < program.stage_count; ++index) {
+    const auto &stage = program.stages[index];
+    if (stage.backend != hal::BackendId::cuda ||
+        stage.execution_domain != domain ||
+        stage.provider !=
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+      if (reason)
+        *reason = ReasonId::semantic_provider_unavailable;
+      return false;
+    }
   }
   return true;
 }
@@ -389,8 +401,7 @@ OpenCudaProductionHalOwner::CreateBackend(
     options.replacement_width = request.replacement_width;
     options.replacement_height = request.replacement_height;
     options.key_light_intensity = request.key_light_intensity;
-    options.key_light_temperature_preset =
-        request.key_light_temperature_preset;
+    options.key_light_temperature_preset = request.key_light_temperature_preset;
     options.key_light_direction_pan_degrees =
         request.key_light_direction_pan_degrees;
     options.wait_policy = request.wait_policy;

@@ -64,6 +64,7 @@ enum class PreparedOpenCudaOperationId : std::uint16_t {
   completion_wait = 12,
   composite_replace = 13,
   key_light = 14,
+  final_resize = 15,
 };
 
 struct PreparedOpenCudaLaunchGeometry {
@@ -75,6 +76,7 @@ struct PreparedOpenCudaLaunchGeometry {
 };
 
 struct PreparedOpenCudaVbPlanInput {
+  std::uint32_t island_stage_count = 1;
   hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
   std::uint64_t frame_width = 0;
   std::uint64_t frame_height = 0;
@@ -83,6 +85,9 @@ struct PreparedOpenCudaVbPlanInput {
   int requested_strength = 8;
   std::uint64_t input_pitch_bytes = 0;
   std::uint64_t output_pitch_bytes = 0;
+  std::uint64_t final_output_width = 0;
+  std::uint64_t final_output_height = 0;
+  std::uint64_t final_output_pitch_bytes = 0;
   std::uint64_t model_alpha_capacity_bytes = 0;
   std::uint64_t input_tensor_capacity_bytes = 0;
   std::uint64_t resized_alpha_pitch_bytes = 0;
@@ -106,7 +111,10 @@ struct PreparedOpenCudaVbPlan {
   hal::ReasonId reason = hal::ReasonId::none;
   hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
   std::uint32_t frame_width = 0;
+  std::uint32_t island_stage_count = 1;
   std::uint32_t frame_height = 0;
+  std::uint32_t final_output_width = 0;
+  std::uint32_t final_output_height = 0;
   std::uint32_t model_width = 0;
   std::uint32_t model_height = 0;
   std::uint32_t strength = 0;
@@ -199,6 +207,7 @@ struct PreparedOpenCudaRuntimeFrame {
   std::size_t input_row_stride_bytes = 0;
   std::size_t output_row_stride_bytes = 0;
   bool stage_disabled = false;
+  std::uint32_t disabled_stage_mask = 0;
   bool stage_required = false;
   hal::FailureAction failure_action = hal::FailureAction::fail_closed;
 };
@@ -221,6 +230,8 @@ struct PreparedOpenCudaRuntimeFrameResult {
   bool valid_input_preserved = false;
   bool analysis_ran = false;
   bool inference_only_path = false;
+  std::array<hal::StageExecutionResult, hal::kMaxPreparedStages> stages{};
+  std::size_t stage_count = 0;
 };
 
 struct PreparedOpenCudaRuntimeTelemetry {

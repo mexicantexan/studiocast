@@ -4,6 +4,8 @@
 #include "core/video/production_video_setup_lease.h"
 #include "core/video/video_adapter_factory.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -52,7 +54,8 @@ using OpenCudaPrepareVideoCandidate = hal::StatusId (*)(
 struct OpenCudaVideoExecutionCachedEvidence {
   hal::ReadinessSnapshot readiness{};
   hal::ExecutionDomainId execution_domain{};
-  hal::ModelArtifactIdentity model{};
+  std::array<hal::ModelArtifactIdentity, hal::kMaxPreparedStages> models{};
+  std::size_t stage_count = 0;
   hal::ProgramGenerations generations{};
   hal::ResourceBudget reserved_budget{};
   bool model_artifact_validated = false;
@@ -90,8 +93,9 @@ struct OpenCudaVideoExecutionFactoryConfig {
 struct OpenCudaProductionVideoExecutionFactoryRequest {
   std::uint64_t factory_id = 0;
   std::uint32_t selection_priority = 0;
-  hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
-  hal::ModelArtifactIdentity model{};
+  std::array<hal::SemanticEffectId, hal::kMaxPreparedStages> semantics{};
+  std::array<hal::ModelArtifactIdentity, hal::kMaxPreparedStages> models{};
+  std::size_t stage_count = 0;
   hal::ProgramGenerations generations{};
   // Exact setup-time capacity reserved for the one prepared resident slot.
   // The lease publishes this value unchanged; frame execution cannot grow it.

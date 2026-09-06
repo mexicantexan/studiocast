@@ -206,8 +206,7 @@ OptionsFor(open_cuda::IPreparedOpenCudaRuntime *runtime,
     options.replacement_width = 2;
     options.replacement_height = 2;
     options.replacement_rgb = {
-        255, 0,   0,   0, 255, 0,
-        0,   0,   255, 255, 255, 255,
+        255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,
     };
   } else if (semantic == hal::SemanticEffectId::virtual_key_light) {
     options.key_light_intensity = 75;
@@ -329,8 +328,7 @@ public:
           static_cast<std::uint64_t>(config.replacement_width) * 3u;
       plan_input.replacement_source_height =
           static_cast<std::uint64_t>(config.replacement_height);
-      plan_input.replacement_frame_pitch_bytes =
-          plan_input.input_pitch_bytes;
+      plan_input.replacement_frame_pitch_bytes = plan_input.input_pitch_bytes;
     }
     plan_input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
     plan_input.readback_staging_bytes =
@@ -558,8 +556,7 @@ struct Fixture {
                        hal::SemanticEffectId::virtual_background_blur,
                    bool required = true)
       : program(Program(semantic, required)),
-        executor(OptionsFor(&runtime, semantic)),
-        adapter(81, executor) {}
+        executor(OptionsFor(&runtime, semantic)), adapter(81, executor) {}
 
   FakeRuntime runtime;
   hal::PreparedProgram program;
@@ -662,6 +659,23 @@ PlanningInput(hal::SemanticEffectId semantic, int strength) {
 bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
   using Operation = open_cuda::PreparedOpenCudaOperationId;
   bool ok = true;
+  auto combined_resize =
+      PlanningInput(hal::SemanticEffectId::virtual_background_remove, 8);
+  combined_resize.island_stage_count = 2;
+  combined_resize.final_output_width = 31;
+  combined_resize.final_output_height = 15;
+  combined_resize.final_output_pitch_bytes = 96;
+  combined_resize.readback_staging_bytes = 31u * 15u * 3u;
+  const auto combined_plan =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(combined_resize);
+  ok = Expect(combined_plan.ready() && combined_plan.island_stage_count == 2 &&
+                  combined_plan.final_output_width == 31 &&
+                  combined_plan.final_output_height == 15 &&
+                  combined_plan.required_budget.resource_count == 20 &&
+                  combined_plan.required_budget.persistent_bytes == 4112,
+              "combined VB/key-light planning must reserve the second stage "
+              "events and terminal device resize exactly") &&
+       ok;
   struct Threshold {
     int requested = 0;
     std::uint32_t strength = 0;
@@ -675,8 +689,7 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
         PlanningInput(hal::SemanticEffectId::virtual_background_blur,
                       threshold.requested));
     const std::uint32_t expected_launches = threshold.feather == 0 ? 4 : 6;
-    const std::uint32_t expected_resources =
-        threshold.feather == 0 ? 19 : 21;
+    const std::uint32_t expected_resources = threshold.feather == 0 ? 19 : 21;
     ok = Expect(
              blur.ready() && blur.frame_width == 17 && blur.frame_height == 9 &&
                  blur.model_width == 8 && blur.model_height == 4 &&
@@ -755,8 +768,7 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
                   replace.required_budget.scratch_bytes == 2160 &&
                   replace.required_budget.resource_count == 21 &&
                   replace.launch_count == 4 &&
-                  replace.launches[3].operation ==
-                      Operation::composite_replace,
+                  replace.launches[3].operation == Operation::composite_replace,
               "replace budget must include setup-sized replacement source "
               "and frame resources with exact composite ordering") &&
        ok;
@@ -834,8 +846,7 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
     const auto undersized =
         open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
     ok = Expect(undersized.status == RuntimeStatus::malformed_contract &&
-                    undersized.reason ==
-                        hal::ReasonId::malformed_descriptor,
+                    undersized.reason == hal::ReasonId::malformed_descriptor,
                 "input tensor capacity below active bytes must fail closed") &&
          ok;
   }
@@ -927,11 +938,10 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
 
 bool TestAcceptedResidentEffectsThroughSession() {
   bool ok = true;
-  for (const auto semantic :
-       {hal::SemanticEffectId::virtual_background_blur,
-        hal::SemanticEffectId::virtual_background_remove,
-        hal::SemanticEffectId::virtual_background_replace,
-        hal::SemanticEffectId::virtual_key_light}) {
+  for (const auto semantic : {hal::SemanticEffectId::virtual_background_blur,
+                              hal::SemanticEffectId::virtual_background_remove,
+                              hal::SemanticEffectId::virtual_background_replace,
+                              hal::SemanticEffectId::virtual_key_light}) {
     Fixture fixture(semantic);
     ok = Configure(&fixture) && ok;
     const auto result = ExecuteBound(&fixture, 1);
@@ -971,41 +981,39 @@ bool TestAcceptedResidentEffectsThroughSession() {
 
 bool TestOptionalFailurePreservesInputWithoutAttribution() {
   bool ok = true;
-  for (const auto semantic :
-       {hal::SemanticEffectId::virtual_background_blur,
-        hal::SemanticEffectId::virtual_background_remove,
-        hal::SemanticEffectId::virtual_background_replace,
-        hal::SemanticEffectId::virtual_key_light}) {
+  for (const auto semantic : {hal::SemanticEffectId::virtual_background_blur,
+                              hal::SemanticEffectId::virtual_background_remove,
+                              hal::SemanticEffectId::virtual_background_replace,
+                              hal::SemanticEffectId::virtual_key_light}) {
     Fixture fixture(semantic, false);
     ok = Configure(&fixture) && ok;
     fixture.runtime.execute_status = RuntimeStatus::optional_failed_open;
     const auto result = ExecuteBound(&fixture, 1);
-    ok = Expect(
-             result.status == hal::StatusId::degraded &&
-                 result.reason == hal::ReasonId::optional_stage_failed_open &&
-                 result.stages[0].status ==
-                     hal::StageExecutionStatus::optional_failed_open &&
-                 result.stages[0].reason ==
-                     hal::ReasonId::semantic_provider_unavailable &&
-                 result.stages[0].valid_output_preserved &&
-                 fixture.output == fixture.input &&
-                 result.transfers.uploads == 1 &&
-                 result.transfers.final_readbacks == 1 &&
-                 result.transfers.intermediate_readbacks == 0 &&
-                 result.transfers.intermediate_uploads == 0 &&
-                 result.transfers.synchronizations == 1 &&
-                 result.transfers.cpu_tail_boundaries == 1 &&
-                 fixture.runtime.last_failed_operation ==
-                     open_cuda::PreparedOpenCudaOperationId::inference,
-             "optional failure should preserve exact valid input without "
-             "hidden crossings") &&
-         ok;
+    ok =
+        Expect(result.status == hal::StatusId::degraded &&
+                   result.reason == hal::ReasonId::optional_stage_failed_open &&
+                   result.stages[0].status ==
+                       hal::StageExecutionStatus::optional_failed_open &&
+                   result.stages[0].reason ==
+                       hal::ReasonId::semantic_provider_unavailable &&
+                   result.stages[0].valid_output_preserved &&
+                   fixture.output == fixture.input &&
+                   result.transfers.uploads == 1 &&
+                   result.transfers.final_readbacks == 1 &&
+                   result.transfers.intermediate_readbacks == 0 &&
+                   result.transfers.intermediate_uploads == 0 &&
+                   result.transfers.synchronizations == 1 &&
+                   result.transfers.cpu_tail_boundaries == 1 &&
+                   fixture.runtime.last_failed_operation ==
+                       open_cuda::PreparedOpenCudaOperationId::inference,
+               "optional failure should preserve exact valid input without "
+               "hidden crossings") &&
+        ok;
     ok = ResolveAndCommit(&fixture, result) && ok;
-    ok = Expect(
-             fixture.session.telemetry().active_backend ==
-                     hal::BackendId::invalid &&
-                 fixture.session.telemetry().optional_fail_open_stages == 1,
-             "optional fail-open commit must not claim backend success") &&
+    ok = Expect(fixture.session.telemetry().active_backend ==
+                        hal::BackendId::invalid &&
+                    fixture.session.telemetry().optional_fail_open_stages == 1,
+                "optional fail-open commit must not claim backend success") &&
          ok;
   }
   return ok;
