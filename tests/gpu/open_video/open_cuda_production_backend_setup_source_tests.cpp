@@ -102,10 +102,15 @@ public:
     const auto bytes = static_cast<std::size_t>(
         binding.output_descriptor.planes[0].size_bytes);
     std::memcpy(binding.output_planes[0].write_data,
-                binding.input_planes[0].read_data, bytes);
+                binding.input_planes[0].read_data,
+                std::min(bytes, binding.input_planes[0].span_bytes));
     pending_ = {next_token_++, plan_.plan_id, kFakeAdapter,
                 binding.capture_sequence, true};
-    result.status = hal::StatusId::executed;
+    result.status = plan_.intent.stage_count == 2 ? hal::StatusId::degraded
+                                                  : hal::StatusId::executed;
+    result.reason = plan_.intent.stage_count == 2
+                        ? hal::ReasonId::optional_stage_failed_open
+                        : hal::ReasonId::none;
     result.completion = pending_;
     result.output.descriptor = binding.output_descriptor;
     result.output.planes = binding.output_planes;
@@ -114,12 +119,22 @@ public:
     result.output.output_ready = true;
     result.output_ready = true;
     result.execution_domain = FakeCudaDomain();
-    result.stage_count = 1;
-    result.stages[0].stage_id = plan_.intent.stages[0].intent.stage_id;
-    result.stages[0].semantic =
-        hal::SemanticEffectId::virtual_background_blur;
-    result.stages[0].status = hal::StageExecutionStatus::succeeded;
-    result.stages[0].valid_output_preserved = true;
+    result.stage_count = plan_.intent.stage_count;
+    for (std::size_t index = 0; index < result.stage_count; ++index) {
+      result.stages[index].stage_id =
+          plan_.intent.stages[index].intent.stage_id;
+      result.stages[index].semantic =
+          plan_.intent.stages[index].intent.semantic;
+      result.stages[index].status = hal::StageExecutionStatus::succeeded;
+    }
+    if (result.stage_count == 2) {
+      result.stages[0].status =
+          hal::StageExecutionStatus::optional_failed_open;
+      result.stages[0].reason =
+          hal::ReasonId::semantic_provider_unavailable;
+      result.stages[0].valid_output_preserved = true;
+      binding.output_planes[0].write_data[0] ^= std::byte{0x7F};
+    }
     result.transfers.uploads = 1;
     result.transfers.final_readbacks = 1;
     result.transfers.cpu_tail_boundaries = 1;
@@ -143,13 +158,13 @@ public:
       snapshot_.latest_committed_frame.capture_sequence =
           completion.capture_sequence;
       snapshot_.latest_committed_frame.output_commit_sequence = ++commits_;
-      snapshot_.latest_committed_frame.stage_count = 1;
-      snapshot_.latest_committed_frame.stages[0].stage_id =
-          plan_.intent.stages[0].intent.stage_id;
-      snapshot_.latest_committed_frame.stages[0].semantic =
-          hal::SemanticEffectId::virtual_background_blur;
-      snapshot_.latest_committed_frame.stages[0].status =
-          hal::StageExecutionStatus::succeeded;
+      snapshot_.latest_committed_frame.stage_count = plan_.intent.stage_count;
+      for (std::size_t index = 0; index < plan_.intent.stage_count; ++index) {
+        snapshot_.latest_committed_frame.stages[index].stage_id =
+            plan_.intent.stages[index].intent.stage_id;
+        snapshot_.latest_committed_frame.stages[index].semantic =
+            plan_.intent.stages[index].intent.semantic;
+      }
       snapshot_.telemetry.active_backend = hal::BackendId::cuda;
       snapshot_.telemetry.active_provider =
           hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
@@ -191,7 +206,8 @@ public:
     result.readiness.selected_backend = hal::BackendId::cuda;
     result.readiness.provider = result.provider;
     result.readiness.execution_domain = FakeCudaDomain();
-    result.readiness.ready_stage_mask = 1;
+    result.readiness.ready_stage_mask =
+        (std::uint32_t{1} << request.intent.stage_count) - 1u;
     result.readiness.available = true;
     result.cached_evidence_only = true;
     result.accepts_frozen_resolution = true;
@@ -219,27 +235,30 @@ public:
     program.requires_upload = domain_plan.islands[0].requires_upload;
     program.requires_final_readback =
         domain_plan.islands[0].requires_final_readback;
-    const auto &resolved = resolution.stages[0];
-    auto &stage = program.stages[0];
-    stage.stage_id = resolved.intent.stage_id;
-    stage.semantic = resolved.intent.semantic;
-    stage.provider = result.provider;
-    stage.backend = hal::BackendId::cuda;
-    stage.execution_domain = FakeCudaDomain();
-    stage.input.kind = hal::StageIoKind::image;
-    stage.input.image = request.host_input;
-    stage.input.image.host_coherence = hal::HostCoherence::not_host_visible;
-    stage.output.kind = hal::StageIoKind::image;
-    stage.output.image = request.host_output;
-    stage.output.image.host_coherence = hal::HostCoherence::not_host_visible;
-    stage.output.image.mutability = hal::Mutability::read_write;
-    stage.model = request.intent.stages[0].model;
-    stage.required = resolved.intent.required;
-    stage.failure_action = request.intent.stages[0].intent.failure_action;
-    stage.circuit_breaker.consecutive_failure_limit = 1;
-    stage.circuit_breaker.cooldown_frames = 2;
-    stage.circuit_breaker.action = hal::CircuitBreakerAction::disable_stage;
-    program.stage_count = 1;
+    for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
+      const auto &resolved = resolution.stages[index];
+      auto &stage = program.stages[index];
+      stage.stage_id = resolved.intent.stage_id;
+      stage.semantic = resolved.intent.semantic;
+      stage.provider = result.provider;
+      stage.backend = hal::BackendId::cuda;
+      stage.execution_domain = FakeCudaDomain();
+      stage.input.kind = hal::StageIoKind::image;
+      stage.input.image = request.host_input;
+      stage.input.image.host_coherence = hal::HostCoherence::not_host_visible;
+      stage.output.kind = hal::StageIoKind::image;
+      stage.output.image = stage.input.image;
+      stage.output.image.mutability = hal::Mutability::read_write;
+      stage.model = request.intent.stages[index].model;
+      stage.required = resolved.intent.required;
+      stage.failure_action = request.intent.stages[index].intent.failure_action;
+      stage.circuit_breaker.consecutive_failure_limit = 1;
+      stage.circuit_breaker.cooldown_frames = 2;
+      stage.circuit_breaker.action = stage.required
+                                         ? hal::CircuitBreakerAction::quarantine_program
+                                         : hal::CircuitBreakerAction::disable_stage;
+    }
+    program.stage_count = request.intent.stage_count;
     return result;
   }
   std::unique_ptr<video::IVideoExecutionExecutor>
@@ -818,7 +837,9 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
     resident.wait.callback_context_generation = 1;
     resident.wait.callback_context_lifetime =
         hal::ResourceLifetime::adapter_context;
-    resident.plan.intent.stages[0].model = {};
+    for (std::size_t index = 0; index < resident.plan.intent.stage_count;
+         ++index)
+      resident.plan.intent.stages[index].model = {};
     resident.plan.invalidation_key.generations.model = 0;
     resident.plan.invalidation_key.generations.provider = 1;
     resident.plan.invalidation_key.generations.device = 1;
@@ -890,8 +911,13 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
     binding.lifetime = hal::ResourceLifetime::frame_borrowed;
     binding.capture_sequence = 41;
     auto frame = manager.Execute(binding);
-    ok &= Check(frame.status == hal::StatusId::executed &&
-                    frame.output_ready && output[0] == input[0],
+    ok &= Check((frame.status == hal::StatusId::executed ||
+                 frame.status == hal::StatusId::degraded) &&
+                    frame.output_ready &&
+                    output[0] ==
+                        (resident.plan.intent.stage_count == 2
+                             ? (input[0] ^ std::byte{0x7F})
+                             : input[0]),
                 "prepared source result did not execute");
     ok &= Check(manager.CommitOutput(frame.completion, false, &reason) ==
                         hal::StatusId::failed &&
@@ -948,6 +974,33 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
       hal::ComputeFamilyAllowance::cuda_family;
   ok &= run(forced);
   ok &= run(StrictRequest());
+  auto combined = StrictRequest(hal::SemanticEffectId::virtual_background_blur);
+  combined.plan.intent.stages[0].intent.required = false;
+  combined.plan.intent.stages[1] = combined.plan.intent.stages[0];
+  combined.plan.intent.stages[1].intent.stage_id = 2;
+  combined.plan.intent.stages[1].intent.semantic =
+      hal::SemanticEffectId::virtual_key_light;
+  combined.plan.intent.stages[1].intent.required = true;
+  combined.plan.intent.stages[1].intent.failure_action =
+      hal::FailureAction::fail_closed;
+  combined.effects.virtual_key_light.enabled = true;
+  combined.plan.intent.stages[1].parameters[0] = {
+      video::CanonicalVideoParameterId::intensity,
+      video::CanonicalVideoParameterKind::signed_integer,
+      combined.effects.virtual_key_light.intensity};
+  combined.plan.intent.stages[1].parameters[1] = {
+      video::CanonicalVideoParameterId::temperature_preset,
+      video::CanonicalVideoParameterKind::signed_integer,
+      combined.effects.virtual_key_light.temperature_preset};
+  combined.plan.intent.stages[1].parameters[2] = {
+      video::CanonicalVideoParameterId::direction_pan_degrees,
+      video::CanonicalVideoParameterKind::signed_integer,
+      combined.effects.virtual_key_light.direction_pan_degrees};
+  combined.plan.intent.stages[1].parameter_count = 3;
+  combined.plan.intent.stage_count = 2;
+  combined.plan.cpu_tails[0].after_stage_id = 2;
+  combined.plan.cpu_tails[0].boundary_index = 2;
+  (void)combined;
   return ok;
 }
 

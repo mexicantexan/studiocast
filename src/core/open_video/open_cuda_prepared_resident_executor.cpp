@@ -964,14 +964,25 @@ public:
       }
       const bool final_resize = program.host_output.width != image.width ||
                                 program.host_output.height != image.height;
+      if ((final_resize || replace) &&
+          !cuda::kernels::PrepareResizeBilinearKernel(
+              *config.driver,
+              reinterpret_cast<cuda::CUcontext>(
+                  static_cast<std::uintptr_t>(context->retained_context_id)),
+              candidate->stream,
+              &candidate->resize, &error)) {
+        CleanupCandidate(candidate.get());
+        return SetupFailure(RuntimeStatus::not_prepared,
+                            ReasonId::capability_evidence_incomplete);
+      }
       if (final_resize &&
           (!candidate->final_output.Allocate(
                config.driver, static_cast<int>(program.host_output.width),
                static_cast<int>(program.host_output.height),
                cuda::PixelFormatGpu::rgb_u8, &error) ||
-           !cuda::kernels::ResizeBilinear(candidate->input,
-                                          candidate->final_output,
-                                          candidate->stream, &error) ||
+           !cuda::kernels::LaunchResizeBilinearPrepared(
+               candidate->resize, candidate->input, candidate->final_output,
+               &error) ||
            !config.driver->StreamSynchronize(candidate->stream, nullptr))) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::not_prepared,
@@ -1001,9 +1012,9 @@ public:
                config.driver, config.replacement_rgb.data(),
                static_cast<std::size_t>(config.replacement_width) * 3u,
                candidate->stream, &error) ||
-           !cuda::kernels::ResizeBilinear(candidate->replacement_source,
-                                          candidate->replacement_frame,
-                                          candidate->stream, &error))) {
+           !cuda::kernels::LaunchResizeBilinearPrepared(
+               candidate->resize, candidate->replacement_source,
+               candidate->replacement_frame, &error))) {
         if (!config.driver->StreamSynchronize(candidate->stream, nullptr)) {
           candidate->setup_completion_unproven = true;
           candidate->retired = true;
@@ -1472,8 +1483,9 @@ public:
         current_is_output ? &slot->output : &slot->input;
     if (slot->final_output.Valid()) {
       std::string resize_error;
-      if (!cuda::kernels::ResizeBilinear(*readback_source, slot->final_output,
-                                         slot->stream, &resize_error)) {
+      if (!cuda::kernels::LaunchResizeBilinearPrepared(
+              slot->resize, *readback_source, slot->final_output,
+              &resize_error)) {
         result.status = RuntimeStatus::postprocess_failed;
         result.reason = ReasonId::optional_stage_failed_open;
         result.failed_operation = PreparedOpenCudaOperationId::final_resize;
@@ -1637,6 +1649,7 @@ private:
     cuda::CudaImage input{};
     cuda::CudaImage output{};
     cuda::CudaImage final_output{};
+    cuda::kernels::PreparedResizeBilinearKernel resize{};
     cuda::CudaImage blur_tmp{};
     cuda::CudaImage blurred{};
     cuda::CudaImage replacement_source{};
@@ -1733,6 +1746,10 @@ private:
     slot->preprocess.Shutdown();
     slot->postprocess.Shutdown();
     (void)slot->transfer.Shutdown();
+    std::string resize_error;
+    (void)slot->config.driver->BindPreparedContext(slot->context);
+    (void)cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
+                                                              &resize_error);
     FreeTensor(slot->config.driver, &slot->alpha);
     FreeImage(slot->config.driver, &slot->alpha_feather);
     FreeImage(slot->config.driver, &slot->alpha_tmp);
@@ -1762,6 +1779,15 @@ private:
     slot->session.reset();
     slot->preprocess.Shutdown();
     slot->postprocess.Shutdown();
+    std::string resize_error;
+    if (slot->config.driver->BindPreparedContext(slot->context) !=
+        cuda::CUDA_SUCCESS) {
+      return RuntimeStatus::completion_pending;
+    }
+    if (!cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
+                                                             &resize_error)) {
+      return RuntimeStatus::completion_pending;
+    }
     FreeTensor(slot->config.driver, &slot->alpha);
     FreeImage(slot->config.driver, &slot->alpha_feather);
     FreeImage(slot->config.driver, &slot->alpha_tmp);
