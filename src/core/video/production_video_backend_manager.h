@@ -157,6 +157,16 @@ public:
 [[nodiscard]] std::unique_ptr<IProductionVideoBackendSetupSource>
 CreateStaticProductionVideoBackendSetupSource() noexcept;
 
+struct StaticProductionVideoBackendSetupSourcesForTesting {
+  std::unique_ptr<IProductionVideoBackendSetupSource> maxine;
+  std::unique_ptr<IProductionVideoBackendSetupSource> open_cuda;
+  std::unique_ptr<IProductionVideoBackendSetupSource> vulkan;
+};
+
+[[nodiscard]] std::unique_ptr<IProductionVideoBackendSetupSource>
+CreateStaticProductionVideoBackendSetupSourceForTesting(
+    StaticProductionVideoBackendSetupSourcesForTesting sources) noexcept;
+
 struct ProductionVideoBackendSetupEvidence {
   hal::StatusId status = hal::StatusId::invalid;
   hal::ReasonId reason = hal::ReasonId::none;

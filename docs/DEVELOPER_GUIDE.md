@@ -507,9 +507,17 @@ StudioCast target edges and duplicate production-source ownership.
 The Hardware Execution Layer is documented in
 [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). Neutral HAL targets
 must build without optional SDK headers, vendor libraries, or backend feature
-definitions. The current staged migration still leaves optional backend
-dependencies on `studiocast_video_runtime`; do not treat that transitional edge
-as permission to put vendor types in neutral contracts.
+definitions. The intended end state is neutral planning and runtime ownership,
+but an ownership cutover is not evidence of behavioral parity. Complete the
+existing Open CUDA effect behavior first, including `auto` fallback and effect
+combinations such as Auto Frame, before using the route-removal gates in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Bounded compatibility may
+preserve working behavior during that migration. It must stay observable and
+must not be described as prepared-route completion. The static
+`studiocast_video_backend_composition` target privately owns optional Maxine,
+Open Video, and Vulkan dependencies; `studiocast_video_runtime` consumes its
+neutral surface and must not acquire direct optional-backend dependencies or
+vendor types.
 
 Key concepts:
 
@@ -584,6 +592,15 @@ production Vulkan virtual-background matting readiness: until a
 device-resident Vulkan matting runtime is available, daemon status must report
 Open Vulkan virtual background as blocked/degraded instead of silently running
 CUDA.
+
+Production Vulkan expansion follows CUDA parity in bounded, independently
+reviewed phases. Each phase needs an adapter with exact resource and execution-
+domain ownership, models that satisfy the documented conversion and checksum
+contract where inference is involved, and real-hardware evidence for the
+claimed device families. These are qualification requirements, not promises
+that the remaining Vulkan effects are available. In particular, Vulkan
+matting stays blocked until reviewed shared-device GPU-only inference and
+converted, checksummed model artifacts satisfy the resident-runtime contract.
 
 The daemon persists Vulkan adapter intent as `video.vulkan.device` and
 `video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection

@@ -52,7 +52,9 @@ backends:
 runtime:
   audio_runtime ---> audio_support, config, contracts, Maxine, Open Audio
   video_execution_runtime ---> hal_runtime
-  video_runtime ---> contracts, CUDA, Maxine, Open Video, Vulkan,
+  video_backend_composition ---> video_execution_runtime; privately owns
+                                  Maxine, Open Video, Vulkan
+  video_runtime ---> contracts, video_backend_composition,
                      video_execution_runtime, video I/O and support
   runtime_config --> audio_runtime, config, video_runtime
   studiocast_core --> runtime_config, ipc, probe_support
@@ -82,9 +84,14 @@ Each arrow points from a dependent to its dependency.
   support; `studiocast_video_execution_runtime` owns the fixed-capacity
   backend-neutral prepared execution facade and typed capability/live-status
   snapshots; and `studiocast_video_runtime` owns the existing camera pipeline
-  and virtual-camera composition. During staged migration the latter retains
-  its legacy backend composition dependencies; those edges may be removed only
-  after each live family passes parity and rollback gates.
+  and virtual-camera composition. `studiocast_video_backend_composition`
+  privately owns the optional Maxine, Open Video, and Vulkan dependencies and
+  exposes the neutral execution surface consumed by the video runtime.
+  Reaching that ownership boundary is not evidence that existing behavior has
+  reached parity. Bounded compatibility routes must preserve working behavior
+  until each live family passes the parity and rollback gates in
+  [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Release qualification
+  remains a separate gate after local parity completion.
 - `studiocast_cuda_support` owns the runtime-loaded CUDA driver wrapper,
   buffers, and embedded kernels without a CUDA toolkit dependency. Its
   canonical API is `core/cuda/cuda_driver_api.h` in namespace
@@ -118,7 +125,9 @@ documented in
 [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). The important
 separation is that CPU primitive availability never establishes selectable
 product-effect capability, while each v1 resident island is owned by exactly
-one adapter.
+one adapter. Completion and release claims must also satisfy
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md); a neutral ownership
+cutover alone does not satisfy those gates.
 
 ## Canonical effect model: `BroadcastCameraEffects`
 

@@ -75,6 +75,12 @@ SourceForProvider(hal::SemanticEffectProviderId provider) noexcept {
 class StaticProductionVideoBackendSetupSource final
     : public IProductionVideoBackendSetupSource {
 public:
+  StaticProductionVideoBackendSetupSource() = default;
+  explicit StaticProductionVideoBackendSetupSource(
+      StaticProductionVideoBackendSetupSourcesForTesting sources)
+      : maxine_(std::move(sources.maxine)),
+        open_cuda_(std::move(sources.open_cuda)),
+        vulkan_(std::move(sources.vulkan)), injected_(true) {}
   ProductionVideoResidentSetupSourceResult AcquireResidentSetup(
       const ProductionVideoResidentSetup &request) noexcept override {
     const auto &intent = request.plan.intent;
@@ -190,6 +196,18 @@ public:
 
 private:
   IProductionVideoBackendSetupSource *Source(StaticSourceId id) noexcept {
+    if (injected_) {
+      switch (id) {
+      case StaticSourceId::maxine:
+        return maxine_.get();
+      case StaticSourceId::open_cuda:
+        return open_cuda_.get();
+      case StaticSourceId::vulkan:
+        return vulkan_.get();
+      case StaticSourceId::invalid:
+        return nullptr;
+      }
+    }
     auto create_if_missing =
         [](std::unique_ptr<IProductionVideoBackendSetupSource> *source,
            auto &&factory) -> IProductionVideoBackendSetupSource * {
@@ -219,6 +237,7 @@ private:
   std::unique_ptr<IProductionVideoBackendSetupSource> maxine_;
   std::unique_ptr<IProductionVideoBackendSetupSource> open_cuda_;
   std::unique_ptr<IProductionVideoBackendSetupSource> vulkan_;
+  bool injected_ = false;
 };
 
 } // namespace
@@ -229,6 +248,17 @@ CreateStaticProductionVideoBackendSetupSource() noexcept {
     return std::make_unique<StaticProductionVideoBackendSetupSource>();
   } catch (const std::bad_alloc &) {
     return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+std::unique_ptr<IProductionVideoBackendSetupSource>
+CreateStaticProductionVideoBackendSetupSourceForTesting(
+    StaticProductionVideoBackendSetupSourcesForTesting sources) noexcept {
+  try {
+    return std::make_unique<StaticProductionVideoBackendSetupSource>(
+        std::move(sources));
   } catch (...) {
     return nullptr;
   }
