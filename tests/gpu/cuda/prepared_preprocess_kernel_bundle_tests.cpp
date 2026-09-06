@@ -53,6 +53,12 @@ struct LaunchCapture {
   float inverse_std[3] = {};
   std::uint32_t destination_is_bgr = 0;
   std::uint32_t source_is_bgr = 0;
+  std::uint32_t letterbox_enabled = 0;
+  std::uint32_t scaled_w = 0;
+  std::uint32_t scaled_h = 0;
+  std::uint32_t pad_x = 0;
+  std::uint32_t pad_y = 0;
+  std::uint32_t pad_value = 0;
   float crop[4] = {};
 };
 
@@ -174,6 +180,12 @@ CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
   capture.inverse_std[2] = *static_cast<float *>(arguments[12]);
   capture.destination_is_bgr = *static_cast<std::uint32_t *>(arguments[13]);
   capture.source_is_bgr = *static_cast<std::uint32_t *>(arguments[14]);
+  capture.letterbox_enabled = *static_cast<std::uint32_t *>(arguments[15]);
+  capture.scaled_w = *static_cast<std::uint32_t *>(arguments[16]);
+  capture.scaled_h = *static_cast<std::uint32_t *>(arguments[17]);
+  capture.pad_x = *static_cast<std::uint32_t *>(arguments[18]);
+  capture.pad_y = *static_cast<std::uint32_t *>(arguments[19]);
+  capture.pad_value = *static_cast<std::uint32_t *>(arguments[20]);
   return g_state->launch_result;
 }
 CUresult FakeAlloc(CUdeviceptr *ptr, std::size_t *pitch, std::size_t width,
@@ -394,6 +406,40 @@ bool TestSetupOnlyAndCompatibilityLaunchParity() {
       Expect(fixture.state.module_loads == loads_after_setup &&
                  fixture.state.function_resolutions == resolutions_after_setup,
              "legacy compatibility should reuse setup on its owning thread");
+  return ok;
+}
+
+bool TestPreparedLetterboxLaunchGeometry() {
+  Fixture fixture;
+  if (!fixture.Initialize())
+    return false;
+  PreparedPreprocessKernelBundle bundle;
+  if (!bundle.Prepare(fixture.binding, fixture.spec,
+                      bundle.RequiredResourceBytes(), &fixture.error))
+    return false;
+  const LetterboxGeometry geometry{.scaled_w = 14,
+                                   .scaled_h = 10,
+                                   .pad_x = 1,
+                                   .pad_y = 4,
+                                   .pad_value = 114};
+  PreparedPreprocessKernelStatus status{};
+  bool ok = Expect(bundle.ExecuteLetterboxed(
+                       fixture.binding, fixture.spec, geometry, fixture.source,
+                       fixture.destination, &status) &&
+                       status == PreparedPreprocessKernelStatus::launch_enqueued,
+                   "prepared letterbox should enqueue");
+  const auto &capture = fixture.state.capture;
+  ok &= Expect(capture.letterbox_enabled == 1 && capture.scaled_w == 14 &&
+                   capture.scaled_h == 10 && capture.pad_x == 1 &&
+                   capture.pad_y == 4 && capture.pad_value == 114,
+               "letterbox launch should carry exact scale, pad, and fill");
+  auto invalid = geometry;
+  invalid.pad_x = 4;
+  ok &= Expect(!bundle.ExecuteLetterboxed(
+                   fixture.binding, fixture.spec, invalid, fixture.source,
+                   fixture.destination, &status) &&
+                   status == PreparedPreprocessKernelStatus::invalid_argument,
+               "out-of-bounds letterbox should fail before launch");
   return ok;
 }
 
@@ -797,6 +843,7 @@ bool TestPreparedResizeCleanupIsRetryable() {
 int main() {
   bool ok = true;
   ok &= TestSetupOnlyAndCompatibilityLaunchParity();
+  ok &= TestPreparedLetterboxLaunchGeometry();
   ok &= TestBudgetAndBindingFailuresFailClosed();
   ok &= TestTypedSetupFailuresAndLifecycle();
   ok &= TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence();

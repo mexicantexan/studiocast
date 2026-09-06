@@ -48,7 +48,13 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     .param .f32 invStd1,
     .param .f32 invStd2,
     .param .u32 dstIsBgr,
-    .param .u32 srcIsBgr
+    .param .u32 srcIsBgr,
+    .param .u32 letterboxEnabled,
+    .param .u32 scaledW,
+    .param .u32 scaledH,
+    .param .u32 padX,
+    .param .u32 padY,
+    .param .u32 padValue
 )
 {
     .reg .pred  %p<8>;
@@ -71,6 +77,12 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     ld.param.f32 %f65, [invStd2];
     ld.param.u32 %r70, [dstIsBgr];
     ld.param.u32 %r71, [srcIsBgr];
+    ld.param.u32 %r72, [letterboxEnabled];
+    ld.param.u32 %r73, [scaledW];
+    ld.param.u32 %r74, [scaledH];
+    ld.param.u32 %r75, [padX];
+    ld.param.u32 %r76, [padY];
+    ld.param.u32 %r77, [padValue];
 
     mov.u32 %r7, %ctaid.x;
     mov.u32 %r8, %ntid.x;
@@ -86,6 +98,25 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     setp.ge.s32 %p2, %r14, %r6;
     or.pred %p3, %p1, %p2;
     @%p3 bra DONE;
+
+    setp.eq.u32 %p6, %r72, 0;
+    @%p6 bra SAMPLE_COORDS;
+    setp.lt.u32 %p1, %r10, %r75;
+    setp.lt.u32 %p2, %r14, %r76;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra PAD_PIXEL;
+    add.u32 %r78, %r75, %r73;
+    add.u32 %r79, %r76, %r74;
+    setp.ge.u32 %p1, %r10, %r78;
+    setp.ge.u32 %p2, %r14, %r79;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra PAD_PIXEL;
+    sub.u32 %r10, %r10, %r75;
+    sub.u32 %r14, %r14, %r76;
+    mov.u32 %r5, %r73;
+    mov.u32 %r6, %r74;
+
+SAMPLE_COORDS:
 
     // sx = srcW / dstW
     cvt.rn.f32.u32 %f1, %r2;
@@ -234,6 +265,18 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     mul.f32 %f67, %f47, %f66; // r
     mul.f32 %f68, %f53, %f66; // g
     mul.f32 %f69, %f59, %f66; // b
+    bra OUTPUT_PIXEL;
+
+PAD_PIXEL:
+    cvt.rn.f32.u32 %f67, %r77;
+    mov.f32 %f68, %f67;
+    mov.f32 %f69, %f67;
+    mov.f32 %f66, 0f3B808081;
+    mul.f32 %f67, %f67, %f66;
+    mul.f32 %f68, %f68, %f66;
+    mul.f32 %f69, %f69, %f66;
+
+OUTPUT_PIXEL:
 
     // Output channel order based on dstIsBgr
     // out0 = dstIsBgr ? b : r
@@ -251,6 +294,12 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     mul.f32 %f75, %f75, %f65;
 
     // Compute output addresses (NCHW contiguous)
+    ld.param.u32 %r5, [dstW];
+    ld.param.u32 %r6, [dstH];
+    mov.u32 %r10, %ctaid.x;
+    mad.lo.s32 %r10, %r10, %ntid.x, %tid.x;
+    mov.u32 %r14, %ctaid.y;
+    mad.lo.s32 %r14, %r14, %ntid.y, %tid.y;
     mul.lo.u32 %r80, %r5, %r6;        // hw = dstW*dstH
     mad.lo.u32 %r81, %r14, %r5, %r10; // index
 
@@ -580,6 +629,12 @@ bool PreprocessToTensorImpl(
       (spec.dst_order == ChannelOrder::bgr) ? 1u : 0u;
   const std::uint32_t src_is_bgr =
       (src.format == PixelFormatGpu::bgr_u8) ? 1u : 0u;
+  const std::uint32_t letterbox_enabled = 0;
+  const std::uint32_t scaled_w = dst_w;
+  const std::uint32_t scaled_h = dst_h;
+  const std::uint32_t pad_x = 0;
+  const std::uint32_t pad_y = 0;
+  const std::uint32_t pad_value = 0;
 
   void *args[] = {
       const_cast<unsigned long long *>(&src_ptr),
@@ -597,6 +652,12 @@ bool PreprocessToTensorImpl(
       const_cast<float *>(&inv2),
       const_cast<std::uint32_t *>(&dst_is_bgr),
       const_cast<std::uint32_t *>(&src_is_bgr),
+      const_cast<std::uint32_t *>(&letterbox_enabled),
+      const_cast<std::uint32_t *>(&scaled_w),
+      const_cast<std::uint32_t *>(&scaled_h),
+      const_cast<std::uint32_t *>(&pad_x),
+      const_cast<std::uint32_t *>(&pad_y),
+      const_cast<std::uint32_t *>(&pad_value),
   };
 
   constexpr unsigned int block_x = 16;

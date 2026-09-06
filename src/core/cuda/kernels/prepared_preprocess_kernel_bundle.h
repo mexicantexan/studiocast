@@ -103,6 +103,13 @@ public:
                const CudaTensor &destination,
                PreparedPreprocessKernelStatus *status_out) noexcept;
 
+  bool ExecuteLetterboxed(const PreparedPreprocessBinding &binding,
+                          const ModelPreprocessSpec &spec,
+                          const LetterboxGeometry &letterbox,
+                          const CudaImage &source,
+                          const CudaTensor &destination,
+                          PreparedPreprocessKernelStatus *status_out) noexcept;
+
   void InvalidateForReconfiguration(
       std::uint64_t configuration_generation,
       std::uint64_t model_preprocess_generation) noexcept;
@@ -115,6 +122,11 @@ private:
   PreparedPreprocessKernelStatus
   ValidateBinding(const PreparedPreprocessBinding &binding,
                   const ModelPreprocessSpec &spec) const noexcept;
+  bool ExecuteImpl(const PreparedPreprocessBinding &binding,
+                   const ModelPreprocessSpec &spec,
+                   const LetterboxGeometry *letterbox,
+                   const CudaImage &source, const CudaTensor &destination,
+                   PreparedPreprocessKernelStatus *status_out) noexcept;
   void SetStatus(PreparedPreprocessKernelStatus status,
                  PreparedPreprocessKernelStatus *status_out) noexcept;
 
