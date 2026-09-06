@@ -222,6 +222,45 @@ bool TestPreparedCpuBindings() {
                "replacement model/provider/session must prepare once");
   return ok;
 }
+
+bool TestFreeDimensionOverrides() {
+  TempModelPack pack;
+  if (!Expect(pack.error().empty(), pack.error()))
+    return false;
+
+  const auto rejected = [&](std::vector<studiocast::onnx::OrtSessionOptions::
+                                        FreeDimensionOverride> dimensions,
+                            const std::string &expected) {
+    studiocast::onnx::OrtSessionOptions opts;
+    opts.prefer_cuda = false;
+    opts.free_dimension_overrides = std::move(dimensions);
+    std::string error;
+    const auto session = studiocast::onnx::OrtSession::Create(
+        pack.model_path(), opts, nullptr, &error);
+    return Expect(!session && error.find(expected) != std::string::npos,
+                  "invalid free dimension override was accepted: " + error);
+  };
+
+  bool ok = true;
+  ok &= rejected({{"", 480}}, "non-empty name");
+  ok &= rejected({{"samples", 0}}, "positive extent");
+  ok &= rejected({{"samples", -1}}, "positive extent");
+  ok &= rejected({{"samples", 480}, {"samples", 240}}, "duplicate");
+
+  studiocast::onnx::OrtSessionOptions opts;
+  opts.prefer_cuda = false;
+  opts.free_dimension_overrides = {{"samples", 480}};
+  studiocast::onnx::OrtSessionInfo info;
+  std::string error;
+  const auto session = studiocast::onnx::OrtSession::Create(
+      pack.model_path(), opts, &info, &error);
+  return Expect(session != nullptr,
+                "valid free dimension override failed: " + error) &&
+         Expect(info.input_shapes.size() == 2 &&
+                    info.input_shapes[0] == std::vector<int64_t>({1, 480}),
+                "free dimension override did not reach ORT session creation") &&
+         ok;
+}
 #endif
 
 bool TestOpenAudioProcessorSteadyBindings() {
@@ -291,6 +330,7 @@ int main() {
   bool ok = true;
 #if STUDIOCAST_HAVE_ONNXRUNTIME
   ok &= TestPreparedCpuBindings();
+  ok &= TestFreeDimensionOverrides();
 #else
   std::cout << "SKIP: shared ONNX Runtime prepared-binding test unavailable\n";
 #endif
