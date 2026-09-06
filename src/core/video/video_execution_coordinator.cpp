@@ -856,20 +856,38 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     telemetry_.runtime_reason = frame.reason;
     return frame;
   }
+  const auto within = [](std::uint64_t value, std::uint64_t minimum,
+                         std::uint64_t maximum) noexcept {
+    return value >= minimum && value <= maximum;
+  };
+  const auto &transfers = plan_.per_frame_transfers;
+  const bool variable_boundary_mismatch =
+      transfers.variable_boundaries_declared &&
+      (!within(frame.transfers.intermediate_readbacks,
+               transfers.minimum_intermediate_readbacks,
+               transfers.maximum_intermediate_readbacks) ||
+       !within(frame.transfers.intermediate_uploads,
+               transfers.minimum_intermediate_uploads,
+               transfers.maximum_intermediate_uploads) ||
+       !within(frame.transfers.cpu_tail_boundaries,
+               transfers.minimum_cpu_tail_boundaries,
+               transfers.maximum_cpu_tail_boundaries));
+  const bool exact_boundary_mismatch =
+      !transfers.variable_boundaries_declared &&
+      (frame.transfers.intermediate_readbacks !=
+           transfers.intermediate_readbacks ||
+       frame.transfers.intermediate_uploads !=
+           transfers.intermediate_uploads ||
+       frame.transfers.cpu_tail_boundaries != transfers.cpu_tail_boundaries);
   if (!passthrough_ &&
       (frame.transfers.uploads != plan_.per_frame_transfers.uploads ||
        frame.transfers.final_readbacks !=
            plan_.per_frame_transfers.final_readbacks ||
-       frame.transfers.intermediate_readbacks !=
-           plan_.per_frame_transfers.intermediate_readbacks ||
-       frame.transfers.intermediate_uploads !=
-           plan_.per_frame_transfers.intermediate_uploads ||
+       variable_boundary_mismatch || exact_boundary_mismatch ||
        frame.transfers.synchronizations <
            plan_.per_frame_transfers.minimum_synchronizations ||
        frame.transfers.synchronizations >
-           plan_.per_frame_transfers.maximum_synchronizations ||
-       frame.transfers.cpu_tail_boundaries !=
-           plan_.per_frame_transfers.cpu_tail_boundaries)) {
+           plan_.per_frame_transfers.maximum_synchronizations)) {
     frame.status = hal::StatusId::failed;
     frame.reason = hal::ReasonId::transfer_contract_violated;
     telemetry_.runtime_status = frame.status;

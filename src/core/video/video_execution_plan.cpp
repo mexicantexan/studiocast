@@ -171,10 +171,63 @@ BuildPerFrameTransferContract(const hal::DomainPlan &domain_plan,
   return contract;
 }
 
+PerFrameTransferContract BuildVariablePerFrameTransferContract(
+    const hal::DomainPlan &domain_plan,
+    std::uint64_t minimum_synchronizations,
+    std::uint64_t maximum_synchronizations,
+    const VariablePerFrameTransferBounds &bounds) noexcept {
+  auto contract = BuildPerFrameTransferContract(
+      domain_plan, minimum_synchronizations, maximum_synchronizations);
+  contract.variable_boundaries_declared = true;
+  contract.minimum_intermediate_readbacks =
+      bounds.minimum_intermediate_readbacks;
+  contract.maximum_intermediate_readbacks =
+      bounds.maximum_intermediate_readbacks;
+  contract.minimum_intermediate_uploads =
+      bounds.minimum_intermediate_uploads;
+  contract.maximum_intermediate_uploads =
+      bounds.maximum_intermediate_uploads;
+  contract.minimum_cpu_tail_boundaries = bounds.minimum_cpu_tail_boundaries;
+  contract.maximum_cpu_tail_boundaries = bounds.maximum_cpu_tail_boundaries;
+  return contract;
+}
+
 bool ValidatePerFrameTransferContract(const PerFrameTransferContract &contract,
                                       const hal::DomainPlan &domain_plan,
                                       hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
+  const bool undeclared_bounds_present =
+      contract.minimum_intermediate_readbacks != 0 ||
+      contract.maximum_intermediate_readbacks != 0 ||
+      contract.minimum_intermediate_uploads != 0 ||
+      contract.maximum_intermediate_uploads != 0 ||
+      contract.minimum_cpu_tail_boundaries != 0 ||
+      contract.maximum_cpu_tail_boundaries != 0;
+  const bool invalid_variable_bounds =
+      contract.variable_boundaries_declared &&
+      (contract.minimum_intermediate_readbacks >
+           contract.maximum_intermediate_readbacks ||
+       contract.minimum_intermediate_uploads >
+           contract.maximum_intermediate_uploads ||
+       contract.minimum_cpu_tail_boundaries >
+           contract.maximum_cpu_tail_boundaries ||
+       contract.maximum_intermediate_readbacks >
+           hal::kMaxExecutionBoundaries ||
+       contract.maximum_intermediate_uploads >
+           hal::kMaxExecutionBoundaries ||
+       contract.maximum_cpu_tail_boundaries > hal::kMaxCpuTails ||
+       contract.intermediate_readbacks <
+           contract.minimum_intermediate_readbacks ||
+       contract.intermediate_readbacks >
+           contract.maximum_intermediate_readbacks ||
+       contract.intermediate_uploads <
+           contract.minimum_intermediate_uploads ||
+       contract.intermediate_uploads >
+           contract.maximum_intermediate_uploads ||
+       contract.cpu_tail_boundaries <
+           contract.minimum_cpu_tail_boundaries ||
+       contract.cpu_tail_boundaries >
+           contract.maximum_cpu_tail_boundaries);
   if (contract.contract_version != hal::kContractVersion ||
       domain_plan.passthrough || domain_plan.island_count != 1 ||
       contract.uploads != domain_plan.expected_transfers.uploads ||
@@ -188,6 +241,11 @@ bool ValidatePerFrameTransferContract(const PerFrameTransferContract &contract,
           domain_plan.expected_transfers.cpu_tail_boundaries ||
       contract.minimum_synchronizations > contract.maximum_synchronizations ||
       contract.maximum_synchronizations > kMaxPerFrameSynchronizationsV1) {
+    SetReason(reason, hal::ReasonId::malformed_contract);
+    return false;
+  }
+  if ((!contract.variable_boundaries_declared && undeclared_bounds_present) ||
+      invalid_variable_bounds) {
     SetReason(reason, hal::ReasonId::malformed_contract);
     return false;
   }

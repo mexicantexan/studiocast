@@ -227,6 +227,9 @@ enum class ExecuteMode {
   stale_program,
   device_loss,
   transfer_mismatch,
+  legacy_boundary_mismatch,
+  variable_maximum,
+  variable_outside,
 };
 
 class FakeExecutor final : public video::IVideoExecutionExecutor {
@@ -302,6 +305,21 @@ public:
     case ExecuteMode::transfer_mismatch:
       result.transfers.synchronizations =
           plan_.per_frame_transfers.maximum_synchronizations + 1;
+      break;
+    case ExecuteMode::legacy_boundary_mismatch:
+      ++result.transfers.intermediate_readbacks;
+      break;
+    case ExecuteMode::variable_maximum:
+      result.transfers.intermediate_readbacks =
+          plan_.per_frame_transfers.maximum_intermediate_readbacks;
+      result.transfers.intermediate_uploads =
+          plan_.per_frame_transfers.maximum_intermediate_uploads;
+      result.transfers.cpu_tail_boundaries =
+          plan_.per_frame_transfers.maximum_cpu_tail_boundaries;
+      break;
+    case ExecuteMode::variable_outside:
+      result.transfers.intermediate_readbacks =
+          plan_.per_frame_transfers.maximum_intermediate_readbacks + 1;
       break;
     }
     return result;
@@ -380,8 +398,14 @@ public:
     result.cached_evidence_only = cached_evidence_only;
     result.accepts_frozen_resolution = accepts_frozen_resolution;
     result.performs_selection = performs_selection;
-    result.per_frame_transfers = video::BuildPerFrameTransferContract(
-        domain_plan, minimum_synchronizations, maximum_synchronizations);
+    result.per_frame_transfers =
+        variable_boundaries
+            ? video::BuildVariablePerFrameTransferContract(
+                  domain_plan, minimum_synchronizations,
+                  maximum_synchronizations, variable_bounds)
+            : video::BuildPerFrameTransferContract(
+                  domain_plan, minimum_synchronizations,
+                  maximum_synchronizations);
     if (malformed_transfer_boundary)
       ++result.per_frame_transfers.intermediate_readbacks;
     if (malformed_transfer_version)
@@ -474,6 +498,8 @@ public:
   bool malformed_prepared_tail = false;
   bool malformed_transfer_boundary = false;
   bool malformed_transfer_version = false;
+  bool variable_boundaries = false;
+  video::VariablePerFrameTransferBounds variable_bounds{};
   bool candidate_rolled_back = false;
   std::uint64_t minimum_synchronizations = 1;
   std::uint64_t maximum_synchronizations = 1;
@@ -1117,7 +1143,8 @@ bool TestPreparedTransferContractAndFinalCpuTail() {
     std::uint8_t input[24]{};
     std::uint8_t output[24]{};
     const auto frame = coordinator.Execute(Binding(input, output, 1));
-    if (mode == ExecuteMode::transfer_mismatch) {
+    if (mode == ExecuteMode::transfer_mismatch ||
+        mode == ExecuteMode::legacy_boundary_mismatch) {
       return Require(frame.status == hal::StatusId::failed &&
                          frame.reason ==
                              hal::ReasonId::transfer_contract_violated,
@@ -1135,6 +1162,7 @@ bool TestPreparedTransferContractAndFinalCpuTail() {
   };
   return run(ExecuteMode::success, false) &&
          run(ExecuteMode::transfer_mismatch, false) &&
+         run(ExecuteMode::legacy_boundary_mismatch, false) &&
          run(ExecuteMode::success, true);
 }
 
@@ -1216,6 +1244,68 @@ bool TestTransferContractValidation() {
   return ok;
 }
 
+bool TestVariableTransferBoundaryContract() {
+  const auto run = [](ExecuteMode mode, int malformed,
+                      hal::StatusId expected_status) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    if (!RegisterCapability(
+            &registry, &resident, domain,
+            hal::SemanticEffectProviderId::open_video_onnxruntime_cuda))
+      return false;
+    FakeFactory factory(
+        domain, hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+        mode);
+    factory.variable_boundaries = true;
+    factory.variable_bounds.maximum_intermediate_readbacks = 12;
+    factory.variable_bounds.maximum_intermediate_uploads = 1;
+    factory.variable_bounds.maximum_cpu_tail_boundaries = 1;
+    if (malformed == 1)
+      factory.variable_bounds.minimum_intermediate_readbacks = 13;
+    if (malformed == 2)
+      factory.variable_bounds.maximum_intermediate_readbacks =
+          hal::kMaxExecutionBoundaries + 1;
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(
+                1, video::VideoExecutionRoute::prepared_resident, domain,
+                hal::SemanticEffectProviderId::open_video_onnxruntime_cuda,
+                &factory),
+            &reason) != hal::StatusId::ready)
+      return false;
+    video::VideoExecutionPrepareEvidence evidence;
+    const auto prepared = coordinator.Prepare(Request(), &evidence, &reason);
+    if (malformed)
+      return Require(prepared == hal::StatusId::blocked &&
+                         reason == hal::ReasonId::malformed_contract &&
+                         factory.prepare_calls == 0,
+                     "malformed variable bounds reached Prepare");
+    if (prepared != hal::StatusId::ready)
+      return false;
+    std::uint8_t input[24]{}, output[24]{};
+    const auto frame = coordinator.Execute(Binding(input, output, 1));
+    return Require(frame.status == expected_status,
+                   expected_status == hal::StatusId::failed
+                       ? "out-of-range variable transfer was accepted"
+                       : "in-range variable transfer was rejected") &&
+           Require(expected_status != hal::StatusId::failed ||
+                       frame.reason ==
+                           hal::ReasonId::transfer_contract_violated,
+                   "out-of-range variable transfer used wrong reason");
+  };
+  bool ok = run(ExecuteMode::success, 0, hal::StatusId::executed);
+  ok &= run(ExecuteMode::optional_fail_open, 0, hal::StatusId::degraded);
+  ok &= run(ExecuteMode::variable_maximum, 0,
+            hal::StatusId::executed);
+  ok &= run(ExecuteMode::variable_outside, 0, hal::StatusId::failed);
+  ok &= run(ExecuteMode::success, 1, hal::StatusId::blocked);
+  ok &= run(ExecuteMode::success, 2, hal::StatusId::blocked);
+
+  return ok;
+}
+
 bool TestNoAllocationDuringExecute() {
   const auto domain = Domain();
   DummyResident resident(domain);
@@ -1293,6 +1383,7 @@ int main() {
   ok &= TestCompatibilityRequiresPreparedRollbackEvidence();
   ok &= TestPreparedTransferContractAndFinalCpuTail();
   ok &= TestTransferContractValidation();
+  ok &= TestVariableTransferBoundaryContract();
   ok &= TestNoAllocationDuringExecute();
   if (!ok)
     return 1;
