@@ -1910,6 +1910,34 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-prepared-cuda-yunet-detector-tests
             integration video gpu model)
 
+    add_executable(studiocast-prepared-cuda-fastdvdnet-denoiser-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_fastdvdnet_denoiser_tests.cpp)
+    target_link_libraries(studiocast-prepared-cuda-fastdvdnet-denoiser-tests PRIVATE
+            studiocast_open_video_backend)
+    studiocast_set_project_warnings(studiocast-prepared-cuda-fastdvdnet-denoiser-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-cuda-fastdvdnet-denoiser-tests)
+    add_test(NAME studiocast-prepared-cuda-fastdvdnet-denoiser-tests
+            COMMAND studiocast-prepared-cuda-fastdvdnet-denoiser-tests)
+    studiocast_set_test_labels(studiocast-prepared-cuda-fastdvdnet-denoiser-tests
+            integration video gpu model)
+
+    add_executable(studiocast-cuda-prepared-fastdvdnet-kernels-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_fastdvdnet_kernels_tests.cpp)
+    target_link_libraries(studiocast-cuda-prepared-fastdvdnet-kernels-tests PRIVATE
+            studiocast_cuda_support)
+    target_include_directories(studiocast-cuda-prepared-fastdvdnet-kernels-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+    studiocast_set_project_warnings(studiocast-cuda-prepared-fastdvdnet-kernels-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-fastdvdnet-kernels-tests)
+    set_target_properties(studiocast-cuda-prepared-fastdvdnet-kernels-tests PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME studiocast-cuda-prepared-fastdvdnet-kernels-tests
+            COMMAND studiocast-cuda-prepared-fastdvdnet-kernels-tests)
+    set_tests_properties(studiocast-cuda-prepared-fastdvdnet-kernels-tests PROPERTIES
+            SKIP_RETURN_CODE 77)
+    studiocast_set_test_labels(studiocast-cuda-prepared-fastdvdnet-kernels-tests
+            integration gpu)
+
     add_test(NAME studiocast-ctest-label-metadata-tests
             COMMAND "${CMAKE_COMMAND}"
                     "-DCTEST_EXECUTABLE=${CMAKE_CTEST_COMMAND}"
