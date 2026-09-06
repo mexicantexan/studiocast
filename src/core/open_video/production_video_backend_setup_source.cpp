@@ -728,7 +728,8 @@ public:
       for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
         const auto &leased = bootstrap.setup_lease.artifacts[index];
         if (leased.semantic != caller.intent.stages[index].intent.semantic ||
-            leased.provider != kProvider || leased.artifact != expected_artifact) {
+            leased.provider != kProvider ||
+            !(leased.artifact == expected_artifact)) {
           return Failure(hal::StatusId::blocked,
                          hal::ReasonId::capability_evidence_incomplete);
         }
