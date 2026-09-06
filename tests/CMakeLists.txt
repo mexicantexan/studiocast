@@ -1601,9 +1601,12 @@ if (BUILD_TESTING)
     add_test(
             NAME studiocast-open-cuda-production-smoke-tests
             COMMAND studiocast-open-cuda-production-smoke-tests)
+    set_tests_properties(
+            studiocast-open-cuda-production-smoke-tests PROPERTIES
+            SKIP_RETURN_CODE 77)
     studiocast_set_test_labels(
             studiocast-open-cuda-production-smoke-tests
-            hardware gpu video model cuda opt-in)
+            integration gpu video model)
 
     add_executable(
             studiocast-prepared-open-video-compatibility-executor-tests

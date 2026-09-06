@@ -28,8 +28,10 @@ struct Options {
   std::filesystem::path model_root;
   std::string effects = "blur";
   bool automatic = false;
-  std::uint32_t width = 64;
-  std::uint32_t height = 48;
+  std::uint32_t input_width = 64;
+  std::uint32_t input_height = 48;
+  std::uint32_t output_width = 64;
+  std::uint32_t output_height = 48;
   std::uint32_t frames = 3;
   bool require = false;
 };
@@ -55,12 +57,15 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     } else if (take("--model-root", &value)) {
       options->model_root = value;
     } else if (take("--effects", &options->effects)) {
-    } else if (take("--output", &value)) {
+    } else if (take("--input", &value) || take("--output", &value)) {
+      const bool input = arg == "--input";
       const auto separator = value.find('x');
       if (separator == std::string::npos ||
-          !ParseUnsigned(std::string_view(value).substr(0, separator), &options->width) ||
-          !ParseUnsigned(std::string_view(value).substr(separator + 1), &options->height)) {
-        *error = "--output must be WIDTHxHEIGHT";
+          !ParseUnsigned(std::string_view(value).substr(0, separator),
+                         input ? &options->input_width : &options->output_width) ||
+          !ParseUnsigned(std::string_view(value).substr(separator + 1),
+                         input ? &options->input_height : &options->output_height)) {
+        *error = std::string(arg) + " must be WIDTHxHEIGHT";
         return false;
       }
     } else if (take("--frames", &value)) {
@@ -84,9 +89,12 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     *error = "--effects must be blur, keylight, or blur+keylight";
     return false;
   }
-  if (options->width == 0 || options->height == 0 || options->frames == 0 ||
-      options->frames > 8) {
-    *error = "geometry must be nonzero and --frames must be in [1,8]";
+  if (options->input_width == 0 || options->input_height == 0 ||
+      options->output_width == 0 || options->output_height == 0 ||
+      options->input_width > 4096 || options->input_height > 4096 ||
+      options->output_width > 4096 || options->output_height > 4096 ||
+      options->frames == 0 || options->frames > 8) {
+    *error = "dimensions must be in [1,4096] and --frames must be in [1,8]";
     return false;
   }
   return true;
@@ -217,19 +225,22 @@ video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
     AddSigned(&stage, video::CanonicalVideoParameterId::direction_pan_degrees,
               request.effects.virtual_key_light.direction_pan_degrees);
   }
-  plan.host_input = HostRgb(options.width, options.height, hal::Mutability::read_only);
-  plan.host_output = HostRgb(options.width, options.height, hal::Mutability::write_only);
+  plan.host_input = HostRgb(options.input_width, options.input_height,
+                            hal::Mutability::read_only);
+  plan.host_output = HostRgb(options.output_width, options.output_height,
+                             hal::Mutability::write_only);
   plan.invalidation_key.generations.configuration = 1;
   plan.invalidation_key.generations.geometry = 1;
   plan.invalidation_key.generations.provider = 1;
   plan.invalidation_key.generations.device = 1;
   plan.invalidation_key.generations.context = 1;
   plan.invalidation_key.canonical_plan_hash = 1;
-  plan.budget.persistent_bytes = UINT64_C(512) << 20;
-  plan.budget.scratch_bytes = UINT64_C(256) << 20;
-  plan.budget.upload_staging_bytes = UINT64_C(64) << 20;
-  plan.budget.readback_staging_bytes = UINT64_C(64) << 20;
-  plan.budget.resource_count = 128;
+  constexpr std::uint64_t kGiB = UINT64_C(1024) * 1024u * 1024u;
+  plan.budget.persistent_bytes = 8u * kGiB;
+  plan.budget.scratch_bytes = 4u * kGiB;
+  plan.budget.upload_staging_bytes = kGiB;
+  plan.budget.readback_staging_bytes = kGiB;
+  plan.budget.resource_count = 1024;
   plan.budget.in_flight_slots = 1;
   plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
   plan.cpu_tails[0].after_stage_id =
@@ -290,8 +301,10 @@ int Run(const Options &options) {
             << " provider=" << static_cast<unsigned>(setup.readiness.provider)
             << " domain_backend="
             << static_cast<unsigned>(setup.readiness.execution_domain.backend)
-            << " model_id=" << options.model_id << " geometry=" << options.width
-            << 'x' << options.height << " prepared=" << setup.resident_prepared
+            << " model_id=" << options.model_id << " input="
+            << options.input_width << 'x' << options.input_height << " output="
+            << options.output_width << 'x' << options.output_height
+            << " prepared=" << setup.resident_prepared
             << " source_called=" << evidence.setup_source_called
             << " candidate_setup_only=" << evidence.candidate_setup_only
             << " candidate_rejected=" << evidence.candidate_rejected
@@ -318,10 +331,31 @@ int Run(const Options &options) {
               << " reason=" << static_cast<unsigned>(reason) << '\n';
     return 1;
   }
+  if (setup.readiness.selected_backend != hal::BackendId::cuda ||
+      setup.readiness.provider !=
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+    std::cerr << "FAIL prepared route did not select CUDA and its CUDA provider\n";
+    return 1;
+  }
+  const auto &domain = setup.readiness.execution_domain;
+  std::cout << "domain api_family=" << static_cast<unsigned>(domain.api_family)
+            << " vendor_id=" << domain.physical_device.vendor_id
+            << " device_id=" << domain.physical_device.device_id
+            << " context_generation=" << domain.logical_context_generation
+            << " allocator=" << static_cast<unsigned>(domain.allocator_family)
+            << " memory_handle=" << static_cast<unsigned>(domain.memory_handle_family)
+            << " queue_or_stream=" << domain.queue_or_stream_identity
+            << " ownership=" << static_cast<unsigned>(domain.ownership_model)
+            << " synchronization="
+            << static_cast<unsigned>(domain.synchronization_protocol)
+            << " adapter=" << domain.adapter_instance_id << '\n';
 
-  const auto bytes = static_cast<std::size_t>(options.width) * options.height * 3;
-  std::vector<std::byte> input(bytes);
-  std::vector<std::byte> output(bytes);
+  const auto input_bytes = static_cast<std::size_t>(options.input_width) *
+                           options.input_height * 3;
+  const auto output_bytes = static_cast<std::size_t>(options.output_width) *
+                            options.output_height * 3;
+  std::vector<std::byte> input(input_bytes);
+  std::vector<std::byte> output(output_bytes);
   for (std::uint32_t frame_index = 0; frame_index < options.frames; ++frame_index) {
     for (std::size_t i = 0; i < input.size(); ++i)
       input[i] = static_cast<std::byte>((i + frame_index * 17u) & 0xffu);
@@ -330,10 +364,10 @@ int Run(const Options &options) {
     binding.output_descriptor = resident.plan.host_output;
     binding.input_planes[0].read_data = input.data();
     binding.input_planes[0].span_bytes = input.size();
-    binding.input_planes[0].row_stride_bytes = options.width * 3u;
+    binding.input_planes[0].row_stride_bytes = options.input_width * 3u;
     binding.output_planes[0].write_data = output.data();
     binding.output_planes[0].span_bytes = output.size();
-    binding.output_planes[0].row_stride_bytes = options.width * 3u;
+    binding.output_planes[0].row_stride_bytes = options.output_width * 3u;
     binding.input_plane_count = binding.output_plane_count = 1;
     binding.ownership = hal::OwnershipModel::borrowed_until_completion;
     binding.lifetime = hal::ResourceLifetime::frame_borrowed;
@@ -349,6 +383,15 @@ int Run(const Options &options) {
               << " intermediate_readbacks=" << frame.transfers.intermediate_readbacks
               << " intermediate_uploads=" << frame.transfers.intermediate_uploads
               << " synchronizations=" << frame.transfers.synchronizations << '\n';
+    for (std::size_t stage_index = 0; stage_index < frame.stage_count;
+         ++stage_index) {
+      const auto &stage = frame.stages[stage_index];
+      std::cout << "frame_stage index=" << stage_index
+                << " semantic=" << static_cast<unsigned>(stage.semantic)
+                << " status=" << static_cast<unsigned>(stage.status)
+                << " reason=" << static_cast<unsigned>(stage.reason)
+                << " elapsed_ns=" << stage.elapsed_ns << '\n';
+    }
     if (frame.status != hal::StatusId::executed || !frame.output_ready) {
       std::cerr << "FAIL frame execution did not produce writable RGB output\n";
       return 1;
@@ -369,6 +412,11 @@ int Run(const Options &options) {
     }
   }
   const auto final = manager.Snapshot().resident.telemetry;
+  std::uint64_t checksum = UINT64_C(1469598103934665603);
+  for (const auto byte : output) {
+    checksum ^= static_cast<std::uint8_t>(byte);
+    checksum *= UINT64_C(1099511628211);
+  }
   std::cout << "summary writer=in_memory_not_v4l2 attempts="
             << final.execution_attempts << " successes=" << final.execution_successes
             << " committed=" << final.committed_output_frames
@@ -377,8 +425,10 @@ int Run(const Options &options) {
             << " uploads=" << final.transfers.uploads
             << " final_readbacks=" << final.transfers.final_readbacks
             << " synchronizations=" << final.transfers.synchronizations
+            << " cpu_tail_boundaries=" << final.transfers.cpu_tail_boundaries
             << " latency_samples=" << final.frame_latency.samples
-            << " latency_total_ns=" << final.frame_latency.total_ns << '\n';
+            << " latency_total_ns=" << final.frame_latency.total_ns
+            << " output_rgb_fnv1a64=" << std::hex << checksum << std::dec << '\n';
   return final.committed_output_frames == options.frames &&
                  final.active_backend_frames == options.frames &&
                  final.fallback_frames == 0
@@ -397,7 +447,7 @@ int main(int argc, char **argv) {
   if (!options.require) {
     std::cout << "[SKIP] Open CUDA production smoke requires "
                  "STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE=1 or --require\n";
-    return 0;
+    return 77;
   }
   return Run(options);
 }
