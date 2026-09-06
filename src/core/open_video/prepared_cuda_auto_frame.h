@@ -20,6 +20,8 @@ enum class PreparedCudaAutoFrameStatus : std::uint8_t {
   invalid_setup,
   stale_binding,
   analysis_failed,
+  synchronization_failed,
+  device_lost,
   crop_failed,
   shutdown
 };
@@ -48,6 +50,7 @@ struct PreparedCudaAutoFrameBinding {
 };
 struct PreparedCudaAutoFrameAnalysisResult {
   bool ok = false, found = false, pending_work = false, device_lost = false;
+  bool synchronization_failed = false;
   PreparedCudaAutoFrameTrackingBox box{};
   hal::TransferCounters transfers{};
   std::uint32_t completion_waits = 0, cpu_tail_boundaries = 0;

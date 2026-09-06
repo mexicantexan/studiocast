@@ -134,6 +134,11 @@ PreparedCudaAutoFrameAnalysisResult PreparedCudaAutoFrameYunetAdapter::Analyze(
   const auto r = detector_->Execute(binding_, image, seq, cache, wait);
   out.pending_work = r.pending_work;
   out.device_lost = r.device_lost;
+  out.synchronization_failed =
+      r.status == PreparedCudaYunetStatus::completion_failed ||
+      r.status == PreparedCudaYunetStatus::timeout ||
+      r.status == PreparedCudaYunetStatus::stop_requested ||
+      r.status == PreparedCudaYunetStatus::cancelled;
   out.completion_waits = r.completion_waits;
   out.cpu_tail_boundaries = r.cpu_tail_boundaries;
   out.transfers.intermediate_readbacks = r.completed_readbacks;
@@ -224,7 +229,7 @@ struct PreparedCudaAutoFrame::Impl {
   PreparedCudaAutoFrameSource last_source = PreparedCudaAutoFrameSource::none;
   std::uint64_t last_seq = 0, last_matte_seq = 0;
   bool have_seq = false, have_smooth = false, have_matte = false, ready = false,
-       stopped = false;
+       stopped = false, cleanup_pending = false;
   std::uint64_t next_id = 1;
 };
 PreparedCudaAutoFrame::PreparedCudaAutoFrame()
@@ -258,11 +263,22 @@ bool PreparedCudaAutoFrame::Prepare(const PreparedCudaAutoFrameSetup &s,
       *error = "invalid prepared Auto Frame setup";
     return false;
   }
-  if (impl_->ready && !Shutdown(error))
+  if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error))
     return false;
   if (!impl_->crop->Prepare(s.binding, s.frame_width, s.frame_height,
-                            s.resource_budget_bytes, error))
+                            s.resource_budget_bytes, error)) {
+    const std::string primary_error = error ? *error : std::string{};
+    impl_->cleanup_pending = true;
+    std::string cleanup_error;
+    if (impl_->crop->Shutdown(&cleanup_error))
+      impl_->cleanup_pending = false;
+    if (error) {
+      *error = primary_error;
+      if (impl_->cleanup_pending && !cleanup_error.empty())
+        *error += "; cleanup pending: " + cleanup_error;
+    }
     return false;
+  }
   impl_->setup = s;
   impl_->handle = {impl_->next_id++, s.binding.configuration_generation,
                    s.binding.model_generation};
@@ -271,6 +287,7 @@ bool PreparedCudaAutoFrame::Prepare(const PreparedCudaAutoFrameSetup &s,
   impl_->last_source = PreparedCudaAutoFrameSource::none;
   impl_->ready = true;
   impl_->stopped = false;
+  impl_->cleanup_pending = false;
   if (h)
     *h = impl_->handle;
   return true;
@@ -338,14 +355,25 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
     ar = impl_->setup.face->Analyze(b, input, seq, impl_->setup.analysis_cache,
                                     impl_->setup.wait);
     out.analysis_ran = true;
+    Add(&out.transfers, ar.transfers);
+    out.completion_waits += ar.completion_waits;
+    out.cpu_tail_boundaries += ar.cpu_tail_boundaries;
+    ar.transfers = {};
+    ar.completion_waits = 0;
+    ar.cpu_tail_boundaries = 0;
   }
   bool face_ok = impl_->setup.face && ar.ok;
   if (impl_->setup.face && !face_ok) {
-    Add(&out.transfers, ar.transfers);
-    out.completion_waits = ar.completion_waits;
-    out.cpu_tail_boundaries = ar.cpu_tail_boundaries;
-    out.status = PreparedCudaAutoFrameStatus::preserved_input;
-    out.valid_input_preserved = !ar.pending_work;
+    if (ar.device_lost)
+      out.status = PreparedCudaAutoFrameStatus::device_lost;
+    else if (ar.pending_work || ar.synchronization_failed)
+      out.status = PreparedCudaAutoFrameStatus::synchronization_failed;
+    else
+      out.status = PreparedCudaAutoFrameStatus::preserved_input;
+    out.valid_input_preserved =
+        !ar.pending_work && !ar.device_lost && !ar.synchronization_failed;
+    if (!out.valid_input_preserved)
+      out.output = nullptr;
     return out;
   }
   if ((!impl_->setup.face || !ar.found) && impl_->setup.matte) {
@@ -371,13 +399,18 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
     }
   }
   Add(&out.transfers, ar.transfers);
-  out.completion_waits = ar.completion_waits;
-  out.cpu_tail_boundaries = ar.cpu_tail_boundaries;
+  out.completion_waits += ar.completion_waits;
+  out.cpu_tail_boundaries += ar.cpu_tail_boundaries;
   if (!ar.ok || ar.pending_work) {
-    out.status = ar.pending_work ? PreparedCudaAutoFrameStatus::drop_frame
-                                 : PreparedCudaAutoFrameStatus::preserved_input;
-    out.valid_input_preserved = !ar.pending_work;
-    if (ar.pending_work)
+    if (ar.device_lost)
+      out.status = PreparedCudaAutoFrameStatus::device_lost;
+    else if (ar.pending_work || ar.synchronization_failed)
+      out.status = PreparedCudaAutoFrameStatus::synchronization_failed;
+    else
+      out.status = PreparedCudaAutoFrameStatus::preserved_input;
+    out.valid_input_preserved =
+        !ar.pending_work && !ar.device_lost && !ar.synchronization_failed;
+    if (!out.valid_input_preserved)
       out.output = nullptr;
     return out;
   }
@@ -428,11 +461,13 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
   return out;
 }
 bool PreparedCudaAutoFrame::Shutdown(std::string *error) noexcept {
-  if (!impl_ || impl_->stopped || !impl_->ready)
+  if (!impl_ || (impl_->stopped && !impl_->cleanup_pending) ||
+      (!impl_->ready && !impl_->cleanup_pending))
     return true;
   if (!impl_->crop->Shutdown(error))
     return false;
   impl_->ready = false;
+  impl_->cleanup_pending = false;
   impl_->stopped = true;
   return true;
 }
