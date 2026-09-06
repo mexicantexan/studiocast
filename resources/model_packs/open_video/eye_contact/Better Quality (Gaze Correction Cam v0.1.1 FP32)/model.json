@@ -33,7 +33,7 @@
     ],
     "inputs": [
       {
-        "name": "eye_rgb",
+        "name": "eye_rgb:0",
         "layout": "nchw",
         "dtype": "float32",
         "width": 64,
@@ -42,16 +42,16 @@
         "note": "Normalized eye crop (48x64)."
       },
       {
-        "name": "anchors",
+        "name": "anchors:0",
         "layout": "nchw",
         "dtype": "float32",
         "width": 64,
         "height": 48,
-        "channels": 1,
-        "note": "Anchor map / pictorial guidance (see upstream FacePredictor)."
+        "channels": 12,
+        "note": "Six landmark-guidance points encoded as paired x/y offset maps."
       },
       {
-        "name": "angles",
+        "name": "angles:0",
         "layout": "nc",
         "dtype": "float32",
         "dim": 2,
@@ -60,13 +60,13 @@
     ],
     "outputs": [
       {
-        "name": "flow",
-        "kind": "flow_field",
+        "name": "rgb:0",
+        "kind": "rgb",
         "dtype": "float32",
         "width": 64,
         "height": 48,
-        "channels": 2,
-        "note": "Dense 2D flow used to warp the eye crop. Warping/compositing happens in StudioCast."
+        "channels": 3,
+        "note": "Corrected RGB eye crop in NCHW layout and the 0..1 range."
       }
     ]
   },
