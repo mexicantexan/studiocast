@@ -13,6 +13,8 @@
 
 namespace studiocast::open_video {
 
+class PreparedCudaYunetDetector;
+
 enum class PreparedCudaYunetStatus : std::uint8_t {
   ready,
   success_no_faces,
@@ -40,6 +42,17 @@ struct PreparedCudaYunetBinding {
   std::uint64_t stream_identity = 0;
   std::uint64_t owner_identity = 0;
   std::uint64_t configuration_generation = 0;
+};
+
+// Immutable proof that a detector and cache were prepared together. Consumers
+// may copy this token, but the detector and cache must outlive them.
+struct PreparedCudaYunetPreparedBinding {
+  PreparedCudaYunetDetector *producer = nullptr;
+  PreparedCudaYunetBinding binding{};
+  ValidatedModelArtifactIdentity artifact{};
+  FrameAnalysisCache *cache = nullptr;
+  int frame_width = 0;
+  int frame_height = 0;
 };
 
 struct PreparedCudaYunetSetup {
@@ -112,6 +125,10 @@ public:
       std::unique_ptr<internal::IPreparedCudaYunetSession> session,
       std::string *error);
   bool PrepareCache(FrameAnalysisCache *cache, std::string *error);
+  bool ExportPreparedBinding(FrameAnalysisCache *cache,
+                             PreparedCudaYunetPreparedBinding *out) noexcept;
+  bool MatchesPreparedBinding(
+      const PreparedCudaYunetPreparedBinding &binding) const noexcept;
   PreparedCudaYunetExecutionResult Execute(
       const PreparedCudaYunetBinding &binding, const cuda::CudaImage &source,
       std::uint64_t capture_sequence, FrameAnalysisCache *cache,

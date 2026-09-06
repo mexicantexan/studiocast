@@ -267,12 +267,11 @@ bool RunNativeTest(const std::filesystem::path &model) {
               << '\n';
     return false;
   }
-  const auto fixture = std::filesystem::temp_directory_path() /
-                       ("studiocast-yunet-native-" +
-                        std::to_string(
-                            std::chrono::steady_clock::now()
-                                .time_since_epoch()
-                                .count()));
+  const auto fixture =
+      std::filesystem::temp_directory_path() /
+      ("studiocast-yunet-native-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto pack = fixture / "face_detection" / "yunet-native";
   std::error_code ec;
   std::filesystem::create_directories(pack, ec);
@@ -320,16 +319,20 @@ bool RunNativeTest(const std::filesystem::path &model) {
   std::vector<std::uint8_t> pixels(64 * 48 * 3);
   for (std::size_t i = 0; i < pixels.size(); ++i)
     pixels[i] = static_cast<std::uint8_t>((i * 37u + 11u) & 0xffu);
-  if (!native_driver.MemcpyHtoD2DAsync(
-          image_storage.ptr, image_storage.pitch, pixels.data(), 64 * 3,
-          64 * 3, 48, stream, &error) ||
+  if (!native_driver.MemcpyHtoD2DAsync(image_storage.ptr, image_storage.pitch,
+                                       pixels.data(), 64 * 3, 64 * 3, 48,
+                                       stream, &error) ||
       !native_driver.StreamSynchronize(stream, &error)) {
     std::cerr << "native YuNet upload failed: " << error << '\n';
     return false;
   }
   open_video::PreparedCudaYunetSetup setup;
-  setup.binding = {&native_driver, *native_driver.context_identity(), stream,
-                   reinterpret_cast<std::uintptr_t>(stream), 1, 1};
+  setup.binding = {&native_driver,
+                   *native_driver.context_identity(),
+                   stream,
+                   reinterpret_cast<std::uintptr_t>(stream),
+                   1,
+                   1};
   setup.models_root = fixture;
   setup.requested_model_id = "yunet_native_acceptance";
   setup.frame_width = 64;
@@ -338,8 +341,8 @@ bool RunNativeTest(const std::filesystem::path &model) {
       open_video::PreparedCudaYunetDetector::RequiredResourceBytes(640, 640);
   open_video::PreparedCudaYunetDetector detector;
   open_video::FrameAnalysisCache cache;
-  bool ok = detector.Prepare(setup, &error) &&
-            detector.PrepareCache(&cache, &error);
+  bool ok =
+      detector.Prepare(setup, &error) && detector.PrepareCache(&cache, &error);
   cuda::CudaImage image;
   image.ptr = image_storage.ptr;
   image.pitch = image_storage.pitch;
@@ -350,14 +353,16 @@ bool RunNativeTest(const std::filesystem::path &model) {
   wait.timeout_nanoseconds = 5'000'000'000ULL;
   wait.poll_interval_nanoseconds = 1'000ULL;
   wait.maximum_poll_count = 10'000'000;
-  const auto result = ok ? detector.Execute(setup.binding, image, 1, &cache, wait)
-                         : open_video::PreparedCudaYunetExecutionResult{};
-  ok = ok &&
-       (result.status == open_video::PreparedCudaYunetStatus::success_no_faces ||
-        result.status == open_video::PreparedCudaYunetStatus::success_faces) &&
-       result.enqueued_readbacks == 12 && result.completed_readbacks == 12 &&
-       result.completion_waits == 1 && result.cpu_tail_boundaries == 1 &&
-       !result.pending_work;
+  const auto result =
+      ok ? detector.Execute(setup.binding, image, 1, &cache, wait)
+         : open_video::PreparedCudaYunetExecutionResult{};
+  ok =
+      ok &&
+      (result.status == open_video::PreparedCudaYunetStatus::success_no_faces ||
+       result.status == open_video::PreparedCudaYunetStatus::success_faces) &&
+      result.enqueued_readbacks == 12 && result.completed_readbacks == 12 &&
+      result.completion_waits == 1 && result.cpu_tail_boundaries == 1 &&
+      !result.pending_work;
   // Cleanup must run even when preparation or the result assertions failed.
   // Keep the input and owner stream alive until detector work is quiescent.
   bool stopped = detector.Shutdown(&error);
@@ -410,6 +415,29 @@ int main() {
   open_video::FrameAnalysisCache cache;
   if (!d.PrepareCache(&cache, &error))
     return 1;
+  bool prepared_binding_ok = true;
+  open_video::PreparedCudaYunetPreparedBinding prepared_binding;
+  prepared_binding_ok &=
+      d.ExportPreparedBinding(&cache, &prepared_binding) &&
+      d.MatchesPreparedBinding(prepared_binding) &&
+      prepared_binding.producer == &d && prepared_binding.cache == &cache &&
+      prepared_binding.artifact == id && prepared_binding.frame_width == 4 &&
+      prepared_binding.frame_height == 3;
+  auto stale_prepared_binding = prepared_binding;
+  ++stale_prepared_binding.binding.configuration_generation;
+  prepared_binding_ok &= !d.MatchesPreparedBinding(stale_prepared_binding);
+  open_video::FrameAnalysisCache foreign_cache;
+  stale_prepared_binding = prepared_binding;
+  stale_prepared_binding.cache = &foreign_cache;
+  prepared_binding_ok &= !d.MatchesPreparedBinding(stale_prepared_binding);
+  stale_prepared_binding = prepared_binding;
+  ++stale_prepared_binding.artifact.registry_generation;
+  prepared_binding_ok &= !d.MatchesPreparedBinding(stale_prepared_binding);
+  stale_prepared_binding = prepared_binding;
+  ++stale_prepared_binding.frame_width;
+  prepared_binding_ok &= !d.MatchesPreparedBinding(stale_prepared_binding);
+  prepared_binding_ok &=
+      !d.ExportPreparedBinding(&foreign_cache, &stale_prepared_binding);
   cuda::CudaImage image;
   image.ptr = (cuda::CUdeviceptr)state.memory[0].get();
   image.pitch = 12;
@@ -425,7 +453,7 @@ int main() {
       g_heap_allocations.load(std::memory_order_relaxed);
   auto r = d.Execute(setup.binding, image, 1, &cache, wait);
   bool ok =
-      state.memory.size() == allocations &&
+      prepared_binding_ok && state.memory.size() == allocations &&
       g_heap_allocations.load(std::memory_order_relaxed) == heap_allocations &&
       r.status == open_video::PreparedCudaYunetStatus::success_no_faces &&
       r.enqueued_readbacks == 12 && r.completed_readbacks == 12 &&
@@ -440,8 +468,8 @@ int main() {
         cached_no_face.enqueued_readbacks == 0 &&
         cached_no_face.completed_readbacks == 0 &&
         cached_no_face.completion_waits == 0 &&
-        cached_no_face.cpu_tail_boundaries == 0 &&
-        state.runs == cached_runs && state.copies == cached_copies;
+        cached_no_face.cpu_tail_boundaries == 0 && state.runs == cached_runs &&
+        state.copies == cached_copies;
   cuda::CudaImage invalid_cached_input;
   invalid_cached_input.w = image.w;
   invalid_cached_input.h = image.h;
@@ -456,7 +484,8 @@ int main() {
   auto wrong_producer = d.Execute(setup.binding, image, 1, &cache, wait);
   ok &= wrong_producer.status ==
             open_video::PreparedCudaYunetStatus::success_no_faces &&
-        wrong_producer.enqueued_readbacks == 12 && state.runs == cached_runs + 1;
+        wrong_producer.enqueued_readbacks == 12 &&
+        state.runs == cached_runs + 1;
   ++cache.face_detections_provenance.producer_revision;
   const int stale_revision_runs = state.runs;
   auto stale_revision = d.Execute(setup.binding, image, 1, &cache, wait);
@@ -466,16 +495,14 @@ int main() {
   (void)cache.PrepareFaceDetections(16);
   const int empty_runs = state.runs;
   auto empty_unproven = d.Execute(setup.binding, image, 99, &cache, wait);
-  ok &= empty_unproven.enqueued_readbacks == 12 &&
-        state.runs == empty_runs + 1;
+  ok &= empty_unproven.enqueued_readbacks == 12 && state.runs == empty_runs + 1;
   state.fail_copy = state.copies + 3;
   auto partial = d.Execute(setup.binding, image, 2, &cache, wait);
   ok &=
       partial.status == open_video::PreparedCudaYunetStatus::readback_failed &&
       partial.enqueued_readbacks == 3 && partial.completed_readbacks == 3 &&
       partial.completion_waits == 1 && partial.cpu_tail_boundaries == 0 &&
-      !partial.pending_work &&
-      state.memory.size() == allocations;
+      !partial.pending_work && state.memory.size() == allocations;
   state.fail_copy = -1;
   state.face = true;
   auto recovered = d.Execute(setup.binding, image, 3, &cache, wait);
@@ -583,14 +610,14 @@ int main() {
   state.launch_result = cuda::CUDA_SUCCESS;
   ok &= device_lost.Shutdown(&error);
   open_video::PreparedCudaYunetDetector copy_lost;
-  ok &= copy_lost.PrepareForTesting(
-      setup, id, std::make_unique<Session>(&state), &error);
+  ok &= copy_lost.PrepareForTesting(setup, id,
+                                    std::make_unique<Session>(&state), &error);
   open_video::FrameAnalysisCache copy_lost_cache;
   ok &= copy_lost.PrepareCache(&copy_lost_cache, &error);
   state.fail_copy = state.copies;
   state.fail_copy_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
-  auto copy_device_lost = copy_lost.Execute(
-      setup.binding, image, 21, &copy_lost_cache, wait);
+  auto copy_device_lost =
+      copy_lost.Execute(setup.binding, image, 21, &copy_lost_cache, wait);
   ok &= copy_device_lost.status ==
             open_video::PreparedCudaYunetStatus::device_lost &&
         copy_device_lost.device_lost &&

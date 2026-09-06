@@ -78,6 +78,9 @@ struct PreparedCudaEyeContactSetup {
   std::size_t resource_budget_bytes = 0;
   FrameAnalysisCache *analysis_cache = nullptr;
   PreparedCudaYunetSetup yunet_setup{};
+  // When present, borrow this already-prepared detector/cache instead of
+  // preparing and owning a private YuNet producer.
+  const PreparedCudaYunetPreparedBinding *shared_yunet = nullptr;
   PreparedCudaDlibSetup dlib_setup{};
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait{};
 };
@@ -101,8 +104,9 @@ struct PreparedCudaEyeContactAnalysisResult {
   std::uint32_t cpu_tail_boundaries = 0;
 };
 
-PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
-    const PreparedCudaDlibResult &, const cuda::CudaTensor &) noexcept;
+PreparedCudaEyeContactStatus
+ValidateResidentDlibLandmarks(const PreparedCudaDlibResult &,
+                              const cuda::CudaTensor &) noexcept;
 
 class IPreparedCudaEyeContactAnalysis {
 public:

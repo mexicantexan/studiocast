@@ -32,7 +32,10 @@ struct Analysis final : IPreparedCudaEyeContactAnalysis {
   cuda::CudaTensor tensor;
   int prepare = 0, detect = 0, landmarks = 0, shutdown = 0;
   int *destructions = nullptr;
-  ~Analysis() override { if (destructions) ++*destructions; }
+  ~Analysis() override {
+    if (destructions)
+      ++*destructions;
+  }
   Analysis() {
     tensor.ptr = 1;
     tensor.pitch = tensor.bytes = 136 * sizeof(float);
@@ -82,11 +85,16 @@ struct Runtime final : IPreparedCudaEyeContactRuntime {
                                    PreparedCudaEyeContactStatus::shutdown;
   PreparedCudaEyeContactRuntimeFrameResult next{};
   int prepare = 0, execute = 0, shutdown = 0;
+  std::size_t last_budget = 0;
   int *destructions = nullptr;
-  ~Runtime() override { if (destructions) ++*destructions; }
+  ~Runtime() override {
+    if (destructions)
+      ++*destructions;
+  }
   PreparedCudaEyeContactStatus
-  Prepare(const PreparedCudaEyeContactRuntimeConfig &) noexcept override {
+  Prepare(const PreparedCudaEyeContactRuntimeConfig &config) noexcept override {
     ++prepare;
+    last_budget = config.resource_budget_bytes;
     return prepare_status;
   }
   PreparedCudaEyeContactRuntimeFrameResult
@@ -106,7 +114,7 @@ struct NativeState {
   std::uint64_t next = 0x1000;
   int runs = 0, records = 0, queries = 0, frees = 0, destroys = 0;
   int fail_run_at = 0, not_ready = 0, fail_free_at = 0;
-} *native;
+} * native;
 cuda::CUresult CInit(unsigned) { return 0; }
 cuda::CUresult CLoad(cuda::CUmodule *m, const void *) {
   *m = reinterpret_cast<cuda::CUmodule>(1);
@@ -119,7 +127,9 @@ cuda::CUresult CFunction(cuda::CUfunction *f, cuda::CUmodule, const char *) {
 cuda::CUresult CUnload(cuda::CUmodule) { return 0; }
 cuda::CUresult CLaunch(cuda::CUfunction, unsigned, unsigned, unsigned, unsigned,
                        unsigned, unsigned, unsigned, cuda::CUstream, void **,
-                       void **) { return 0; }
+                       void **) {
+  return 0;
+}
 cuda::CUresult CAlloc(cuda::CUdeviceptr *p, std::size_t *pitch, std::size_t w,
                       std::size_t, unsigned) {
   *p = native->next;
@@ -129,20 +139,29 @@ cuda::CUresult CAlloc(cuda::CUdeviceptr *p, std::size_t *pitch, std::size_t w,
 }
 cuda::CUresult CFree(cuda::CUdeviceptr) {
   ++native->frees;
-  return native->fail_free_at == native->frees ? cuda::CUDA_ERROR_INVALID_CONTEXT
-                                                : cuda::CUDA_SUCCESS;
+  return native->fail_free_at == native->frees
+             ? cuda::CUDA_ERROR_INVALID_CONTEXT
+             : cuda::CUDA_SUCCESS;
 }
 cuda::CUresult CCopy(const cuda::CUDA_MEMCPY2D *, cuda::CUstream) { return 0; }
 cuda::CUresult CMemset(cuda::CUdeviceptr, unsigned char, std::size_t,
-                       cuda::CUstream) { return 0; }
+                       cuda::CUstream) {
+  return 0;
+}
 cuda::CUresult CStream(cuda::CUstream *s, unsigned) {
   *s = reinterpret_cast<cuda::CUstream>(9);
   return 0;
 }
 cuda::CUresult CDestroyStream(cuda::CUstream) { return 0; }
 cuda::CUresult CSync(cuda::CUstream) { return 0; }
-cuda::CUresult CCount(int *count) { *count = 1; return 0; }
-cuda::CUresult CDevice(cuda::CUdevice *device, int) { *device = 0; return 0; }
+cuda::CUresult CCount(int *count) {
+  *count = 1;
+  return 0;
+}
+cuda::CUresult CDevice(cuda::CUdevice *device, int) {
+  *device = 0;
+  return 0;
+}
 cuda::CUresult CUuid(cuda::CUuuid *uuid, cuda::CUdevice) {
   std::memset(uuid, 0, sizeof(*uuid));
   uuid->bytes[0] = 1;
@@ -150,7 +169,8 @@ cuda::CUresult CUuid(cuda::CUuuid *uuid, cuda::CUdevice) {
 }
 cuda::CUresult CPci(char *text, int size, cuda::CUdevice) {
   const char value[] = "0000:01:00.0";
-  if (size < static_cast<int>(sizeof(value))) return 1;
+  if (size < static_cast<int>(sizeof(value)))
+    return 1;
   std::memcpy(text, value, sizeof(value));
   return 0;
 }
@@ -159,14 +179,26 @@ cuda::CUresult CRetain(cuda::CUcontext *context, cuda::CUdevice) {
   return 0;
 }
 cuda::CUresult CRelease(cuda::CUdevice) { return 0; }
-cuda::CUresult CSet(cuda::CUcontext context) { native->current = context; return 0; }
-cuda::CUresult CGet(cuda::CUcontext *context) { *context = native->current; return 0; }
-cuda::CUresult CGetDevice(cuda::CUdevice *device) { *device = 0; return 0; }
+cuda::CUresult CSet(cuda::CUcontext context) {
+  native->current = context;
+  return 0;
+}
+cuda::CUresult CGet(cuda::CUcontext *context) {
+  *context = native->current;
+  return 0;
+}
+cuda::CUresult CGetDevice(cuda::CUdevice *device) {
+  *device = 0;
+  return 0;
+}
 cuda::CUresult CEventCreate(cuda::CUevent *event, unsigned) {
   *event = reinterpret_cast<cuda::CUevent>(8);
   return 0;
 }
-cuda::CUresult CEventDestroy(cuda::CUevent) { ++native->destroys; return 0; }
+cuda::CUresult CEventDestroy(cuda::CUevent) {
+  ++native->destroys;
+  return 0;
+}
 cuda::CUresult CEventRecord(cuda::CUevent, cuda::CUstream) {
   ++native->records;
   return 0;
@@ -185,17 +217,32 @@ cuda::CUresult CElapsed(float *ms, cuda::CUevent, cuda::CUevent) {
 }
 cuda::CudaDriverApi::Functions CudaFunctions() {
   cuda::CudaDriverApi::Functions f;
-  f.cuInit=CInit; f.cuModuleLoadData=CLoad; f.cuModuleGetFunction=CFunction;
-  f.cuModuleUnload=CUnload; f.cuLaunchKernel=CLaunch; f.cuMemAllocPitch=CAlloc;
-  f.cuMemFree=CFree; f.cuMemcpy2DAsync=CCopy; f.cuMemsetD8Async=CMemset;
-  f.cuStreamCreate=CStream; f.cuStreamDestroy=CDestroyStream;
-  f.cuStreamSynchronize=CSync; f.cuDeviceGetCount=CCount; f.cuDeviceGet=CDevice;
-  f.cuDeviceGetUuid=CUuid; f.cuDeviceGetPCIBusId=CPci;
-  f.cuDevicePrimaryCtxRetain=CRetain; f.cuDevicePrimaryCtxRelease=CRelease;
-  f.cuCtxSetCurrent=CSet; f.cuCtxGetCurrent=CGet; f.cuCtxGetDevice=CGetDevice;
-  f.cuEventCreate=CEventCreate; f.cuEventDestroy=CEventDestroy;
-  f.cuEventRecord=CEventRecord; f.cuEventQuery=CEventQuery;
-  f.cuEventElapsedTime=CElapsed;
+  f.cuInit = CInit;
+  f.cuModuleLoadData = CLoad;
+  f.cuModuleGetFunction = CFunction;
+  f.cuModuleUnload = CUnload;
+  f.cuLaunchKernel = CLaunch;
+  f.cuMemAllocPitch = CAlloc;
+  f.cuMemFree = CFree;
+  f.cuMemcpy2DAsync = CCopy;
+  f.cuMemsetD8Async = CMemset;
+  f.cuStreamCreate = CStream;
+  f.cuStreamDestroy = CDestroyStream;
+  f.cuStreamSynchronize = CSync;
+  f.cuDeviceGetCount = CCount;
+  f.cuDeviceGet = CDevice;
+  f.cuDeviceGetUuid = CUuid;
+  f.cuDeviceGetPCIBusId = CPci;
+  f.cuDevicePrimaryCtxRetain = CRetain;
+  f.cuDevicePrimaryCtxRelease = CRelease;
+  f.cuCtxSetCurrent = CSet;
+  f.cuCtxGetCurrent = CGet;
+  f.cuCtxGetDevice = CGetDevice;
+  f.cuEventCreate = CEventCreate;
+  f.cuEventDestroy = CEventDestroy;
+  f.cuEventRecord = CEventRecord;
+  f.cuEventQuery = CEventQuery;
+  f.cuEventElapsedTime = CElapsed;
   return f;
 }
 struct EyeSession final : IPreparedEyeContactOrtSession {
@@ -204,22 +251,26 @@ struct EyeSession final : IPreparedEyeContactOrtSession {
   int *run_count = nullptr;
   int *destruction_count = nullptr;
   ~EyeSession() override {
-    if (destruction_count) ++*destruction_count;
+    if (destruction_count)
+      ++*destruction_count;
   }
-  const onnx::OrtSessionInfo &info() const noexcept override { return metadata; }
+  const onnx::OrtSessionInfo &info() const noexcept override {
+    return metadata;
+  }
   onnx::OrtPreparedCudaRunEvidence evidence() const noexcept override {
     return run_evidence;
   }
-  bool PrepareBinding(const onnx::OrtSession::CudaBindingInput *in, std::size_t n,
+  bool PrepareBinding(const onnx::OrtSession::CudaBindingInput *in,
+                      std::size_t n,
                       const onnx::OrtSession::CudaBindingOutput *out,
                       std::size_t no) noexcept override {
     return n == 3 && no == 1 && std::strcmp(in[0].name, "eye_rgb:0") == 0 &&
            std::strcmp(out[0].name, "rgb:0") == 0;
   }
-  onnx::OrtPreparedRunResult Execute(
-      const onnx::OrtSession::CudaBindingInput *, std::size_t,
-      const onnx::OrtSession::CudaBindingOutput *, std::size_t,
-      const onnx::OrtPreparedCudaRunEvidence &) noexcept override {
+  onnx::OrtPreparedRunResult
+  Execute(const onnx::OrtSession::CudaBindingInput *, std::size_t,
+          const onnx::OrtSession::CudaBindingOutput *, std::size_t,
+          const onnx::OrtPreparedCudaRunEvidence &) noexcept override {
     ++*run_count;
     onnx::OrtPreparedRunResult result;
     result.status = native->fail_run_at == *run_count
@@ -235,14 +286,15 @@ struct EyeFactory final : IPreparedEyeContactOrtFactory {
   int runs = 0, validations = 0;
   int session_destructions = 0;
   bool validate = true;
-  bool ValidateArtifact(const ModelPack &, const ModelFile &,
-                        const ValidatedModelArtifactIdentity &) noexcept override {
+  bool
+  ValidateArtifact(const ModelPack &, const ModelFile &,
+                   const ValidatedModelArtifactIdentity &) noexcept override {
     ++validations;
     return validate;
   }
   std::unique_ptr<IPreparedEyeContactOrtSession>
-  Create(const std::filesystem::path &, const onnx::OrtSessionOptions &options)
-      noexcept override {
+  Create(const std::filesystem::path &,
+         const onnx::OrtSessionOptions &options) noexcept override {
     if (options.provider_policy != onnx::OrtProviderPolicy::strict_cuda_only ||
         options.enable_tensorrt || !options.user_compute_stream)
       return {};
@@ -393,9 +445,8 @@ bool FailureAndDisabled() {
   CHECK(!eye.Prepare(Setup(&cache), &h, &error));
   CHECK(!eye.ready());
   setup = Setup(&cache);
-  setup.resource_budget_bytes =
-      setup.yunet_setup.resource_budget_bytes +
-      setup.dlib_setup.resource_budget_bytes;
+  setup.resource_budget_bytes = setup.yunet_setup.resource_budget_bytes +
+                                setup.dlib_setup.resource_budget_bytes;
   CHECK(!eye.Prepare(setup, &h, &error));
   int analysis_destructions = 0, runtime_destructions = 0;
   {
@@ -420,6 +471,21 @@ bool FailureAndDisabled() {
     CHECK(owned.Prepare(Setup(&cache), &h, &error));
   }
   CHECK(analysis_destructions == 1 && runtime_destructions == 1);
+
+  // A shared YuNet is budgeted by the outer slot. Eye accounts only for its
+  // owned dlib analysis and eye runtime reserve.
+  Analysis shared_analysis;
+  Runtime shared_runtime;
+  PreparedCudaEyeContact shared_eye(&shared_analysis, &shared_runtime);
+  setup = Setup(&cache);
+  PreparedCudaYunetPreparedBinding borrowed;
+  setup.shared_yunet = &borrowed;
+  setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes + 123;
+  CHECK(shared_eye.Prepare(setup, &h, &error));
+  CHECK(shared_runtime.last_budget == 123);
+  CHECK(shared_eye.Shutdown(&error));
+  setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes - 1;
+  CHECK(!shared_eye.Prepare(setup, &h, &error));
   return true;
 }
 bool NativeBoundaries() {
@@ -447,8 +513,10 @@ bool NativeBoundaries() {
   config.wait.maximum_poll_count = 2;
   ModelPack pack;
   ModelFile left, right;
-  left.role = "left"; left.path = "left.onnx";
-  right.role = "right"; right.path = "right.onnx";
+  left.role = "left";
+  left.path = "left.onnx";
+  right.role = "right";
+  right.path = "right.onnx";
   pack.files = {left, right};
   config.models.eye_pack = &pack;
   config.models.left_file = &pack.files[0];
@@ -460,9 +528,9 @@ bool NativeBoundaries() {
   EyeFactory factory;
   factory.metadata.input_names = {"eye_rgb:0", "anchors:0", "angles:0"};
   factory.metadata.output_names = {"rgb:0"};
-  factory.metadata.input_shapes = {{1,3,48,64},{1,12,48,64},{1,2}};
-  factory.metadata.output_shapes = {{1,3,48,64}};
-  factory.metadata.input_elem_types = {1,1,1};
+  factory.metadata.input_shapes = {{1, 3, 48, 64}, {1, 12, 48, 64}, {1, 2}};
+  factory.metadata.output_shapes = {{1, 3, 48, 64}};
+  factory.metadata.input_elem_types = {1, 1, 1};
   factory.metadata.output_elem_types = {1};
   factory.evidence.session_generation = 1;
   auto &provider = factory.evidence.provider;
@@ -477,11 +545,18 @@ bool NativeBoundaries() {
   CHECK(runtime.Prepare(config) == PreparedCudaEyeContactStatus::executed);
   CHECK(factory.validations == 2 && factory.runs == 2 && state.records == 1);
   cuda::CudaImage input;
-  input.ptr = 0x2000000; input.pitch = 192; input.w = 64; input.h = 48;
+  input.ptr = 0x2000000;
+  input.pitch = 192;
+  input.w = 64;
+  input.h = 48;
   input.format = cuda::PixelFormatGpu::rgb_u8;
   cuda::CudaTensor landmarks;
-  landmarks.ptr = 0x3000000; landmarks.pitch = landmarks.bytes = 136*sizeof(float);
-  landmarks.n=1; landmarks.c=1; landmarks.h=1; landmarks.w=136;
+  landmarks.ptr = 0x3000000;
+  landmarks.pitch = landmarks.bytes = 136 * sizeof(float);
+  landmarks.n = 1;
+  landmarks.c = 1;
+  landmarks.h = 1;
+  landmarks.w = 136;
   state.fail_run_at = 4;
   auto result = runtime.Execute(config.binding, input, landmarks, 0.5F);
   CHECK(result.status == PreparedCudaEyeContactStatus::inference_failed &&
@@ -492,11 +567,13 @@ bool NativeBoundaries() {
   state = {};
   state.next = 0x1000;
   native = &state;
-  CHECK(driver.BindPreparedContext(config.binding.context) == cuda::CUDA_SUCCESS);
+  CHECK(driver.BindPreparedContext(config.binding.context) ==
+        cuda::CUDA_SUCCESS);
   EyeFactory timeout_factory = factory;
   timeout_factory.runs = 0;
   NativePreparedCudaEyeContactRuntime timeout_runtime(&timeout_factory);
-  CHECK(timeout_runtime.Prepare(config) == PreparedCudaEyeContactStatus::executed);
+  CHECK(timeout_runtime.Prepare(config) ==
+        PreparedCudaEyeContactStatus::executed);
   state.not_ready = 2;
   state.fail_run_at = 4;
   result = timeout_runtime.Execute(config.binding, input, landmarks, 0.5F);
@@ -540,12 +617,14 @@ bool NativeBoundaries() {
   rejected.validations = 0;
   rejected.validate = false;
   NativePreparedCudaEyeContactRuntime invalid(&rejected);
-  CHECK(invalid.Prepare(config) == PreparedCudaEyeContactStatus::invalid_setup &&
+  CHECK(invalid.Prepare(config) ==
+            PreparedCudaEyeContactStatus::invalid_setup &&
         rejected.validations == 1);
   config.resource_budget_bytes = 1;
   EyeFactory budget_factory = factory;
   NativePreparedCudaEyeContactRuntime budget(&budget_factory);
-  CHECK(budget.Prepare(config) == PreparedCudaEyeContactStatus::resource_exhausted);
+  CHECK(budget.Prepare(config) ==
+        PreparedCudaEyeContactStatus::resource_exhausted);
   return true;
 }
 } // namespace

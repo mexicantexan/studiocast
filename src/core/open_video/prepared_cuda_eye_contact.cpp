@@ -7,9 +7,9 @@
 #include <limits>
 
 namespace studiocast::open_video {
-PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
-    const PreparedCudaDlibResult &result,
-    const cuda::CudaTensor &tensor) noexcept {
+PreparedCudaEyeContactStatus
+ValidateResidentDlibLandmarks(const PreparedCudaDlibResult &result,
+                              const cuda::CudaTensor &tensor) noexcept {
   if (result.status != PreparedCudaDlibStatus::success)
     return result.pending_work
                ? PreparedCudaEyeContactStatus::synchronization_failed
@@ -37,16 +37,38 @@ public:
   PreparedCudaEyeContactStatus
   Prepare(const PreparedCudaEyeContactSetup &s) noexcept override {
     std::string error;
-    if (!yunet_.Prepare(s.yunet_setup, &error))
-      return PreparedCudaEyeContactStatus::model_invalid;
-    if (!yunet_.PrepareCache(s.analysis_cache, &error))
-      return PreparedCudaEyeContactStatus::resource_exhausted;
+    borrowed_ = s.shared_yunet != nullptr;
+    if (borrowed_) {
+      borrowed_binding_ = *s.shared_yunet;
+      active_yunet_ = borrowed_binding_.producer;
+      if (!active_yunet_ || borrowed_binding_.cache != s.analysis_cache ||
+          borrowed_binding_.binding.driver != s.binding.driver ||
+          borrowed_binding_.binding.context != s.binding.context ||
+          borrowed_binding_.binding.stream != s.binding.stream ||
+          borrowed_binding_.binding.stream_identity !=
+              s.binding.stream_identity ||
+          borrowed_binding_.binding.owner_identity !=
+              s.binding.owner_identity ||
+          borrowed_binding_.binding.configuration_generation !=
+              s.binding.configuration_generation ||
+          borrowed_binding_.frame_width != s.frame_width ||
+          borrowed_binding_.frame_height != s.frame_height ||
+          borrowed_binding_.artifact != s.models.yunet ||
+          !active_yunet_->MatchesPreparedBinding(borrowed_binding_))
+        return PreparedCudaEyeContactStatus::model_invalid;
+    } else {
+      if (!yunet_.Prepare(s.yunet_setup, &error))
+        return PreparedCudaEyeContactStatus::model_invalid;
+      if (!yunet_.PrepareCache(s.analysis_cache, &error))
+        return PreparedCudaEyeContactStatus::resource_exhausted;
+      active_yunet_ = &yunet_;
+    }
     if (!dlib_.Prepare(s.dlib_setup, &error))
       return PreparedCudaEyeContactStatus::model_invalid;
     return PreparedCudaEyeContactStatus::executed;
   }
   const ValidatedModelArtifactIdentity &artifact() const noexcept override {
-    return yunet_.artifact();
+    return active_yunet_ ? active_yunet_->artifact() : yunet_.artifact();
   }
   const ValidatedModelArtifactIdentity &
   landmark_artifact() const noexcept override {
@@ -61,7 +83,11 @@ public:
     PreparedCudaYunetBinding yb{b.driver,         b.context,
                                 b.stream,         b.stream_identity,
                                 b.owner_identity, b.configuration_generation};
-    const auto result = yunet_.Execute(yb, image, sequence, cache, wait);
+    if (!active_yunet_ || (borrowed_ && !active_yunet_->MatchesPreparedBinding(
+                                            borrowed_binding_)))
+      return out;
+    const auto result =
+        active_yunet_->Execute(yb, image, sequence, cache, wait);
     out.enqueued_readbacks = result.enqueued_readbacks;
     out.completed_readbacks = result.completed_readbacks;
     out.completion_waits = result.completion_waits;
@@ -131,13 +157,16 @@ public:
   PreparedCudaEyeContactStatus Shutdown() noexcept override {
     std::string error;
     const bool d = dlib_.Shutdown(&error);
-    const bool y = yunet_.Shutdown(&error);
+    const bool y = borrowed_ || yunet_.Shutdown(&error);
     return d && y ? PreparedCudaEyeContactStatus::shutdown
                   : PreparedCudaEyeContactStatus::shutdown_failed;
   }
 
 private:
   PreparedCudaYunetDetector yunet_;
+  PreparedCudaYunetDetector *active_yunet_ = nullptr;
+  PreparedCudaYunetPreparedBinding borrowed_binding_{};
+  bool borrowed_ = false;
   PreparedCudaDlibShapePredictor dlib_;
 };
 
@@ -221,7 +250,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
     return false;
   auto frozen = s;
   std::size_t accounted = 0;
-  if (!CheckedAdd(s.yunet_setup.resource_budget_bytes, &accounted) ||
+  if ((!s.shared_yunet &&
+       !CheckedAdd(s.yunet_setup.resource_budget_bytes, &accounted)) ||
       !CheckedAdd(s.dlib_setup.resource_budget_bytes, &accounted) ||
       accounted > s.resource_budget_bytes) {
     if (error)
@@ -248,10 +278,14 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
        !(impl_->analysis->landmark_artifact() == s.models.landmarks)))
     status = PreparedCudaEyeContactStatus::model_invalid;
   if (status == PreparedCudaEyeContactStatus::executed) {
-    PreparedCudaEyeContactRuntimeConfig config{
-        frozen.binding, frozen.models, frozen.cuda_device_id,
-        frozen.frame_width, frozen.frame_height,
-        frozen.resource_budget_bytes - accounted, frozen.wait};
+    PreparedCudaEyeContactRuntimeConfig config{frozen.binding,
+                                               frozen.models,
+                                               frozen.cuda_device_id,
+                                               frozen.frame_width,
+                                               frozen.frame_height,
+                                               frozen.resource_budget_bytes -
+                                                   accounted,
+                                               frozen.wait};
     status = impl_->runtime->Prepare(config);
   }
   if (status != PreparedCudaEyeContactStatus::executed) {

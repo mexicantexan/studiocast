@@ -60,11 +60,13 @@ bool ReadDeclaredInput(const std::filesystem::path &manifest,
   if (!top)
     return false;
   const auto onnx_it = top->find("onnx");
-  const auto *onnx = onnx_it == top->end() ? nullptr : onnx_it->second.AsObject();
+  const auto *onnx =
+      onnx_it == top->end() ? nullptr : onnx_it->second.AsObject();
   if (!onnx)
     return false;
   const auto inputs_it = onnx->find("inputs");
-  const auto *inputs = inputs_it == onnx->end() ? nullptr : inputs_it->second.AsArray();
+  const auto *inputs =
+      inputs_it == onnx->end() ? nullptr : inputs_it->second.AsArray();
   if (!inputs || inputs->size() != 1)
     return false;
   const auto *input = (*inputs)[0].AsObject();
@@ -89,8 +91,7 @@ bool ReadDeclaredInput(const std::filesystem::path &manifest,
   };
   if (!string_field("name", &out->name) ||
       !string_field("layout", &out->layout) ||
-      !string_field("dtype", &out->dtype) ||
-      !int_field("width", &out->width) ||
+      !string_field("dtype", &out->dtype) || !int_field("width", &out->width) ||
       !int_field("height", &out->height) ||
       !int_field("channels", &out->channels) || out->layout != "nchw" ||
       out->dtype != "float32" || out->channels != 3) {
@@ -219,9 +220,9 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   if (error)
     error->clear();
   if (!impl_ || impl_->ready || impl_->warmup_pending ||
-      !setup.binding.driver ||
-      !setup.binding.context.Valid() || !setup.binding.stream ||
-      setup.binding.stream_identity == 0 || setup.binding.owner_identity == 0 ||
+      !setup.binding.driver || !setup.binding.context.Valid() ||
+      !setup.binding.stream || setup.binding.stream_identity == 0 ||
+      setup.binding.owner_identity == 0 ||
       setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
       setup.frame_height <= 0) {
     if (error)
@@ -395,15 +396,13 @@ bool PreparedCudaYunetDetector::PrepareValidated(
         matches(declared_output[1], anchors) &&
         matches(declared_output[2], channels)) {
       out.shape = {1, anchors, channels};
-    } else if (declared_output.size() == 4 &&
-               matches(declared_output[0], 1) &&
+    } else if (declared_output.size() == 4 && matches(declared_output[0], 1) &&
                matches(declared_output[1], channels) &&
                matches(declared_output[2], rows) &&
                matches(declared_output[3], cols) && declared_output[1] > 0) {
       out.shape = {1, channels, rows, cols};
       out.channels_first = true;
-    } else if (declared_output.size() == 4 &&
-               matches(declared_output[0], 1) &&
+    } else if (declared_output.size() == 4 && matches(declared_output[0], 1) &&
                matches(declared_output[1], rows) &&
                matches(declared_output[2], cols) &&
                matches(declared_output[3], channels) &&
@@ -520,14 +519,35 @@ bool PreparedCudaYunetDetector::PrepareCache(FrameAnalysisCache *cache,
   return true;
 }
 
+bool PreparedCudaYunetDetector::ExportPreparedBinding(
+    FrameAnalysisCache *cache, PreparedCudaYunetPreparedBinding *out) noexcept {
+  if (out)
+    *out = {};
+  if (!out || !impl_ || !impl_->ready || cache != impl_->prepared_cache)
+    return false;
+  *out = {this,  impl_->setup.binding,     impl_->artifact,
+          cache, impl_->setup.frame_width, impl_->setup.frame_height};
+  return true;
+}
+
+bool PreparedCudaYunetDetector::MatchesPreparedBinding(
+    const PreparedCudaYunetPreparedBinding &binding) const noexcept {
+  return impl_ && impl_->ready && binding.producer == this &&
+         binding.cache == impl_->prepared_cache &&
+         SameBinding(binding.binding, impl_->setup.binding) &&
+         binding.artifact == impl_->artifact &&
+         binding.frame_width == impl_->setup.frame_width &&
+         binding.frame_height == impl_->setup.frame_height;
+}
+
 PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
     const PreparedCudaYunetBinding &binding, const cuda::CudaImage &source,
     std::uint64_t sequence, FrameAnalysisCache *cache,
     const cuda::CudaPreparedTransferCompletion::WaitPolicy &wait) noexcept {
   PreparedCudaYunetExecutionResult result;
   if (!ready() || !cache || cache != impl_->prepared_cache ||
-      !SameBinding(binding, impl_->setup.binding) ||
-      !source.Valid() || source.format != cuda::PixelFormatGpu::rgb_u8 ||
+      !SameBinding(binding, impl_->setup.binding) || !source.Valid() ||
+      source.format != cuda::PixelFormatGpu::rgb_u8 ||
       source.w != impl_->setup.frame_width ||
       source.h != impl_->setup.frame_height)
     return result;
