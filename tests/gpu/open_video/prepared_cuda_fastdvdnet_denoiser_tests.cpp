@@ -96,22 +96,28 @@ cuda::CudaImage Image(cuda::CUdeviceptr ptr) {
   i.format=cuda::PixelFormatGpu::rgb_u8; return i;
 }
 
-struct NativeCudaState { cuda::CUcontext current=nullptr; std::uint64_t next=0x1000; int allocs=0, frees=0, launches=0, copies=0, records=0; } *native_state;
+struct NativeCudaState {
+  cuda::CUcontext current=nullptr; std::uint64_t next=0x1000;
+  int allocs=0, frees=0, launches=0, copies=0, memsets=0, records=0,
+      syncs=0, queries=0;
+  int fail_launch_at=0, fail_copy_at=0, fail_memset_at=0, fail_record_at=0,
+      fail_syncs=0, not_ready_queries=0;
+} *native_state;
 cuda::CUresult NInit(unsigned){return 0;} cuda::CUresult NLoad(cuda::CUmodule*m,const void*){*m=reinterpret_cast<cuda::CUmodule>(1);return 0;}
 cuda::CUresult NFn(cuda::CUfunction*f,cuda::CUmodule,const char*n){*f=reinterpret_cast<cuda::CUfunction>(std::strcmp(n,"fastdvdnet_preprocess")==0?2:3);return 0;}
-cuda::CUresult NUnload(cuda::CUmodule){return 0;} cuda::CUresult NLaunch(cuda::CUfunction,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,cuda::CUstream,void**,void**){++native_state->launches;return 0;}
+cuda::CUresult NUnload(cuda::CUmodule){return 0;} cuda::CUresult NLaunch(cuda::CUfunction,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,cuda::CUstream,void**,void**){++native_state->launches;return native_state->fail_launch_at==native_state->launches?cuda::CUDA_ERROR_LAUNCH_FAILED:0;}
 cuda::CUresult NAlloc(cuda::CUdeviceptr*p,std::size_t*pi,std::size_t w,std::size_t,unsigned){*p=native_state->next;native_state->next+=0x10000;*pi=w;++native_state->allocs;return 0;}
-cuda::CUresult NFree(cuda::CUdeviceptr){++native_state->frees;return 0;} cuda::CUresult NCopy(const cuda::CUDA_MEMCPY2D*,cuda::CUstream){++native_state->copies;return 0;}
-cuda::CUresult NMemset(cuda::CUdeviceptr,unsigned char,std::size_t,cuda::CUstream){return 0;} cuda::CUresult NStream(cuda::CUstream*s,unsigned){*s=reinterpret_cast<cuda::CUstream>(9);return 0;}
-cuda::CUresult NDestroyStream(cuda::CUstream){return 0;} cuda::CUresult NSync(cuda::CUstream){return 0;} cuda::CUresult NCount(int*c){*c=1;return 0;} cuda::CUresult NDev(cuda::CUdevice*d,int){*d=0;return 0;}
+cuda::CUresult NFree(cuda::CUdeviceptr){++native_state->frees;return 0;} cuda::CUresult NCopy(const cuda::CUDA_MEMCPY2D*,cuda::CUstream){++native_state->copies;return native_state->fail_copy_at==native_state->copies?cuda::CUDA_ERROR_ILLEGAL_ADDRESS:0;}
+cuda::CUresult NMemset(cuda::CUdeviceptr,unsigned char,std::size_t,cuda::CUstream){++native_state->memsets;return native_state->fail_memset_at==native_state->memsets?cuda::CUDA_ERROR_LAUNCH_FAILED:0;} cuda::CUresult NStream(cuda::CUstream*s,unsigned){*s=reinterpret_cast<cuda::CUstream>(9);return 0;}
+cuda::CUresult NDestroyStream(cuda::CUstream){return 0;} cuda::CUresult NSync(cuda::CUstream){++native_state->syncs;if(native_state->fail_syncs>0){--native_state->fail_syncs;return cuda::CUDA_ERROR_NOT_READY;}return 0;} cuda::CUresult NCount(int*c){*c=1;return 0;} cuda::CUresult NDev(cuda::CUdevice*d,int){*d=0;return 0;}
 cuda::CUresult NUuid(cuda::CUuuid*u,cuda::CUdevice){std::memset(u,0,sizeof(*u));u->bytes[0]=1;return 0;} cuda::CUresult NPci(char*b,int n,cuda::CUdevice){const char*s="0000:01:00.0";if(n<13)return 1;std::memcpy(b,s,13);return 0;}
 cuda::CUresult NRetain(cuda::CUcontext*c,cuda::CUdevice){*c=reinterpret_cast<cuda::CUcontext>(7);return 0;} cuda::CUresult NRelease(cuda::CUdevice){return 0;}
 cuda::CUresult NSet(cuda::CUcontext c){native_state->current=c;return 0;} cuda::CUresult NGet(cuda::CUcontext*c){*c=native_state->current;return 0;} cuda::CUresult NGetDev(cuda::CUdevice*d){*d=0;return 0;}
 cuda::CUresult NECreate(cuda::CUevent*e,unsigned){*e=reinterpret_cast<cuda::CUevent>(8);return 0;} cuda::CUresult NEDestroy(cuda::CUevent){return 0;}
-cuda::CUresult NERecord(cuda::CUevent,cuda::CUstream){++native_state->records;return 0;} cuda::CUresult NEQuery(cuda::CUevent){return 0;} cuda::CUresult NEElapsed(float*m,cuda::CUevent,cuda::CUevent){*m=0;return 0;}
+cuda::CUresult NERecord(cuda::CUevent,cuda::CUstream){++native_state->records;return native_state->fail_record_at==native_state->records?cuda::CUDA_ERROR_LAUNCH_FAILED:0;} cuda::CUresult NEQuery(cuda::CUevent){++native_state->queries;if(native_state->not_ready_queries>0){--native_state->not_ready_queries;return cuda::CUDA_ERROR_NOT_READY;}return 0;} cuda::CUresult NEElapsed(float*m,cuda::CUevent,cuda::CUevent){*m=0;return 0;}
 cuda::CudaDriverApi::Functions NativeFunctions(){cuda::CudaDriverApi::Functions f;f.cuInit=NInit;f.cuModuleLoadData=NLoad;f.cuModuleGetFunction=NFn;f.cuModuleUnload=NUnload;f.cuLaunchKernel=NLaunch;f.cuMemAllocPitch=NAlloc;f.cuMemFree=NFree;f.cuMemcpy2DAsync=NCopy;f.cuMemsetD8Async=NMemset;f.cuStreamCreate=NStream;f.cuStreamDestroy=NDestroyStream;f.cuStreamSynchronize=NSync;f.cuDeviceGetCount=NCount;f.cuDeviceGet=NDev;f.cuDeviceGetUuid=NUuid;f.cuDeviceGetPCIBusId=NPci;f.cuDevicePrimaryCtxRetain=NRetain;f.cuDevicePrimaryCtxRelease=NRelease;f.cuCtxSetCurrent=NSet;f.cuCtxGetCurrent=NGet;f.cuCtxGetDevice=NGetDev;f.cuEventCreate=NECreate;f.cuEventDestroy=NEDestroy;f.cuEventRecord=NERecord;f.cuEventQuery=NEQuery;f.cuEventElapsedTime=NEElapsed;return f;}
-struct FakeOrt final:IPreparedFastDvdnetOrtSession{onnx::OrtPreparedCudaRunEvidence ev;int binds=0,runs=0;explicit FakeOrt(onnx::OrtPreparedCudaRunEvidence e):ev(e){} auto evidence()const noexcept->onnx::OrtPreparedCudaRunEvidence override{return ev;} bool PrepareBinding(const onnx::OrtSession::CudaBindingInput*,std::size_t,const onnx::OrtSession::CudaBindingOutput*,std::size_t)noexcept override{++binds;return true;} onnx::OrtPreparedRunResult Execute(const onnx::OrtSession::CudaBindingInput*,std::size_t,const onnx::OrtSession::CudaBindingOutput*,std::size_t,const onnx::OrtPreparedCudaRunEvidence&)noexcept override{++runs;onnx::OrtPreparedRunResult r;r.status=onnx::OrtPreparedRunStatus::success;return r;}void RequestShutdown()noexcept override{}};
-struct FakeOrtFactory final:IPreparedFastDvdnetOrtFactory{onnx::OrtPreparedCudaRunEvidence ev;FakeOrt*made=nullptr;auto Create(const std::filesystem::path&,const onnx::OrtSessionOptions&o,const PreparedCudaFastDvdnetTensorContract&)noexcept->std::unique_ptr<IPreparedFastDvdnetOrtSession> override{if(o.provider_policy!=onnx::OrtProviderPolicy::strict_cuda_only||!o.user_compute_stream||o.enable_tensorrt)return{};auto p=std::make_unique<FakeOrt>(ev);made=p.get();return p;}};
+struct FakeOrt final:IPreparedFastDvdnetOrtSession{onnx::OrtPreparedCudaRunEvidence ev;int binds=0,runs=0,fail_run_at=0;bool binding_valid=true;explicit FakeOrt(onnx::OrtPreparedCudaRunEvidence e,int fail):ev(e),fail_run_at(fail){} auto evidence()const noexcept->onnx::OrtPreparedCudaRunEvidence override{return ev;} bool PrepareBinding(const onnx::OrtSession::CudaBindingInput*i,std::size_t,const onnx::OrtSession::CudaBindingOutput*o,std::size_t)noexcept override{++binds;binding_valid=std::strcmp(i[0].name,"noisy")==0&&std::strcmp(i[1].name,"noise_map")==0&&std::strcmp(o[0].name,"denoised")==0&&i[0].shape[1]==15&&o[0].shape[1]==3;return binding_valid;} onnx::OrtPreparedRunResult Execute(const onnx::OrtSession::CudaBindingInput*i,std::size_t,const onnx::OrtSession::CudaBindingOutput*o,std::size_t,const onnx::OrtPreparedCudaRunEvidence&)noexcept override{++runs;binding_valid=binding_valid&&std::strcmp(i[0].name,"noisy")==0&&i[0].shape[1]==15&&o[0].shape[1]==3;onnx::OrtPreparedRunResult r;r.status=(fail_run_at==runs)?onnx::OrtPreparedRunStatus::inference_failure:onnx::OrtPreparedRunStatus::success;return r;}void RequestShutdown()noexcept override{}};
+struct FakeOrtFactory final:IPreparedFastDvdnetOrtFactory{onnx::OrtPreparedCudaRunEvidence ev;FakeOrt*made=nullptr;int fail_run_at=0;auto Create(const std::filesystem::path&,const onnx::OrtSessionOptions&o,const PreparedCudaFastDvdnetTensorContract&)noexcept->std::unique_ptr<IPreparedFastDvdnetOrtSession> override{if(o.provider_policy!=onnx::OrtProviderPolicy::strict_cuda_only||!o.user_compute_stream||o.enable_tensorrt)return{};auto p=std::make_unique<FakeOrt>(ev,fail_run_at);made=p.get();return p;}};
 } // namespace
 
 int main() {
@@ -182,5 +188,112 @@ int main() {
   ok=Check(nr.status==PreparedCudaFastDvdnetStatus::executed && native.launches==2 && native.copies==2 && factory.made->binds==1 && factory.made->runs==2,"native execute should launch both kernels, fill history, and reuse binding")&&ok;
   auto ns=native_runtime.Shutdown(np.runtime_handle);
   ok=Check(ns.quiescent && native.frees==6,"native shutdown should quiesce and free all six tensors")&&ok;
+
+  auto native_failure_case = [&](int stage) {
+    NativeCudaState state{}; native_state=&state;
+    cuda::CudaDriverApi d; std::string e;
+    bool pass=d.InitializeForTesting(NativeFunctions(),&e)&&d.EnsureContextForDevice(0,&e);
+    auto c=Config(&pack); c.driver=&d;c.owner_context=state.current;
+    c.owner_stream=reinterpret_cast<cuda::CUstream>(9);
+    c.execution_domain.logical_context_generation=d.context_identity()->logical_generation;
+    c.ort_evidence.provider.cuda_context_generation=c.execution_domain.logical_context_generation;
+    c.ort_evidence.provider.requested_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.execution_domain.queue_or_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.available_budget={1ull<<20,1ull<<20,0,0,20,1};
+    FakeOrtFactory f;f.ev=c.ort_evidence;
+    NativePreparedCudaFastDvdnetRuntime r(&f);
+    auto p=r.Prepare(c); pass=pass&&p.status==PreparedCudaFastDvdnetStatus::ready;
+    const auto allocations=r.Telemetry().allocation_requests;
+    if(stage==1)state.fail_launch_at=state.launches+1;
+    if(stage==2)state.fail_copy_at=state.copies+1;
+    if(stage==3)f.made->fail_run_at=f.made->runs+1;
+    if(stage==4)state.fail_launch_at=state.launches+2;
+    if(stage==5)state.fail_record_at=state.records+1;
+    const auto fr=r.Execute(p.runtime_handle,{1,true,{2,2,2,2,2}},input,&output,0.1f);
+    pass=pass&&fr.status!=PreparedCudaFastDvdnetStatus::executed&&state.syncs==1;
+    const auto s=r.Shutdown(p.runtime_handle);
+    pass=pass&&s.quiescent&&state.syncs==2&&state.frees==state.allocs&&
+         r.Telemetry().allocation_requests==allocations;
+    return pass;
+  };
+  for(int stage=1;stage<=5;++stage)
+    ok=Check(native_failure_case(stage),"each partial frame failure must retain then quiesce native work without hot-path allocation")&&ok;
+
+  {
+    NativeCudaState state{}; native_state=&state;
+    cuda::CudaDriverApi d; std::string e;
+    ok=Check(d.InitializeForTesting(NativeFunctions(),&e)&&d.EnsureContextForDevice(0,&e),"warmup failure driver setup")&&ok;
+    auto c=Config(&pack);c.driver=&d;c.owner_context=state.current;c.owner_stream=reinterpret_cast<cuda::CUstream>(9);
+    c.execution_domain.logical_context_generation=d.context_identity()->logical_generation;
+    c.ort_evidence.provider.cuda_context_generation=c.execution_domain.logical_context_generation;
+    c.ort_evidence.provider.requested_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.execution_domain.queue_or_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.available_budget={1ull<<20,1ull<<20,0,0,20,1};
+    FakeOrtFactory f;f.ev=c.ort_evidence;f.fail_run_at=1;
+    NativePreparedCudaFastDvdnetRuntime r(&f);
+    state.fail_syncs=2;
+    auto p=r.Prepare(c);
+    ok=Check(p.status==PreparedCudaFastDvdnetStatus::completion_pending&&p.runtime_handle!=0&&state.frees==0,
+             "failed warmup synchronization must retain a retryable owner")&&ok;
+    ok=Check(r.Prepare(c).status==PreparedCudaFastDvdnetStatus::malformed_contract,
+             "prepare must reject while warmup work remains pending")&&ok;
+    auto s=r.Shutdown(p.runtime_handle);
+    ok=Check(!s.quiescent&&state.frees==0,
+             "failed warmup cleanup must remain retryable")&&ok;
+    s=r.Shutdown(p.runtime_handle);
+    ok=Check(s.quiescent&&state.frees==state.allocs,
+             "explicit shutdown retry must quiesce and release failed warmup")&&ok;
+  }
+
+  for(int failed_memset=1;failed_memset<=2;++failed_memset) {
+    NativeCudaState state{};native_state=&state;cuda::CudaDriverApi d;std::string e;
+    d.InitializeForTesting(NativeFunctions(),&e);d.EnsureContextForDevice(0,&e);
+    auto c=Config(&pack);c.driver=&d;c.owner_context=state.current;c.owner_stream=reinterpret_cast<cuda::CUstream>(9);
+    c.execution_domain.logical_context_generation=d.context_identity()->logical_generation;
+    c.ort_evidence.provider.cuda_context_generation=c.execution_domain.logical_context_generation;
+    c.ort_evidence.provider.requested_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.execution_domain.queue_or_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);c.available_budget={1ull<<20,1ull<<20,0,0,20,1};
+    FakeOrtFactory f;f.ev=c.ort_evidence;NativePreparedCudaFastDvdnetRuntime r(&f);
+    state.fail_memset_at=failed_memset;auto p=r.Prepare(c);
+    ok=Check(p.status==PreparedCudaFastDvdnetStatus::inference_failed&&state.syncs==1&&state.frees==state.allocs,
+             "each partial warmup memset failure must synchronize before release")&&ok;
+  }
+
+  {
+    NativeCudaState state{}; native_state=&state;
+    cuda::CudaDriverApi d;std::string e;d.InitializeForTesting(NativeFunctions(),&e);d.EnsureContextForDevice(0,&e);
+    auto c=Config(&pack);c.driver=&d;c.owner_context=state.current;c.owner_stream=reinterpret_cast<cuda::CUstream>(9);
+    c.execution_domain.logical_context_generation=d.context_identity()->logical_generation;
+    c.ort_evidence.provider.cuda_context_generation=c.execution_domain.logical_context_generation;
+    c.ort_evidence.provider.requested_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.execution_domain.queue_or_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);c.available_budget={1ull<<20,1ull<<20,0,0,20,1};
+    std::string noisy="noisy",noise="noise_map",den="denoised";
+    c.tensors.noisy_name=noisy.c_str();c.tensors.noise_map_name=noise.c_str();c.tensors.denoised_name=den.c_str();
+    FakeOrtFactory f;f.ev=c.ort_evidence;NativePreparedCudaFastDvdnetRuntime r(&f);auto p=r.Prepare(c);
+    noisy.assign("destroyed");noise.assign("destroyed");den.assign("destroyed");
+    auto fr=r.Execute(p.runtime_handle,{1,true,{2,2,2,2,2}},input,&output,0.1f);
+    ok=Check(fr.status==PreparedCudaFastDvdnetStatus::executed&&f.made->binding_valid,
+             "native bindings must own tensor names and shapes beyond caller config lifetime")&&ok;
+    state.not_ready_queries=1;
+    auto s=r.Shutdown(p.runtime_handle);
+    ok=Check(!s.quiescent&&state.frees==0,"event-pending shutdown must retain all owners")&&ok;
+    s=r.Shutdown(p.runtime_handle);
+    ok=Check(s.quiescent&&state.frees==state.allocs,"event cleanup must be retryable")&&ok;
+  }
+  {
+    NativeCudaState state{};native_state=&state;cuda::CudaDriverApi d;std::string e;
+    d.InitializeForTesting(NativeFunctions(),&e);d.EnsureContextForDevice(0,&e);
+    auto c=Config(&pack);c.driver=&d;c.owner_context=state.current;c.owner_stream=reinterpret_cast<cuda::CUstream>(9);
+    c.execution_domain.logical_context_generation=d.context_identity()->logical_generation;
+    c.ort_evidence.provider.cuda_context_generation=c.execution_domain.logical_context_generation;
+    c.ort_evidence.provider.requested_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);
+    c.execution_domain.queue_or_stream_identity=reinterpret_cast<std::uintptr_t>(c.owner_stream);c.available_budget={1ull<<20,1ull<<20,0,0,20,1};
+    FakeOrtFactory f;f.ev=c.ort_evidence;NativePreparedCudaFastDvdnetRuntime r(&f);auto p=r.Prepare(c);
+    cuda::CudaDriverApi replacement;replacement.InitializeForTesting(NativeFunctions(),&e);replacement.EnsureContextForDevice(0,&e);d=std::move(replacement);
+    auto fr=r.Execute(p.runtime_handle,{1,true,{2,2,2,2,2}},input,&output,0.1f);
+    ok=Check(fr.status==PreparedCudaFastDvdnetStatus::device_lost&&state.launches==0,
+             "execute must bind the exact prepared context identity")&&ok;
+    ok=Check(r.Shutdown(p.runtime_handle).quiescent,"replaced-context test cleanup")&&ok;
+  }
   return ok ? 0 : 1;
 }

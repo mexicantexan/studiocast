@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <string>
 
 namespace studiocast::open_video {
 
@@ -56,7 +57,9 @@ public:
 private:
   bool CopyHistory(const cuda::CudaTensor &source,
                    const cuda::CudaTensor &destination) noexcept;
+  bool QuiescePending() noexcept;
   bool Release() noexcept;
+  void Quarantine() noexcept;
 
   IPreparedFastDvdnetOrtFactory *factory_ = nullptr;
   std::unique_ptr<IPreparedFastDvdnetOrtFactory> owned_factory_;
@@ -71,12 +74,17 @@ private:
   std::array<onnx::OrtSession::CudaBindingOutput, 1> outputs_{};
   PreparedCudaFastDvdnetRuntimeTelemetry telemetry_{};
   onnx::OrtPreparedCudaRunEvidence active_ort_evidence_{};
+  cuda::CudaContextIdentity prepared_context_identity_{};
+  std::array<std::string, 3> tensor_names_{};
+  std::array<std::array<std::int64_t, 4>, 3> tensor_shapes_{};
   std::uint64_t handle_ = 0;
   std::uint64_t shutdown_attempts_ = 0;
   bool prepared_ = false;
   bool shutdown_requested_ = false;
   bool work_pending_ = false;
+  bool completion_recorded_ = false;
   bool reset_requested_ = true;
+  cuda::CUresult last_copy_result_ = cuda::CUDA_SUCCESS;
   cuda::CUevent completion_event_ = nullptr;
 };
 

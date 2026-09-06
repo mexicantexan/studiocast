@@ -91,7 +91,8 @@ NativePreparedCudaFastDvdnetRuntime::NativePreparedCudaFastDvdnetRuntime(
 
 NativePreparedCudaFastDvdnetRuntime::~NativePreparedCudaFastDvdnetRuntime() {
   if (prepared_) {
-    Shutdown(handle_);
+    const auto stopped = Shutdown(handle_);
+    if (!stopped.quiescent) Quarantine();
   }
 }
 
@@ -100,7 +101,7 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     const PreparedCudaFastDvdnetConfig &config) noexcept {
   PreparedCudaFastDvdnetRuntimePrepareResult result;
   ++telemetry_.allocation_requests; // candidate/session owner
-  if (prepared_ || !factory_ || !config.driver || !config.owner_context ||
+  if (prepared_ || work_pending_ || !factory_ || !config.driver || !config.owner_context ||
       !config.owner_stream || !config.model_pack || !config.artifact.Valid() ||
       !config.ort_evidence.provider.ValidStrictCuda() ||
       config.ort_evidence.provider.explicit_stream_synchronization ||
@@ -126,6 +127,17 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   const int w = static_cast<int>(config.tensors.noisy_shape[3]);
   const int h = static_cast<int>(config.tensors.noisy_shape[2]);
   config_ = config;
+  prepared_context_identity_ = *identity;
+  tensor_names_ = {config.tensors.noisy_name, config.tensors.noise_map_name,
+                   config.tensors.denoised_name};
+  tensor_shapes_ = {config.tensors.noisy_shape, config.tensors.noise_map_shape,
+                    config.tensors.denoised_shape};
+  config_.tensors.noisy_name = tensor_names_[0].c_str();
+  config_.tensors.noise_map_name = tensor_names_[1].c_str();
+  config_.tensors.denoised_name = tensor_names_[2].c_str();
+  config_.tensors.noisy_shape = tensor_shapes_[0];
+  config_.tensors.noise_map_shape = tensor_shapes_[1];
+  config_.tensors.denoised_shape = tensor_shapes_[2];
   std::string error;
   for (auto &slot : history_) {
     slot = std::make_unique<cuda::CudaTensor>();
@@ -168,15 +180,15 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     Release(); return result;
   }
   active_ort_evidence_ = session_->evidence();
-  inputs_[0] = {config.tensors.noisy_name,
+  inputs_[0] = {config_.tensors.noisy_name,
                 reinterpret_cast<const float *>(noisy_.ptr),
-                noisy_.ElementCount(), config.tensors.noisy_shape.data(), 4};
-  inputs_[1] = {config.tensors.noise_map_name,
+                noisy_.ElementCount(), config_.tensors.noisy_shape.data(), 4};
+  inputs_[1] = {config_.tensors.noise_map_name,
                 reinterpret_cast<const float *>(noise_map_.ptr),
-                noise_map_.ElementCount(), config.tensors.noise_map_shape.data(), 4};
-  outputs_[0] = {config.tensors.denoised_name,
+                noise_map_.ElementCount(), config_.tensors.noise_map_shape.data(), 4};
+  outputs_[0] = {config_.tensors.denoised_name,
                  reinterpret_cast<float *>(denoised_.ptr),
-                 denoised_.ElementCount(), config.tensors.denoised_shape.data(), 4};
+                 denoised_.ElementCount(), config_.tensors.denoised_shape.data(), 4};
   ++telemetry_.binding_constructions;
   if (!session_->PrepareBinding(inputs_.data(), inputs_.size(), outputs_.data(),
                                 outputs_.size())) {
@@ -184,15 +196,28 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     Release(); return result;
   }
   // Warmup uses zeroed resident tensors; no host tensor or image is involved.
-  if (!config.driver->MemsetD8Async(noisy_.ptr, 0, noisy_.bytes,
-                                    config.owner_stream, nullptr) ||
-      !config.driver->MemsetD8Async(noise_map_.ptr, 0, noise_map_.bytes,
-                                    config.owner_stream, nullptr) ||
-      !session_->Execute(inputs_.data(), inputs_.size(), outputs_.data(),
-                         outputs_.size(), active_ort_evidence_).ok() ||
-      !config.driver->StreamSynchronize(config.owner_stream, nullptr)) {
+  work_pending_ = true;
+  completion_recorded_ = false;
+  const bool warmup_ok =
+      config.driver->MemsetD8Async(noisy_.ptr, 0, noisy_.bytes,
+                                   config.owner_stream, nullptr) &&
+      config.driver->MemsetD8Async(noise_map_.ptr, 0, noise_map_.bytes,
+                                   config.owner_stream, nullptr) &&
+      session_->Execute(inputs_.data(), inputs_.size(), outputs_.data(),
+                        outputs_.size(), active_ort_evidence_).ok();
+  const bool warmup_quiescent = QuiescePending();
+  if (!warmup_ok || !warmup_quiescent) {
     result.status = PreparedCudaFastDvdnetStatus::inference_failed;
-    Release(); return result;
+    if (warmup_quiescent) Release();
+    else {
+      handle_ = g_next_handle.fetch_add(1, std::memory_order_relaxed);
+      if (handle_ == 0) handle_ = g_next_handle.fetch_add(1);
+      prepared_ = true;
+      shutdown_requested_ = true;
+      result.status = PreparedCudaFastDvdnetStatus::completion_pending;
+      result.runtime_handle = handle_;
+    }
+    return result;
   }
   handle_ = g_next_handle.fetch_add(1, std::memory_order_relaxed);
   if (handle_ == 0) handle_ = g_next_handle.fetch_add(1);
@@ -225,8 +250,9 @@ bool NativePreparedCudaFastDvdnetRuntime::CopyHistory(
   copy.dstPitch = destination.bytes;
   copy.WidthInBytes = source.bytes;
   copy.Height = 1;
-  const bool ok = config_.driver->f().cuMemcpy2DAsync(&copy, config_.owner_stream) ==
-                  cuda::CUDA_SUCCESS;
+  last_copy_result_ =
+      config_.driver->f().cuMemcpy2DAsync(&copy, config_.owner_stream);
+  const bool ok = last_copy_result_ == cuda::CUDA_SUCCESS;
   if (ok) ++telemetry_.internal_device_copies;
   return ok;
 }
@@ -242,10 +268,12 @@ NativePreparedCudaFastDvdnetRuntime::Execute(
   if (shutdown_requested_) {
     result.status = PreparedCudaFastDvdnetStatus::shutdown; return result;
   }
-  if (config_.driver->BindPreparedContext(*config_.driver->context_identity()) !=
+  if (config_.driver->BindPreparedContext(prepared_context_identity_) !=
       cuda::CUDA_SUCCESS) {
     result.status = PreparedCudaFastDvdnetStatus::device_lost; return result;
   }
+  work_pending_ = true;
+  completion_recorded_ = false;
   const bool reset = temporal.reset || reset_requested_;
   if (!cuda::kernels::LaunchFastDvdnetPreprocess(
           kernels_, input, *history_[0], *history_[1], *history_[2], noisy_,
@@ -258,7 +286,9 @@ NativePreparedCudaFastDvdnetRuntime::Execute(
   }
   if (reset && (!CopyHistory(*history_[2], *history_[0]) ||
                 !CopyHistory(*history_[2], *history_[1]))) {
-    result.status = PreparedCudaFastDvdnetStatus::preprocess_failed;
+    result.status = cuda::IsCudaDeviceLossResult(last_copy_result_)
+                        ? PreparedCudaFastDvdnetStatus::device_lost
+                        : PreparedCudaFastDvdnetStatus::preprocess_failed;
     result.failed_operation = PreparedCudaFastDvdnetOperation::temporal_preprocess;
     return result;
   }
@@ -285,7 +315,7 @@ NativePreparedCudaFastDvdnetRuntime::Execute(
     result.failed_operation = PreparedCudaFastDvdnetOperation::completion_wait;
     return result;
   }
-  work_pending_ = true;
+  completion_recorded_ = true;
   std::swap(history_[0], history_[1]);
   std::swap(history_[1], history_[2]);
   reset_requested_ = false;
@@ -301,7 +331,22 @@ PreparedCudaFastDvdnetStatus NativePreparedCudaFastDvdnetRuntime::ResetTemporalS
   return PreparedCudaFastDvdnetStatus::ready;
 }
 
+bool NativePreparedCudaFastDvdnetRuntime::QuiescePending() noexcept {
+  if (!work_pending_) return true;
+  if (completion_recorded_) {
+    const auto query = config_.driver->f().cuEventQuery(completion_event_);
+    if (query == cuda::CUDA_SUCCESS) { work_pending_ = false; return true; }
+    if (query == cuda::CUDA_ERROR_NOT_READY) return false;
+  }
+  if (!config_.driver->StreamSynchronize(config_.owner_stream, nullptr))
+    return false;
+  work_pending_ = false;
+  completion_recorded_ = false;
+  return true;
+}
+
 bool NativePreparedCudaFastDvdnetRuntime::Release() noexcept {
+  if (work_pending_) return false;
   bool ok = true;
   // Drop IoBinding/tensor wrappers before releasing their backing allocations.
   session_.reset();
@@ -312,13 +357,26 @@ bool NativePreparedCudaFastDvdnetRuntime::Release() noexcept {
   if (kernels_.live) ok = cuda::kernels::DestroyFastDvdnetKernels(&kernels_, nullptr) && ok;
   for (auto &slot : history_) {
     if (slot && slot->owns_memory) ok = slot->Free(config_.driver, nullptr) && ok;
-    if (ok) slot.reset();
+    if (slot && !slot->owns_memory) slot.reset();
   }
   if (noisy_.owns_memory) ok = noisy_.Free(config_.driver, nullptr) && ok;
   if (noise_map_.owns_memory) ok = noise_map_.Free(config_.driver, nullptr) && ok;
   if (denoised_.owns_memory) ok = denoised_.Free(config_.driver, nullptr) && ok;
-  if (ok) { prepared_ = false; handle_ = 0; config_ = {}; active_ort_evidence_ = {}; }
+  if (ok) { prepared_ = false; handle_ = 0; config_ = {}; active_ort_evidence_ = {};
+    prepared_context_identity_ = {}; tensor_names_ = {}; tensor_shapes_ = {}; }
   return ok;
+}
+
+void NativePreparedCudaFastDvdnetRuntime::Quarantine() noexcept {
+  // Deliberately retain every owner when CUDA cannot prove quiescence.
+  (void)session_.release();
+  for (auto &slot : history_) (void)slot.release();
+  noisy_.owns_memory = false;
+  noise_map_.owns_memory = false;
+  denoised_.owns_memory = false;
+  completion_event_ = nullptr;
+  kernels_ = {};
+  prepared_ = false;
 }
 
 PreparedCudaFastDvdnetShutdownSnapshot
@@ -328,14 +386,8 @@ NativePreparedCudaFastDvdnetRuntime::Shutdown(std::uint64_t handle) noexcept {
     return {PreparedCudaFastDvdnetStatus::foreign_handle, shutdown_attempts_, true, false};
   shutdown_requested_ = true;
   if (session_) session_->RequestShutdown();
-  if (work_pending_) {
-    const auto query = config_.driver->f().cuEventQuery(completion_event_);
-    if (query == cuda::CUDA_ERROR_NOT_READY)
-      return {PreparedCudaFastDvdnetStatus::completion_pending, shutdown_attempts_, true, false};
-    if (query != cuda::CUDA_SUCCESS)
-      return {PreparedCudaFastDvdnetStatus::device_lost, shutdown_attempts_, true, false};
-    work_pending_ = false;
-  }
+  if (!QuiescePending())
+    return {PreparedCudaFastDvdnetStatus::completion_pending, shutdown_attempts_, true, false};
   const bool released = Release();
   return {released ? PreparedCudaFastDvdnetStatus::shutdown
                    : PreparedCudaFastDvdnetStatus::completion_pending,

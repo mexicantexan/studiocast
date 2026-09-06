@@ -107,6 +107,18 @@ PreparedCudaFastDvdnetDenoiser::Prepare(
   const auto prepared = runtime_->Prepare(config);
   result.status = prepared.status;
   result.reserved_budget = prepared.reserved_budget;
+  if (prepared.status == PreparedCudaFastDvdnetStatus::completion_pending &&
+      prepared.runtime_handle != 0) {
+    config_ = config;
+    runtime_handle_ = prepared.runtime_handle;
+    handle_ = {runtime_handle_, config.configuration_generation,
+               config.model_generation};
+    prepared_ = true;
+    shutdown_requested_ = true;
+    result.handle = handle_;
+    result.reason = hal::ReasonId::synchronization_failed;
+    return result;
+  }
   if (prepared.status != PreparedCudaFastDvdnetStatus::ready ||
       prepared.runtime_handle == 0 || !prepared.reusable_bindings ||
       !prepared.warmup_complete || !prepared.strict_cuda_only ||
@@ -248,6 +260,7 @@ void PreparedCudaFastDvdnetDenoiser::Clear() noexcept {
   have_sequence_ = false;
   prepared_ = false;
   quarantined_ = false;
+  shutdown_requested_ = false;
 }
 
 PreparedCudaFastDvdnetShutdownSnapshot PreparedCudaFastDvdnetDenoiser::Shutdown(
