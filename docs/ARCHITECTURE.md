@@ -52,7 +52,9 @@ backends:
 runtime:
   audio_runtime ---> audio_support, config, contracts, Maxine, Open Audio
   video_execution_runtime ---> hal_runtime
-  video_runtime ---> contracts, CUDA, Maxine, Open Video, Vulkan,
+  video_backend_composition ---> video_execution_runtime; privately owns
+                                  Maxine, Open Video, Vulkan
+  video_runtime ---> contracts, video_backend_composition,
                      video_execution_runtime, video I/O and support
   runtime_config --> audio_runtime, config, video_runtime
   studiocast_core --> runtime_config, ipc, probe_support
@@ -82,13 +84,14 @@ Each arrow points from a dependent to its dependency.
   support; `studiocast_video_execution_runtime` owns the fixed-capacity
   backend-neutral prepared execution facade and typed capability/live-status
   snapshots; and `studiocast_video_runtime` owns the existing camera pipeline
-  and virtual-camera composition. Neutral planning and ownership are the
-  intended architecture, but reaching that ownership boundary is not evidence
-  that existing behavior has reached parity. During staged migration the
-  latter retains legacy backend composition dependencies and bounded
-  compatibility routes; those edges and routes may be removed only after each
-  live family passes the parity, rollback, qualification, and release gates in
-  [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md).
+  and virtual-camera composition. `studiocast_video_backend_composition`
+  privately owns the optional Maxine, Open Video, and Vulkan dependencies and
+  exposes the neutral execution surface consumed by the video runtime.
+  Reaching that ownership boundary is not evidence that existing behavior has
+  reached parity. Bounded compatibility routes must preserve working behavior
+  until each live family passes the parity and rollback gates in
+  [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Release qualification
+  remains a separate gate after local parity completion.
 - `studiocast_cuda_support` owns the runtime-loaded CUDA driver wrapper,
   buffers, and embedded kernels without a CUDA toolkit dependency. Its
   canonical API is `core/cuda/cuda_driver_api.h` in namespace

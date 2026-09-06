@@ -510,13 +510,14 @@ must build without optional SDK headers, vendor libraries, or backend feature
 definitions. The intended end state is neutral planning and runtime ownership,
 but an ownership cutover is not evidence of behavioral parity. Complete the
 existing Open CUDA effect behavior first, including `auto` fallback and effect
-combinations such as Auto Frame, before using the removal and release gates in
+combinations such as Auto Frame, before using the route-removal gates in
 [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Bounded compatibility may
 preserve working behavior during that migration. It must stay observable and
-must not be described as prepared-route completion. The current staged
-migration still leaves optional backend dependencies on
-`studiocast_video_runtime`; do not treat that transitional edge as permission
-to put vendor types in neutral contracts.
+must not be described as prepared-route completion. The static
+`studiocast_video_backend_composition` target privately owns optional Maxine,
+Open Video, and Vulkan dependencies; `studiocast_video_runtime` consumes its
+neutral surface and must not acquire direct optional-backend dependencies or
+vendor types.
 
 Key concepts:
 

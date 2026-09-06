@@ -20,7 +20,10 @@ CUDA requests, `auto` selection and fallback, each already supported effect,
 and supported combinations and dependencies such as Auto Frame. The current
 prepared CUDA route does not yet cover every one of these cases. Uncovered
 behavior must remain on a bounded compatibility route or remain explicitly
-blocked; neutral ownership must not be used to claim that it is fixed.
+blocked; neutral ownership must not be used to claim that it is fixed. Any
+regression of behavior that worked before the migration must be restored for
+the CUDA parity milestone. A compatibility route is temporary preservation,
+not an acceptable permanent parity result.
 
 After CUDA parity, expand production Vulkan in bounded phases. Each phase must
 name its effects, adapter and execution-domain contract, models and artifacts,
@@ -64,13 +67,15 @@ known parity gap is open. Its effect coverage must be explicit in typed status,
 it must obey strict-selection and GPU-only rules, and it must not be counted as
 prepared-HAL capability or completion evidence.
 
-## Removal, qualification, and release gate
+## Route-removal gate
 
 A compatibility route or legacy direct dependency may be eliminated only when
 the family parity evidence above is reviewed and the replacement is enabled in
 the same configurations and supported hardware contexts as the working route.
 The change must include a tested rollback boundary. Source ownership or CMake
 dependency cleanup is insufficient evidence by itself.
+
+## Qualification and release gate
 
 A production capability or release note may claim only the exact effects and
 hardware covered by reviewed evidence. Synthetic adapters, loader/device
@@ -82,6 +87,8 @@ must retain the existing policies in [PIPELINE_POLICY.md](PIPELINE_POLICY.md),
 evidence such as
 [INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md).
 
-Until every applicable gate is satisfied, documentation and PR text must name
-the remaining compatibility or blocked routes and avoid claiming end-to-end
-parity, production readiness, or release completion.
+Local family parity completion does not itself qualify a production capability
+or release. Until every applicable release gate is satisfied, documentation
+and PR text must name the remaining compatibility or blocked routes and avoid
+claiming production readiness or release completion. Until the family parity
+gate is satisfied, they must also avoid claiming end-to-end parity.

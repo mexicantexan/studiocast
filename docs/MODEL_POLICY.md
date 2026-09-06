@@ -276,4 +276,3 @@ Before accepting a model-related change, answer these questions:
 - Is there a list/self-test/benchmark path for users and support?
 - Are latency and CPU/GPU transfer implications consistent with
   `docs/LATENCY_POLICY.md` and `docs/PIPELINE_POLICY.md`?
-
