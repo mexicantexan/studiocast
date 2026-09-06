@@ -21,6 +21,8 @@ namespace {
 
 constexpr auto kProvider =
     hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+constexpr auto kNativeProvider =
+    hal::SemanticEffectProviderId::open_cuda_production_kernels;
 constexpr std::uint64_t kHashOffset = UINT64_C(1469598103934665603);
 constexpr std::uint64_t kHashPrime = UINT64_C(1099511628211);
 
@@ -142,8 +144,7 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
                        std::uint32_t stage_count,
                        hal::ResourceBudget *budget) noexcept {
   if (budget == nullptr || frame_width == 0 || frame_height == 0 ||
-      output_width == 0 || output_height == 0 || model_width == 0 ||
-      model_height == 0) {
+      output_width == 0 || output_height == 0) {
     return false;
   }
   std::uint64_t rgb_row = 0;
@@ -158,7 +159,9 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
   std::uint64_t output_boundary = 0;
   std::uint64_t output_rgb_row = 0;
   std::uint64_t output_device = 0;
-  if (!AlignRow(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
+  const bool model_free = semantic == hal::SemanticEffectId::vignette;
+  if ((!model_free && (model_width == 0 || model_height == 0)) ||
+      !AlignRow(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
       !AlignRow(static_cast<std::uint64_t>(frame_width) * 4u, &alpha_row) ||
       !Multiply(rgb_row, frame_height, &frame_rgb) ||
       !Multiply(alpha_row, frame_height, &frame_alpha) ||
@@ -179,6 +182,23 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
   }
 
   hal::ResourceBudget result;
+  if (model_free) {
+    if (!Add(frame_rgb, &result.persistent_bytes) ||
+        !Add(frame_rgb, &result.persistent_bytes) ||
+        ((output_width != frame_width || output_height != frame_height) &&
+         !Add(output_device, &result.persistent_bytes)))
+      return false;
+    result.scratch_bytes = 1;
+    result.upload_staging_bytes = boundary;
+    result.readback_staging_bytes = output_boundary;
+    // Two device images, two pinned transfer buffers, and three transfer
+    // events are always owned by the prepared native stage.
+    result.resource_count = 7u +
+        ((output_width != frame_width || output_height != frame_height) ? 1u : 0u);
+    result.in_flight_slots = 1;
+    *budget = result;
+    return true;
+  }
   if (!Add(frame_rgb, &result.persistent_bytes) ||
       !Add(frame_rgb, &result.persistent_bytes) ||
       !Add(model_alpha, &result.persistent_bytes) ||
@@ -348,16 +368,27 @@ bool VirtualBackground(hal::SemanticEffectId semantic) noexcept {
          semantic == hal::SemanticEffectId::virtual_background_replace;
 }
 
+hal::SemanticEffectProviderId ProviderFor(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::vignette ? kNativeProvider : kProvider;
+}
+
 bool PreparedSemantics(
     const video::NormalizedVideoExecutionIntent &intent) noexcept {
-  return (intent.stage_count == 1 &&
+  const bool vignette_last = intent.stage_count != 0 &&
+      intent.stages[intent.stage_count - 1].intent.semantic ==
+          hal::SemanticEffectId::vignette;
+  const std::size_t model_count = intent.stage_count - (vignette_last ? 1u : 0u);
+  if (model_count == 0)
+    return vignette_last;
+  return ((model_count == 1 &&
           (VirtualBackground(intent.stages[0].intent.semantic) ||
            intent.stages[0].intent.semantic ==
                hal::SemanticEffectId::virtual_key_light)) ||
-         (intent.stage_count == 2 &&
+         (model_count == 2 &&
           VirtualBackground(intent.stages[0].intent.semantic) &&
           intent.stages[1].intent.semantic ==
-              hal::SemanticEffectId::virtual_key_light);
+              hal::SemanticEffectId::virtual_key_light)) &&
+         model_count + (vignette_last ? 1u : 0u) == intent.stage_count;
 }
 
 hal::ExecutionDomainId
@@ -586,11 +617,13 @@ public:
     }
     if (!PreparedSemantics(caller.intent)) {
       return Failure(hal::StatusId::blocked,
-                     caller.intent.stage_count > 2
+                     caller.intent.stage_count > 3
                          ? hal::ReasonId::cross_adapter_residency_forbidden
                          : hal::ReasonId::semantic_effect_unsupported);
     }
     const auto &stage = caller.intent.stages[0];
+    const bool has_model_consumer =
+        stage.intent.semantic != hal::SemanticEffectId::vignette;
     if (!TightRgb24(caller.host_input, hal::Mutability::read_only) ||
         !TightRgb24(caller.host_output, hal::Mutability::write_only)) {
       return Failure(hal::StatusId::blocked,
@@ -606,19 +639,22 @@ public:
     try {
       open_video::ModelPack pack;
       open_video::ValidatedModelArtifactIdentity artifact;
-      const bool model_resolved =
-          dependencies_.resolve_model
+      const bool model_resolved = !has_model_consumer ||
+          (dependencies_.resolve_model
               ? dependencies_.resolve_model(
                     dependencies_.context, stage,
                     request.effects.virtual_background.model_id, &pack,
                     &artifact)
               : ResolveModel(stage, request.effects.virtual_background.model_id,
-                             &pack, &artifact);
+                             &pack, &artifact));
       if (!model_resolved) {
         return Failure(hal::StatusId::unavailable,
                        hal::ReasonId::capability_evidence_incomplete);
       }
-      const auto &matting = *pack.matting;
+      const std::uint32_t model_width = has_model_consumer
+          ? static_cast<std::uint32_t>(pack.matting->input.width) : 0u;
+      const std::uint32_t model_height = has_model_consumer
+          ? static_cast<std::uint32_t>(pack.matting->input.height) : 0u;
       std::vector<std::uint8_t> replacement_rgb;
       int replacement_width = 0;
       int replacement_height = 0;
@@ -637,8 +673,7 @@ public:
       if (!ResourceBudgetFor(
               caller.host_input.width, caller.host_input.height,
               caller.host_output.width, caller.host_output.height,
-              static_cast<std::uint32_t>(matting.input.width),
-              static_cast<std::uint32_t>(matting.input.height),
+              model_width, model_height,
               stage.intent.semantic, strength,
               static_cast<std::uint32_t>(replacement_width),
               static_cast<std::uint32_t>(replacement_height),
@@ -664,13 +699,19 @@ public:
       factory.stage_count = caller.intent.stage_count;
       for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
         factory.semantics[index] = caller.intent.stages[index].intent.semantic;
-        factory.models[index].model_id_hash = artifact.model_id_sha256;
-        factory.models[index].artifact_set_hash = artifact.artifact_set_sha256;
-        factory.models[index].artifact_generation =
-            artifact.registry_generation;
+        if (caller.intent.stages[index].intent.semantic !=
+            hal::SemanticEffectId::vignette) {
+          factory.models[index].model_id_hash = artifact.model_id_sha256;
+          factory.models[index].artifact_set_hash = artifact.artifact_set_sha256;
+          factory.models[index].artifact_generation = artifact.registry_generation;
+        }
       }
       factory.generations = caller.invalidation_key.generations;
-      factory.generations.model = artifact.registry_generation;
+      factory.generations.model = has_model_consumer
+                                      ? artifact.registry_generation
+                                      : std::max<std::uint64_t>(
+                                            caller.invalidation_key.generations.model,
+                                            1);
       if (factory.generations.provider == 0)
         factory.generations.provider = 1;
       if (factory.generations.device == 0)
@@ -682,8 +723,10 @@ public:
       factory.backend.model_artifact = artifact;
       factory.backend.configuration_generation =
           factory.generations.configuration;
-      factory.backend.model_preprocess_generation = factory.generations.model;
-      factory.backend.model_artifact_hash = HashArtifact(artifact);
+      factory.backend.model_preprocess_generation =
+          has_model_consumer ? factory.generations.model : 0;
+      factory.backend.model_artifact_hash =
+          has_model_consumer ? HashArtifact(artifact) : 0;
       factory.backend.strength = strength;
       factory.backend.remove_background_rgb = RemoveColor(stage);
       factory.backend.replacement_rgb = std::move(replacement_rgb);
@@ -695,6 +738,7 @@ public:
           request.effects.virtual_key_light.temperature_preset;
       factory.backend.key_light_direction_pan_degrees =
           request.effects.virtual_key_light.direction_pan_degrees;
+      factory.backend.vignette_intensity = request.effects.vignette.intensity;
       factory.backend.wait_policy.timeout_nanoseconds =
           request.wait.timeout_nanoseconds;
       factory.backend.wait_policy.poll_interval_nanoseconds =
@@ -709,12 +753,12 @@ public:
       factory.backend.wait_policy.poll_wait = request.wait.poll_wait;
       factory.backend.wait_policy.callback_context =
           request.wait.callback_context;
-      factory.model_artifact_validated = true;
+      factory.model_artifact_validated = has_model_consumer;
       factory.provider_runtime_validated = true;
-      factory.cuda_iobinding_validated = true;
+      factory.cuda_iobinding_validated = has_model_consumer;
       factory.user_stream_bound = true;
       factory.reusable_resources_supported = true;
-      factory.device_preprocess_supported = true;
+      factory.device_preprocess_supported = has_model_consumer;
       factory.device_postprocess_supported = true;
       factory.stop_aware_bounded_wait = true;
       factory.allocation_free_execute = true;
@@ -738,13 +782,16 @@ public:
       result.readiness = bootstrap.setup_lease.readiness;
       if (!IsSetupSuccess(result.status) || !result.lease.live())
         return result;
-      if (bootstrap.setup_lease.artifact_count != caller.intent.stage_count ||
+      const std::size_t expected_artifact_count =
+          has_model_consumer ? caller.intent.stage_count -
+              (caller.intent.stages[caller.intent.stage_count - 1].intent.semantic ==
+                   hal::SemanticEffectId::vignette ? 1u : 0u) : 0u;
+      if (bootstrap.setup_lease.artifact_count != expected_artifact_count ||
           bootstrap.setup_lease.generations.configuration !=
               factory.generations.configuration ||
           bootstrap.setup_lease.generations.geometry !=
               factory.generations.geometry ||
-          bootstrap.setup_lease.generations.model !=
-              factory.generations.model ||
+          bootstrap.setup_lease.generations.model != factory.generations.model ||
           bootstrap.setup_lease.generations.provider !=
               factory.generations.provider ||
           bootstrap.setup_lease.generations.device !=
@@ -756,10 +803,14 @@ public:
       expected_artifact.model_id_hash = artifact.model_id_sha256;
       expected_artifact.artifact_set_hash = artifact.artifact_set_sha256;
       expected_artifact.artifact_generation = artifact.registry_generation;
+      std::size_t artifact_index = 0;
       for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
-        const auto &leased = bootstrap.setup_lease.artifacts[index];
+        if (caller.intent.stages[index].intent.semantic ==
+            hal::SemanticEffectId::vignette)
+          continue;
+        const auto &leased = bootstrap.setup_lease.artifacts[artifact_index++];
         if (leased.semantic != caller.intent.stages[index].intent.semantic ||
-            leased.provider != kProvider ||
+            leased.provider != ProviderFor(caller.intent.stages[index].intent.semantic) ||
             leased.artifact.model_id_hash != expected_artifact.model_id_hash ||
             leased.artifact.artifact_set_hash !=
                 expected_artifact.artifact_set_hash ||
@@ -773,17 +824,25 @@ public:
       result.plan = caller;
       if (setup_output_tail)
         result.plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
-      for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
-        result.plan.intent.stages[index].model =
-            bootstrap.setup_lease.artifacts[index].artifact;
+      artifact_index = 0;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        if (caller.intent.stages[index].intent.semantic ==
+            hal::SemanticEffectId::vignette) {
+          result.plan.intent.stages[index].model = {};
+        } else {
+          result.plan.intent.stages[index].model =
+              bootstrap.setup_lease.artifacts[artifact_index++].artifact;
+        }
+      }
       result.plan.invalidation_key.generations =
           bootstrap.setup_lease.generations;
-      result.plan.invalidation_key.model_artifact_hash = HashArtifact(artifact);
+      result.plan.invalidation_key.model_artifact_hash =
+          has_model_consumer ? HashArtifact(artifact) : 0;
       result.plan.invalidation_key.execution_domain_hash =
           video::ProductionVideoExecutionDomainHash(
               bootstrap.setup_lease.execution_domain);
       result.plan.budget = bootstrap.setup_lease.reserved_budget;
-      if (stage.intent.semantic != hal::SemanticEffectId::virtual_key_light) {
+      if (VirtualBackground(stage.intent.semantic)) {
         auto &selection =
             result.model_selections[result.model_selection_count++];
         selection.semantic = stage.intent.semantic;

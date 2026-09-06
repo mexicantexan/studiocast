@@ -90,10 +90,19 @@ public:
     snapshot_.readiness.status = hal::StatusId::ready;
     snapshot_.readiness.requested_backend = hal::BackendId::cuda;
     snapshot_.readiness.selected_backend = hal::BackendId::cuda;
+    const bool has_vignette =
+        plan.intent.stages[plan.intent.stage_count - 1].intent.semantic ==
+        hal::SemanticEffectId::vignette;
+    const bool has_model = plan.intent.stage_count > (has_vignette ? 1u : 0u);
     snapshot_.readiness.provider =
-        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+        has_model && has_vignette
+            ? hal::SemanticEffectProviderId::invalid
+            : has_model
+                  ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
+                  : hal::SemanticEffectProviderId::open_cuda_production_kernels;
     snapshot_.readiness.execution_domain = FakeCudaDomain();
-    snapshot_.readiness.ready_stage_mask = 1;
+    snapshot_.readiness.ready_stage_mask =
+        (std::uint32_t{1} << plan.intent.stage_count) - 1u;
     snapshot_.readiness.available = true;
   }
   video::VideoExecutionFrameResult
@@ -198,8 +207,15 @@ public:
     video::VideoAdapterFactoryPreflight result;
     result.status = hal::StatusId::ready;
     result.backend = hal::BackendId::cuda;
-    result.provider =
-        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    const bool has_vignette = request.intent.stages[request.intent.stage_count - 1]
+                                  .intent.semantic ==
+                              hal::SemanticEffectId::vignette;
+    const bool has_model = request.intent.stage_count > (has_vignette ? 1u : 0u);
+    result.provider = has_model && has_vignette
+                          ? hal::SemanticEffectProviderId::invalid
+                          : has_model
+                                ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
+                                : hal::SemanticEffectProviderId::open_cuda_production_kernels;
     result.execution_domain = FakeCudaDomain();
     result.readiness.status = hal::StatusId::ready;
     result.readiness.requested_backend = hal::BackendId::cuda;
@@ -240,7 +256,9 @@ public:
       auto &stage = program.stages[index];
       stage.stage_id = resolved.intent.stage_id;
       stage.semantic = resolved.intent.semantic;
-      stage.provider = result.provider;
+      stage.provider = resolved.intent.semantic == hal::SemanticEffectId::vignette
+                           ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+                           : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
       stage.backend = hal::BackendId::cuda;
       stage.execution_domain = FakeCudaDomain();
       stage.input.kind = hal::StageIoKind::image;
@@ -328,6 +346,7 @@ hal::StatusId AcquireFakeLease(
   }
   auto owner = std::make_unique<FakeOwner>();
   video::ProductionVideoSetupLeaseSnapshot snapshot;
+  snapshot.contract_version = video::kProductionVideoSetupLeaseContractVersion;
   snapshot.state = video::ProductionVideoSetupLeaseState::live;
   snapshot.status = hal::StatusId::ready;
   snapshot.backend = hal::BackendId::cuda;
@@ -335,17 +354,25 @@ hal::StatusId AcquireFakeLease(
   snapshot.generations = request.generations;
   snapshot.generations.context = FakeCudaDomain().logical_context_generation;
   snapshot.reserved_budget = request.reserved_budget;
-  snapshot.providers[0] =
-      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
-  snapshot.provider_count = 1;
+  const bool has_vignette = request.semantics[request.stage_count - 1] ==
+                            hal::SemanticEffectId::vignette;
+  const bool has_model = request.stage_count > (has_vignette ? 1u : 0u);
+  if (has_model)
+    snapshot.providers[snapshot.provider_count++] =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  if (has_vignette)
+    snapshot.providers[snapshot.provider_count++] =
+        hal::SemanticEffectProviderId::open_cuda_production_kernels;
   for (std::size_t index = 0; index < request.stage_count; ++index) {
-    snapshot.artifacts[index].semantic = request.semantics[index];
-    snapshot.artifacts[index].provider = snapshot.providers[0];
-    snapshot.artifacts[index].artifact = request.models[index];
+    if (request.semantics[index] == hal::SemanticEffectId::vignette)
+      continue;
+    auto &leased = snapshot.artifacts[snapshot.artifact_count++];
+    leased.semantic = request.semantics[index];
+    leased.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    leased.artifact = request.models[index];
   }
-  if (state->mismatch_artifact)
+  if (state->mismatch_artifact && snapshot.artifact_count != 0)
     ++snapshot.artifacts[0].artifact.model_id_hash[0];
-  snapshot.artifact_count = request.stage_count;
   snapshot.adapter.adapter_instance_id = kFakeAdapter;
   snapshot.adapter.backend = hal::BackendId::cuda;
   snapshot.adapter.execution_domain = FakeCudaDomain();
@@ -354,7 +381,9 @@ hal::StatusId AcquireFakeLease(
   for (std::size_t index = 0; index < request.stage_count; ++index) {
     auto &capability = snapshot.adapter.semantic_capabilities[index];
     capability.semantic = request.semantics[index];
-    capability.provider = snapshot.providers[0];
+    capability.provider = request.semantics[index] == hal::SemanticEffectId::vignette
+                              ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+                              : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
     capability.status = hal::StatusId::ready;
     capability.live_stage = true;
     capability.production_eligible = true;
@@ -365,7 +394,9 @@ hal::StatusId AcquireFakeLease(
     capability.cpu_tail_placement =
         hal::DeclaredCpuTail::Placement::after_stage;
     capability.evidence[0].code =
-        hal::CapabilityEvidenceCode::model_artifact_identity_valid;
+        request.semantics[index] == hal::SemanticEffectId::vignette
+            ? hal::CapabilityEvidenceCode::synchronization_evidence_valid
+            : hal::CapabilityEvidenceCode::model_artifact_identity_valid;
     capability.evidence[0].status = hal::StatusId::ready;
     capability.evidence[0].semantic = request.semantics[index];
     capability.evidence[0].backend = hal::BackendId::cuda;
@@ -376,7 +407,9 @@ hal::StatusId AcquireFakeLease(
   snapshot.factory.factory_id = kFakeFactory;
   snapshot.factory.route = video::VideoExecutionRoute::prepared_resident;
   snapshot.factory.backend = hal::BackendId::cuda;
-  snapshot.factory.provider = snapshot.providers[0];
+  snapshot.factory.provider = has_model && has_vignette
+                                  ? hal::SemanticEffectProviderId::invalid
+                                  : snapshot.providers[0];
   snapshot.factory.adapter_instance_id = kFakeAdapter;
   snapshot.factory.execution_domain = FakeCudaDomain();
   snapshot.factory.selection_priority = 100;
@@ -384,7 +417,7 @@ hal::StatusId AcquireFakeLease(
   snapshot.readiness.status = hal::StatusId::ready;
   snapshot.readiness.requested_backend = hal::BackendId::cuda;
   snapshot.readiness.selected_backend = hal::BackendId::cuda;
-  snapshot.readiness.provider = snapshot.providers[0];
+  snapshot.readiness.provider = snapshot.factory.provider;
   snapshot.readiness.execution_domain = FakeCudaDomain();
   snapshot.readiness.ready_stage_mask =
       (std::uint32_t{1} << request.stage_count) - 1u;
@@ -475,6 +508,46 @@ StrictRequest(hal::SemanticEffectId semantic =
   return request;
 }
 
+video::ProductionVideoResidentSetup WithTerminalVignette(
+    video::ProductionVideoResidentSetup request) {
+  if (request.plan.intent.stage_count == 1 &&
+      request.plan.intent.stages[0].intent.semantic ==
+          hal::SemanticEffectId::vignette) {
+    request.plan.intent.requested_provider =
+        hal::SemanticEffectProviderId::open_cuda_production_kernels;
+    request.plan.intent.stages[0].parameters[0] = {
+        video::CanonicalVideoParameterId::intensity,
+        video::CanonicalVideoParameterKind::signed_integer, 35};
+    request.plan.intent.stages[0].parameters[1] = {
+        video::CanonicalVideoParameterId::center_on_tracked_face,
+        video::CanonicalVideoParameterKind::boolean, 0, 0, 0.0, false};
+    request.plan.intent.stages[0].parameter_count = 2;
+    request.effects.vignette.enabled = true;
+    request.effects.vignette.center_on_tracked_face = false;
+    return request;
+  }
+  auto &intent = request.plan.intent;
+  auto &stage = intent.stages[intent.stage_count++];
+  stage.intent.stage_id = static_cast<std::uint32_t>(intent.stage_count);
+  stage.intent.semantic = hal::SemanticEffectId::vignette;
+  stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  stage.parameters[0] = {video::CanonicalVideoParameterId::intensity,
+                         video::CanonicalVideoParameterKind::signed_integer,
+                         35};
+  stage.parameters[1] = {
+      video::CanonicalVideoParameterId::center_on_tracked_face,
+      video::CanonicalVideoParameterKind::boolean, 0, 0, 0.0, false};
+  stage.parameter_count = 2;
+  intent.requested_provider = hal::SemanticEffectProviderId::invalid;
+  intent.strict_provider_selection = false;
+  request.effects.vignette.enabled = true;
+  request.effects.vignette.center_on_tracked_face = false;
+  request.plan.cpu_tails[0].after_stage_id = stage.intent.stage_id;
+  request.plan.cpu_tails[0].boundary_index =
+      static_cast<std::uint32_t>(intent.stage_count);
+  return request;
+}
+
 bool StrictPolicyIsFailClosed() {
   auto source = open_cuda::CreateProductionVideoBackendSetupSource();
   if (!Check(source != nullptr, "source construction failed"))
@@ -534,7 +607,6 @@ bool SemanticCapabilityClaimsRemainExact() {
   const hal::SemanticEffectId unsupported[] = {
       hal::SemanticEffectId::auto_frame,
       hal::SemanticEffectId::mirror,
-      hal::SemanticEffectId::vignette,
   };
   for (const auto semantic : unsupported) {
     const auto result = source->AcquireResidentSetup(StrictRequest(semantic));
@@ -866,24 +938,41 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
     resident.plan.cpu_tails[0].after_stage_id =
         resident.plan.intent.stages[resident.plan.intent.stage_count - 1]
             .intent.stage_id;
-    resident.plan.cpu_tails[0].boundary_index = resident.plan.intent.stage_count;
-    resident.effects.virtual_background.mode =
-        video::effects::VirtualBackgroundMode::blur;
+    resident.plan.cpu_tails[0].boundary_index =
+        static_cast<std::uint32_t>(resident.plan.intent.stage_count);
     auto &stage = resident.plan.intent.stages[0];
-    stage.parameters[1].id =
-        video::CanonicalVideoParameterId::remove_color_rgb;
-    stage.parameters[1].kind =
-        video::CanonicalVideoParameterKind::unsigned_integer;
-    stage.parameters[2].id =
-        video::CanonicalVideoParameterId::greenscreen_mode;
-    stage.parameters[2].kind =
-        video::CanonicalVideoParameterKind::unsigned_integer;
-    stage.parameters[3].id =
-        video::CanonicalVideoParameterId::greenscreen_temporal;
-    stage.parameters[3].kind =
-        video::CanonicalVideoParameterKind::boolean;
-    stage.parameters[3].boolean_value = true;
-    stage.parameter_count = 4;
+    if (stage.intent.semantic == hal::SemanticEffectId::virtual_key_light) {
+      resident.effects.virtual_key_light.enabled = true;
+      stage.parameters[0] = {video::CanonicalVideoParameterId::intensity,
+                             video::CanonicalVideoParameterKind::signed_integer,
+                             resident.effects.virtual_key_light.intensity};
+      stage.parameters[1] = {
+          video::CanonicalVideoParameterId::temperature_preset,
+          video::CanonicalVideoParameterKind::signed_integer,
+          resident.effects.virtual_key_light.temperature_preset};
+      stage.parameters[2] = {
+          video::CanonicalVideoParameterId::direction_pan_degrees,
+          video::CanonicalVideoParameterKind::signed_integer,
+          resident.effects.virtual_key_light.direction_pan_degrees};
+      stage.parameter_count = 3;
+    } else if (stage.intent.semantic != hal::SemanticEffectId::vignette) {
+      resident.effects.virtual_background.mode =
+          video::effects::VirtualBackgroundMode::blur;
+      stage.parameters[1].id =
+          video::CanonicalVideoParameterId::remove_color_rgb;
+      stage.parameters[1].kind =
+          video::CanonicalVideoParameterKind::unsigned_integer;
+      stage.parameters[2].id =
+          video::CanonicalVideoParameterId::greenscreen_mode;
+      stage.parameters[2].kind =
+          video::CanonicalVideoParameterKind::unsigned_integer;
+      stage.parameters[3].id =
+          video::CanonicalVideoParameterId::greenscreen_temporal;
+      stage.parameters[3].kind =
+          video::CanonicalVideoParameterKind::boolean;
+      stage.parameters[3].boolean_value = true;
+      stage.parameter_count = 4;
+    }
     const auto probe = probe_source->AcquireResidentSetup(resident);
     if (!Check(probe.status == hal::StatusId::ready,
                "source probe rejected canonical resident request"))
@@ -899,6 +988,16 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
                "real source did not prepare through manager"))
       return false;
     const auto setup = manager.Snapshot();
+    const bool has_vignette =
+        original.stages[original.stage_count - 1].intent.semantic ==
+        hal::SemanticEffectId::vignette;
+    const bool has_model = original.stage_count > (has_vignette ? 1u : 0u);
+    const auto expected_provider =
+        has_model && has_vignette
+            ? hal::SemanticEffectProviderId::invalid
+            : has_model
+                  ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
+                  : hal::SemanticEffectProviderId::open_cuda_production_kernels;
     bool ok = Check(setup.resident.plan.intent.backend.mode ==
                             original.backend.mode &&
                         setup.resident.plan.intent.backend.backend ==
@@ -907,11 +1006,10 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
                             original.requested_provider &&
                         setup.readiness.selected_backend ==
                             hal::BackendId::cuda &&
-                        setup.readiness.provider ==
-                            hal::SemanticEffectProviderId::
-                                open_video_onnxruntime_cuda &&
+                        setup.readiness.provider == expected_provider &&
                         setup.resident.plan.intent.stages[0]
-                                .model.artifact_generation == 13,
+                                .model.artifact_generation ==
+                            (has_model ? 13u : 0u),
                     "source changed canonical intent or lost bound evidence");
     std::array<std::byte, 64 * 48 * 3> input{};
     std::array<std::byte, 128 * 96 * 3> output{};
@@ -965,13 +1063,16 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
                     manager.Snapshot().resident_prepared,
                 "injected lease failure did not retain active CUDA plan");
     state.fail_acquire = false;
-    state.mismatch_artifact = true;
-    evidence = {};
-    ok &= Check(manager.Setup(request, &evidence, &reason) ==
-                        hal::StatusId::blocked &&
-                    evidence.candidate_rejected && evidence.old_plan_retained &&
-                    manager.Snapshot().resident_prepared,
-                "mismatched lease artifact evidence was accepted");
+    if (has_model) {
+      state.mismatch_artifact = true;
+      evidence = {};
+      ok &= Check(manager.Setup(request, &evidence, &reason) ==
+                          hal::StatusId::blocked &&
+                      evidence.candidate_rejected &&
+                      evidence.old_plan_retained &&
+                      manager.Snapshot().resident_prepared,
+                  "mismatched lease artifact evidence was accepted");
+    }
     return ok;
   };
 
@@ -1031,6 +1132,12 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
   upscale.plan.host_output =
       HostRgb(79, 53, hal::Mutability::write_only);
   ok &= run(upscale);
+  ok &= run(WithTerminalVignette(
+      StrictRequest(hal::SemanticEffectId::vignette)));
+  ok &= run(WithTerminalVignette(StrictRequest()));
+  ok &= run(WithTerminalVignette(
+      StrictRequest(hal::SemanticEffectId::virtual_key_light)));
+  ok &= run(WithTerminalVignette(combined));
   return ok;
 }
 

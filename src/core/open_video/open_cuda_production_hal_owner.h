@@ -71,6 +71,7 @@ struct OpenCudaProductionBackendRequest {
   int key_light_intensity = 50;
   int key_light_temperature_preset = 0;
   int key_light_direction_pan_degrees = 0;
+  int vignette_intensity = 35;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 
   // Null selects the production CUDA/ORT runtime owned by the executor.
