@@ -82,9 +82,13 @@ Each arrow points from a dependent to its dependency.
   support; `studiocast_video_execution_runtime` owns the fixed-capacity
   backend-neutral prepared execution facade and typed capability/live-status
   snapshots; and `studiocast_video_runtime` owns the existing camera pipeline
-  and virtual-camera composition. During staged migration the latter retains
-  its legacy backend composition dependencies; those edges may be removed only
-  after each live family passes parity and rollback gates.
+  and virtual-camera composition. Neutral planning and ownership are the
+  intended architecture, but reaching that ownership boundary is not evidence
+  that existing behavior has reached parity. During staged migration the
+  latter retains legacy backend composition dependencies and bounded
+  compatibility routes; those edges and routes may be removed only after each
+  live family passes the parity, rollback, qualification, and release gates in
+  [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md).
 - `studiocast_cuda_support` owns the runtime-loaded CUDA driver wrapper,
   buffers, and embedded kernels without a CUDA toolkit dependency. Its
   canonical API is `core/cuda/cuda_driver_api.h` in namespace
@@ -118,7 +122,9 @@ documented in
 [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). The important
 separation is that CPU primitive availability never establishes selectable
 product-effect capability, while each v1 resident island is owned by exactly
-one adapter.
+one adapter. Completion and release claims must also satisfy
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md); a neutral ownership
+cutover alone does not satisfy those gates.
 
 ## Canonical effect model: `BroadcastCameraEffects`
 

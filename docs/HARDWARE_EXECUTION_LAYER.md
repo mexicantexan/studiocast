@@ -12,11 +12,14 @@ Video, and Open Vulkan implementations. It is not OpenCV's macro HAL and does
 not imply that CUDA, Maxine, ONNX Runtime, Vulkan, or another API can share
 resources merely because they use the same physical GPU.
 
-The production camera path now has one neutral plan owner. A qualified resident
-route owns its live execution island; the only retained compatibility execution
-is itself a typed setup-source result with exact provider and execution-domain
-evidence. Compatibility does not relax strict backend selection, production
-capability evidence, or transfer accounting.
+The production camera path now has one neutral plan owner. This is an
+architecture milestone, not a parity-completion claim. A qualified resident
+route owns its live execution island; retained compatibility execution is a
+typed setup-source result with exact provider and execution-domain evidence.
+Compatibility is bounded to preserving existing behavior while a family is
+migrated and does not relax strict backend selection, production capability
+evidence, transfer accounting, or the removal gates in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md).
 
 ## Two separate layers
 
@@ -150,6 +153,15 @@ real hardware.
 
 ## Current production adapters and migration gates
 
+Prepared HAL completion proceeds by existing-functionality family. Open CUDA
+parity is the first completion target because it preserves the established
+GPU-only effects before StudioCast expands production Vulkan behavior. Current
+known CUDA gaps include `auto` selection/fallback behavior and combinations
+whose dependency graph is not yet represented by one qualified prepared
+island, including Auto Frame. These routes are not fixed merely because setup,
+planning, or ownership is neutral; they remain compatibility-owned or blocked
+as reported by the daemon until their parity evidence passes review.
+
 The camera pipeline uses one `ProductionVideoBackendManager` backed by typed
 setup leases. Backend factories own native sessions, contexts, streams/queues,
 buffers, and adapters; the pipeline sees a canonical setup request, host-frame
@@ -201,13 +213,15 @@ virtual key light, and virtual-background modes retain their existing
 production, degraded, experimental, diagnostics-only, or blocked states.
 Creating a generic Vulkan adapter does not promote them.
 
-`camera_pipeline.cpp` no longer selects, instantiates, probes, or reallocates
-backend implementations. It builds one canonical request and executes the
-manager's prepared neutral result. The static backend-composition target owns
-the optional Maxine, Open CUDA/Open Video, and Vulkan dependencies privately;
-`studiocast_video_runtime` exposes only neutral contracts, execution runtime,
-video I/O, and support dependencies and receives no optional backend feature
-definitions.
+`camera_pipeline.cpp` builds the canonical request and consumes the manager's
+typed setup result. The static backend-composition target owns the optional
+Maxine, Open CUDA/Open Video, and Vulkan dependencies privately;
+`studiocast_video_runtime` exposes neutral contracts, execution runtime, video
+I/O, and support dependencies and receives no optional backend feature
+definitions. Any retained compatibility execution is still part of the live
+behavioral surface and must remain visible in status and parity accounting.
+Moving selection, construction, probing, or allocation behind the manager does
+not by itself prove that every former route is prepared-HAL owned.
 
 ## Transfers, CPU tails, and telemetry
 
