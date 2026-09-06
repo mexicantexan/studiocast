@@ -3,18 +3,27 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 using namespace studiocast::cuda;
 using namespace studiocast::cuda::kernels;
 
 int main() {
+  const char *required =
+      std::getenv("STUDIOCAST_REQUIRE_CUDA_FASTDVDNET_KERNEL_TEST");
+  if (!required || std::string_view(required) != "1") {
+    std::cout << "SKIP: set STUDIOCAST_REQUIRE_CUDA_FASTDVDNET_KERNEL_TEST=1 "
+                 "to run the CUDA FastDVDnet kernel reference\n";
+    return 77;
+  }
   CudaDriverApi driver;
   std::string error;
   if (!driver.Initialize(&error) || !driver.EnsureContextForDevice(0, &error)) {
     std::cout << "SKIP: " << error << '\n';
-    return 77;
+    return 1;
   }
   CUstream stream=nullptr;
   if (!driver.CreateStream(&stream,&error)) { std::cerr<<error<<'\n'; return 1; }
