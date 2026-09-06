@@ -467,6 +467,18 @@ video::VideoExecutionPlanRequest Request() {
   return request;
 }
 
+hal::AdapterRegistration UnavailableRegistration() {
+  auto registration = Registration(nullptr);
+  auto &capability = registration.semantic_capabilities[0];
+  capability.status = hal::StatusId::unavailable;
+  capability.reason = hal::ReasonId::capability_evidence_incomplete;
+  capability.live_stage = false;
+  capability.production_eligible = false;
+  capability.exact_evidence = false;
+  capability.evidence_count = 0;
+  return registration;
+}
+
 hal::HostFrameBinding Binding(std::array<std::uint8_t, kBytes> *input,
                               std::array<std::uint8_t, kBytes> *output,
                               std::uint64_t sequence) {
@@ -556,6 +568,37 @@ bool TestLifecycleAndAttribution() {
                     factory.counters.invalidate_calls == 1 &&
                     factory.counters.shutdown_calls == 1,
                 "composition must own the complete executor lifecycle");
+  return ok;
+}
+
+bool TestLeaseFreeOptionalPassthroughLifecycle() {
+  video::ProductionVideoExecutionComposition composition;
+  auto request = Request();
+  video::VideoExecutionPrepareEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Require(composition.PreparePassthrough(
+                        UnavailableRegistration(), request, &evidence,
+                        &reason) == hal::StatusId::passthrough,
+                    "lease-free optional candidate must prepare passthrough") &&
+            Require(evidence.resolution.stages[0].skipped_optional &&
+                        evidence.resolution.selected_backend ==
+                            hal::BackendId::invalid,
+                    "composition must independently resolve no backend");
+  std::array<std::uint8_t, kBytes> input{}, output{};
+  auto frame = composition.Execute(Binding(&input, &output, 4));
+  ok &= Require(
+      frame.status == hal::StatusId::passthrough &&
+          frame.transfers.uploads == 0 && frame.transfers.final_readbacks == 0,
+      "lease-free composition must execute zero-transfer passthrough");
+  ok &= Require(composition.CommitOutput(frame.completion, true, &reason) ==
+                        hal::StatusId::ready &&
+                    composition.Snapshot().latest_committed_frame.valid &&
+                    composition.Snapshot().latest_committed_frame.stage_count ==
+                        0,
+                "passthrough writer success must commit without attribution");
+  const auto stopped = composition.Shutdown();
+  ok &= Require(stopped.quiescent && stopped.driver_context_release_permitted,
+                "lease-free passthrough shutdown must be complete");
   return ok;
 }
 
@@ -838,6 +881,7 @@ bool TestPermanentPendingCompositionUsesCallerBoundedAttempts() {
 
 int main() {
   return TestLifecycleAndAttribution() &&
+                 TestLeaseFreeOptionalPassthroughLifecycle() &&
                  TestMalformedFactoryRegistrationRollsBack() &&
                  TestOwnedLeaseLifecycleAndOrderedShutdown() &&
                  TestFailedLeaseCandidatesRetainOldPlan() &&

@@ -2477,6 +2477,11 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
             execution.output.planes[0].write_data);
         rgb_stride = execution.output.planes[0].row_stride_bytes;
         rgb_bytes = execution.output.planes[0].span_bytes;
+      } else if (execution.status == hal::StatusId::passthrough &&
+                 execution.passthrough) {
+        // Neutral passthrough publishes the original host frame through the
+        // normal resize/conversion/writer path. Its completion is committed
+        // only after that writer reports the exact result.
       } else {
         if (completion_pending) {
           hal::ReasonId reason = hal::ReasonId::none;
