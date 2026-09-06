@@ -1,8 +1,8 @@
 #include "core/open_video/production_video_backend_setup_source.h"
 
 #include "core/open_video/model_pack_registry.h"
-#include "core/open_video/prepared_open_video_compatibility_executor.h"
 #include "core/open_video/open_cuda_selection_policy.h"
+#include "core/open_video/prepared_open_video_compatibility_executor.h"
 #include "core/open_video/video_execution_factory.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/image_ppm.h"
@@ -134,13 +134,16 @@ bool ExactTerminalOutputTail(const video::VideoExecutionPlanRequest &plan,
 }
 
 bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
+                       std::uint32_t output_width, std::uint32_t output_height,
                        std::uint32_t model_width, std::uint32_t model_height,
                        hal::SemanticEffectId semantic, int strength,
                        std::uint32_t replacement_width,
                        std::uint32_t replacement_height,
+                       std::uint32_t stage_count,
                        hal::ResourceBudget *budget) noexcept {
   if (budget == nullptr || frame_width == 0 || frame_height == 0 ||
-      model_width == 0 || model_height == 0) {
+      output_width == 0 || output_height == 0 || model_width == 0 ||
+      model_height == 0) {
     return false;
   }
   std::uint64_t rgb_row = 0;
@@ -152,6 +155,9 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
   std::uint64_t model_alpha = 0;
   std::uint64_t model_tensor = 0;
   std::uint64_t boundary = 0;
+  std::uint64_t output_boundary = 0;
+  std::uint64_t output_rgb_row = 0;
+  std::uint64_t output_device = 0;
   if (!AlignRow(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
       !AlignRow(static_cast<std::uint64_t>(frame_width) * 4u, &alpha_row) ||
       !Multiply(rgb_row, frame_height, &frame_rgb) ||
@@ -163,7 +169,12 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
       !AlignRow(model_tensor_row, &model_tensor_row) ||
       !Multiply(model_tensor_row, model_height, &model_tensor) ||
       !Multiply(frame_width, frame_height, &boundary) ||
-      !Multiply(boundary, 3u, &boundary)) {
+      !Multiply(boundary, 3u, &boundary) ||
+      !Multiply(output_width, output_height, &output_boundary) ||
+      !Multiply(output_boundary, 3u, &output_boundary) ||
+      !AlignRow(static_cast<std::uint64_t>(output_width) * 3u,
+                &output_rgb_row) ||
+      !Multiply(output_rgb_row, output_height, &output_device)) {
     return false;
   }
 
@@ -180,8 +191,7 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
                  video::effects::contract::kVbStrengthMax);
   const bool feather = std::min(4, canonical_strength / 16) > 0;
   const bool blur = semantic == hal::SemanticEffectId::virtual_background_blur;
-  const bool key_light =
-      semantic == hal::SemanticEffectId::virtual_key_light;
+  const bool key_light = semantic == hal::SemanticEffectId::virtual_key_light;
   const bool replace =
       semantic == hal::SemanticEffectId::virtual_background_replace;
   const bool prepared_feather = !key_light && feather;
@@ -205,12 +215,17 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
       return false;
     }
   }
+  if ((output_width != frame_width || output_height != frame_height) &&
+      !Add(output_device, &result.persistent_bytes))
+    return false;
   result.scratch_bytes = std::max<std::uint64_t>(result.scratch_bytes, 1);
   result.upload_staging_bytes = boundary;
-  result.readback_staging_bytes = boundary;
-  result.resource_count = (blur ? 19u : 17u) +
-                          (prepared_feather ? 2u : 0u) +
-                          (replace ? 2u : 0u);
+  result.readback_staging_bytes = output_boundary;
+  result.resource_count =
+      (blur ? 19u : 17u) + (prepared_feather ? 2u : 0u) + (replace ? 2u : 0u) +
+      ((output_width != frame_width || output_height != frame_height) ? 1u
+                                                                      : 0u) +
+      2u * (stage_count - 1u);
   result.in_flight_slots = 1;
   if (result.persistent_bytes > (UINT64_C(2) << 30) ||
       result.scratch_bytes > (UINT64_C(1) << 30) ||
@@ -327,6 +342,24 @@ bool CompatibilitySemantic(hal::SemanticEffectId semantic) noexcept {
          semantic == hal::SemanticEffectId::eye_contact;
 }
 
+bool VirtualBackground(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::virtual_background_blur ||
+         semantic == hal::SemanticEffectId::virtual_background_remove ||
+         semantic == hal::SemanticEffectId::virtual_background_replace;
+}
+
+bool PreparedSemantics(
+    const video::NormalizedVideoExecutionIntent &intent) noexcept {
+  return (intent.stage_count == 1 &&
+          (VirtualBackground(intent.stages[0].intent.semantic) ||
+           intent.stages[0].intent.semantic ==
+               hal::SemanticEffectId::virtual_key_light)) ||
+         (intent.stage_count == 2 &&
+          VirtualBackground(intent.stages[0].intent.semantic) &&
+          intent.stages[1].intent.semantic ==
+              hal::SemanticEffectId::virtual_key_light);
+}
+
 hal::ExecutionDomainId
 HostOrtDomain(std::uint32_t stage_id, std::uint64_t generation,
               std::uint64_t adapter_instance_id) noexcept {
@@ -425,11 +458,10 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
     return Failure(hal::StatusId::blocked,
                    hal::ReasonId::semantic_provider_unavailable);
   }
-  const bool setup_output_tail = ExactTerminalOutputTail(
-      caller, hal::CpuTailId::backend_resolved_output);
+  const bool setup_output_tail =
+      ExactTerminalOutputTail(caller, hal::CpuTailId::backend_resolved_output);
   if (caller.cpu_tail_count != 0 && !setup_output_tail) {
-    return Failure(hal::StatusId::blocked,
-                   hal::ReasonId::cpu_tail_required);
+    return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
   }
 
   auto result = video::ProductionVideoResidentSetupSourceResult{};
@@ -490,9 +522,8 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
   topology.cross_adapter_residency_forbidden = true;
   const auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
   auto &entry = topology.domains[0];
-  entry.domain =
-      HostOrtDomain(caller.intent.stages[0].intent.stage_id,
-                    generations.context, adapter);
+  entry.domain = HostOrtDomain(caller.intent.stages[0].intent.stage_id,
+                               generations.context, adapter);
   entry.backend = hal::BackendId::open_video_onnxruntime;
   entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
   entry.first_stage_id = caller.intent.stages[0].intent.stage_id;
@@ -553,25 +584,15 @@ public:
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::strict_backend_unavailable);
     }
-    if (caller.intent.stage_count != 1) {
+    if (!PreparedSemantics(caller.intent)) {
       return Failure(hal::StatusId::blocked,
-                     hal::ReasonId::cross_adapter_residency_forbidden);
+                     caller.intent.stage_count > 2
+                         ? hal::ReasonId::cross_adapter_residency_forbidden
+                         : hal::ReasonId::semantic_effect_unsupported);
     }
     const auto &stage = caller.intent.stages[0];
-    if (stage.intent.semantic !=
-            hal::SemanticEffectId::virtual_background_blur &&
-        stage.intent.semantic !=
-            hal::SemanticEffectId::virtual_background_remove &&
-        stage.intent.semantic !=
-            hal::SemanticEffectId::virtual_background_replace &&
-        stage.intent.semantic != hal::SemanticEffectId::virtual_key_light) {
-      return Failure(hal::StatusId::blocked,
-                     hal::ReasonId::semantic_effect_unsupported);
-    }
     if (!TightRgb24(caller.host_input, hal::Mutability::read_only) ||
-        !TightRgb24(caller.host_output, hal::Mutability::write_only) ||
-        caller.host_input.width != caller.host_output.width ||
-        caller.host_input.height != caller.host_output.height) {
+        !TightRgb24(caller.host_output, hal::Mutability::write_only)) {
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::malformed_descriptor);
     }
@@ -591,8 +612,7 @@ public:
                     dependencies_.context, stage,
                     request.effects.virtual_background.model_id, &pack,
                     &artifact)
-              : ResolveModel(stage,
-                             request.effects.virtual_background.model_id,
+              : ResolveModel(stage, request.effects.virtual_background.model_id,
                              &pack, &artifact);
       if (!model_resolved) {
         return Failure(hal::StatusId::unavailable,
@@ -614,13 +634,15 @@ public:
       }
       hal::ResourceBudget budget;
       const int strength = Strength(stage);
-      if (!ResourceBudgetFor(caller.host_input.width, caller.host_input.height,
-                             static_cast<std::uint32_t>(matting.input.width),
-                             static_cast<std::uint32_t>(matting.input.height),
-                             stage.intent.semantic, strength,
-                             static_cast<std::uint32_t>(replacement_width),
-                             static_cast<std::uint32_t>(replacement_height),
-                             &budget)) {
+      if (!ResourceBudgetFor(
+              caller.host_input.width, caller.host_input.height,
+              caller.host_output.width, caller.host_output.height,
+              static_cast<std::uint32_t>(matting.input.width),
+              static_cast<std::uint32_t>(matting.input.height),
+              stage.intent.semantic, strength,
+              static_cast<std::uint32_t>(replacement_width),
+              static_cast<std::uint32_t>(replacement_height),
+              static_cast<std::uint32_t>(caller.intent.stage_count), &budget)) {
         return Failure(hal::StatusId::resource_exhausted,
                        hal::ReasonId::resource_exhausted);
       }
@@ -639,10 +661,14 @@ public:
       if (factory.factory_id == 0)
         factory.factory_id = 1;
       factory.selection_priority = 100;
-      factory.semantic = stage.intent.semantic;
-      factory.model.model_id_hash = artifact.model_id_sha256;
-      factory.model.artifact_set_hash = artifact.artifact_set_sha256;
-      factory.model.artifact_generation = artifact.registry_generation;
+      factory.stage_count = caller.intent.stage_count;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        factory.semantics[index] = caller.intent.stages[index].intent.semantic;
+        factory.models[index].model_id_hash = artifact.model_id_sha256;
+        factory.models[index].artifact_set_hash = artifact.artifact_set_sha256;
+        factory.models[index].artifact_generation =
+            artifact.registry_generation;
+      }
       factory.generations = caller.invalidation_key.generations;
       factory.generations.model = artifact.registry_generation;
       if (factory.generations.provider == 0)
@@ -700,24 +726,29 @@ public:
       result.setup_completed_outside_frame_loop = true;
       OpenCudaProductionVideoExecutionBootstrapResult bootstrap;
       hal::ReasonId reason = hal::ReasonId::none;
-      result.status = dependencies_.acquire_lease
-                          ? dependencies_.acquire_lease(
-                                dependencies_.context, factory, &result.lease,
-                                &bootstrap, &result.lease_acquire, &reason)
-                          : OpenCudaVideoExecutionFactory::
-                                AcquireProductionSetupLease(
-                                    factory, &result.lease, &bootstrap,
-                                    &result.lease_acquire, &reason);
+      result.status =
+          dependencies_.acquire_lease
+              ? dependencies_.acquire_lease(dependencies_.context, factory,
+                                            &result.lease, &bootstrap,
+                                            &result.lease_acquire, &reason)
+              : OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+                    factory, &result.lease, &bootstrap, &result.lease_acquire,
+                    &reason);
       result.reason = reason;
       result.readiness = bootstrap.setup_lease.readiness;
       if (!IsSetupSuccess(result.status) || !result.lease.live())
         return result;
       if (bootstrap.setup_lease.artifact_count != caller.intent.stage_count ||
-          bootstrap.setup_lease.generations.configuration != factory.generations.configuration ||
-          bootstrap.setup_lease.generations.geometry != factory.generations.geometry ||
-          bootstrap.setup_lease.generations.model != factory.generations.model ||
-          bootstrap.setup_lease.generations.provider != factory.generations.provider ||
-          bootstrap.setup_lease.generations.device != factory.generations.device) {
+          bootstrap.setup_lease.generations.configuration !=
+              factory.generations.configuration ||
+          bootstrap.setup_lease.generations.geometry !=
+              factory.generations.geometry ||
+          bootstrap.setup_lease.generations.model !=
+              factory.generations.model ||
+          bootstrap.setup_lease.generations.provider !=
+              factory.generations.provider ||
+          bootstrap.setup_lease.generations.device !=
+              factory.generations.device) {
         return Failure(hal::StatusId::blocked,
                        hal::ReasonId::capability_evidence_incomplete);
       }
@@ -742,8 +773,9 @@ public:
       result.plan = caller;
       if (setup_output_tail)
         result.plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
-      result.plan.intent.stages[0].model =
-          bootstrap.setup_lease.artifacts[0].artifact;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
+        result.plan.intent.stages[index].model =
+            bootstrap.setup_lease.artifacts[index].artifact;
       result.plan.invalidation_key.generations =
           bootstrap.setup_lease.generations;
       result.plan.invalidation_key.model_artifact_hash = HashArtifact(artifact);

@@ -421,7 +421,8 @@ FactoryConfig(SetupContext *context,
   config.selection_priority = 5;
   config.cached.execution_domain = context->domain;
   config.cached.readiness = Readiness(context->domain);
-  config.cached.model = request.intent.stages[0].model;
+  config.cached.models[0] = request.intent.stages[0].model;
+  config.cached.stage_count = 1;
   config.cached.generations = request.invalidation_key.generations;
   config.cached.model_artifact_validated = true;
   config.cached.provider_runtime_validated = true;
@@ -552,15 +553,13 @@ bool ExactPreflightAndMalformedRejection() {
   automatic.intent.preferences.effects_engine =
       hal::EffectsEnginePreferenceConstraint::automatic;
   automatic.intent.preferences.strict_effects_engine = false;
-  automatic.intent.requested_provider =
-      hal::SemanticEffectProviderId::invalid;
+  automatic.intent.requested_provider = hal::SemanticEffectProviderId::invalid;
   automatic.intent.strict_provider_selection = false;
   REQUIRE(BuildFrozen(automatic, registration, &factory, &plan, &preflight));
   REQUIRE(preflight.status == hal::StatusId::ready);
   REQUIRE(plan.intent.backend.mode == hal::BackendRequestMode::automatic);
   REQUIRE(plan.intent.backend.backend == hal::BackendId::invalid);
-  REQUIRE(preflight.prepared_program.requested_backend ==
-          hal::BackendId::cuda);
+  REQUIRE(preflight.prepared_program.requested_backend == hal::BackendId::cuda);
   REQUIRE(!preflight.prepared_program.strict_backend_selection);
   REQUIRE(preflight.prepared_program.requested_provider ==
           hal::SemanticEffectProviderId::open_video_onnxruntime_cuda);
@@ -585,8 +584,9 @@ bool ExactPreflightAndMalformedRejection() {
   REQUIRE(automatic_executor->CommitOutput(automatic_frame.completion, true,
                                            &automatic_reason) ==
           hal::StatusId::ready);
-  REQUIRE(automatic_executor->Snapshot().latest_committed_frame.capture_sequence ==
-          78);
+  REQUIRE(
+      automatic_executor->Snapshot().latest_committed_frame.capture_sequence ==
+      78);
 
   auto forced_cuda = automatic;
   forced_cuda.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
@@ -628,7 +628,11 @@ bool ExactPreflightAndMalformedRejection() {
   malformed.host_output.planes[0].size_bytes = 48;
   malformed.budget.readback_staging_bytes = 48;
   REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));
-  REQUIRE(preflight.status == hal::StatusId::blocked);
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.host_output.width == 8);
+  REQUIRE(preflight.prepared_program.host_output.height == 2);
+  REQUIRE(preflight.prepared_program.stages[0].output.image.width == 8);
+  REQUIRE(preflight.prepared_program.stages[0].output.image.height == 2);
 
   auto malformed_config = FactoryConfig(&context, request);
   malformed_config.cached.minimum_synchronizations_per_frame = 2;
