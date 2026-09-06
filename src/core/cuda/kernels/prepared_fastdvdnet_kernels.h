@@ -15,6 +15,7 @@ struct PreparedFastDvdnetKernels {
   CUmodule module = nullptr;
   CUfunction preprocess = nullptr;
   CUfunction postprocess = nullptr;
+  mutable CUresult last_result = CUDA_SUCCESS;
   bool live = false;
 };
 

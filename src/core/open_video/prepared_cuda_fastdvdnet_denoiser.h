@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace studiocast::open_video {
 
@@ -59,6 +60,10 @@ struct PreparedCudaFastDvdnetTensorContract {
 };
 
 struct PreparedCudaFastDvdnetConfig {
+  cuda::CudaDriverApi *driver = nullptr;
+  cuda::CUcontext owner_context = nullptr;
+  cuda::CUstream owner_stream = nullptr;
+  int cuda_device_id = 0;
   const ModelPack *model_pack = nullptr;
   ValidatedModelArtifactIdentity artifact{};
   hal::ExecutionDomainId execution_domain{};
@@ -167,6 +172,7 @@ struct PreparedCudaFastDvdnetFrameResult {
 
 class PreparedCudaFastDvdnetDenoiser {
 public:
+  PreparedCudaFastDvdnetDenoiser();
   explicit PreparedCudaFastDvdnetDenoiser(
       IPreparedCudaFastDvdnetRuntime *runtime) noexcept;
 
@@ -191,6 +197,7 @@ private:
   bool HandleMatches(const PreparedCudaFastDvdnetHandle &handle) const noexcept;
   void Clear() noexcept;
 
+  std::unique_ptr<IPreparedCudaFastDvdnetRuntime> owned_runtime_;
   IPreparedCudaFastDvdnetRuntime *runtime_ = nullptr;
   PreparedCudaFastDvdnetConfig config_{};
   PreparedCudaFastDvdnetHandle handle_{};

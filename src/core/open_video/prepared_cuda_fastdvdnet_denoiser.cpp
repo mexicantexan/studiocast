@@ -1,4 +1,5 @@
 #include "core/open_video/prepared_cuda_fastdvdnet_denoiser.h"
+#include "core/open_video/native_prepared_cuda_fastdvdnet_runtime.h"
 
 #include <algorithm>
 #include <cstring>
@@ -63,6 +64,10 @@ hal::ReasonId FailureReason(PreparedCudaFastDvdnetStatus status) noexcept {
 
 PreparedCudaFastDvdnetDenoiser::PreparedCudaFastDvdnetDenoiser(
     IPreparedCudaFastDvdnetRuntime *runtime) noexcept : runtime_(runtime) {}
+
+PreparedCudaFastDvdnetDenoiser::PreparedCudaFastDvdnetDenoiser()
+    : owned_runtime_(std::make_unique<NativePreparedCudaFastDvdnetRuntime>()),
+      runtime_(owned_runtime_.get()) {}
 
 std::uint32_t
 PreparedCudaFastDvdnetDenoiser::PaddedExtent(std::uint32_t extent) noexcept {
