@@ -304,12 +304,12 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
               std::numeric_limits<std::size_t>::max() - bytes) {
         return Failed(Status::invalid_argument);
       }
+      const auto maximum = std::numeric_limits<CUdeviceptr>::max();
+      if (descriptor.source > maximum - descriptor.row_bytes)
+        return Failed(Status::invalid_argument);
       const std::size_t last_row = descriptor.rows - 1;
-      if (last_row > 0 &&
-          descriptor.source_pitch >
-              (std::numeric_limits<CUdeviceptr>::max() - descriptor.source -
-               descriptor.row_bytes) /
-                  last_row)
+      const auto remaining = maximum - descriptor.source - descriptor.row_bytes;
+      if (last_row > 0 && descriptor.source_pitch > remaining / last_row)
         return Failed(Status::invalid_argument);
       readback_bytes = std::max(
           readback_bytes, descriptor.host_offset_bytes + bytes);
@@ -451,7 +451,7 @@ CudaPreparedTransferCompletion::EnqueueUpload(
   Result validation = ValidateFrameBinding(binding);
   if (!validation.ok())
     return validation;
-  if (upload_enqueued_ || destination == 0 ||
+  if (resident_work_ || upload_enqueued_ || destination == 0 ||
       destination_pitch < upload_row_bytes_) {
     return Failed(Status::invalid_sequence);
   }

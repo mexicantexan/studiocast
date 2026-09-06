@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -788,8 +789,12 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   options.budget.max_pinned_host_bytes = 48 + 28;
   Support support;
   const auto prepared = support.Prepare(&driver, options);
+  const int copies_before_resident = fake.copy_calls;
   ok &= Expect(prepared.ok() &&
                    support.BeginFrame(binding, 71).ok() &&
+                   support.EnqueueUpload(binding, 0x4000, 16).status ==
+                       Support::Status::invalid_sequence &&
+                   fake.copy_calls == copies_before_resident &&
                    support.SubmitResidentWork(binding).ok() &&
                    support.RecordStageBegin(binding, 0).ok() &&
                    support.RecordStageEnd(binding, 0).ok() &&
@@ -838,6 +843,25 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   ok &= Expect(malformed.Prepare(&driver, overlap).status ==
                    Support::Status::invalid_argument,
                "overlapping prepared host destinations should fail setup");
+  auto overflow = options;
+  overflow.readbacks[0].source =
+      std::numeric_limits<cuda::CUdeviceptr>::max() - 3;
+  overflow.readbacks[0].row_bytes = 8;
+  overflow.readbacks[0].source_pitch = 8;
+  Support single_overflow;
+  ok &= Expect(single_overflow.Prepare(&driver, overflow).status ==
+                   Support::Status::invalid_argument,
+               "single-row source extent overflow should fail setup");
+  overflow = options;
+  overflow.readbacks[0].source =
+      std::numeric_limits<cuda::CUdeviceptr>::max() - 15;
+  overflow.readbacks[0].row_bytes = 8;
+  overflow.readbacks[0].source_pitch = 12;
+  overflow.readbacks[0].rows = 2;
+  Support multi_overflow;
+  ok &= Expect(multi_overflow.Prepare(&driver, overflow).status ==
+                   Support::Status::invalid_argument,
+               "multi-row source extent overflow should fail setup");
   return ok;
 }
 
