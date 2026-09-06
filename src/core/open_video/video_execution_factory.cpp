@@ -1,4 +1,5 @@
 #include "core/open_video/video_execution_factory.h"
+#include "core/open_video/open_cuda_selection_policy.h"
 
 #include <limits>
 #include <new>
@@ -140,29 +141,7 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
                        const hal::DomainPlan &domain_plan,
                        hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
-  const bool automatic_request =
-      request.intent.backend.mode == hal::BackendRequestMode::automatic &&
-      request.intent.backend.backend == hal::BackendId::invalid &&
-      !request.intent.backend.strict &&
-      request.intent.preferences.compute_family ==
-          hal::ComputeFamilyAllowance::any &&
-      request.intent.preferences.effects_engine ==
-          hal::EffectsEnginePreferenceConstraint::automatic &&
-      !request.intent.preferences.strict_effects_engine &&
-      request.intent.requested_provider ==
-          hal::SemanticEffectProviderId::invalid &&
-      !request.intent.strict_provider_selection;
-  const bool strict_request =
-      request.intent.backend.mode ==
-          hal::BackendRequestMode::explicit_backend &&
-      request.intent.backend.backend == hal::BackendId::cuda &&
-      request.intent.backend.strict &&
-      request.intent.preferences.effects_engine ==
-          hal::EffectsEnginePreferenceConstraint::open_cuda &&
-      request.intent.preferences.strict_effects_engine &&
-      request.intent.requested_provider == kProvider &&
-      request.intent.strict_provider_selection;
-  if ((!automatic_request && !strict_request) ||
+  if (!AcceptsOpenCudaSelectionIntent(request.intent) ||
       (request.intent.preferences.compute_family !=
            hal::ComputeFamilyAllowance::any &&
        request.intent.preferences.compute_family !=

@@ -213,6 +213,57 @@ bool HostAndModelEvidenceAreSetupOnly() {
   return ok;
 }
 
+bool CanonicalAutomaticAndForcedCudaShapesReachSetup() {
+  auto source = open_cuda::CreateProductionVideoBackendSetupSource();
+  const auto temp = std::filesystem::temp_directory_path() /
+                    "studiocast-open-cuda-selector-empty";
+  std::error_code ec;
+  std::filesystem::remove_all(temp, ec);
+  std::filesystem::create_directories(temp, ec);
+  const char *old = std::getenv("XDG_DATA_HOME");
+  const std::string old_value = old == nullptr ? std::string{} : old;
+  const bool had_old = old != nullptr;
+  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+
+  auto automatic = StrictRequest();
+  automatic.plan.intent.backend.mode = hal::BackendRequestMode::automatic;
+  automatic.plan.intent.backend.backend = hal::BackendId::invalid;
+  automatic.plan.intent.backend.strict = false;
+  automatic.plan.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::any;
+  automatic.plan.intent.preferences.effects_engine =
+      hal::EffectsEnginePreferenceConstraint::automatic;
+  automatic.plan.intent.preferences.strict_effects_engine = false;
+  automatic.plan.intent.requested_provider =
+      hal::SemanticEffectProviderId::invalid;
+  automatic.plan.intent.strict_provider_selection = false;
+  auto result = source->AcquireResidentSetup(automatic);
+  bool ok = Check(result.status == hal::StatusId::unavailable &&
+                      result.reason ==
+                          hal::ReasonId::capability_evidence_incomplete,
+                  "automatic intent did not reach model setup");
+
+  auto forced_cuda = automatic;
+  forced_cuda.plan.intent.backend.mode =
+      hal::BackendRequestMode::explicit_backend;
+  forced_cuda.plan.intent.backend.backend = hal::BackendId::cuda;
+  forced_cuda.plan.intent.backend.strict = true;
+  forced_cuda.plan.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  result = source->AcquireResidentSetup(forced_cuda);
+  ok &= Check(result.status == hal::StatusId::unavailable &&
+                  result.reason ==
+                      hal::ReasonId::capability_evidence_incomplete,
+              "compute=cuda engine=auto intent did not reach model setup");
+
+  if (had_old)
+    (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
+  else
+    (void)unsetenv("XDG_DATA_HOME");
+  std::filesystem::remove_all(temp, ec);
+  return ok;
+}
+
 bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
   auto source = open_cuda::CreateProductionVideoBackendSetupSource();
   auto request = StrictRequest(hal::SemanticEffectId::video_noise_removal);
@@ -274,6 +325,7 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
 int main() {
   if (!StrictPolicyIsFailClosed() || !SemanticCapabilityClaimsRemainExact() ||
       !HostAndModelEvidenceAreSetupOnly() ||
+      !CanonicalAutomaticAndForcedCudaShapesReachSetup() ||
       !CompatibilityTopologyNeverMasqueradesAsStrictCuda()) {
     return 1;
   }

@@ -588,6 +588,17 @@ bool ExactPreflightAndMalformedRejection() {
   REQUIRE(automatic_executor->Snapshot().latest_committed_frame.capture_sequence ==
           78);
 
+  auto forced_cuda = automatic;
+  forced_cuda.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  forced_cuda.intent.backend.backend = hal::BackendId::cuda;
+  forced_cuda.intent.backend.strict = true;
+  forced_cuda.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::cuda_family;
+  REQUIRE(BuildFrozen(forced_cuda, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.strict_backend_selection);
+  REQUIRE(!preflight.prepared_program.strict_provider_selection);
+
   auto malformed = request;
   malformed.intent.backend.strict = false;
   REQUIRE(BuildFrozen(malformed, registration, &factory, &plan, &preflight));

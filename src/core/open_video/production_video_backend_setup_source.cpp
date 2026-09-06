@@ -2,6 +2,7 @@
 
 #include "core/open_video/model_pack_registry.h"
 #include "core/open_video/prepared_open_video_compatibility_executor.h"
+#include "core/open_video/open_cuda_selection_policy.h"
 #include "core/open_video/video_execution_factory.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/image_ppm.h"
@@ -532,6 +533,9 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
 class ProductionSetupSource final
     : public video::IProductionVideoBackendSetupSource {
 public:
+  explicit ProductionSetupSource(
+      ProductionVideoBackendSetupDependencies dependencies = {}) noexcept
+      : dependencies_(dependencies) {}
   video::ProductionVideoResidentSetupSourceResult AcquireResidentSetup(
       const video::ProductionVideoResidentSetup &request) noexcept override {
     const auto &caller = request.plan;
@@ -543,33 +547,9 @@ public:
     }
     if (compatibility)
       return BuildCompatibility(request);
-    const bool automatic_request =
-        caller.intent.backend.mode == hal::BackendRequestMode::automatic &&
-        caller.intent.backend.backend == hal::BackendId::invalid &&
-        !caller.intent.backend.strict &&
-        caller.intent.preferences.compute_family ==
-            hal::ComputeFamilyAllowance::any &&
-        caller.intent.preferences.effects_engine ==
-            hal::EffectsEnginePreferenceConstraint::automatic &&
-        !caller.intent.preferences.strict_effects_engine &&
-        caller.intent.requested_provider ==
-            hal::SemanticEffectProviderId::invalid &&
-        !caller.intent.strict_provider_selection;
-    const bool strict_open_cuda_request =
-        caller.intent.backend.mode ==
-            hal::BackendRequestMode::explicit_backend &&
-        caller.intent.backend.backend == hal::BackendId::cuda &&
-        caller.intent.backend.strict &&
-        caller.intent.preferences.compute_family ==
-            hal::ComputeFamilyAllowance::cuda_family &&
-        caller.intent.preferences.effects_engine ==
-            hal::EffectsEnginePreferenceConstraint::open_cuda &&
-        caller.intent.preferences.strict_effects_engine &&
-        caller.intent.requested_provider == kProvider &&
-        caller.intent.strict_provider_selection;
     if (request.contract_version !=
             video::kProductionVideoBackendManagerContractVersion ||
-        (!automatic_request && !strict_open_cuda_request)) {
+        !AcceptsOpenCudaSelectionIntent(caller.intent)) {
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::strict_backend_unavailable);
     }
@@ -605,8 +585,16 @@ public:
     try {
       open_video::ModelPack pack;
       open_video::ValidatedModelArtifactIdentity artifact;
-      if (!ResolveModel(stage, request.effects.virtual_background.model_id,
-                        &pack, &artifact)) {
+      const bool model_resolved =
+          dependencies_.resolve_model
+              ? dependencies_.resolve_model(
+                    dependencies_.context, stage,
+                    request.effects.virtual_background.model_id, &pack,
+                    &artifact)
+              : ResolveModel(stage,
+                             request.effects.virtual_background.model_id,
+                             &pack, &artifact);
+      if (!model_resolved) {
         return Failure(hal::StatusId::unavailable,
                        hal::ReasonId::capability_evidence_incomplete);
       }
@@ -712,10 +700,14 @@ public:
       result.setup_completed_outside_frame_loop = true;
       OpenCudaProductionVideoExecutionBootstrapResult bootstrap;
       hal::ReasonId reason = hal::ReasonId::none;
-      result.status =
-          OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
-              factory, &result.lease, &bootstrap, &result.lease_acquire,
-              &reason);
+      result.status = dependencies_.acquire_lease
+                          ? dependencies_.acquire_lease(
+                                dependencies_.context, factory, &result.lease,
+                                &bootstrap, &result.lease_acquire, &reason)
+                          : OpenCudaVideoExecutionFactory::
+                                AcquireProductionSetupLease(
+                                    factory, &result.lease, &bootstrap,
+                                    &result.lease_acquire, &reason);
       result.reason = reason;
       result.readiness = bootstrap.setup_lease.readiness;
       if (!IsSetupSuccess(result.status) || !result.lease.live())
@@ -753,6 +745,9 @@ public:
                      hal::ReasonId::capability_evidence_incomplete);
     }
   }
+
+private:
+  ProductionVideoBackendSetupDependencies dependencies_{};
 };
 
 } // namespace
@@ -761,6 +756,18 @@ std::unique_ptr<video::IProductionVideoBackendSetupSource>
 CreateProductionVideoBackendSetupSource() noexcept {
   try {
     return std::make_unique<ProductionSetupSource>();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+std::unique_ptr<video::IProductionVideoBackendSetupSource>
+CreateProductionVideoBackendSetupSourceForTesting(
+    ProductionVideoBackendSetupDependencies dependencies) noexcept {
+  if (!dependencies.resolve_model || !dependencies.acquire_lease)
+    return nullptr;
+  try {
+    return std::make_unique<ProductionSetupSource>(dependencies);
   } catch (...) {
     return nullptr;
   }
