@@ -26,6 +26,7 @@ bool Same(const PreparedCudaDlibBinding &a, const PreparedCudaDlibBinding &b) {
 struct Buffer {
   cuda::CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
+  std::size_t reserved_bytes = 0;
 };
 #if STUDIOCAST_HAVE_DLIB
 bool Charge(std::size_t count, std::size_t size, std::size_t budget,
@@ -139,6 +140,7 @@ bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
   }
   out->ptr = a.ptr;
   out->bytes = n;
+  out->reserved_bytes = a.pitch * rows;
   if (!d->MemcpyHtoD2DAsync(a.ptr, a.pitch, staging.data(), row_bytes,
                             row_bytes, rows, s, e)) {
     std::string x;
@@ -360,6 +362,14 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   std::size_t sizes[] = {iv.size() * 4, ct.size() * 4,         ts.size() * 4,
                          tl.size() * 4, sv.size() * sizeof(S), lv.size() * 4,
                          cf.size() * 4, av.size() * 4,         dv.size() * 4};
+  std::size_t reserved_bytes = 0;
+  const auto charge_reserved = [&](std::size_t amount) {
+    if (reserved_bytes > s.resource_budget_bytes ||
+        amount > s.resource_budget_bytes - reserved_bytes)
+      return false;
+    reserved_bytes += amount;
+    return true;
+  };
   for (int i = 0; i < 9; ++i)
     if (!AllocUpload(s.binding.driver, s.binding.stream, ptrs[i], sizes[i],
                      &candidate->buffers[i], &candidate->pending, e)) {
@@ -370,12 +380,22 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
         impl_ = std::move(candidate);
       }
       return false;
+    } else if (!charge_reserved(candidate->buffers[i].reserved_bytes)) {
+      if (e)
+        *e = "dlib prepared resource budget exceeded";
+      return false;
     }
   if (!candidate->shape.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
+      !charge_reserved(candidate->shape.pitch) ||
       !candidate->features.AllocateNchwF32(s.binding.driver, 1, 1, 1, (int)maxf,
                                            e) ||
-      !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e))
+      !charge_reserved(candidate->features.pitch) ||
+      !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
+      !charge_reserved(candidate->output.pitch)) {
+    if (e && e->empty())
+      *e = "dlib prepared resource budget exceeded";
     return false;
+  }
   if (!cuda::kernels::PrepareDlibShapePredictorKernel(
           *s.binding.driver, s.binding.owner_context, s.binding.stream,
           &candidate->kernel, e)) {

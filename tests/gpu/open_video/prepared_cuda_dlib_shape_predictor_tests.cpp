@@ -15,6 +15,7 @@ CUcontext ctx = reinterpret_cast<CUcontext>(1);
 int loads, gets, launches, unloads;
 CUresult launch_result = CUDA_SUCCESS;
 int allocations, frees, syncs, fail_sync_from, fail_sync_through;
+std::size_t tensor_pitch_extra;
 CUresult Current(CUcontext *c) {
   *c = ctx;
   return 0;
@@ -42,7 +43,7 @@ CUresult Alloc(CUdeviceptr *p, std::size_t *q, std::size_t n, std::size_t,
                unsigned) {
   *p = 1;
   *p = static_cast<CUdeviceptr>(0x1000 + (++allocations) * 0x1000);
-  *q = n;
+  *q = n == 8192 ? n : n + tensor_pitch_extra;
   return 0;
 }
 CUresult Free(CUdeviceptr) {
@@ -225,6 +226,20 @@ int main() {
                  frees == retained_allocations - allocations_before,
              "shutdown retry did not release complete candidate");
   std::filesystem::remove_all(root);
+  const auto padded_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor padded;
+  setup.models_root = padded_root;
+  setup.model_id = "tiny-dlib68";
+  tensor_pitch_extra = 1u << 20;
+  const int before_padded_allocations = allocations;
+  const int before_padded_frees = frees;
+  ok &= Need(!padded.Prepare(setup, &e),
+             "pitched allocations exceeding budget must fail");
+  ok &= Need(frees - before_padded_frees ==
+                 allocations - before_padded_allocations,
+             "budget rejection leaked padded allocations");
+  tensor_pitch_extra = 0;
+  std::filesystem::remove_all(padded_root);
   const auto oversized_root = OversizedPack();
   studiocast::open_video::PreparedCudaDlibShapePredictor oversized;
   setup.models_root = oversized_root;
