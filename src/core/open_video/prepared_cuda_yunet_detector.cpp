@@ -215,7 +215,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
                                         std::string *error) {
   if (error)
     error->clear();
-  if (!impl_ || impl_->ready || !setup.binding.driver ||
+  if (!impl_ || impl_->ready || impl_->warmup_pending ||
+      !setup.binding.driver ||
       !setup.binding.context.Valid() || !setup.binding.stream ||
       setup.binding.stream_identity == 0 || setup.binding.owner_identity == 0 ||
       setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
