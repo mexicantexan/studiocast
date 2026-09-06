@@ -137,6 +137,12 @@ struct PreparedOpenCudaVbPlan {
 PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
     const PreparedOpenCudaVbPlanInput &input) noexcept;
 
+// CudaTensor stores NCHW data in one pitched allocation row. This converts
+// that exact allocation metadata into the capacity consumed by setup budgets.
+bool PreparedContiguousTensorCapacityBytes(std::uint64_t allocation_pitch_bytes,
+                                           std::uint64_t active_bytes,
+                                           std::uint64_t *capacity_bytes) noexcept;
+
 struct PreparedOpenCudaProductionConfig;
 hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
     const hal::PreparedProgram &program,

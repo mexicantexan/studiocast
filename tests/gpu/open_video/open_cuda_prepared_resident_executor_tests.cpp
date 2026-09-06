@@ -748,6 +748,16 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
               "combined VB/key-light planning must reserve the second stage "
               "events and terminal device resize exactly") &&
        ok;
+  auto triple_resize = combined_resize;
+  triple_resize.island_stage_count = 3;
+  const auto triple_plan =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(triple_resize);
+  ok = Expect(triple_plan.ready() && triple_plan.island_stage_count == 3 &&
+                  triple_plan.required_budget.resource_count == 22 &&
+                  triple_plan.required_budget.persistent_bytes == 4112,
+              "VB/key-light/vignette planning must admit the bounded third "
+              "stage and reserve its completion events exactly") &&
+       ok;
   struct Threshold {
     int requested = 0;
     std::uint32_t strength = 0;
@@ -1005,6 +1015,47 @@ bool TestPreparedGeometryStrengthLaunchesAndBudgets() {
                 "undersized prepared pitch must fail as malformed") &&
          ok;
   }
+  return ok;
+}
+
+bool TestContiguousTensorPitchBudgetBoundary() {
+  constexpr std::uint64_t active = 256u * 256u * sizeof(float);
+  constexpr std::uint64_t pitch = active + 256u;
+  std::uint64_t capacity = 0;
+  bool ok = Expect(open_cuda::PreparedContiguousTensorCapacityBytes(
+                       pitch, active, &capacity) &&
+                       capacity == pitch,
+                   "one-row CudaTensor pitch must be counted once as its exact "
+                   "allocation capacity");
+
+  auto accepted = PlanningInput(
+      hal::SemanticEffectId::virtual_background_remove, 8);
+  accepted.model_width = 256;
+  accepted.model_height = 256;
+  accepted.model_alpha_capacity_bytes = capacity;
+  accepted.input_tensor_capacity_bytes = active * 3u;
+  accepted.available_budget.persistent_bytes = 2u * 1024u * 1024u;
+  const auto baseline =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted);
+  ok = Expect(baseline.ready(),
+              "exact contiguous tensor resources must produce a ready plan") &&
+       ok;
+  accepted.available_budget.persistent_bytes =
+      baseline.required_budget.persistent_bytes;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted).ready(),
+              "an exact tight persistent budget must remain eligible") &&
+       ok;
+  --accepted.available_budget.persistent_bytes;
+  const auto under =
+      open_cuda::PlanPreparedOpenCudaVirtualBackground(accepted);
+  ok = Expect(under.status == RuntimeStatus::resource_exhausted &&
+                  under.reason == hal::ReasonId::resource_exhausted,
+              "one byte below the exact allocation budget must fail closed") &&
+       ok;
+  ok = Expect(!open_cuda::PreparedContiguousTensorCapacityBytes(
+                  active - 1u, active, &capacity),
+              "invalid allocation metadata must be rejected") &&
+       ok;
   return ok;
 }
 
@@ -1438,6 +1489,7 @@ bool TestBudgetEvidenceRollbackAndOldPlanRetention() {
     const auto status = fixture.session.Configure(replacement, fixture.adapter,
                                                   &readiness, &reason);
     ok = Expect(status == hal::StatusId::resource_exhausted &&
+                    reason == hal::ReasonId::resource_exhausted &&
                     fixture.session.prepared() &&
                     fixture.session.program().program_id ==
                         fixture.program.program_id &&
@@ -1579,6 +1631,7 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
 int main() {
   bool ok = true;
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
+  ok = TestContiguousTensorPitchBudgetBoundary() && ok;
   ok = TestAcceptedResidentEffectsThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
   ok = TestCombinedOptionalFirstFailureContinuesSecondStage() && ok;

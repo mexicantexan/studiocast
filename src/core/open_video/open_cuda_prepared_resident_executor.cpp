@@ -153,7 +153,8 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
                             (input.final_output_width != input.frame_width ||
                              input.final_output_height != input.frame_height);
   if ((!blur && !remove && !replace && !key_light) ||
-      input.island_stage_count == 0 || input.island_stage_count > 2) {
+      input.island_stage_count == 0 ||
+      input.island_stage_count > hal::kMaxPreparedStages) {
     result.status = RuntimeStatus::unsupported_effect;
     result.reason = ReasonId::semantic_effect_unsupported;
     return result;
@@ -353,7 +354,8 @@ bool ExactPreparedOpenCudaVirtualBackgroundPlan(
                             plan.final_output_height != plan.frame_height;
   if (!plan.ready() || plan.frame_width == 0 || plan.frame_height == 0 ||
       plan.model_width == 0 || plan.model_height == 0 ||
-      plan.island_stage_count == 0 || plan.island_stage_count > 2 ||
+      plan.island_stage_count == 0 ||
+      plan.island_stage_count > hal::kMaxPreparedStages ||
       plan.required_budget.persistent_bytes == 0 ||
       ((blur || feather) && plan.required_budget.scratch_bytes == 0) ||
       plan.required_budget.upload_staging_bytes == 0 ||
@@ -1330,12 +1332,12 @@ public:
       exact_plan_input.final_output_pitch_bytes =
           candidate->final_output.Valid() ? candidate->final_output.pitch
                                           : candidate->output.pitch;
-      if (!CheckedMul(candidate->alpha.pitch,
-                      static_cast<std::uint64_t>(model_h),
-                      &exact_plan_input.model_alpha_capacity_bytes)) {
+      if (!PreparedContiguousTensorCapacityBytes(
+              candidate->alpha.pitch, candidate->alpha.bytes,
+              &exact_plan_input.model_alpha_capacity_bytes)) {
         CleanupCandidate(candidate.get());
-        return SetupFailure(RuntimeStatus::resource_exhausted,
-                            ReasonId::resource_exhausted);
+        return SetupFailure(RuntimeStatus::malformed_contract,
+                            ReasonId::malformed_descriptor);
       }
       exact_plan_input.input_tensor_capacity_bytes =
           input_view.allocation_capacity_bytes;
@@ -2276,6 +2278,17 @@ hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
 PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
     const PreparedOpenCudaVbPlanInput &input) noexcept {
   return BuildPreparedOpenCudaVirtualBackgroundPlan(input);
+}
+
+bool PreparedContiguousTensorCapacityBytes(
+    std::uint64_t allocation_pitch_bytes, std::uint64_t active_bytes,
+    std::uint64_t *capacity_bytes) noexcept {
+  if (!capacity_bytes || active_bytes == 0 ||
+      allocation_pitch_bytes < active_bytes) {
+    return false;
+  }
+  *capacity_bytes = allocation_pitch_bytes;
+  return true;
 }
 
 struct OpenCudaPreparedResidentExecutor::Impl {
