@@ -95,6 +95,8 @@ ProviderToken(hal::SemanticEffectProviderId value) noexcept {
     return "open_vulkan_production_kernels";
   case hal::SemanticEffectProviderId::maxine_cuda_utility:
     return "maxine_cuda_utility";
+  case hal::SemanticEffectProviderId::open_cuda_production_kernels:
+    return "open_cuda_production_kernels";
   case hal::SemanticEffectProviderId::test_fake:
     return "test_fake";
   }

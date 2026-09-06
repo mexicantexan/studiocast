@@ -1067,6 +1067,30 @@ bool TestMultiIslandStrictAndFailureSemantics() {
   return ok;
 }
 
+bool TestNativeCudaProviderUsesOpenCudaLane() {
+  auto input = MultiIslandPassthroughInput();
+  input.writer_commit = {true, 601, 10};
+  ConfigureIsland(
+      &input, PreparedExecutionRouteId::open_cuda_virtual_background, 1, 201,
+      21, SemanticEffectId::vignette, BackendId::cuda,
+      SemanticEffectProviderId::open_cuda_production_kernels,
+      ProductCapabilityLaneId::open_cuda, Code::open_cuda_effect_available, 0,
+      1, 0);
+  MultiIslandVideoRuntimeStatusSnapshot snapshot;
+  const auto result = studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+      input, &snapshot);
+  const auto &vignette =
+      snapshot.effects[static_cast<std::size_t>(SemanticEffectId::vignette) - 1];
+  return Expect(result.code == MultiIslandStatusValidationCode::valid &&
+                    vignette.selected_provider ==
+                        SemanticEffectProviderId::open_cuda_production_kernels &&
+                    vignette.active_provider ==
+                        SemanticEffectProviderId::open_cuda_production_kernels &&
+                    vignette.selected_capability_lane ==
+                        ProductCapabilityLaneId::open_cuda,
+                "native CUDA committed stage did not retain exact provider and lane");
+}
+
 bool TestNoAllocation() {
   const std::uint64_t before = g_allocations.load(std::memory_order_relaxed);
   ProductCapabilitySnapshot capabilities =
@@ -1136,6 +1160,7 @@ int main() {
   ok = TestMultiIslandPassthroughAndProductionFixtures() && ok;
   ok = TestMultiIslandStructuralRejection() && ok;
   ok = TestMultiIslandStrictAndFailureSemantics() && ok;
+  ok = TestNativeCudaProviderUsesOpenCudaLane() && ok;
   ok = TestNoAllocation() && ok;
   if (ok)
     std::cout << "video runtime status tests passed\n";

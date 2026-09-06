@@ -47,7 +47,7 @@ public:
     return kAdapterId;
   }
   hal::BackendId backend_id() const noexcept override {
-    return hal::BackendId::maxine;
+    return backend;
   }
   hal::StatusId Prepare(const hal::PreparedProgram &,
                         hal::PreparedProgramHandle *, hal::ReadinessSnapshot *,
@@ -64,6 +64,7 @@ public:
   }
   void DestroyPrepared(hal::PreparedProgramHandle *) noexcept override {}
   void Shutdown() noexcept override {}
+  hal::BackendId backend = hal::BackendId::maxine;
 };
 
 class FakeFactory final : public video::IVideoAdapterFactory {
@@ -268,6 +269,66 @@ bool TestValidMixedProviderLeaseAndMove() {
                   moved.snapshot().factory.factory == &raw->factory,
               "shutdown must be idempotent and visible");
   return ok;
+}
+
+bool TestValidCudaMixedProviderLease() {
+  OwnerCounters counters;
+  auto owner = std::make_unique<FakeOwner>(&counters);
+  auto *raw = owner.get();
+  raw->adapter.backend = hal::BackendId::cuda;
+  auto snapshot = Snapshot(raw);
+  auto domain = snapshot.execution_domain;
+  domain.backend = hal::BackendId::cuda;
+  domain.api_family = hal::ApiFamily::cuda_driver;
+  domain.allocator_family = hal::AllocatorFamily::cuda_driver;
+  domain.memory_handle_family = hal::MemoryHandleFamily::cuda_device_pointer;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::cuda_stream_ordered;
+  snapshot.backend = hal::BackendId::cuda;
+  snapshot.execution_domain = domain;
+  snapshot.adapter.backend = hal::BackendId::cuda;
+  snapshot.adapter.execution_domain = domain;
+  snapshot.factory.backend = hal::BackendId::cuda;
+  snapshot.factory.execution_domain = domain;
+  snapshot.readiness.requested_backend = hal::BackendId::cuda;
+  snapshot.readiness.selected_backend = hal::BackendId::cuda;
+  snapshot.readiness.execution_domain = domain;
+  snapshot.providers[0] =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  snapshot.providers[1] =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  snapshot.adapter.semantic_capabilities[0].provider = snapshot.providers[0];
+  snapshot.adapter.semantic_capabilities[1].provider = snapshot.providers[1];
+  snapshot.artifacts[0].provider = snapshot.providers[0];
+  for (std::size_t index = 0;
+       index < snapshot.adapter.semantic_capability_count; ++index) {
+    auto &capability = snapshot.adapter.semantic_capabilities[index];
+    for (std::size_t evidence = 0; evidence < capability.evidence_count;
+         ++evidence) {
+      capability.evidence[evidence].backend = hal::BackendId::cuda;
+    }
+  }
+  auto false_homogeneous = snapshot;
+  false_homogeneous.factory.provider = snapshot.providers[0];
+  false_homogeneous.readiness.provider = snapshot.providers[0];
+  hal::ReasonId false_reason = hal::ReasonId::none;
+  if (!Require(video::ValidateProductionVideoSetupLease(
+                   false_homogeneous, *owner, &false_reason) ==
+                   hal::StatusId::blocked &&
+                   false_reason != hal::ReasonId::none,
+               "mixed CUDA stages must reject a false homogeneous provider")) {
+    return false;
+  }
+  video::ProductionVideoSetupLease lease;
+  video::ProductionVideoSetupLeaseAcquireEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto status = video::ProductionVideoSetupLease::Acquire(
+      snapshot, std::move(owner), &lease, &evidence, &reason);
+  return Require(status == hal::StatusId::ready && lease.live() &&
+                     lease.snapshot().factory.provider ==
+                         hal::SemanticEffectProviderId::invalid &&
+                     lease.snapshot().provider_count == 2,
+                 "same-domain ORT and native CUDA providers must acquire");
 }
 
 bool TestMalformedAndForeignContracts() {
@@ -487,6 +548,7 @@ bool TestPermanentPendingHasBoundedCallsAndFinalAttempt() {
 int main() {
   bool ok = true;
   ok &= TestValidMixedProviderLeaseAndMove();
+  ok &= TestValidCudaMixedProviderLease();
   ok &= TestMalformedAndForeignContracts();
   ok &= TestFailedCandidateRetainsOldLease();
   ok &= TestCoordinatorBeforeLeaseDestructionOrder();

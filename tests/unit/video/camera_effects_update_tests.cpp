@@ -37,6 +37,7 @@ struct CameraPipelineIssue1TestAccess {
 namespace {
 
 using studiocast::video::CameraPipeline;
+using studiocast::video::ComputeBackendPreference;
 using studiocast::video::EffectsPlanRequiresRebuild;
 using studiocast::video::OptionalEffectBreaker;
 using studiocast::video::detail::CameraPipelineIssue1TestAccess;
@@ -165,6 +166,39 @@ bool TestExplicitEffectsResourceRefreshIsSeparateInvalidation() {
                 "post-refresh update performed replacement scanning");
 }
 
+bool TestCameraBackendSelectionPreservesExplicitProviderIntent() {
+  namespace hal = studiocast::hal;
+  using Engine = studiocast::video::effects::EffectsEnginePreference;
+
+  studiocast::video::NormalizedVideoExecutionIntent intent;
+  studiocast::video::ApplyCameraBackendSelectionIntent(
+      Engine::open_cuda, ComputeBackendPreference::auto_select, &intent);
+  if (!Expect(intent.backend.mode == hal::BackendRequestMode::explicit_backend &&
+                  intent.backend.backend == hal::BackendId::cuda &&
+                  intent.backend.strict &&
+                  intent.preferences.effects_engine ==
+                      hal::EffectsEnginePreferenceConstraint::open_cuda &&
+                  intent.preferences.strict_effects_engine &&
+                  intent.requested_provider ==
+                      hal::SemanticEffectProviderId::invalid &&
+                  !intent.strict_provider_selection,
+              "OpenCUDA engine intent invented an exact provider request")) {
+    return false;
+  }
+
+  intent.requested_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  intent.strict_provider_selection = true;
+  studiocast::video::ApplyCameraBackendSelectionIntent(
+      Engine::open_cuda, ComputeBackendPreference::vulkan, &intent);
+  return Expect(
+      intent.backend.backend == hal::BackendId::vulkan &&
+          intent.requested_provider ==
+              hal::SemanticEffectProviderId::open_video_onnxruntime_cuda &&
+          intent.strict_provider_selection,
+      "backend mapping erased a caller-owned exact provider constraint");
+}
+
 } // namespace
 
 namespace studiocast::tests {
@@ -174,7 +208,8 @@ bool TestCameraPipelineIdenticalEffectsPreserveRuntimeGeneration() {
 }
 
 bool TestCameraPipelineExplicitEffectsRefreshIsSeparateInvalidation() {
-  return TestExplicitEffectsResourceRefreshIsSeparateInvalidation();
+  return TestExplicitEffectsResourceRefreshIsSeparateInvalidation() &&
+         TestCameraBackendSelectionPreservesExplicitProviderIntent();
 }
 
 } // namespace studiocast::tests

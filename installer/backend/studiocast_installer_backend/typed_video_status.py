@@ -44,6 +44,7 @@ PROVIDERS = {
     4: "open_video_onnxruntime_cpu",
     5: "open_vulkan_production_kernels",
     6: "maxine_cuda_utility",
+    7: "open_cuda_production_kernels",
 }
 STATUSES = {
     0: "invalid", 1: "ready", 2: "blocked", 3: "degraded",
@@ -612,7 +613,7 @@ def _parse_island(
     if domain["backend_id"] != backend_id or domain["adapter_instance_id"] != adapter:
         _fail("typed_status.domain_mismatch")
     expected_backend = {1: 5, 2: 3, 3: 2}[route_id]
-    expected_providers = {1: {5}, 2: {1, 2, 6}, 3: {3}}[route_id]
+    expected_providers = {1: {5}, 2: {1, 2, 6}, 3: {3, 7}}[route_id]
     if backend_id != expected_backend:
         _fail("typed_status.route_backend_mismatch")
 

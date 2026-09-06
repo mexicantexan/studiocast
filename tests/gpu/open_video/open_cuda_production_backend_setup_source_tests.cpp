@@ -755,6 +755,9 @@ bool StaticSelectionOrderIsBehavioral() {
       hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
   strict_provider.plan.intent.strict_provider_selection = true;
   ok &= exercise(strict_provider, hal::StatusId::ready, 0, 1);
+  strict_provider.plan.intent.requested_provider =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  ok &= exercise(strict_provider, hal::StatusId::ready, 0, 1);
 
   {
     int maxine_calls = 0, cuda_calls = 0;
