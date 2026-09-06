@@ -198,9 +198,19 @@ PreparedCudaDlibShapePredictor::~PreparedCudaDlibShapePredictor() {
     (void)impl_.release();
 }
 bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
-                                             std::string *e) {
+                                             std::string *e,
+                                             PreparedCudaDlibStatus *status_out) {
+  if (status_out)
+    *status_out = PreparedCudaDlibStatus::invalid_setup;
   if (e)
     e->clear();
+  if (impl_ && impl_->setup_quarantined) {
+    if (e)
+      *e = "invalid prepared dlib setup";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::shutdown_failed;
+    return false;
+  }
   if (!impl_ || impl_->ready || impl_->setup_quarantined || !s.binding.driver ||
       !s.binding.context.Valid() || !s.binding.owner_context ||
       !s.binding.stream || !s.binding.stream_identity ||
@@ -213,6 +223,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   (void)s;
   if (e)
     *e = "dlib is unavailable in this build";
+  if (status_out)
+    *status_out = PreparedCudaDlibStatus::unavailable;
   return false;
 #else
   auto registry = s.models_root.empty()
@@ -225,6 +237,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   if (!pack) {
     if (e)
       *e = "dlib landmark pack unavailable";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::model_invalid;
     return false;
   }
   const ModelFile *file = nullptr;
@@ -236,22 +250,31 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   if (!file) {
     if (e)
       *e = "dlib landmark artifact unavailable";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::model_invalid;
     return false;
   }
   auto validation = ValidateModelArtifactIdentity(*pack, *file);
   if (!validation.ok()) {
     if (e)
       *e = "dlib landmark artifact identity mismatch";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::model_invalid;
     return false;
   }
+  if (status_out)
+    *status_out = PreparedCudaDlibStatus::model_invalid;
   dlib::matrix<float, 0, 1> initial;
   std::vector<std::vector<dlib::impl::regression_tree>> forests;
   std::vector<std::vector<unsigned long>> anchors;
   std::vector<std::vector<dlib::vector<float, 2>>> deltas;
   try {
     std::ifstream wire(file->path, std::ios::binary);
-    if (!ValidatePredictorWire(wire, s.resource_budget_bytes, e))
+    if (!ValidatePredictorWire(wire, s.resource_budget_bytes, e)) {
+      if (status_out)
+        *status_out = PreparedCudaDlibStatus::resource_exhausted;
       return false;
+    }
     std::ifstream in(file->path, std::ios::binary);
     int version = 0;
     dlib::deserialize(version, in);
@@ -266,6 +289,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   } catch (const std::exception &x) {
     if (e)
       *e = std::string("invalid dlib predictor: ") + x.what();
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::model_invalid;
     return false;
   }
   if (initial.size() != 136 || forests.empty() ||
@@ -358,6 +383,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   if (bytes > s.resource_budget_bytes) {
     if (e)
       *e = "dlib prepared resource budget exceeded";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::resource_exhausted;
     return false;
   }
   auto candidate = std::make_unique<Impl>();
@@ -367,8 +394,12 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
     candidate->setup_quarantined = true;
     impl_ = std::move(candidate);
     std::string cleanup_error;
-    if (!Shutdown(&cleanup_error) && original_error.empty())
-      original_error = cleanup_error;
+    if (!Shutdown(&cleanup_error)) {
+      if (status_out)
+        *status_out = PreparedCudaDlibStatus::shutdown_failed;
+      if (original_error.empty())
+        original_error = cleanup_error;
+    }
     if (e)
       *e = std::move(original_error);
     return false;
@@ -398,6 +429,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
       }
       return reject_candidate(e ? *e : std::string{});
     } else if (!charge_reserved(candidate->buffers[i].reserved_bytes)) {
+      if (status_out)
+        *status_out = PreparedCudaDlibStatus::resource_exhausted;
       return reject_candidate("dlib prepared resource budget exceeded");
     }
   if (!candidate->shape.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
@@ -407,6 +440,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
       !charge_reserved(candidate->features.pitch) ||
       !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
       !charge_reserved(candidate->output.pitch)) {
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::resource_exhausted;
     return reject_candidate(e && !e->empty()
                                 ? *e
                                 : "dlib prepared resource budget exceeded");
@@ -432,6 +467,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   }
   candidate->ready = true;
   impl_ = std::move(candidate);
+  if (status_out)
+    *status_out = PreparedCudaDlibStatus::success;
   return true;
 #endif
 }

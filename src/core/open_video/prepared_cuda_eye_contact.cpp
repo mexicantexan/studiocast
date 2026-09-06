@@ -57,14 +57,34 @@ public:
           !active_yunet_->MatchesPreparedBinding(borrowed_binding_))
         return PreparedCudaEyeContactStatus::model_invalid;
     } else {
-      if (!yunet_.Prepare(s.yunet_setup, &error))
-        return PreparedCudaEyeContactStatus::model_invalid;
+      PreparedCudaYunetStatus yunet_status{};
+      if (!yunet_.Prepare(s.yunet_setup, &error, &yunet_status)) {
+        if (yunet_status == PreparedCudaYunetStatus::resource_exhausted)
+          return PreparedCudaEyeContactStatus::resource_exhausted;
+        if (yunet_status == PreparedCudaYunetStatus::provider_mismatch)
+          return PreparedCudaEyeContactStatus::provider_mismatch;
+        if (yunet_status == PreparedCudaYunetStatus::graph_mismatch)
+          return PreparedCudaEyeContactStatus::graph_mismatch;
+        if (yunet_status == PreparedCudaYunetStatus::shutdown_failed)
+          return PreparedCudaEyeContactStatus::shutdown_failed;
+        return yunet_status == PreparedCudaYunetStatus::model_invalid
+                   ? PreparedCudaEyeContactStatus::model_invalid
+                   : PreparedCudaEyeContactStatus::invalid_setup;
+      }
       if (!yunet_.PrepareCache(s.analysis_cache, &error))
         return PreparedCudaEyeContactStatus::resource_exhausted;
       active_yunet_ = &yunet_;
     }
-    if (!dlib_.Prepare(s.dlib_setup, &error))
-      return PreparedCudaEyeContactStatus::model_invalid;
+    PreparedCudaDlibStatus dlib_status{};
+    if (!dlib_.Prepare(s.dlib_setup, &error, &dlib_status)) {
+      if (dlib_status == PreparedCudaDlibStatus::resource_exhausted)
+        return PreparedCudaEyeContactStatus::resource_exhausted;
+      if (dlib_status == PreparedCudaDlibStatus::shutdown_failed)
+        return PreparedCudaEyeContactStatus::shutdown_failed;
+      return dlib_status == PreparedCudaDlibStatus::model_invalid
+                 ? PreparedCudaEyeContactStatus::model_invalid
+                 : PreparedCudaEyeContactStatus::invalid_setup;
+    }
     return PreparedCudaEyeContactStatus::executed;
   }
   const ValidatedModelArtifactIdentity &artifact() const noexcept override {
@@ -256,8 +276,11 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
       *error = "invalid prepared Eye Contact setup";
     return false;
   }
-  if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error))
+  if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error)) {
+    if (status_out)
+      *status_out = PreparedCudaEyeContactStatus::shutdown_failed;
     return false;
+  }
   auto frozen = s;
   std::size_t accounted = 0;
   if ((!s.shared_yunet &&

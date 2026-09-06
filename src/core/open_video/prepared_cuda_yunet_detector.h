@@ -23,6 +23,7 @@ enum class PreparedCudaYunetStatus : std::uint8_t {
   model_invalid,
   provider_mismatch,
   graph_mismatch,
+  resource_exhausted,
   stale_binding,
   preprocess_failed,
   inference_failed,
@@ -32,6 +33,7 @@ enum class PreparedCudaYunetStatus : std::uint8_t {
   stop_requested,
   cancelled,
   device_lost,
+  shutdown_failed,
   shutdown
 };
 
@@ -119,12 +121,13 @@ public:
   PreparedCudaYunetDetector(PreparedCudaYunetDetector &&) noexcept;
   PreparedCudaYunetDetector &operator=(PreparedCudaYunetDetector &&) = delete;
 
-  bool Prepare(const PreparedCudaYunetSetup &setup, std::string *error);
+  bool Prepare(const PreparedCudaYunetSetup &setup, std::string *error,
+               PreparedCudaYunetStatus *status_out = nullptr);
   bool PrepareForTesting(
       const PreparedCudaYunetSetup &setup,
       const ValidatedModelArtifactIdentity &validated_artifact,
       std::unique_ptr<internal::IPreparedCudaYunetSession> session,
-      std::string *error);
+      std::string *error, PreparedCudaYunetStatus *status_out = nullptr);
   bool PrepareCache(FrameAnalysisCache *cache, std::string *error);
   bool ExportPreparedBinding(FrameAnalysisCache *cache,
                              PreparedCudaYunetPreparedBinding *out) noexcept;
@@ -144,7 +147,7 @@ private:
   PrepareValidated(const PreparedCudaYunetSetup &setup,
                    const ValidatedModelArtifactIdentity &validated_artifact,
                    std::unique_ptr<internal::IPreparedCudaYunetSession> session,
-                   std::string *error);
+                   std::string *error, PreparedCudaYunetStatus *status_out);
   std::unique_ptr<Impl> impl_;
 };
 

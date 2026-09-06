@@ -31,6 +31,7 @@ enum class PreparedCudaDlibStatus : std::uint8_t {
   unavailable,
   invalid_setup,
   model_invalid,
+  resource_exhausted,
   stale_binding,
   launch_failed,
   shutdown_failed,
@@ -49,7 +50,8 @@ public:
       delete;
   PreparedCudaDlibShapePredictor &
   operator=(const PreparedCudaDlibShapePredictor &) = delete;
-  bool Prepare(const PreparedCudaDlibSetup &, std::string *);
+  bool Prepare(const PreparedCudaDlibSetup &, std::string *,
+               PreparedCudaDlibStatus *status_out = nullptr);
   PreparedCudaDlibResult Execute(const PreparedCudaDlibBinding &,
                                  const cuda::CudaImage &,
                                  const PreparedCudaFaceBox &,

@@ -255,7 +255,10 @@ int main() {
   tensor_pitch_extra = 1u << 20;
   const int before_padded_allocations = allocations;
   const int before_padded_frees = frees;
-  ok &= Need(!padded.Prepare(setup, &e),
+  studiocast::open_video::PreparedCudaDlibStatus padded_status{};
+  ok &= Need(!padded.Prepare(setup, &e, &padded_status) &&
+                 padded_status == studiocast::open_video::
+                                      PreparedCudaDlibStatus::resource_exhausted,
              "pitched allocations exceeding budget must fail");
   ok &= Need(frees - before_padded_frees ==
                  allocations - before_padded_allocations,

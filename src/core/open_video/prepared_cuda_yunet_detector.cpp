@@ -216,9 +216,19 @@ PreparedCudaYunetDetector::PreparedCudaYunetDetector(
     PreparedCudaYunetDetector &&) noexcept = default;
 
 bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
-                                        std::string *error) {
+                                        std::string *error,
+                                        PreparedCudaYunetStatus *status_out) {
+  if (status_out)
+    *status_out = PreparedCudaYunetStatus::invalid_setup;
   if (error)
     error->clear();
+  if (impl_ && impl_->warmup_pending) {
+    if (error)
+      *error = "invalid prepared YuNet setup";
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::shutdown_failed;
+    return false;
+  }
   if (!impl_ || impl_->ready || impl_->warmup_pending ||
       !setup.binding.driver || !setup.binding.context.Valid() ||
       !setup.binding.stream || setup.binding.stream_identity == 0 ||
@@ -239,6 +249,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   if (!pack) {
     if (error)
       *error = "requested YuNet model is not installed";
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::model_invalid;
     return false;
   }
   const ModelFile *main = nullptr;
@@ -250,6 +262,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   if (!main) {
     if (error)
       *error = "YuNet main ONNX artifact is missing";
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::model_invalid;
     return false;
   }
   auto validated_setup = setup;
@@ -257,6 +271,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
                          error)) {
     if (error && error->empty())
       *error = "YuNet validated manifest input is missing";
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::model_invalid;
     return false;
   }
   // Validation follows parsing so its manifest checksum proves that the
@@ -265,6 +281,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   if (!validation.ok()) {
     if (error)
       *error = validation.detail;
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::model_invalid;
     return false;
   }
 
@@ -286,27 +304,34 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
       info.output_names.size() != kOutputs) {
     if (error && error->empty())
       *error = "YuNet strict CUDA graph/provider evidence mismatch";
+    if (status_out)
+      *status_out = !session || !info.strict_provider_validation_passed
+                        ? PreparedCudaYunetStatus::provider_mismatch
+                        : PreparedCudaYunetStatus::graph_mismatch;
     return false;
   }
   return PrepareValidated(
       validated_setup, validation.identity,
       std::make_unique<OrtYunetSession>(std::move(session), std::move(info)),
-      error);
+      error, status_out);
 }
 
 bool PreparedCudaYunetDetector::PrepareForTesting(
     const PreparedCudaYunetSetup &setup,
     const ValidatedModelArtifactIdentity &validated_artifact,
     std::unique_ptr<internal::IPreparedCudaYunetSession> session,
-    std::string *error) {
-  return PrepareValidated(setup, validated_artifact, std::move(session), error);
+    std::string *error, PreparedCudaYunetStatus *status_out) {
+  return PrepareValidated(setup, validated_artifact, std::move(session), error,
+                          status_out);
 }
 
 bool PreparedCudaYunetDetector::PrepareValidated(
     const PreparedCudaYunetSetup &setup,
     const ValidatedModelArtifactIdentity &validated_artifact,
     std::unique_ptr<internal::IPreparedCudaYunetSession> session,
-    std::string *error) {
+    std::string *error, PreparedCudaYunetStatus *status_out) {
+  if (status_out)
+    *status_out = PreparedCudaYunetStatus::invalid_setup;
   if (error)
     error->clear();
   if (!impl_ || impl_->ready || impl_->warmup_pending ||
@@ -317,6 +342,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   }
   const auto &info = session->info();
   const auto &declared = setup.declared_input;
+  if (status_out)
+    *status_out = PreparedCudaYunetStatus::graph_mismatch;
   if (declared.name.empty() || declared.layout != "nchw" ||
       declared.dtype != "float32" || declared.channels != 3 ||
       declared.width <= 0 || declared.height <= 0 || declared.width > 2048 ||
@@ -328,12 +355,18 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   }
   const int input_h = declared.height;
   const int input_w = declared.width;
+  if (setup.resource_budget_bytes < RequiredResourceBytes(input_w, input_h)) {
+    if (error)
+      *error = "YuNet prepared resource budget exceeded";
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::resource_exhausted;
+    return false;
+  }
   if (!setup.binding.driver || !setup.binding.context.Valid() ||
       !setup.binding.stream || setup.binding.stream_identity == 0 ||
       setup.binding.owner_identity == 0 ||
       setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
       setup.frame_height <= 0 ||
-      setup.resource_budget_bytes < RequiredResourceBytes(input_w, input_h) ||
       !info.strict_provider_validation_passed ||
       !onnx::OrtPreparedProviderEvidenceMatches(
           info.prepared_provider_evidence, setup.cuda_device_id,
@@ -345,6 +378,10 @@ bool PreparedCudaYunetDetector::PrepareValidated(
       info.output_names.size() != kOutputs) {
     if (error)
       *error = "YuNet strict CUDA graph/provider evidence mismatch";
+    if (status_out)
+      *status_out = !info.strict_provider_validation_passed
+                        ? PreparedCudaYunetStatus::provider_mismatch
+                        : PreparedCudaYunetStatus::graph_mismatch;
     return false;
   }
   std::string geometry_error;
@@ -364,8 +401,11 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   candidate->input_shape = {1, 3, input_h, input_w};
   candidate->session = std::move(session);
   if (!candidate->input.AllocateNchwF32(setup.binding.driver, 1, 3, input_h,
-                                        input_w, error))
+                                        input_w, error)) {
+    if (status_out)
+      *status_out = PreparedCudaYunetStatus::resource_exhausted;
     return false;
+  }
   std::size_t host_offset = 0;
   for (std::size_t index = 0; index < kOutputs; ++index) {
     const auto found = std::find(info.output_names.begin(),
@@ -416,8 +456,11 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     out.name = kNames[index];
     out.host_offset = host_offset;
     if (!out.tensor.AllocateNchwF32(setup.binding.driver, 1, 1, 1,
-                                    anchors * channels, error))
+                                    anchors * channels, error)) {
+      if (status_out)
+        *status_out = PreparedCudaYunetStatus::resource_exhausted;
       return false;
+    }
     host_offset += out.tensor.bytes;
     candidate->ort_outputs[index] = {
         out.name.c_str(), reinterpret_cast<float *>(out.tensor.ptr),
@@ -448,6 +491,10 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   const bool warmup_quiesced =
       setup.binding.driver->StreamSynchronize(setup.binding.stream, error);
   if (!warmup.ok() || !warmup_quiesced) {
+    if (status_out)
+      *status_out = !warmup_quiesced
+                        ? PreparedCudaYunetStatus::shutdown_failed
+                        : PreparedCudaYunetStatus::inference_failed;
     if (error && error->empty())
       *error = "YuNet strict CUDA warmup failed";
     if (!warmup_quiesced) {
@@ -502,6 +549,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     return false;
   candidate->ready = true;
   impl_ = std::move(candidate);
+  if (status_out)
+    *status_out = PreparedCudaYunetStatus::ready;
   return true;
 }
 

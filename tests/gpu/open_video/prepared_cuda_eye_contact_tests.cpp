@@ -120,6 +120,7 @@ struct NativeState {
   std::uint64_t next = 0x1000;
   int runs = 0, records = 0, queries = 0, frees = 0, destroys = 0;
   int fail_run_at = 0, not_ready = 0, fail_free_at = 0;
+  std::size_t pitch_extra = 0;
   int yunet_runs = 0, yunet_invalidates = 0;
 } * native;
 cuda::CUresult CInit(unsigned) { return 0; }
@@ -139,10 +140,10 @@ cuda::CUresult CLaunch(cuda::CUfunction, unsigned, unsigned, unsigned, unsigned,
 }
 cuda::CUresult CAlloc(cuda::CUdeviceptr *p, std::size_t *pitch, std::size_t w,
                       std::size_t h, unsigned) {
-  *p = reinterpret_cast<cuda::CUdeviceptr>(std::calloc(1, w * h));
+  *pitch = w == 8192 ? w : w + native->pitch_extra;
+  *p = reinterpret_cast<cuda::CUdeviceptr>(std::calloc(1, *pitch * h));
   if (!*p)
     return cuda::CUDA_ERROR_OUT_OF_MEMORY;
-  *pitch = w;
   return 0;
 }
 cuda::CUresult CFree(cuda::CUdeviceptr p) {
@@ -592,6 +593,19 @@ bool FailureAndDisabled() {
   CHECK(shared_eye.Shutdown(&error));
   setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes - 1;
   CHECK(!shared_eye.Prepare(setup, &h, &error));
+
+  Analysis retry_analysis;
+  Runtime retry_runtime;
+  PreparedCudaEyeContact retry_eye(&retry_analysis, &retry_runtime);
+  setup = Setup(&cache);
+  CHECK(retry_eye.Prepare(setup, &h, &error));
+  retry_runtime.shutdown_status = PreparedCudaEyeContactStatus::shutdown_failed;
+  CHECK(!retry_eye.Prepare(setup, &h, &error, &prepare_status));
+  CHECK(prepare_status == PreparedCudaEyeContactStatus::shutdown_failed);
+  retry_runtime.shutdown_status = PreparedCudaEyeContactStatus::shutdown;
+  CHECK(retry_eye.Prepare(setup, &h, &error, &prepare_status));
+  CHECK(prepare_status == PreparedCudaEyeContactStatus::executed);
+  CHECK(retry_eye.Shutdown(&error));
   return true;
 }
 bool ConcreteSharedAnalysis() {
@@ -653,7 +667,10 @@ bool ConcreteSharedAnalysis() {
   setup.dlib_setup.resource_budget_bytes = 1U << 20;
   setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes + 4096;
   PreparedCudaEyeContactHandle handle;
-  if (!eye.Prepare(setup, &handle, &error)) { std::cerr << "concrete shared prepare: " << error << '\n'; return false; }
+  if (!eye.Prepare(setup, &handle, &error)) {
+    std::cerr << "concrete shared prepare: " << error << '\n';
+    return false;
+  }
   CHECK(state.yunet_runs == runs_after_warmup);
   cuda::CudaImage input;
   input.ptr = 1;
@@ -670,6 +687,13 @@ bool ConcreteSharedAnalysis() {
         direct.enqueued_readbacks == 0 && direct.completion_waits == 0 &&
         state.yunet_runs == runs_after_warmup + 1);
   CHECK(eye.Shutdown(&error));
+  PreparedCudaEyeContactStatus budget_status;
+  Runtime budget_runtime;
+  PreparedCudaEyeContact budget_eye(&budget_runtime);
+  state.pitch_extra = 1U << 20;
+  CHECK(!budget_eye.Prepare(setup, &handle, &error, &budget_status));
+  CHECK(budget_status == PreparedCudaEyeContactStatus::resource_exhausted);
+  state.pitch_extra = 0;
   CHECK(yunet.ready() && state.yunet_invalidates == 0);
   CHECK(yunet.Shutdown(&error) && state.yunet_invalidates == 1);
   CHECK(yunet.PrepareForTesting(yunet_setup, yunet_identity,
