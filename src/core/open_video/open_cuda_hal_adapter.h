@@ -8,6 +8,16 @@
 
 namespace studiocast::open_cuda {
 
+// Setup components are failure domains, not execution stages.  The shared
+// matting component prepares one model/session used by every VB/KL stage;
+// vignette owns only its native kernel resources.
+enum class OpenCudaSetupComponentId : std::uint8_t {
+  invalid = 0,
+  aggregate_island,
+  shared_matting,
+  native_vignette,
+};
+
 // Cached setup evidence consumed by the HAL registry. None of these fields may
 // be populated by probing from the frame path.
 struct ResidentCapabilityFacts {
@@ -111,6 +121,8 @@ struct ExecutorPrepareResult {
   hal::ReasonId reason = hal::ReasonId::capability_evidence_incomplete;
   PreparedExecutorHandle handle{};
   PreparedExecutorEvidence evidence{};
+  OpenCudaSetupComponentId failed_component =
+      OpenCudaSetupComponentId::invalid;
 };
 
 class IPreparedResidentExecutor {

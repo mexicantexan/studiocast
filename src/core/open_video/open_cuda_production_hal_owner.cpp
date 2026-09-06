@@ -524,6 +524,12 @@ OpenCudaProductionHalOwner::executor() const noexcept {
   return impl_ ? impl_->executor.get() : nullptr;
 }
 
+ExecutorPrepareResult
+OpenCudaProductionHalOwner::LastPrepareResult() const noexcept {
+  return impl_ && impl_->executor ? impl_->executor->LastPrepareResult()
+                                 : ExecutorPrepareResult{};
+}
+
 ResidentAdapter *OpenCudaProductionHalOwner::adapter() noexcept {
   return impl_ ? impl_->adapter.get() : nullptr;
 }

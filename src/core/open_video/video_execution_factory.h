@@ -96,6 +96,11 @@ struct OpenCudaProductionVideoExecutionFactoryRequest {
   std::array<hal::SemanticEffectId, hal::kMaxPreparedStages> semantics{};
   std::array<hal::ModelArtifactIdentity, hal::kMaxPreparedStages> models{};
   std::size_t stage_count = 0;
+  // Full canonical request.  stage_count/semantics/models above describe only
+  // the compact selectable program for this preparation attempt.
+  video::VideoExecutionPlanRequest plan{};
+  std::array<hal::StatusId, hal::kMaxPreparedStages> canonical_status{};
+  std::array<hal::ReasonId, hal::kMaxPreparedStages> canonical_reason{};
   hal::ProgramGenerations generations{};
   // Exact setup-time capacity reserved for the one prepared resident slot.
   // The lease publishes this value unchanged; frame execution cannot grow it.
@@ -118,6 +123,11 @@ struct OpenCudaProductionVideoExecutionBootstrapResult {
   OpenCudaProductionPreparationResult owner{};
   video::ProductionVideoSetupLeaseSnapshot setup_lease{};
   bool exact_candidate_ready = false;
+  OpenCudaSetupComponentId failed_component =
+      OpenCudaSetupComponentId::invalid;
+  video::VideoAdapterPrepareEvidence prepare{};
+  video::ProductionVideoSetupLeaseShutdownResult candidate_shutdown{};
+  hal::ResourceBudget actual_required_budget{};
 };
 
 // Static Open CUDA/Open Video adapter factory for the first conservative

@@ -292,7 +292,8 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
       const bool before = resolved.cpu_tail_placement ==
                           hal::DeclaredCpuTail::Placement::before_stage;
       const auto expected_boundary =
-          static_cast<std::uint32_t>(before ? index : index + 1);
+          static_cast<std::uint32_t>(before ? prepared_index
+                                            : prepared_index + 1);
       if (tail.id != resolved.cpu_tail ||
           tail.scratch_bytes != resolved.cpu_tail_scratch_bytes ||
           tail.placement != resolved.cpu_tail_placement ||
@@ -308,7 +309,34 @@ bool ExactPreparedProgram(const hal::PreparedProgram &program,
     ++prepared_index;
   }
   for (std::size_t index = 0; index < request.cpu_tail_count; ++index) {
-    if (!SameTail(program.cpu_tails[index], request.cpu_tails[index])) {
+    const auto &prepared_tail = program.cpu_tails[index];
+    const auto &canonical_tail = request.cpu_tails[index];
+    std::size_t canonical_stage_index = resolution.stage_count;
+    for (std::size_t stage = 0; stage < resolution.stage_count; ++stage) {
+      const auto stage_id = resolution.stages[stage].intent.stage_id;
+      if ((canonical_tail.placement ==
+               hal::DeclaredCpuTail::Placement::after_stage &&
+           canonical_tail.after_stage_id == stage_id) ||
+          (canonical_tail.placement ==
+               hal::DeclaredCpuTail::Placement::before_stage &&
+           canonical_tail.before_stage_id == stage_id)) {
+        canonical_stage_index = stage;
+        break;
+      }
+    }
+    const auto expected_canonical_boundary = static_cast<std::uint32_t>(
+        canonical_tail.placement ==
+                hal::DeclaredCpuTail::Placement::before_stage
+            ? canonical_stage_index
+            : canonical_stage_index + 1);
+    if (canonical_stage_index == resolution.stage_count ||
+        canonical_tail.boundary_index != expected_canonical_boundary ||
+        prepared_tail.id != canonical_tail.id ||
+        prepared_tail.after_stage_id != canonical_tail.after_stage_id ||
+        prepared_tail.before_stage_id != canonical_tail.before_stage_id ||
+        prepared_tail.scratch_bytes != canonical_tail.scratch_bytes ||
+        prepared_tail.required != canonical_tail.required ||
+        prepared_tail.placement != canonical_tail.placement) {
       SetReason(reason, hal::ReasonId::malformed_contract);
       return false;
     }

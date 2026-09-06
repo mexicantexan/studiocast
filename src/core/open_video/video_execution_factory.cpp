@@ -1,5 +1,6 @@
 #include "core/open_video/video_execution_factory.h"
 #include "core/open_video/open_cuda_selection_policy.h"
+#include "core/video/production_video_backend_manager.h"
 
 #include <limits>
 #include <new>
@@ -29,6 +30,315 @@ bool SameModel(const hal::ModelArtifactIdentity &left,
          left.artifact_generation == right.artifact_generation;
 }
 
+bool SameBudget(const hal::ResourceBudget &left,
+                const hal::ResourceBudget &right) noexcept;
+
+bool SamePlane(const hal::PlaneDescriptor &left,
+               const hal::PlaneDescriptor &right) noexcept {
+  return left.offset_bytes == right.offset_bytes &&
+         left.row_stride_bytes == right.row_stride_bytes &&
+         left.size_bytes == right.size_bytes && left.width == right.width &&
+         left.height == right.height &&
+         left.alignment_bytes == right.alignment_bytes;
+}
+
+bool SameImage(const hal::ImageDescriptor &left,
+               const hal::ImageDescriptor &right) noexcept {
+  bool exact = left.width == right.width && left.height == right.height &&
+               left.plane_count == right.plane_count &&
+               left.format == right.format &&
+               left.channel_order == right.channel_order &&
+               left.color_space == right.color_space &&
+               left.color_range == right.color_range &&
+               left.alpha_meaning == right.alpha_meaning &&
+               left.orientation == right.orientation &&
+               left.host_coherence == right.host_coherence &&
+               left.mutability == right.mutability &&
+               left.aliasing == right.aliasing &&
+               left.in_place_permitted == right.in_place_permitted &&
+               left.base_alignment_bytes == right.base_alignment_bytes;
+  for (std::size_t index = 0; exact && index < left.planes.size(); ++index)
+    exact = SamePlane(left.planes[index], right.planes[index]);
+  return exact;
+}
+
+bool SameTensor(const hal::TensorDescriptor &left,
+                const hal::TensorDescriptor &right) noexcept {
+  return left.element_type == right.element_type &&
+         left.layout == right.layout &&
+         left.channel_order == right.channel_order &&
+         left.color_space == right.color_space &&
+         left.color_range == right.color_range &&
+         left.alpha_meaning == right.alpha_meaning &&
+         left.orientation == right.orientation &&
+         left.host_coherence == right.host_coherence &&
+         left.mutability == right.mutability &&
+         left.aliasing == right.aliasing &&
+         left.in_place_permitted == right.in_place_permitted &&
+         left.rank == right.rank &&
+         left.base_alignment_bytes == right.base_alignment_bytes &&
+         left.dimensions == right.dimensions &&
+         left.strides_bytes == right.strides_bytes;
+}
+
+bool SameStageIo(const hal::StageIoDescriptor &left,
+                 const hal::StageIoDescriptor &right) noexcept {
+  return left.kind == right.kind && SameImage(left.image, right.image) &&
+         SameTensor(left.tensor, right.tensor);
+}
+
+bool SameTail(const hal::DeclaredCpuTail &left,
+              const hal::DeclaredCpuTail &right) noexcept {
+  return left.id == right.id && left.after_stage_id == right.after_stage_id &&
+         left.scratch_bytes == right.scratch_bytes &&
+         left.required == right.required && left.placement == right.placement &&
+         left.before_stage_id == right.before_stage_id &&
+         left.boundary_index == right.boundary_index;
+}
+
+bool SameTemporal(const hal::TemporalContract &left,
+                  const hal::TemporalContract &right) noexcept {
+  return left.temporal == right.temporal &&
+         left.requires_contiguous_capture_sequence ==
+             right.requires_contiguous_capture_sequence &&
+         left.frame_drop_behavior == right.frame_drop_behavior &&
+         left.discontinuity_action == right.discontinuity_action &&
+         left.history_frames == right.history_frames;
+}
+
+bool SamePreparedProgram(const hal::PreparedProgram &left,
+                         const hal::PreparedProgram &right) noexcept {
+  bool exact =
+      left.contract_version == right.contract_version &&
+      left.program_id == right.program_id &&
+      left.owner_adapter_instance_id == right.owner_adapter_instance_id &&
+      left.execution_domain == right.execution_domain &&
+      SameImage(left.host_input, right.host_input) &&
+      SameImage(left.host_output, right.host_output) &&
+      left.invalidation_key == right.invalidation_key &&
+      SameTemporal(left.temporal, right.temporal) &&
+      SameBudget(left.budget, right.budget) &&
+      left.setup_failure_policy == right.setup_failure_policy &&
+      left.stage_count == right.stage_count &&
+      left.cpu_tail_count == right.cpu_tail_count &&
+      left.requested_backend == right.requested_backend &&
+      left.strict_backend_selection == right.strict_backend_selection &&
+      left.requested_provider == right.requested_provider &&
+      left.strict_provider_selection == right.strict_provider_selection &&
+      left.requested_execution_domain == right.requested_execution_domain &&
+      left.strict_execution_domain == right.strict_execution_domain &&
+      left.requires_upload == right.requires_upload &&
+      left.requires_final_readback == right.requires_final_readback;
+  for (std::size_t index = 0; exact && index < left.stage_count; ++index) {
+    const auto &a = left.stages[index];
+    const auto &b = right.stages[index];
+    exact = a.stage_id == b.stage_id && a.semantic == b.semantic &&
+            a.provider == b.provider && a.backend == b.backend &&
+            a.execution_domain == b.execution_domain &&
+            SameStageIo(a.input, b.input) && SameStageIo(a.output, b.output) &&
+            SameModel(a.model, b.model) && a.required == b.required &&
+            a.failure_action == b.failure_action &&
+            a.circuit_breaker.consecutive_failure_limit ==
+                b.circuit_breaker.consecutive_failure_limit &&
+            a.circuit_breaker.cooldown_frames ==
+                b.circuit_breaker.cooldown_frames &&
+            a.circuit_breaker.action == b.circuit_breaker.action &&
+            a.scratch_bytes == b.scratch_bytes && a.primitive == b.primitive;
+  }
+  for (std::size_t index = 0; exact && index < left.cpu_tail_count; ++index)
+    exact = SameTail(left.cpu_tails[index], right.cpu_tails[index]);
+  return exact;
+}
+
+bool SameTransfers(const video::PerFrameTransferContract &left,
+                   const video::PerFrameTransferContract &right) noexcept {
+  return left.contract_version == right.contract_version &&
+         left.uploads == right.uploads &&
+         left.final_readbacks == right.final_readbacks &&
+         left.intermediate_readbacks == right.intermediate_readbacks &&
+         left.intermediate_uploads == right.intermediate_uploads &&
+         left.cpu_tail_boundaries == right.cpu_tail_boundaries &&
+         left.minimum_synchronizations == right.minimum_synchronizations &&
+         left.maximum_synchronizations == right.maximum_synchronizations &&
+         left.variable_boundaries_declared ==
+             right.variable_boundaries_declared &&
+         left.minimum_intermediate_readbacks ==
+             right.minimum_intermediate_readbacks &&
+         left.maximum_intermediate_readbacks ==
+             right.maximum_intermediate_readbacks &&
+         left.minimum_intermediate_uploads ==
+             right.minimum_intermediate_uploads &&
+         left.maximum_intermediate_uploads ==
+             right.maximum_intermediate_uploads &&
+         left.minimum_cpu_tail_boundaries ==
+             right.minimum_cpu_tail_boundaries &&
+         left.maximum_cpu_tail_boundaries ==
+             right.maximum_cpu_tail_boundaries;
+}
+
+bool SameIntent(const video::NormalizedVideoExecutionIntent &left,
+                const video::NormalizedVideoExecutionIntent &right) noexcept {
+  bool exact = left.backend.mode == right.backend.mode &&
+               left.backend.backend == right.backend.backend &&
+               left.backend.strict == right.backend.strict &&
+               left.preferences.compute_family ==
+                   right.preferences.compute_family &&
+               left.preferences.effects_engine ==
+                   right.preferences.effects_engine &&
+               left.preferences.strict_effects_engine ==
+                   right.preferences.strict_effects_engine &&
+               left.requested_provider == right.requested_provider &&
+               left.strict_provider_selection ==
+                   right.strict_provider_selection &&
+               left.stage_count == right.stage_count;
+  for (std::size_t index = 0; exact && index < left.stage_count; ++index) {
+    const auto &a = left.stages[index];
+    const auto &b = right.stages[index];
+    exact = a.intent.stage_id == b.intent.stage_id &&
+            a.intent.semantic == b.intent.semantic &&
+            a.intent.required == b.intent.required &&
+            a.intent.failure_action == b.intent.failure_action &&
+            a.intent.requires_tracked_vignette_center ==
+                b.intent.requires_tracked_vignette_center &&
+            a.parameter_count == b.parameter_count && SameModel(a.model, b.model);
+    for (std::size_t parameter = 0;
+         exact && parameter < a.parameter_count; ++parameter) {
+      const auto &x = a.parameters[parameter];
+      const auto &y = b.parameters[parameter];
+      exact = x.id == y.id && x.kind == y.kind &&
+              x.signed_value == y.signed_value &&
+              x.unsigned_value == y.unsigned_value &&
+              x.real_value == y.real_value &&
+              x.boolean_value == y.boolean_value;
+    }
+  }
+  return exact;
+}
+
+bool SameResolution(const hal::ResolutionResult &left,
+                    const hal::ResolutionResult &right) noexcept {
+  bool exact = left.request_mode == right.request_mode &&
+               left.strict_backend_selection ==
+                   right.strict_backend_selection &&
+               left.status == right.status && left.reason == right.reason &&
+               left.requested_backend == right.requested_backend &&
+               left.preferences.compute_family ==
+                   right.preferences.compute_family &&
+               left.preferences.effects_engine ==
+                   right.preferences.effects_engine &&
+               left.preferences.strict_effects_engine ==
+                   right.preferences.strict_effects_engine &&
+               left.selected_backend == right.selected_backend &&
+               left.active_backend == right.active_backend &&
+               left.selected_provider == right.selected_provider &&
+               left.stage_count == right.stage_count &&
+               left.available == right.available &&
+               left.degraded == right.degraded &&
+               left.fallback == right.fallback &&
+               left.passthrough == right.passthrough;
+  for (std::size_t index = 0; exact && index < left.stage_count; ++index) {
+    const auto &a = left.stages[index];
+    const auto &b = right.stages[index];
+    exact = a.intent.stage_id == b.intent.stage_id &&
+            a.intent.semantic == b.intent.semantic &&
+            a.intent.required == b.intent.required &&
+            a.intent.failure_action == b.intent.failure_action &&
+            a.intent.requires_tracked_vignette_center ==
+                b.intent.requires_tracked_vignette_center &&
+            a.status == b.status && a.reason == b.reason &&
+            a.selected_backend == b.selected_backend &&
+            a.provider == b.provider &&
+            a.adapter_instance_id == b.adapter_instance_id &&
+            a.execution_domain == b.execution_domain &&
+            a.cpu_tail == b.cpu_tail &&
+            a.cpu_tail_scratch_bytes == b.cpu_tail_scratch_bytes &&
+            a.cpu_tail_placement == b.cpu_tail_placement &&
+            a.evidence_count == b.evidence_count &&
+            a.skipped_optional == b.skipped_optional &&
+            a.fallback_selected == b.fallback_selected;
+    for (std::size_t evidence = 0;
+         exact && evidence < a.evidence_count; ++evidence) {
+      const auto &x = a.evidence[evidence];
+      const auto &y = b.evidence[evidence];
+      exact = x.code == y.code && x.status == y.status &&
+              x.reason == y.reason && x.semantic == y.semantic &&
+              x.backend == y.backend && x.satisfied == y.satisfied;
+    }
+  }
+  return exact;
+}
+
+bool SameDomainPlan(const hal::DomainPlan &left,
+                    const hal::DomainPlan &right) noexcept {
+  bool exact = left.status == right.status && left.reason == right.reason &&
+               left.island_count == right.island_count &&
+               left.boundary_count == right.boundary_count &&
+               left.expected_transfers.uploads ==
+                   right.expected_transfers.uploads &&
+               left.expected_transfers.final_readbacks ==
+                   right.expected_transfers.final_readbacks &&
+               left.expected_transfers.intermediate_readbacks ==
+                   right.expected_transfers.intermediate_readbacks &&
+               left.expected_transfers.intermediate_uploads ==
+                   right.expected_transfers.intermediate_uploads &&
+               left.expected_transfers.synchronizations ==
+                   right.expected_transfers.synchronizations &&
+               left.expected_transfers.cpu_tail_boundaries ==
+                   right.expected_transfers.cpu_tail_boundaries &&
+               left.passthrough == right.passthrough;
+  for (std::size_t index = 0; exact && index < left.island_count; ++index) {
+    const auto &a = left.islands[index];
+    const auto &b = right.islands[index];
+    exact = a.adapter_instance_id == b.adapter_instance_id &&
+            a.resident_adapter == b.resident_adapter &&
+            a.execution_domain == b.execution_domain &&
+            a.stage_count == b.stage_count &&
+            a.requires_upload == b.requires_upload &&
+            a.requires_final_readback == b.requires_final_readback;
+    for (std::size_t stage = 0; exact && stage < a.stage_count; ++stage)
+      exact = a.resolved_stage_indices[stage] == b.resolved_stage_indices[stage];
+  }
+  for (std::size_t index = 0; exact && index < left.boundary_count; ++index) {
+    const auto &a = left.boundaries[index];
+    const auto &b = right.boundaries[index];
+    exact = a.kind == b.kind && a.after_stage_id == b.after_stage_id &&
+            a.before_stage_id == b.before_stage_id &&
+            a.boundary_index == b.boundary_index &&
+            a.cpu_tail == b.cpu_tail &&
+            a.scratch_bytes == b.scratch_bytes &&
+            a.source_domain == b.source_domain &&
+            a.destination_domain == b.destination_domain &&
+            a.readback_required == b.readback_required &&
+            a.following_upload_required == b.following_upload_required;
+  }
+  return exact;
+}
+
+bool SamePrimedPlan(const video::FrozenVideoExecutionPlan &left,
+                    const video::FrozenVideoExecutionPlan &right) noexcept {
+  bool exact = left.contract_version == right.contract_version &&
+               left.plan_id == right.plan_id && left.route == right.route &&
+               SameIntent(left.intent, right.intent) &&
+               SameImage(left.host_input, right.host_input) &&
+               SameImage(left.host_output, right.host_output) &&
+               left.invalidation_key == right.invalidation_key &&
+               SameTemporal(left.temporal, right.temporal) &&
+               SameBudget(left.budget, right.budget) &&
+               left.cpu_tail_count == right.cpu_tail_count &&
+               left.setup_failure_policy == right.setup_failure_policy &&
+               left.migration_policy == right.migration_policy &&
+               SameResolution(left.resolution, right.resolution) &&
+               SameDomainPlan(left.domain_plan, right.domain_plan) &&
+               left.factory_id == right.factory_id &&
+               SameTransfers(left.per_frame_transfers,
+                             right.per_frame_transfers) &&
+               SamePreparedProgram(left.prepared_program,
+                                   right.prepared_program);
+  for (std::size_t index = 0; exact && index < left.cpu_tail_count; ++index)
+    exact = SameTail(left.cpu_tails[index], right.cpu_tails[index]);
+  return exact;
+}
+
 bool UsesMatting(hal::SemanticEffectId semantic) noexcept {
   return semantic == hal::SemanticEffectId::virtual_background_blur ||
          semantic == hal::SemanticEffectId::virtual_background_remove ||
@@ -42,11 +352,32 @@ hal::SemanticEffectProviderId ProviderFor(hal::SemanticEffectId semantic) noexce
 
 hal::SemanticEffectProviderId AggregateProvider(
     const video::NormalizedVideoExecutionIntent &intent) noexcept {
+  if (intent.stage_count == 0)
+    return hal::SemanticEffectProviderId::invalid;
   const auto first = ProviderFor(intent.stages[0].intent.semantic);
   for (std::size_t index = 1; index < intent.stage_count; ++index)
     if (ProviderFor(intent.stages[index].intent.semantic) != first)
       return hal::SemanticEffectProviderId::invalid;
   return first;
+}
+
+std::size_t SelectedStageCount(const hal::ResolutionResult &resolution) noexcept {
+  std::size_t count = 0;
+  for (std::size_t index = 0; index < resolution.stage_count; ++index)
+    count += resolution.stages[index].skipped_optional ? 0u : 1u;
+  return count;
+}
+
+video::NormalizedVideoExecutionIntent CompactIntent(
+    const video::VideoExecutionPlanRequest &request,
+    const hal::ResolutionResult &resolution) noexcept {
+  auto compact = request.intent;
+  compact.stage_count = 0;
+  for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
+    if (!resolution.stages[index].skipped_optional)
+      compact.stages[compact.stage_count++] = request.intent.stages[index];
+  }
+  return compact;
 }
 
 bool ZeroModel(const hal::ModelArtifactIdentity &model) noexcept {
@@ -149,9 +480,10 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       domain_plan, cached.minimum_synchronizations_per_frame,
       cached.maximum_synchronizations_per_frame);
   hal::ReasonId transfer_reason = hal::ReasonId::none;
+  const auto compact = CompactIntent(request, resolution);
   bool has_model_consumer = false;
-  for (std::size_t index = 0; index < request.intent.stage_count; ++index)
-    has_model_consumer |= UsesMatting(request.intent.stages[index].intent.semantic);
+  for (std::size_t index = 0; index < compact.stage_count; ++index)
+    has_model_consumer |= UsesMatting(compact.stages[index].intent.semantic);
   if ((has_model_consumer && !cached.model_artifact_validated) ||
       !cached.provider_runtime_validated ||
       !cached.device_context_validated ||
@@ -168,20 +500,20 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       cached.readiness.execution_domain != cached.execution_domain ||
       cached.readiness.requested_backend != hal::BackendId::cuda ||
       cached.readiness.selected_backend != hal::BackendId::cuda ||
-      cached.readiness.provider != AggregateProvider(request.intent) ||
+      cached.readiness.provider != AggregateProvider(compact) ||
       !cached.readiness.available ||
       (cached.readiness.status != hal::StatusId::ready &&
        cached.readiness.status != hal::StatusId::degraded) ||
       // Readiness masks use prepared-stage slots, not stable stage_id values.
       // The only live Open CUDA route owns slot zero, so its exact mask is 1
       // even when the canonical stage_id is greater than 31.
-      cached.stage_count != request.intent.stage_count ||
+      cached.stage_count != compact.stage_count ||
       cached.readiness.ready_stage_mask !=
-          ((std::uint32_t{1} << request.intent.stage_count) - 1u) ||
+          ((std::uint32_t{1} << compact.stage_count) - 1u) ||
       cached.readiness.blocked_stage_mask != 0 ||
       cached.readiness.disabled_stage_mask != 0 ||
       resolution.selected_backend != hal::BackendId::cuda ||
-      resolution.selected_provider != AggregateProvider(request.intent) ||
+      resolution.selected_provider != AggregateProvider(compact) ||
       request.invalidation_key.generations != cached.generations ||
       (ValidReservedBudget(cached.reserved_budget) &&
        !SameBudget(request.budget, cached.reserved_budget)) ||
@@ -191,14 +523,19 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
                                                &transfer_reason)) {
     return false;
   }
+  std::size_t prepared_index = 0;
   for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
+    if (resolution.stages[index].skipped_optional)
+      continue;
     const auto semantic = request.intent.stages[index].intent.semantic;
     if ((UsesMatting(semantic) &&
-         !SameModel(request.intent.stages[index].model, cached.models[index])) ||
+         !SameModel(request.intent.stages[index].model,
+                    cached.models[prepared_index])) ||
         (!UsesMatting(semantic) &&
          (!ZeroModel(request.intent.stages[index].model) ||
-          !ZeroModel(cached.models[index]))))
+          !ZeroModel(cached.models[prepared_index]))))
       return false;
+    ++prepared_index;
   }
   return true;
 }
@@ -208,22 +545,29 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
                        const hal::DomainPlan &domain_plan,
                        hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
+  const auto compact = CompactIntent(request, resolution);
   if (!AcceptsOpenCudaSelectionIntent(request.intent) ||
       (request.intent.preferences.compute_family !=
            hal::ComputeFamilyAllowance::any &&
        request.intent.preferences.compute_family !=
            hal::ComputeFamilyAllowance::cuda_family) ||
-      !SupportedStages(request.intent) ||
+      !SupportedStages(compact) ||
       resolution.stage_count != request.intent.stage_count ||
       domain_plan.island_count != 1 ||
-      domain_plan.islands[0].stage_count != request.intent.stage_count) {
+      domain_plan.islands[0].stage_count != compact.stage_count) {
     SetReason(reason, hal::ReasonId::strict_backend_unavailable);
     return false;
   }
   for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
     const auto &intent = request.intent.stages[index].intent;
-    if (resolution.stages[index].skipped_optional ||
-        resolution.stages[index].selected_backend != hal::BackendId::cuda ||
+    if (resolution.stages[index].skipped_optional) {
+      if (intent.required) {
+        SetReason(reason, hal::ReasonId::required_stage_failed);
+        return false;
+      }
+      continue;
+    }
+    if (resolution.stages[index].selected_backend != hal::BackendId::cuda ||
         resolution.stages[index].provider != ProviderFor(intent.semantic) ||
         intent.stage_id == 0 || intent.requires_tracked_vignette_center ||
         (intent.required &&
@@ -235,8 +579,7 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
       return false;
     }
   }
-  const auto &intent =
-      request.intent.stages[request.intent.stage_count - 1].intent;
+  const auto &intent = compact.stages[compact.stage_count - 1].intent;
   if (!TightRgb24(request.host_input, hal::Mutability::read_only) ||
       !TightRgb24(request.host_output, hal::Mutability::write_only) ||
       request.temporal.temporal ||
@@ -248,7 +591,10 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
       request.cpu_tails[0].placement !=
           hal::DeclaredCpuTail::Placement::after_stage ||
       request.cpu_tails[0].before_stage_id != 0 ||
-      request.cpu_tails[0].boundary_index != request.intent.stage_count ||
+      request.cpu_tails[0].boundary_index !=
+          domain_plan.islands[0]
+                  .resolved_stage_indices[domain_plan.islands[0].stage_count - 1] +
+              1 ||
       !domain_plan.islands[0].requires_upload ||
       !domain_plan.islands[0].requires_final_readback ||
       domain_plan.expected_transfers.uploads != 1 ||
@@ -296,9 +642,12 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
 
   const auto resident =
       ResidentImage(request.host_input, hal::Mutability::read_write);
+  std::size_t prepared_index = 0;
   for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
+    if (resolution.stages[index].skipped_optional)
+      continue;
     const auto &intent = request.intent.stages[index].intent;
-    auto &stage = program.stages[index];
+    auto &stage = program.stages[prepared_index];
     stage.stage_id = intent.stage_id;
     stage.semantic = intent.semantic;
     stage.provider = resolution.stages[index].provider;
@@ -308,7 +657,7 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.input.image = resident;
     stage.input.image.mutability = hal::Mutability::read_only;
     stage.output.kind = hal::StageIoKind::image;
-    stage.output.image = index + 1 == request.intent.stage_count
+    stage.output.image = prepared_index + 1 == SelectedStageCount(resolution)
                              ? ResidentImage(request.host_output,
                                              hal::Mutability::read_write)
                              : resident;
@@ -320,8 +669,15 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.circuit_breaker.action =
         intent.required ? hal::CircuitBreakerAction::quarantine_program
                         : hal::CircuitBreakerAction::disable_stage;
+    ++prepared_index;
   }
-  program.stage_count = request.intent.stage_count;
+  program.stage_count = prepared_index;
+  if (program.cpu_tail_count == 1 && prepared_index != 0) {
+    program.cpu_tails[0].after_stage_id =
+        program.stages[prepared_index - 1].stage_id;
+    program.cpu_tails[0].boundary_index =
+        static_cast<std::uint32_t>(prepared_index);
+  }
   return program;
 }
 
@@ -780,6 +1136,8 @@ struct OpenCudaVideoExecutionFactory::Impl {
   std::array<hal::SemanticEffectId, hal::kMaxPreparedStages>
       production_semantics{};
   std::size_t production_stage_count = 0;
+  video::FrozenVideoExecutionPlan preprepared_plan{};
+  std::unique_ptr<video::IVideoExecutionExecutor> preprepared_executor;
   bool production_shutdown_requested = false;
   bool production_owner_retired = false;
 };
@@ -861,6 +1219,9 @@ OpenCudaVideoExecutionFactory::CreateProduction(
        i < request.stage_count && i < supported_intent.stages.size(); ++i)
     supported_intent.stages[i].intent.semantic = request.semantics[i];
   const bool supported_semantic = SupportedStages(supported_intent);
+  const bool has_canonical_plan = request.plan.intent.stage_count != 0;
+  const std::size_t canonical_stage_count =
+      has_canonical_plan ? request.plan.intent.stage_count : request.stage_count;
   const auto checked_count =
       std::min(request.stage_count, request.semantics.size());
   const bool has_replace =
@@ -906,7 +1267,9 @@ OpenCudaVideoExecutionFactory::CreateProduction(
   }
   exact_model &= has_model_consumer ? request.backend.model_artifact.Valid()
                                     : !request.backend.model_artifact.Valid();
-  if (request.factory_id == 0 || !supported_semantic || !replacement_contract ||
+  if (request.factory_id == 0 || canonical_stage_count == 0 ||
+      canonical_stage_count > hal::kMaxPreparedStages || !supported_semantic ||
+      !replacement_contract ||
       !key_light_contract || !exact_model ||
       !ValidReservedBudget(request.reserved_budget) ||
       request.generations.configuration == 0 ||
@@ -950,6 +1313,11 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.readiness.ready_stage_mask =
         (std::uint32_t{1} << request.stage_count) - 1u;
     config.cached.readiness.available = true;
+    if (has_canonical_plan && canonical_stage_count != request.stage_count) {
+      config.cached.readiness.status = hal::StatusId::degraded;
+      config.cached.readiness.reason = hal::ReasonId::optional_stage_failed_open;
+      config.cached.readiness.degraded = true;
+    }
     config.cached.models = request.models;
     config.cached.stage_count = request.stage_count;
     config.cached.generations = request.generations;
@@ -994,53 +1362,72 @@ OpenCudaVideoExecutionFactory::CreateProduction(
         request.selection_priority;
     impl.production_registration.resident_adapter =
         impl.production_adapter_view.get();
-    for (std::size_t index = 0; index < request.stage_count; ++index) {
+    std::size_t final_selected_capability = canonical_stage_count;
+    for (std::size_t index = canonical_stage_count; index-- > 0;) {
+      const auto status = has_canonical_plan ? request.canonical_status[index]
+                                             : hal::StatusId::ready;
+      if (status == hal::StatusId::ready || status == hal::StatusId::degraded) {
+        final_selected_capability = index;
+        break;
+      }
+    }
+    for (std::size_t index = 0; index < canonical_stage_count; ++index) {
+      const auto semantic = has_canonical_plan
+                                ? request.plan.intent.stages[index].intent.semantic
+                                : request.semantics[index];
+      const auto status = has_canonical_plan ? request.canonical_status[index]
+                                             : hal::StatusId::ready;
+      const auto reason = has_canonical_plan ? request.canonical_reason[index]
+                                             : hal::ReasonId::none;
+      const bool selectable =
+          status == hal::StatusId::ready || status == hal::StatusId::degraded;
       auto &capability =
           impl.production_registration.semantic_capabilities[index];
-      capability.semantic = request.semantics[index];
-      capability.provider = ProviderFor(request.semantics[index]);
-      capability.status = hal::StatusId::ready;
-      capability.reason = hal::ReasonId::none;
-      capability.cpu_tail = index + 1 == request.stage_count
+      capability.semantic = semantic;
+      capability.provider = ProviderFor(semantic);
+      capability.status = status;
+      capability.reason = reason;
+      capability.cpu_tail = index == final_selected_capability
                                 ? hal::CpuTailId::writer_copy
                                 : hal::CpuTailId::invalid;
       capability.cpu_tail_placement =
           hal::DeclaredCpuTail::Placement::after_stage;
-      capability.live_stage = true;
-      capability.production_eligible = true;
-      capability.exact_evidence = true;
+      capability.live_stage = selectable;
+      capability.production_eligible = selectable;
+      capability.exact_evidence = selectable;
       capability.evidence[0] = {
           hal::CapabilityEvidenceCode::provider_runtime_available,
           hal::StatusId::ready,
           hal::ReasonId::none,
-          request.semantics[index],
+          semantic,
           hal::BackendId::cuda,
           true};
       capability.evidence[1] = {
-          UsesMatting(request.semantics[index])
+          UsesMatting(semantic)
               ? hal::CapabilityEvidenceCode::model_artifact_identity_valid
               : hal::CapabilityEvidenceCode::synchronization_evidence_valid,
           hal::StatusId::ready,
           hal::ReasonId::none,
-          request.semantics[index],
+          semantic,
           hal::BackendId::cuda,
           true};
       capability.evidence[2] = {
           hal::CapabilityEvidenceCode::synchronization_evidence_valid,
           hal::StatusId::ready,
           hal::ReasonId::none,
-          request.semantics[index],
+          semantic,
           hal::BackendId::cuda,
           true};
-      capability.evidence_count = UsesMatting(request.semantics[index]) ? 3 : 2;
+      capability.evidence_count = selectable ? (UsesMatting(semantic) ? 3 : 2)
+                                             : 0;
     }
     impl.production_registration.semantic_capability_count =
-        request.stage_count;
+        canonical_stage_count;
     impl.config.prepare_candidate = Impl::PrepareProductionCandidate;
     impl.config.setup_context = &impl;
     result->status = hal::StatusId::ready;
     result->reason = hal::ReasonId::none;
-    result->exact_candidate_ready = true;
+    result->exact_candidate_ready = !has_canonical_plan;
     auto &snapshot = result->setup_lease;
     snapshot.contract_version =
         video::kProductionVideoSetupLeaseContractVersion;
@@ -1119,6 +1506,122 @@ hal::StatusId OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
           destination != nullptr && destination->live();
     }
     return bootstrap->status;
+  }
+
+  if (request.plan.intent.stage_count != 0) {
+    auto exact_request = request.plan;
+    exact_request.invalidation_key.generations.context =
+        bootstrap->setup_lease.execution_domain.logical_context_generation;
+    exact_request.invalidation_key.execution_domain_hash =
+        video::ProductionVideoExecutionDomainHash(
+            bootstrap->setup_lease.execution_domain);
+    exact_request.budget = request.reserved_budget;
+
+    hal::StaticAdapterRegistry registry;
+    hal::ReasonId setup_reason = hal::ReasonId::none;
+    auto setup_status =
+        registry.Register(factory->adapter_registration(), &setup_reason);
+    const auto resolution =
+        setup_status == hal::StatusId::ready
+            ? hal::ResolveSemanticStages(
+                  registry, video::BuildVideoResolutionRequest(exact_request.intent))
+            : hal::ResolutionResult{};
+    const auto domain_plan =
+        setup_status == hal::StatusId::ready && resolution.available &&
+                !resolution.passthrough
+            ? hal::PlanExecutionDomains(registry, resolution,
+                                        hal::CrossAdapterPolicy::reject)
+            : hal::DomainPlan{};
+    if (setup_status == hal::StatusId::ready &&
+        (!resolution.available || resolution.passthrough ||
+         !IsSetupSuccess(domain_plan.status))) {
+      setup_status = resolution.status == hal::StatusId::resource_exhausted
+                         ? resolution.status
+                         : hal::StatusId::blocked;
+      setup_reason = resolution.reason == hal::ReasonId::none
+                         ? domain_plan.reason
+                         : resolution.reason;
+    }
+
+    video::VideoAdapterFactoryPreflight preflight;
+    if (setup_status == hal::StatusId::ready) {
+      preflight = factory->Preflight(
+          exact_request, resolution, domain_plan,
+          video::VideoExecutionRoute::prepared_resident);
+      setup_status = preflight.status;
+      setup_reason = preflight.reason;
+    }
+
+    video::FrozenVideoExecutionPlan frozen;
+    if (IsSetupSuccess(setup_status)) {
+      frozen.plan_id = exact_request.plan_id;
+      frozen.route = video::VideoExecutionRoute::prepared_resident;
+      frozen.intent = exact_request.intent;
+      frozen.host_input = exact_request.host_input;
+      frozen.host_output = exact_request.host_output;
+      frozen.invalidation_key = exact_request.invalidation_key;
+      frozen.temporal = exact_request.temporal;
+      frozen.budget = exact_request.budget;
+      frozen.cpu_tails = exact_request.cpu_tails;
+      frozen.cpu_tail_count = exact_request.cpu_tail_count;
+      frozen.setup_failure_policy = exact_request.setup_failure_policy;
+      frozen.migration_policy = exact_request.migration_policy;
+      frozen.resolution = resolution;
+      frozen.domain_plan = domain_plan;
+      frozen.factory_id = request.factory_id;
+      frozen.per_frame_transfers = preflight.per_frame_transfers;
+      frozen.prepared_program = preflight.prepared_program;
+      auto prepared = factory->Prepare(frozen, &bootstrap->prepare);
+      setup_status = bootstrap->prepare.status;
+      setup_reason = bootstrap->prepare.reason;
+      if (prepared && IsSetupSuccess(setup_status)) {
+        bootstrap->actual_required_budget =
+            factory->impl_->production_owner->LastPrepareResult()
+                .handle.reserved_budget;
+        factory->impl_->preprepared_plan = frozen;
+        factory->impl_->preprepared_executor = std::move(prepared);
+        bootstrap->exact_candidate_ready = true;
+      } else {
+        setup_status = setup_status == hal::StatusId::invalid
+                           ? hal::StatusId::blocked
+                           : setup_status;
+        setup_reason = setup_reason == hal::ReasonId::none
+                           ? hal::ReasonId::capability_evidence_incomplete
+                           : setup_reason;
+      }
+    }
+
+    if (!factory->impl_->preprepared_executor) {
+      const auto last = factory->impl_->production_owner->LastPrepareResult();
+      bootstrap->status = setup_status;
+      bootstrap->reason = setup_reason;
+      bootstrap->failed_component = last.failed_component;
+      const auto shutdown = factory->RequestProductionOwnerShutdown();
+      bootstrap->candidate_shutdown.status = shutdown.hal_status;
+      bootstrap->candidate_shutdown.reason = shutdown.reason;
+      bootstrap->candidate_shutdown.shutdown_attempts = shutdown.shutdown_attempts;
+      bootstrap->candidate_shutdown.shutdown_requested =
+          shutdown.shutdown_requested;
+      bootstrap->candidate_shutdown.pending =
+          !shutdown.driver_context_release_permitted;
+      bootstrap->candidate_shutdown.quiescent = shutdown.quiescent;
+      bootstrap->candidate_shutdown.driver_context_release_permitted =
+          shutdown.driver_context_release_permitted;
+      if (evidence) {
+        evidence->status = setup_status;
+        evidence->reason = setup_reason;
+        evidence->readiness = bootstrap->setup_lease.readiness;
+        evidence->candidate_shutdown = bootstrap->candidate_shutdown;
+        evidence->candidate_owner_rolled_back =
+            bootstrap->candidate_shutdown.driver_context_release_permitted;
+        evidence->candidate_cleanup_pending =
+            !bootstrap->candidate_shutdown.driver_context_release_permitted;
+        evidence->previous_lease_retained =
+            destination != nullptr && destination->live();
+      }
+      SetReason(reason, setup_reason);
+      return setup_status;
+    }
   }
 
   std::unique_ptr<video::IProductionVideoSetupLeaseOwner> owner;
@@ -1200,6 +1703,11 @@ OpenCudaVideoExecutionFactory::RequestProductionOwnerShutdown() noexcept {
     return impl_->production_owner->ShutdownSnapshot();
 
   impl_->production_shutdown_requested = true;
+  // A lease may be retired before the coordinator consumes its setup-prepared
+  // executor. Destroy that prepared slot while the adapter facade is still
+  // live so the runtime can retain any pending native work and report it from
+  // the owner shutdown snapshot.
+  impl_->preprepared_executor.reset();
   result = impl_->production_owner->RequestShutdown();
   if (result.driver_context_release_permitted) {
     if (impl_->production_adapter_view)
@@ -1338,6 +1846,22 @@ OpenCudaVideoExecutionFactory::Prepare(
       evidence->candidate_resources_rolled_back = true;
       return nullptr;
     }
+  }
+
+  if (impl_->preprepared_executor) {
+    const auto &primed = impl_->preprepared_plan;
+    if (!SamePrimedPlan(primed, plan)) {
+      evidence->status = hal::StatusId::stale;
+      evidence->reason = hal::ReasonId::stale_program;
+      evidence->candidate_resources_rolled_back = false;
+      return nullptr;
+    }
+    const auto snapshot = impl_->preprepared_executor->Snapshot();
+    evidence->status = snapshot.status;
+    evidence->reason = snapshot.reason;
+    evidence->readiness = snapshot.readiness;
+    evidence->candidate_resources_rolled_back = false;
+    return std::move(impl_->preprepared_executor);
   }
 
   OpenCudaVideoExecutionCandidate candidate;

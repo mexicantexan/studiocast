@@ -848,6 +848,11 @@ public:
   Prepare(const hal::PreparedProgram &program,
           const PreparedOpenCudaProductionConfig &config) noexcept override {
     PreparedOpenCudaRuntimePrepareResult result;
+    setup_failure_component_ =
+        program.stage_count != 0 &&
+                program.stages[0].semantic == SemanticEffectId::vignette
+            ? OpenCudaSetupComponentId::native_vignette
+            : OpenCudaSetupComponentId::shared_matting;
     result.reason = ValidatePreparedOpenCudaProductionProgram(program, config);
     if (result.reason != ReasonId::none) {
       result.status = RuntimeStatus::malformed_contract;
@@ -1305,7 +1310,8 @@ public:
               &candidate->vignette, &error)) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::not_prepared,
-                            ReasonId::capability_evidence_incomplete);
+                            ReasonId::capability_evidence_incomplete,
+                            OpenCudaSetupComponentId::native_vignette);
       }
 
       cuda::CudaPreparedTransferCompletion::PrepareOptions transfer_options;
@@ -1929,11 +1935,16 @@ private:
     bool setup_completion_unproven = false;
   };
 
-  static PreparedOpenCudaRuntimePrepareResult
-  SetupFailure(RuntimeStatus status, ReasonId reason) noexcept {
+  PreparedOpenCudaRuntimePrepareResult
+  SetupFailure(RuntimeStatus status, ReasonId reason,
+               OpenCudaSetupComponentId component =
+                   OpenCudaSetupComponentId::invalid) noexcept {
     PreparedOpenCudaRuntimePrepareResult result;
     result.status = status;
     result.reason = reason;
+    result.failed_component = component == OpenCudaSetupComponentId::invalid
+                                  ? setup_failure_component_
+                                  : component;
     return result;
   }
 
@@ -2298,6 +2309,8 @@ private:
   std::array<std::unique_ptr<Slot>, kRuntimeSlots> slots_{};
   PreparedOpenCudaRuntimeTelemetry telemetry_{};
   std::uint64_t next_handle_id_ = 1;
+  OpenCudaSetupComponentId setup_failure_component_ =
+      OpenCudaSetupComponentId::aggregate_island;
   cuda::CudaDriverApi *owned_driver_ = nullptr;
   cuda::CUstream owned_stream_ = nullptr;
   bool owns_stream_ = false;
@@ -2464,6 +2477,7 @@ struct OpenCudaPreparedResidentExecutor::Impl {
   std::uint64_t next_handle_id = 1;
   std::uint64_t next_resource_id = 1;
   PreparedOpenCudaShutdownSnapshot shutdown_snapshot{};
+  ExecutorPrepareResult last_prepare_result{};
   bool shutdown_requested = false;
 };
 
@@ -2478,10 +2492,16 @@ OpenCudaPreparedResidentExecutor::~OpenCudaPreparedResidentExecutor() {
 ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
     const hal::PreparedProgram &program) noexcept {
   ExecutorPrepareResult result;
+  const auto finish = [this](ExecutorPrepareResult value) noexcept {
+    if (impl_)
+      impl_->last_prepare_result = value;
+    return value;
+  };
+  result.failed_component = OpenCudaSetupComponentId::aggregate_island;
   if (!impl_ || impl_->shutdown_requested || !impl_->runtime) {
     result.status = StatusId::stopped;
     result.reason = ReasonId::shutdown_requested;
-    return result;
+    return finish(result);
   }
   const ReasonId validation =
       ValidatePreparedOpenCudaProductionProgram(program, impl_->config);
@@ -2490,7 +2510,7 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
                         ? StatusId::resource_exhausted
                         : StatusId::blocked;
     result.reason = validation;
-    return result;
+    return finish(result);
   }
   auto destination =
       std::find_if(impl_->slots.begin(), impl_->slots.end(),
@@ -2498,10 +2518,11 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
   if (destination == impl_->slots.end()) {
     result.status = StatusId::resource_exhausted;
     result.reason = ReasonId::resource_exhausted;
-    return result;
+    return finish(result);
   }
 
   const auto prepared = impl_->runtime->Prepare(program, impl_->config);
+  result.failed_component = prepared.failed_component;
   const auto &evidence = prepared.evidence;
   const bool model_free = program.stages[0].semantic == SemanticEffectId::vignette;
   const auto expected_provider = model_free ? kNativeProvider
@@ -2558,11 +2579,12 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
     result.reason = prepared.reason == ReasonId::none
                         ? ReasonId::capability_evidence_incomplete
                         : prepared.reason;
-    return result;
+    return finish(result);
   }
 
   result.status = StatusId::ready;
   result.reason = ReasonId::none;
+  result.failed_component = OpenCudaSetupComponentId::invalid;
   result.handle.handle_id = impl_->next_handle_id++;
   if (result.handle.handle_id == 0)
     result.handle.handle_id = impl_->next_handle_id++;
@@ -2633,7 +2655,12 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
   destination->program = program;
   destination->executor_handle = result.handle;
   destination->runtime_handle = prepared.handle;
-  return result;
+  return finish(result);
+}
+
+ExecutorPrepareResult
+OpenCudaPreparedResidentExecutor::LastPrepareResult() const noexcept {
+  return impl_ ? impl_->last_prepare_result : ExecutorPrepareResult{};
 }
 
 hal::ExecuteResult OpenCudaPreparedResidentExecutor::Execute(
