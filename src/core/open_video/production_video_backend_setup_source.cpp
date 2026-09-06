@@ -543,19 +543,33 @@ public:
     }
     if (compatibility)
       return BuildCompatibility(request);
+    const bool automatic_request =
+        caller.intent.backend.mode == hal::BackendRequestMode::automatic &&
+        caller.intent.backend.backend == hal::BackendId::invalid &&
+        !caller.intent.backend.strict &&
+        caller.intent.preferences.compute_family ==
+            hal::ComputeFamilyAllowance::any &&
+        caller.intent.preferences.effects_engine ==
+            hal::EffectsEnginePreferenceConstraint::automatic &&
+        !caller.intent.preferences.strict_effects_engine &&
+        caller.intent.requested_provider ==
+            hal::SemanticEffectProviderId::invalid &&
+        !caller.intent.strict_provider_selection;
+    const bool strict_open_cuda_request =
+        caller.intent.backend.mode ==
+            hal::BackendRequestMode::explicit_backend &&
+        caller.intent.backend.backend == hal::BackendId::cuda &&
+        caller.intent.backend.strict &&
+        caller.intent.preferences.compute_family ==
+            hal::ComputeFamilyAllowance::cuda_family &&
+        caller.intent.preferences.effects_engine ==
+            hal::EffectsEnginePreferenceConstraint::open_cuda &&
+        caller.intent.preferences.strict_effects_engine &&
+        caller.intent.requested_provider == kProvider &&
+        caller.intent.strict_provider_selection;
     if (request.contract_version !=
             video::kProductionVideoBackendManagerContractVersion ||
-        caller.intent.backend.mode !=
-            hal::BackendRequestMode::explicit_backend ||
-        caller.intent.backend.backend != hal::BackendId::cuda ||
-        !caller.intent.backend.strict ||
-        caller.intent.preferences.compute_family !=
-            hal::ComputeFamilyAllowance::cuda_family ||
-        caller.intent.preferences.effects_engine !=
-            hal::EffectsEnginePreferenceConstraint::open_cuda ||
-        !caller.intent.preferences.strict_effects_engine ||
-        caller.intent.requested_provider != kProvider ||
-        !caller.intent.strict_provider_selection) {
+        (!automatic_request && !strict_open_cuda_request)) {
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::strict_backend_unavailable);
     }

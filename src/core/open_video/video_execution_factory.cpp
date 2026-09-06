@@ -140,19 +140,33 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
                        const hal::DomainPlan &domain_plan,
                        hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
-  if (request.intent.backend.mode !=
-          hal::BackendRequestMode::explicit_backend ||
-      request.intent.backend.backend != hal::BackendId::cuda ||
-      !request.intent.backend.strict ||
-      request.intent.preferences.effects_engine !=
-          hal::EffectsEnginePreferenceConstraint::open_cuda ||
-      !request.intent.preferences.strict_effects_engine ||
+  const bool automatic_request =
+      request.intent.backend.mode == hal::BackendRequestMode::automatic &&
+      request.intent.backend.backend == hal::BackendId::invalid &&
+      !request.intent.backend.strict &&
+      request.intent.preferences.compute_family ==
+          hal::ComputeFamilyAllowance::any &&
+      request.intent.preferences.effects_engine ==
+          hal::EffectsEnginePreferenceConstraint::automatic &&
+      !request.intent.preferences.strict_effects_engine &&
+      request.intent.requested_provider ==
+          hal::SemanticEffectProviderId::invalid &&
+      !request.intent.strict_provider_selection;
+  const bool strict_request =
+      request.intent.backend.mode ==
+          hal::BackendRequestMode::explicit_backend &&
+      request.intent.backend.backend == hal::BackendId::cuda &&
+      request.intent.backend.strict &&
+      request.intent.preferences.effects_engine ==
+          hal::EffectsEnginePreferenceConstraint::open_cuda &&
+      request.intent.preferences.strict_effects_engine &&
+      request.intent.requested_provider == kProvider &&
+      request.intent.strict_provider_selection;
+  if ((!automatic_request && !strict_request) ||
       (request.intent.preferences.compute_family !=
            hal::ComputeFamilyAllowance::any &&
        request.intent.preferences.compute_family !=
            hal::ComputeFamilyAllowance::cuda_family) ||
-      request.intent.requested_provider != kProvider ||
-      !request.intent.strict_provider_selection ||
       request.intent.stage_count != 1 || resolution.stage_count != 1 ||
       domain_plan.island_count != 1 ||
       domain_plan.islands[0].stage_count != 1 ||
@@ -221,10 +235,17 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
   program.setup_failure_policy = request.setup_failure_policy;
   program.cpu_tails = request.cpu_tails;
   program.cpu_tail_count = request.cpu_tail_count;
-  program.requested_backend = hal::BackendId::cuda;
-  program.strict_backend_selection = true;
-  program.requested_provider = kProvider;
-  program.strict_provider_selection = true;
+  program.requested_backend =
+      request.intent.backend.mode == hal::BackendRequestMode::explicit_backend
+          ? request.intent.backend.backend
+          : resolution.selected_backend;
+  program.strict_backend_selection = request.intent.backend.strict;
+  program.requested_provider =
+      request.intent.requested_provider !=
+              hal::SemanticEffectProviderId::invalid
+          ? request.intent.requested_provider
+          : resolution.selected_provider;
+  program.strict_provider_selection = request.intent.strict_provider_selection;
   program.requested_execution_domain = domain;
   program.strict_execution_domain = true;
   program.requires_upload = true;
@@ -1177,9 +1198,7 @@ OpenCudaVideoExecutionFactory::Prepare(
   }
   if (plan.route != video::VideoExecutionRoute::prepared_resident ||
       plan.prepared_program.requested_backend != hal::BackendId::cuda ||
-      !plan.prepared_program.strict_backend_selection ||
       plan.prepared_program.requested_provider != kProvider ||
-      !plan.prepared_program.strict_provider_selection ||
       !video::ValidatePerFrameTransferContract(plan.per_frame_transfers,
                                                plan.domain_plan, nullptr) ||
       plan.prepared_program.stage_count != 1) {
