@@ -13,10 +13,10 @@ struct Split {
 // that order changes float results and sometimes later cascade decisions.
 extern "C" __global__ void dlib_shape_predictor_68(
     const unsigned char *rgb, unsigned int pitch, unsigned int width,
-    unsigned int height, float left, float top, float right, float bottom,
-    const float *initial, const unsigned int *cascade_trees,
-    const unsigned int *tree_splits, const unsigned int *tree_leaves,
-    const Split *splits, const float *leaves,
+    unsigned int height, double m00, double m01, double m10, double m11,
+    double tx, double ty, const float *initial,
+    const unsigned int *cascade_trees, const unsigned int *tree_splits,
+    const unsigned int *tree_leaves, const Split *splits, const float *leaves,
     const unsigned int *cascade_features, const unsigned int *anchors,
     const float2 *deltas, unsigned int cascades, float *shape, float *features,
     float *output) {
@@ -52,10 +52,8 @@ extern "C" __global__ void dlib_shape_predictor_68(
       float dx = deltas[f].x, dy = deltas[f].y;
       float nx = shape[2 * k] + a * dx - b * dy,
             ny = shape[2 * k + 1] + b * dx + a * dy;
-      const double mapped_x =
-          static_cast<double>(left) + static_cast<double>(nx) * (right - left);
-      const double mapped_y =
-          static_cast<double>(top) + static_cast<double>(ny) * (bottom - top);
+      const double mapped_x = m00 * nx + m01 * ny + tx;
+      const double mapped_y = m10 * nx + m11 * ny + ty;
       long x = static_cast<long>(floor(mapped_x + 0.5));
       long y = static_cast<long>(floor(mapped_y + 0.5));
       float value = 0;
@@ -80,10 +78,8 @@ extern "C" __global__ void dlib_shape_predictor_68(
   }
   for (int i = 0; i < 68; ++i) {
     output[2 * i] =
-        floor(static_cast<double>(left) +
-              static_cast<double>(shape[2 * i]) * (right - left) + 0.5);
+        floor(m00 * shape[2 * i] + m01 * shape[2 * i + 1] + tx + 0.5);
     output[2 * i + 1] =
-        floor(static_cast<double>(top) +
-              static_cast<double>(shape[2 * i + 1]) * (bottom - top) + 0.5);
+        floor(m10 * shape[2 * i] + m11 * shape[2 * i + 1] + ty + 0.5);
   }
 }

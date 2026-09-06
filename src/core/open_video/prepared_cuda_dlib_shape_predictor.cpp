@@ -411,13 +411,45 @@ PreparedCudaDlibResult PreparedCudaDlibShapePredictor::Execute(
     r.status = PreparedCudaDlibStatus::stale_binding;
     return r;
   }
+  if (!std::isfinite(box.left) || !std::isfinite(box.top) ||
+      !std::isfinite(box.right) || !std::isfinite(box.bottom) ||
+      box.left < std::numeric_limits<long>::lowest() ||
+      box.top < std::numeric_limits<long>::lowest() ||
+      box.right > std::numeric_limits<long>::max() ||
+      box.bottom > std::numeric_limits<long>::max() ||
+      static_cast<long>(box.right) <= static_cast<long>(box.left) ||
+      static_cast<long>(box.bottom) <= static_cast<long>(box.top)) {
+    r.status = PreparedCudaDlibStatus::launch_failed;
+    if (e)
+      *e = "invalid dlib face rectangle";
+    return r;
+  }
   impl_->sequence = seq;
   auto &p = impl_->buffers;
+  const dlib::rectangle rect(
+      static_cast<long>(box.left), static_cast<long>(box.top),
+      static_cast<long>(box.right), static_cast<long>(box.bottom));
+  // dlib constructs this affine transform through its configured linear
+  // algebra backend.  Preserve those coefficients: replacing them with the
+  // algebraically ideal rectangle scale can cross a half-pixel boundary and
+  // select a different regression-tree leaf.
+  dlib::point_transform_affine to_image;
+  try {
+    to_image = dlib::impl::unnormalizing_tform(rect);
+  } catch (const std::exception &x) {
+    r.status = PreparedCudaDlibStatus::launch_failed;
+    if (e)
+      *e = std::string("dlib face transform failed: ") + x.what();
+    return r;
+  }
+  const auto &m = to_image.get_m();
+  const auto &translation = to_image.get_b();
   if (!cuda::kernels::LaunchDlibShapePredictor(
-          impl_->kernel, im, box.left, box.top, box.right, box.bottom, p[0].ptr,
-          p[1].ptr, p[2].ptr, p[3].ptr, p[4].ptr, p[5].ptr, p[6].ptr, p[7].ptr,
-          p[8].ptr, (unsigned)(p[1].bytes / 4 - 1), impl_->shape.ptr,
-          impl_->features.ptr, impl_->output.ptr, e)) {
+          impl_->kernel, im, m(0, 0), m(0, 1), m(1, 0), m(1, 1),
+          translation.x(), translation.y(), p[0].ptr, p[1].ptr, p[2].ptr,
+          p[3].ptr, p[4].ptr, p[5].ptr, p[6].ptr, p[7].ptr, p[8].ptr,
+          (unsigned)(p[1].bytes / 4 - 1), impl_->shape.ptr, impl_->features.ptr,
+          impl_->output.ptr, e)) {
     r.status = PreparedCudaDlibStatus::launch_failed;
     return r;
   }

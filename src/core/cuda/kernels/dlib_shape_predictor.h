@@ -19,13 +19,13 @@ bool PrepareDlibShapePredictorKernel(CudaDriverApi &, CUcontext, CUstream,
                                      PreparedDlibShapePredictorKernel *,
                                      std::string *);
 bool LaunchDlibShapePredictor(
-    const PreparedDlibShapePredictorKernel &, const CudaImage &, float, float,
-    float, float, CUdeviceptr initial_shape, CUdeviceptr cascade_tree_offsets,
-    CUdeviceptr tree_split_offsets, CUdeviceptr tree_leaf_offsets,
-    CUdeviceptr splits, CUdeviceptr leaves, CUdeviceptr cascade_feature_offsets,
-    CUdeviceptr anchors, CUdeviceptr deltas, unsigned int cascades,
-    CUdeviceptr scratch_shape, CUdeviceptr scratch_features,
-    CUdeviceptr output_landmarks, std::string *);
+    const PreparedDlibShapePredictorKernel &, const CudaImage &, double, double,
+    double, double, double, double, CUdeviceptr initial_shape,
+    CUdeviceptr cascade_tree_offsets, CUdeviceptr tree_split_offsets,
+    CUdeviceptr tree_leaf_offsets, CUdeviceptr splits, CUdeviceptr leaves,
+    CUdeviceptr cascade_feature_offsets, CUdeviceptr anchors,
+    CUdeviceptr deltas, unsigned int cascades, CUdeviceptr scratch_shape,
+    CUdeviceptr scratch_features, CUdeviceptr output_landmarks, std::string *);
 bool DestroyDlibShapePredictorKernel(PreparedDlibShapePredictorKernel *,
                                      std::string *);
 

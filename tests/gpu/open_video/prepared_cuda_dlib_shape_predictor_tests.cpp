@@ -170,15 +170,15 @@ int main() {
   image.w = 10;
   image.h = 10;
   image.format = PixelFormatGpu::rgb_u8;
-  ok &=
-      Need(kernels::LaunchDlibShapePredictor(k, image, 1, 1, 8, 8, 1, 2, 3, 4,
-                                             5, 6, 7, 8, 9, 1, 10, 11, 12, &e),
-           e.c_str());
+  ok &= Need(kernels::LaunchDlibShapePredictor(k, image, 7, 0, 0, 7, 1, 1, 1, 2,
+                                               3, 4, 5, 6, 7, 8, 9, 1, 10, 11,
+                                               12, &e),
+             e.c_str());
   launch_result = CUDA_ERROR_LAUNCH_FAILED;
-  ok &=
-      Need(!kernels::LaunchDlibShapePredictor(k, image, 1, 1, 8, 8, 1, 2, 3, 4,
-                                              5, 6, 7, 8, 9, 1, 10, 11, 12, &e),
-           "launch failure must be reported");
+  ok &= Need(!kernels::LaunchDlibShapePredictor(k, image, 7, 0, 0, 7, 1, 1, 1,
+                                                2, 3, 4, 5, 6, 7, 8, 9, 1, 10,
+                                                11, 12, &e),
+             "launch failure must be reported");
   ctx = reinterpret_cast<CUcontext>(9);
   ok &= Need(!kernels::DestroyDlibShapePredictorKernel(&k, &e) && k.module,
              "failed shutdown must retain module");

@@ -44,19 +44,17 @@ bool PrepareDlibShapePredictorKernel(CudaDriverApi &d, CUcontext c, CUstream s,
   o->function = f;
   return true;
 }
-bool LaunchDlibShapePredictor(const PreparedDlibShapePredictorKernel &k,
-                              const CudaImage &im, float l, float t, float r,
-                              float b, CUdeviceptr initial, CUdeviceptr ct,
-                              CUdeviceptr ts, CUdeviceptr tl, CUdeviceptr sp,
-                              CUdeviceptr leaves, CUdeviceptr cf,
-                              CUdeviceptr anchors, CUdeviceptr deltas,
-                              unsigned int cascades, CUdeviceptr shape,
-                              CUdeviceptr features, CUdeviceptr output,
-                              std::string *e) {
+bool LaunchDlibShapePredictor(
+    const PreparedDlibShapePredictorKernel &k, const CudaImage &im, double m00,
+    double m01, double m10, double m11, double tx, double ty,
+    CUdeviceptr initial, CUdeviceptr ct, CUdeviceptr ts, CUdeviceptr tl,
+    CUdeviceptr sp, CUdeviceptr leaves, CUdeviceptr cf, CUdeviceptr anchors,
+    CUdeviceptr deltas, unsigned int cascades, CUdeviceptr shape,
+    CUdeviceptr features, CUdeviceptr output, std::string *e) {
   if (e)
     e->clear();
   if (!k.driver || !k.function || !im.Valid() ||
-      im.format != PixelFormatGpu::rgb_u8 || !(r > l && b > t))
+      im.format != PixelFormatGpu::rgb_u8)
     return Fail(e, "invalid dlib CUDA execution");
   auto rgb = (unsigned long long)im.ptr;
   auto pitch = (unsigned int)im.pitch, w = (unsigned int)im.w,
@@ -65,8 +63,9 @@ bool LaunchDlibShapePredictor(const PreparedDlibShapePredictorKernel &k,
   auto i = cv(initial), a = cv(ct), c = cv(ts), d = cv(tl), f = cv(sp),
        g = cv(leaves), j = cv(cf), q = cv(anchors), x = cv(deltas),
        y = cv(shape), z = cv(features), out = cv(output);
-  void *args[] = {&rgb, &pitch, &w, &h, &l, &t, &r,        &b, &i, &a,  &c,
-                  &d,   &f,     &g, &j, &q, &x, &cascades, &y, &z, &out};
+  void *args[] = {&rgb, &pitch, &w, &h,        &m00, &m01, &m10, &m11,
+                  &tx,  &ty,    &i, &a,        &c,   &d,   &f,   &g,
+                  &j,   &q,     &x, &cascades, &y,   &z,   &out};
   return k.driver->f().cuLaunchKernel(k.function, 1, 1, 1, 1, 1, 1, 0, k.stream,
                                       args, nullptr) == CUDA_SUCCESS
              ? true
