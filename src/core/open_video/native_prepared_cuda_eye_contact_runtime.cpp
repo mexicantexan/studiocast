@@ -295,6 +295,7 @@ NativePreparedCudaEyeContactRuntime::Execute(
       ++out.inference_successes;
     if (!succeeded[i]) {
       // A failed second session must not expose the successful left-eye write.
+      ++out.completion_waits;
       const auto quiesced = Quiesce();
       if (quiesced != PreparedCudaEyeContactStatus::executed) {
         out.status = quiesced;

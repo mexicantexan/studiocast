@@ -7,9 +7,9 @@
 #include <limits>
 
 namespace studiocast::open_video {
-PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
-    const PreparedCudaDlibResult &result,
-    const cuda::CudaTensor &tensor) noexcept {
+PreparedCudaEyeContactStatus
+ValidateResidentDlibLandmarks(const PreparedCudaDlibResult &result,
+                              const cuda::CudaTensor &tensor) noexcept {
   if (result.status != PreparedCudaDlibStatus::success)
     return result.pending_work
                ? PreparedCudaEyeContactStatus::synchronization_failed
@@ -37,16 +37,58 @@ public:
   PreparedCudaEyeContactStatus
   Prepare(const PreparedCudaEyeContactSetup &s) noexcept override {
     std::string error;
-    if (!yunet_.Prepare(s.yunet_setup, &error))
-      return PreparedCudaEyeContactStatus::model_invalid;
-    if (!yunet_.PrepareCache(s.analysis_cache, &error))
-      return PreparedCudaEyeContactStatus::resource_exhausted;
-    if (!dlib_.Prepare(s.dlib_setup, &error))
-      return PreparedCudaEyeContactStatus::model_invalid;
+    borrowed_ = s.shared_yunet != nullptr;
+    if (borrowed_) {
+      borrowed_binding_ = *s.shared_yunet;
+      active_yunet_ = borrowed_binding_.producer;
+      if (!active_yunet_ || borrowed_binding_.cache != s.analysis_cache ||
+          borrowed_binding_.binding.driver != s.binding.driver ||
+          borrowed_binding_.binding.context != s.binding.context ||
+          borrowed_binding_.binding.stream != s.binding.stream ||
+          borrowed_binding_.binding.stream_identity !=
+              s.binding.stream_identity ||
+          borrowed_binding_.binding.owner_identity !=
+              s.binding.owner_identity ||
+          borrowed_binding_.binding.configuration_generation !=
+              s.binding.configuration_generation ||
+          borrowed_binding_.frame_width != s.frame_width ||
+          borrowed_binding_.frame_height != s.frame_height ||
+          borrowed_binding_.artifact != s.models.yunet ||
+          !active_yunet_->MatchesPreparedBinding(borrowed_binding_))
+        return PreparedCudaEyeContactStatus::model_invalid;
+    } else {
+      PreparedCudaYunetStatus yunet_status{};
+      if (!yunet_.Prepare(s.yunet_setup, &error, &yunet_status)) {
+        if (yunet_status == PreparedCudaYunetStatus::resource_exhausted)
+          return PreparedCudaEyeContactStatus::resource_exhausted;
+        if (yunet_status == PreparedCudaYunetStatus::provider_mismatch)
+          return PreparedCudaEyeContactStatus::provider_mismatch;
+        if (yunet_status == PreparedCudaYunetStatus::graph_mismatch)
+          return PreparedCudaEyeContactStatus::graph_mismatch;
+        if (yunet_status == PreparedCudaYunetStatus::shutdown_failed)
+          return PreparedCudaEyeContactStatus::shutdown_failed;
+        return yunet_status == PreparedCudaYunetStatus::model_invalid
+                   ? PreparedCudaEyeContactStatus::model_invalid
+                   : PreparedCudaEyeContactStatus::invalid_setup;
+      }
+      if (!yunet_.PrepareCache(s.analysis_cache, &error))
+        return PreparedCudaEyeContactStatus::resource_exhausted;
+      active_yunet_ = &yunet_;
+    }
+    PreparedCudaDlibStatus dlib_status{};
+    if (!dlib_.Prepare(s.dlib_setup, &error, &dlib_status)) {
+      if (dlib_status == PreparedCudaDlibStatus::resource_exhausted)
+        return PreparedCudaEyeContactStatus::resource_exhausted;
+      if (dlib_status == PreparedCudaDlibStatus::shutdown_failed)
+        return PreparedCudaEyeContactStatus::shutdown_failed;
+      return dlib_status == PreparedCudaDlibStatus::model_invalid
+                 ? PreparedCudaEyeContactStatus::model_invalid
+                 : PreparedCudaEyeContactStatus::invalid_setup;
+    }
     return PreparedCudaEyeContactStatus::executed;
   }
   const ValidatedModelArtifactIdentity &artifact() const noexcept override {
-    return yunet_.artifact();
+    return active_yunet_ ? active_yunet_->artifact() : yunet_.artifact();
   }
   const ValidatedModelArtifactIdentity &
   landmark_artifact() const noexcept override {
@@ -61,7 +103,11 @@ public:
     PreparedCudaYunetBinding yb{b.driver,         b.context,
                                 b.stream,         b.stream_identity,
                                 b.owner_identity, b.configuration_generation};
-    const auto result = yunet_.Execute(yb, image, sequence, cache, wait);
+    if (!active_yunet_ || (borrowed_ && !active_yunet_->MatchesPreparedBinding(
+                                            borrowed_binding_)))
+      return out;
+    const auto result =
+        active_yunet_->Execute(yb, image, sequence, cache, wait);
     out.enqueued_readbacks = result.enqueued_readbacks;
     out.completed_readbacks = result.completed_readbacks;
     out.completion_waits = result.completion_waits;
@@ -131,13 +177,16 @@ public:
   PreparedCudaEyeContactStatus Shutdown() noexcept override {
     std::string error;
     const bool d = dlib_.Shutdown(&error);
-    const bool y = yunet_.Shutdown(&error);
+    const bool y = borrowed_ || yunet_.Shutdown(&error);
     return d && y ? PreparedCudaEyeContactStatus::shutdown
                   : PreparedCudaEyeContactStatus::shutdown_failed;
   }
 
 private:
   PreparedCudaYunetDetector yunet_;
+  PreparedCudaYunetDetector *active_yunet_ = nullptr;
+  PreparedCudaYunetPreparedBinding borrowed_binding_{};
+  bool borrowed_ = false;
   PreparedCudaDlibShapePredictor dlib_;
 };
 
@@ -182,6 +231,13 @@ PreparedCudaEyeContact::PreparedCudaEyeContact()
   impl_->runtime = impl_->owned_runtime.get();
 }
 PreparedCudaEyeContact::PreparedCudaEyeContact(
+    IPreparedCudaEyeContactRuntime *runtime) noexcept
+    : impl_(std::make_unique<Impl>()) {
+  impl_->owned_analysis = std::make_unique<PreparedAnalysis>();
+  impl_->analysis = impl_->owned_analysis.get();
+  impl_->runtime = runtime;
+}
+PreparedCudaEyeContact::PreparedCudaEyeContact(
     IPreparedCudaEyeContactAnalysis *analysis,
     IPreparedCudaEyeContactRuntime *runtime) noexcept
     : impl_(std::make_unique<Impl>()) {
@@ -207,7 +263,10 @@ PreparedCudaEyeContact::~PreparedCudaEyeContact() {
 
 bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
                                      PreparedCudaEyeContactHandle *handle,
-                                     std::string *error) {
+                                     std::string *error,
+                                     PreparedCudaEyeContactStatus *status_out) {
+  if (status_out)
+    *status_out = PreparedCudaEyeContactStatus::invalid_setup;
   if (error)
     error->clear();
   if (handle)
@@ -217,15 +276,21 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
       *error = "invalid prepared Eye Contact setup";
     return false;
   }
-  if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error))
+  if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error)) {
+    if (status_out)
+      *status_out = PreparedCudaEyeContactStatus::shutdown_failed;
     return false;
+  }
   auto frozen = s;
   std::size_t accounted = 0;
-  if (!CheckedAdd(s.yunet_setup.resource_budget_bytes, &accounted) ||
+  if ((!s.shared_yunet &&
+       !CheckedAdd(s.yunet_setup.resource_budget_bytes, &accounted)) ||
       !CheckedAdd(s.dlib_setup.resource_budget_bytes, &accounted) ||
       accounted > s.resource_budget_bytes) {
     if (error)
       *error = "prepared Eye Contact aggregate resource budget exceeded";
+    if (status_out)
+      *status_out = PreparedCudaEyeContactStatus::resource_exhausted;
     return false;
   }
   frozen.yunet_setup.binding = {
@@ -248,10 +313,14 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
        !(impl_->analysis->landmark_artifact() == s.models.landmarks)))
     status = PreparedCudaEyeContactStatus::model_invalid;
   if (status == PreparedCudaEyeContactStatus::executed) {
-    PreparedCudaEyeContactRuntimeConfig config{
-        frozen.binding, frozen.models, frozen.cuda_device_id,
-        frozen.frame_width, frozen.frame_height,
-        frozen.resource_budget_bytes - accounted, frozen.wait};
+    PreparedCudaEyeContactRuntimeConfig config{frozen.binding,
+                                               frozen.models,
+                                               frozen.cuda_device_id,
+                                               frozen.frame_width,
+                                               frozen.frame_height,
+                                               frozen.resource_budget_bytes -
+                                                   accounted,
+                                               frozen.wait};
     status = impl_->runtime->Prepare(config);
   }
   if (status != PreparedCudaEyeContactStatus::executed) {
@@ -262,6 +331,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
         analysis_shutdown == PreparedCudaEyeContactStatus::shutdown_failed;
     if (error)
       *error = "prepared Eye Contact setup failed";
+    if (status_out)
+      *status_out = status;
     return false;
   }
   impl_->setup = std::move(frozen);
@@ -272,6 +343,8 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
   impl_->cleanup_pending = false;
   if (handle)
     *handle = impl_->handle;
+  if (status_out)
+    *status_out = PreparedCudaEyeContactStatus::executed;
   return true;
 }
 
@@ -343,6 +416,7 @@ PreparedCudaEyeContact::Execute(const PreparedCudaEyeContactHandle &h,
   out.device_lost = runtime.device_lost;
   out.inference_attempts = runtime.inference_attempts;
   out.inference_successes = runtime.inference_successes;
+  out.completion_waits += runtime.completion_waits;
   if (runtime.output == &input && !runtime.pending_work &&
       !runtime.device_lost) {
     out.output = &input;
