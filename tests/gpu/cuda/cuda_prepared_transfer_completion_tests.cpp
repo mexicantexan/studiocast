@@ -781,6 +781,7 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   options.readback_row_bytes = 0;
   options.readback_rows = 0;
   options.readback_count = 3;
+  options.resident_work = true;
   options.readbacks[0] = {0x5000, 8, 0, 8, 1};
   options.readbacks[1] = {0x6000, 12, 8, 12, 1};
   options.readbacks[2] = {0x7000, 8, 20, 4, 2};
@@ -789,7 +790,7 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   const auto prepared = support.Prepare(&driver, options);
   ok &= Expect(prepared.ok() &&
                    support.BeginFrame(binding, 71).ok() &&
-                   support.EnqueueUpload(binding, 0x4000, 16).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
                    support.RecordStageBegin(binding, 0).ok() &&
                    support.RecordStageEnd(binding, 0).ok() &&
                    support.EnqueueReadbackAt(binding, 0, 0x5001, 8).status ==
@@ -802,13 +803,13 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
                "three prepared readbacks should complete in order");
   ok &= Expect(support.counters().frame_readbacks == 3 &&
                    support.counters().frame_final_readbacks == 0 &&
-                   fake.copies[1].dstHost == support.readback_data() &&
-                   fake.copies[2].dstHost ==
+                   fake.copies[0].dstHost == support.readback_data() &&
+                   fake.copies[1].dstHost ==
                        static_cast<std::byte *>(support.readback_data()) + 8,
                "batch readbacks should report actual copies and frozen offsets");
 
   ok &= Expect(support.BeginFrame(binding, 72).ok() &&
-                   support.EnqueueUpload(binding, 0x4000, 16).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
                    support.RecordStageBegin(binding, 0).ok() &&
                    support.RecordStageEnd(binding, 0).ok(),
                "partial failure frame should begin");
@@ -820,8 +821,23 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   ok &= Expect(p0.ok() && p1.status == Support::Status::resource_exhausted &&
                    record.ok() && wait.ok(),
                "partial readback failure should record and wait for pending work");
-  ok &= Expect(support.BeginFrame(binding, 73).ok(),
+  ok &= Expect(support.BeginFrame(binding, 73).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
+                   support.RecordStageBegin(binding, 0).ok() &&
+                   support.RecordStageEnd(binding, 0).ok(),
                "completed partial frame should permit safe reuse");
+  fake.fail_copy_call = fake.copy_calls;
+  ok &= Expect(support.EnqueueReadbackAt(binding, 0, 0x5000, 8).status ==
+                       Support::Status::resource_exhausted &&
+                   support.RecordCompletion(binding).ok() &&
+                   support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
+               "resident work should quiesce when its first readback fails");
+  auto overlap = options;
+  overlap.readbacks[1].host_offset_bytes = 4;
+  Support malformed;
+  ok &= Expect(malformed.Prepare(&driver, overlap).status ==
+                   Support::Status::invalid_argument,
+               "overlapping prepared host destinations should fail setup");
   return ok;
 }
 

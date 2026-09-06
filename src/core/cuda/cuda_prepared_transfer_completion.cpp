@@ -186,6 +186,7 @@ void CudaPreparedTransferCompletion::ResetFrameState() noexcept {
   frame_active_ = false;
   frame_reuse_blocked_ = false;
   upload_enqueued_ = false;
+  work_submitted_ = false;
   readback_enqueued_ = false;
   next_readback_index_ = 0;
   completion_recorded_ = false;
@@ -230,6 +231,7 @@ CudaPreparedTransferCompletion::ReleaseCurrent(bool mark_shutdown) noexcept {
   readback_size_bytes_ = 0;
   readbacks_.fill({});
   readback_count_ = 0;
+  resident_work_ = false;
   resource_budget_ = {};
   timed_stage_count_ = 0;
   prepared_ = false;
@@ -273,7 +275,8 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
   }
   std::size_t upload_bytes = 0;
   std::size_t readback_bytes = 0;
-  if (!CheckedMultiply(options.upload_row_bytes, options.upload_rows,
+  if (!options.resident_work &&
+      !CheckedMultiply(options.upload_row_bytes, options.upload_rows,
                        &upload_bytes)) {
     return Failed(Status::invalid_argument);
   }
@@ -301,8 +304,24 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
               std::numeric_limits<std::size_t>::max() - bytes) {
         return Failed(Status::invalid_argument);
       }
+      const std::size_t last_row = descriptor.rows - 1;
+      if (last_row > 0 &&
+          descriptor.source_pitch >
+              (std::numeric_limits<CUdeviceptr>::max() - descriptor.source -
+               descriptor.row_bytes) /
+                  last_row)
+        return Failed(Status::invalid_argument);
       readback_bytes = std::max(
           readback_bytes, descriptor.host_offset_bytes + bytes);
+      for (std::uint32_t prior = 0; prior < index; ++prior) {
+        const auto &other = readbacks[prior];
+        const std::size_t other_end = other.host_offset_bytes +
+                                      other.row_bytes * other.rows;
+        const std::size_t this_end = descriptor.host_offset_bytes + bytes;
+        if (descriptor.host_offset_bytes < other_end &&
+            other.host_offset_bytes < this_end)
+          return Failed(Status::invalid_argument);
+      }
     }
   }
   if (upload_bytes > std::numeric_limits<std::size_t>::max() - readback_bytes)
@@ -327,13 +346,16 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
   cuda_ = cuda;
   Candidate candidate;
   const auto &functions = cuda->f();
-  CUresult result = functions.cuMemHostAlloc(
-      &candidate.upload_host, upload_bytes, CU_MEMHOSTALLOC_DEFAULT);
-  if (result != CUDA_SUCCESS || !candidate.upload_host) {
-    cuda_ = nullptr;
-    return FromCudaFailure(Status::resource_exhausted, result);
+  CUresult result = CUDA_SUCCESS;
+  if (!options.resident_work) {
+    result = functions.cuMemHostAlloc(
+        &candidate.upload_host, upload_bytes, CU_MEMHOSTALLOC_DEFAULT);
+    if (result != CUDA_SUCCESS || !candidate.upload_host) {
+      cuda_ = nullptr;
+      return FromCudaFailure(Status::resource_exhausted, result);
+    }
+    ++counters_.setup_pinned_allocations;
   }
-  ++counters_.setup_pinned_allocations;
 
   result = functions.cuMemHostAlloc(&candidate.readback_host, readback_bytes,
                                     CU_MEMHOSTALLOC_DEFAULT);
@@ -392,6 +414,7 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
   readback_size_bytes_ = readback_bytes;
   readbacks_ = readbacks;
   readback_count_ = readback_count;
+  resident_work_ = options.resident_work;
   resource_budget_ = options.budget;
   timed_stage_count_ = options.timed_stage_count;
   candidate = {};
@@ -445,7 +468,20 @@ CudaPreparedTransferCompletion::EnqueueUpload(
   if (result != CUDA_SUCCESS)
     return FromCudaFailure(Status::copy_failed, result);
   upload_enqueued_ = true;
+  work_submitted_ = true;
   ++counters_.frame_uploads;
+  return {};
+}
+
+CudaPreparedTransferCompletion::Result
+CudaPreparedTransferCompletion::SubmitResidentWork(
+    const Binding &binding) noexcept {
+  Result validation = ValidateFrameBinding(binding);
+  if (!validation.ok())
+    return validation;
+  if (!resident_work_ || work_submitted_)
+    return Failed(Status::invalid_sequence);
+  work_submitted_ = true;
   return {};
 }
 
@@ -455,7 +491,7 @@ CudaPreparedTransferCompletion::RecordStageBegin(
   Result validation = ValidateFrameBinding(binding);
   if (!validation.ok())
     return validation;
-  if (!upload_enqueued_ || readback_enqueued_ ||
+  if (!work_submitted_ || readback_enqueued_ ||
       stage_index >= timed_stage_count_ || stage_index != next_stage_index_ ||
       stage_begin_recorded_[stage_index]) {
     return Failed(Status::invalid_sequence, CUDA_SUCCESS, stage_index);
@@ -499,6 +535,8 @@ CudaPreparedTransferCompletion::Result
 CudaPreparedTransferCompletion::EnqueueReadback(
     const Binding &binding, CUdeviceptr source,
     std::size_t source_pitch) noexcept {
+  if (readback_count_ != 1)
+    return Failed(Status::invalid_sequence);
   const Result result = EnqueueReadbackAt(binding, 0, source, source_pitch);
   if (result.ok())
     ++counters_.frame_final_readbacks;
@@ -512,7 +550,7 @@ CudaPreparedTransferCompletion::EnqueueReadbackAt(
   Result validation = ValidateFrameBinding(binding);
   if (!validation.ok())
     return validation;
-  if (!upload_enqueued_ || readback_enqueued_ || index != next_readback_index_ ||
+  if (!work_submitted_ || readback_enqueued_ || index != next_readback_index_ ||
       index >= readback_count_ ||
       next_stage_index_ != timed_stage_count_ || source == 0 ||
       source_pitch < readbacks_[index].row_bytes) {
@@ -547,7 +585,7 @@ CudaPreparedTransferCompletion::RecordCompletion(
   Result validation = ValidateFrameBinding(binding);
   if (!validation.ok())
     return validation;
-  if ((!readback_enqueued_ && next_readback_index_ == 0) ||
+  if (!work_submitted_ || (!resident_work_ && !readback_enqueued_) ||
       completion_recorded_)
     return Failed(Status::invalid_sequence);
   const CUresult result =

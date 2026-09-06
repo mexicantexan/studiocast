@@ -82,6 +82,7 @@ public:
     };
     std::array<ReadbackDescriptor, kMaxReadbacks> readbacks{};
     std::uint32_t readback_count = 0;
+    bool resident_work = false;
   };
 
   using Predicate = bool (*)(void *context) noexcept;
@@ -138,6 +139,7 @@ public:
                     std::uint64_t capture_sequence) noexcept;
   Result EnqueueUpload(const Binding &binding, CUdeviceptr destination,
                        std::size_t destination_pitch) noexcept;
+  Result SubmitResidentWork(const Binding &binding) noexcept;
   Result RecordStageBegin(const Binding &binding,
                           std::uint32_t stage_index) noexcept;
   Result RecordStageEnd(const Binding &binding,
@@ -232,6 +234,8 @@ private:
   bool frame_active_ = false;
   bool frame_reuse_blocked_ = false;
   bool upload_enqueued_ = false;
+  bool resident_work_ = false;
+  bool work_submitted_ = false;
   bool readback_enqueued_ = false;
   bool completion_recorded_ = false;
   bool wait_attempted_ = false;
