@@ -436,6 +436,20 @@ struct OpenCudaMattingSession::Impl {
       return false;
     }
 
+    // This curated MODNet graph declares these exact symbolic dimensions.
+    // Other packs need an explicit manifest contract before specialization.
+    constexpr const char *kModnetId = "modnet-webnn-256-fp32";
+    constexpr const char *kModnetSha256 =
+        "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9";
+    const auto *onnx = FindMainOnnxFile(pack);
+    if (pack.id == kModnetId && onnx && onnx->sha256 == kModnetSha256) {
+      ort_opts.free_dimension_overrides = {
+          {"batch_size", 1},
+          {"height", spec->input.height},
+          {"width", spec->input.width},
+      };
+    }
+
     ort_session = studiocast::onnx::OrtSession::Create(onnx_path, ort_opts,
                                                        &ort_info, &ort_err);
     if (!ort_session) {

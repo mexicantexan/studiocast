@@ -164,7 +164,16 @@ struct OrtPreparedRunResult {
 
 // Options for creating an ONNX Runtime session.
 struct OrtSessionOptions {
+  struct FreeDimensionOverride {
+    std::string name;
+    int64_t extent = 0;
+  };
+
   OrtProviderPolicy provider_policy = OrtProviderPolicy::compatibility;
+
+  // Setup-time specialization for symbolic model dimensions. Callers must
+  // provide names from a reviewed model contract; ORT ignores unknown names.
+  std::vector<FreeDimensionOverride> free_dimension_overrides;
 
   // If true, attempt to use CUDA EP and fall back to CPU EP if CUDA EP is not
   // available.

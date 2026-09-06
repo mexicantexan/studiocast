@@ -1121,6 +1121,10 @@ CreateOrtSessionForPlan(void *context, internal::OrtSessionCreateAttempt,
     so.SetIntraOpNumThreads(1);
     so.SetInterOpNumThreads(1);
     so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
+    for (const auto &dimension : session_opts.free_dimension_overrides) {
+      so.AddFreeDimensionOverrideByName(dimension.name.c_str(),
+                                        dimension.extent);
+    }
     if (session_opts.provider_policy ==
         OrtProviderPolicy::strict_cuda_only) {
       // Fail session construction when any graph node would otherwise be
@@ -1335,6 +1339,23 @@ OrtSession::Create(const std::filesystem::path &model_path,
       if (error)
         *error = "model_path is empty";
       return nullptr;
+    }
+
+    for (std::size_t i = 0; i < opts.free_dimension_overrides.size(); ++i) {
+      const auto &dimension = opts.free_dimension_overrides[i];
+      if (dimension.name.empty() || dimension.extent <= 0) {
+        if (error)
+          *error = "free dimension overrides require a non-empty name and "
+                   "positive extent";
+        return nullptr;
+      }
+      for (std::size_t j = 0; j < i; ++j) {
+        if (opts.free_dimension_overrides[j].name == dimension.name) {
+          if (error)
+            *error = "duplicate free dimension override: " + dimension.name;
+          return nullptr;
+        }
+      }
     }
 
     std::unique_ptr<Ort::Session> session;
