@@ -17,6 +17,7 @@ CUresult launch_result = CUDA_SUCCESS;
 CUresult copy_result = CUDA_SUCCESS;
 int allocations, frees, syncs, fail_sync_from, fail_sync_through;
 int fail_free_from, fail_free_through;
+int fail_alloc_from, fail_alloc_through;
 std::size_t tensor_pitch_extra;
 const volatile std::byte *pending_copy_source;
 bool inspect_pending_copy_source;
@@ -45,8 +46,13 @@ CUresult Launch(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
 }
 CUresult Alloc(CUdeviceptr *p, std::size_t *q, std::size_t n, std::size_t,
                unsigned) {
-  *p = 1;
-  *p = static_cast<CUdeviceptr>(0x1000 + (++allocations) * 0x1000);
+  ++allocations;
+  if (allocations >= fail_alloc_from && allocations <= fail_alloc_through) {
+    *p = 0;
+    *q = 0;
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  *p = static_cast<CUdeviceptr>(0x1000 + allocations * 0x1000);
   *q = n == 8192 ? n : n + tensor_pitch_extra;
   return 0;
 }
@@ -275,6 +281,29 @@ int main() {
              "failed setup cleanup was not retryable");
   tensor_pitch_extra = 0;
   std::filesystem::remove_all(cleanup_root);
+  const auto later_alloc_root = TinyPack();
+  studiocast::open_video::PreparedCudaDlibShapePredictor later_alloc;
+  setup.models_root = later_alloc_root;
+  fail_alloc_from = allocations + 2;
+  fail_alloc_through = fail_alloc_from;
+  fail_free_from = frees + 1;
+  fail_free_through = fail_free_from;
+  const int before_later_alloc = allocations;
+  ok &= Need(!later_alloc.Prepare(setup, &e) &&
+                 allocations == before_later_alloc + 2,
+             "later table allocation failure did not reject setup");
+  const int after_later_alloc = allocations;
+  const int after_later_free_failure = frees;
+  ok &= Need(!later_alloc.Prepare(setup, &e) &&
+                 allocations == after_later_alloc,
+             "later allocation failure lost cleanup retry state");
+  fail_alloc_from = 0;
+  fail_alloc_through = 0;
+  fail_free_from = 0;
+  fail_free_through = 0;
+  ok &= Need(later_alloc.Shutdown(&e) && frees > after_later_free_failure,
+             "earlier table free was not retried after allocation failure");
+  std::filesystem::remove_all(later_alloc_root);
   const auto partial_root = TinyPack();
   studiocast::open_video::PreparedCudaDlibShapePredictor partial;
   setup.models_root = partial_root;
@@ -314,6 +343,8 @@ int main() {
              "failed launch was not reported");
   ok &= Need(failed.pending_work,
              "failed launch did not expose possibly pending work");
+  ok &= Need(!failed_launch.ready(),
+             "quarantined failed launch still advertised readiness");
   ok &= Need(failed_launch.Execute(binding, image, {1, 1, 8, 8}, 2, &e).status ==
                  studiocast::open_video::PreparedCudaDlibStatus::shutdown,
              "failed launch did not quarantine subsequent execution");
