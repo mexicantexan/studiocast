@@ -31,6 +31,8 @@ struct Analysis final : IPreparedCudaEyeContactAnalysis {
       PreparedCudaEyeContactStatus::executed;
   cuda::CudaTensor tensor;
   int prepare = 0, detect = 0, landmarks = 0, shutdown = 0;
+  int *destructions = nullptr;
+  ~Analysis() override { if (destructions) ++*destructions; }
   Analysis() {
     tensor.ptr = 1;
     tensor.pitch = tensor.bytes = 136 * sizeof(float);
@@ -80,6 +82,8 @@ struct Runtime final : IPreparedCudaEyeContactRuntime {
                                    PreparedCudaEyeContactStatus::shutdown;
   PreparedCudaEyeContactRuntimeFrameResult next{};
   int prepare = 0, execute = 0, shutdown = 0;
+  int *destructions = nullptr;
+  ~Runtime() override { if (destructions) ++*destructions; }
   PreparedCudaEyeContactStatus
   Prepare(const PreparedCudaEyeContactRuntimeConfig &) noexcept override {
     ++prepare;
@@ -198,6 +202,10 @@ struct EyeSession final : IPreparedEyeContactOrtSession {
   onnx::OrtSessionInfo metadata;
   onnx::OrtPreparedCudaRunEvidence run_evidence;
   int *run_count = nullptr;
+  int *destruction_count = nullptr;
+  ~EyeSession() override {
+    if (destruction_count) ++*destruction_count;
+  }
   const onnx::OrtSessionInfo &info() const noexcept override { return metadata; }
   onnx::OrtPreparedCudaRunEvidence evidence() const noexcept override {
     return run_evidence;
@@ -225,6 +233,7 @@ struct EyeFactory final : IPreparedEyeContactOrtFactory {
   onnx::OrtSessionInfo metadata;
   onnx::OrtPreparedCudaRunEvidence evidence;
   int runs = 0, validations = 0;
+  int session_destructions = 0;
   bool validate = true;
   bool ValidateArtifact(const ModelPack &, const ModelFile &,
                         const ValidatedModelArtifactIdentity &) noexcept override {
@@ -241,6 +250,7 @@ struct EyeFactory final : IPreparedEyeContactOrtFactory {
     session->metadata = metadata;
     session->run_evidence = evidence;
     session->run_count = &runs;
+    session->destruction_count = &session_destructions;
     return session;
   }
 };
@@ -387,6 +397,29 @@ bool FailureAndDisabled() {
       setup.yunet_setup.resource_budget_bytes +
       setup.dlib_setup.resource_budget_bytes;
   CHECK(!eye.Prepare(setup, &h, &error));
+  int analysis_destructions = 0, runtime_destructions = 0;
+  {
+    auto owned_analysis = std::make_unique<Analysis>();
+    auto owned_runtime = std::make_unique<Runtime>();
+    owned_analysis->destructions = &analysis_destructions;
+    owned_runtime->destructions = &runtime_destructions;
+    owned_runtime->shutdown_status =
+        PreparedCudaEyeContactStatus::shutdown_failed;
+    PreparedCudaEyeContact owned(std::move(owned_analysis),
+                                 std::move(owned_runtime));
+    CHECK(owned.Prepare(Setup(&cache), &h, &error));
+  }
+  CHECK(analysis_destructions == 0 && runtime_destructions == 0);
+  {
+    auto owned_analysis = std::make_unique<Analysis>();
+    auto owned_runtime = std::make_unique<Runtime>();
+    owned_analysis->destructions = &analysis_destructions;
+    owned_runtime->destructions = &runtime_destructions;
+    PreparedCudaEyeContact owned(std::move(owned_analysis),
+                                 std::move(owned_runtime));
+    CHECK(owned.Prepare(Setup(&cache), &h, &error));
+  }
+  CHECK(analysis_destructions == 1 && runtime_destructions == 1);
   return true;
 }
 bool NativeBoundaries() {
@@ -454,6 +487,7 @@ bool NativeBoundaries() {
   CHECK(result.status == PreparedCudaEyeContactStatus::inference_failed &&
         result.output == &input && !result.pending_work && factory.runs == 4);
   CHECK(runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown);
+  CHECK(factory.session_destructions == 2 && state.frees == 10);
 
   state = {};
   state.next = 0x1000;
@@ -471,6 +505,24 @@ bool NativeBoundaries() {
   CHECK(timeout_runtime.Shutdown() ==
         PreparedCudaEyeContactStatus::shutdown_failed);
   CHECK(timeout_runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown);
+
+  state = {};
+  state.next = 0x1000;
+  native = &state;
+  EyeFactory destructor_factory = factory;
+  destructor_factory.runs = 0;
+  destructor_factory.session_destructions = 0;
+  {
+    NativePreparedCudaEyeContactRuntime pending(&destructor_factory);
+    CHECK(pending.Prepare(config) == PreparedCudaEyeContactStatus::executed);
+    state.not_ready = 100;
+    state.fail_run_at = 4;
+    result = pending.Execute(config.binding, input, landmarks, 0.5F);
+    CHECK(result.status == PreparedCudaEyeContactStatus::timeout &&
+          result.pending_work);
+  }
+  CHECK(destructor_factory.session_destructions == 0 && state.frees == 0 &&
+        state.destroys == 0);
 
   state = {};
   state.next = 0x1000;

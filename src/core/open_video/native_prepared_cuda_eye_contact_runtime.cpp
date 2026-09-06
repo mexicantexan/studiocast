@@ -103,7 +103,14 @@ NativePreparedCudaEyeContactRuntime::NativePreparedCudaEyeContactRuntime(
   }
 }
 NativePreparedCudaEyeContactRuntime::~NativePreparedCudaEyeContactRuntime() {
-  (void)Shutdown();
+  if (Shutdown() == PreparedCudaEyeContactStatus::shutdown_failed) {
+    // Direct destruction has no owner left to retry. Preserve every object
+    // whose destructor could release an IoBinding/session while CUDA work may
+    // still reference it. Device/module handles intentionally remain leaked.
+    for (auto &session : sessions_)
+      (void)session.release();
+    (void)owned_factory_.release();
+  }
 }
 
 PreparedCudaEyeContactStatus NativePreparedCudaEyeContactRuntime::Prepare(

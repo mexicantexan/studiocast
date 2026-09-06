@@ -175,6 +175,9 @@ public:
   PreparedCudaEyeContact();
   PreparedCudaEyeContact(IPreparedCudaEyeContactAnalysis *,
                          IPreparedCudaEyeContactRuntime *) noexcept;
+  PreparedCudaEyeContact(
+      std::unique_ptr<IPreparedCudaEyeContactAnalysis>,
+      std::unique_ptr<IPreparedCudaEyeContactRuntime>) noexcept;
   ~PreparedCudaEyeContact();
   PreparedCudaEyeContact(const PreparedCudaEyeContact &) = delete;
   PreparedCudaEyeContact &operator=(const PreparedCudaEyeContact &) = delete;

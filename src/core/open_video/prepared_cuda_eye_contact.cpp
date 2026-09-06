@@ -188,9 +188,21 @@ PreparedCudaEyeContact::PreparedCudaEyeContact(
   impl_->analysis = analysis;
   impl_->runtime = runtime;
 }
+PreparedCudaEyeContact::PreparedCudaEyeContact(
+    std::unique_ptr<IPreparedCudaEyeContactAnalysis> analysis,
+    std::unique_ptr<IPreparedCudaEyeContactRuntime> runtime) noexcept
+    : impl_(std::make_unique<Impl>()) {
+  impl_->owned_analysis = std::move(analysis);
+  impl_->owned_runtime = std::move(runtime);
+  impl_->analysis = impl_->owned_analysis.get();
+  impl_->runtime = impl_->owned_runtime.get();
+}
 PreparedCudaEyeContact::~PreparedCudaEyeContact() {
-  if (impl_)
-    (void)Shutdown(nullptr);
+  if (impl_ && !Shutdown(nullptr))
+    // Pending CUDA work still owns the sessions, bindings, modules, and
+    // buffers reachable through Impl. The borrowed driver/context must outlive
+    // successful Shutdown; when it does not, leaking is the only safe teardown.
+    (void)impl_.release();
 }
 
 bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
