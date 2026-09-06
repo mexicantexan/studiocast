@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -86,8 +87,11 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     }
   }
   if (options->effects != "blur" && options->effects != "keylight" &&
-      options->effects != "blur+keylight") {
-    *error = "--effects must be blur, keylight, or blur+keylight";
+      options->effects != "blur+keylight" && options->effects != "vignette" &&
+      options->effects != "blur+vignette" &&
+      options->effects != "keylight+vignette" &&
+      options->effects != "blur+keylight+vignette") {
+    *error = "unsupported --effects topology";
     return false;
   }
   if (options->input_width == 0 || options->input_height == 0 ||
@@ -161,6 +165,61 @@ void Poll(void *, std::uint64_t wait_nanoseconds) noexcept {
   std::this_thread::sleep_for(std::chrono::nanoseconds(wait_nanoseconds));
 }
 
+std::vector<std::byte> ReferenceResizeVignette(
+    const std::vector<std::byte> &input, std::uint32_t input_width,
+    std::uint32_t input_height, std::uint32_t output_width,
+    std::uint32_t output_height, float intensity) {
+  std::vector<std::byte> result(
+      static_cast<std::size_t>(output_width) * output_height * 3u);
+  const float scale_x = static_cast<float>(input_width) /
+                        static_cast<float>(output_width);
+  const float scale_y = static_cast<float>(input_height) /
+                        static_cast<float>(output_height);
+  const float center_x = static_cast<float>(output_width) * 0.5f;
+  const float center_y = static_cast<float>(output_height) * 0.5f;
+  for (std::uint32_t y = 0; y < output_height; ++y) {
+    for (std::uint32_t x = 0; x < output_width; ++x) {
+      const float source_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
+      const float source_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
+      const int x0 = std::clamp(static_cast<int>(source_x), 0,
+                                static_cast<int>(input_width) - 1);
+      const int y0 = std::clamp(static_cast<int>(source_y), 0,
+                                static_cast<int>(input_height) - 1);
+      const int x1 = std::min(x0 + 1, static_cast<int>(input_width) - 1);
+      const int y1 = std::min(y0 + 1, static_cast<int>(input_height) - 1);
+      const float fx = source_x - static_cast<float>(x0);
+      const float fy = source_y - static_cast<float>(y0);
+      const float nx = ((static_cast<float>(x) + 0.5f) - center_x) *
+                       (2.0f / static_cast<float>(output_width));
+      const float ny = ((static_cast<float>(y) + 0.5f) - center_y) *
+                       (2.0f / static_cast<float>(output_height));
+      const float radius = std::clamp(std::sqrt(nx * nx + ny * ny) *
+                                          0.70710678f,
+                                      0.0f, 1.0f);
+      const float factor = std::max(0.0f, 1.0f - intensity * radius * radius);
+      for (std::size_t channel = 0; channel < 3; ++channel) {
+        const auto sample = [&](int sx, int sy) {
+          return static_cast<float>(static_cast<std::uint8_t>(
+              input[(static_cast<std::size_t>(sy) * input_width +
+                     static_cast<std::size_t>(sx)) *
+                        3u +
+                    channel]));
+        };
+        const float upper = sample(x0, y0) + fx * (sample(x1, y0) - sample(x0, y0));
+        const float lower = sample(x0, y1) + fx * (sample(x1, y1) - sample(x0, y1));
+        const auto resized = static_cast<unsigned>(
+            std::clamp(static_cast<int>(upper + fy * (lower - upper) + 0.5f),
+                       0, 255));
+        result[(static_cast<std::size_t>(y) * output_width + x) * 3u +
+               channel] = static_cast<std::byte>(std::clamp(
+            static_cast<int>(std::nearbyint(static_cast<float>(resized) * factor)),
+            0, 255));
+      }
+    }
+  }
+  return result;
+}
+
 video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
   video::ProductionVideoResidentSetup request;
   request.wait.timeout_nanoseconds = UINT64_C(5000000000);
@@ -188,17 +247,21 @@ video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
       options.automatic ? hal::EffectsEnginePreferenceConstraint::automatic
                         : hal::EffectsEnginePreferenceConstraint::open_cuda;
   plan.intent.preferences.strict_effects_engine = !options.automatic;
+  const bool vignette = options.effects.find("vignette") != std::string::npos;
+  const bool blur = options.effects.find("blur") != std::string::npos;
+  const bool keylight = options.effects.find("keylight") != std::string::npos;
+  const bool mixed_provider = vignette && (blur || keylight);
   plan.intent.requested_provider =
-      options.automatic ? hal::SemanticEffectProviderId::invalid
-                        : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
-  plan.intent.strict_provider_selection = !options.automatic;
+      options.automatic || mixed_provider
+          ? hal::SemanticEffectProviderId::invalid
+          : vignette ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+                     : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  plan.intent.strict_provider_selection = !options.automatic && !mixed_provider;
 
   request.effects.engine = options.automatic
                                ? video::effects::EffectsEnginePreference::auto_select
                                : video::effects::EffectsEnginePreference::open_cuda;
   request.effects.virtual_background.model_id = options.model_id;
-  const bool blur = options.effects != "keylight";
-  const bool keylight = options.effects != "blur";
   if (blur) {
     request.effects.virtual_background.mode =
         video::effects::VirtualBackgroundMode::blur;
@@ -228,15 +291,28 @@ video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
     AddSigned(&stage, video::CanonicalVideoParameterId::direction_pan_degrees,
               request.effects.virtual_key_light.direction_pan_degrees);
   }
+  if (vignette) {
+    request.effects.vignette.enabled = true;
+    request.effects.vignette.center_on_tracked_face = false;
+    auto &stage = plan.intent.stages[plan.intent.stage_count++];
+    stage.intent.stage_id = static_cast<std::uint32_t>(plan.intent.stage_count);
+    stage.intent.semantic = hal::SemanticEffectId::vignette;
+    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+    AddSigned(&stage, video::CanonicalVideoParameterId::intensity,
+              request.effects.vignette.intensity);
+    AddBoolean(&stage, video::CanonicalVideoParameterId::center_on_tracked_face,
+               false);
+  }
   plan.host_input = HostRgb(options.input_width, options.input_height,
                             hal::Mutability::read_only);
   plan.host_output = HostRgb(options.output_width, options.output_height,
                              hal::Mutability::write_only);
   plan.invalidation_key.generations.configuration = 1;
   plan.invalidation_key.generations.geometry = 1;
+  plan.invalidation_key.generations.model = 0;
   plan.invalidation_key.generations.provider = 1;
   plan.invalidation_key.generations.device = 1;
-  plan.invalidation_key.generations.context = 1;
+  plan.invalidation_key.generations.context = 0;
   plan.invalidation_key.canonical_plan_hash = 1;
   constexpr std::uint64_t kGiB = UINT64_C(1024) * 1024u * 1024u;
   plan.budget.persistent_bytes = 8u * kGiB;
@@ -319,6 +395,10 @@ int Run(const Options &options) {
             << static_cast<unsigned>(evidence.candidate_readiness.selected_backend)
             << " candidate_provider="
             << static_cast<unsigned>(evidence.candidate_readiness.provider)
+            << " prepare_status="
+            << static_cast<unsigned>(evidence.composition_prepare.status)
+            << " prepare_reason="
+            << static_cast<unsigned>(evidence.composition_prepare.reason)
             << '\n';
   for (std::size_t i = 0; i < setup.resident.plan.intent.stage_count; ++i) {
     const auto &stage = setup.resident.plan.intent.stages[i];
@@ -328,15 +408,23 @@ int Run(const Options &options) {
               << " artifact_set_sha256=" << Hex(stage.model.artifact_set_hash)
               << '\n';
   }
-  if (status != hal::StatusId::ready || !setup.resident_prepared) {
+  if ((status != hal::StatusId::ready && status != hal::StatusId::degraded) ||
+      !setup.resident_prepared) {
     std::cerr << "FAIL production setup did not produce a prepared resident program"
               << " status=" << static_cast<unsigned>(status)
               << " reason=" << static_cast<unsigned>(reason) << '\n';
     return 1;
   }
+  const bool vignette = options.effects.find("vignette") != std::string::npos;
+  const bool model = options.effects.find("blur") != std::string::npos ||
+                     options.effects.find("keylight") != std::string::npos;
+  const auto expected_provider = model && vignette
+                                     ? hal::SemanticEffectProviderId::invalid
+                                     : vignette
+                                           ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+                                           : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
   if (setup.readiness.selected_backend != hal::BackendId::cuda ||
-      setup.readiness.provider !=
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda) {
+      setup.readiness.provider != expected_provider) {
     std::cerr << "FAIL prepared route did not select CUDA and its CUDA provider\n";
     return 1;
   }
@@ -398,6 +486,17 @@ int Run(const Options &options) {
     if (frame.status != hal::StatusId::executed || !frame.output_ready) {
       std::cerr << "FAIL frame execution did not produce writable RGB output\n";
       return 1;
+    }
+    if (options.effects == "vignette") {
+      const auto expected = ReferenceResizeVignette(
+          input, options.input_width, options.input_height,
+          options.output_width, options.output_height,
+          static_cast<float>(resident.effects.vignette.intensity) / 100.0f);
+      if (output != expected) {
+        std::cerr << "FAIL standalone vignette pixels differ from the CPU "
+                     "resize-then-vignette reference\n";
+        return 1;
+      }
     }
     const auto before = manager.Snapshot().resident.latest_committed_frame;
     reason = hal::ReasonId::none;

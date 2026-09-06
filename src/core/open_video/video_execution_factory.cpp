@@ -1019,7 +1019,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       capability.evidence[1] = {
           UsesMatting(request.semantics[index])
               ? hal::CapabilityEvidenceCode::model_artifact_identity_valid
-              : hal::CapabilityEvidenceCode::reusable_resources_prepared,
+              : hal::CapabilityEvidenceCode::synchronization_evidence_valid,
           hal::StatusId::ready,
           hal::ReasonId::none,
           request.semantics[index],
@@ -1032,7 +1032,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           request.semantics[index],
           hal::BackendId::cuda,
           true};
-      capability.evidence_count = 3;
+      capability.evidence_count = UsesMatting(request.semantics[index]) ? 3 : 2;
     }
     impl.production_registration.semantic_capability_count =
         request.stage_count;

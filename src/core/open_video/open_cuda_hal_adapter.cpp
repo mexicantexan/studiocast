@@ -292,11 +292,12 @@ std::uint32_t StageMask(std::size_t stage_count) noexcept {
                            : ((std::uint32_t{1} << stage_count) - 1u);
 }
 
-bool AnyStageRan(const ExecuteResult &result) noexcept {
+bool AnyModelStageRan(const ExecuteResult &result) noexcept {
   for (std::size_t index = 0;
        index < result.stage_count && index < result.stages.size(); ++index) {
     const auto status = result.stages[index].status;
-    if (status != StageExecutionStatus::not_run &&
+    if (result.stages[index].semantic != SemanticEffectId::vignette &&
+        status != StageExecutionStatus::not_run &&
         status != StageExecutionStatus::disabled_preserved) {
       return true;
     }
@@ -647,7 +648,16 @@ StatusId ResidentAdapter::Prepare(const PreparedProgram &program,
                : (cpu_tail ? ReasonId::cpu_tail_required : ReasonId::none);
   readiness->requested_backend = program.requested_backend;
   readiness->selected_backend = BackendId::cuda;
-  readiness->provider = SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  const bool vignette_last =
+      program.stages[program.stage_count - 1].semantic ==
+      SemanticEffectId::vignette;
+  const bool has_model_consumer =
+      program.stage_count > (vignette_last ? 1u : 0u);
+  readiness->provider =
+      has_model_consumer && vignette_last
+          ? SemanticEffectProviderId::invalid
+          : has_model_consumer ? SemanticEffectProviderId::open_video_onnxruntime_cuda
+                               : SemanticEffectProviderId::open_cuda_production_kernels;
   readiness->execution_domain = program.execution_domain;
   readiness->available = true;
   readiness->degraded = readiness->status == StatusId::degraded;
@@ -705,7 +715,7 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
 
   if (!ValidateTelemetry(before, after, result, slot->program.cpu_tail_count,
                          slot->completion_synchronizations_per_frame, completed,
-                         AnyStageRan(result))) {
+                         AnyModelStageRan(result))) {
     slot->host_binding_active = false;
     slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::synchronization_failed);

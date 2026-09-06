@@ -615,7 +615,7 @@ public:
     }
     if (!PreparedSemantics(caller.intent)) {
       return Failure(hal::StatusId::blocked,
-                     caller.intent.stage_count > 2
+                     caller.intent.stage_count > 3
                          ? hal::ReasonId::cross_adapter_residency_forbidden
                          : hal::ReasonId::semantic_effect_unsupported);
     }
@@ -705,7 +705,11 @@ public:
         }
       }
       factory.generations = caller.invalidation_key.generations;
-      factory.generations.model = has_model_consumer ? artifact.registry_generation : 0;
+      factory.generations.model = has_model_consumer
+                                      ? artifact.registry_generation
+                                      : std::max<std::uint64_t>(
+                                            caller.invalidation_key.generations.model,
+                                            1);
       if (factory.generations.provider == 0)
         factory.generations.provider = 1;
       if (factory.generations.device == 0)
@@ -717,8 +721,10 @@ public:
       factory.backend.model_artifact = artifact;
       factory.backend.configuration_generation =
           factory.generations.configuration;
-      factory.backend.model_preprocess_generation = factory.generations.model;
-      factory.backend.model_artifact_hash = HashArtifact(artifact);
+      factory.backend.model_preprocess_generation =
+          has_model_consumer ? factory.generations.model : 0;
+      factory.backend.model_artifact_hash =
+          has_model_consumer ? HashArtifact(artifact) : 0;
       factory.backend.strength = strength;
       factory.backend.remove_background_rgb = RemoveColor(stage);
       factory.backend.replacement_rgb = std::move(replacement_rgb);

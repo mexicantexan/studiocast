@@ -548,8 +548,9 @@ ReasonId ValidateProductionProgramInternal(
         config.model_artifact_hash != 0)) ||
       program.invalidation_key.generations.configuration !=
           config.configuration_generation ||
-      program.invalidation_key.generations.model !=
-          config.model_preprocess_generation ||
+      (model_count != 0 &&
+       program.invalidation_key.generations.model !=
+           config.model_preprocess_generation) ||
       program.invalidation_key.generations.context !=
           program.execution_domain.logical_context_generation) {
     return ReasonId::reconfiguration_required;
@@ -910,6 +911,19 @@ public:
       candidate->stream = config.prepared_stream;
 
       if (model_free) {
+        if (config.driver->BindPreparedContext(candidate->context) !=
+            cuda::CUDA_SUCCESS) {
+          return SetupFailure(RuntimeStatus::wrong_execution_domain,
+                              ReasonId::wrong_execution_domain);
+        }
+        cuda::CUcontext native_context = nullptr;
+        if (!config.driver->f().cuCtxGetCurrent ||
+            config.driver->f().cuCtxGetCurrent(&native_context) !=
+                cuda::CUDA_SUCCESS ||
+            !native_context) {
+          return SetupFailure(RuntimeStatus::wrong_execution_domain,
+                              ReasonId::wrong_execution_domain);
+        }
         const int width = static_cast<int>(program.host_input.width);
         const int height = static_cast<int>(program.host_input.height);
         if (!candidate->input.Allocate(config.driver, width, height,
@@ -917,9 +931,7 @@ public:
             !candidate->output.Allocate(config.driver, width, height,
                                         cuda::PixelFormatGpu::rgb_u8, &error) ||
             !cuda::kernels::PrepareVignetteKernel(
-                *config.driver,
-                reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
-                    context->retained_context_id)), candidate->stream,
+                *config.driver, native_context, candidate->stream,
                 &candidate->vignette, &error)) {
           CleanupCandidate(candidate.get());
           return SetupFailure(RuntimeStatus::not_prepared,
@@ -929,9 +941,7 @@ public:
                                   program.host_output.height != program.host_input.height;
         if (final_resize &&
             (!cuda::kernels::PrepareResizeBilinearKernel(
-                 *config.driver,
-                 reinterpret_cast<cuda::CUcontext>(static_cast<std::uintptr_t>(
-                     context->retained_context_id)), candidate->stream,
+                 *config.driver, native_context, candidate->stream,
                  &candidate->resize, &error) ||
              !candidate->final_output.Allocate(
                  config.driver, static_cast<int>(program.host_output.width),
@@ -1647,8 +1657,8 @@ public:
           static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f, 1.0f);
       if (!cuda::kernels::LaunchVignettePrepared(
               slot->vignette, *readback_source, *readback_source, intensity,
-              (static_cast<float>(readback_source->w) - 1.0f) * 0.5f,
-              (static_cast<float>(readback_source->h) - 1.0f) * 0.5f,
+              static_cast<float>(readback_source->w) * 0.5f,
+              static_cast<float>(readback_source->h) * 0.5f,
               &vignette_error)) {
         auto &stage_result = result.stages[vignette_index];
         stage_result.reason = ReasonId::optional_stage_failed_open;
@@ -2414,19 +2424,20 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
       evidence.device_postprocess && evidence.one_upload_one_readback &&
       evidence.no_intermediate_crossings && evidence.single_in_flight &&
       (model_free || ExactPreparedOpenCudaVirtualBackgroundPlan(evidence.geometry_plan)) &&
-      (model_free || evidence.geometry_plan.api_version ==
-          kPreparedOpenCudaRuntimeApiVersion &&
-      evidence.geometry_plan.semantic == program.stages[0].semantic &&
-      evidence.geometry_plan.frame_width == program.host_input.width &&
-      evidence.geometry_plan.frame_height == program.host_input.height &&
-      evidence.geometry_plan.model_width ==
-          static_cast<std::uint32_t>(impl_->model_pack.matting->input.width) &&
-      evidence.geometry_plan.model_height ==
-          static_cast<std::uint32_t>(impl_->model_pack.matting->input.height) &&
-      evidence.geometry_plan.strength ==
-          static_cast<std::uint32_t>(std::clamp(
-              impl_->config.strength, video::effects::contract::kVbStrengthMin,
-          video::effects::contract::kVbStrengthMax))) &&
+      (model_free ||
+       (evidence.geometry_plan.api_version ==
+            kPreparedOpenCudaRuntimeApiVersion &&
+        evidence.geometry_plan.semantic == program.stages[0].semantic &&
+        evidence.geometry_plan.frame_width == program.host_input.width &&
+        evidence.geometry_plan.frame_height == program.host_input.height &&
+        evidence.geometry_plan.model_width == static_cast<std::uint32_t>(
+                                                  impl_->model_pack.matting->input.width) &&
+        evidence.geometry_plan.model_height == static_cast<std::uint32_t>(
+                                                   impl_->model_pack.matting->input.height) &&
+        evidence.geometry_plan.strength == static_cast<std::uint32_t>(std::clamp(
+                                              impl_->config.strength,
+                                              video::effects::contract::kVbStrengthMin,
+                                              video::effects::contract::kVbStrengthMax)))) &&
       (model_free || SameBudget(evidence.geometry_plan.required_budget,
                                 evidence.reserved_budget)) &&
       evidence.reserved_budget.in_flight_slots == 1 &&
@@ -2495,6 +2506,10 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
         semantic == SemanticEffectId::virtual_background_replace;
     result.evidence.capability.virtual_key_light |=
         semantic == SemanticEffectId::virtual_key_light;
+    result.evidence.capability.vignette |=
+        semantic == SemanticEffectId::vignette;
+    result.evidence.capability.native_vignette_kernel_prepared |=
+        semantic == SemanticEffectId::vignette;
     auto &stage_evidence = result.evidence.stages[index];
     stage_evidence.stage_id = program.stages[index].stage_id;
     stage_evidence.semantic = semantic;
