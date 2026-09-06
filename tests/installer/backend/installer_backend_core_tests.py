@@ -896,6 +896,7 @@ class InstallerBackendCoreTests(unittest.TestCase):
             "strict_provider_selection": True,
             "requested": True, "blocked": True,
         })
+
         denoise = effects["video_noise_removal"]
         denoise_capability = typed_capability(
             1, "video_noise_removal", 1, "maxine", 2,
@@ -958,6 +959,43 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(
             parsed["reason_codes"], ["typed_status.authority_incomplete"])
         self.assertEqual(parsed["effects"], {})
+
+    def test_typed_status_recognizes_native_cuda_provider_shadow_only(self):
+        value = typed_multi_island_fixture()
+        value["effects"][2] = typed_effect(3, "virtual_background.blur")
+        vignette = typed_effect(8, "vignette")
+        active_typed_effect(
+            vignette, 2, "open_cuda", 3, "open_cuda_effect_available",
+            3, 13, 2, "cuda", 7, "open_cuda_production_kernels")
+        value["effects"][7] = vignette
+        value["islands"][2] = typed_island(
+            3, "open_cuda_virtual_background", 3, 103, 13, 8, "vignette",
+            2, "cuda", 7, "open_cuda_production_kernels", 1)
+        value["capabilities"]["lanes"] = typed_capability_lanes(
+            value["effects"])
+        value["authority"]["prepared_route_effect_mask"] = 386
+
+        parsed = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": value,
+        })
+        self.assertTrue(parsed["valid"], parsed["reason_codes"])
+        self.assertFalse(parsed["recommendation_eligible"])
+        self.assertEqual(
+            parsed["islands"][2]["provider"],
+            "open_cuda_production_kernels")
+
+        mixed = typed_multi_island_fixture()
+        mixed["islands"][2]["resolution"]["selected_provider"] = typed_pair(
+            0, "")
+        mixed["islands"][2]["readiness"]["provider"] = typed_pair(0, "")
+        rejected = parse_typed_multi_island_video_status({
+            "typed_multi_island_video_status": mixed,
+        })
+        self.assertFalse(rejected["valid"])
+        self.assertFalse(rejected["recommendation_eligible"])
+        self.assertEqual(
+            rejected["reason_codes"],
+            ["typed_status.island_selection_mismatch"])
 
     def test_typed_multi_island_status_accepts_maxine_zero_numeric_device_identity(self):
         value = typed_multi_island_fixture()

@@ -17,7 +17,7 @@ inline bool AcceptsOpenCudaSelectionIntent(
       intent.preferences.effects_engine ==
           hal::EffectsEnginePreferenceConstraint::automatic &&
       !intent.preferences.strict_effects_engine && provider_unbound;
-  const bool strict_open_cuda =
+  const bool strict_open_cuda_engine =
       intent.backend.mode == hal::BackendRequestMode::explicit_backend &&
       intent.backend.backend == hal::BackendId::cuda &&
       intent.backend.strict &&
@@ -25,9 +25,19 @@ inline bool AcceptsOpenCudaSelectionIntent(
           hal::ComputeFamilyAllowance::cuda_family &&
       intent.preferences.effects_engine ==
           hal::EffectsEnginePreferenceConstraint::open_cuda &&
+      intent.preferences.strict_effects_engine && provider_unbound;
+  const bool strict_open_cuda_provider =
+      intent.backend.mode == hal::BackendRequestMode::explicit_backend &&
+      intent.backend.backend == hal::BackendId::cuda && intent.backend.strict &&
+      intent.preferences.compute_family ==
+          hal::ComputeFamilyAllowance::cuda_family &&
+      intent.preferences.effects_engine ==
+          hal::EffectsEnginePreferenceConstraint::open_cuda &&
       intent.preferences.strict_effects_engine &&
-      intent.requested_provider ==
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda &&
+      (intent.requested_provider ==
+           hal::SemanticEffectProviderId::open_video_onnxruntime_cuda ||
+       intent.requested_provider ==
+           hal::SemanticEffectProviderId::open_cuda_production_kernels) &&
       intent.strict_provider_selection;
   const bool forced_cuda_with_automatic_engine =
       intent.backend.mode == hal::BackendRequestMode::explicit_backend &&
@@ -38,7 +48,8 @@ inline bool AcceptsOpenCudaSelectionIntent(
       intent.preferences.effects_engine ==
           hal::EffectsEnginePreferenceConstraint::automatic &&
       !intent.preferences.strict_effects_engine && provider_unbound;
-  return automatic || strict_open_cuda || forced_cuda_with_automatic_engine;
+  return automatic || strict_open_cuda_engine || strict_open_cuda_provider ||
+         forced_cuda_with_automatic_engine;
 }
 
 } // namespace studiocast::open_cuda

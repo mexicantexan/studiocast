@@ -19,7 +19,8 @@ bool ProviderMatchesBackend(BackendId backend,
   case BackendId::cpu:
     return false;
   case BackendId::cuda:
-    return provider == SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    return provider == SemanticEffectProviderId::open_video_onnxruntime_cuda ||
+           provider == SemanticEffectProviderId::open_cuda_production_kernels;
   case BackendId::maxine:
     return provider == SemanticEffectProviderId::maxine_vfx ||
            provider == SemanticEffectProviderId::maxine_ar ||

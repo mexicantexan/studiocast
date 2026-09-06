@@ -170,7 +170,9 @@ Accepted JSON values:
 
 - `"auto"` / `"auto_select"`: prefer Maxine when available; otherwise fall back to Open CUDA for supported effects
 - `"maxine"`: force Maxine (unsupported effects remain blocked/unavailable)
-- `"open_cuda"`: force Open CUDA (GPU-only; requires ONNX Runtime + CUDA EP + model packs)
+- `"open_cuda"`: force Open CUDA. Open CUDA effects are GPU-only; model-backed
+  stages require ONNX Runtime, its CUDA execution provider, and a compatible
+  model pack, while native CUDA kernel stages do not invent those prerequisites.
 
 Installation docs:
 
@@ -206,7 +208,9 @@ ineligible to affect recommendations.
 
 ## Open CUDA model packs (XDG)
 
-The `open_cuda` backend (ONNX Runtime CUDA EP) discovers user-supplied model packs at runtime.
+Model-backed stages in the `open_cuda` backend discover user-supplied model
+packs for ONNX Runtime CUDA EP at runtime. Native CUDA kernel stages carry a
+distinct semantic-provider identity and no model artifact.
 
 Default root:
 

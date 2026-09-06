@@ -2224,6 +2224,12 @@ ComputeProviderStatus BuildTypedComputeProviderStatus(
     out.device = "cuda";
     out.tensor_io_mode = "cuda_device_iobinding";
     break;
+  case Provider::open_cuda_production_kernels:
+    out.mode = "open_cuda";
+    out.active_provider = "StudioCast CUDA kernels";
+    out.device = "cuda";
+    out.tensor_io_mode = "cuda_device_kernels";
+    break;
   case Provider::open_video_onnxruntime_cpu:
     out.mode = "cpu";
     out.active_provider = "CPUExecutionProvider";

@@ -51,6 +51,13 @@ enum class ComputeBackendKind {
   vulkan,
 };
 
+// Applies only backend/engine intent. An independently supplied exact provider
+// constraint remains caller-owned and is never rewritten here.
+void ApplyCameraBackendSelectionIntent(
+    effects::EffectsEnginePreference engine,
+    ComputeBackendPreference compute_backend,
+    NormalizedVideoExecutionIntent *intent) noexcept;
+
 struct ComputeBackendAvailability {
   bool cuda_available = false;
   bool vulkan_available = false;

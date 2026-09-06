@@ -61,6 +61,7 @@ SourceForProvider(hal::SemanticEffectProviderId provider) noexcept {
   case hal::SemanticEffectProviderId::maxine_cuda_utility:
     return StaticSourceId::maxine;
   case hal::SemanticEffectProviderId::open_video_onnxruntime_cuda:
+  case hal::SemanticEffectProviderId::open_cuda_production_kernels:
     return StaticSourceId::open_cuda;
   case hal::SemanticEffectProviderId::open_vulkan_production_kernels:
     return StaticSourceId::vulkan;

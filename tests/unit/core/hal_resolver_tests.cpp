@@ -240,7 +240,10 @@ bool TestDeterministicPrecedenceAndStrictSelection() {
   cuda_registration.semantic_capabilities[0] =
       Capability(SemanticEffectId::mirror,
                  SemanticEffectProviderId::open_video_onnxruntime_cuda);
-  cuda_registration.semantic_capability_count = 1;
+  cuda_registration.semantic_capabilities[1] =
+      Capability(SemanticEffectId::vignette,
+                 SemanticEffectProviderId::open_cuda_production_kernels);
+  cuda_registration.semantic_capability_count = 2;
   auto maxine_registration = Registration(&maxine, BackendId::maxine, 100, 21);
   maxine_registration.semantic_capabilities[0] = Capability(
       SemanticEffectId::mirror, SemanticEffectProviderId::maxine_vfx);
@@ -317,6 +320,23 @@ bool TestDeterministicPrecedenceAndStrictSelection() {
                     cuda_result.requested_backend == BackendId::cuda &&
                     cuda_result.selected_backend == BackendId::cuda,
                 "strict CUDA request did not select exact CUDA backend");
+
+  auto mixed_cuda = StrictRequest(BackendId::cuda);
+  mixed_cuda.stages[0] = Stage(1, SemanticEffectId::mirror);
+  mixed_cuda.stages[1] = Stage(2, SemanticEffectId::vignette);
+  mixed_cuda.stage_count = 2;
+  const auto mixed_result = ResolveSemanticStages(first, mixed_cuda);
+  ok &= Require(
+      mixed_result.status == StatusId::ready &&
+          mixed_result.selected_backend == BackendId::cuda &&
+          mixed_result.selected_provider == SemanticEffectProviderId::invalid &&
+          mixed_result.stages[0].provider ==
+              SemanticEffectProviderId::open_video_onnxruntime_cuda &&
+          mixed_result.stages[1].provider ==
+              SemanticEffectProviderId::open_cuda_production_kernels &&
+          mixed_result.stages[0].execution_domain ==
+              mixed_result.stages[1].execution_domain,
+      "same-domain Open CUDA stages must retain exact mixed providers");
 
   auto strict_vulkan = StrictRequest(BackendId::vulkan);
   strict_vulkan.stages[0] = Stage(1, SemanticEffectId::mirror);
