@@ -8,6 +8,40 @@
 
 namespace studiocast::cuda::kernels {
 
+struct PreparedResizeBilinearKernel {
+  CudaDriverApi *driver = nullptr;
+  CUcontext owner_context = nullptr;
+  CUstream owner_stream = nullptr;
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  bool live = false;
+
+  PreparedResizeBilinearKernel() = default;
+  PreparedResizeBilinearKernel(const PreparedResizeBilinearKernel &) = delete;
+  PreparedResizeBilinearKernel &
+  operator=(const PreparedResizeBilinearKernel &) = delete;
+  PreparedResizeBilinearKernel(PreparedResizeBilinearKernel &&other) noexcept;
+  PreparedResizeBilinearKernel &
+  operator=(PreparedResizeBilinearKernel &&) = delete;
+};
+
+bool PrepareResizeBilinearKernel(CudaDriverApi &driver,
+                                 CUcontext owner_context,
+                                 CUstream owner_stream,
+                                 PreparedResizeBilinearKernel *out,
+                                 std::string *error_out);
+bool LaunchResizeBilinearPrepared(const PreparedResizeBilinearKernel &kernel,
+                                  const CudaImage &src, const CudaImage &dst,
+                                  std::string *error_out);
+bool LaunchCropResizeBilinearPrepared(
+    const PreparedResizeBilinearKernel &kernel, const CudaImage &src,
+    const CudaImage &dst, float crop_x, float crop_y, float crop_w,
+    float crop_h, std::string *error_out);
+// Caller must quiesce owner_stream and activate owner_context first. Failure
+// leaves the handle live so shutdown can retry before releasing the context.
+bool DestroyResizeBilinearKernelPrepared(PreparedResizeBilinearKernel *kernel,
+                                         std::string *error_out);
+
 namespace detail {
 
 // U8 resize byte rounding matches video::ResizeRgb24Bilinear's CPU contract:

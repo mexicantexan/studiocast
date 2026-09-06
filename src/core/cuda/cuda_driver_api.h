@@ -141,6 +141,7 @@ public:
                                             void **optionValues);
   using cuModuleGetFunction_t = CUresult (*)(CUfunction *hfunc, CUmodule hmod,
                                              const char *name);
+  using cuModuleUnload_t = CUresult (*)(CUmodule hmod);
   using cuLaunchKernel_t = CUresult (*)(
       CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
       unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
@@ -188,6 +189,7 @@ public:
     cuModuleLoadData_t cuModuleLoadData = nullptr;
     cuModuleLoadDataEx_t cuModuleLoadDataEx = nullptr;
     cuModuleGetFunction_t cuModuleGetFunction = nullptr;
+    cuModuleUnload_t cuModuleUnload = nullptr;
     cuLaunchKernel_t cuLaunchKernel = nullptr;
     cuMemAllocPitch_t cuMemAllocPitch = nullptr;
     cuMemFree_t cuMemFree = nullptr;
