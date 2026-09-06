@@ -1542,7 +1542,8 @@ if (BUILD_TESTING)
     target_link_libraries(
             studiocast-open-cuda-production-backend-setup-source-tests PRIVATE
             studiocast_open_video_backend
-            studiocast_video_execution_runtime)
+            studiocast_video_execution_runtime
+            studiocast_video_backend_composition)
 
     target_include_directories(
             studiocast-open-cuda-production-backend-setup-source-tests PRIVATE
