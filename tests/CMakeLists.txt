@@ -1953,6 +1953,25 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-prepared-cuda-fastdvdnet-denoiser-tests
             integration video gpu model)
 
+    add_executable(studiocast-cuda-prepared-mirror-kernels-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_mirror_tests.cpp)
+    target_link_libraries(studiocast-cuda-prepared-mirror-kernels-tests PRIVATE
+            studiocast_cuda_support)
+    target_include_directories(studiocast-cuda-prepared-mirror-kernels-tests PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+    studiocast_set_project_warnings(studiocast-cuda-prepared-mirror-kernels-tests)
+    studiocast_enable_sanitizers(studiocast-cuda-prepared-mirror-kernels-tests)
+    add_test(NAME studiocast-cuda-prepared-mirror-kernels-tests
+            COMMAND studiocast-cuda-prepared-mirror-kernels-tests)
+    studiocast_set_test_labels(studiocast-cuda-prepared-mirror-kernels-tests
+            unit video gpu)
+    add_test(NAME studiocast-cuda-prepared-mirror-native-tests
+            COMMAND studiocast-cuda-prepared-mirror-kernels-tests --native)
+    set_tests_properties(studiocast-cuda-prepared-mirror-native-tests PROPERTIES
+            SKIP_RETURN_CODE 77)
+    studiocast_set_test_labels(studiocast-cuda-prepared-mirror-native-tests
+            integration video gpu)
+
     add_executable(studiocast-cuda-prepared-eye-contact-kernels-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_eye_contact_kernels_tests.cpp)
     target_link_libraries(studiocast-cuda-prepared-eye-contact-kernels-tests PRIVATE
