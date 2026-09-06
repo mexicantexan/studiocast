@@ -1059,6 +1059,57 @@ bool TestContiguousTensorPitchBudgetBoundary() {
   return ok;
 }
 
+bool TestNativeVignetteExactAllocationBudgetBoundary() {
+  open_cuda::PreparedOpenCudaVignetteBudgetInput input;
+  input.input_pitch_bytes = 256;
+  input.input_height = 49;
+  input.output_pitch_bytes = 320;
+  input.output_height = 49;
+  input.final_output_pitch_bytes = 384;
+  input.final_output_height = 51;
+  input.upload_staging_bytes = 65u * 49u * 3u;
+  input.readback_staging_bytes = 67u * 51u * 3u;
+  input.available_budget.persistent_bytes = 1u << 20;
+  input.available_budget.scratch_bytes = 1;
+  input.available_budget.upload_staging_bytes = input.upload_staging_bytes;
+  input.available_budget.readback_staging_bytes = input.readback_staging_bytes;
+  input.available_budget.resource_count = 8;
+  input.available_budget.in_flight_slots = 1;
+  hal::ResourceBudget required;
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Expect(
+      open_cuda::PlanPreparedOpenCudaVignetteBudget(input, &required, &reason) ==
+              RuntimeStatus::ready &&
+          reason == hal::ReasonId::none &&
+          required.persistent_bytes == 256u * 49u + 320u * 49u + 384u * 51u &&
+          required.resource_count == 8,
+      "native vignette must reserve exact pitched input/output/final storage");
+  input.available_budget = required;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) == RuntimeStatus::ready,
+              "native vignette exact allocation budget must be accepted") &&
+       ok;
+  --input.available_budget.persistent_bytes;
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) ==
+                      RuntimeStatus::resource_exhausted &&
+                  reason == hal::ReasonId::resource_exhausted,
+              "native vignette exact-minus-one budget must fail closed with "
+              "resource exhaustion") &&
+       ok;
+  input.available_budget.persistent_bytes =
+      std::numeric_limits<std::uint64_t>::max();
+  input.input_pitch_bytes = std::numeric_limits<std::uint64_t>::max();
+  ok = Expect(open_cuda::PlanPreparedOpenCudaVignetteBudget(
+                  input, &required, &reason) ==
+                      RuntimeStatus::resource_exhausted &&
+                  reason == hal::ReasonId::resource_exhausted,
+              "native vignette allocation overflow must remain resource "
+              "exhaustion") &&
+       ok;
+  return ok;
+}
+
 bool TestAcceptedResidentEffectsThroughSession() {
   bool ok = true;
   for (const auto semantic : {hal::SemanticEffectId::virtual_background_blur,
@@ -1632,6 +1683,7 @@ int main() {
   bool ok = true;
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
   ok = TestContiguousTensorPitchBudgetBoundary() && ok;
+  ok = TestNativeVignetteExactAllocationBudgetBoundary() && ok;
   ok = TestAcceptedResidentEffectsThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
   ok = TestCombinedOptionalFirstFailureContinuesSecondStage() && ok;

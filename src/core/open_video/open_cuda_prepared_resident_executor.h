@@ -143,6 +143,23 @@ bool PreparedContiguousTensorCapacityBytes(std::uint64_t allocation_pitch_bytes,
                                            std::uint64_t active_bytes,
                                            std::uint64_t *capacity_bytes) noexcept;
 
+struct PreparedOpenCudaVignetteBudgetInput {
+  std::uint64_t input_pitch_bytes = 0;
+  std::uint64_t input_height = 0;
+  std::uint64_t output_pitch_bytes = 0;
+  std::uint64_t output_height = 0;
+  std::uint64_t final_output_pitch_bytes = 0;
+  std::uint64_t final_output_height = 0;
+  std::uint64_t upload_staging_bytes = 0;
+  std::uint64_t readback_staging_bytes = 0;
+  hal::ResourceBudget available_budget{};
+};
+
+PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
+    const PreparedOpenCudaVignetteBudgetInput &input,
+    hal::ResourceBudget *required_budget,
+    hal::ReasonId *reason) noexcept;
+
 struct PreparedOpenCudaProductionConfig;
 hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
     const hal::PreparedProgram &program,

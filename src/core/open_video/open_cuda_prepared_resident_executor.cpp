@@ -976,7 +976,26 @@ public:
                               HalReason(TransferStatus(prepared.status)));
         }
         candidate->transfer_binding = transfer_options.binding;
-        candidate->reserved_budget = program.budget;
+        PreparedOpenCudaVignetteBudgetInput budget_input;
+        budget_input.input_pitch_bytes = candidate->input.pitch;
+        budget_input.input_height = program.host_input.height;
+        budget_input.output_pitch_bytes = candidate->output.pitch;
+        budget_input.output_height = program.host_input.height;
+        budget_input.final_output_pitch_bytes = candidate->final_output.pitch;
+        budget_input.final_output_height =
+            static_cast<std::uint64_t>(candidate->final_output.h);
+        budget_input.upload_staging_bytes =
+            program.host_input.planes[0].size_bytes;
+        budget_input.readback_staging_bytes =
+            program.host_output.planes[0].size_bytes;
+        budget_input.available_budget = program.budget;
+        ReasonId budget_reason = ReasonId::none;
+        const auto budget_status = PlanPreparedOpenCudaVignetteBudget(
+            budget_input, &candidate->reserved_budget, &budget_reason);
+        if (budget_status != RuntimeStatus::ready) {
+          CleanupCandidate(candidate.get());
+          return SetupFailure(budget_status, budget_reason);
+        }
         candidate->handle.handle_id = next_handle_id_++;
         candidate->handle.program_id = program.program_id;
         candidate->handle.invalidation_key = program.invalidation_key;
@@ -989,7 +1008,7 @@ public:
         result.evidence.semantic = SemanticEffectId::vignette;
         result.evidence.provider = kNativeProvider;
         result.evidence.execution_domain = program.execution_domain;
-        result.evidence.reserved_budget = program.budget;
+        result.evidence.reserved_budget = candidate->reserved_budget;
         result.evidence.strict_cuda_only = true;
         result.evidence.user_stream_bound = true;
         result.evidence.cpu_provider_fallback_disabled = true;
@@ -1568,12 +1587,16 @@ public:
       stage_result.semantic = stage.semantic;
       const bool disabled = (disabled_mask & (std::uint32_t{1} << index)) != 0;
       const auto stage_index = static_cast<std::uint32_t>(index);
-      const auto stage_begin =
-          slot->transfer.RecordStageBegin(slot->transfer_binding, stage_index);
-      if (!stage_begin.ok())
-        return finish(
-            TransferFailure(slot, stage_begin.status, result.transfers,
-                            PreparedOpenCudaOperationId::completion_wait));
+      const bool deferred_vignette =
+          !disabled && stage.semantic == SemanticEffectId::vignette;
+      if (!deferred_vignette) {
+        const auto stage_begin = slot->transfer.RecordStageBegin(
+            slot->transfer_binding, stage_index);
+        if (!stage_begin.ok())
+          return finish(
+              TransferFailure(slot, stage_begin.status, result.transfers,
+                              PreparedOpenCudaOperationId::completion_wait));
+      }
       RuntimeStatus stage_status = analysis_status;
       PreparedOpenCudaOperationId failed_operation =
           analysis_status == RuntimeStatus::preprocess_failed
@@ -1585,7 +1608,6 @@ public:
         stage_result.valid_output_preserved = true;
       } else if (stage.semantic == SemanticEffectId::vignette) {
         // Terminal fixed-center vignette is launched after any final resize.
-        stage_result.status = StageExecutionStatus::succeeded;
       } else if (analysis_status == RuntimeStatus::executed) {
         const auto &current = current_is_output ? slot->output : slot->input;
         const auto &next = current_is_output ? slot->input : slot->output;
@@ -1624,12 +1646,14 @@ public:
         result.stage_failure_reason = stage_result.reason;
         result.failed_operation = failed_operation;
       }
-      const auto stage_end =
-          slot->transfer.RecordStageEnd(slot->transfer_binding, stage_index);
-      if (!stage_end.ok())
-        return finish(
-            TransferFailure(slot, stage_end.status, result.transfers,
-                            PreparedOpenCudaOperationId::completion_wait));
+      if (!deferred_vignette) {
+        const auto stage_end = slot->transfer.RecordStageEnd(
+            slot->transfer_binding, stage_index);
+        if (!stage_end.ok())
+          return finish(
+              TransferFailure(slot, stage_end.status, result.transfers,
+                              PreparedOpenCudaOperationId::completion_wait));
+      }
     }
     result.stage_count = slot->program.stage_count;
     const cuda::CudaImage *readback_source =
@@ -1651,6 +1675,12 @@ public:
         (disabled_mask & (std::uint32_t{1} << vignette_index)) == 0 &&
         !required_failed) {
       std::string vignette_error;
+      const auto vignette_begin = slot->transfer.RecordStageBegin(
+          slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
+      if (!vignette_begin.ok())
+        return finish(TransferFailure(
+            slot, vignette_begin.status, result.transfers,
+            PreparedOpenCudaOperationId::completion_wait));
       const float intensity = std::clamp(
           static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f, 1.0f);
       if (!cuda::kernels::LaunchVignettePrepared(
@@ -1672,7 +1702,16 @@ public:
           stage_result.valid_output_preserved = true;
           optional_failed = true;
         }
+      } else {
+        result.stages[vignette_index].status =
+            StageExecutionStatus::succeeded;
       }
+      const auto vignette_end = slot->transfer.RecordStageEnd(
+          slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
+      if (!vignette_end.ok())
+        return finish(TransferFailure(
+            slot, vignette_end.status, result.transfers,
+            PreparedOpenCudaOperationId::completion_wait));
     }
     const auto readback = slot->transfer.EnqueueReadback(
         slot->transfer_binding, readback_source->ptr, readback_source->pitch);
@@ -2289,6 +2328,59 @@ bool PreparedContiguousTensorCapacityBytes(
   }
   *capacity_bytes = allocation_pitch_bytes;
   return true;
+}
+
+PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
+    const PreparedOpenCudaVignetteBudgetInput &input,
+    hal::ResourceBudget *required_budget, hal::ReasonId *reason) noexcept {
+  if (required_budget)
+    *required_budget = {};
+  if (reason)
+    *reason = hal::ReasonId::none;
+  const bool final_resize = input.final_output_pitch_bytes != 0 ||
+                            input.final_output_height != 0;
+  std::uint64_t input_bytes = 0;
+  std::uint64_t output_bytes = 0;
+  std::uint64_t final_output_bytes = 0;
+  if (!required_budget || input.input_pitch_bytes == 0 ||
+      input.input_height == 0 || input.output_pitch_bytes == 0 ||
+      input.output_height == 0 || input.upload_staging_bytes == 0 ||
+      input.readback_staging_bytes == 0 ||
+      (final_resize && (input.final_output_pitch_bytes == 0 ||
+                        input.final_output_height == 0))) {
+    if (reason)
+      *reason = hal::ReasonId::malformed_descriptor;
+    return RuntimeStatus::malformed_contract;
+  }
+  if (!CheckedMul(input.input_pitch_bytes, input.input_height, &input_bytes) ||
+      !CheckedMul(input.output_pitch_bytes, input.output_height, &output_bytes) ||
+      (final_resize &&
+       !CheckedMul(input.final_output_pitch_bytes, input.final_output_height,
+                   &final_output_bytes))) {
+    if (reason)
+      *reason = hal::ReasonId::resource_exhausted;
+    return RuntimeStatus::resource_exhausted;
+  }
+  auto &required = *required_budget;
+  if (!CheckedAdd(input_bytes, output_bytes, &required.persistent_bytes) ||
+      (final_resize &&
+       !CheckedAdd(required.persistent_bytes, final_output_bytes,
+                   &required.persistent_bytes))) {
+    if (reason)
+      *reason = hal::ReasonId::resource_exhausted;
+    return RuntimeStatus::resource_exhausted;
+  }
+  required.scratch_bytes = 1;
+  required.upload_staging_bytes = input.upload_staging_bytes;
+  required.readback_staging_bytes = input.readback_staging_bytes;
+  required.resource_count = final_resize ? 8u : 7u;
+  required.in_flight_slots = 1;
+  if (!BudgetContains(input.available_budget, required)) {
+    if (reason)
+      *reason = hal::ReasonId::resource_exhausted;
+    return RuntimeStatus::resource_exhausted;
+  }
+  return RuntimeStatus::ready;
 }
 
 struct OpenCudaPreparedResidentExecutor::Impl {

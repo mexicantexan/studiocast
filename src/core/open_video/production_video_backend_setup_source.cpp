@@ -191,7 +191,9 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
     result.scratch_bytes = 1;
     result.upload_staging_bytes = boundary;
     result.readback_staging_bytes = output_boundary;
-    result.resource_count = 6u +
+    // Two device images, two pinned transfer buffers, and three transfer
+    // events are always owned by the prepared native stage.
+    result.resource_count = 7u +
         ((output_width != frame_width || output_height != frame_height) ? 1u : 0u);
     result.in_flight_slots = 1;
     *budget = result;
