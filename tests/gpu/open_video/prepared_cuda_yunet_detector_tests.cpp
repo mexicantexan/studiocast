@@ -32,6 +32,7 @@ struct State {
   std::vector<std::size_t> sizes;
   int copies = 0, launches = 0, syncs = 0, runs = 0, invalidates = 0, frees = 0;
   int fail_copy = -1;
+  cuda::CUresult fail_copy_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
   int fail_run = -1;
   bool face = false;
   cuda::CUresult query = cuda::CUDA_SUCCESS;
@@ -72,7 +73,7 @@ cuda::CUresult Free(cuda::CUdeviceptr) {
 cuda::CUresult Copy(const cuda::CUDA_MEMCPY2D *c, cuda::CUstream) {
   int call = g->copies++;
   if (call == g->fail_copy)
-    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
+    return g->fail_copy_result;
   for (std::size_t y = 0; y < c->Height; ++y) {
     const auto *src =
         c->srcMemoryType == cuda::CU_MEMORYTYPE_HOST
@@ -197,6 +198,7 @@ struct Session final : open_video::internal::IPreparedCudaYunetSession {
     i.strict_provider_validation_passed = valid;
     i.input_names = {"input"};
     i.input_shapes = {{1, 3, dim, dim}};
+    i.input_elem_types = {1};
     for (auto n : {"cls_8", "cls_16", "cls_32", "obj_8", "obj_16", "obj_32",
                    "bbox_8", "bbox_16", "bbox_32", "kps_8", "kps_16", "kps_32"})
       i.output_names.emplace_back(n);
@@ -268,6 +270,7 @@ int main() {
   setup.frame_height = 3;
   setup.resource_budget_bytes =
       open_video::PreparedCudaYunetDetector::RequiredResourceBytes();
+  setup.declared_input = {"input", "nchw", "float32", 320, 320, 3};
   open_video::ValidatedModelArtifactIdentity id;
   id.registry_generation = 1;
   id.model_id_sha256[0] = id.manifest_sha256[0] = id.artifact_sha256[0] =
@@ -360,10 +363,31 @@ int main() {
   const int sync_loss_invalidates = state.invalidates;
   state.sync_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
   open_video::PreparedCudaYunetDetector warmup_unquiesced;
+  const auto warmup_pending_allocations = state.memory.size();
   ok &= !warmup_unquiesced.PrepareForTesting(
             setup, id, std::make_unique<Session>(&state), &error) &&
         state.invalidates == sync_loss_invalidates &&
         !warmup_unquiesced.ready();
+  const auto retained_allocations = state.memory.size();
+  ok &= retained_allocations > warmup_pending_allocations &&
+        !warmup_unquiesced.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error) &&
+        state.memory.size() == retained_allocations &&
+        !warmup_unquiesced.Shutdown(&error) &&
+        state.invalidates == sync_loss_invalidates;
+  state.sync_result = cuda::CUDA_SUCCESS;
+  ok &= warmup_unquiesced.Shutdown(&error) &&
+        state.invalidates == sync_loss_invalidates + 1;
+  state.sync_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  const int setup_destructor_invalidates = state.invalidates;
+  const int setup_destructor_frees = state.frees;
+  {
+    open_video::PreparedCudaYunetDetector pending_setup_destructor;
+    ok &= !pending_setup_destructor.PrepareForTesting(
+        setup, id, std::make_unique<Session>(&state), &error);
+  }
+  ok &= state.invalidates == setup_destructor_invalidates &&
+        state.frees == setup_destructor_frees;
   state.sync_result = cuda::CUDA_SUCCESS;
   open_video::PreparedCudaYunetDetector device_lost;
   ok &= device_lost.PrepareForTesting(
@@ -382,6 +406,22 @@ int main() {
   ok &= device_lost_ok;
   state.launch_result = cuda::CUDA_SUCCESS;
   ok &= device_lost.Shutdown(&error);
+  open_video::PreparedCudaYunetDetector copy_lost;
+  ok &= copy_lost.PrepareForTesting(
+      setup, id, std::make_unique<Session>(&state), &error);
+  open_video::FrameAnalysisCache copy_lost_cache;
+  ok &= copy_lost.PrepareCache(&copy_lost_cache, &error);
+  state.fail_copy = state.copies;
+  state.fail_copy_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  auto copy_device_lost = copy_lost.Execute(
+      setup.binding, image, 21, &copy_lost_cache, wait);
+  ok &= copy_device_lost.status ==
+            open_video::PreparedCudaYunetStatus::device_lost &&
+        copy_device_lost.device_lost &&
+        copy_device_lost.enqueued_readbacks == 0;
+  state.fail_copy = -1;
+  state.fail_copy_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  ok &= copy_lost.Shutdown(&error);
   ok &= inference_failed.Shutdown(&error);
   const int invalidates_before_pending_destructor = state.invalidates;
   {
@@ -399,10 +439,32 @@ int main() {
   ok &= state.invalidates == invalidates_before_pending_destructor;
   state.query = cuda::CUDA_SUCCESS;
   open_video::PreparedCudaYunetDetector size640;
+  auto setup640 = setup;
+  setup640.declared_input.width = 640;
+  setup640.declared_input.height = 640;
   ok &= size640.PrepareForTesting(
-            setup, id, std::make_unique<Session>(&state, true, false, 640),
+            setup640, id, std::make_unique<Session>(&state, true, false, 640),
             &error) &&
         size640.Shutdown(&error);
+  open_video::PreparedCudaYunetDetector wrong_geometry;
+  ok &= !wrong_geometry.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state, true, false, 640),
+            &error) &&
+        !wrong_geometry.ready();
+  for (int mismatch = 0; mismatch < 3; ++mismatch) {
+    auto bad_setup = setup;
+    auto bad_session = std::make_unique<Session>(&state);
+    if (mismatch == 0)
+      bad_setup.declared_input.layout = "nhwc";
+    else if (mismatch == 1)
+      bad_setup.declared_input.dtype = "float16";
+    else
+      bad_session->i.input_names[0] = "wrong_input";
+    open_video::PreparedCudaYunetDetector contract_rejected;
+    ok &= !contract_rejected.PrepareForTesting(
+              bad_setup, id, std::move(bad_session), &error) &&
+          !contract_rejected.ready();
+  }
   open_video::PreparedCudaYunetDetector rank4;
   ok &= rank4.PrepareForTesting(
             setup, id, std::make_unique<Session>(&state, true, true), &error) &&

@@ -50,6 +50,10 @@ struct PreparedCudaYunetSetup {
   int frame_width = 0;
   int frame_height = 0;
   std::size_t resource_budget_bytes = 0;
+  // Exact input tensor declaration from the already-selected model pack.
+  // Production Prepare overwrites this from the validated manifest; the test
+  // seam supplies it directly with its synthetic artifact identity.
+  ModelTensorSpec declared_input{};
 };
 
 struct PreparedCudaYunetExecutionResult {

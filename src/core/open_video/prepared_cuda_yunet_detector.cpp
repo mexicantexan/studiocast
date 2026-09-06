@@ -11,6 +11,8 @@
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
 #include "core/onnx/ort_session.h"
 #include "core/open_video/yunet_face_detector.h"
+#include "core/util/fs.h"
+#include "core/util/json.h"
 
 namespace studiocast::open_video {
 namespace {
@@ -40,6 +42,61 @@ int Channels(std::string_view name) {
   if (name.starts_with("kps_"))
     return 10;
   return 1;
+}
+
+bool ReadDeclaredInput(const std::filesystem::path &manifest,
+                       ModelTensorSpec *out, std::string *error) {
+  const auto text = util::ReadTextFile(manifest.string());
+  util::json::Value root;
+  std::string parse_error;
+  if (!text || !util::json::Parse(*text, &root, &parse_error)) {
+    if (error)
+      *error = "YuNet validated manifest cannot be parsed";
+    return false;
+  }
+  const auto *top = root.AsObject();
+  if (!top)
+    return false;
+  const auto onnx_it = top->find("onnx");
+  const auto *onnx = onnx_it == top->end() ? nullptr : onnx_it->second.AsObject();
+  if (!onnx)
+    return false;
+  const auto inputs_it = onnx->find("inputs");
+  const auto *inputs = inputs_it == onnx->end() ? nullptr : inputs_it->second.AsArray();
+  if (!inputs || inputs->size() != 1)
+    return false;
+  const auto *input = (*inputs)[0].AsObject();
+  if (!input)
+    return false;
+  const auto string_field = [&](const char *name, std::string *value) {
+    const auto it = input->find(name);
+    const auto *found = it == input->end() ? nullptr : it->second.AsString();
+    if (!found)
+      return false;
+    *value = *found;
+    return true;
+  };
+  const auto int_field = [&](const char *name, int *value) {
+    const auto it = input->find(name);
+    const auto *found = it == input->end() ? nullptr : it->second.AsNumber();
+    if (!found || !std::isfinite(*found) || std::floor(*found) != *found ||
+        *found < 1 || *found > 2048)
+      return false;
+    *value = static_cast<int>(*found);
+    return true;
+  };
+  if (!string_field("name", &out->name) ||
+      !string_field("layout", &out->layout) ||
+      !string_field("dtype", &out->dtype) ||
+      !int_field("width", &out->width) ||
+      !int_field("height", &out->height) ||
+      !int_field("channels", &out->channels) || out->layout != "nchw" ||
+      out->dtype != "float32" || out->channels != 3) {
+    if (error)
+      *error = "YuNet manifest requires one fixed NCHW float32 input";
+    return false;
+  }
+  return true;
 }
 
 PreparedCudaYunetStatus
@@ -120,6 +177,7 @@ struct PreparedCudaYunetDetector::Impl {
   YunetDetectionScratch scratch;
   bool ready = false;
   bool stopped = false;
+  bool warmup_pending = false;
   FrameAnalysisCache *prepared_cache = nullptr;
   ~Impl() {
     // Live prepared generations require explicit after-quiescence Shutdown().
@@ -189,6 +247,15 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
       *error = "YuNet main ONNX artifact is missing";
     return false;
   }
+  auto validated_setup = setup;
+  if (!ReadDeclaredInput(pack->manifest_path, &validated_setup.declared_input,
+                         error)) {
+    if (error && error->empty())
+      *error = "YuNet validated manifest input is missing";
+    return false;
+  }
+  // Validation follows parsing so its manifest checksum proves that the
+  // frozen tensor declaration came from this registry generation.
   const auto validation = ValidateModelArtifactIdentity(*pack, *main);
   if (!validation.ok()) {
     if (error)
@@ -217,7 +284,7 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
     return false;
   }
   return PrepareValidated(
-      setup, validation.identity,
+      validated_setup, validation.identity,
       std::make_unique<OrtYunetSession>(std::move(session), std::move(info)),
       error);
 }
@@ -237,21 +304,25 @@ bool PreparedCudaYunetDetector::PrepareValidated(
     std::string *error) {
   if (error)
     error->clear();
-  if (!impl_ || impl_->ready || !validated_artifact.Valid() || !session) {
+  if (!impl_ || impl_->ready || impl_->warmup_pending ||
+      !validated_artifact.Valid() || !session) {
     if (error)
       *error = "invalid prepared YuNet validated setup";
     return false;
   }
   const auto &info = session->info();
-  if (info.input_shapes.size() != 1 || info.input_shapes[0].size() != 4 ||
-      info.input_shapes[0][2] <= 0 || info.input_shapes[0][3] <= 0 ||
-      info.input_shapes[0][2] > 2048 || info.input_shapes[0][3] > 2048) {
+  const auto &declared = setup.declared_input;
+  if (declared.name.empty() || declared.layout != "nchw" ||
+      declared.dtype != "float32" || declared.channels != 3 ||
+      declared.width <= 0 || declared.height <= 0 || declared.width > 2048 ||
+      declared.height > 2048 || info.input_shapes.size() != 1 ||
+      info.input_shapes[0].size() != 4) {
     if (error)
       *error = "YuNet requires fixed bounded NCHW input geometry";
     return false;
   }
-  const int input_h = static_cast<int>(info.input_shapes[0][2]);
-  const int input_w = static_cast<int>(info.input_shapes[0][3]);
+  const int input_h = declared.height;
+  const int input_w = declared.width;
   if (!setup.binding.driver || !setup.binding.context.Valid() ||
       !setup.binding.stream || setup.binding.stream_identity == 0 ||
       setup.binding.owner_identity == 0 ||
@@ -264,6 +335,8 @@ bool PreparedCudaYunetDetector::PrepareValidated(
           setup.binding.context.logical_generation,
           reinterpret_cast<std::uintptr_t>(setup.binding.stream)) ||
       info.input_names.size() != 1 || info.input_shapes.size() != 1 ||
+      info.input_elem_types.size() != 1 || info.input_elem_types[0] != 1 ||
+      info.input_names[0] != declared.name ||
       info.output_names.size() != kOutputs) {
     if (error)
       *error = "YuNet strict CUDA graph/provider evidence mismatch";
@@ -308,21 +381,27 @@ bool PreparedCudaYunetDetector::PrepareValidated(
       return false;
     }
     auto &out = candidate->outputs[index];
-    const auto &declared = info.output_shapes[graph_index];
+    const auto &declared_output = info.output_shapes[graph_index];
     const auto matches = [](int64_t value, int expected) {
       return value <= 0 || value == expected;
     };
-    if (declared.size() == 3 && matches(declared[0], 1) &&
-        matches(declared[1], anchors) && matches(declared[2], channels)) {
+    if (declared_output.size() == 3 && matches(declared_output[0], 1) &&
+        matches(declared_output[1], anchors) &&
+        matches(declared_output[2], channels)) {
       out.shape = {1, anchors, channels};
-    } else if (declared.size() == 4 && matches(declared[0], 1) &&
-               matches(declared[1], channels) && matches(declared[2], rows) &&
-               matches(declared[3], cols) && declared[1] > 0) {
+    } else if (declared_output.size() == 4 &&
+               matches(declared_output[0], 1) &&
+               matches(declared_output[1], channels) &&
+               matches(declared_output[2], rows) &&
+               matches(declared_output[3], cols) && declared_output[1] > 0) {
       out.shape = {1, channels, rows, cols};
       out.channels_first = true;
-    } else if (declared.size() == 4 && matches(declared[0], 1) &&
-               matches(declared[1], rows) && matches(declared[2], cols) &&
-               matches(declared[3], channels) && declared[3] > 0) {
+    } else if (declared_output.size() == 4 &&
+               matches(declared_output[0], 1) &&
+               matches(declared_output[1], rows) &&
+               matches(declared_output[2], cols) &&
+               matches(declared_output[3], channels) &&
+               declared_output[3] > 0) {
       out.shape = {1, rows, cols, channels};
     } else {
       if (error)
@@ -366,8 +445,10 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   if (!warmup.ok() || !warmup_quiesced) {
     if (error && error->empty())
       *error = "YuNet strict CUDA warmup failed";
-    if (!warmup_quiesced)
-      (void)candidate.release();
+    if (!warmup_quiesced) {
+      candidate->warmup_pending = true;
+      impl_ = std::move(candidate);
+    }
     return false;
   }
   cuda::kernels::PreparedPreprocessBinding preprocess_binding{
@@ -563,7 +644,10 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
         completion_binding, i, impl_->outputs[i].tensor.ptr,
         impl_->outputs[i].tensor.bytes);
     if (!copy.ok()) {
-      result.status = PreparedCudaYunetStatus::readback_failed;
+      result.device_lost = IsDeviceLost(copy.status);
+      result.status = result.device_lost
+                          ? PreparedCudaYunetStatus::device_lost
+                          : PreparedCudaYunetStatus::readback_failed;
       break;
     }
     ++result.enqueued_readbacks;
@@ -619,6 +703,15 @@ bool PreparedCudaYunetDetector::Shutdown(std::string *error) noexcept {
     error->clear();
   if (!impl_ || impl_->stopped)
     return true;
+  if (impl_->warmup_pending) {
+    if (!impl_->setup.binding.driver->StreamSynchronize(
+            impl_->setup.binding.stream, error)) {
+      if (error && error->empty())
+        *error = "YuNet warmup cleanup remains pending";
+      return false;
+    }
+    impl_->warmup_pending = false;
+  }
   const auto completion = impl_->completion.Shutdown();
   if (!completion.ok()) {
     if (error)
