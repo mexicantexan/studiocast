@@ -46,6 +46,7 @@ struct LaunchCapture {
   std::uint32_t source_w = 0;
   std::uint32_t source_h = 0;
   unsigned long long destination_ptr = 0;
+  std::uint32_t destination_pitch = 0;
   std::uint32_t destination_w = 0;
   std::uint32_t destination_h = 0;
   float mean[3] = {};
@@ -142,6 +143,15 @@ CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
   capture.block_y = block_y;
   if (function == reinterpret_cast<CUfunction>(
                       static_cast<std::uintptr_t>(0x301))) {
+    capture.source_ptr = *static_cast<unsigned long long *>(arguments[0]);
+    capture.source_pitch = *static_cast<std::uint32_t *>(arguments[1]);
+    capture.source_w = *static_cast<std::uint32_t *>(arguments[2]);
+    capture.source_h = *static_cast<std::uint32_t *>(arguments[3]);
+    capture.destination_ptr =
+        *static_cast<unsigned long long *>(arguments[4]);
+    capture.destination_pitch = *static_cast<std::uint32_t *>(arguments[5]);
+    capture.destination_w = *static_cast<std::uint32_t *>(arguments[6]);
+    capture.destination_h = *static_cast<std::uint32_t *>(arguments[7]);
     capture.crop[0] = *static_cast<float *>(arguments[8]);
     capture.crop[1] = *static_cast<float *>(arguments[9]);
     capture.crop[2] = *static_cast<float *>(arguments[10]);
@@ -662,6 +672,14 @@ bool TestPreparedResizeHasNoFrameTimeSetup() {
                    fixture.state.synchronizations == 0,
                "repeated resize launches performed frame-time setup or sync");
   ok &= Expect(fixture.state.capture.stream == fixture.binding.stream &&
+                   fixture.state.capture.source_ptr == fixture.source.ptr &&
+                   fixture.state.capture.source_pitch == fixture.source.pitch &&
+                   fixture.state.capture.source_w == 7 &&
+                   fixture.state.capture.source_h == 9 &&
+                   fixture.state.capture.destination_ptr == destination.ptr &&
+                   fixture.state.capture.destination_pitch == destination.pitch &&
+                   fixture.state.capture.destination_w == 17 &&
+                   fixture.state.capture.destination_h == 18 &&
                    fixture.state.capture.grid_x == 2 &&
                    fixture.state.capture.grid_y == 2 &&
                    fixture.state.capture.crop[0] == 0.0f &&
