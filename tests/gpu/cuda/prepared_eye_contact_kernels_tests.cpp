@@ -178,33 +178,54 @@ std::uint8_t Byte(float value) {
       static_cast<int>(std::floor(std::clamp(value, 0.f, 255.f) + .5f)), 0,
       255));
 }
+float SampleModel(const std::vector<float> &model, int channel, float x,
+                  float y) {
+  x = std::clamp(x, 0.f, 63.f);
+  y = std::clamp(y, 0.f, 47.f);
+  const int x0 = static_cast<int>(std::floor(x));
+  const int y0 = static_cast<int>(std::floor(y));
+  const int x1 = std::min(63, x0 + 1), y1 = std::min(47, y0 + 1);
+  const float fx = x - x0, fy = y - y0;
+  const auto at = [&](int px, int py) {
+    return static_cast<float>(Byte(
+        std::clamp(model[channel * 48 * 64 + py * 64 + px], 0.f, 1.f) * 255.f));
+  };
+  return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) +
+         (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
+}
 std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t> &input,
                                    const std::vector<float> &marks, int width,
-                                   int height, float strength, bool left_ok,
+                                   int height,
+                                   const std::vector<float> &left_model,
+                                   const std::vector<float> &right_model,
+                                   float strength, bool left_ok,
                                    bool right_ok) {
   auto out = input;
   const CpuCrop crops[2] = {Crop(marks, 0, width, height),
                             Crop(marks, 1, width, height)};
-  for (int y = 0; y < height; ++y)
-    for (int x = 0; x < width; ++x) {
-      int selected = -1;
-      for (int eye = 0; eye < 2; ++eye) {
+  const std::vector<float> *models[2] = {&left_model, &right_model};
+  for (int eye = 0; eye < 2; ++eye) {
+    const auto &crop = crops[eye];
+    const bool ok = eye == 0 ? left_ok : right_ok;
+    if (!ok || !crop.valid || strength <= 0)
+      continue;
+    for (int y = 0; y < height; ++y)
+      for (int x = 0; x < width; ++x) {
         const auto &c = crops[eye];
-        const bool ok = eye == 0 ? left_ok : right_ok;
-        if (ok && c.valid && x >= c.left && y >= c.top &&
-            x < c.left + c.width && y < c.top + c.height)
-          selected = eye;
+        if (x >= c.left && y >= c.top && x < c.left + c.width &&
+            y < c.top + c.height) {
+          const float mx = (x - c.left + .5f) * 64.f / c.width - .5f;
+          const float my = (y - c.top + .5f) * 48.f / c.height - .5f;
+          for (int channel = 0; channel < 3; ++channel) {
+            const auto i =
+                static_cast<std::size_t>((y * width + x) * 3 + channel);
+            const float corrected =
+                Byte(SampleModel(*models[eye], channel, mx, my));
+            out[i] = Byte(out[i] + (corrected - out[i]) * strength);
+          }
+        }
       }
-      if (selected < 0 || strength <= 0)
-        continue;
-      const auto &c = crops[selected];
-      (void)c;
-      for (int channel = 0; channel < 3; ++channel) {
-        const auto i = static_cast<std::size_t>((y * width + x) * 3 + channel);
-        const float corrected = Byte((channel + 1) * .2f * 255.f);
-        out[i] = Byte(input[i] + (corrected - input[i]) * strength);
-      }
-    }
+  }
   return out;
 }
 
@@ -325,6 +346,12 @@ bool FakeContract() {
   ok &= Check(LaunchEyeContactInputsPrepared(k, image, inputs, .5f, &error) &&
                   state.launches == 1 && state.launched_stream == stream,
               "input launch/stream");
+  auto one_pixel = ImageAt(0x500000);
+  one_pixel.w = 1;
+  ok &= Check(
+      !LaunchEyeContactInputsPrepared(k, one_pixel, inputs, .5f, &error) &&
+          state.launches == 1,
+      "one-pixel input geometry rejected before launch");
   auto left_out = TensorAt(0x300000, 3, 48, 64),
        right_out = TensorAt(0x310000, 3, 48, 64);
   auto output = ImageAt(0x400000);
@@ -333,11 +360,24 @@ bool FakeContract() {
                                                 &output, &error) &&
                   state.launches == 2,
               "composite launch");
+  auto wide_span_source = ImageAt(0x100000000ull);
+  wide_span_source.w = 2;
+  wide_span_source.h = 3;
+  wide_span_source.pitch = 0x7fffffffu;
+  auto wide_span_output = ImageAt(0x300000000ull);
+  wide_span_output.w = 2;
+  wide_span_output.h = 3;
+  wide_span_output.pitch = 0x7fffffffu;
+  ok &= Check(LaunchEyeContactCompositePrepared(
+                  k, wide_span_source, geo, left_out, right_out, true, true,
+                  .5f, &wide_span_output, &error) &&
+                  state.launches == 3,
+              "64-bit image row offsets accepted without 32-bit overflow");
   output.ptr = image.ptr + 1;
   ok &= Check(!LaunchEyeContactCompositePrepared(k, image, geo, left_out,
                                                  right_out, true, true, .5f,
                                                  &output, &error) &&
-                  state.launches == 2,
+                  state.launches == 3,
               "partial alias rejected");
   output.ptr = 0x400000;
   geo.ptr = left_out.ptr;
@@ -394,10 +434,14 @@ int NativeOracle() {
     marks[2 * (36 + i)] = rx[i];
     marks[2 * (36 + i) + 1] = ry[i];
   }
-  std::vector<float> model(3 * 48 * 64);
+  std::vector<float> left_model(3 * 48 * 64), right_model(3 * 48 * 64);
   for (int c = 0; c < 3; ++c)
-    for (int i = 0; i < 48 * 64; ++i)
-      model[c * 48 * 64 + i] = (c + 1) * .2f;
+    for (int y = 0; y < 48; ++y)
+      for (int x = 0; x < 64; ++x) {
+        const auto i = c * 48 * 64 + y * 64 + x;
+        left_model[i] = ((17 * x + 11 * y + 31 * c) % 254 + .75f) / 255.f;
+        right_model[i] = ((7 * x + 19 * y + 47 * c + 23) % 254 + .75f) / 255.f;
+      }
   CudaImage source, output;
   CudaTensor lm, geo, le, re, la, ra, langle, rangle, lout, rout;
   PreparedEyeContactKernels kernels;
@@ -413,10 +457,10 @@ int NativeOracle() {
             rangle.AllocateNchwF32(&driver, 1, 2, 1, 1, &error) &&
             lout.AllocateNchwF32(&driver, 1, 3, 48, 64, &error) &&
             rout.AllocateNchwF32(&driver, 1, 3, 48, 64, &error) &&
-            lout.UploadFromCpuF32(&driver, model.data(), model.size(), stream,
-                                  &error) &&
-            rout.UploadFromCpuF32(&driver, model.data(), model.size(), stream,
-                                  &error) &&
+            lout.UploadFromCpuF32(&driver, left_model.data(), left_model.size(),
+                                  stream, &error) &&
+            rout.UploadFromCpuF32(&driver, right_model.data(),
+                                  right_model.size(), stream, &error) &&
             PrepareEyeContactKernels(driver, context, stream, &kernels, &error);
   PreparedEyeContactInputs inputs{&lm, &geo, &le,     &re,
                                   &la, &ra,  &langle, &rangle};
@@ -446,17 +490,14 @@ int NativeOracle() {
                                           &error) &&
         output.DownloadToCpuRgb24(&driver, out.data(), w * 3, stream, &error) &&
         driver.StreamSynchronize(stream, &error);
-    const auto expected =
-        Expected(host, landmarks, w, h, strength, left_ok, right_ok);
+    const auto expected = Expected(host, landmarks, w, h, left_model,
+                                   right_model, strength, left_ok, right_ok);
     const auto expected_inputs =
         ExpectedInputs(host, landmarks, w, h, strength);
-    const bool frame_ok = BytesNear(out, expected, strength == 0.f ? 0 : 1);
+    const bool frame_ok = BytesNear(out, expected, 0);
     const bool geometry_ok = Near(actual_geometry, expected_inputs.geometry);
-    constexpr float kOneByte = 1.f / 255.f + 1e-6f;
-    const bool left_rgb_ok =
-        Near(actual_left_rgb, expected_inputs.left_rgb, kOneByte);
-    const bool right_rgb_ok =
-        Near(actual_right_rgb, expected_inputs.right_rgb, kOneByte);
+    const bool left_rgb_ok = Near(actual_left_rgb, expected_inputs.left_rgb);
+    const bool right_rgb_ok = Near(actual_right_rgb, expected_inputs.right_rgb);
     const bool left_anchors_ok =
         Near(actual_left_anchors, expected_inputs.left_anchors);
     const bool right_anchors_ok =
@@ -486,6 +527,15 @@ int NativeOracle() {
   ok = ok && run(marks, .5f, true, true, "both eyes intermediate strength");
   ok = ok && run(marks, 1.f, false, true, "left model failure preservation");
   ok = ok && run(marks, 1.f, true, false, "right model failure preservation");
+  auto overlapping = marks;
+  for (int i = 0; i < 6; ++i) {
+    overlapping[2 * (42 + i)] = 47.f + i;
+    overlapping[2 * (42 + i) + 1] = 38.f + (i & 1);
+    overlapping[2 * (36 + i)] = 49.f + i;
+    overlapping[2 * (36 + i) + 1] = 38.f + (i & 1);
+  }
+  ok = ok && run(overlapping, .5f, true, true,
+                 "overlapping eyes composite left then right");
   auto one_invalid = marks;
   for (int point = 0; point < 6; ++point) {
     one_invalid[2 * (42 + point)] = 50.f;
@@ -522,5 +572,9 @@ int NativeOracle() {
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--native")
     return NativeOracle();
-  return FakeContract() ? 0 : 1;
+  if (!FakeContract())
+    return 1;
+  std::cout << "[PASS] prepared CUDA eye-contact fake contract: ownership, "
+               "geometry, 64-bit spans, aliasing, launch, destroy retry\n";
+  return 0;
 }

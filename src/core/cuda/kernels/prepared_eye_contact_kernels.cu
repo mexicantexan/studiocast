@@ -5,7 +5,7 @@ namespace {
 __device__ int clampi(int v, int lo, int hi) { return max(lo, min(hi, v)); }
 __device__ unsigned char round_byte(float v) {
   return static_cast<unsigned char>(clampi(
-      static_cast<int>(floorf(fminf(255.f, fmaxf(0.f, v))) + .5f), 0, 255));
+      static_cast<int>(floorf(fminf(255.f, fmaxf(0.f, v)) + .5f)), 0, 255));
 }
 __device__ void eye_geometry(const float *landmarks, int eye, int fw, int fh,
                              float *g) {
@@ -34,10 +34,12 @@ __device__ float sample_u8(const unsigned char *src, unsigned pitch, int fw,
   const int x0 = static_cast<int>(floorf(x)), y0 = static_cast<int>(floorf(y));
   const int x1 = min(fw - 1, x0 + 1), y1 = min(fh - 1, y0 + 1);
   const float fx = x - x0, fy = y - y0;
-  const float a = src[y0 * pitch + 3 * x0 + channel] * (1.f - fx) +
-                  src[y0 * pitch + 3 * x1 + channel] * fx;
-  const float b = src[y1 * pitch + 3 * x0 + channel] * (1.f - fx) +
-                  src[y1 * pitch + 3 * x1 + channel] * fx;
+  const uint64_t row0 = static_cast<uint64_t>(y0) * pitch;
+  const uint64_t row1 = static_cast<uint64_t>(y1) * pitch;
+  const float a = src[row0 + 3 * x0 + channel] * (1.f - fx) +
+                  src[row0 + 3 * x1 + channel] * fx;
+  const float b = src[row1 + 3 * x0 + channel] * (1.f - fx) +
+                  src[row1 + 3 * x1 + channel] * fx;
   return a * (1.f - fy) + b * fy;
 }
 __device__ float sample_nchw(const float *src, int channel, float x, float y) {
@@ -120,26 +122,22 @@ eye_contact_composite(const unsigned char *src, unsigned src_pitch,
   const unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height)
     return;
-  const unsigned so = y * src_pitch + 3 * x, d = y * dst_pitch + 3 * x;
-  const float *model = nullptr, *g = nullptr;
-  for (int eye = 0; eye < 2; ++eye) {
-    const float *candidate = geometry + eye * 5;
-    const bool ok = eye == 0 ? left_ok : right_ok;
-    if (ok && candidate[4] > .5f && x >= candidate[0] && y >= candidate[1] &&
-        x < candidate[0] + candidate[2] && y < candidate[1] + candidate[3]) {
-      model = eye == 0 ? left : right;
-      g = candidate;
-    }
-  }
+  const uint64_t so = static_cast<uint64_t>(y) * src_pitch + 3u * x;
+  const uint64_t d = static_cast<uint64_t>(y) * dst_pitch + 3u * x;
   for (int c = 0; c < 3; ++c) {
-    const unsigned char original = src[so + c];
-    if (!model || strength <= 0.f) {
-      dst[d + c] = original;
-      continue;
+    unsigned char value = src[so + c];
+    for (int eye = 0; eye < 2; ++eye) {
+      const float *g = geometry + eye * 5;
+      const bool ok = eye == 0 ? left_ok : right_ok;
+      if (!ok || g[4] <= .5f || x < g[0] || y < g[1] || x >= g[0] + g[2] ||
+          y >= g[1] + g[3] || strength <= 0.f)
+        continue;
+      const float *model = eye == 0 ? left : right;
+      const float mx = (static_cast<float>(x) - g[0] + .5f) * 64.f / g[2] - .5f;
+      const float my = (static_cast<float>(y) - g[1] + .5f) * 48.f / g[3] - .5f;
+      const float corrected = round_byte(sample_nchw(model, c, mx, my));
+      value = round_byte(value + (corrected - value) * strength);
     }
-    const float mx = (static_cast<float>(x) - g[0] + .5f) * 64.f / g[2] - .5f;
-    const float my = (static_cast<float>(y) - g[1] + .5f) * 48.f / g[3] - .5f;
-    const float corrected = round_byte(sample_nchw(model, c, mx, my));
-    dst[d + c] = round_byte(original + (corrected - original) * strength);
+    dst[d + c] = value;
   }
 }

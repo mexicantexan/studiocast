@@ -118,7 +118,7 @@ bool LaunchEyeContactInputsPrepared(const PreparedEyeContactKernels &k,
   if (error)
     error->clear();
   if (!k.live || !k.driver || !k.prepare_inputs || !image.Valid() ||
-      image.format != PixelFormatGpu::rgb_u8 ||
+      image.w < 2 || image.h < 2 || image.format != PixelFormatGpu::rgb_u8 ||
       !Tensor(o.landmarks, 1, 1, 136) || !Tensor(o.crop_geometry, 2, 1, 5) ||
       !Tensor(o.left_eye_rgb, 3, 48, 64) ||
       !Tensor(o.right_eye_rgb, 3, 48, 64) ||
