@@ -53,6 +53,8 @@ set(_studiocast_cuda_support_sources
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_preprocess_kernel_bundle.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_vignette.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/dlib_shape_predictor.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/dlib_shape_predictor_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/prepared_fastdvdnet_kernels.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/preprocess_to_nchw_ptx.cpp
         ${PROJECT_SOURCE_DIR}/src/core/cuda/kernels/resize_bilinear_ptx.cpp)
@@ -118,6 +120,8 @@ set(_studiocast_open_video_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/production_video_backend_setup_source.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/video_execution_factory.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/matting_session.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_cuda_auto_frame.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_cuda_dlib_shape_predictor.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_cuda_yunet_detector.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_cuda_fastdvdnet_denoiser.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/native_prepared_cuda_fastdvdnet_runtime.cpp
@@ -633,7 +637,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 145)
+set(_studiocast_expected_source_count 149)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

@@ -1899,6 +1899,38 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-v4l2loopback-diagnostics-tests
             integration video)
 
+    if (_studiocast_have_dlib)
+        foreach(_dlib_test IN ITEMS shape-predictor native-oracle)
+            string(REPLACE "-" "_" _dlib_test_file "${_dlib_test}")
+            set(_dlib_target "studiocast-prepared-cuda-dlib-${_dlib_test}-tests")
+            add_executable(${_dlib_target}
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_dlib_${_dlib_test_file}_tests.cpp)
+            target_link_libraries(${_dlib_target} PRIVATE studiocast_open_video_backend)
+            if (TARGET dlib::dlib)
+                target_link_libraries(${_dlib_target} PRIVATE dlib::dlib)
+            elseif (TARGET dlib)
+                target_link_libraries(${_dlib_target} PRIVATE dlib)
+            endif ()
+            studiocast_set_project_warnings(${_dlib_target})
+            studiocast_enable_sanitizers(${_dlib_target})
+            add_test(NAME ${_dlib_target} COMMAND ${_dlib_target})
+            studiocast_set_test_labels(${_dlib_target} integration video gpu model)
+        endforeach ()
+        set_tests_properties(studiocast-prepared-cuda-dlib-native-oracle-tests
+                PROPERTIES SKIP_RETURN_CODE 77)
+    endif ()
+
+    add_executable(studiocast-prepared-cuda-auto-frame-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_auto_frame_tests.cpp)
+    target_link_libraries(studiocast-prepared-cuda-auto-frame-tests PRIVATE
+            studiocast_open_video_backend)
+    studiocast_set_project_warnings(studiocast-prepared-cuda-auto-frame-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-cuda-auto-frame-tests)
+    add_test(NAME studiocast-prepared-cuda-auto-frame-tests
+            COMMAND studiocast-prepared-cuda-auto-frame-tests)
+    studiocast_set_test_labels(studiocast-prepared-cuda-auto-frame-tests
+            integration video gpu model)
+
     add_executable(studiocast-prepared-cuda-yunet-detector-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_yunet_detector_tests.cpp)
     target_link_libraries(studiocast-prepared-cuda-yunet-detector-tests PRIVATE
