@@ -1956,7 +1956,7 @@ if (BUILD_TESTING)
     add_executable(studiocast-cuda-prepared-eye-contact-kernels-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/cuda/prepared_eye_contact_kernels_tests.cpp)
     target_link_libraries(studiocast-cuda-prepared-eye-contact-kernels-tests PRIVATE
-            studiocast_cuda_backend)
+            studiocast_cuda_support)
     target_include_directories(studiocast-cuda-prepared-eye-contact-kernels-tests PRIVATE
             ${PROJECT_SOURCE_DIR}/src)
     studiocast_set_project_warnings(studiocast-cuda-prepared-eye-contact-kernels-tests)
