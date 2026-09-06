@@ -156,12 +156,29 @@ real hardware.
 
 Prepared HAL completion proceeds by existing-functionality family. Open CUDA
 parity is the first completion target because it preserves the established
-GPU-only effects before StudioCast expands production Vulkan behavior. Current
-known CUDA gaps include `auto` selection/fallback behavior and combinations
-whose dependency graph is not yet represented by one qualified prepared
-island, including Auto Frame. These routes are not fixed merely because setup,
-planning, or ownership is neutral; they remain compatibility-owned or blocked
-as reported by the daemon until their parity evidence passes review.
+GPU-only effects before StudioCast expands production Vulkan behavior. At the
+current source checkpoint, automatic Maxine preference and Open CUDA fallback,
+strict backend/provider boundaries, background/key-light combinations, output
+geometry, and prepared YuNet, dlib-landmark, FastDVDnet, Auto Frame, Eye
+Contact, vignette, and mirror components have been implemented or staged. This
+is a component and contract inventory, not a parity claim: denoise, Auto Frame,
+Eye Contact, mirror, and vignette are not all routed through the production
+prepared island on the current main checkpoint.
+
+The current Quadro P1000 evidence is also bounded. Strict CUDA MODNet executes
+after setup-time specialization of its free dimensions; the later production
+smoke blocker was a capacity check that multiplied a one-row pitched NCHW
+tensor allocation by the model height even though its pitch already represented
+the full tensor allocation. The correction exists only in the unintegrated
+vignette candidate at this checkpoint. Native YuNet, dlib landmark, Eye
+Contact, mirror, vignette, resize, and letterbox runs prove their stated
+components on NVIDIA driver 535.309.01, but do not prove the complete camera
+route, face quality, latency, or every required combination and rollback case.
+The installed FastDVDnet
+artifact matches its curated identity but fails ONNX graph validation because
+a weight input has no producer or initializer; its catalog policy awaits an
+explicit decision. These routes remain compatibility-owned or blocked as
+reported by the daemon until their parity evidence passes review.
 
 The camera pipeline uses one `ProductionVideoBackendManager` backed by typed
 setup leases. Backend factories own native sessions, contexts, streams/queues,
