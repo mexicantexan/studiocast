@@ -493,6 +493,7 @@ enum class SourceMode {
   ready,
   optional_passthrough,
   malformed_optional_passthrough,
+  nondeterministic_optional_passthrough_hash,
   malformed_returned_plan,
   foreign_returned_domain,
   single_domain_compatibility,
@@ -522,7 +523,8 @@ public:
     result.plan = request.plan;
     result.canonical_effects = request.effects;
     if (mode == SourceMode::optional_passthrough ||
-        mode == SourceMode::malformed_optional_passthrough) {
+        mode == SourceMode::malformed_optional_passthrough ||
+        mode == SourceMode::nondeterministic_optional_passthrough_hash) {
       auto domain = Domain();
       domain.backend = hal::BackendId::cuda;
       domain.api_family = hal::ApiFamily::cuda_driver;
@@ -546,9 +548,12 @@ public:
       capability.reason = hal::ReasonId::capability_evidence_incomplete;
       registration.semantic_capability_count = 1;
       result.plan.invalidation_key.execution_domain_hash =
-          video::ProductionVideoExecutionDomainHash(domain);
+          video::kProductionVideoNeutralPassthroughExecutionHash;
       if (mode == SourceMode::malformed_optional_passthrough)
         registration.adapter_instance_id = 0;
+      if (mode == SourceMode::nondeterministic_optional_passthrough_hash)
+        result.plan.invalidation_key.execution_domain_hash +=
+            counters_->source_calls;
       result.status = hal::StatusId::degraded;
       result.reason = hal::ReasonId::capability_evidence_incomplete;
       result.readiness.status = hal::StatusId::degraded;
@@ -874,6 +879,22 @@ bool TestOptionalUnavailableUsesNeutralPassthrough() {
   bad_binding.output_descriptor.width = 8;
   ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
                 "passthrough must preserve exact geometry binding");
+
+  bad_binding = Binding(&input, &output, 4);
+  --bad_binding.input_planes[0].span_bytes;
+  ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
+                "passthrough must reject a short borrowed input plane");
+  bad_binding = Binding(&input, &output, 5);
+  ++bad_binding.output_planes[0].row_stride_bytes;
+  ok &= Require(manager.Execute(bad_binding).status == hal::StatusId::blocked,
+                "passthrough must reject a wrong borrowed output stride");
+
+  raw_source->mode = SourceMode::nondeterministic_optional_passthrough_hash;
+  ++request.resident.plan.plan_id;
+  ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    evidence.old_plan_retained,
+                "source-defined neutral route hashes must be rejected");
 
   raw_source->mode = SourceMode::malformed_optional_passthrough;
   ++request.resident.plan.plan_id;

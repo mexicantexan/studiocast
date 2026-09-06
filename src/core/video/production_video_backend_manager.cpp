@@ -613,7 +613,8 @@ bool SamePassthroughPlanRequest(
       caller.invalidation_key.model_artifact_hash !=
           bound.invalidation_key.model_artifact_hash ||
       caller.invalidation_key.execution_domain_hash != 0 ||
-      bound.invalidation_key.execution_domain_hash == 0 ||
+      bound.invalidation_key.execution_domain_hash !=
+          kProductionVideoNeutralPassthroughExecutionHash ||
       !SameTemporal(caller.temporal, bound.temporal) ||
       !SameBudget(caller.budget, bound.budget) ||
       caller.cpu_tail_count != bound.cpu_tail_count ||

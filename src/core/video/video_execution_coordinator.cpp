@@ -189,8 +189,25 @@ bool SamePassthroughBinding(const hal::HostFrameBinding &binding,
     return false;
   }
   for (std::size_t index = 0; index < binding.input_plane_count; ++index) {
-    if (binding.input_planes[index].read_data == nullptr ||
-        binding.output_planes[index].write_data == nullptr) {
+    const auto &input = binding.input_planes[index];
+    const auto &output = binding.output_planes[index];
+    const auto &expected_input = binding.input_descriptor.planes[index];
+    const auto &expected_output = binding.output_descriptor.planes[index];
+    const auto input_address =
+        reinterpret_cast<std::uintptr_t>(input.read_data);
+    const auto output_address =
+        reinterpret_cast<std::uintptr_t>(output.write_data);
+    if (input.read_data == nullptr || output.write_data == nullptr ||
+        input.span_bytes < expected_input.size_bytes ||
+        output.span_bytes < expected_output.size_bytes ||
+        input.row_stride_bytes != expected_input.row_stride_bytes ||
+        output.row_stride_bytes != expected_output.row_stride_bytes ||
+        input_address % expected_input.alignment_bytes != 0 ||
+        output_address % expected_output.alignment_bytes != 0 ||
+        input_address >
+            std::numeric_limits<std::uintptr_t>::max() - input.span_bytes ||
+        output_address >
+            std::numeric_limits<std::uintptr_t>::max() - output.span_bytes) {
       return false;
     }
   }

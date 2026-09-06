@@ -618,6 +618,10 @@ bool TestStrictOptionalUnavailablePassthrough() {
 
   video::VideoExecutionCoordinator coordinator(registry);
   auto request = Request();
+  request.host_output.width = 2;
+  request.host_output.planes[0].width = 2;
+  request.host_output.planes[0].row_stride_bytes = 6;
+  request.host_output.planes[0].size_bytes = 12;
   video::VideoExecutionPrepareEvidence evidence;
   bool ok = Require(coordinator.Prepare(request, &evidence, &reason) ==
                         hal::StatusId::passthrough,
@@ -630,11 +634,16 @@ bool TestStrictOptionalUnavailablePassthrough() {
                             hal::SemanticEffectProviderId::invalid,
                     "passthrough must preserve skipped typed resolution");
   std::uint8_t input[24]{}, output[24]{};
-  auto frame = coordinator.Execute(Binding(input, output, 3));
+  auto binding = Binding(input, output, 3);
+  binding.output_descriptor = request.host_output;
+  binding.output_planes[0].span_bytes = 12;
+  binding.output_planes[0].row_stride_bytes = 6;
+  auto frame = coordinator.Execute(binding);
   ok &= Require(frame.status == hal::StatusId::passthrough &&
                     frame.passthrough && frame.transfers.uploads == 0 &&
                     frame.transfers.final_readbacks == 0,
-                "optional passthrough must execute without transfers");
+                "optional passthrough must permit distinct host geometry and "
+                "buffers without transfers");
   ok &= Require(coordinator.CommitOutput(frame.completion, false, &reason) ==
                         hal::StatusId::failed &&
                     !coordinator.Snapshot().latest_committed_frame.valid,
