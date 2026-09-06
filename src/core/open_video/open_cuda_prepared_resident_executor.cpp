@@ -469,10 +469,9 @@ ReasonId ValidateProductionProgram(
       program.temporal.history_frames != 0 || !program.requires_upload ||
       !program.requires_final_readback ||
       program.requested_backend != BackendId::cuda ||
-      !program.strict_backend_selection ||
       program.requested_provider !=
           SemanticEffectProviderId::open_video_onnxruntime_cuda ||
-      !program.strict_provider_selection || !program.strict_execution_domain ||
+      !program.strict_execution_domain ||
       program.requested_execution_domain != program.execution_domain) {
     return ReasonId::malformed_contract;
   }

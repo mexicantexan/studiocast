@@ -178,6 +178,22 @@ hal::PreparedProgram Program(hal::SemanticEffectId semantic =
   return program;
 }
 
+hal::PreparedProgram CombinedProgram(bool first_required = false) {
+  auto program = Program(hal::SemanticEffectId::virtual_background_remove,
+                         first_required);
+  program.stages[1] = program.stages[0];
+  program.stages[1].stage_id = 2;
+  program.stages[1].semantic = hal::SemanticEffectId::virtual_key_light;
+  program.stages[1].required = true;
+  program.stages[1].failure_action = hal::FailureAction::fail_closed;
+  program.stages[1].circuit_breaker.action =
+      hal::CircuitBreakerAction::quarantine_program;
+  program.stage_count = 2;
+  program.cpu_tails[0].after_stage_id = 2;
+  program.cpu_tails[0].boundary_index = 2;
+  return program;
+}
+
 open_cuda::OpenCudaPreparedResidentExecutor::Options
 Options(open_cuda::IPreparedOpenCudaRuntime *runtime) {
   const auto artifact = Artifact();
@@ -250,8 +266,10 @@ public:
   int forbidden_frame_work = 0;
   bool no_analysis = false;
   bool pending_destroy = false;
+  bool combined_optional_first_failure = false;
   std::uint64_t prepare_calls = 0;
   std::uint64_t execute_calls = 0;
+  std::uint64_t analysis_runs = 0;
   std::uint64_t reset_calls = 0;
   std::uint64_t destroy_calls = 0;
   std::uint64_t shutdown_calls = 0;
@@ -299,6 +317,8 @@ public:
     result.evidence.model_artifact = config.model_artifact;
     open_cuda::PreparedOpenCudaVbPlanInput plan_input;
     plan_input.semantic = program.stages[0].semantic;
+    plan_input.island_stage_count =
+        static_cast<std::uint32_t>(program.stage_count);
     plan_input.frame_width = program.host_input.width;
     plan_input.frame_height = program.host_input.height;
     plan_input.model_width =
@@ -333,6 +353,10 @@ public:
     plan_input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
     plan_input.readback_staging_bytes =
         program.host_output.planes[0].size_bytes;
+    plan_input.final_output_width = program.host_output.width;
+    plan_input.final_output_height = program.host_output.height;
+    plan_input.final_output_pitch_bytes =
+        program.host_output.planes[0].row_stride_bytes;
     plan_input.available_budget = program.budget;
     result.evidence.geometry_plan =
         open_cuda::PlanPreparedOpenCudaVirtualBackground(plan_input);
@@ -387,6 +411,26 @@ public:
     else if (forbidden_frame_work == 6)
       ++telemetry.json_serializations;
     result.status = execute_status;
+    if (combined_optional_first_failure && slot->program.stage_count == 2) {
+      ++analysis_runs;
+      result.status = RuntimeStatus::optional_failed_open;
+      result.reason = hal::ReasonId::optional_stage_failed_open;
+      result.stage_failure_status = RuntimeStatus::postprocess_failed;
+      result.stage_failure_reason =
+          hal::ReasonId::semantic_provider_unavailable;
+      result.failed_operation =
+          open_cuda::PreparedOpenCudaOperationId::composite_solid;
+      result.stage_count = 2;
+      result.stages[0].stage_id = slot->program.stages[0].stage_id;
+      result.stages[0].semantic = slot->program.stages[0].semantic;
+      result.stages[0].status =
+          hal::StageExecutionStatus::optional_failed_open;
+      result.stages[0].reason = result.stage_failure_reason;
+      result.stages[0].valid_output_preserved = true;
+      result.stages[1].stage_id = slot->program.stages[1].stage_id;
+      result.stages[1].semantic = slot->program.stages[1].semantic;
+      result.stages[1].status = hal::StageExecutionStatus::succeeded;
+    }
     if (frame.stage_disabled)
       result.status = RuntimeStatus::executed;
     result.reason = result.status == RuntimeStatus::optional_failed_open
@@ -396,7 +440,8 @@ public:
                                : (result.status == RuntimeStatus::device_lost
                                       ? hal::ReasonId::device_lost
                                       : hal::ReasonId::none));
-    if (result.status == RuntimeStatus::optional_failed_open) {
+    if (result.status == RuntimeStatus::optional_failed_open &&
+        !combined_optional_first_failure) {
       result.stage_failure_status = RuntimeStatus::inference_failed;
       result.stage_failure_reason =
           hal::ReasonId::semantic_provider_unavailable;
@@ -435,7 +480,9 @@ public:
     if (completed) {
       std::memcpy(frame.output, frame.input,
                   std::min(frame.input_span_bytes, frame.output_span_bytes));
-      if (!frame.stage_disabled && result.status == RuntimeStatus::executed &&
+      if (!frame.stage_disabled &&
+          (result.status == RuntimeStatus::executed ||
+           combined_optional_first_failure) &&
           frame.output_span_bytes != 0) {
         frame.output[0] ^= std::byte{0x7F};
       }
@@ -1019,6 +1066,53 @@ bool TestOptionalFailurePreservesInputWithoutAttribution() {
   return ok;
 }
 
+bool TestCombinedOptionalFirstFailureContinuesSecondStage() {
+  FakeRuntime runtime;
+  runtime.combined_optional_first_failure = true;
+  auto options = Options(&runtime);
+  open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+  open_cuda::ResidentAdapter adapter(81, executor);
+  hal::PreparedProgramSession session;
+  hal::ReadinessSnapshot readiness;
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto program = CombinedProgram();
+  bool ok = Expect(session.Configure(program, adapter, &readiness, &reason) ==
+                       hal::StatusId::degraded &&
+                       runtime.prepare_calls == 1,
+                   "combined optional/required island must prepare once");
+  std::array<std::byte, 384> input{};
+  std::array<std::byte, 384> output{};
+  output.fill(std::byte{0xEE});
+  input[0] = std::byte{0x22};
+  const auto binding = HostBinding(program, input.data(), output.data(), 1);
+  hal::HostFrameTokens tokens;
+  ok = Expect(session.BindHostFrame(binding, &tokens, &reason) ==
+                  hal::StatusId::ready,
+              "combined fixture host binding must be valid") && ok;
+  hal::ExecuteRequest request;
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = tokens.input;
+  const auto result = session.Execute(request);
+  return Expect(result.status == hal::StatusId::degraded &&
+                    result.output_valid && result.stage_count == 2 &&
+                    result.stages[0].status ==
+                        hal::StageExecutionStatus::optional_failed_open &&
+                    result.stages[0].valid_output_preserved &&
+                    result.stages[1].status ==
+                        hal::StageExecutionStatus::succeeded &&
+                    result.transfers.uploads == 1 &&
+                    result.transfers.final_readbacks == 1 &&
+                    result.transfers.intermediate_uploads == 0 &&
+                    result.transfers.intermediate_readbacks == 0 &&
+                    runtime.execute_calls == 1 && runtime.analysis_runs == 1 &&
+                    output[0] == (input[0] ^ std::byte{0x7F}),
+                "optional first-stage failure must preserve the resident "
+                "input, continue key light, and share one analysis pass") &&
+         ok;
+}
+
 bool TestRequiredFailureDeviceLossAndForbiddenFrameWork() {
   bool ok = true;
   {
@@ -1143,7 +1237,7 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
       program.host_output.planes[0].row_stride_bytes = 24;
       program.host_output.planes[0].size_bytes = 192;
     } else if (mode == 2) {
-      program.strict_provider_selection = false;
+      program.requested_backend = hal::BackendId::cpu;
     } else if (mode == 3) {
       program.requested_provider =
           hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
@@ -1193,6 +1287,49 @@ bool TestEligibilityFailsClosedBeforeRuntimeSetup() {
                     runtime.prepare_calls == 0,
                 "execution-domain stream identity must be the exact owned "
                 "CUstream, not an unrelated logical number") &&
+         ok;
+  }
+  return ok;
+}
+
+bool TestResolvedSelectionStrictnessDoesNotRejectNativeCuda() {
+  bool ok = true;
+  for (int mode = 0; mode < 3; ++mode) {
+    FakeRuntime runtime;
+    auto program = Program();
+    if (mode == 0) {
+      program.strict_backend_selection = false;
+      program.strict_provider_selection = false;
+    } else if (mode == 1) {
+      program.strict_provider_selection = false;
+    }
+    auto options = Options(&runtime);
+    open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+    open_cuda::ResidentAdapter adapter(81, executor);
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status = session.Configure(program, adapter, &readiness, &reason);
+    ok = Expect(status == hal::StatusId::degraded && runtime.prepare_calls == 1,
+                "automatic, forced-CUDA/automatic-engine, and exact Open "
+                "CUDA programs must reach native preparation") && ok;
+  }
+  {
+    FakeRuntime runtime;
+    auto program = Program();
+    program.requested_provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    auto options = Options(&runtime);
+    open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
+    open_cuda::ResidentAdapter adapter(81, executor);
+    hal::PreparedProgramSession session;
+    hal::ReadinessSnapshot readiness;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status = session.Configure(program, adapter, &readiness, &reason);
+    ok = Expect(status != hal::StatusId::ready &&
+                    status != hal::StatusId::degraded &&
+                    runtime.prepare_calls == 0,
+                "foreign resolved provider must fail before native setup") &&
          ok;
   }
   return ok;
@@ -1391,9 +1528,11 @@ int main() {
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
   ok = TestAcceptedResidentEffectsThroughSession() && ok;
   ok = TestOptionalFailurePreservesInputWithoutAttribution() && ok;
+  ok = TestCombinedOptionalFirstFailureContinuesSecondStage() && ok;
   ok = TestRequiredFailureDeviceLossAndForbiddenFrameWork() && ok;
   ok = TestModelAndCaptureGeometryMayDiffer() && ok;
   ok = TestEligibilityFailsClosedBeforeRuntimeSetup() && ok;
+  ok = TestResolvedSelectionStrictnessDoesNotRejectNativeCuda() && ok;
   ok = TestBudgetEvidenceRollbackAndOldPlanRetention() && ok;
   ok = TestStaleForeignBindingReconfigurationAndReset() && ok;
   ok = TestBoundedTerminalStatesAndPendingShutdown() && ok;
