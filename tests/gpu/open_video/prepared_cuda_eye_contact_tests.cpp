@@ -233,6 +233,8 @@ cuda::CUresult CElapsed(float *ms, cuda::CUevent, cuda::CUevent) {
   *ms = 0;
   return 0;
 }
+std::uint64_t FrozenNow(void *) noexcept { return 0; }
+void NoPollWait(void *, std::uint64_t) noexcept {}
 cuda::CudaDriverApi::Functions CudaFunctions() {
   cuda::CudaDriverApi::Functions f;
   f.cuInit = CInit;
@@ -751,6 +753,8 @@ bool NativeBoundaries() {
   config.wait.timeout_nanoseconds = 100;
   config.wait.poll_interval_nanoseconds = 1;
   config.wait.maximum_poll_count = 2;
+  config.wait.now_nanoseconds = FrozenNow;
+  config.wait.poll_wait = NoPollWait;
   ModelPack pack;
   ModelFile left, right;
   left.role = "left";
@@ -815,15 +819,19 @@ bool NativeBoundaries() {
   NativePreparedCudaEyeContactRuntime timeout_runtime(&timeout_factory);
   CHECK(timeout_runtime.Prepare(config) ==
         PreparedCudaEyeContactStatus::executed);
-  state.not_ready = 2;
+  state.not_ready = 4;
   state.fail_run_at = 4;
+  const int timeout_queries = state.queries;
   result = timeout_runtime.Execute(config.binding, input, landmarks, 0.5F);
   CHECK(result.status == PreparedCudaEyeContactStatus::timeout &&
         result.pending_work && result.output == nullptr &&
-        result.completion_waits == 1);
+        result.completion_waits == 1 &&
+        state.queries == timeout_queries + 2);
   CHECK(timeout_runtime.Shutdown() ==
-        PreparedCudaEyeContactStatus::shutdown_failed);
-  CHECK(timeout_runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown);
+            PreparedCudaEyeContactStatus::shutdown_failed &&
+        state.queries == timeout_queries + 4);
+  CHECK(timeout_runtime.Shutdown() == PreparedCudaEyeContactStatus::shutdown &&
+        state.queries == timeout_queries + 5);
 
   state = {};
   state.next = 0x1000;
