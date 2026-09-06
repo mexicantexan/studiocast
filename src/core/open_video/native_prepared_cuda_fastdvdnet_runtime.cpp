@@ -1,4 +1,6 @@
 #include "core/open_video/native_prepared_cuda_fastdvdnet_runtime.h"
+#include "core/util/fs.h"
+#include "core/util/json.h"
 
 #include <algorithm>
 #include <atomic>
@@ -43,22 +45,13 @@ public:
   std::unique_ptr<IPreparedFastDvdnetOrtSession>
   Create(const std::filesystem::path &model,
          const onnx::OrtSessionOptions &options,
-         const PreparedCudaFastDvdnetTensorContract &tensors) noexcept override {
+         const PreparedCudaFastDvdnetTensorContract &tensors,
+         const PreparedFastDvdnetModelContract &contract) noexcept override {
     onnx::OrtSessionInfo info;
     auto session = onnx::OrtSession::Create(model, options, &info, nullptr);
     if (!session || !info.strict_provider_validation_passed ||
         !info.prepared_provider_evidence.ValidStrictCuda() ||
-        info.input_names.size() != 2 || info.output_names.size() != 1 ||
-        info.input_names[0] != tensors.noisy_name ||
-        info.input_names[1] != tensors.noise_map_name ||
-        info.output_names[0] != tensors.denoised_name ||
-        info.input_shapes.size() != 2 || info.output_shapes.size() != 1 ||
-        info.input_shapes[0] != std::vector<std::int64_t>(tensors.noisy_shape.begin(), tensors.noisy_shape.end()) ||
-        info.input_shapes[1] != std::vector<std::int64_t>(tensors.noise_map_shape.begin(), tensors.noise_map_shape.end()) ||
-        info.output_shapes[0] != std::vector<std::int64_t>(tensors.denoised_shape.begin(), tensors.denoised_shape.end()) ||
-        info.input_elem_types.size() != 2 || info.output_elem_types.size() != 1 ||
-        info.input_elem_types[0] != 1 || info.input_elem_types[1] != 1 ||
-        info.output_elem_types[0] != 1)
+        !ValidatePreparedFastDvdnetSessionMetadata(info, contract, tensors))
       return {};
     auto evidence = session->prepared_cuda_run_evidence();
     if (!evidence.Valid()) return {};
@@ -76,7 +69,143 @@ const ModelFile *MainOnnx(const ModelPack &pack) noexcept {
   return fallback;
 }
 
+bool ReadManifestTensor(const util::json::Value &value, std::string *name,
+                        int *channels, int *width, int *height,
+                        bool *dynamic_hw, bool require_layout) {
+  const auto *object = value.AsObject();
+  if (!object) return false;
+  const auto string_value = [&](const char *key) -> const std::string * {
+    const auto it = object->find(key);
+    return it == object->end() ? nullptr : it->second.AsString();
+  };
+  const auto *n = string_value("name");
+  const auto *layout = string_value("layout");
+  const auto *dtype = string_value("dtype");
+  const auto channel_it = object->find("channels");
+  const auto dynamic_it = object->find("dynamic_hw");
+  const auto width_it = object->find("width");
+  const auto height_it = object->find("height");
+  const auto *number = channel_it == object->end()
+                           ? nullptr : channel_it->second.AsNumber();
+  const auto *dynamic = dynamic_it == object->end()
+                            ? nullptr : dynamic_it->second.AsBool();
+  if (!n || (require_layout && (!layout || *layout != "nchw")) ||
+      (!require_layout && layout && *layout != "nchw") ||
+      !dtype || *dtype != "float32" ||
+      !number || *number < 1 || *number > std::numeric_limits<int>::max() ||
+      static_cast<double>(static_cast<int>(*number)) != *number || !dynamic)
+    return false;
+  const auto integer_field = [&](const util::json::Value::Object::const_iterator &it,
+                                 int *out) {
+    if (it == object->end()) return false;
+    const auto *value_number = it->second.AsNumber();
+    if (!value_number || *value_number < 1 ||
+        *value_number > std::numeric_limits<int>::max() ||
+        static_cast<double>(static_cast<int>(*value_number)) != *value_number)
+      return false;
+    *out = static_cast<int>(*value_number);
+    return true;
+  };
+  if (!*dynamic &&
+      (!integer_field(width_it, width) || !integer_field(height_it, height)))
+    return false;
+  *name = *n;
+  *channels = static_cast<int>(*number);
+  *dynamic_hw = *dynamic;
+  return true;
+}
+
+bool ReadFastDvdnetManifest(const ModelPack &pack,
+                            PreparedFastDvdnetModelContract *contract) {
+  const auto text = util::ReadTextFile(pack.manifest_path.string());
+  util::json::Value root;
+  std::string error;
+  if (!text || !util::json::Parse(*text, &root, &error)) return false;
+  const auto *root_object = root.AsObject();
+  if (!root_object) return false;
+  const auto onnx_it = root_object->find("onnx");
+  if (onnx_it == root_object->end()) return false;
+  const auto *onnx = onnx_it->second.AsObject();
+  if (!onnx) return false;
+  const auto inputs_it = onnx->find("inputs");
+  const auto outputs_it = onnx->find("outputs");
+  const auto *inputs = inputs_it == onnx->end()
+                           ? nullptr : inputs_it->second.AsArray();
+  const auto *outputs = outputs_it == onnx->end()
+                            ? nullptr : outputs_it->second.AsArray();
+  return inputs && inputs->size() == 2 && outputs && outputs->size() == 1 &&
+         ReadManifestTensor((*inputs)[0], &contract->input_names[0],
+                            &contract->input_channels[0],
+                            &contract->input_widths[0],
+                            &contract->input_heights[0],
+                            &contract->input_dynamic_hw[0], true) &&
+         ReadManifestTensor((*inputs)[1], &contract->input_names[1],
+                            &contract->input_channels[1],
+                            &contract->input_widths[1],
+                            &contract->input_heights[1],
+                            &contract->input_dynamic_hw[1], true) &&
+         ReadManifestTensor((*outputs)[0], &contract->output_name,
+                            &contract->output_channels,
+                            &contract->output_width,
+                            &contract->output_height,
+                            &contract->output_dynamic_hw, false);
+}
+
 } // namespace
+
+bool ValidatePreparedFastDvdnetSessionMetadata(
+    const onnx::OrtSessionInfo &info,
+    const PreparedFastDvdnetModelContract &model,
+    const PreparedCudaFastDvdnetTensorContract &selected) noexcept {
+  if (info.input_names.size() != 2 || info.output_names.size() != 1 ||
+      info.input_shapes.size() != 2 || info.output_shapes.size() != 1 ||
+      info.input_elem_types.size() != 2 || info.output_elem_types.size() != 1 ||
+      !selected.noisy_name || !selected.noise_map_name ||
+      !selected.denoised_name ||
+      model.input_names[0] != selected.noisy_name ||
+      model.input_names[1] != selected.noise_map_name ||
+      model.output_name != selected.denoised_name ||
+      info.input_names[0] != model.input_names[0] ||
+      info.input_names[1] != model.input_names[1] ||
+      info.output_names[0] != model.output_name ||
+      info.input_elem_types[0] != 1 || info.input_elem_types[1] != 1 ||
+      info.output_elem_types[0] != 1)
+    return false;
+  const std::array<const std::vector<std::int64_t> *, 3> actual{
+      &info.input_shapes[0], &info.input_shapes[1], &info.output_shapes[0]};
+  const std::array<const std::array<std::int64_t, 4> *, 3> selected_shapes{
+      &selected.noisy_shape, &selected.noise_map_shape, &selected.denoised_shape};
+  const std::array<int, 3> channels{model.input_channels[0],
+                                    model.input_channels[1],
+                                    model.output_channels};
+  const std::array<bool, 3> dynamic{model.input_dynamic_hw[0],
+                                    model.input_dynamic_hw[1],
+                                    model.output_dynamic_hw};
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    if (selected_shapes[i]->at(0) != 1 ||
+        selected_shapes[i]->at(1) != channels[i] ||
+        selected_shapes[i]->at(2) <= 0 || selected_shapes[i]->at(3) <= 0 ||
+        actual[i]->size() != 4 || (*actual[i])[0] != 1 ||
+        (*actual[i])[1] != channels[i])
+      return false;
+    if (dynamic[i]) {
+      if ((*actual[i])[2] >= 0 || (*actual[i])[3] >= 0) return false;
+    } else {
+      const int manifest_width = i < 2 ? model.input_widths[i]
+                                       : model.output_width;
+      const int manifest_height = i < 2 ? model.input_heights[i]
+                                        : model.output_height;
+      if (manifest_width <= 0 || manifest_height <= 0 ||
+          selected_shapes[i]->at(2) != manifest_height ||
+          selected_shapes[i]->at(3) != manifest_width ||
+          *actual[i] != std::vector<std::int64_t>(
+                            selected_shapes[i]->begin(),
+                            selected_shapes[i]->end()))
+        return false;
+    }
+  }
+  return true;
+}
 
 NativePreparedCudaFastDvdnetRuntime::NativePreparedCudaFastDvdnetRuntime(
     IPreparedFastDvdnetOrtFactory *factory) noexcept
@@ -118,13 +247,24 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
     return result;
   }
+  PreparedFastDvdnetModelContract model_contract;
   if (!injected_factory_) {
+    if (!ReadFastDvdnetManifest(*config.model_pack, &model_contract)) {
+      result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
+      return result;
+    }
     const auto validated = ValidateModelArtifactIdentity(*config.model_pack, *model);
     if (!validated.ok() ||
         !ModelArtifactIdentityMatches(validated.identity, config.artifact)) {
       result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
       return result;
     }
+  } else {
+    model_contract.input_names = {config.tensors.noisy_name,
+                                  config.tensors.noise_map_name};
+    model_contract.output_name = config.tensors.denoised_name;
+    model_contract.input_channels = {15, 1};
+    model_contract.output_channels = 3;
   }
   const auto tensor_w = config.tensors.noisy_shape[3];
   const auto tensor_h = config.tensors.noisy_shape[2];
@@ -204,13 +344,13 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
       config.execution_domain.logical_context_generation;
   options.user_compute_stream = config.owner_stream;
   ++telemetry_.session_constructions;
-  session_ = factory_->Create(model->path, options, config.tensors);
+  session_ = factory_->Create(model->path, options, config.tensors,
+                              model_contract);
   if (!session_ || !session_->evidence().Valid() ||
-      !session_->evidence().provider.ValidStrictCuda() ||
-      session_->evidence().provider.cuda_context_generation !=
-          config.execution_domain.logical_context_generation ||
-      session_->evidence().provider.requested_stream_identity !=
-          reinterpret_cast<std::uintptr_t>(config.owner_stream)) {
+      !onnx::OrtPreparedProviderEvidenceMatches(
+          session_->evidence().provider, config.cuda_device_id,
+          config.execution_domain.logical_context_generation,
+          reinterpret_cast<std::uintptr_t>(config.owner_stream))) {
     FinishFailedPrepare(PreparedCudaFastDvdnetStatus::wrong_provider, &result);
     return result;
   }
