@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -14,6 +15,23 @@ using namespace studiocast;
 
 constexpr std::uint64_t kFakeAdapter = UINT64_C(0xc0da0001);
 constexpr std::uint64_t kFakeFactory = UINT64_C(0xc0da0002);
+
+class UniqueTempDir {
+public:
+  UniqueTempDir() {
+    path_ = (std::filesystem::temp_directory_path() /
+             "studiocast-open-cuda-XXXXXX").string();
+    if (::mkdtemp(path_.data()) == nullptr)
+      throw std::runtime_error("mkdtemp failed");
+  }
+  ~UniqueTempDir() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+  const std::string &path() const noexcept { return path_; }
+private:
+  std::string path_;
+};
 
 hal::ExecutionDomainId FakeCudaDomain() {
   hal::ExecutionDomainId domain;
@@ -461,15 +479,11 @@ bool StrictPolicyIsFailClosed() {
 
 bool SemanticCapabilityClaimsRemainExact() {
   auto source = open_cuda::CreateProductionVideoBackendSetupSource();
-  const auto temp = std::filesystem::temp_directory_path() /
-                    "studiocast-open-cuda-capability-empty";
-  std::error_code ec;
-  std::filesystem::remove_all(temp, ec);
-  std::filesystem::create_directories(temp, ec);
+  const UniqueTempDir temp;
   const char *old = std::getenv("XDG_DATA_HOME");
   const std::string old_value = old == nullptr ? std::string{} : old;
   const bool had_old = old != nullptr;
-  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+  (void)setenv("XDG_DATA_HOME", temp.path().c_str(), 1);
   const hal::SemanticEffectId supported[] = {
       hal::SemanticEffectId::virtual_background_replace,
       hal::SemanticEffectId::virtual_key_light,
@@ -487,7 +501,6 @@ bool SemanticCapabilityClaimsRemainExact() {
     (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
   else
     (void)unsetenv("XDG_DATA_HOME");
-  std::filesystem::remove_all(temp, ec);
 
   const hal::SemanticEffectId unsupported[] = {
       hal::SemanticEffectId::auto_frame,
@@ -527,20 +540,16 @@ bool HostAndModelEvidenceAreSetupOnly() {
                       result.reason == hal::ReasonId::malformed_descriptor,
                   "geometry mismatch was not rejected before setup");
 
-  const auto temp = std::filesystem::temp_directory_path() /
-                    "studiocast-open-cuda-backend-source-empty";
-  std::error_code ec;
-  std::filesystem::create_directories(temp, ec);
+  const UniqueTempDir temp;
   const char *old = std::getenv("XDG_DATA_HOME");
   const std::string old_value = old == nullptr ? std::string{} : old;
   const bool had_old = old != nullptr;
-  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+  (void)setenv("XDG_DATA_HOME", temp.path().c_str(), 1);
   result = source->AcquireResidentSetup(StrictRequest());
   if (had_old)
     (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
   else
     (void)unsetenv("XDG_DATA_HOME");
-  std::filesystem::remove_all(temp, ec);
 
   ok &= Check(
       result.status == hal::StatusId::unavailable &&
@@ -552,15 +561,11 @@ bool HostAndModelEvidenceAreSetupOnly() {
 
 bool CanonicalAutomaticAndForcedCudaShapesReachSetup() {
   auto source = open_cuda::CreateProductionVideoBackendSetupSource();
-  const auto temp = std::filesystem::temp_directory_path() /
-                    "studiocast-open-cuda-selector-empty";
-  std::error_code ec;
-  std::filesystem::remove_all(temp, ec);
-  std::filesystem::create_directories(temp, ec);
+  const UniqueTempDir temp;
   const char *old = std::getenv("XDG_DATA_HOME");
   const std::string old_value = old == nullptr ? std::string{} : old;
   const bool had_old = old != nullptr;
-  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+  (void)setenv("XDG_DATA_HOME", temp.path().c_str(), 1);
 
   auto automatic = StrictRequest();
   automatic.plan.intent.backend.mode = hal::BackendRequestMode::automatic;
@@ -597,7 +602,6 @@ bool CanonicalAutomaticAndForcedCudaShapesReachSetup() {
     (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
   else
     (void)unsetenv("XDG_DATA_HOME");
-  std::filesystem::remove_all(temp, ec);
   return ok;
 }
 
@@ -633,21 +637,16 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
   request.effects.video_noise_removal.enabled = true;
   request.effects.eye_contact.enabled = true;
 
-  const auto temp = std::filesystem::temp_directory_path() /
-                    "studiocast-open-cuda-compatibility-empty";
-  std::error_code ec;
-  std::filesystem::remove_all(temp, ec);
-  std::filesystem::create_directories(temp, ec);
+  const UniqueTempDir temp;
   const char *old = std::getenv("XDG_DATA_HOME");
   const std::string old_value = old == nullptr ? std::string{} : old;
   const bool had_old = old != nullptr;
-  (void)setenv("XDG_DATA_HOME", temp.c_str(), 1);
+  (void)setenv("XDG_DATA_HOME", temp.path().c_str(), 1);
   result = source->AcquireResidentSetup(request);
   if (had_old)
     (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
   else
     (void)unsetenv("XDG_DATA_HOME");
-  std::filesystem::remove_all(temp, ec);
 
   ok &= Check(
       result.status == hal::StatusId::unavailable &&
@@ -727,6 +726,70 @@ bool StaticSelectionOrderIsBehavioral() {
       hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
   strict_provider.plan.intent.strict_provider_selection = true;
   ok &= exercise(strict_provider, hal::StatusId::ready, 0, 1);
+
+  {
+    int maxine_calls = 0, cuda_calls = 0;
+    video::StaticProductionVideoBackendSetupSourcesForTesting sources;
+    sources.maxine = std::make_unique<ScriptedSetupSource>(
+        &maxine_calls, hal::StatusId::unavailable);
+    sources.open_cuda = std::make_unique<ScriptedSetupSource>(
+        &cuda_calls, hal::StatusId::ready);
+    auto source = video::CreateStaticProductionVideoBackendSetupSourceForTesting(
+        std::move(sources));
+    auto strict_maxine = automatic;
+    strict_maxine.plan.intent.backend.mode =
+        hal::BackendRequestMode::explicit_backend;
+    strict_maxine.plan.intent.backend.backend = hal::BackendId::maxine;
+    strict_maxine.plan.intent.backend.strict = true;
+    const auto result = source->AcquireResidentSetup(strict_maxine);
+    ok &= Check(result.status == hal::StatusId::unavailable &&
+                    maxine_calls == 1 && cuda_calls == 0,
+                "strict Maxine failure substituted CUDA");
+  }
+  {
+    int maxine_calls = 0, cuda_calls = 0, vulkan_calls = 0;
+    video::StaticProductionVideoBackendSetupSourcesForTesting sources;
+    sources.maxine = std::make_unique<ScriptedSetupSource>(
+        &maxine_calls, hal::StatusId::ready);
+    sources.open_cuda = std::make_unique<ScriptedSetupSource>(
+        &cuda_calls, hal::StatusId::ready);
+    sources.vulkan = std::make_unique<ScriptedSetupSource>(
+        &vulkan_calls, hal::StatusId::unavailable);
+    auto source = video::CreateStaticProductionVideoBackendSetupSourceForTesting(
+        std::move(sources));
+    auto strict_vulkan = automatic;
+    strict_vulkan.plan.intent.backend.mode =
+        hal::BackendRequestMode::explicit_backend;
+    strict_vulkan.plan.intent.backend.backend = hal::BackendId::vulkan;
+    strict_vulkan.plan.intent.backend.strict = true;
+    strict_vulkan.plan.intent.preferences.compute_family =
+        hal::ComputeFamilyAllowance::vulkan_only;
+    const auto result = source->AcquireResidentSetup(strict_vulkan);
+    ok &= Check(result.status == hal::StatusId::unavailable &&
+                    vulkan_calls == 1 && maxine_calls == 0 && cuda_calls == 0,
+                "strict Vulkan failure substituted another backend");
+  }
+  {
+    int maxine_calls = 0;
+    open_cuda::ProductionVideoBackendSetupDependencies dependencies;
+    InjectionState state;
+    dependencies.resolve_model = &ResolveFakeModel;
+    dependencies.acquire_lease = &AcquireFakeLease;
+    dependencies.context = &state;
+    video::StaticProductionVideoBackendSetupSourcesForTesting sources;
+    sources.maxine = std::make_unique<ScriptedSetupSource>(
+        &maxine_calls, hal::StatusId::ready);
+    sources.open_cuda =
+        open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+            dependencies);
+    auto source = video::CreateStaticProductionVideoBackendSetupSourceForTesting(
+        std::move(sources));
+    auto conflict = StrictRequest();
+    conflict.plan.intent.backend.backend = hal::BackendId::maxine;
+    const auto result = source->AcquireResidentSetup(conflict);
+    ok &= Check(result.status == hal::StatusId::blocked && maxine_calls == 0,
+                "conflicting strict backend/provider was substituted");
+  }
   return ok;
 }
 
