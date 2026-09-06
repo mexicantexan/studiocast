@@ -1304,6 +1304,20 @@ bool TestResolvedSelectionStrictnessDoesNotRejectNativeCuda() {
       program.strict_provider_selection = false;
     }
     auto options = Options(&runtime);
+    open_cuda::PreparedOpenCudaProductionConfig native_config;
+    native_config.prepared_stream = options.prepared_stream;
+    native_config.model_pack = &options.model_pack;
+    native_config.model_artifact = options.model_artifact;
+    native_config.adapter_instance_id = options.adapter_instance_id;
+    native_config.stream_identity = options.stream_identity;
+    native_config.configuration_generation = options.configuration_generation;
+    native_config.model_preprocess_generation =
+        options.model_preprocess_generation;
+    native_config.model_artifact_hash = options.model_artifact_hash;
+    native_config.executor_owns_stream = options.executor_owns_stream;
+    ok = Expect(open_cuda::ValidatePreparedOpenCudaProductionProgram(
+                    program, native_config) == hal::ReasonId::none,
+                "resolved CUDA selection must pass native validation") && ok;
     open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
     open_cuda::ResidentAdapter adapter(81, executor);
     hal::PreparedProgramSession session;
@@ -1320,6 +1334,20 @@ bool TestResolvedSelectionStrictnessDoesNotRejectNativeCuda() {
     program.requested_provider =
         hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
     auto options = Options(&runtime);
+    open_cuda::PreparedOpenCudaProductionConfig native_config;
+    native_config.prepared_stream = options.prepared_stream;
+    native_config.model_pack = &options.model_pack;
+    native_config.model_artifact = options.model_artifact;
+    native_config.adapter_instance_id = options.adapter_instance_id;
+    native_config.stream_identity = options.stream_identity;
+    native_config.configuration_generation = options.configuration_generation;
+    native_config.model_preprocess_generation =
+        options.model_preprocess_generation;
+    native_config.model_artifact_hash = options.model_artifact_hash;
+    native_config.executor_owns_stream = options.executor_owns_stream;
+    ok = Expect(open_cuda::ValidatePreparedOpenCudaProductionProgram(
+                    program, native_config) != hal::ReasonId::none,
+                "foreign provider must fail native validation") && ok;
     open_cuda::OpenCudaPreparedResidentExecutor executor(std::move(options));
     open_cuda::ResidentAdapter adapter(81, executor);
     hal::PreparedProgramSession session;

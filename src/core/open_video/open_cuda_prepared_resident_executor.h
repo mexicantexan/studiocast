@@ -136,6 +136,11 @@ struct PreparedOpenCudaVbPlan {
 PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
     const PreparedOpenCudaVbPlanInput &input) noexcept;
 
+struct PreparedOpenCudaProductionConfig;
+hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
+    const hal::PreparedProgram &program,
+    const PreparedOpenCudaProductionConfig &config) noexcept;
+
 struct PreparedOpenCudaRuntimeHandle {
   std::uint64_t handle_id = 0;
   std::uint64_t program_id = 0;

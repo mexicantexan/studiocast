@@ -186,7 +186,10 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
       (feather && (input.alpha_scratch_pitch_bytes < frame_alpha_row ||
                    input.alpha_feather_pitch_bytes < frame_alpha_row)) ||
       input.upload_staging_bytes < frame_rgb_active ||
-      input.readback_staging_bytes < frame_rgb_active ||
+      input.readback_staging_bytes <
+          (final_resize ? input.final_output_width *
+                              input.final_output_height * 3u
+                        : frame_rgb_active) ||
       (blur && (input.blur_scratch_pitch_bytes < frame_rgb_row ||
                 input.blurred_pitch_bytes < frame_rgb_row)) ||
       (replace && (input.replacement_source_pitch_bytes == 0 ||
@@ -461,7 +464,7 @@ bool ExactCudaDomain(const hal::ExecutionDomainId &domain,
          domain.queue_or_stream_identity == stream_identity;
 }
 
-ReasonId ValidateProductionProgram(
+ReasonId ValidateProductionProgramInternal(
     const hal::PreparedProgram &program,
     const PreparedOpenCudaProductionConfig &config) noexcept {
   if (program.stage_count == 0 || program.stage_count > 2 ||
@@ -805,7 +808,7 @@ public:
   Prepare(const hal::PreparedProgram &program,
           const PreparedOpenCudaProductionConfig &config) noexcept override {
     PreparedOpenCudaRuntimePrepareResult result;
-    result.reason = ValidateProductionProgram(program, config);
+    result.reason = ValidatePreparedOpenCudaProductionProgram(program, config);
     if (result.reason != ReasonId::none) {
       result.status = RuntimeStatus::malformed_contract;
       if (result.reason == ReasonId::semantic_effect_unsupported)
@@ -1383,6 +1386,17 @@ public:
       result.inference_only_path = inference_only;
       return finish(result);
     }
+    if (analysis_status == RuntimeStatus::cancelled ||
+        analysis_status == RuntimeStatus::stop_requested) {
+      result.status = analysis_status;
+      result.reason = HalReason(analysis_status);
+      result.stage_failure_status = analysis_status;
+      result.stage_failure_reason = result.reason;
+      result.failed_operation = PreparedOpenCudaOperationId::inference;
+      result.analysis_ran = analysis_ran;
+      result.inference_only_path = inference_only;
+      return finish(result);
+    }
     bool current_is_output = false;
     bool required_failed = false;
     bool optional_failed = false;
@@ -1416,6 +1430,17 @@ public:
         slot->output_ptr_arg = next.ptr;
         slot->output_pitch_arg = static_cast<std::uint32_t>(next.pitch);
         stage_status = LaunchPostprocess(*slot, index, &failed_operation);
+        if (stage_status == RuntimeStatus::device_lost) {
+          slot->quarantined = true;
+          result.status = RuntimeStatus::device_lost;
+          result.reason = ReasonId::device_lost;
+          result.stage_failure_status = stage_status;
+          result.stage_failure_reason = ReasonId::device_lost;
+          result.failed_operation = failed_operation;
+          result.analysis_ran = analysis_ran;
+          result.inference_only_path = inference_only;
+          return finish(result);
+        }
         if (stage_status == RuntimeStatus::executed) {
           current_is_output = !current_is_output;
           stage_result.status = StageExecutionStatus::succeeded;
@@ -1441,8 +1466,6 @@ public:
         return finish(
             TransferFailure(slot, stage_end.status, result.transfers,
                             PreparedOpenCudaOperationId::completion_wait));
-      stage_result.elapsed_ns =
-          slot->transfer.stage_elapsed_nanoseconds(stage_index);
     }
     result.stage_count = slot->program.stage_count;
     const cuda::CudaImage *readback_source =
@@ -1484,6 +1507,11 @@ public:
       failed.stage_failure_reason = HalReason(failed.stage_failure_status);
       failed.failed_operation = PreparedOpenCudaOperationId::completion_wait;
       return finish(failed);
+    }
+
+    for (std::size_t index = 0; index < result.stage_count; ++index) {
+      result.stages[index].elapsed_ns = slot->transfer.stage_elapsed_nanoseconds(
+          static_cast<std::uint32_t>(index));
     }
 
     result.stage_elapsed_ns = slot->transfer.stage_elapsed_nanoseconds(0);
@@ -2026,6 +2054,12 @@ private:
 
 } // namespace
 
+hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
+    const hal::PreparedProgram &program,
+    const PreparedOpenCudaProductionConfig &config) noexcept {
+  return ValidateProductionProgramInternal(program, config);
+}
+
 PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
     const PreparedOpenCudaVbPlanInput &input) noexcept {
   return BuildPreparedOpenCudaVirtualBackgroundPlan(input);
@@ -2130,7 +2164,8 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
     result.reason = ReasonId::shutdown_requested;
     return result;
   }
-  const ReasonId validation = ValidateProductionProgram(program, impl_->config);
+  const ReasonId validation =
+      ValidatePreparedOpenCudaProductionProgram(program, impl_->config);
   if (validation != ReasonId::none) {
     result.status = validation == ReasonId::resource_exhausted
                         ? StatusId::resource_exhausted

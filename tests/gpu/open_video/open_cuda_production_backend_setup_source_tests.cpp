@@ -315,35 +315,39 @@ hal::StatusId AcquireFakeLease(
   snapshot.providers[0] =
       hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
   snapshot.provider_count = 1;
-  snapshot.artifacts[0].semantic = request.semantic;
-  snapshot.artifacts[0].provider = snapshot.providers[0];
-  snapshot.artifacts[0].artifact = request.model;
+  for (std::size_t index = 0; index < request.stage_count; ++index) {
+    snapshot.artifacts[index].semantic = request.semantics[index];
+    snapshot.artifacts[index].provider = snapshot.providers[0];
+    snapshot.artifacts[index].artifact = request.models[index];
+  }
   if (state->mismatch_artifact)
     ++snapshot.artifacts[0].artifact.model_id_hash[0];
-  snapshot.artifact_count = 1;
+  snapshot.artifact_count = request.stage_count;
   snapshot.adapter.adapter_instance_id = kFakeAdapter;
   snapshot.adapter.backend = hal::BackendId::cuda;
   snapshot.adapter.execution_domain = FakeCudaDomain();
   snapshot.adapter.selection_priority = 100;
   snapshot.adapter.resident_adapter = &owner->adapter;
-  auto &capability = snapshot.adapter.semantic_capabilities[0];
-  capability.semantic = request.semantic;
-  capability.provider = snapshot.providers[0];
-  capability.status = hal::StatusId::ready;
-  capability.live_stage = true;
-  capability.production_eligible = true;
-  capability.exact_evidence = true;
-  capability.cpu_tail = hal::CpuTailId::writer_copy;
-  capability.cpu_tail_placement =
-      hal::DeclaredCpuTail::Placement::after_stage;
-  capability.evidence[0].code =
-      hal::CapabilityEvidenceCode::model_artifact_identity_valid;
-  capability.evidence[0].status = hal::StatusId::ready;
-  capability.evidence[0].semantic = request.semantic;
-  capability.evidence[0].backend = hal::BackendId::cuda;
-  capability.evidence[0].satisfied = true;
-  capability.evidence_count = 1;
-  snapshot.adapter.semantic_capability_count = 1;
+  for (std::size_t index = 0; index < request.stage_count; ++index) {
+    auto &capability = snapshot.adapter.semantic_capabilities[index];
+    capability.semantic = request.semantics[index];
+    capability.provider = snapshot.providers[0];
+    capability.status = hal::StatusId::ready;
+    capability.live_stage = true;
+    capability.production_eligible = true;
+    capability.exact_evidence = true;
+    capability.cpu_tail = hal::CpuTailId::writer_copy;
+    capability.cpu_tail_placement =
+        hal::DeclaredCpuTail::Placement::after_stage;
+    capability.evidence[0].code =
+        hal::CapabilityEvidenceCode::model_artifact_identity_valid;
+    capability.evidence[0].status = hal::StatusId::ready;
+    capability.evidence[0].semantic = request.semantics[index];
+    capability.evidence[0].backend = hal::BackendId::cuda;
+    capability.evidence[0].satisfied = true;
+    capability.evidence_count = 1;
+  }
+  snapshot.adapter.semantic_capability_count = request.stage_count;
   snapshot.factory.factory_id = kFakeFactory;
   snapshot.factory.route = video::VideoExecutionRoute::prepared_resident;
   snapshot.factory.backend = hal::BackendId::cuda;
@@ -357,7 +361,8 @@ hal::StatusId AcquireFakeLease(
   snapshot.readiness.selected_backend = hal::BackendId::cuda;
   snapshot.readiness.provider = snapshot.providers[0];
   snapshot.readiness.execution_domain = FakeCudaDomain();
-  snapshot.readiness.ready_stage_mask = 1;
+  snapshot.readiness.ready_stage_mask =
+      (std::uint32_t{1} << request.stage_count) - 1u;
   snapshot.readiness.available = true;
   if (bootstrap)
     bootstrap->setup_lease = snapshot;
@@ -471,9 +476,8 @@ bool StrictPolicyIsFailClosed() {
   request.plan.intent.stage_count = 2;
   result = source->AcquireResidentSetup(request);
   ok &= Check(result.status == hal::StatusId::blocked &&
-                  result.reason ==
-                      hal::ReasonId::cross_adapter_residency_forbidden,
-              "mixed resident section was not rejected");
+                  result.reason == hal::ReasonId::semantic_effect_unsupported,
+              "malformed two-stage semantic form was not rejected");
   return ok;
 }
 

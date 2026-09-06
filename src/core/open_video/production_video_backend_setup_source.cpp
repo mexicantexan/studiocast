@@ -156,6 +156,8 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
   std::uint64_t model_tensor = 0;
   std::uint64_t boundary = 0;
   std::uint64_t output_boundary = 0;
+  std::uint64_t output_rgb_row = 0;
+  std::uint64_t output_device = 0;
   if (!AlignRow(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
       !AlignRow(static_cast<std::uint64_t>(frame_width) * 4u, &alpha_row) ||
       !Multiply(rgb_row, frame_height, &frame_rgb) ||
@@ -169,7 +171,10 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
       !Multiply(frame_width, frame_height, &boundary) ||
       !Multiply(boundary, 3u, &boundary) ||
       !Multiply(output_width, output_height, &output_boundary) ||
-      !Multiply(output_boundary, 3u, &output_boundary)) {
+      !Multiply(output_boundary, 3u, &output_boundary) ||
+      !AlignRow(static_cast<std::uint64_t>(output_width) * 3u,
+                &output_rgb_row) ||
+      !Multiply(output_rgb_row, output_height, &output_device)) {
     return false;
   }
 
@@ -211,7 +216,7 @@ bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
     }
   }
   if ((output_width != frame_width || output_height != frame_height) &&
-      !Add(output_boundary, &result.persistent_bytes))
+      !Add(output_device, &result.persistent_bytes))
     return false;
   result.scratch_bytes = std::max<std::uint64_t>(result.scratch_bytes, 1);
   result.upload_staging_bytes = boundary;
