@@ -24,6 +24,19 @@ struct ModelPreprocessSpec {
   ChannelOrder dst_order = ChannelOrder::rgb;
 };
 
+struct LetterboxGeometry {
+  int scaled_w = 0;
+  int scaled_h = 0;
+  int pad_x = 0;
+  int pad_y = 0;
+  std::uint8_t pad_value = 0;
+
+  [[nodiscard]] bool ValidFor(int dst_w, int dst_h) const noexcept {
+    return scaled_w > 0 && scaled_h > 0 && pad_x >= 0 && pad_y >= 0 &&
+           pad_x + scaled_w <= dst_w && pad_y + scaled_h <= dst_h;
+  }
+};
+
 // Resolve/JIT the preprocess kernel on the resident execution thread during
 // setup and bind the thread-local cached function to this exact driver wrapper
 // and retained CUDA context generation.

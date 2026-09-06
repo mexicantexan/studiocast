@@ -2,6 +2,7 @@
 #include "core/cuda/kernels/resize_bilinear.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 std::atomic<std::size_t> g_heap_allocations{0};
 
@@ -53,6 +55,12 @@ struct LaunchCapture {
   float inverse_std[3] = {};
   std::uint32_t destination_is_bgr = 0;
   std::uint32_t source_is_bgr = 0;
+  std::uint32_t letterbox_enabled = 0;
+  std::uint32_t scaled_w = 0;
+  std::uint32_t scaled_h = 0;
+  std::uint32_t pad_x = 0;
+  std::uint32_t pad_y = 0;
+  std::uint32_t pad_value = 0;
   float crop[4] = {};
 };
 
@@ -174,6 +182,12 @@ CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
   capture.inverse_std[2] = *static_cast<float *>(arguments[12]);
   capture.destination_is_bgr = *static_cast<std::uint32_t *>(arguments[13]);
   capture.source_is_bgr = *static_cast<std::uint32_t *>(arguments[14]);
+  capture.letterbox_enabled = *static_cast<std::uint32_t *>(arguments[15]);
+  capture.scaled_w = *static_cast<std::uint32_t *>(arguments[16]);
+  capture.scaled_h = *static_cast<std::uint32_t *>(arguments[17]);
+  capture.pad_x = *static_cast<std::uint32_t *>(arguments[18]);
+  capture.pad_y = *static_cast<std::uint32_t *>(arguments[19]);
+  capture.pad_value = *static_cast<std::uint32_t *>(arguments[20]);
   return g_state->launch_result;
 }
 CUresult FakeAlloc(CUdeviceptr *ptr, std::size_t *pitch, std::size_t width,
@@ -394,6 +408,120 @@ bool TestSetupOnlyAndCompatibilityLaunchParity() {
       Expect(fixture.state.module_loads == loads_after_setup &&
                  fixture.state.function_resolutions == resolutions_after_setup,
              "legacy compatibility should reuse setup on its owning thread");
+  return ok;
+}
+
+bool TestPreparedLetterboxLaunchGeometry() {
+  Fixture fixture;
+  if (!fixture.Initialize())
+    return false;
+  PreparedPreprocessKernelBundle bundle;
+  if (!bundle.Prepare(fixture.binding, fixture.spec,
+                      bundle.RequiredResourceBytes(), &fixture.error))
+    return false;
+  const LetterboxGeometry geometry{.scaled_w = 14,
+                                   .scaled_h = 10,
+                                   .pad_x = 1,
+                                   .pad_y = 4,
+                                   .pad_value = 114};
+  PreparedPreprocessKernelStatus status{};
+  bool ok = Expect(bundle.ExecuteLetterboxed(
+                       fixture.binding, fixture.spec, geometry, fixture.source,
+                       fixture.destination, &status) &&
+                       status == PreparedPreprocessKernelStatus::launch_enqueued,
+                   "prepared letterbox should enqueue");
+  const auto &capture = fixture.state.capture;
+  ok &= Expect(capture.letterbox_enabled == 1 && capture.scaled_w == 14 &&
+                   capture.scaled_h == 10 && capture.pad_x == 1 &&
+                   capture.pad_y == 4 && capture.pad_value == 114,
+               "letterbox launch should carry exact scale, pad, and fill");
+  auto invalid = geometry;
+  invalid.pad_x = 4;
+  ok &= Expect(!bundle.ExecuteLetterboxed(
+                   fixture.binding, fixture.spec, invalid, fixture.source,
+                   fixture.destination, &status) &&
+                   status == PreparedPreprocessKernelStatus::invalid_argument,
+               "out-of-bounds letterbox should fail before launch");
+  return ok;
+}
+
+bool TestNativeLetterboxWhenRequired() {
+  if (!std::getenv("STUDIOCAST_REQUIRE_CUDA_LETTERBOX_TEST")) {
+    std::cout << "[SKIP] native CUDA letterbox check not requested\n";
+    return true;
+  }
+  CudaDriverApi driver;
+  std::string error;
+  if (!driver.Initialize(&error) || !driver.EnsureContextForDevice(0, &error))
+    return Expect(false, error);
+  CUstream stream = nullptr;
+  CudaImage source;
+  CudaTensor destination;
+  const std::vector<std::uint8_t> pixels{
+      0,10,20, 40,50,60, 80,90,100,
+      120,130,140, 160,170,180, 200,210,220};
+  bool ok = driver.CreateStream(&stream, &error) &&
+            source.Allocate(&driver, 3, 2, PixelFormatGpu::rgb_u8, &error) &&
+            destination.AllocateNchwF32(&driver, 1, 3, 4, 4, &error) &&
+            source.UploadFromCpuRgb24(&driver, pixels.data(), 9, stream,
+                                      &error);
+  ModelPreprocessSpec spec;
+  spec.dst_w = 4;
+  spec.dst_h = 4;
+  PreparedPreprocessBinding binding;
+  binding.driver = &driver;
+  binding.context_identity = *driver.context_identity();
+  binding.stream = stream;
+  binding.stream_identity = 1;
+  binding.configuration_generation = 1;
+  binding.model_preprocess_generation = 1;
+  PreparedPreprocessKernelBundle bundle;
+  PreparedPreprocessKernelStatus status{};
+  const LetterboxGeometry geometry{4, 3, 0, 0, 0};
+  ok = ok && bundle.Prepare(binding, spec, bundle.RequiredResourceBytes(),
+                            &error) &&
+       bundle.ExecuteLetterboxed(binding, spec, geometry, source, destination,
+                                 &status);
+  std::vector<float> output;
+  ok = ok && destination.DownloadToCpuF32(&driver, &output, stream, &error) &&
+       driver.StreamSynchronize(stream, &error);
+  auto reference = [&](int channel, int x, int y, bool letterbox) {
+      if (letterbox && y >= 3) return 0.0f;
+      const int sample_h = letterbox ? 3 : 4;
+      const float sx = 3.0f / 4.0f, sy = 2.0f / static_cast<float>(sample_h);
+      const float px = (static_cast<float>(x) + .5f) * sx - .5f;
+      const float py = (static_cast<float>(y) + .5f) * sy - .5f;
+      const int x0=std::clamp(static_cast<int>(px),0,2), y0=std::clamp(static_cast<int>(py),0,1);
+      const int x1=std::min(x0+1,2), y1=std::min(y0+1,1);
+      const float fx=px-static_cast<float>(x0), fy=py-static_cast<float>(y0);
+      auto at=[&](int xx,int yy){return static_cast<float>(pixels[static_cast<std::size_t>((yy*3+xx)*3+channel)]);};
+      const float a=at(x0,y0)+fx*(at(x1,y0)-at(x0,y0));
+      const float b=at(x0,y1)+fx*(at(x1,y1)-at(x0,y1));
+      return (a+fy*(b-a))/255.0f;
+  };
+  if (ok) {
+    for (int channel = 0; channel < 3; ++channel) {
+      for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+          const float want = reference(channel,x,y,true);
+          const auto index = static_cast<std::size_t>(channel * 16 + y * 4 + x);
+          ok &= std::abs(output[index] - want) <= 2.0e-5f;
+        }
+      }
+    }
+  }
+  ok = ok && bundle.Execute(binding, spec, source, destination, &status) &&
+       destination.DownloadToCpuF32(&driver, &output, stream, &error) &&
+       driver.StreamSynchronize(stream, &error);
+  if (ok) for(int c=0;c<3;++c) for(int y=0;y<4;++y) for(int x=0;x<4;++x) {
+    const auto index=static_cast<std::size_t>(c*16+y*4+x);
+    ok &= std::abs(output[index]-reference(c,x,y,false)) <= 2.0e-5f;
+  }
+  ok &= Expect(ok, error.empty() ? "native CUDA letterbox output mismatch"
+                                 : error);
+  (void)destination.Free(&driver, &error);
+  (void)source.Free(&driver, &error);
+  (void)driver.DestroyStream(stream, &error);
   return ok;
 }
 
@@ -797,6 +925,8 @@ bool TestPreparedResizeCleanupIsRetryable() {
 int main() {
   bool ok = true;
   ok &= TestSetupOnlyAndCompatibilityLaunchParity();
+  ok &= TestPreparedLetterboxLaunchGeometry();
+  ok &= TestNativeLetterboxWhenRequired();
   ok &= TestBudgetAndBindingFailuresFailClosed();
   ok &= TestTypedSetupFailuresAndLifecycle();
   ok &= TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence();

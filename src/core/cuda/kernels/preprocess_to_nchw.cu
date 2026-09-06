@@ -101,16 +101,37 @@ extern "C" __global__ void preprocess_to_nchw_f32(
     const unsigned char *src, unsigned int src_pitch, unsigned int src_w,
     unsigned int src_h, float *dst, unsigned int dst_w, unsigned int dst_h,
     float mean0, float mean1, float mean2, float inv_std0, float inv_std1,
-    float inv_std2, unsigned int dst_is_bgr, unsigned int src_is_bgr) {
+    float inv_std2, unsigned int dst_is_bgr, unsigned int src_is_bgr,
+    unsigned int letterbox_enabled, unsigned int scaled_w,
+    unsigned int scaled_h, unsigned int pad_x, unsigned int pad_y,
+    unsigned int pad_value) {
   const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
   if (x >= static_cast<int>(dst_w) || y >= static_cast<int>(dst_h))
     return;
 
-  const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
-  const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
-  const float src_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
-  const float src_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
+  const bool padding = letterbox_enabled &&
+      (x < static_cast<int>(pad_x) || y < static_cast<int>(pad_y) ||
+       x >= static_cast<int>(pad_x + scaled_w) ||
+       y >= static_cast<int>(pad_y + scaled_h));
+  if (padding) {
+    const float value = static_cast<float>(pad_value) / 255.0f;
+    const unsigned int hw = dst_w * dst_h;
+    const unsigned int base = static_cast<unsigned int>(y) * dst_w +
+                              static_cast<unsigned int>(x);
+    dst[base] = (value - mean0) * inv_std0;
+    dst[hw + base] = (value - mean1) * inv_std1;
+    dst[hw + hw + base] = (value - mean2) * inv_std2;
+    return;
+  }
+  const unsigned int sample_w = letterbox_enabled ? scaled_w : dst_w;
+  const unsigned int sample_h = letterbox_enabled ? scaled_h : dst_h;
+  const int sample_x = letterbox_enabled ? x - static_cast<int>(pad_x) : x;
+  const int sample_y = letterbox_enabled ? y - static_cast<int>(pad_y) : y;
+  const float scale_x = static_cast<float>(src_w) / static_cast<float>(sample_w);
+  const float scale_y = static_cast<float>(src_h) / static_cast<float>(sample_h);
+  const float src_x = (static_cast<float>(sample_x) + 0.5f) * scale_x - 0.5f;
+  const float src_y = (static_cast<float>(sample_y) + 0.5f) * scale_y - 0.5f;
 
   const int src_w_max = static_cast<int>(src_w) - 1;
   const int src_h_max = static_cast<int>(src_h) - 1;

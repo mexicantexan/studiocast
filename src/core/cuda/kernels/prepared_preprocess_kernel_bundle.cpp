@@ -231,6 +231,22 @@ bool PreparedPreprocessKernelBundle::Execute(
     const PreparedPreprocessBinding &binding, const ModelPreprocessSpec &spec,
     const CudaImage &source, const CudaTensor &destination,
     PreparedPreprocessKernelStatus *status_out) noexcept {
+  return ExecuteImpl(binding, spec, nullptr, source, destination, status_out);
+}
+
+bool PreparedPreprocessKernelBundle::ExecuteLetterboxed(
+    const PreparedPreprocessBinding &binding, const ModelPreprocessSpec &spec,
+    const LetterboxGeometry &letterbox, const CudaImage &source,
+    const CudaTensor &destination,
+    PreparedPreprocessKernelStatus *status_out) noexcept {
+  return ExecuteImpl(binding, spec, &letterbox, source, destination, status_out);
+}
+
+bool PreparedPreprocessKernelBundle::ExecuteImpl(
+    const PreparedPreprocessBinding &binding, const ModelPreprocessSpec &spec,
+    const LetterboxGeometry *letterbox, const CudaImage &source,
+    const CudaTensor &destination,
+    PreparedPreprocessKernelStatus *status_out) noexcept {
   if (status_out)
     *status_out = PreparedPreprocessKernelStatus::invalid;
 
@@ -266,6 +282,10 @@ bool PreparedPreprocessKernelBundle::Execute(
     SetStatus(PreparedPreprocessKernelStatus::invalid_argument, status_out);
     return false;
   }
+  if (letterbox && !letterbox->ValidFor(destination.w, destination.h)) {
+    SetStatus(PreparedPreprocessKernelStatus::invalid_argument, status_out);
+    return false;
+  }
 
   const std::size_t element_count = static_cast<std::size_t>(destination.n) *
                                     static_cast<std::size_t>(destination.c) *
@@ -293,6 +313,18 @@ bool PreparedPreprocessKernelBundle::Execute(
   const std::uint32_t destination_is_bgr = evidence_.launch.dst_is_bgr;
   const std::uint32_t source_is_bgr =
       source.format == PixelFormatGpu::bgr_u8 ? 1u : 0u;
+  const std::uint32_t letterbox_enabled = letterbox ? 1u : 0u;
+  const std::uint32_t scaled_w = letterbox
+                                     ? static_cast<std::uint32_t>(letterbox->scaled_w)
+                                     : destination_w;
+  const std::uint32_t scaled_h = letterbox
+                                     ? static_cast<std::uint32_t>(letterbox->scaled_h)
+                                     : destination_h;
+  const std::uint32_t pad_x =
+      letterbox ? static_cast<std::uint32_t>(letterbox->pad_x) : 0u;
+  const std::uint32_t pad_y =
+      letterbox ? static_cast<std::uint32_t>(letterbox->pad_y) : 0u;
+  const std::uint32_t pad_value = letterbox ? letterbox->pad_value : 0u;
 
   void *arguments[] = {
       const_cast<unsigned long long *>(&source_ptr),
@@ -310,6 +342,12 @@ bool PreparedPreprocessKernelBundle::Execute(
       const_cast<float *>(&inverse_std2),
       const_cast<std::uint32_t *>(&destination_is_bgr),
       const_cast<std::uint32_t *>(&source_is_bgr),
+      const_cast<std::uint32_t *>(&letterbox_enabled),
+      const_cast<std::uint32_t *>(&scaled_w),
+      const_cast<std::uint32_t *>(&scaled_h),
+      const_cast<std::uint32_t *>(&pad_x),
+      const_cast<std::uint32_t *>(&pad_y),
+      const_cast<std::uint32_t *>(&pad_value),
   };
 
   const CUresult launch_result = binding.driver->f().cuLaunchKernel(

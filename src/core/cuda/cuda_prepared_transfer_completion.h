@@ -15,6 +15,7 @@ class CudaPreparedTransferCompletion {
 public:
   static constexpr std::uint32_t kApiVersion = 1;
   static constexpr std::size_t kMaxTimedStages = 16;
+  static constexpr std::size_t kMaxReadbacks = 12;
   static constexpr std::uint32_t kNoStage =
       std::numeric_limits<std::uint32_t>::max();
 
@@ -72,6 +73,16 @@ public:
     std::size_t readback_rows = 0;
     std::uint32_t timed_stage_count = 0;
     ResourceBudget budget{};
+    struct ReadbackDescriptor {
+      CUdeviceptr source = 0;
+      std::size_t source_pitch = 0;
+      std::size_t host_offset_bytes = 0;
+      std::size_t row_bytes = 0;
+      std::size_t rows = 0;
+    };
+    std::array<ReadbackDescriptor, kMaxReadbacks> readbacks{};
+    std::uint32_t readback_count = 0;
+    bool resident_work = false;
   };
 
   using Predicate = bool (*)(void *context) noexcept;
@@ -97,6 +108,7 @@ public:
     std::uint64_t setup_event_destructions = 0;
     std::uint64_t frame_uploads = 0;
     std::uint64_t frame_final_readbacks = 0;
+    std::uint64_t frame_readbacks = 0;
     std::uint64_t frame_waits = 0;
     std::uint64_t event_records = 0;
     std::uint64_t event_queries = 0;
@@ -127,12 +139,16 @@ public:
                     std::uint64_t capture_sequence) noexcept;
   Result EnqueueUpload(const Binding &binding, CUdeviceptr destination,
                        std::size_t destination_pitch) noexcept;
+  Result SubmitResidentWork(const Binding &binding) noexcept;
   Result RecordStageBegin(const Binding &binding,
                           std::uint32_t stage_index) noexcept;
   Result RecordStageEnd(const Binding &binding,
                         std::uint32_t stage_index) noexcept;
   Result EnqueueReadback(const Binding &binding, CUdeviceptr source,
                          std::size_t source_pitch) noexcept;
+  Result EnqueueReadbackAt(const Binding &binding, std::uint32_t index,
+                           CUdeviceptr source,
+                           std::size_t source_pitch) noexcept;
   Result RecordCompletion(const Binding &binding) noexcept;
   Result WaitForCompletion(const Binding &binding,
                            const WaitPolicy &policy) noexcept;
@@ -199,6 +215,9 @@ private:
   std::size_t readback_row_bytes_ = 0;
   std::size_t readback_rows_ = 0;
   std::size_t readback_size_bytes_ = 0;
+  std::array<PrepareOptions::ReadbackDescriptor, kMaxReadbacks> readbacks_{};
+  std::uint32_t readback_count_ = 0;
+  std::uint32_t next_readback_index_ = 0;
   ResourceBudget resource_budget_{};
   std::array<CUevent, kMaxTimedStages> stage_begin_events_{};
   std::array<CUevent, kMaxTimedStages> stage_end_events_{};
@@ -215,6 +234,8 @@ private:
   bool frame_active_ = false;
   bool frame_reuse_blocked_ = false;
   bool upload_enqueued_ = false;
+  bool resident_work_ = false;
+  bool work_submitted_ = false;
   bool readback_enqueued_ = false;
   bool completion_recorded_ = false;
   bool wait_attempted_ = false;

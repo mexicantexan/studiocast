@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -45,6 +46,7 @@ struct FakeDriver {
   int context_queries = 0;
   int context_releases = 0;
   int fail_event_create_call = -1;
+  int fail_copy_call = -1;
   cuda::CUresult copy_result = cuda::CUDA_SUCCESS;
   cuda::CUresult query_result = cuda::CUDA_SUCCESS;
   cuda::CUresult event_destroy_result = cuda::CUDA_SUCCESS;
@@ -88,8 +90,9 @@ cuda::CUresult FakeCopy(const cuda::CUDA_MEMCPY2D *copy,
     const auto index = static_cast<std::size_t>(g_fake->copy_calls);
     g_fake->copies[index] = *copy;
     g_fake->copy_streams[index] = stream;
-    ++g_fake->copy_calls;
-    return g_fake->copy_result;
+    const int call = g_fake->copy_calls++;
+    return call == g_fake->fail_copy_call ? cuda::CUDA_ERROR_OUT_OF_MEMORY
+                                         : g_fake->copy_result;
   }
   return cuda::CUDA_ERROR_OUT_OF_MEMORY;
 }
@@ -770,6 +773,98 @@ bool TestCleanupFailuresAreTypedAfterExactReleaseAttempts() {
   return ok;
 }
 
+bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
+  FakeDriver fake;
+  cuda::CudaDriverApi driver;
+  bool ok = Expect(Initialize(&driver, &fake), "fake CUDA should initialize");
+  const auto binding = BindingFor(driver, 70);
+  auto options = OptionsFor(binding, 1);
+  options.readback_row_bytes = 0;
+  options.readback_rows = 0;
+  options.readback_count = 3;
+  options.resident_work = true;
+  options.readbacks[0] = {0x5000, 8, 0, 8, 1};
+  options.readbacks[1] = {0x6000, 12, 8, 12, 1};
+  options.readbacks[2] = {0x7000, 8, 20, 4, 2};
+  options.budget.max_pinned_host_bytes = 48 + 28;
+  Support support;
+  const auto prepared = support.Prepare(&driver, options);
+  const int copies_before_resident = fake.copy_calls;
+  ok &= Expect(prepared.ok() &&
+                   support.BeginFrame(binding, 71).ok() &&
+                   support.EnqueueUpload(binding, 0x4000, 16).status ==
+                       Support::Status::invalid_sequence &&
+                   fake.copy_calls == copies_before_resident &&
+                   support.SubmitResidentWork(binding).ok() &&
+                   support.RecordStageBegin(binding, 0).ok() &&
+                   support.RecordStageEnd(binding, 0).ok() &&
+                   support.EnqueueReadbackAt(binding, 0, 0x5001, 8).status ==
+                       Support::Status::invalid_sequence &&
+                   support.EnqueueReadbackAt(binding, 0, 0x5000, 8).ok() &&
+                   support.EnqueueReadbackAt(binding, 1, 0x6000, 12).ok() &&
+                   support.EnqueueReadbackAt(binding, 2, 0x7000, 8).ok() &&
+                   support.RecordCompletion(binding).ok() &&
+                   support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
+               "three prepared readbacks should complete in order");
+  ok &= Expect(support.counters().frame_readbacks == 3 &&
+                   support.counters().frame_final_readbacks == 0 &&
+                   fake.copies[0].dstHost == support.readback_data() &&
+                   fake.copies[1].dstHost ==
+                       static_cast<std::byte *>(support.readback_data()) + 8,
+               "batch readbacks should report actual copies and frozen offsets");
+
+  ok &= Expect(support.BeginFrame(binding, 72).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
+                   support.RecordStageBegin(binding, 0).ok() &&
+                   support.RecordStageEnd(binding, 0).ok(),
+               "partial failure frame should begin");
+  fake.fail_copy_call = fake.copy_calls + 1;
+  const auto p0 = support.EnqueueReadbackAt(binding, 0, 0x5000, 8);
+  const auto p1 = support.EnqueueReadbackAt(binding, 1, 0x6000, 12);
+  const auto record = support.RecordCompletion(binding);
+  const auto wait = support.WaitForCompletion(binding, WaitPolicyFor(&fake));
+  ok &= Expect(p0.ok() && p1.status == Support::Status::resource_exhausted &&
+                   record.ok() && wait.ok(),
+               "partial readback failure should record and wait for pending work");
+  ok &= Expect(support.BeginFrame(binding, 73).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
+                   support.RecordStageBegin(binding, 0).ok() &&
+                   support.RecordStageEnd(binding, 0).ok(),
+               "completed partial frame should permit safe reuse");
+  fake.fail_copy_call = fake.copy_calls;
+  ok &= Expect(support.EnqueueReadbackAt(binding, 0, 0x5000, 8).status ==
+                       Support::Status::resource_exhausted &&
+                   support.RecordCompletion(binding).ok() &&
+                   support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
+               "resident work should quiesce when its first readback fails");
+  auto overlap = options;
+  overlap.readbacks[1].host_offset_bytes = 4;
+  Support malformed;
+  ok &= Expect(malformed.Prepare(&driver, overlap).status ==
+                   Support::Status::invalid_argument,
+               "overlapping prepared host destinations should fail setup");
+  auto overflow = options;
+  overflow.readbacks[0].source =
+      std::numeric_limits<cuda::CUdeviceptr>::max() - 3;
+  overflow.readbacks[0].row_bytes = 8;
+  overflow.readbacks[0].source_pitch = 8;
+  Support single_overflow;
+  ok &= Expect(single_overflow.Prepare(&driver, overflow).status ==
+                   Support::Status::invalid_argument,
+               "single-row source extent overflow should fail setup");
+  overflow = options;
+  overflow.readbacks[0].source =
+      std::numeric_limits<cuda::CUdeviceptr>::max() - 15;
+  overflow.readbacks[0].row_bytes = 8;
+  overflow.readbacks[0].source_pitch = 12;
+  overflow.readbacks[0].rows = 2;
+  Support multi_overflow;
+  ok &= Expect(multi_overflow.Prepare(&driver, overflow).status ==
+                   Support::Status::invalid_argument,
+               "multi-row source extent overflow should fail setup");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -781,6 +876,7 @@ int main() {
   ok = TestTimeoutStopCancelAndDeviceLossAreBounded() && ok;
   ok = TestCopyAndEventFailuresAreTyped() && ok;
   ok = TestCleanupFailuresAreTypedAfterExactReleaseAttempts() && ok;
+  ok = TestPreparedBatchReadbacksAndPartialFailureQuiescence() && ok;
   if (!ok)
     return 1;
   std::cout << "CUDA PREPARED TRANSFER COMPLETION TESTS OK\n";
