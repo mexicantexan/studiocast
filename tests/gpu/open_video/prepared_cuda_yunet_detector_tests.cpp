@@ -1,9 +1,12 @@
 #include "core/open_video/prepared_cuda_yunet_detector.h"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -26,6 +29,8 @@ void operator delete[](void *memory, std::size_t) noexcept {
   std::free(memory);
 }
 namespace {
+constexpr const char *kYunetSha256 =
+    "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4";
 struct State {
   cuda::CUcontext ctx = nullptr;
   std::vector<std::unique_ptr<std::byte[]>> memory;
@@ -254,6 +259,118 @@ struct Session final : open_video::internal::IPreparedCudaYunetSession {
   }
   void Invalidate() noexcept override { ++s->invalidates; }
 };
+
+bool RunNativeTest(const std::filesystem::path &model) {
+  if (!std::filesystem::is_regular_file(model) ||
+      std::filesystem::file_size(model) != 232589) {
+    std::cerr << "native YuNet artifact missing or wrong size: " << model
+              << '\n';
+    return false;
+  }
+  const auto fixture = std::filesystem::temp_directory_path() /
+                       ("studiocast-yunet-native-" +
+                        std::to_string(
+                            std::chrono::steady_clock::now()
+                                .time_since_epoch()
+                                .count()));
+  const auto pack = fixture / "face_detection" / "yunet-native";
+  std::error_code ec;
+  std::filesystem::create_directories(pack, ec);
+  if (ec)
+    return false;
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{fixture};
+  std::filesystem::copy_file(model, pack / "model.onnx",
+                             std::filesystem::copy_options::overwrite_existing,
+                             ec);
+  if (ec)
+    return false;
+  std::ofstream manifest(pack / "model.json");
+  manifest << R"({
+  "schema_version": 2,
+  "id": "yunet_native_acceptance",
+  "display_name": "YuNet native acceptance",
+  "task": "face_detection",
+  "files": [{"name":"model.onnx","kind":"onnx","role":"main","sha256":")"
+           << kYunetSha256 << R"("}],
+  "onnx": {"main":"model.onnx","inputs":[{
+    "name":"input","layout":"nchw","dtype":"float32",
+    "width":640,"height":640,"channels":3
+  }]}
+})";
+  manifest.close();
+  std::ofstream(pack / "LICENSE.txt") << "Native test fixture only\n";
+
+  cuda::CudaDriverApi native_driver;
+  std::string error;
+  cuda::CUstream stream = nullptr;
+  cuda::CudaDriverApi::PitchAllocation image_storage;
+  if (!native_driver.Initialize(&error) ||
+      !native_driver.EnsureContextForDevice(0, &error) ||
+      !native_driver.CreateStream(&stream, &error) ||
+      !native_driver.AllocatePitch(64 * 3, 48, &image_storage, &error, 4)) {
+    std::cerr << "native YuNet CUDA setup failed: " << error << '\n';
+    return false;
+  }
+  std::vector<std::uint8_t> pixels(64 * 48 * 3);
+  for (std::size_t i = 0; i < pixels.size(); ++i)
+    pixels[i] = static_cast<std::uint8_t>((i * 37u + 11u) & 0xffu);
+  if (!native_driver.MemcpyHtoD2DAsync(
+          image_storage.ptr, image_storage.pitch, pixels.data(), 64 * 3,
+          64 * 3, 48, stream, &error) ||
+      !native_driver.StreamSynchronize(stream, &error)) {
+    std::cerr << "native YuNet upload failed: " << error << '\n';
+    return false;
+  }
+  open_video::PreparedCudaYunetSetup setup;
+  setup.binding = {&native_driver, *native_driver.context_identity(), stream,
+                   reinterpret_cast<std::uintptr_t>(stream), 1, 1};
+  setup.models_root = fixture;
+  setup.requested_model_id = "yunet_native_acceptance";
+  setup.frame_width = 64;
+  setup.frame_height = 48;
+  setup.resource_budget_bytes =
+      open_video::PreparedCudaYunetDetector::RequiredResourceBytes(640, 640);
+  open_video::PreparedCudaYunetDetector detector;
+  open_video::FrameAnalysisCache cache;
+  bool ok = detector.Prepare(setup, &error) &&
+            detector.PrepareCache(&cache, &error);
+  cuda::CudaImage image;
+  image.ptr = image_storage.ptr;
+  image.pitch = image_storage.pitch;
+  image.w = 64;
+  image.h = 48;
+  image.format = cuda::PixelFormatGpu::rgb_u8;
+  cuda::CudaPreparedTransferCompletion::WaitPolicy wait;
+  wait.timeout_nanoseconds = 5'000'000'000ULL;
+  wait.poll_interval_nanoseconds = 1'000ULL;
+  wait.maximum_poll_count = 10'000'000;
+  const auto result = ok ? detector.Execute(setup.binding, image, 1, &cache, wait)
+                         : open_video::PreparedCudaYunetExecutionResult{};
+  ok = ok &&
+       (result.status == open_video::PreparedCudaYunetStatus::success_no_faces ||
+        result.status == open_video::PreparedCudaYunetStatus::success_faces) &&
+       result.enqueued_readbacks == 12 && result.completed_readbacks == 12 &&
+       result.completion_waits == 1 && result.cpu_tail_boundaries == 1 &&
+       !result.pending_work && detector.Shutdown(&error);
+  ok = native_driver.Free(image_storage.ptr, &error) && ok;
+  ok = native_driver.DestroyStream(stream, &error) && ok;
+  if (!ok)
+    std::cerr << "native YuNet acceptance failed: " << error << '\n';
+  else
+    std::cout << "PREPARED CUDA YUNET NATIVE TEST OK status="
+              << (result.status ==
+                          open_video::PreparedCudaYunetStatus::success_faces
+                      ? "success_faces"
+                      : "success_no_faces")
+              << " readbacks=12 waits=1 cpu_tail=1\n";
+  return ok;
+}
 } // namespace
 int main() {
   State state;
@@ -372,6 +489,9 @@ int main() {
   ok &= retained_allocations > warmup_pending_allocations &&
         !warmup_unquiesced.PrepareForTesting(
             setup, id, std::make_unique<Session>(&state), &error) &&
+        state.memory.size() == retained_allocations &&
+        !warmup_unquiesced.Prepare(setup, &error) &&
+        error == "invalid prepared YuNet setup" &&
         state.memory.size() == retained_allocations &&
         !warmup_unquiesced.Shutdown(&error) &&
         state.invalidates == sync_loss_invalidates;
@@ -494,6 +614,13 @@ int main() {
               << " invalidates=" << state.invalidates
               << " inverse_std=" << state.preprocess_inverse_std << '\n';
     return 1;
+  }
+  if (const char *native_model =
+          std::getenv("STUDIOCAST_TEST_YUNET_NATIVE_MODEL")) {
+    if (!RunNativeTest(native_model))
+      return 1;
+  } else {
+    std::cout << "PREPARED CUDA YUNET NATIVE TEST SKIPPED\n";
   }
   std::cout << "PREPARED CUDA YUNET TESTS OK\n";
 }
