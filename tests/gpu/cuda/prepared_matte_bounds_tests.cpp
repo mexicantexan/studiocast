@@ -328,10 +328,16 @@ bool NativeOracle() {
   return ok;
 }
 } // namespace
-int main() {
-  if (!FakeContracts())
+int main(int argc, char **argv) {
+  if (argc == 1)
+    return FakeContracts() ? 0 : 1;
+  if (argc != 2 || std::string_view(argv[1]) != "--native") {
+    std::cerr << "usage: prepared_matte_bounds_tests [--native]\n";
     return 1;
-  if (std::getenv("STUDIOCAST_REQUIRE_CUDA_MATTE_BOUNDS_TEST") == nullptr) {
+  }
+  const char *required =
+      std::getenv("STUDIOCAST_REQUIRE_CUDA_MATTE_BOUNDS_TEST");
+  if (!required || std::string_view(required) != "1") {
     std::cout << "[SKIP] real CUDA matte bounds not requested\n";
     return 77;
   }
