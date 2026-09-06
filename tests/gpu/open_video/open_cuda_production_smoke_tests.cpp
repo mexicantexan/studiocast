@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace studiocast::video {
@@ -156,7 +157,9 @@ std::uint64_t Now(void *) noexcept {
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
 }
-void Poll(void *, std::uint64_t) noexcept {}
+void Poll(void *, std::uint64_t wait_nanoseconds) noexcept {
+  std::this_thread::sleep_for(std::chrono::nanoseconds(wait_nanoseconds));
+}
 
 video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
   video::ProductionVideoResidentSetup request;
@@ -412,7 +415,7 @@ int Run(const Options &options) {
     }
   }
   const auto final = manager.Snapshot().resident.telemetry;
-  std::uint64_t checksum = UINT64_C(1469598103934665603);
+  std::uint64_t checksum = UINT64_C(14695981039346656037);
   for (const auto byte : output) {
     checksum ^= static_cast<std::uint8_t>(byte);
     checksum *= UINT64_C(1099511628211);
