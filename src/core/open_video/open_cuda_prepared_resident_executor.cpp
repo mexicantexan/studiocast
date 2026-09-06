@@ -957,10 +957,7 @@ public:
       if (!candidate->input.Allocate(config.driver, width, height,
                                      cuda::PixelFormatGpu::rgb_u8, &error) ||
           !candidate->output.Allocate(config.driver, width, height,
-                                      cuda::PixelFormatGpu::rgb_u8, &error) ||
-          candidate->input.pitch != image.planes[0].row_stride_bytes ||
-          candidate->output.pitch !=
-              program.stages[0].input.image.planes[0].row_stride_bytes) {
+                                      cuda::PixelFormatGpu::rgb_u8, &error)) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::resource_exhausted,
                             ReasonId::resource_exhausted);
