@@ -110,11 +110,10 @@ PreparedCudaFastDvdnetDenoiser::Prepare(
   }
   const bool evidence_matches =
       prepared.ort_evidence.Valid() &&
-      prepared.ort_evidence.provider.ValidStrictCuda() &&
-      prepared.ort_evidence.provider.cuda_context_generation ==
-          config.execution_domain.logical_context_generation &&
-      prepared.ort_evidence.provider.requested_stream_identity ==
-          config.execution_domain.queue_or_stream_identity;
+      onnx::OrtPreparedProviderEvidenceMatches(
+          prepared.ort_evidence.provider, config.cuda_device_id,
+          config.execution_domain.logical_context_generation,
+          config.execution_domain.queue_or_stream_identity);
   if (prepared.status != PreparedCudaFastDvdnetStatus::ready ||
       prepared.runtime_handle == 0 || !prepared.reusable_bindings ||
       !prepared.warmup_complete || !prepared.strict_cuda_only ||

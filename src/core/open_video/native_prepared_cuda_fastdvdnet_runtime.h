@@ -9,6 +9,20 @@
 
 namespace studiocast::open_video {
 
+struct PreparedFastDvdnetModelContract {
+  std::array<std::string, 2> input_names{};
+  std::string output_name;
+  std::array<int, 2> input_channels{};
+  int output_channels = 0;
+  std::array<bool, 2> input_dynamic_hw{};
+  bool output_dynamic_hw = false;
+};
+
+bool ValidatePreparedFastDvdnetSessionMetadata(
+    const onnx::OrtSessionInfo &info,
+    const PreparedFastDvdnetModelContract &model,
+    const PreparedCudaFastDvdnetTensorContract &selected) noexcept;
+
 class IPreparedFastDvdnetOrtSession {
 public:
   virtual ~IPreparedFastDvdnetOrtSession() = default;
@@ -31,7 +45,8 @@ public:
   virtual std::unique_ptr<IPreparedFastDvdnetOrtSession>
   Create(const std::filesystem::path &model,
          const onnx::OrtSessionOptions &options,
-         const PreparedCudaFastDvdnetTensorContract &tensors) noexcept = 0;
+         const PreparedCudaFastDvdnetTensorContract &tensors,
+         const PreparedFastDvdnetModelContract &contract) noexcept = 0;
 };
 
 class NativePreparedCudaFastDvdnetRuntime final

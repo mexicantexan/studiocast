@@ -134,12 +134,37 @@ cuda::CUresult NECreate(cuda::CUevent*e,unsigned){*e=reinterpret_cast<cuda::CUev
 cuda::CUresult NERecord(cuda::CUevent,cuda::CUstream){++native_state->records;return native_state->fail_record_at==native_state->records?cuda::CUDA_ERROR_LAUNCH_FAILED:0;} cuda::CUresult NEQuery(cuda::CUevent){++native_state->queries;if(native_state->not_ready_queries>0){--native_state->not_ready_queries;return cuda::CUDA_ERROR_NOT_READY;}return 0;} cuda::CUresult NEElapsed(float*m,cuda::CUevent,cuda::CUevent){*m=0;return 0;}
 cuda::CudaDriverApi::Functions NativeFunctions(){cuda::CudaDriverApi::Functions f;f.cuInit=NInit;f.cuModuleLoadData=NLoad;f.cuModuleGetFunction=NFn;f.cuModuleUnload=NUnload;f.cuLaunchKernel=NLaunch;f.cuMemAllocPitch=NAlloc;f.cuMemFree=NFree;f.cuMemcpy2DAsync=NCopy;f.cuMemsetD8Async=NMemset;f.cuStreamCreate=NStream;f.cuStreamDestroy=NDestroyStream;f.cuStreamSynchronize=NSync;f.cuDeviceGetCount=NCount;f.cuDeviceGet=NDev;f.cuDeviceGetUuid=NUuid;f.cuDeviceGetPCIBusId=NPci;f.cuDevicePrimaryCtxRetain=NRetain;f.cuDevicePrimaryCtxRelease=NRelease;f.cuCtxSetCurrent=NSet;f.cuCtxGetCurrent=NGet;f.cuCtxGetDevice=NGetDev;f.cuEventCreate=NECreate;f.cuEventDestroy=NEDestroy;f.cuEventRecord=NERecord;f.cuEventQuery=NEQuery;f.cuEventElapsedTime=NEElapsed;return f;}
 struct FakeOrt final:IPreparedFastDvdnetOrtSession{onnx::OrtPreparedCudaRunEvidence ev;int binds=0,runs=0,fail_run_at=0;bool binding_valid=true;explicit FakeOrt(onnx::OrtPreparedCudaRunEvidence e,int fail):ev(e),fail_run_at(fail){} auto evidence()const noexcept->onnx::OrtPreparedCudaRunEvidence override{return ev;} bool PrepareBinding(const onnx::OrtSession::CudaBindingInput*i,std::size_t,const onnx::OrtSession::CudaBindingOutput*o,std::size_t)noexcept override{++binds;binding_valid=std::strcmp(i[0].name,"noisy")==0&&std::strcmp(i[1].name,"noise_map")==0&&std::strcmp(o[0].name,"denoised")==0&&i[0].shape[1]==15&&o[0].shape[1]==3;return binding_valid;} onnx::OrtPreparedRunResult Execute(const onnx::OrtSession::CudaBindingInput*i,std::size_t,const onnx::OrtSession::CudaBindingOutput*o,std::size_t,const onnx::OrtPreparedCudaRunEvidence&)noexcept override{++runs;binding_valid=binding_valid&&std::strcmp(i[0].name,"noisy")==0&&i[0].shape[1]==15&&o[0].shape[1]==3;onnx::OrtPreparedRunResult r;r.status=(fail_run_at==runs)?onnx::OrtPreparedRunStatus::inference_failure:onnx::OrtPreparedRunStatus::success;return r;}void RequestShutdown()noexcept override{}};
-struct FakeOrtFactory final:IPreparedFastDvdnetOrtFactory{onnx::OrtPreparedCudaRunEvidence ev;FakeOrt*made=nullptr;int fail_run_at=0;auto Create(const std::filesystem::path&,const onnx::OrtSessionOptions&o,const PreparedCudaFastDvdnetTensorContract&)noexcept->std::unique_ptr<IPreparedFastDvdnetOrtSession> override{if(o.provider_policy!=onnx::OrtProviderPolicy::strict_cuda_only||!o.user_compute_stream||o.enable_tensorrt)return{};auto p=std::make_unique<FakeOrt>(ev,fail_run_at);made=p.get();return p;}};
+struct FakeOrtFactory final:IPreparedFastDvdnetOrtFactory{onnx::OrtPreparedCudaRunEvidence ev;FakeOrt*made=nullptr;int fail_run_at=0;auto Create(const std::filesystem::path&,const onnx::OrtSessionOptions&o,const PreparedCudaFastDvdnetTensorContract&,const PreparedFastDvdnetModelContract&)noexcept->std::unique_ptr<IPreparedFastDvdnetOrtSession> override{if(o.provider_policy!=onnx::OrtProviderPolicy::strict_cuda_only||!o.user_compute_stream||o.enable_tensorrt)return{};auto p=std::make_unique<FakeOrt>(ev,fail_run_at);made=p.get();return p;}};
 } // namespace
 
 int main() {
   bool ok = true;
   ModelPack pack; pack.task="video_denoise"; pack.id="fastdvdnet_sigma15";
+  {
+    auto selected=Config(&pack).tensors;
+    PreparedFastDvdnetModelContract model;
+    model.input_names={"noisy","noise_map"};model.output_name="denoised";
+    model.input_channels={15,1};model.output_channels=3;
+    model.input_dynamic_hw={true,true};model.output_dynamic_hw=true;
+    onnx::OrtSessionInfo info;
+    info.input_names={"noisy","noise_map"};info.output_names={"denoised"};
+    info.input_shapes={{1,15,-1,-1},{1,1,-1,-1}};
+    info.output_shapes={{1,3,-1,-1}};
+    info.input_elem_types={1,1};info.output_elem_types={1};
+    ok=Check(ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),
+             "dynamic manifest metadata must accept setup-selected H/W bindings")&&ok;
+    auto bad=info;bad.input_names[0]="input";
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph input name must fail")&&ok;
+    bad=info;bad.input_shapes[0][1]=3;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph channel count must fail")&&ok;
+    bad=info;bad.input_elem_types[1]=11;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph dtype must fail")&&ok;
+    model.input_dynamic_hw={false,false};model.output_dynamic_hw=false;
+    info.input_shapes={{1,15,8,8},{1,1,8,8}};info.output_shapes={{1,3,8,8}};
+    ok=Check(ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),"matching fixed graph geometry must pass")&&ok;
+    info.output_shapes[0][3]=12;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),"wrong fixed graph geometry must fail")&&ok;
+  }
   FakeRuntime runtime;
   PreparedCudaFastDvdnetDenoiser denoiser(&runtime);
   auto config=Config(&pack);
