@@ -159,9 +159,20 @@ int main() {
     ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph channel count must fail")&&ok;
     bad=info;bad.input_elem_types[1]=11;
     ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph dtype must fail")&&ok;
+    auto wrong_model=model;wrong_model.input_names[0]="input";bad=info;bad.input_names[0]="input";
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,wrong_model,selected),
+             "manifest and graph names must not override selected canonical bindings")&&ok;
+    wrong_model=model;wrong_model.input_channels[0]=12;bad=info;bad.input_shapes[0][1]=12;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,wrong_model,selected),
+             "manifest and graph channels must not override selected buffer channels")&&ok;
     model.input_dynamic_hw={false,false};model.output_dynamic_hw=false;
+    model.input_widths={8,8};model.input_heights={8,8};
+    model.output_width=8;model.output_height=8;
     info.input_shapes={{1,15,8,8},{1,1,8,8}};info.output_shapes={{1,3,8,8}};
     ok=Check(ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),"matching fixed graph geometry must pass")&&ok;
+    wrong_model=model;wrong_model.input_widths[0]=4;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(info,wrong_model,selected),
+             "fixed manifest geometry must match graph and selected binding")&&ok;
     info.output_shapes[0][3]=12;
     ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),"wrong fixed graph geometry must fail")&&ok;
   }

@@ -70,7 +70,8 @@ const ModelFile *MainOnnx(const ModelPack &pack) noexcept {
 }
 
 bool ReadManifestTensor(const util::json::Value &value, std::string *name,
-                        int *channels, bool *dynamic_hw, bool require_layout) {
+                        int *channels, int *width, int *height,
+                        bool *dynamic_hw, bool require_layout) {
   const auto *object = value.AsObject();
   if (!object) return false;
   const auto string_value = [&](const char *key) -> const std::string * {
@@ -82,6 +83,8 @@ bool ReadManifestTensor(const util::json::Value &value, std::string *name,
   const auto *dtype = string_value("dtype");
   const auto channel_it = object->find("channels");
   const auto dynamic_it = object->find("dynamic_hw");
+  const auto width_it = object->find("width");
+  const auto height_it = object->find("height");
   const auto *number = channel_it == object->end()
                            ? nullptr : channel_it->second.AsNumber();
   const auto *dynamic = dynamic_it == object->end()
@@ -91,6 +94,20 @@ bool ReadManifestTensor(const util::json::Value &value, std::string *name,
       !dtype || *dtype != "float32" ||
       !number || *number < 1 || *number > std::numeric_limits<int>::max() ||
       static_cast<double>(static_cast<int>(*number)) != *number || !dynamic)
+    return false;
+  const auto integer_field = [&](const util::json::Value::Object::const_iterator &it,
+                                 int *out) {
+    if (it == object->end()) return false;
+    const auto *value_number = it->second.AsNumber();
+    if (!value_number || *value_number < 1 ||
+        *value_number > std::numeric_limits<int>::max() ||
+        static_cast<double>(static_cast<int>(*value_number)) != *value_number)
+      return false;
+    *out = static_cast<int>(*value_number);
+    return true;
+  };
+  if (!*dynamic &&
+      (!integer_field(width_it, width) || !integer_field(height_it, height)))
     return false;
   *name = *n;
   *channels = static_cast<int>(*number);
@@ -119,12 +136,18 @@ bool ReadFastDvdnetManifest(const ModelPack &pack,
   return inputs && inputs->size() == 2 && outputs && outputs->size() == 1 &&
          ReadManifestTensor((*inputs)[0], &contract->input_names[0],
                             &contract->input_channels[0],
+                            &contract->input_widths[0],
+                            &contract->input_heights[0],
                             &contract->input_dynamic_hw[0], true) &&
          ReadManifestTensor((*inputs)[1], &contract->input_names[1],
                             &contract->input_channels[1],
+                            &contract->input_widths[1],
+                            &contract->input_heights[1],
                             &contract->input_dynamic_hw[1], true) &&
          ReadManifestTensor((*outputs)[0], &contract->output_name,
                             &contract->output_channels,
+                            &contract->output_width,
+                            &contract->output_height,
                             &contract->output_dynamic_hw, false);
 }
 
@@ -137,6 +160,11 @@ bool ValidatePreparedFastDvdnetSessionMetadata(
   if (info.input_names.size() != 2 || info.output_names.size() != 1 ||
       info.input_shapes.size() != 2 || info.output_shapes.size() != 1 ||
       info.input_elem_types.size() != 2 || info.output_elem_types.size() != 1 ||
+      !selected.noisy_name || !selected.noise_map_name ||
+      !selected.denoised_name ||
+      model.input_names[0] != selected.noisy_name ||
+      model.input_names[1] != selected.noise_map_name ||
+      model.output_name != selected.denoised_name ||
       info.input_names[0] != model.input_names[0] ||
       info.input_names[1] != model.input_names[1] ||
       info.output_names[0] != model.output_name ||
@@ -154,15 +182,26 @@ bool ValidatePreparedFastDvdnetSessionMetadata(
                                     model.input_dynamic_hw[1],
                                     model.output_dynamic_hw};
   for (std::size_t i = 0; i < actual.size(); ++i) {
-    if (actual[i]->size() != 4 || (*actual[i])[0] != 1 ||
+    if (selected_shapes[i]->at(0) != 1 ||
+        selected_shapes[i]->at(1) != channels[i] ||
+        selected_shapes[i]->at(2) <= 0 || selected_shapes[i]->at(3) <= 0 ||
+        actual[i]->size() != 4 || (*actual[i])[0] != 1 ||
         (*actual[i])[1] != channels[i])
       return false;
     if (dynamic[i]) {
       if ((*actual[i])[2] >= 0 || (*actual[i])[3] >= 0) return false;
-    } else if (*actual[i] != std::vector<std::int64_t>(
-                                 selected_shapes[i]->begin(),
-                                 selected_shapes[i]->end())) {
-      return false;
+    } else {
+      const int manifest_width = i < 2 ? model.input_widths[i]
+                                       : model.output_width;
+      const int manifest_height = i < 2 ? model.input_heights[i]
+                                        : model.output_height;
+      if (manifest_width <= 0 || manifest_height <= 0 ||
+          selected_shapes[i]->at(2) != manifest_height ||
+          selected_shapes[i]->at(3) != manifest_width ||
+          *actual[i] != std::vector<std::int64_t>(
+                            selected_shapes[i]->begin(),
+                            selected_shapes[i]->end()))
+        return false;
     }
   }
   return true;
@@ -208,17 +247,15 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
     result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
     return result;
   }
-  if (!injected_factory_) {
-    const auto validated = ValidateModelArtifactIdentity(*config.model_pack, *model);
-    if (!validated.ok() ||
-        !ModelArtifactIdentityMatches(validated.identity, config.artifact)) {
-      result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
-      return result;
-    }
-  }
   PreparedFastDvdnetModelContract model_contract;
   if (!injected_factory_) {
     if (!ReadFastDvdnetManifest(*config.model_pack, &model_contract)) {
+      result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
+      return result;
+    }
+    const auto validated = ValidateModelArtifactIdentity(*config.model_pack, *model);
+    if (!validated.ok() ||
+        !ModelArtifactIdentityMatches(validated.identity, config.artifact)) {
       result.status = PreparedCudaFastDvdnetStatus::stale_artifact;
       return result;
     }

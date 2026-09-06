@@ -14,6 +14,10 @@ struct PreparedFastDvdnetModelContract {
   std::string output_name;
   std::array<int, 2> input_channels{};
   int output_channels = 0;
+  std::array<int, 2> input_widths{};
+  std::array<int, 2> input_heights{};
+  int output_width = 0;
+  int output_height = 0;
   std::array<bool, 2> input_dynamic_hw{};
   bool output_dynamic_hw = false;
 };
