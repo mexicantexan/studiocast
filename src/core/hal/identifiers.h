@@ -50,6 +50,7 @@ enum class SemanticEffectProviderId : std::uint32_t {
   open_video_onnxruntime_cpu = 4,
   open_vulkan_production_kernels = 5,
   maxine_cuda_utility = 6,
+  open_cuda_production_kernels = 7,
   test_fake = 0x7fff0001u,
 };
 

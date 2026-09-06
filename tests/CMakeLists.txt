@@ -1899,6 +1899,17 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-v4l2loopback-diagnostics-tests
             integration video)
 
+    add_executable(studiocast-prepared-cuda-yunet-detector-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_yunet_detector_tests.cpp)
+    target_link_libraries(studiocast-prepared-cuda-yunet-detector-tests PRIVATE
+            studiocast_open_video_backend)
+    studiocast_set_project_warnings(studiocast-prepared-cuda-yunet-detector-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-cuda-yunet-detector-tests)
+    add_test(NAME studiocast-prepared-cuda-yunet-detector-tests
+            COMMAND studiocast-prepared-cuda-yunet-detector-tests)
+    studiocast_set_test_labels(studiocast-prepared-cuda-yunet-detector-tests
+            integration video gpu model)
+
     add_test(NAME studiocast-ctest-label-metadata-tests
             COMMAND "${CMAKE_COMMAND}"
                     "-DCTEST_EXECUTABLE=${CMAKE_CTEST_COMMAND}"

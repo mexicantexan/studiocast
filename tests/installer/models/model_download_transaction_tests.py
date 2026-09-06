@@ -208,6 +208,58 @@ class CatalogContractTests(TempTest):
             self.assertTrue(pack["license"]["spdx"])
             self.assertTrue(pack["provenance"]["url"])
 
+    def test_curated_yunet_fp32_artifact_has_verified_tensor_contract(self):
+        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        pack = next(
+            item for item in catalog["packs"]
+            if item["id"] == "yunet_opencv_zoo_2023mar_fp32"
+        )
+        self.assertEqual(pack["provenance"]["project"], "OpenCV Zoo YuNet")
+        self.assertEqual(pack["provenance"]["release"], "2023mar FP32")
+        self.assertEqual(
+            pack["artifacts"],
+            [{
+                "name": "model.onnx",
+                "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+                "size_bytes": 232589,
+                "size_status": "known",
+                "source_paths": [
+                    "open_video/face_detection/Best Quality (YuNet FP32)/model.onnx",
+                    "face_detection/Best Quality (YuNet FP32)/model.onnx",
+                    "open_cuda/face_detection/Best Quality (YuNet FP32)/model.onnx",
+                ],
+            }],
+        )
+
+        model_metadata = next(
+            item for item in pack["metadata"] if item["destination"] == "model.json"
+        )
+        metadata_path = REPO_ROOT / model_metadata["source"]
+        self.assertEqual(model_tx.sha256_path(metadata_path), model_metadata["sha256"])
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["id"], pack["id"])
+        self.assertEqual(metadata["files"][0]["sha256"], pack["artifacts"][0]["sha256"])
+        self.assertEqual(
+            metadata["onnx"]["inputs"],
+            [{
+                "name": "input", "layout": "nchw", "dtype": "float32",
+                "width": 640, "height": 640, "channels": 3,
+            }],
+        )
+        expected_heads = {
+            "cls_8": "scores", "cls_16": "scores", "cls_32": "scores",
+            "obj_8": "objectness", "obj_16": "objectness", "obj_32": "objectness",
+            "bbox_8": "boxes", "bbox_16": "boxes", "bbox_32": "boxes",
+            "kps_8": "keypoints", "kps_16": "keypoints", "kps_32": "keypoints",
+        }
+        self.assertEqual(
+            {head["name"]: head["kind"] for head in metadata["onnx"]["outputs"]},
+            expected_heads,
+        )
+        self.assertTrue(all(head["dtype"] == "float32" for head in metadata["onnx"]["outputs"]))
+        self.assertEqual({stride: (640 // stride) ** 2 for stride in (8, 16, 32)},
+                         {8: 6400, 16: 1600, 32: 400})
+
     def test_recommended_untrusted_known_sizes_block_before_filesystem_mutation(self):
         fixture = Fixture(self.root)
         raw = json.loads(fixture.catalog_path.read_text())

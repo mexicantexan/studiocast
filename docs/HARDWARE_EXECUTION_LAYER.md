@@ -93,7 +93,8 @@ synchronization evidence.
 
 ## Prepared-program lifecycle
 
-A prepared program fixes the canonical stage order and exact backend/provider,
+A prepared program fixes the canonical stage order and exact per-stage
+backend/provider,
 input/output descriptors, model-artifact identity, execution domain,
 configuration/geometry/model/provider/device/context generations, temporal
 rules, required/optional behavior, circuit-breaker policy, declared CPU tails,
@@ -175,7 +176,7 @@ the prior valid plan.
 | CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
 | Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
 | Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; zero CPU tails | Matting, tracked-center vignette, Auto Frame, eye contact, denoise, key light, and background modes remain blocked or non-production exactly as documented |
-| Open CUDA resident | Explicit strict CUDA plus ONNX Runtime CUDA; one blur, remove, replace, or virtual-key-light stage; tight same-geometry RGB24; one measured writer-copy tail | Multi-stage/shared-matte islands and Auto Frame remain blocked because the current contract cannot prove their full resident dependency graph |
+| Open CUDA resident | Explicit strict CUDA; model-backed stages require ONNX Runtime CUDA and exact model evidence, while native kernel stages use their own provider identity | The native CUDA-kernel provider contract permits same-domain model-free stages, but the provider ID alone is not production eligibility; each stage still requires its integration and evidence gates |
 | Open Video compatibility | Typed host ONNX Runtime domain for the existing denoise and eye-contact route | It is not CUDA attribution and cannot satisfy strict CUDA/provider selection |
 
 The setup request declares a setup-only terminal
@@ -196,6 +197,15 @@ resources, bounded completion waiting, and retryable shutdown. Replacement
 images are decoded, uploaded, and resized during setup. Model discovery,
 manifest parsing, artifact validation, provider selection, session creation,
 and resource sizing happen at setup.
+
+An Open CUDA island may contain exact per-stage providers under one unchanged
+execution domain. ONNX Runtime model stages use
+`open_video_onnxruntime_cuda`; model-free native kernels use
+`open_cuda_production_kernels`. A mixed island leaves its aggregate provider
+invalid and retains exact provider identity on every stage. This does not relax
+strict provider requests: an explicit provider constraint may select only
+stages from that provider. The native provider ID is a contract prerequisite,
+not evidence that a native stage is already integrated or production-ready.
 
 Setup-lease shutdown is typed and retryable. The composition retires its
 coordinator and registry before requesting native shutdown, and it marks the
