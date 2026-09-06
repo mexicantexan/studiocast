@@ -1,4 +1,5 @@
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
+#include "core/cuda/kernels/resize_bilinear.h"
 
 #include <atomic>
 #include <cstdint>
@@ -45,12 +46,14 @@ struct LaunchCapture {
   std::uint32_t source_w = 0;
   std::uint32_t source_h = 0;
   unsigned long long destination_ptr = 0;
+  std::uint32_t destination_pitch = 0;
   std::uint32_t destination_w = 0;
   std::uint32_t destination_h = 0;
   float mean[3] = {};
   float inverse_std[3] = {};
   std::uint32_t destination_is_bgr = 0;
   std::uint32_t source_is_bgr = 0;
+  float crop[4] = {};
 };
 
 bool SameCapture(const LaunchCapture &left,
@@ -81,12 +84,15 @@ struct FakeState {
   CUcontext current = nullptr;
   int module_loads = 0;
   int function_resolutions = 0;
+  int module_unloads = 0;
   int allocations = 0;
   int launches = 0;
   int context_queries = 0;
+  int synchronizations = 0;
   CUresult context_query_result = CUDA_SUCCESS;
   CUresult module_load_result = CUDA_SUCCESS;
   CUresult function_resolution_result = CUDA_SUCCESS;
+  CUresult module_unload_result = CUDA_SUCCESS;
   CUresult launch_result = CUDA_SUCCESS;
   LaunchCapture capture;
 };
@@ -112,10 +118,17 @@ CUresult FakeModuleGetFunction(CUfunction *function, CUmodule,
   ++g_state->function_resolutions;
   if (g_state->function_resolution_result != CUDA_SUCCESS)
     return g_state->function_resolution_result;
-  if (std::string_view(name) != "preprocess_to_nchw_f32")
+  const auto entry = std::string_view(name);
+  if (entry != "preprocess_to_nchw_f32" &&
+      entry != "resize_bilinear_u8x3")
     return 3;
-  *function = reinterpret_cast<CUfunction>(static_cast<std::uintptr_t>(0x300));
+  *function = reinterpret_cast<CUfunction>(static_cast<std::uintptr_t>(
+      entry == "resize_bilinear_u8x3" ? 0x301 : 0x300));
   return CUDA_SUCCESS;
+}
+CUresult FakeModuleUnload(CUmodule) {
+  ++g_state->module_unloads;
+  return g_state->module_unload_result;
 }
 CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
                     unsigned int grid_y, unsigned int, unsigned int block_x,
@@ -129,6 +142,23 @@ CUresult FakeLaunch(CUfunction function, unsigned int grid_x,
   capture.grid_y = grid_y;
   capture.block_x = block_x;
   capture.block_y = block_y;
+  if (function == reinterpret_cast<CUfunction>(
+                      static_cast<std::uintptr_t>(0x301))) {
+    capture.source_ptr = *static_cast<unsigned long long *>(arguments[0]);
+    capture.source_pitch = *static_cast<std::uint32_t *>(arguments[1]);
+    capture.source_w = *static_cast<std::uint32_t *>(arguments[2]);
+    capture.source_h = *static_cast<std::uint32_t *>(arguments[3]);
+    capture.destination_ptr =
+        *static_cast<unsigned long long *>(arguments[4]);
+    capture.destination_pitch = *static_cast<std::uint32_t *>(arguments[5]);
+    capture.destination_w = *static_cast<std::uint32_t *>(arguments[6]);
+    capture.destination_h = *static_cast<std::uint32_t *>(arguments[7]);
+    capture.crop[0] = *static_cast<float *>(arguments[8]);
+    capture.crop[1] = *static_cast<float *>(arguments[9]);
+    capture.crop[2] = *static_cast<float *>(arguments[10]);
+    capture.crop[3] = *static_cast<float *>(arguments[11]);
+    return g_state->launch_result;
+  }
   capture.source_ptr = *static_cast<unsigned long long *>(arguments[0]);
   capture.source_pitch = *static_cast<std::uint32_t *>(arguments[1]);
   capture.source_w = *static_cast<std::uint32_t *>(arguments[2]);
@@ -163,7 +193,10 @@ CUresult FakeStreamCreate(CUstream *stream, unsigned int) {
   return CUDA_SUCCESS;
 }
 CUresult FakeStreamDestroy(CUstream) { return CUDA_SUCCESS; }
-CUresult FakeStreamSynchronize(CUstream) { return CUDA_SUCCESS; }
+CUresult FakeStreamSynchronize(CUstream) {
+  ++g_state->synchronizations;
+  return CUDA_SUCCESS;
+}
 CUresult FakeDeviceGetCount(int *count) {
   *count = 1;
   return CUDA_SUCCESS;
@@ -211,6 +244,7 @@ CudaDriverApi::Functions FakeFunctions() {
   functions.cuInit = FakeInit;
   functions.cuModuleLoadData = FakeModuleLoad;
   functions.cuModuleGetFunction = FakeModuleGetFunction;
+  functions.cuModuleUnload = FakeModuleUnload;
   functions.cuLaunchKernel = FakeLaunch;
   functions.cuMemAllocPitch = FakeAlloc;
   functions.cuMemFree = FakeFree;
@@ -606,6 +640,158 @@ bool TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence() {
   return ok;
 }
 
+bool TestPreparedResizeHasNoFrameTimeSetup() {
+  Fixture fixture;
+  if (!fixture.Initialize())
+    return false;
+  CudaImage destination;
+  destination.ptr = 0x9000;
+  destination.pitch = 17u * 3u;
+  destination.w = 17;
+  destination.h = 18;
+  destination.format = PixelFormatGpu::bgr_u8;
+  PreparedResizeBilinearKernel kernel;
+  bool ok = Expect(PrepareResizeBilinearKernel(
+                       fixture.driver, fixture.state.current,
+                       fixture.binding.stream, &kernel, &fixture.error),
+                   "prepared resize should load on the owner context");
+  const int context_queries = fixture.state.context_queries;
+  ok &= Expect(fixture.state.module_loads == 1 &&
+                   fixture.state.function_resolutions == 1 && kernel.live,
+               "prepared resize should load and resolve exactly once");
+  ok &= Expect(LaunchCropResizeBilinearPrepared(
+                   kernel, fixture.source, destination, -2.0f, -3.0f, 99.0f,
+                   99.0f, &fixture.error) &&
+                   LaunchResizeBilinearPrepared(
+                       kernel, fixture.source, destination, &fixture.error),
+               "prepared resize launches should enqueue");
+  ok &= Expect(fixture.state.launches == 2 &&
+                   fixture.state.module_loads == 1 &&
+                   fixture.state.function_resolutions == 1 &&
+                   fixture.state.context_queries == context_queries &&
+                   fixture.state.allocations == 0 &&
+                   fixture.state.synchronizations == 0,
+               "repeated resize launches performed frame-time setup or sync");
+  ok &= Expect(fixture.state.capture.stream == fixture.binding.stream &&
+                   fixture.state.capture.source_ptr == fixture.source.ptr &&
+                   fixture.state.capture.source_pitch == fixture.source.pitch &&
+                   fixture.state.capture.source_w == 7 &&
+                   fixture.state.capture.source_h == 9 &&
+                   fixture.state.capture.destination_ptr == destination.ptr &&
+                   fixture.state.capture.destination_pitch == destination.pitch &&
+                   fixture.state.capture.destination_w == 17 &&
+                   fixture.state.capture.destination_h == 18 &&
+                   fixture.state.capture.grid_x == 2 &&
+                   fixture.state.capture.grid_y == 2 &&
+                   fixture.state.capture.crop[0] == 0.0f &&
+                   fixture.state.capture.crop[1] == 0.0f &&
+                   fixture.state.capture.crop[2] == 7.0f &&
+                   fixture.state.capture.crop[3] == 9.0f,
+               "prepared resize changed stream, geometry, or crop clamping");
+  CudaImage invalid;
+  invalid.ptr = fixture.source.ptr;
+  invalid.pitch = fixture.source.pitch;
+  invalid.w = fixture.source.w;
+  invalid.h = fixture.source.h;
+  invalid.format = PixelFormatGpu::f32_1;
+  ok &= Expect(!LaunchResizeBilinearPrepared(
+                    kernel, invalid, destination, &fixture.error) &&
+                   fixture.state.launches == 2,
+               "invalid prepared resize input reached CUDA");
+  ok &= Expect(DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   fixture.state.module_unloads == 1 && !kernel.live &&
+                   DestroyResizeBilinearKernelPrepared(&kernel,
+                                                       &fixture.error) &&
+                   fixture.state.module_unloads == 1,
+               "prepared resize cleanup should unload exactly once");
+  return ok;
+}
+
+bool TestPreparedResizeCleanupIsRetryable() {
+  Fixture fixture;
+  if (!fixture.Initialize())
+    return false;
+  PreparedResizeBilinearKernel kernel;
+  bool ok = Expect(PrepareResizeBilinearKernel(
+                       fixture.driver, fixture.state.current,
+                       fixture.binding.stream, &kernel, &fixture.error),
+                   "resize lifecycle fixture should prepare");
+  const int loads = fixture.state.module_loads;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, fixture.state.current,
+                    fixture.binding.stream, &kernel, &fixture.error) &&
+                   fixture.state.module_loads == loads,
+               "prepare on live handle loaded another module");
+
+  const auto owner_context = fixture.state.current;
+  fixture.state.current = reinterpret_cast<CUcontext>(
+      static_cast<std::uintptr_t>(0xdead));
+  PreparedResizeBilinearKernel wrong_context;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, owner_context, fixture.binding.stream,
+                    &wrong_context, &fixture.error) &&
+                   fixture.state.module_loads == loads,
+               "wrong-context prepare reached module loading");
+  ok &= Expect(!DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   kernel.live && fixture.state.module_unloads == 0,
+               "wrong-context destroy lost the live module");
+  fixture.state.current = owner_context;
+
+  fixture.state.module_unload_result = 3;
+  ok &= Expect(!DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   kernel.live && fixture.state.module_unloads == 1,
+               "unload failure did not preserve retry state");
+  fixture.state.module_unload_result = CUDA_SUCCESS;
+  ok &= Expect(DestroyResizeBilinearKernelPrepared(&kernel, &fixture.error) &&
+                   !kernel.live && fixture.state.module_unloads == 2,
+               "unload retry did not release the module");
+
+  fixture.state.function_resolution_result = 3;
+  fixture.state.module_unload_result = 3;
+  PreparedResizeBilinearKernel partial;
+  ok &= Expect(!PrepareResizeBilinearKernel(
+                    fixture.driver, owner_context, fixture.binding.stream,
+                    &partial, &fixture.error) &&
+                   partial.live && partial.module && !partial.function,
+               "partial prepare did not retain failed-cleanup handle");
+  CudaImage source;
+  source.ptr = 0x1000;
+  source.pitch = 3;
+  source.w = source.h = 1;
+  source.format = PixelFormatGpu::rgb_u8;
+  CudaImage destination;
+  destination.ptr = 0x2000;
+  destination.pitch = 3;
+  destination.w = destination.h = 1;
+  destination.format = PixelFormatGpu::rgb_u8;
+  const int launches = fixture.state.launches;
+  ok &= Expect(!LaunchResizeBilinearPrepared(
+                    partial, source, destination, &fixture.error) &&
+                   fixture.state.launches == launches,
+               "partial prepared handle reached launch");
+  fixture.state.module_unload_result = CUDA_SUCCESS;
+  ok &= Expect(DestroyResizeBilinearKernelPrepared(&partial, &fixture.error),
+               "partial prepared handle could not retry cleanup");
+
+  fixture.state.function_resolution_result = CUDA_SUCCESS;
+  PreparedResizeBilinearKernel movable;
+  ok &= Expect(PrepareResizeBilinearKernel(
+                   fixture.driver, owner_context, fixture.binding.stream,
+                   &movable, &fixture.error),
+               "move lifecycle fixture should prepare");
+  PreparedResizeBilinearKernel moved(std::move(movable));
+  const int unloads = fixture.state.module_unloads;
+  ok &= Expect(!movable.live && movable.module == nullptr && moved.live &&
+                   DestroyResizeBilinearKernelPrepared(&movable,
+                                                       &fixture.error) &&
+                   fixture.state.module_unloads == unloads &&
+                   DestroyResizeBilinearKernelPrepared(&moved,
+                                                       &fixture.error) &&
+                   fixture.state.module_unloads == unloads + 1,
+               "move construction did not transfer sole cleanup ownership");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -614,6 +800,8 @@ int main() {
   ok &= TestBudgetAndBindingFailuresFailClosed();
   ok &= TestTypedSetupFailuresAndLifecycle();
   ok &= TestExplicitBundleExecutesAcrossThreadsWithoutThreadLocalEvidence();
+  ok &= TestPreparedResizeHasNoFrameTimeSetup();
+  ok &= TestPreparedResizeCleanupIsRetryable();
   if (ok)
     std::cout << "Prepared preprocess kernel bundle tests passed.\n";
   return ok ? 0 : 1;

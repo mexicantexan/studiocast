@@ -247,6 +247,7 @@ bool CudaDriverApi::LoadSymbols(std::string *error_out) {
       !load_req("cuCtxGetDevice", &f_.cuCtxGetDevice)) {
     return false;
   }
+  (void)lib_.GetSymbol("cuModuleUnload", &f_.cuModuleUnload, nullptr);
 
   // Optional corroborating stable identity. UUID remains mandatory.
   (void)lib_.GetSymbol("cuDeviceGetPCIBusId", &f_.cuDeviceGetPCIBusId,
