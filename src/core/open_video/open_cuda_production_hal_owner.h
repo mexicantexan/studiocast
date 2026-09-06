@@ -165,6 +165,7 @@ public:
   [[nodiscard]] OpenCudaPreparedResidentExecutor *executor() noexcept;
   [[nodiscard]] const OpenCudaPreparedResidentExecutor *
   executor() const noexcept;
+  [[nodiscard]] ExecutorPrepareResult LastPrepareResult() const noexcept;
   [[nodiscard]] ResidentAdapter *adapter() noexcept;
   [[nodiscard]] const ResidentAdapter *adapter() const noexcept;
 

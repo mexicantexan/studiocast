@@ -1,5 +1,6 @@
 #include "core/open_video/open_cuda_production_hal_owner.h"
 #include "core/open_video/video_execution_factory.h"
+#include "core/video/production_video_backend_manager.h"
 #include "core/video/video_execution_coordinator.h"
 
 #include <array>
@@ -342,6 +343,7 @@ public:
   open_cuda::PreparedOpenCudaRuntimeHandle active{};
   std::uint64_t shutdown_calls = 0;
   std::uint64_t stream_destructions = 0;
+  std::uint64_t destroy_prepared_calls = 0;
 
   open_cuda::PreparedOpenCudaRuntimePrepareResult
   Prepare(const hal::PreparedProgram &program,
@@ -439,6 +441,7 @@ public:
   }
   RuntimeStatus DestroyPrepared(
       open_cuda::PreparedOpenCudaRuntimeHandle *handle) noexcept override {
+    ++destroy_prepared_calls;
     if (pending)
       return RuntimeStatus::completion_pending;
     if (handle)
@@ -1026,6 +1029,146 @@ bool ProductionSetupLeaseIsExactStableAndIdempotent() {
   return ok;
 }
 
+bool ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() {
+  bool ok = true;
+  {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    runtime.pending = false;
+    auto setup = ProductionFactoryRequest(&state, &runtime);
+    setup.plan = VideoRequest({});
+    setup.plan.invalidation_key.generations = setup.generations;
+    setup.canonical_status[0] = hal::StatusId::ready;
+    video::ProductionVideoSetupLease lease;
+    video::ProductionVideoSetupLeaseAcquireEvidence acquire{};
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto acquire_status =
+        open_cuda::OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+            setup, &lease, &bootstrap, &acquire, &reason);
+    if (acquire_status != hal::StatusId::ready)
+      std::cerr << "[DETAIL] prepared acquire status="
+                << static_cast<unsigned>(acquire_status)
+                << " reason=" << static_cast<unsigned>(reason)
+                << " bootstrap=" << static_cast<unsigned>(bootstrap.status)
+                << '/' << static_cast<unsigned>(bootstrap.reason)
+                << " prepare=" << static_cast<unsigned>(bootstrap.prepare.status)
+                << '/' << static_cast<unsigned>(bootstrap.prepare.reason) << '\n';
+    ok = Expect(
+             acquire_status == hal::StatusId::ready &&
+                 lease.live() && runtime.prepare_calls == 1 &&
+                 runtime.destroy_prepared_calls == 0,
+             "lease publication must perform exactly one native preparation") &&
+         ok;
+    if (!lease.live())
+      return false;
+
+    const auto snapshot = lease.snapshot();
+    hal::StaticAdapterRegistry registry;
+    ok = Expect(registry.Register(snapshot.adapter, &reason) ==
+                    hal::StatusId::ready,
+                "prepared lease adapter must register") &&
+         ok;
+    video::VideoExecutionCoordinator coordinator(registry);
+    ok = Expect(coordinator.RegisterFactory(snapshot.factory, &reason) ==
+                    hal::StatusId::ready,
+                "prepared lease factory must register") &&
+         ok;
+    auto request = setup.plan;
+    request.invalidation_key.generations.context =
+        snapshot.execution_domain.logical_context_generation;
+    request.invalidation_key.execution_domain_hash =
+        video::ProductionVideoExecutionDomainHash(snapshot.execution_domain);
+    request.budget = setup.reserved_budget;
+
+    auto mismatched = request;
+    mismatched.setup_failure_policy = hal::SetupFailurePolicy::stop_pipeline;
+    video::VideoExecutionPrepareEvidence prepare{};
+    const auto mismatch_status = coordinator.Prepare(mismatched, &prepare, &reason);
+    if (mismatch_status != hal::StatusId::blocked ||
+        prepare.status != hal::StatusId::blocked ||
+        prepare.reason != hal::ReasonId::incomplete_execution ||
+        prepare.candidate_resources_rolled_back || runtime.prepare_calls != 1 ||
+        runtime.destroy_prepared_calls != 0)
+      std::cerr << "[DETAIL] cache mismatch status="
+                << static_cast<unsigned>(mismatch_status)
+                << " reason=" << static_cast<unsigned>(reason)
+                << " evidence=" << static_cast<unsigned>(prepare.status)
+                << '/' << static_cast<unsigned>(prepare.reason)
+                << " rollback=" << prepare.candidate_resources_rolled_back
+                << " calls=" << runtime.prepare_calls
+                << " destroys=" << runtime.destroy_prepared_calls << '\n';
+    ok = Expect(mismatch_status == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::incomplete_execution &&
+                    prepare.status == hal::StatusId::blocked &&
+                    prepare.reason == hal::ReasonId::incomplete_execution &&
+                    !prepare.candidate_resources_rolled_back &&
+                    runtime.prepare_calls == 1 &&
+                    runtime.destroy_prepared_calls == 0,
+                "mismatched frozen policy must reject without consuming "
+                "or replacing the setup-prepared executor") &&
+         ok;
+
+    const auto exact_status = coordinator.Prepare(request, &prepare, &reason);
+    ok = Expect((exact_status == hal::StatusId::ready ||
+                 exact_status == hal::StatusId::degraded) &&
+                    runtime.prepare_calls == 1 &&
+                    runtime.destroy_prepared_calls == 0,
+                "the exact frozen plan must consume setup preparation once "
+                "without a second native Prepare") &&
+         ok;
+    coordinator.Invalidate(hal::ReasonId::reconfiguration_required);
+    const auto second_status = coordinator.Prepare(request, &prepare, &reason);
+    ok = Expect((second_status == hal::StatusId::ready ||
+                 second_status == hal::StatusId::degraded) &&
+                    runtime.prepare_calls == 2 &&
+                    runtime.destroy_prepared_calls == 1,
+                "after one cache consumption a reprepare must use the native "
+                "path and retire the prior prepared slot") &&
+         ok;
+    coordinator.Shutdown();
+    lease.Shutdown();
+    ok = Expect(runtime.destroy_prepared_calls == 2 &&
+                    runtime.stream_destructions == 1 &&
+                    state.destroy_successes == 1,
+                "consumed cached preparation must retain and release the full "
+                "owner graph exactly once") &&
+         ok;
+  }
+
+  {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    runtime.pending = false;
+    auto setup = ProductionFactoryRequest(&state, &runtime);
+    setup.plan = VideoRequest({});
+    setup.plan.invalidation_key.generations = setup.generations;
+    setup.canonical_status[0] = hal::StatusId::ready;
+    video::ProductionVideoSetupLease lease;
+    video::ProductionVideoSetupLeaseAcquireEvidence acquire{};
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok = Expect(
+             open_cuda::OpenCudaVideoExecutionFactory::
+                     AcquireProductionSetupLease(setup, &lease, &bootstrap,
+                                                 &acquire, &reason) ==
+                 hal::StatusId::ready &&
+                 runtime.prepare_calls == 1,
+             "unused-cache fixture must publish one prepared lease") &&
+         ok;
+    const auto shutdown = lease.Shutdown();
+    ok = Expect(shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted &&
+                    runtime.destroy_prepared_calls == 1 &&
+                    runtime.stream_destructions == 1 &&
+                    state.destroy_successes == 1,
+                "retiring an unconsumed cache must destroy its prepared slot "
+                "before native owner shutdown") &&
+         ok;
+  }
+  return ok;
+}
+
 bool ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() {
   FakeCudaState old_state{};
   PendingRuntime old_runtime{};
@@ -1363,6 +1506,7 @@ int main() {
   ok = ProductionStreamDestroyFailureIsRetryable() && ok;
   ok = ProductionNewSemanticContractsAreExact() && ok;
   ok = ProductionSetupLeaseIsExactStableAndIdempotent() && ok;
+  ok = ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() && ok;
   ok = ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() && ok;
   ok = ProductionSetupLeaseShutdownRetriesPendingThenComplete() && ok;
   ok = ProductionSetupLeasePermanentPendingIsTruthfulAndFailSafe() && ok;

@@ -441,6 +441,9 @@ public:
           result.prepared_program.cpu_tail_count != 0) {
         ++result.prepared_program.cpu_tails[0].scratch_bytes;
       }
+      if (malformed_prepared_boundary &&
+          result.prepared_program.cpu_tail_count != 0)
+        ++result.prepared_program.cpu_tails[0].boundary_index;
     }
     return result;
   }
@@ -476,27 +479,41 @@ public:
     program.setup_failure_policy = request.setup_failure_policy;
     program.requested_backend = resolution.requested_backend;
     program.strict_backend_selection = request.intent.backend.strict;
-    program.requested_provider = request.intent.requested_provider;
+    program.requested_provider =
+        request.intent.requested_provider ==
+                hal::SemanticEffectProviderId::invalid
+            ? resolution.selected_provider
+            : request.intent.requested_provider;
     program.strict_provider_selection =
         request.intent.strict_provider_selection;
     program.requested_execution_domain = domain_;
     program.strict_execution_domain = true;
     program.requires_upload = true;
     program.requires_final_readback = true;
-    program.stage_count = 1;
-    auto &stage = program.stages[0];
-    stage.stage_id = request.intent.stages[0].intent.stage_id;
-    stage.semantic = request.intent.stages[0].intent.semantic;
-    stage.provider = provider_;
-    stage.backend = domain_.backend;
-    stage.execution_domain = domain_;
-    stage.input.kind = hal::StageIoKind::image;
-    stage.input.image = Image(hal::HostCoherence::not_host_visible,
-                              hal::Mutability::read_write);
-    stage.output = stage.input;
-    stage.required = request.intent.stages[0].intent.required;
-    stage.failure_action = request.intent.stages[0].intent.failure_action;
-    stage.model = request.intent.stages[0].model;
+    for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+      if (resolution.stages[index].skipped_optional)
+        continue;
+      auto &stage = program.stages[program.stage_count++];
+      stage.stage_id = request.intent.stages[index].intent.stage_id;
+      stage.semantic = request.intent.stages[index].intent.semantic;
+      stage.provider = resolution.stages[index].provider;
+      stage.backend = domain_.backend;
+      stage.execution_domain = domain_;
+      stage.input.kind = hal::StageIoKind::image;
+      stage.input.image = Image(hal::HostCoherence::not_host_visible,
+                                hal::Mutability::read_write);
+      stage.output = stage.input;
+      stage.required = request.intent.stages[index].intent.required;
+      stage.failure_action =
+          request.intent.stages[index].intent.failure_action;
+      stage.model = request.intent.stages[index].model;
+    }
+    if (program.cpu_tail_count == 1 && program.stage_count != 0) {
+      program.cpu_tails[0].after_stage_id =
+          program.stages[program.stage_count - 1].stage_id;
+      program.cpu_tails[0].boundary_index =
+          static_cast<std::uint32_t>(program.stage_count);
+    }
     return program;
   }
 
@@ -512,6 +529,7 @@ public:
   bool wrong_preflight_domain = false;
   bool malformed_prepared_program = false;
   bool malformed_prepared_tail = false;
+  bool malformed_prepared_boundary = false;
   bool malformed_transfer_boundary = false;
   bool malformed_transfer_version = false;
   bool undeclared_variable_bound = false;
@@ -1473,6 +1491,97 @@ bool TestNoAllocationDuringExecute() {
                  "Execute must not allocate");
 }
 
+bool TestCompactPreparedTailPreservesCanonicalBoundary() {
+  const auto domain = Domain();
+  DummyResident resident(domain);
+  hal::AdapterRegistration registration;
+  registration.adapter_instance_id = domain.adapter_instance_id;
+  registration.backend = domain.backend;
+  registration.execution_domain = domain;
+  registration.selection_priority = 10;
+  registration.resident_adapter = &resident;
+  auto &missing = registration.semantic_capabilities[0];
+  missing.semantic = hal::SemanticEffectId::virtual_background_blur;
+  missing.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  missing.status = hal::StatusId::unavailable;
+  missing.reason = hal::ReasonId::capability_evidence_incomplete;
+  auto &vignette = registration.semantic_capabilities[1];
+  vignette = Capability(
+      domain.backend,
+      hal::SemanticEffectProviderId::open_cuda_production_kernels,
+      hal::CpuTailId::writer_copy);
+  vignette.semantic = hal::SemanticEffectId::vignette;
+  vignette.evidence[0].semantic = vignette.semantic;
+  registration.semantic_capability_count = 2;
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(registry.Register(registration, &reason) == hal::StatusId::ready,
+               "mixed selectable registration must be valid"))
+    return false;
+
+  auto request = Request();
+  request.intent.requested_provider = hal::SemanticEffectProviderId::invalid;
+  request.intent.strict_provider_selection = false;
+  request.intent.stages[0].intent.required = false;
+  request.intent.stages[1] = request.intent.stages[0];
+  request.intent.stages[1].intent.stage_id = 2;
+  request.intent.stages[1].intent.semantic = hal::SemanticEffectId::vignette;
+  request.intent.stages[1].model = {};
+  request.intent.stage_count = 2;
+  request.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+  request.cpu_tails[0].after_stage_id = 2;
+  request.cpu_tails[0].required = true;
+  request.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  request.cpu_tails[0].boundary_index = 2;
+  request.cpu_tail_count = 1;
+
+  hal::PreparedProgram observed_program;
+  const auto configure = [&](bool malformed_compact,
+                             video::VideoExecutionPrepareEvidence *evidence) {
+    FakeFactory factory(
+        domain, hal::SemanticEffectProviderId::open_cuda_production_kernels);
+    factory.malformed_prepared_boundary = malformed_compact;
+    video::VideoExecutionCoordinator coordinator(registry);
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(
+                91, video::VideoExecutionRoute::prepared_resident, domain,
+                hal::SemanticEffectProviderId::open_cuda_production_kernels,
+                &factory),
+            &reason) != hal::StatusId::ready)
+      return hal::StatusId::blocked;
+    const auto status = coordinator.Prepare(request, evidence, &reason);
+    observed_program = factory.observed_plan.prepared_program;
+    return status;
+  };
+
+  video::VideoExecutionPrepareEvidence evidence;
+  bool ok = Require(configure(false, &evidence) == hal::StatusId::ready &&
+                        evidence.resolution.stages[0].skipped_optional &&
+                        observed_program.stage_count == 1 &&
+                        observed_program.stages[0].stage_id == 2 &&
+                        observed_program.cpu_tails[0].boundary_index == 1,
+                    "compact program must retain canonical stage id with a "
+                    "compact tail boundary");
+  ok &= Require(configure(true, &evidence) == hal::StatusId::blocked,
+                "malformed compact tail boundary must fail closed");
+  auto malformed = request;
+  malformed.cpu_tails[0].boundary_index = 1;
+  FakeFactory factory(
+      domain, hal::SemanticEffectProviderId::open_cuda_production_kernels);
+  video::VideoExecutionCoordinator coordinator(registry);
+  (void)coordinator.RegisterFactory(
+      FactoryRegistration(
+          92, video::VideoExecutionRoute::prepared_resident, domain,
+          hal::SemanticEffectProviderId::open_cuda_production_kernels, &factory),
+      &reason);
+  ok &= Require(coordinator.Prepare(malformed, &evidence, &reason) ==
+                        hal::StatusId::blocked,
+                "malformed canonical tail boundary must fail closed");
+  return ok;
+}
+
 } // namespace
 
 void *operator new(std::size_t size) {
@@ -1519,6 +1628,7 @@ int main() {
   ok &= TestPreparedTransferContractAndFinalCpuTail();
   ok &= TestTransferContractValidation();
   ok &= TestVariableTransferBoundaryContract();
+  ok &= TestCompactPreparedTailPreservesCanonicalBoundary();
   ok &= TestNoAllocationDuringExecute();
   if (!ok)
     return 1;

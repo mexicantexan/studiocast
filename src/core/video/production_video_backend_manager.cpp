@@ -218,9 +218,15 @@ bool CompatibleCpuTails(const VideoExecutionPlanRequest &caller,
       bound_tail.id != hal::CpuTailId::provider_postprocess) {
     return false;
   }
-  auto exact = caller.cpu_tails[0];
-  exact.id = bound_tail.id;
-  return SameTail(exact, bound_tail);
+  if (!bound_tail.required ||
+      bound_tail.placement != hal::DeclaredCpuTail::Placement::after_stage ||
+      bound_tail.before_stage_id != 0 || bound_tail.boundary_index == 0 ||
+      bound_tail.boundary_index > caller.intent.stage_count)
+    return false;
+  const auto selected_index = bound_tail.boundary_index - 1;
+  return bound_tail.after_stage_id ==
+             caller.intent.stages[selected_index].intent.stage_id &&
+         bound_tail.scratch_bytes == caller.cpu_tails[0].scratch_bytes;
 }
 
 bool ValidWaitPolicy(const ProductionVideoBoundedWaitPolicy &wait) noexcept {
@@ -418,6 +424,39 @@ bool StageParametersMatchEffects(
 
 bool IsZeroModel(const hal::ModelArtifactIdentity &model) noexcept;
 
+bool StageSelectable(const hal::AdapterRegistration &registration,
+                     hal::SemanticEffectId semantic) noexcept {
+  for (std::size_t index = 0;
+       index < registration.semantic_capability_count; ++index) {
+    if (registration.semantic_capabilities[index].semantic == semantic &&
+        hal::IsSelectableSemanticCapability(
+            registration.semantic_capabilities[index]))
+      return true;
+  }
+  return false;
+}
+
+bool SameResolutionRegistration(const hal::AdapterRegistration &left,
+                                const hal::AdapterRegistration &right) noexcept {
+  if (left.adapter_instance_id != right.adapter_instance_id ||
+      left.backend != right.backend ||
+      left.execution_domain != right.execution_domain ||
+      left.semantic_capability_count != right.semantic_capability_count)
+    return false;
+  for (std::size_t index = 0; index < left.semantic_capability_count; ++index) {
+    const auto &a = left.semantic_capabilities[index];
+    const auto &b = right.semantic_capabilities[index];
+    if (a.semantic != b.semantic || a.provider != b.provider ||
+        a.status != b.status || a.reason != b.reason ||
+        a.live_stage != b.live_stage ||
+        a.production_eligible != b.production_eligible ||
+        a.exact_evidence != b.exact_evidence || a.cpu_tail != b.cpu_tail ||
+        a.cpu_tail_placement != b.cpu_tail_placement)
+      return false;
+  }
+  return true;
+}
+
 bool ValidModelSelections(
     const ProductionVideoResidentSetupSourceResult &candidate,
     const effects::BroadcastCameraEffects &effects) noexcept {
@@ -448,7 +487,9 @@ bool ValidModelSelections(
        stage_index < candidate.plan.intent.stage_count; ++stage_index) {
     const auto &stage = candidate.plan.intent.stages[stage_index];
     const auto *configured = ConfiguredModelId(effects, stage.intent.semantic);
-    if (configured == nullptr)
+    if (configured == nullptr ||
+        !StageSelectable(candidate.resolution_registration,
+                         stage.intent.semantic))
       continue;
     bool found = false;
     for (std::size_t selection_index = 0;
@@ -780,9 +821,33 @@ hal::StatusId ValidateResidentCandidate(
     return hal::StatusId::blocked;
   }
 
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId registration_reason = hal::ReasonId::none;
+  if (registry.Register(candidate.adapter, &registration_reason) !=
+      hal::StatusId::ready) {
+    SetReason(reason, registration_reason);
+    return hal::StatusId::blocked;
+  }
+  const auto resolution = hal::ResolveSemanticStages(
+      registry, BuildVideoResolutionRequest(plan.intent));
+  if (!resolution.available || resolution.passthrough ||
+      resolution.stage_count != plan.intent.stage_count) {
+    SetReason(reason, resolution.reason == hal::ReasonId::none
+                          ? hal::ReasonId::capability_evidence_incomplete
+                          : resolution.reason);
+    return hal::StatusId::blocked;
+  }
+
   for (std::size_t index = 0; index < plan.intent.stage_count;
        ++index) {
     const auto &stage = plan.intent.stages[index];
+    if (resolution.stages[index].skipped_optional) {
+      if (stage.intent.required) {
+        SetReason(reason, hal::ReasonId::required_stage_failed);
+        return hal::StatusId::blocked;
+      }
+      continue;
+    }
     const auto provider = ProviderForStage(candidate, stage.intent.semantic);
     if (provider == hal::SemanticEffectProviderId::invalid ||
         (plan.intent.strict_provider_selection &&
@@ -1121,6 +1186,13 @@ hal::StatusId ProductionVideoBackendManager::Setup(
                 hal::ReasonId::capability_evidence_incomplete, retained,
                 evidence, reason);
   }
+  if (lease_snapshot.backend == hal::BackendId::cuda &&
+      !SameResolutionRegistration(candidate.resolution_registration,
+                                  lease_snapshot.adapter)) {
+    return Fail(hal::StatusId::blocked,
+                hal::ReasonId::capability_evidence_incomplete, retained,
+                evidence, reason);
+  }
 
   hal::ReasonId validation_reason = hal::ReasonId::none;
   const auto validation_status = ValidateResidentCandidate(
@@ -1155,11 +1227,27 @@ hal::StatusId ProductionVideoBackendManager::Setup(
   snapshot_.setup_complete = true;
   ++snapshot_.setup_successes;
   RefreshResidentSnapshot();
-  if (evidence != nullptr) {
-    evidence->status = status;
-    evidence->reason = reason != nullptr ? *reason : prepare.reason;
+  const auto final_status =
+      candidate.status == hal::StatusId::degraded ||
+              status == hal::StatusId::degraded
+          ? hal::StatusId::degraded
+          : hal::StatusId::ready;
+  const auto final_reason = candidate.status == hal::StatusId::degraded
+                                ? candidate.reason
+                                : (reason != nullptr ? *reason : prepare.reason);
+  if (final_status == hal::StatusId::degraded) {
+    snapshot_.status = final_status;
+    snapshot_.reason = final_reason;
+    snapshot_.readiness.status = final_status;
+    snapshot_.readiness.reason = final_reason;
+    snapshot_.readiness.degraded = true;
   }
-  return status;
+  if (evidence != nullptr) {
+    evidence->status = final_status;
+    evidence->reason = final_reason;
+  }
+  SetReason(reason, final_reason);
+  return final_status;
 }
 
 VideoExecutionFrameResult ProductionVideoBackendManager::Execute(
