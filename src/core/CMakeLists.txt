@@ -116,6 +116,7 @@ set(_studiocast_open_video_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/production_video_backend_setup_source.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/video_execution_factory.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/matting_session.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_cuda_yunet_detector.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/yunet_face_detector.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/prepared_open_cuda_hardware_execution_owner.cpp)
 
@@ -628,7 +629,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 140)
+set(_studiocast_expected_source_count 141)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

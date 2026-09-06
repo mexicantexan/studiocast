@@ -1,0 +1,545 @@
+#include "core/open_video/prepared_cuda_yunet_detector.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <vector>
+
+#include "core/cuda/cuda_tensor.h"
+#include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
+#include "core/onnx/ort_session.h"
+#include "core/open_video/yunet_face_detector.h"
+
+namespace studiocast::open_video {
+namespace {
+constexpr int kInput = 320;
+constexpr std::size_t kOutputs = 12;
+constexpr std::size_t kTopK = 5000;
+const std::array<const char *, kOutputs> kNames = {
+    "cls_8",  "cls_16",  "cls_32",  "obj_8", "obj_16", "obj_32",
+    "bbox_8", "bbox_16", "bbox_32", "kps_8", "kps_16", "kps_32"};
+
+bool SameBinding(const PreparedCudaYunetBinding &a,
+                 const PreparedCudaYunetBinding &b) noexcept {
+  return a.driver == b.driver && a.context == b.context &&
+         a.stream == b.stream && a.stream_identity == b.stream_identity &&
+         a.owner_identity == b.owner_identity &&
+         a.configuration_generation == b.configuration_generation;
+}
+int Stride(std::string_view name) {
+  if (name.ends_with("_8"))
+    return 8;
+  if (name.ends_with("_16"))
+    return 16;
+  return 32;
+}
+int Channels(std::string_view name) {
+  if (name.starts_with("bbox_"))
+    return 4;
+  if (name.starts_with("kps_"))
+    return 10;
+  return 1;
+}
+
+class OrtYunetSession final : public internal::IPreparedCudaYunetSession {
+public:
+  OrtYunetSession(std::unique_ptr<onnx::OrtSession> session,
+                  onnx::OrtSessionInfo info)
+      : session_(std::move(session)), info_(std::move(info)) {}
+  const onnx::OrtSessionInfo &info() const noexcept override { return info_; }
+  bool Prepare(const onnx::OrtSession::CudaBindingInput *inputs, std::size_t ni,
+               const onnx::OrtSession::CudaBindingOutput *outputs,
+               std::size_t no, std::string *error) override {
+    session_->ReserveRunScratch(ni, no);
+    return session_->PrepareCudaIoBinding(0, inputs, ni, outputs, no, error);
+  }
+  onnx::OrtPreparedCudaRunEvidence evidence() const noexcept override {
+    return session_->prepared_cuda_run_evidence();
+  }
+  onnx::OrtPreparedRunResult
+  Execute(const onnx::OrtSession::CudaBindingInput *inputs, std::size_t ni,
+          const onnx::OrtSession::CudaBindingOutput *outputs, std::size_t no,
+          const onnx::OrtPreparedCudaRunEvidence &evidence) noexcept override {
+    return session_->ExecutePreparedCudaIoBindingTyped(0, inputs, ni, outputs,
+                                                       no, evidence);
+  }
+  void Invalidate() noexcept override {
+    session_->InvalidatePreparedBindings();
+  }
+
+private:
+  std::unique_ptr<onnx::OrtSession> session_;
+  onnx::OrtSessionInfo info_;
+};
+} // namespace
+
+struct PreparedCudaYunetDetector::Impl {
+  struct Output {
+    std::string name;
+    std::vector<int64_t> shape;
+    bool channels_first = false;
+    cuda::CudaTensor tensor;
+    std::size_t host_offset = 0;
+  };
+  PreparedCudaYunetSetup setup;
+  ValidatedModelArtifactIdentity artifact;
+  std::unique_ptr<internal::IPreparedCudaYunetSession> session;
+  onnx::OrtPreparedCudaRunEvidence run_evidence;
+  cuda::CudaTensor input;
+  std::string input_name;
+  std::array<int64_t, 4> input_shape{1, 3, kInput, kInput};
+  std::array<Output, kOutputs> outputs;
+  std::array<onnx::OrtSession::CudaBindingInput, 1> ort_input{};
+  std::array<onnx::OrtSession::CudaBindingOutput, kOutputs> ort_outputs{};
+  cuda::kernels::PreparedPreprocessKernelBundle preprocess;
+  cuda::CudaPreparedTransferCompletion completion;
+  YunetDetectionScratch scratch;
+  bool ready = false;
+  bool stopped = false;
+  FrameAnalysisCache *prepared_cache = nullptr;
+  ~Impl() {
+    // Live prepared generations require explicit after-quiescence Shutdown().
+    // Candidate setup rollback is safe here on the setup thread/context.
+    if (ready && !stopped)
+      return;
+    if (session)
+      session->Invalidate();
+    if (setup.binding.driver) {
+      std::string ignored;
+      for (auto &output : outputs)
+        (void)output.tensor.Free(setup.binding.driver, &ignored);
+      (void)input.Free(setup.binding.driver, &ignored);
+    }
+  }
+};
+
+PreparedCudaYunetDetector::PreparedCudaYunetDetector()
+    : impl_(std::make_unique<Impl>()) {}
+PreparedCudaYunetDetector::~PreparedCudaYunetDetector() = default;
+PreparedCudaYunetDetector::PreparedCudaYunetDetector(
+    PreparedCudaYunetDetector &&) noexcept = default;
+
+bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
+                                        std::string *error) {
+  if (error)
+    error->clear();
+  if (!impl_ || impl_->ready || !setup.binding.driver ||
+      !setup.binding.context.Valid() || !setup.binding.stream ||
+      setup.binding.stream_identity == 0 || setup.binding.owner_identity == 0 ||
+      setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
+      setup.frame_height <= 0 ||
+      setup.resource_budget_bytes < RequiredResourceBytes()) {
+    if (error)
+      *error = "invalid prepared YuNet setup";
+    return false;
+  }
+  auto registry = setup.models_root.empty()
+                      ? ModelPackRegistry::ScanDefault()
+                      : ModelPackRegistry::Scan(setup.models_root);
+  std::string selected = setup.requested_model_id.empty()
+                             ? registry.DefaultModelIdForTask("face_detection")
+                             : setup.requested_model_id;
+  const auto pack = registry.Find("face_detection", selected);
+  if (!pack) {
+    if (error)
+      *error = "requested YuNet model is not installed";
+    return false;
+  }
+  const ModelFile *main = nullptr;
+  for (const auto &file : pack->files)
+    if (file.kind == "onnx" && file.role == "main") {
+      main = &file;
+      break;
+    }
+  if (!main) {
+    if (error)
+      *error = "YuNet main ONNX artifact is missing";
+    return false;
+  }
+  const auto validation = ValidateModelArtifactIdentity(*pack, *main);
+  if (!validation.ok()) {
+    if (error)
+      *error = validation.detail;
+    return false;
+  }
+
+  onnx::OrtSessionOptions options;
+  options.provider_policy = onnx::OrtProviderPolicy::strict_cuda_only;
+  options.prefer_cuda = true;
+  options.enable_tensorrt = false;
+  options.cuda_device_id = setup.cuda_device_id;
+  options.cuda_context_generation = setup.binding.context.logical_generation;
+  options.user_compute_stream = setup.binding.stream;
+  onnx::OrtSessionInfo info;
+  auto session = onnx::OrtSession::Create(main->path, options, &info, error);
+  if (!session || !info.strict_provider_validation_passed ||
+      !onnx::OrtPreparedProviderEvidenceMatches(
+          info.prepared_provider_evidence, setup.cuda_device_id,
+          setup.binding.context.logical_generation,
+          reinterpret_cast<std::uintptr_t>(setup.binding.stream)) ||
+      info.input_names.size() != 1 || info.input_shapes.size() != 1 ||
+      info.output_names.size() != kOutputs) {
+    if (error && error->empty())
+      *error = "YuNet strict CUDA graph/provider evidence mismatch";
+    return false;
+  }
+  return PrepareValidated(
+      setup, validation.identity,
+      std::make_unique<OrtYunetSession>(std::move(session), std::move(info)),
+      error);
+}
+
+bool PreparedCudaYunetDetector::PrepareForTesting(
+    const PreparedCudaYunetSetup &setup,
+    const ValidatedModelArtifactIdentity &validated_artifact,
+    std::unique_ptr<internal::IPreparedCudaYunetSession> session,
+    std::string *error) {
+  return PrepareValidated(setup, validated_artifact, std::move(session), error);
+}
+
+bool PreparedCudaYunetDetector::PrepareValidated(
+    const PreparedCudaYunetSetup &setup,
+    const ValidatedModelArtifactIdentity &validated_artifact,
+    std::unique_ptr<internal::IPreparedCudaYunetSession> session,
+    std::string *error) {
+  if (error)
+    error->clear();
+  if (!impl_ || impl_->ready || !validated_artifact.Valid() || !session) {
+    if (error)
+      *error = "invalid prepared YuNet validated setup";
+    return false;
+  }
+  const auto &info = session->info();
+  if (!setup.binding.driver || !setup.binding.context.Valid() ||
+      !setup.binding.stream || setup.binding.stream_identity == 0 ||
+      setup.binding.owner_identity == 0 ||
+      setup.binding.configuration_generation == 0 || setup.frame_width <= 0 ||
+      setup.frame_height <= 0 ||
+      setup.resource_budget_bytes < RequiredResourceBytes() ||
+      !info.strict_provider_validation_passed ||
+      !onnx::OrtPreparedProviderEvidenceMatches(
+          info.prepared_provider_evidence, setup.cuda_device_id,
+          setup.binding.context.logical_generation,
+          reinterpret_cast<std::uintptr_t>(setup.binding.stream)) ||
+      info.input_names.size() != 1 || info.input_shapes.size() != 1 ||
+      info.output_names.size() != kOutputs) {
+    if (error)
+      *error = "YuNet strict CUDA graph/provider evidence mismatch";
+    return false;
+  }
+  std::string geometry_error;
+  if (!ValidateYunetInputTensorContract(info.input_shapes[0], false, kInput,
+                                        kInput, &geometry_error)) {
+    if (error)
+      *error = geometry_error;
+    return false;
+  }
+  auto candidate = std::make_unique<Impl>();
+  candidate->setup = setup;
+  candidate->artifact = validated_artifact;
+  candidate->session = std::move(session);
+  if (!candidate->input.AllocateNchwF32(setup.binding.driver, 1, 3, kInput,
+                                        kInput, error))
+    return false;
+  std::size_t host_offset = 0;
+  for (std::size_t index = 0; index < kOutputs; ++index) {
+    const auto found = std::find(info.output_names.begin(),
+                                 info.output_names.end(), kNames[index]);
+    if (found == info.output_names.end()) {
+      if (error)
+        *error = "YuNet expected output is missing";
+      return false;
+    }
+    const auto graph_index = static_cast<std::size_t>(
+        std::distance(info.output_names.begin(), found));
+    const int stride = Stride(kNames[index]);
+    const int channels = Channels(kNames[index]);
+    const int anchors = (kInput / stride) * (kInput / stride);
+    if (graph_index >= info.output_shapes.size()) {
+      if (error)
+        *error = "YuNet output tensor shape mismatch";
+      return false;
+    }
+    auto &out = candidate->outputs[index];
+    const auto &declared = info.output_shapes[graph_index];
+    const auto matches = [](int64_t value, int expected) {
+      return value <= 0 || value == expected;
+    };
+    if (declared.size() == 3 && matches(declared[0], 1) &&
+        matches(declared[1], anchors) && matches(declared[2], channels)) {
+      out.shape = {1, anchors, channels};
+    } else if (declared.size() == 4 && matches(declared[0], 1) &&
+               matches(declared[1], channels) &&
+               matches(declared[2], kInput / stride) &&
+               matches(declared[3], kInput / stride) && declared[1] > 0) {
+      out.shape = {1, channels, kInput / stride, kInput / stride};
+      out.channels_first = true;
+    } else if (declared.size() == 4 && matches(declared[0], 1) &&
+               matches(declared[1], kInput / stride) &&
+               matches(declared[2], kInput / stride) &&
+               matches(declared[3], channels) && declared[3] > 0) {
+      out.shape = {1, kInput / stride, kInput / stride, channels};
+    } else {
+      if (error)
+        *error = "YuNet output tensor shape mismatch";
+      return false;
+    }
+    out.name = kNames[index];
+    out.host_offset = host_offset;
+    if (!out.tensor.AllocateNchwF32(setup.binding.driver, 1, 1, 1,
+                                    anchors * channels, error))
+      return false;
+    host_offset += out.tensor.bytes;
+    candidate->ort_outputs[index] = {
+        out.name.c_str(), reinterpret_cast<float *>(out.tensor.ptr),
+        out.tensor.ElementCount(), out.shape.data(), out.shape.size()};
+  }
+  candidate->input_name = info.input_names[0];
+  candidate->ort_input[0] = {
+      candidate->input_name.c_str(),
+      reinterpret_cast<const float *>(candidate->input.ptr),
+      candidate->input.ElementCount(), candidate->input_shape.data(),
+      candidate->input_shape.size()};
+  // Names/shapes referenced by bindings are retained by the candidate->
+  if (!candidate->session->Prepare(candidate->ort_input.data(), 1,
+                                   candidate->ort_outputs.data(), kOutputs,
+                                   error))
+    return false;
+  candidate->run_evidence = candidate->session->evidence();
+  if (!setup.binding.driver->MemsetD8Async(candidate->input.ptr, 0,
+                                           candidate->input.bytes,
+                                           setup.binding.stream, error))
+    return false;
+  const auto warmup = candidate->session->Execute(
+      candidate->ort_input.data(), 1, candidate->ort_outputs.data(), kOutputs,
+      candidate->run_evidence);
+  if (!warmup.ok() ||
+      !setup.binding.driver->StreamSynchronize(setup.binding.stream, error)) {
+    if (error && error->empty())
+      *error = "YuNet strict CUDA warmup failed";
+    return false;
+  }
+  cuda::kernels::PreparedPreprocessBinding preprocess_binding{
+      setup.binding.driver,
+      setup.binding.context,
+      setup.binding.stream,
+      setup.binding.stream_identity,
+      setup.binding.configuration_generation,
+      validated_artifact.registry_generation};
+  cuda::kernels::ModelPreprocessSpec spec;
+  spec.dst_w = kInput;
+  spec.dst_h = kInput;
+  spec.dst_order = cuda::kernels::ChannelOrder::bgr;
+  if (!candidate->preprocess.Prepare(
+          preprocess_binding, spec,
+          cuda::kernels::PreparedPreprocessKernelBundle::
+              RequiredResourceBytes(),
+          error))
+    return false;
+  cuda::CudaPreparedTransferCompletion::PrepareOptions completion_options;
+  completion_options.binding = {setup.binding.context, setup.binding.stream,
+                                setup.binding.stream_identity,
+                                setup.binding.owner_identity,
+                                setup.binding.configuration_generation};
+  completion_options.timed_stage_count = 1;
+  completion_options.resident_work = true;
+  completion_options.readback_count = kOutputs;
+  completion_options.budget.max_pinned_host_bytes = host_offset;
+  completion_options.budget.max_events = 3;
+  for (std::size_t i = 0; i < kOutputs; ++i)
+    completion_options.readbacks[i] = {candidate->outputs[i].tensor.ptr,
+                                       candidate->outputs[i].tensor.bytes,
+                                       candidate->outputs[i].host_offset,
+                                       candidate->outputs[i].tensor.bytes, 1};
+  if (!candidate->completion.Prepare(setup.binding.driver, completion_options)
+           .ok()) {
+    if (error)
+      *error = "YuNet prepared completion setup failed";
+    return false;
+  }
+  if (!candidate->scratch.Configure(kTopK))
+    return false;
+  candidate->ready = true;
+  impl_ = std::move(candidate);
+  return true;
+}
+
+bool PreparedCudaYunetDetector::PrepareCache(FrameAnalysisCache *cache,
+                                             std::string *error) {
+  if (error)
+    error->clear();
+  if (!cache || !ready()) {
+    if (error)
+      *error = "YuNet/cache is not prepared";
+    return false;
+  }
+  (void)cache->PrepareFaceDetections(kTopK);
+  impl_->prepared_cache = cache;
+  return true;
+}
+
+PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
+    const PreparedCudaYunetBinding &binding, const cuda::CudaImage &source,
+    std::uint64_t sequence, FrameAnalysisCache *cache,
+    const cuda::CudaPreparedTransferCompletion::WaitPolicy &wait) noexcept {
+  PreparedCudaYunetExecutionResult result;
+  if (!ready() || !cache || cache != impl_->prepared_cache ||
+      !SameBinding(binding, impl_->setup.binding) ||
+      source.w != impl_->setup.frame_width ||
+      source.h != impl_->setup.frame_height)
+    return result;
+  cache->BeginFrame(sequence);
+  const float scale =
+      std::min(static_cast<float>(kInput) / static_cast<float>(source.w),
+               static_cast<float>(kInput) / static_cast<float>(source.h));
+  const int scaled_w = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(source.w) * scale)));
+  const int scaled_h = std::max(
+      1, static_cast<int>(std::lround(static_cast<float>(source.h) * scale)));
+  const cuda::kernels::LetterboxGeometry geometry{
+      scaled_w, scaled_h, (kInput - scaled_w) / 2, (kInput - scaled_h) / 2, 0};
+  const cuda::CudaPreparedTransferCompletion::Binding completion_binding{
+      binding.context, binding.stream, binding.stream_identity,
+      binding.owner_identity, binding.configuration_generation};
+  if (!impl_->completion.BeginFrame(completion_binding, sequence).ok())
+    return result;
+  if (!impl_->completion.SubmitResidentWork(completion_binding).ok() ||
+      !impl_->completion.RecordStageBegin(completion_binding, 0).ok())
+    return result;
+  result.pending_work = true;
+  cuda::kernels::PreparedPreprocessBinding preprocess_binding{
+      binding.driver,
+      binding.context,
+      binding.stream,
+      binding.stream_identity,
+      binding.configuration_generation,
+      impl_->artifact.registry_generation};
+  cuda::kernels::ModelPreprocessSpec spec;
+  spec.dst_w = kInput;
+  spec.dst_h = kInput;
+  spec.dst_order = cuda::kernels::ChannelOrder::bgr;
+  cuda::kernels::PreparedPreprocessKernelStatus preprocess_status{};
+  if (!impl_->preprocess.ExecuteLetterboxed(preprocess_binding, spec, geometry,
+                                            source, impl_->input,
+                                            &preprocess_status)) {
+    (void)impl_->completion.RecordStageEnd(completion_binding, 0);
+    (void)impl_->completion.RecordCompletion(completion_binding);
+    const auto completed =
+        impl_->completion.WaitForCompletion(completion_binding, wait);
+    ++result.completion_waits;
+    result.pending_work = !completed.ok();
+    result.status = PreparedCudaYunetStatus::preprocess_failed;
+    return result;
+  }
+  const auto run = impl_->session->Execute(impl_->ort_input.data(), 1,
+                                           impl_->ort_outputs.data(), kOutputs,
+                                           impl_->run_evidence);
+  if (!run.ok()) {
+    (void)impl_->completion.RecordStageEnd(completion_binding, 0);
+    (void)impl_->completion.RecordCompletion(completion_binding);
+    const auto completed =
+        impl_->completion.WaitForCompletion(completion_binding, wait);
+    ++result.completion_waits;
+    result.pending_work = !completed.ok();
+    result.status = PreparedCudaYunetStatus::inference_failed;
+    return result;
+  }
+  if (!impl_->completion.RecordStageEnd(completion_binding, 0).ok())
+    return result;
+  for (std::uint32_t i = 0; i < kOutputs; ++i) {
+    const auto copy = impl_->completion.EnqueueReadbackAt(
+        completion_binding, i, impl_->outputs[i].tensor.ptr,
+        impl_->outputs[i].tensor.bytes);
+    if (!copy.ok()) {
+      result.status = PreparedCudaYunetStatus::readback_failed;
+      break;
+    }
+    ++result.enqueued_readbacks;
+  }
+  if (!impl_->completion.RecordCompletion(completion_binding).ok() ||
+      !impl_->completion.WaitForCompletion(completion_binding, wait).ok()) {
+    ++result.completion_waits;
+    result.status = PreparedCudaYunetStatus::completion_failed;
+    return result;
+  }
+  result.pending_work = false;
+  result.completed_readbacks = result.enqueued_readbacks;
+  if (result.completed_readbacks != kOutputs)
+    return result;
+  impl_->scratch.BeginFrame();
+  const auto *host =
+      static_cast<const std::byte *>(impl_->completion.readback_data());
+  for (int si = 0; si < 3; ++si) {
+    const int stride = si == 0 ? 8 : (si == 1 ? 16 : 32),
+              cols = kInput / stride, rows = kInput / stride;
+    const auto *cls = reinterpret_cast<const float *>(
+        host + impl_->outputs[static_cast<std::size_t>(si)].host_offset);
+    const auto *obj = reinterpret_cast<const float *>(
+        host + impl_->outputs[static_cast<std::size_t>(3 + si)].host_offset);
+    const auto *box = reinterpret_cast<const float *>(
+        host + impl_->outputs[static_cast<std::size_t>(6 + si)].host_offset);
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c) {
+        const int idx = r * cols + c;
+        const float score = std::sqrt(std::clamp(cls[idx], 0.f, 1.f) *
+                                      std::clamp(obj[idx], 0.f, 1.f));
+        if (score < 0.9f)
+          continue;
+        const auto box_value = [&](int channel) {
+          return impl_->outputs[static_cast<std::size_t>(6 + si)].channels_first
+                     ? box[channel * rows * cols + idx]
+                     : box[idx * 4 + channel];
+        };
+        const float stride_f = static_cast<float>(stride);
+        const float cx = (static_cast<float>(c) + box_value(0)) * stride_f,
+                    cy = (static_cast<float>(r) + box_value(1)) * stride_f;
+        const float w = std::exp(box_value(2)) * stride_f,
+                    h = std::exp(box_value(3)) * stride_f;
+        impl_->scratch.Consider({cx - w * .5f, cy - h * .5f, w, h, score});
+      }
+  }
+  const auto &faces = impl_->scratch.Finalize(
+      scale, geometry.pad_x, geometry.pad_y, source.w, source.h, .3f);
+  auto &cached = cache->PrepareFaceDetections(kTopK);
+  cached.assign(faces.begin(), faces.end());
+  result.cpu_tail_boundaries = 1;
+  result.completion_waits = 1;
+  result.status = faces.empty() ? PreparedCudaYunetStatus::success_no_faces
+                                : PreparedCudaYunetStatus::success_faces;
+  return result;
+}
+
+bool PreparedCudaYunetDetector::Shutdown(std::string *error) noexcept {
+  if (error)
+    error->clear();
+  if (!impl_ || impl_->stopped)
+    return true;
+  const auto completion = impl_->completion.Shutdown();
+  if (!completion.ok()) {
+    if (error)
+      *error = "YuNet completion cleanup remains pending";
+    return false;
+  }
+  if (impl_->session)
+    impl_->session->Invalidate();
+  bool ok = true;
+  for (auto &out : impl_->outputs)
+    ok = out.tensor.Free(impl_->setup.binding.driver, error) && ok;
+  ok = impl_->input.Free(impl_->setup.binding.driver, error) && ok;
+  if (ok) {
+    impl_->ready = false;
+    impl_->stopped = true;
+  }
+  return ok;
+}
+bool PreparedCudaYunetDetector::ready() const noexcept {
+  return impl_ && impl_->ready && !impl_->stopped;
+}
+const ValidatedModelArtifactIdentity &
+PreparedCudaYunetDetector::artifact() const noexcept {
+  return impl_->artifact;
+}
+
+} // namespace studiocast::open_video
