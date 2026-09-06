@@ -63,7 +63,8 @@ ProviderMatchesLane(ProductCapabilityLaneId lane,
            provider == Provider::maxine_ar ||
            provider == Provider::maxine_cuda_utility;
   case ProductCapabilityLaneId::open_cuda:
-    return provider == Provider::open_video_onnxruntime_cuda;
+    return provider == Provider::open_video_onnxruntime_cuda ||
+           provider == Provider::open_cuda_production_kernels;
   case ProductCapabilityLaneId::open_vulkan:
     return provider == Provider::open_vulkan_production_kernels;
   case ProductCapabilityLaneId::cpu:

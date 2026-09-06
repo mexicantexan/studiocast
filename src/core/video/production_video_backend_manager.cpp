@@ -474,6 +474,7 @@ bool ProviderMatchesCompatibilityDomain(
   const auto residency = hal::ClassifyExecutionResidency(entry.domain);
   switch (entry.provider) {
   case hal::SemanticEffectProviderId::open_video_onnxruntime_cuda:
+  case hal::SemanticEffectProviderId::open_cuda_production_kernels:
     return entry.backend == hal::BackendId::cuda &&
            residency == hal::ExecutionResidencyClass::device;
   case hal::SemanticEffectProviderId::open_video_onnxruntime_cpu:

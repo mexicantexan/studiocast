@@ -542,8 +542,10 @@ Video compute preference values:
 - `auto`: prefer usable CUDA on NVIDIA systems, otherwise resolve to the next
   supported backend or CPU/pass-through.
 - `cpu`: force CPU/pass-through behavior for GPU-backed effects.
-- `cuda`: request Open CUDA; missing CUDA/ORT/model support must be reported as
-  unavailable or degraded.
+- `cuda`: request Open CUDA; missing CUDA support must be reported as
+  unavailable or degraded. Model-backed stages additionally require ONNX
+  Runtime CUDA EP and a compatible model pack; model-free native CUDA stages
+  do not report fabricated ORT or model prerequisites.
 - `vulkan`: request Open Vulkan. This must not silently run CUDA; if Vulkan is
   unavailable, status reports a Vulkan fallback/degraded reason and the active
   backend reflects CPU/pass-through where applicable.
@@ -579,9 +581,11 @@ routes. The GUI has not become authoritative, and installer consumption is
 still shadow-only, rejects incomplete authority, and is
 recommendation-ineligible.
 
-Open CUDA video effects are GPU-only. If CUDA, ONNX Runtime, or model packs are
-missing, the effects should be marked unavailable rather than silently falling
-back to CPU.
+Open CUDA video effects are GPU-only. Missing CUDA makes them unavailable.
+Model-backed stages also become unavailable when ONNX Runtime CUDA EP or their
+model packs are missing. Native CUDA kernel stages carry their own provider
+identity and require neither an ORT session nor a model artifact. No Open CUDA
+stage silently falls back to CPU.
 
 Open Vulkan is optional and runtime-loaded. Build with
 `-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it. Ubuntu-family setup can

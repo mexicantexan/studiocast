@@ -28,6 +28,62 @@ namespace studiocast::video {
 std::unique_ptr<IProductionVideoBackendSetupSource>
 CreateStaticProductionVideoBackendSetupSource() noexcept;
 
+void ApplyCameraBackendSelectionIntent(
+    effects::EffectsEnginePreference engine,
+    ComputeBackendPreference compute_backend,
+    NormalizedVideoExecutionIntent *intent) noexcept {
+  if (intent == nullptr)
+    return;
+  switch (engine) {
+  case effects::EffectsEnginePreference::maxine:
+    intent->backend.mode = hal::BackendRequestMode::explicit_backend;
+    intent->backend.backend = hal::BackendId::maxine;
+    intent->backend.strict = true;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::cuda_family;
+    intent->preferences.effects_engine = hal::EffectsEnginePreferenceConstraint::maxine;
+    intent->preferences.strict_effects_engine = true;
+    break;
+  case effects::EffectsEnginePreference::open_cuda:
+    intent->backend.mode = hal::BackendRequestMode::explicit_backend;
+    intent->backend.backend = hal::BackendId::cuda;
+    intent->backend.strict = true;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::cuda_family;
+    intent->preferences.effects_engine = hal::EffectsEnginePreferenceConstraint::open_cuda;
+    intent->preferences.strict_effects_engine = true;
+    break;
+  case effects::EffectsEnginePreference::auto_select:
+    intent->backend.mode = hal::BackendRequestMode::automatic;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::any;
+    intent->preferences.effects_engine = hal::EffectsEnginePreferenceConstraint::automatic;
+    intent->preferences.strict_effects_engine = false;
+    break;
+  }
+  if (compute_backend == ComputeBackendPreference::vulkan) {
+    intent->backend.mode = hal::BackendRequestMode::explicit_backend;
+    intent->backend.backend = hal::BackendId::vulkan;
+    intent->backend.strict = true;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::vulkan_only;
+    if (intent->requested_provider ==
+            hal::SemanticEffectProviderId::invalid &&
+        !intent->strict_provider_selection) {
+      intent->requested_provider =
+          hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+      intent->strict_provider_selection = true;
+    }
+  } else if (compute_backend == ComputeBackendPreference::cuda &&
+             intent->backend.mode == hal::BackendRequestMode::automatic) {
+    intent->backend.mode = hal::BackendRequestMode::explicit_backend;
+    intent->backend.backend = hal::BackendId::cuda;
+    intent->backend.strict = true;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::cuda_family;
+  } else if (compute_backend == ComputeBackendPreference::cpu) {
+    intent->backend.mode = hal::BackendRequestMode::explicit_backend;
+    intent->backend.backend = hal::BackendId::cpu;
+    intent->backend.strict = true;
+    intent->preferences.compute_family = hal::ComputeFamilyAllowance::cpu_only;
+  }
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -398,62 +454,8 @@ ProductionVideoBackendSetupRequest BuildSetupRequest(
   auto &plan = request.resident.plan;
   plan.plan_id = plan_id == 0 ? 1 : plan_id;
 
-  switch (effects.engine) {
-  case effects::EffectsEnginePreference::maxine:
-    plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-    plan.intent.backend.backend = hal::BackendId::maxine;
-    plan.intent.backend.strict = true;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::cuda_family;
-    plan.intent.preferences.effects_engine =
-        hal::EffectsEnginePreferenceConstraint::maxine;
-    plan.intent.preferences.strict_effects_engine = true;
-    break;
-  case effects::EffectsEnginePreference::open_cuda:
-    plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-    plan.intent.backend.backend = hal::BackendId::cuda;
-    plan.intent.backend.strict = true;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::cuda_family;
-    plan.intent.preferences.effects_engine =
-        hal::EffectsEnginePreferenceConstraint::open_cuda;
-    plan.intent.preferences.strict_effects_engine = true;
-    plan.intent.requested_provider =
-        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
-    plan.intent.strict_provider_selection = true;
-    break;
-  case effects::EffectsEnginePreference::auto_select:
-    plan.intent.backend.mode = hal::BackendRequestMode::automatic;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::any;
-    plan.intent.preferences.effects_engine =
-        hal::EffectsEnginePreferenceConstraint::automatic;
-    plan.intent.preferences.strict_effects_engine = false;
-    break;
-  }
-  if (compute_backend == ComputeBackendPreference::vulkan) {
-    plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-    plan.intent.backend.backend = hal::BackendId::vulkan;
-    plan.intent.backend.strict = true;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::vulkan_only;
-    plan.intent.requested_provider =
-        hal::SemanticEffectProviderId::open_vulkan_production_kernels;
-    plan.intent.strict_provider_selection = true;
-  } else if (compute_backend == ComputeBackendPreference::cuda &&
-             plan.intent.backend.mode == hal::BackendRequestMode::automatic) {
-    plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-    plan.intent.backend.backend = hal::BackendId::cuda;
-    plan.intent.backend.strict = true;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::cuda_family;
-  } else if (compute_backend == ComputeBackendPreference::cpu) {
-    plan.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
-    plan.intent.backend.backend = hal::BackendId::cpu;
-    plan.intent.backend.strict = true;
-    plan.intent.preferences.compute_family =
-        hal::ComputeFamilyAllowance::cpu_only;
-  }
+  ApplyCameraBackendSelectionIntent(effects.engine, compute_backend,
+                                    &plan.intent);
 
   const auto canonical =
       effects::BuildBroadcastEffectsPlan(request.resident.effects);
@@ -985,11 +987,8 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
             effects::EffectsEnginePreference::auto_select ||
         input.compute_backend != ComputeBackendPreference::auto_select;
     compatibility_program.requested_provider =
-        input.effects->engine == effects::EffectsEnginePreference::open_cuda
-            ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
-            : hal::SemanticEffectProviderId::invalid;
-    compatibility_program.strict_provider_selection =
-        input.effects->engine == effects::EffectsEnginePreference::open_cuda;
+        hal::SemanticEffectProviderId::invalid;
+    compatibility_program.strict_provider_selection = false;
     compatibility_program.requires_upload =
         topology.expected_transfers.uploads != 0;
     compatibility_program.requires_final_readback =
@@ -1215,7 +1214,10 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
     const auto desired = desired_backend(state.effect);
     state.requested = true;
     state.requested_backend = desired;
-    state.requested_provider = provider_for(desired, state.effect);
+    state.requested_provider =
+        input.effects->engine == effects::EffectsEnginePreference::open_cuda
+            ? hal::SemanticEffectProviderId::invalid
+            : provider_for(desired, state.effect);
     state.capability_lane = lane_for_backend(desired);
     if (const auto *desired_capability = FindProductCapabilityLane(
             build.capabilities, state.effect, state.capability_lane)) {
@@ -1230,9 +1232,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
         input.effects->engine !=
             effects::EffectsEnginePreference::auto_select ||
         input.compute_backend != ComputeBackendPreference::auto_select;
-    state.strict_provider_selection =
-        input.effects->engine ==
-        effects::EffectsEnginePreference::open_cuda;
+    state.strict_provider_selection = false;
     state.status = hal::StatusId::unavailable;
     state.reason = hal::ReasonId::capability_evidence_incomplete;
     state.blocked = true;
