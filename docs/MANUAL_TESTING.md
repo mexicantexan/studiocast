@@ -576,7 +576,9 @@ cover selected CUDA and Vulkan components, including both FP32 Eye Contact
 models with generated input and synthetic landmarks. They do not cover the
 full production route or camera/quality/latency behavior. Strict MODNet runs
 after free-dimension specialization, but the main-checkpoint production smoke
-still fails before writer commit on the resident alpha capacity calculation;
+still fails before writer commit because its capacity check multiplies the
+one-row pitched tensor allocation by model height even though the pitch already
+represents the full allocation;
 its correction is only in an unintegrated candidate. The final Vulkan matrix
 has not run, `vulkaninfo` is absent on the test host, and no AMD or Intel
 hardware has been qualified.

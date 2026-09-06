@@ -167,12 +167,14 @@ prepared island on the current main checkpoint.
 
 The current Quadro P1000 evidence is also bounded. Strict CUDA MODNet executes
 after setup-time specialization of its free dimensions; the later production
-smoke blocker was an alpha resource whose one-row pitch was used as its full
-capacity. The correction exists only in the unintegrated vignette candidate at
-this checkpoint. Native YuNet, dlib landmark, Eye Contact, mirror, vignette,
-resize, and letterbox runs prove their stated components on NVIDIA driver
-535.309.01, but do not prove the complete camera route, face quality, latency,
-or every required combination and rollback case. The installed FastDVDnet
+smoke blocker was a capacity check that multiplied a one-row pitched NCHW
+tensor allocation by the model height even though its pitch already represented
+the full tensor allocation. The correction exists only in the unintegrated
+vignette candidate at this checkpoint. Native YuNet, dlib landmark, Eye
+Contact, mirror, vignette, resize, and letterbox runs prove their stated
+components on NVIDIA driver 535.309.01, but do not prove the complete camera
+route, face quality, latency, or every required combination and rollback case.
+The installed FastDVDnet
 artifact matches its curated identity but fails ONNX graph validation because
 a weight input has no producer or initializer; its catalog policy awaits an
 explicit decision. These routes remain compatibility-owned or blocked as

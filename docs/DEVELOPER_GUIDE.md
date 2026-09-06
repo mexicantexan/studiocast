@@ -614,7 +614,8 @@ stage and its alpha-capacity correction are still an unintegrated candidate.
 Strict MODNet inference succeeds after setup-time free-dimension
 specialization, so an earlier CPU graph-partition diagnosis is obsolete. The
 remaining observed production-smoke failure at this checkpoint is the
-resident alpha capacity calculation, before a successful writer commit.
+resident alpha capacity check multiplying the one-row allocation pitch by model
+height, before a successful writer commit.
 
 On a Quadro P1000 with NVIDIA driver 535.309.01, component evidence includes
 exact dlib landmark parity across 20 generated cases, YuNet metadata/readback
