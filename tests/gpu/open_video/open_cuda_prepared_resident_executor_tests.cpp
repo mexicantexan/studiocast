@@ -288,6 +288,8 @@ public:
     if (fail_prepare) {
       result.status = RuntimeStatus::resource_exhausted;
       result.reason = hal::ReasonId::resource_exhausted;
+      result.failed_component =
+          open_cuda::OpenCudaSetupComponentId::shared_matting;
       return result;
     }
     Slot *slot = nullptr;
@@ -1544,6 +1546,8 @@ bool TestBudgetEvidenceRollbackAndOldPlanRetention() {
                     fixture.session.prepared() &&
                     fixture.session.program().program_id ==
                         fixture.program.program_id &&
+                    fixture.executor.LastPrepareResult().failed_component ==
+                        open_cuda::OpenCudaSetupComponentId::shared_matting &&
                     fixture.session.telemetry().setup_rollbacks == 1,
                 "failed candidate should retain the old exact program") &&
          ok;

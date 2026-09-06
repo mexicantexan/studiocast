@@ -90,19 +90,10 @@ public:
     snapshot_.readiness.status = hal::StatusId::ready;
     snapshot_.readiness.requested_backend = hal::BackendId::cuda;
     snapshot_.readiness.selected_backend = hal::BackendId::cuda;
-    const bool has_vignette =
-        plan.intent.stages[plan.intent.stage_count - 1].intent.semantic ==
-        hal::SemanticEffectId::vignette;
-    const bool has_model = plan.intent.stage_count > (has_vignette ? 1u : 0u);
-    snapshot_.readiness.provider =
-        has_model && has_vignette
-            ? hal::SemanticEffectProviderId::invalid
-            : has_model
-                  ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
-                  : hal::SemanticEffectProviderId::open_cuda_production_kernels;
+    snapshot_.readiness.provider = plan.prepared_program.requested_provider;
     snapshot_.readiness.execution_domain = FakeCudaDomain();
     snapshot_.readiness.ready_stage_mask =
-        (std::uint32_t{1} << plan.intent.stage_count) - 1u;
+        (std::uint32_t{1} << plan.prepared_program.stage_count) - 1u;
     snapshot_.readiness.available = true;
   }
   video::VideoExecutionFrameResult
@@ -115,11 +106,8 @@ public:
                 std::min(bytes, binding.input_planes[0].span_bytes));
     pending_ = {next_token_++, plan_.plan_id, kFakeAdapter,
                 binding.capture_sequence, true};
-    result.status = plan_.intent.stage_count == 2 ? hal::StatusId::degraded
-                                                  : hal::StatusId::executed;
-    result.reason = plan_.intent.stage_count == 2
-                        ? hal::ReasonId::optional_stage_failed_open
-                        : hal::ReasonId::none;
+    result.status = hal::StatusId::executed;
+    result.reason = hal::ReasonId::none;
     result.completion = pending_;
     result.output.descriptor = binding.output_descriptor;
     result.output.planes = binding.output_planes;
@@ -128,22 +116,18 @@ public:
     result.output.output_ready = true;
     result.output_ready = true;
     result.execution_domain = FakeCudaDomain();
-    result.stage_count = plan_.intent.stage_count;
+    result.stage_count = plan_.prepared_program.stage_count;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
-      result.stages[index].stage_id =
-          plan_.intent.stages[index].intent.stage_id;
-      result.stages[index].semantic =
-          plan_.intent.stages[index].intent.semantic;
+      result.stages[index].stage_id = plan_.prepared_program.stages[index].stage_id;
+      result.stages[index].semantic = plan_.prepared_program.stages[index].semantic;
       result.stages[index].status = hal::StageExecutionStatus::succeeded;
     }
-    if (result.stage_count == 2) {
-      result.stages[0].status =
-          hal::StageExecutionStatus::optional_failed_open;
-      result.stages[0].reason =
-          hal::ReasonId::semantic_provider_unavailable;
-      result.stages[0].valid_output_preserved = true;
+    bool vignette_executed = false;
+    for (std::size_t index = 0; index < result.stage_count; ++index)
+      vignette_executed |= result.stages[index].semantic ==
+                           hal::SemanticEffectId::vignette;
+    if (vignette_executed)
       binding.output_planes[0].write_data[0] ^= std::byte{0x7F};
-    }
     result.transfers.uploads = 1;
     result.transfers.final_readbacks = 1;
     result.transfers.cpu_tail_boundaries = 1;
@@ -167,16 +151,18 @@ public:
       snapshot_.latest_committed_frame.capture_sequence =
           completion.capture_sequence;
       snapshot_.latest_committed_frame.output_commit_sequence = ++commits_;
-      snapshot_.latest_committed_frame.stage_count = plan_.intent.stage_count;
-      for (std::size_t index = 0; index < plan_.intent.stage_count; ++index) {
+      snapshot_.latest_committed_frame.stage_count =
+          plan_.prepared_program.stage_count;
+      for (std::size_t index = 0; index < plan_.prepared_program.stage_count;
+           ++index) {
         snapshot_.latest_committed_frame.stages[index].stage_id =
-            plan_.intent.stages[index].intent.stage_id;
+            plan_.prepared_program.stages[index].stage_id;
         snapshot_.latest_committed_frame.stages[index].semantic =
-            plan_.intent.stages[index].intent.semantic;
+            plan_.prepared_program.stages[index].semantic;
       }
       snapshot_.telemetry.active_backend = hal::BackendId::cuda;
       snapshot_.telemetry.active_provider =
-          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+          plan_.prepared_program.requested_provider;
     }
     pending_ = {};
     return succeeded ? hal::StatusId::ready : hal::StatusId::failed;
@@ -207,10 +193,18 @@ public:
     video::VideoAdapterFactoryPreflight result;
     result.status = hal::StatusId::ready;
     result.backend = hal::BackendId::cuda;
-    const bool has_vignette = request.intent.stages[request.intent.stage_count - 1]
-                                  .intent.semantic ==
-                              hal::SemanticEffectId::vignette;
-    const bool has_model = request.intent.stage_count > (has_vignette ? 1u : 0u);
+    bool has_vignette = false;
+    bool has_model = false;
+    std::size_t selected_count = 0;
+    for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+      if (resolution.stages[index].skipped_optional)
+        continue;
+      ++selected_count;
+      has_vignette |= resolution.stages[index].intent.semantic ==
+                      hal::SemanticEffectId::vignette;
+      has_model |= resolution.stages[index].intent.semantic !=
+                   hal::SemanticEffectId::vignette;
+    }
     result.provider = has_model && has_vignette
                           ? hal::SemanticEffectProviderId::invalid
                           : has_model
@@ -223,7 +217,7 @@ public:
     result.readiness.provider = result.provider;
     result.readiness.execution_domain = FakeCudaDomain();
     result.readiness.ready_stage_mask =
-        (std::uint32_t{1} << request.intent.stage_count) - 1u;
+        (std::uint32_t{1} << selected_count) - 1u;
     result.readiness.available = true;
     result.cached_evidence_only = true;
     result.accepts_frozen_resolution = true;
@@ -251,9 +245,12 @@ public:
     program.requires_upload = domain_plan.islands[0].requires_upload;
     program.requires_final_readback =
         domain_plan.islands[0].requires_final_readback;
+    std::size_t prepared_index = 0;
     for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
       const auto &resolved = resolution.stages[index];
-      auto &stage = program.stages[index];
+      if (resolved.skipped_optional)
+        continue;
+      auto &stage = program.stages[prepared_index];
       stage.stage_id = resolved.intent.stage_id;
       stage.semantic = resolved.intent.semantic;
       stage.provider = resolved.intent.semantic == hal::SemanticEffectId::vignette
@@ -266,7 +263,7 @@ public:
       stage.input.image.host_coherence = hal::HostCoherence::not_host_visible;
       stage.output.kind = hal::StageIoKind::image;
       stage.output.image =
-          index + 1 == request.intent.stage_count
+          prepared_index + 1 == selected_count
               ? request.host_output
               : request.host_input;
       stage.output.image.host_coherence = hal::HostCoherence::not_host_visible;
@@ -279,8 +276,15 @@ public:
       stage.circuit_breaker.action = stage.required
                                          ? hal::CircuitBreakerAction::quarantine_program
                                          : hal::CircuitBreakerAction::disable_stage;
+      ++prepared_index;
     }
-    program.stage_count = request.intent.stage_count;
+    program.stage_count = prepared_index;
+    if (program.cpu_tail_count == 1 && prepared_index != 0) {
+      program.cpu_tails[0].after_stage_id =
+          program.stages[prepared_index - 1].stage_id;
+      program.cpu_tails[0].boundary_index =
+          static_cast<std::uint32_t>(prepared_index);
+    }
     return result;
   }
   std::unique_ptr<video::IVideoExecutionExecutor>
@@ -306,7 +310,12 @@ public:
 
 struct InjectionState {
   bool fail_acquire = false;
+  std::size_t fail_attempts = 0;
   bool mismatch_artifact = false;
+  std::size_t acquire_calls = 0;
+  open_cuda::OpenCudaSetupComponentId failed_component =
+      open_cuda::OpenCudaSetupComponentId::invalid;
+  bool cleanup_quiescent = true;
 };
 
 bool ResolveFakeModel(
@@ -331,6 +340,13 @@ bool ResolveFakeModel(
   return true;
 }
 
+bool ResolveMissingModel(
+    void *, const video::CanonicalVideoStage &, const std::string &,
+    open_video::ModelPack *,
+    open_video::ValidatedModelArtifactIdentity *) noexcept {
+  return false;
+}
+
 hal::StatusId AcquireFakeLease(
     void *context,
     const open_cuda::OpenCudaProductionVideoExecutionFactoryRequest &request,
@@ -339,7 +355,24 @@ hal::StatusId AcquireFakeLease(
     video::ProductionVideoSetupLeaseAcquireEvidence *evidence,
     hal::ReasonId *reason) noexcept {
   auto *state = static_cast<InjectionState *>(context);
-  if (state->fail_acquire) {
+  ++state->acquire_calls;
+  if (state->fail_acquire || state->acquire_calls <= state->fail_attempts) {
+    if (bootstrap) {
+      bootstrap->status = hal::StatusId::resource_exhausted;
+      bootstrap->reason = hal::ReasonId::resource_exhausted;
+      bootstrap->failed_component = state->failed_component;
+      bootstrap->candidate_shutdown.status =
+          state->cleanup_quiescent ? hal::StatusId::stopped
+                                   : hal::StatusId::degraded;
+      bootstrap->candidate_shutdown.reason =
+          state->cleanup_quiescent ? hal::ReasonId::shutdown_requested
+                                   : hal::ReasonId::synchronization_failed;
+      bootstrap->candidate_shutdown.shutdown_requested = true;
+      bootstrap->candidate_shutdown.pending = !state->cleanup_quiescent;
+      bootstrap->candidate_shutdown.quiescent = state->cleanup_quiescent;
+      bootstrap->candidate_shutdown.driver_context_release_permitted =
+          state->cleanup_quiescent;
+    }
     if (reason)
       *reason = hal::ReasonId::resource_exhausted;
     return hal::StatusId::resource_exhausted;
@@ -378,32 +411,41 @@ hal::StatusId AcquireFakeLease(
   snapshot.adapter.execution_domain = FakeCudaDomain();
   snapshot.adapter.selection_priority = 100;
   snapshot.adapter.resident_adapter = &owner->adapter;
-  for (std::size_t index = 0; index < request.stage_count; ++index) {
+  std::size_t final_selected = request.plan.intent.stage_count;
+  for (std::size_t index = request.plan.intent.stage_count; index-- > 0;)
+    if (request.canonical_status[index] == hal::StatusId::ready) {
+      final_selected = index;
+      break;
+    }
+  for (std::size_t index = 0; index < request.plan.intent.stage_count; ++index) {
+    const auto semantic = request.plan.intent.stages[index].intent.semantic;
     auto &capability = snapshot.adapter.semantic_capabilities[index];
-    capability.semantic = request.semantics[index];
-    capability.provider = request.semantics[index] == hal::SemanticEffectId::vignette
+    capability.semantic = semantic;
+    capability.provider = semantic == hal::SemanticEffectId::vignette
                               ? hal::SemanticEffectProviderId::open_cuda_production_kernels
                               : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
-    capability.status = hal::StatusId::ready;
-    capability.live_stage = true;
-    capability.production_eligible = true;
-    capability.exact_evidence = true;
-    capability.cpu_tail = index + 1 == request.stage_count
+    capability.status = request.canonical_status[index];
+    capability.reason = request.canonical_reason[index];
+    const bool selectable = capability.status == hal::StatusId::ready;
+    capability.live_stage = selectable;
+    capability.production_eligible = selectable;
+    capability.exact_evidence = selectable;
+    capability.cpu_tail = index == final_selected
                               ? hal::CpuTailId::writer_copy
                               : hal::CpuTailId::invalid;
     capability.cpu_tail_placement =
         hal::DeclaredCpuTail::Placement::after_stage;
     capability.evidence[0].code =
-        request.semantics[index] == hal::SemanticEffectId::vignette
+        semantic == hal::SemanticEffectId::vignette
             ? hal::CapabilityEvidenceCode::synchronization_evidence_valid
             : hal::CapabilityEvidenceCode::model_artifact_identity_valid;
     capability.evidence[0].status = hal::StatusId::ready;
-    capability.evidence[0].semantic = request.semantics[index];
+    capability.evidence[0].semantic = semantic;
     capability.evidence[0].backend = hal::BackendId::cuda;
     capability.evidence[0].satisfied = true;
-    capability.evidence_count = 1;
+    capability.evidence_count = selectable ? 1 : 0;
   }
-  snapshot.adapter.semantic_capability_count = request.stage_count;
+  snapshot.adapter.semantic_capability_count = request.plan.intent.stage_count;
   snapshot.factory.factory_id = kFakeFactory;
   snapshot.factory.route = video::VideoExecutionRoute::prepared_resident;
   snapshot.factory.backend = hal::BackendId::cuda;
@@ -422,8 +464,19 @@ hal::StatusId AcquireFakeLease(
   snapshot.readiness.ready_stage_mask =
       (std::uint32_t{1} << request.stage_count) - 1u;
   snapshot.readiness.available = true;
+  if (request.stage_count != request.plan.intent.stage_count) {
+    snapshot.status = hal::StatusId::degraded;
+    snapshot.reason = hal::ReasonId::optional_stage_failed_open;
+    snapshot.readiness.status = snapshot.status;
+    snapshot.readiness.reason = snapshot.reason;
+    snapshot.readiness.degraded = true;
+  }
   if (bootstrap)
+  {
     bootstrap->setup_lease = snapshot;
+    bootstrap->exact_candidate_ready = true;
+    bootstrap->actual_required_budget = request.reserved_budget;
+  }
   return video::ProductionVideoSetupLease::Acquire(
       snapshot, std::move(owner), destination, evidence, reason);
 }
@@ -594,10 +647,16 @@ bool SemanticCapabilityClaimsRemainExact() {
   for (const auto semantic : supported) {
     const auto result = source->AcquireResidentSetup(StrictRequest(semantic));
     ok &= Check(
-        result.status == hal::StatusId::unavailable &&
+        result.status == hal::StatusId::degraded &&
             result.reason == hal::ReasonId::capability_evidence_incomplete &&
+            result.readiness.available && result.readiness.degraded &&
+            result.readiness.selected_backend == hal::BackendId::invalid &&
+            result.readiness.provider ==
+                hal::SemanticEffectProviderId::invalid &&
+            result.plan.invalidation_key.execution_domain_hash ==
+                video::kProductionVideoNeutralPassthroughExecutionHash &&
             result.setup_completed_outside_frame_loop && !result.lease.live(),
-        "supported semantic did not advance to setup-time model evidence");
+        "optional missing model did not become typed neutral setup");
   }
   if (had_old)
     (void)setenv("XDG_DATA_HOME", old_value.c_str(), 1);
@@ -653,10 +712,12 @@ bool HostAndModelEvidenceAreSetupOnly() {
     (void)unsetenv("XDG_DATA_HOME");
 
   ok &= Check(
-      result.status == hal::StatusId::unavailable &&
+      result.status == hal::StatusId::degraded &&
           result.reason == hal::ReasonId::capability_evidence_incomplete &&
+          result.plan.invalidation_key.execution_domain_hash ==
+              video::kProductionVideoNeutralPassthroughExecutionHash &&
           result.setup_completed_outside_frame_loop && !result.lease.live(),
-      "missing model evidence did not fail during setup");
+      "missing optional model evidence did not become neutral setup");
   return ok;
 }
 
@@ -681,7 +742,7 @@ bool CanonicalAutomaticAndForcedCudaShapesReachSetup() {
       hal::SemanticEffectProviderId::invalid;
   automatic.plan.intent.strict_provider_selection = false;
   auto result = source->AcquireResidentSetup(automatic);
-  bool ok = Check(result.status == hal::StatusId::unavailable &&
+  bool ok = Check(result.status == hal::StatusId::degraded &&
                       result.reason ==
                           hal::ReasonId::capability_evidence_incomplete,
                   "automatic intent did not reach model setup");
@@ -694,7 +755,7 @@ bool CanonicalAutomaticAndForcedCudaShapesReachSetup() {
   forced_cuda.plan.intent.preferences.compute_family =
       hal::ComputeFamilyAllowance::cuda_family;
   result = source->AcquireResidentSetup(forced_cuda);
-  ok &= Check(result.status == hal::StatusId::unavailable &&
+  ok &= Check(result.status == hal::StatusId::degraded &&
                   result.reason ==
                       hal::ReasonId::capability_evidence_incomplete,
               "compute=cuda engine=auto intent did not reach model setup");
@@ -1035,7 +1096,7 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
                  frame.status == hal::StatusId::degraded) &&
                     frame.output_ready &&
                     output[0] ==
-                        (resident.plan.intent.stage_count == 2
+                        (has_vignette
                              ? (input[0] ^ std::byte{0x7F})
                              : input[0]),
                 "prepared source result did not execute");
@@ -1141,6 +1202,215 @@ bool ProductionSourceManagerBoundaryIsBehavioral() {
   return ok;
 }
 
+video::ProductionVideoResidentSetup OptionalMattingAndVignetteRequest() {
+  auto resident = WithTerminalVignette(StrictRequest());
+  resident.plan.intent.stages[0].intent.stage_id = 1;
+  resident.plan.intent.stages[0].intent.required = false;
+  resident.plan.intent.stages[1].intent.stage_id = 2;
+  resident.plan.intent.stages[1].intent.required = false;
+  resident.plan.cpu_tails[0].after_stage_id = 2;
+  resident.plan.cpu_tails[0].boundary_index = 2;
+  resident.effects.virtual_background.mode =
+      video::effects::VirtualBackgroundMode::blur;
+  auto &vb = resident.plan.intent.stages[0];
+  vb.parameters[1] = {video::CanonicalVideoParameterId::remove_color_rgb,
+                      video::CanonicalVideoParameterKind::unsigned_integer};
+  vb.parameters[2] = {video::CanonicalVideoParameterId::greenscreen_mode,
+                      video::CanonicalVideoParameterKind::unsigned_integer};
+  vb.parameters[3] = {video::CanonicalVideoParameterId::greenscreen_temporal,
+                      video::CanonicalVideoParameterKind::boolean};
+  vb.parameters[3].boolean_value = true;
+  vb.parameter_count = 4;
+  resident.plan.invalidation_key.generations.model = 0;
+  resident.plan.invalidation_key.generations.provider = 1;
+  resident.plan.invalidation_key.generations.device = 1;
+  resident.plan.invalidation_key.generations.context = 7;
+  resident.plan.budget.persistent_bytes = UINT64_C(1) << 20;
+  resident.plan.budget.scratch_bytes = UINT64_C(1) << 20;
+  resident.plan.budget.upload_staging_bytes = UINT64_C(1) << 20;
+  resident.plan.budget.readback_staging_bytes = UINT64_C(1) << 20;
+  resident.plan.budget.resource_count = 128;
+  resident.wait.timeout_nanoseconds = 1000;
+  resident.wait.poll_interval_nanoseconds = 10;
+  resident.wait.maximum_poll_count = 100;
+  resident.wait.stop_requested = &StopNever;
+  resident.wait.cancel_requested = &StopNever;
+  resident.wait.now_nanoseconds = &Now;
+  resident.wait.poll_wait = &Poll;
+  resident.wait.callback_context_generation = 1;
+  resident.wait.callback_context_lifetime =
+      hal::ResourceLifetime::adapter_context;
+  return resident;
+}
+
+bool OptionalSetupFailurePreservesHealthyComponent() {
+  const auto run = [](bool missing_matting) {
+    InjectionState state;
+    open_cuda::ProductionVideoBackendSetupDependencies dependencies;
+    dependencies.resolve_model =
+        missing_matting ? &ResolveMissingModel : &ResolveFakeModel;
+    dependencies.acquire_lease = &AcquireFakeLease;
+    dependencies.context = &state;
+    if (!missing_matting) {
+      state.fail_attempts = 1;
+      state.failed_component =
+          open_cuda::OpenCudaSetupComponentId::native_vignette;
+    }
+    auto resident = OptionalMattingAndVignetteRequest();
+    resident.wait.callback_context = &state;
+    video::ProductionVideoBackendManager manager(
+        open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+            dependencies));
+    video::ProductionVideoBackendSetupRequest request;
+    request.kind = video::ProductionVideoBackendSetupKind::resident_island;
+    request.resident = resident;
+    video::ProductionVideoBackendSetupEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status = manager.Setup(request, &evidence, &reason);
+    const auto setup = manager.Snapshot();
+    const auto &resolution = setup.resident.plan.resolution;
+    const auto failed_index = missing_matting ? 0u : 1u;
+    const auto ready_index = missing_matting ? 1u : 0u;
+    const auto expected_failure_reason =
+        missing_matting ? hal::ReasonId::capability_evidence_incomplete
+                        : hal::ReasonId::resource_exhausted;
+    const bool setup_exact = status == hal::StatusId::degraded &&
+                        setup.resident_prepared &&
+                        setup.resident.plan.intent.stage_count == 2 &&
+                        setup.resident.plan.prepared_program.stage_count == 1 &&
+                        setup.resident.plan.prepared_program.stages[0].stage_id ==
+                            (missing_matting ? 2u : 1u) &&
+                        resolution.stage_count == 2 &&
+                        resolution.stages[failed_index].status ==
+                            hal::StatusId::degraded &&
+                        resolution.stages[failed_index].reason ==
+                            expected_failure_reason &&
+                        resolution.stages[failed_index].skipped_optional &&
+                        resolution.stages[ready_index].status ==
+                            hal::StatusId::ready &&
+                        !resolution.stages[ready_index].skipped_optional &&
+                        state.acquire_calls == (missing_matting ? 1u : 2u);
+    if (!setup_exact)
+      std::cerr << "DETAIL optional setup missing=" << missing_matting
+                << " status=" << static_cast<unsigned>(status)
+                << " prepared=" << setup.resident_prepared
+                << " program_count="
+                << setup.resident.plan.prepared_program.stage_count
+                << " program_id="
+                << setup.resident.plan.prepared_program.stages[0].stage_id
+                << " resolution_count=" << resolution.stage_count
+                << " failed_status="
+                << static_cast<unsigned>(resolution.stages[failed_index].status)
+                << " failed_reason="
+                << static_cast<unsigned>(resolution.stages[failed_index].reason)
+                << " failed_skip="
+                << resolution.stages[failed_index].skipped_optional
+                << " ready_status="
+                << static_cast<unsigned>(resolution.stages[ready_index].status)
+                << " ready_skip="
+                << resolution.stages[ready_index].skipped_optional
+                << " calls=" << state.acquire_calls << '\n';
+    bool ok = Check(setup_exact,
+                    missing_matting
+                        ? "missing optional matting did not preserve vignette"
+                        : "optional vignette setup failure did not preserve matting");
+
+    std::array<std::byte, 64 * 48 * 3> input{};
+    std::array<std::byte, 64 * 48 * 3> output{};
+    input[0] = std::byte{0x25};
+    hal::HostFrameBinding binding;
+    binding.input_descriptor = resident.plan.host_input;
+    binding.output_descriptor = resident.plan.host_output;
+    binding.input_planes[0].read_data = input.data();
+    binding.input_planes[0].span_bytes = input.size();
+    binding.input_planes[0].row_stride_bytes = 64 * 3;
+    binding.output_planes[0].write_data = output.data();
+    binding.output_planes[0].span_bytes = output.size();
+    binding.output_planes[0].row_stride_bytes = 64 * 3;
+    binding.input_plane_count = binding.output_plane_count = 1;
+    binding.capture_sequence = 77;
+    binding.ownership = hal::OwnershipModel::borrowed_until_completion;
+    binding.lifetime = hal::ResourceLifetime::frame_borrowed;
+    const auto frame = manager.Execute(binding);
+    const auto expected = missing_matting ? (input[0] ^ std::byte{0x7f})
+                                          : input[0];
+    ok &= Check(frame.output_ready && frame.stage_count == 1 &&
+                    frame.stages[0].stage_id == (missing_matting ? 2u : 1u) &&
+                    output[0] == expected &&
+                    manager.CommitOutput(frame.completion, true, &reason) ==
+                        hal::StatusId::ready &&
+                    manager.Snapshot()
+                            .resident.latest_committed_frame.capture_sequence ==
+                        77 &&
+                    manager.Snapshot()
+                            .resident.latest_committed_frame.stage_count == 1 &&
+                    manager.Snapshot()
+                            .resident.latest_committed_frame.stages[0].stage_id ==
+                        (missing_matting ? 2u : 1u),
+                "surviving prepared component did not execute and commit");
+
+    if (!missing_matting) {
+      const auto restored_status = manager.Setup(request, &evidence, &reason);
+      const auto restored = manager.Snapshot();
+      ok &= Check(restored_status == hal::StatusId::ready &&
+                      restored.resident_prepared &&
+                      restored.resident.plan.intent.stage_count == 2 &&
+                      restored.resident.plan.prepared_program.stage_count == 2 &&
+                      restored.resident.plan.prepared_program.stages[0].stage_id ==
+                          1 &&
+                      restored.resident.plan.prepared_program.stages[1].stage_id ==
+                          2 &&
+                      !restored.resident.plan.resolution.stages[0]
+                           .skipped_optional &&
+                      !restored.resident.plan.resolution.stages[1]
+                           .skipped_optional,
+                  "next reconfiguration did not restore the previously failed "
+                  "optional vignette component");
+    }
+    return ok;
+  };
+
+  bool ok = run(true);
+  ok &= run(false);
+
+  InjectionState unsafe;
+  unsafe.fail_attempts = 1;
+  unsafe.failed_component =
+      open_cuda::OpenCudaSetupComponentId::native_vignette;
+  unsafe.cleanup_quiescent = false;
+  open_cuda::ProductionVideoBackendSetupDependencies dependencies;
+  dependencies.resolve_model = &ResolveFakeModel;
+  dependencies.acquire_lease = &AcquireFakeLease;
+  dependencies.context = &unsafe;
+  auto source = open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+      dependencies);
+  auto resident = OptionalMattingAndVignetteRequest();
+  resident.wait.callback_context = &unsafe;
+  const auto rejected = source->AcquireResidentSetup(resident);
+  ok &= Check(rejected.status == hal::StatusId::resource_exhausted &&
+                  unsafe.acquire_calls == 1 && !rejected.lease.live(),
+              "nonquiescent optional failure retried or published a candidate");
+
+  InjectionState required_state;
+  required_state.fail_attempts = 1;
+  required_state.failed_component =
+      open_cuda::OpenCudaSetupComponentId::native_vignette;
+  dependencies.context = &required_state;
+  source = open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+      dependencies);
+  resident = OptionalMattingAndVignetteRequest();
+  resident.plan.intent.stages[1].intent.required = true;
+  resident.plan.intent.stages[1].intent.failure_action =
+      hal::FailureAction::fail_closed;
+  resident.wait.callback_context = &required_state;
+  const auto required = source->AcquireResidentSetup(resident);
+  ok &= Check(required.status == hal::StatusId::resource_exhausted &&
+                  required.reason == hal::ReasonId::required_stage_failed &&
+                  required_state.acquire_calls == 1 && !required.lease.live(),
+              "required setup failure did not fail closed");
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -1149,6 +1419,7 @@ int main() {
       !CanonicalAutomaticAndForcedCudaShapesReachSetup() ||
       !StaticSelectionOrderIsBehavioral() ||
       !ProductionSourceManagerBoundaryIsBehavioral() ||
+      !OptionalSetupFailurePreservesHealthyComponent() ||
       !CompatibilityTopologyNeverMasqueradesAsStrictCuda()) {
     return 1;
   }

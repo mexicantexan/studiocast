@@ -225,6 +225,8 @@ struct PreparedOpenCudaRuntimePrepareResult {
   hal::ReasonId reason = hal::ReasonId::capability_evidence_incomplete;
   PreparedOpenCudaRuntimeHandle handle{};
   PreparedOpenCudaRuntimeEvidence evidence{};
+  OpenCudaSetupComponentId failed_component =
+      OpenCudaSetupComponentId::invalid;
 };
 
 struct PreparedOpenCudaRuntimeFrame {
@@ -357,6 +359,7 @@ public:
 
   ExecutorPrepareResult
   Prepare(const hal::PreparedProgram &program) noexcept override;
+  [[nodiscard]] ExecutorPrepareResult LastPrepareResult() const noexcept;
   hal::ExecuteResult
   Execute(const PreparedExecutorHandle &program,
           const hal::ExecuteRequest &request) noexcept override;
