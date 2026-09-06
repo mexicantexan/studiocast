@@ -95,6 +95,10 @@ struct ProductionVideoResidentSetupSourceResult {
   // that this plan preserves the caller's canonical request before composing
   // it.
   VideoExecutionPlanRequest plan{};
+  // Setup-only capability evidence used to independently resolve an
+  // all-optional unavailable request to neutral passthrough. It owns no
+  // resident adapter and is never consulted from the frame loop.
+  hal::AdapterRegistration resolution_registration{};
   ProductionVideoSetupLease lease{};
   ProductionVideoSetupLeaseAcquireEvidence lease_acquire{};
   // The source is called only from Setup(). This flag attests that its

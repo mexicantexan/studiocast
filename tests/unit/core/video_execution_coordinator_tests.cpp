@@ -595,6 +595,62 @@ bool TestZeroGpuPassthrough() {
                  "passthrough must not attribute a backend");
 }
 
+bool TestStrictOptionalUnavailablePassthrough() {
+  const auto domain = Domain();
+  hal::AdapterRegistration registration;
+  registration.adapter_instance_id = domain.adapter_instance_id;
+  registration.backend = domain.backend;
+  registration.execution_domain = domain;
+  registration.selection_priority = 10;
+  auto &capability = registration.semantic_capabilities[0];
+  capability.semantic = hal::SemanticEffectId::virtual_background_blur;
+  capability.provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  capability.status = hal::StatusId::unavailable;
+  capability.reason = hal::ReasonId::capability_evidence_incomplete;
+  registration.semantic_capability_count = 1;
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(registry.Register(registration, &reason) == hal::StatusId::ready,
+               "unavailable capability registration must be valid")) {
+    return false;
+  }
+
+  video::VideoExecutionCoordinator coordinator(registry);
+  auto request = Request();
+  video::VideoExecutionPrepareEvidence evidence;
+  bool ok = Require(coordinator.Prepare(request, &evidence, &reason) ==
+                        hal::StatusId::passthrough,
+                    "strict optional unavailable stage must pass through") &&
+            Require(evidence.resolution.stages[0].skipped_optional &&
+                        evidence.resolution.degraded &&
+                        evidence.resolution.selected_backend ==
+                            hal::BackendId::invalid &&
+                        evidence.resolution.selected_provider ==
+                            hal::SemanticEffectProviderId::invalid,
+                    "passthrough must preserve skipped typed resolution");
+  std::uint8_t input[24]{}, output[24]{};
+  auto frame = coordinator.Execute(Binding(input, output, 3));
+  ok &= Require(frame.status == hal::StatusId::passthrough &&
+                    frame.passthrough && frame.transfers.uploads == 0 &&
+                    frame.transfers.final_readbacks == 0,
+                "optional passthrough must execute without transfers");
+  ok &= Require(coordinator.CommitOutput(frame.completion, false, &reason) ==
+                        hal::StatusId::failed &&
+                    !coordinator.Snapshot().latest_committed_frame.valid,
+                "failed writer must not commit passthrough output");
+
+  request.intent.stages[0].intent.required = true;
+  request.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_closed;
+  video::VideoExecutionCoordinator required(registry);
+  ok &= Require(required.Prepare(request, &evidence, &reason) ==
+                        hal::StatusId::blocked &&
+                    !required.Snapshot().prepared,
+                "required unavailable stage must remain blocked");
+  return ok;
+}
+
 bool TestStrictMismatch() {
   const auto maxine_domain = Domain(hal::BackendId::maxine, 55);
   DummyResident maxine(maxine_domain);
@@ -614,6 +670,28 @@ bool TestStrictMismatch() {
                  "strict mismatch must preserve exact reason") &&
          Require(!coordinator.Snapshot().prepared,
                  "strict mismatch must leave no active plan");
+}
+
+bool TestStrictProviderMismatch() {
+  const auto domain = Domain();
+  DummyResident resident(domain);
+  hal::StaticAdapterRegistry registry;
+  if (!RegisterCapability(
+          &registry, &resident, domain,
+          hal::SemanticEffectProviderId::open_cuda_production_kernels)) {
+    return false;
+  }
+  video::VideoExecutionCoordinator coordinator(registry);
+  auto request = Request();
+  video::VideoExecutionPrepareEvidence evidence;
+  hal::ReasonId reason = hal::ReasonId::none;
+  return Require(coordinator.Prepare(request, &evidence, &reason) ==
+                     hal::StatusId::blocked,
+                 "strict provider request must reject another CUDA provider") &&
+         Require(reason == hal::ReasonId::semantic_provider_unavailable,
+                 "strict provider mismatch must preserve exact reason") &&
+         Require(!coordinator.Snapshot().prepared,
+                 "strict provider mismatch must leave no active plan");
 }
 
 bool TestExecuteCommitAndWriterFailure() {
@@ -1416,7 +1494,9 @@ void operator delete[](void *pointer, std::size_t) noexcept {
 int main() {
   bool ok = true;
   ok &= TestZeroGpuPassthrough();
+  ok &= TestStrictOptionalUnavailablePassthrough();
   ok &= TestStrictMismatch();
+  ok &= TestStrictProviderMismatch();
   ok &= TestExecuteCommitAndWriterFailure();
   ok &= TestInvalidationStaleGenerationAndOldPlanRetention();
   ok &= TestWrongDomainAndStaleCompletion();

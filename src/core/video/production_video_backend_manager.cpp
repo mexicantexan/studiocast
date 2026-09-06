@@ -598,6 +598,36 @@ bool SameCanonicalPlanRequest(const VideoExecutionPlanRequest &caller,
   return true;
 }
 
+bool SamePassthroughPlanRequest(
+    const VideoExecutionPlanRequest &caller,
+    const VideoExecutionPlanRequest &bound) noexcept {
+  if (caller.contract_version != bound.contract_version ||
+      caller.plan_id != bound.plan_id ||
+      !SameCanonicalIntent(caller.intent, bound.intent) ||
+      !SameImage(caller.host_input, bound.host_input) ||
+      !SameImage(caller.host_output, bound.host_output) ||
+      caller.invalidation_key.generations !=
+          bound.invalidation_key.generations ||
+      caller.invalidation_key.canonical_plan_hash !=
+          bound.invalidation_key.canonical_plan_hash ||
+      caller.invalidation_key.model_artifact_hash !=
+          bound.invalidation_key.model_artifact_hash ||
+      caller.invalidation_key.execution_domain_hash != 0 ||
+      bound.invalidation_key.execution_domain_hash == 0 ||
+      !SameTemporal(caller.temporal, bound.temporal) ||
+      !SameBudget(caller.budget, bound.budget) ||
+      caller.cpu_tail_count != bound.cpu_tail_count ||
+      caller.setup_failure_policy != bound.setup_failure_policy ||
+      caller.migration_policy != bound.migration_policy) {
+    return false;
+  }
+  for (std::size_t index = 0; index < caller.cpu_tail_count; ++index) {
+    if (!SameTail(caller.cpu_tails[index], bound.cpu_tails[index]))
+      return false;
+  }
+  return true;
+}
+
 bool IsZeroModel(const hal::ModelArtifactIdentity &model) noexcept {
   if (model.artifact_generation != 0)
     return false;
@@ -931,6 +961,69 @@ hal::StatusId ProductionVideoBackendManager::Setup(
   if (!candidate.setup_completed_outside_frame_loop) {
     return Fail(hal::StatusId::blocked, hal::ReasonId::malformed_contract,
                 retained, evidence, reason);
+  }
+  if (candidate.status == hal::StatusId::degraded && !candidate.lease.live() &&
+      !candidate.compatibility_executor) {
+    hal::StaticAdapterRegistry registry;
+    hal::ReasonId registration_reason = hal::ReasonId::none;
+    if (!IsSetupSuccess(registry.Register(candidate.resolution_registration,
+                                          &registration_reason))) {
+      return Fail(hal::StatusId::blocked, registration_reason, retained,
+                  evidence, reason);
+    }
+    const auto resolution = hal::ResolveSemanticStages(
+        registry, BuildVideoResolutionRequest(candidate.plan.intent));
+    if (!resolution.passthrough || !resolution.available ||
+        !resolution.degraded ||
+        resolution.status != hal::StatusId::passthrough ||
+        resolution.selected_backend != hal::BackendId::invalid ||
+        resolution.selected_provider !=
+            hal::SemanticEffectProviderId::invalid ||
+        candidate.canonical_effects != request.resident.effects ||
+        !SamePassthroughPlanRequest(request.resident.plan, candidate.plan)) {
+      return Fail(hal::StatusId::blocked,
+                  hal::ReasonId::capability_evidence_incomplete, retained,
+                  evidence, reason);
+    }
+    for (std::size_t index = 0; index < resolution.stage_count; ++index) {
+      if (!resolution.stages[index].skipped_optional ||
+          !StageParametersMatchEffects(candidate.plan.intent.stages[index],
+                                       request.resident.effects)) {
+        return Fail(hal::StatusId::blocked,
+                    hal::ReasonId::capability_evidence_incomplete, retained,
+                    evidence, reason);
+      }
+    }
+    VideoExecutionPrepareEvidence prepare;
+    const auto passthrough_status = composition_.PreparePassthrough(
+        candidate.resolution_registration, candidate.plan, &prepare, reason);
+    if (evidence)
+      evidence->composition_prepare = prepare;
+    if (passthrough_status != hal::StatusId::passthrough) {
+      if (evidence) {
+        evidence->status = passthrough_status;
+        evidence->reason = reason ? *reason : prepare.reason;
+        evidence->candidate_rejected = true;
+        evidence->old_plan_retained = prepare.old_plan_retained || retained;
+      }
+      return passthrough_status;
+    }
+    resident_selected_ = true;
+    if (compatibility_executor_) {
+      compatibility_executor_->Shutdown();
+      compatibility_executor_.reset();
+    }
+    snapshot_.state = ProductionVideoBackendManagerState::resident_ready;
+    snapshot_.cpu_primitive_bits = 0;
+    snapshot_.setup_complete = true;
+    ++snapshot_.setup_successes;
+    RefreshResidentSnapshot();
+    if (evidence) {
+      evidence->status = hal::StatusId::degraded;
+      evidence->reason = resolution.reason;
+    }
+    SetReason(reason, resolution.reason);
+    return hal::StatusId::degraded;
   }
   if (!IsSetupSuccess(candidate.status)) {
     const auto status = candidate.status == hal::StatusId::invalid

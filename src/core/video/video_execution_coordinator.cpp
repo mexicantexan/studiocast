@@ -183,7 +183,6 @@ bool SamePassthroughBinding(const hal::HostFrameBinding &binding,
       binding.lifetime != hal::ResourceLifetime::frame_borrowed ||
       !SameImage(binding.input_descriptor, plan.host_input) ||
       !SameImage(binding.output_descriptor, plan.host_output) ||
-      !SameImage(binding.input_descriptor, binding.output_descriptor) ||
       binding.input_plane_count != binding.input_descriptor.plane_count ||
       binding.output_plane_count != binding.output_descriptor.plane_count ||
       binding.input_plane_count != binding.output_plane_count) {
@@ -191,13 +190,7 @@ bool SamePassthroughBinding(const hal::HostFrameBinding &binding,
   }
   for (std::size_t index = 0; index < binding.input_plane_count; ++index) {
     if (binding.input_planes[index].read_data == nullptr ||
-        binding.output_planes[index].write_data == nullptr ||
-        binding.input_planes[index].read_data !=
-            binding.output_planes[index].write_data ||
-        binding.input_planes[index].span_bytes !=
-            binding.output_planes[index].span_bytes ||
-        binding.input_planes[index].row_stride_bytes !=
-            binding.output_planes[index].row_stride_bytes) {
+        binding.output_planes[index].write_data == nullptr) {
       return false;
     }
   }
@@ -617,6 +610,18 @@ VideoExecutionCoordinator::Prepare(const VideoExecutionPlanRequest &request,
   } else if (!IsSetupSuccess(domain_plan.status)) {
     prepare_.status = domain_plan.status;
     prepare_.reason = domain_plan.reason;
+  } else if (domain_plan.passthrough &&
+             !(request.intent.backend.strict &&
+               resolution.reason ==
+                   hal::ReasonId::strict_backend_unavailable)) {
+    ActivatePassthrough(request, resolution, domain_plan);
+    prepare_.status = hal::StatusId::passthrough;
+    prepare_.reason = resolution.reason;
+    prepare_.selected_route = VideoExecutionRoute::passthrough;
+    prepare_.readiness = readiness_;
+    if (evidence)
+      *evidence = prepare_;
+    return prepare_.status;
   } else if (request.intent.backend.strict &&
              resolution.selected_backend != request.intent.backend.backend) {
     prepare_.status = hal::StatusId::blocked;
@@ -626,15 +631,6 @@ VideoExecutionCoordinator::Prepare(const VideoExecutionPlanRequest &request,
                  request.intent.requested_provider) {
     prepare_.status = hal::StatusId::blocked;
     prepare_.reason = hal::ReasonId::semantic_provider_unavailable;
-  } else if (domain_plan.passthrough) {
-    ActivatePassthrough(request, resolution, domain_plan);
-    prepare_.status = hal::StatusId::passthrough;
-    prepare_.reason = hal::ReasonId::none;
-    prepare_.selected_route = VideoExecutionRoute::passthrough;
-    prepare_.readiness = readiness_;
-    if (evidence)
-      *evidence = prepare_;
-    return prepare_.status;
   } else {
     std::unique_ptr<IVideoExecutionExecutor> candidate;
     FrozenVideoExecutionPlan candidate_plan;
@@ -754,10 +750,12 @@ void VideoExecutionCoordinator::ActivatePassthrough(
   plan_.resolution = resolution;
   plan_.domain_plan = domain_plan;
   readiness_ = {};
-  readiness_.status = hal::StatusId::passthrough;
-  readiness_.reason = hal::ReasonId::none;
+  readiness_.status = resolution.degraded ? hal::StatusId::degraded
+                                          : hal::StatusId::passthrough;
+  readiness_.reason = resolution.reason;
   readiness_.requested_backend = resolution.requested_backend;
   readiness_.available = true;
+  readiness_.degraded = resolution.degraded;
   prepared_ = true;
   passthrough_ = true;
   quarantined_ = false;
@@ -798,12 +796,6 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     frame.status = hal::StatusId::passthrough;
     frame.completion = {passthrough_token_, plan_.plan_id, 0,
                         binding.capture_sequence, true};
-    frame.output.descriptor = binding.output_descriptor;
-    frame.output.planes = binding.output_planes;
-    frame.output.plane_count = binding.output_plane_count;
-    frame.output.capture_sequence = binding.capture_sequence;
-    frame.output.output_ready = true;
-    frame.output_ready = true;
     frame.passthrough = true;
   } else {
     frame = executor_->Execute(binding);
@@ -840,9 +832,10 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
       frame.completion.program_id != plan_.plan_id ||
       frame.completion.adapter_instance_id != expected_adapter ||
       frame.completion.capture_sequence != binding.capture_sequence ||
-      !frame.output_ready || !frame.output.output_ready ||
-      frame.output.capture_sequence != binding.capture_sequence ||
-      !SameImage(frame.output.descriptor, plan_.host_output) ||
+      (!passthrough_ &&
+       (!frame.output_ready || !frame.output.output_ready ||
+        frame.output.capture_sequence != binding.capture_sequence ||
+        !SameImage(frame.output.descriptor, plan_.host_output))) ||
       (!passthrough_ && frame.execution_domain !=
                             plan_.domain_plan.islands[0].execution_domain) ||
       frame.stage_count > hal::kMaxPreparedStages) {
