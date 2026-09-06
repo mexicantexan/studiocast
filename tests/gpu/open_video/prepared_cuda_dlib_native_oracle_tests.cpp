@@ -12,7 +12,7 @@ int main() {
   if (!root) {
     std::cout << "SKIP: set STUDIOCAST_DLIB_ORACLE_MODELS_ROOT for opt-in "
                  "native test\n";
-    return 0;
+    return 77;
   }
   const std::filesystem::path artifact =
       std::filesystem::path(root) / "face_landmarks" / "Dlib 68 (iBUG 300-W)" /
