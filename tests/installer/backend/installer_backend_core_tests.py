@@ -2335,7 +2335,9 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         # A literal full wipe does not recreate or restore the user's settings.
         (config / "daemon.conf").write_text("remove")
         (data / "models/custom").mkdir(parents=True, exist_ok=True); (data / "models/custom/mine").write_text("remove")
-        self.s.write_facts(self.s.json("analyze", "--target-version", "0.2.9"))
+        facts = self.s.json("analyze", "--target-version", "0.2.9")
+        facts["paths"]["free_bytes"] = 20_000_000_000
+        self.s.write_facts(facts)
         result, _ = self._apply_clean(False)
         self.assertEqual(result.returncode, 3)
         self.assertFalse(config.exists()); self.assertFalse((data / "models/custom/mine").exists())
