@@ -42,6 +42,27 @@ int Channels(std::string_view name) {
   return 1;
 }
 
+PreparedCudaYunetStatus
+CompletionStatus(cuda::CudaPreparedTransferCompletion::Status status) noexcept {
+  using Status = cuda::CudaPreparedTransferCompletion::Status;
+  switch (status) {
+  case Status::timeout:
+    return PreparedCudaYunetStatus::timeout;
+  case Status::stop_requested:
+    return PreparedCudaYunetStatus::stop_requested;
+  case Status::cancelled:
+    return PreparedCudaYunetStatus::cancelled;
+  case Status::device_lost:
+    return PreparedCudaYunetStatus::device_lost;
+  default:
+    return PreparedCudaYunetStatus::completion_failed;
+  }
+}
+
+bool IsDeviceLost(cuda::CudaPreparedTransferCompletion::Status status) {
+  return status == cuda::CudaPreparedTransferCompletion::Status::device_lost;
+}
+
 class OrtYunetSession final : public internal::IPreparedCudaYunetSession {
 public:
   OrtYunetSession(std::unique_ptr<onnx::OrtSession> session,
@@ -118,7 +139,17 @@ struct PreparedCudaYunetDetector::Impl {
 
 PreparedCudaYunetDetector::PreparedCudaYunetDetector()
     : impl_(std::make_unique<Impl>()) {}
-PreparedCudaYunetDetector::~PreparedCudaYunetDetector() = default;
+PreparedCudaYunetDetector::~PreparedCudaYunetDetector() {
+  if (!impl_)
+    return;
+  std::string ignored;
+  if (!Shutdown(&ignored)) {
+    // The owner violated the explicit after-quiescence shutdown contract.  Do
+    // not destroy ORT or CUDA storage while submitted work may still refer to
+    // it.  Context teardown reclaims this quarantined generation.
+    (void)impl_.release();
+  }
+}
 PreparedCudaYunetDetector::PreparedCudaYunetDetector(
     PreparedCudaYunetDetector &&) noexcept = default;
 
@@ -327,10 +358,16 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   const auto warmup = candidate->session->Execute(
       candidate->ort_input.data(), 1, candidate->ort_outputs.data(), kOutputs,
       candidate->run_evidence);
-  if (!warmup.ok() ||
-      !setup.binding.driver->StreamSynchronize(setup.binding.stream, error)) {
+  // Execute may have submitted part of a graph before reporting failure.  The
+  // setup candidate cannot release bindings or tensors until the owner stream
+  // is known quiescent.
+  const bool warmup_quiesced =
+      setup.binding.driver->StreamSynchronize(setup.binding.stream, error);
+  if (!warmup.ok() || !warmup_quiesced) {
     if (error && error->empty())
       *error = "YuNet strict CUDA warmup failed";
+    if (!warmup_quiesced)
+      (void)candidate.release();
     return false;
   }
   cuda::kernels::PreparedPreprocessBinding preprocess_binding{
@@ -344,6 +381,10 @@ bool PreparedCudaYunetDetector::PrepareValidated(
   spec.dst_w = input_w;
   spec.dst_h = input_h;
   spec.dst_order = cuda::kernels::ChannelOrder::bgr;
+  // OpenCV YuNet consumes bilinearly sampled BGR float values in [0,255].
+  // The shared prepared kernel first scales bytes by 1/255, so this reciprocal
+  // std preserves the published detector's raw-float input contract.
+  std::fill(std::begin(spec.std), std::end(spec.std), 1.0F / 255.0F);
   if (!candidate->preprocess.Prepare(
           preprocess_binding, spec,
           cuda::kernels::PreparedPreprocessKernelBundle::
@@ -418,10 +459,60 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
       binding.owner_identity, binding.configuration_generation};
   if (!impl_->completion.BeginFrame(completion_binding, sequence).ok())
     return result;
-  if (!impl_->completion.SubmitResidentWork(completion_binding).ok() ||
-      !impl_->completion.RecordStageBegin(completion_binding, 0).ok())
+  const auto submitted =
+      impl_->completion.SubmitResidentWork(completion_binding);
+  if (!submitted.ok()) {
+    result.status = CompletionStatus(submitted.status);
+    result.device_lost = IsDeviceLost(submitted.status);
     return result;
+  }
   result.pending_work = true;
+  const auto stage_begin =
+      impl_->completion.RecordStageBegin(completion_binding, 0);
+  if (!stage_begin.ok()) {
+    result.status = CompletionStatus(stage_begin.status);
+    result.device_lost = IsDeviceLost(stage_begin.status);
+    const auto recorded =
+        impl_->completion.RecordCompletion(completion_binding);
+    if (recorded.ok()) {
+      ++result.completion_waits;
+      const auto completed =
+          impl_->completion.WaitForCompletion(completion_binding, wait);
+      result.pending_work = !completed.ok();
+      result.device_lost = result.device_lost || IsDeviceLost(completed.status);
+      if (!completed.ok())
+        result.status = CompletionStatus(completed.status);
+    }
+    return result;
+  }
+  const auto finish_submitted_work = [&](bool record_stage_end) noexcept {
+    if (record_stage_end) {
+      const auto stage =
+          impl_->completion.RecordStageEnd(completion_binding, 0);
+      if (!stage.ok()) {
+        result.device_lost = IsDeviceLost(stage.status);
+        result.status = CompletionStatus(stage.status);
+      }
+    }
+    const auto recorded =
+        impl_->completion.RecordCompletion(completion_binding);
+    if (!recorded.ok()) {
+      result.device_lost = result.device_lost || IsDeviceLost(recorded.status);
+      result.status = CompletionStatus(recorded.status);
+      return false;
+    }
+    ++result.completion_waits;
+    const auto completed =
+        impl_->completion.WaitForCompletion(completion_binding, wait);
+    result.pending_work = !completed.ok();
+    if (!completed.ok()) {
+      result.device_lost = result.device_lost || IsDeviceLost(completed.status);
+      result.status = CompletionStatus(completed.status);
+      return false;
+    }
+    result.completed_readbacks = result.enqueued_readbacks;
+    return true;
+  };
   cuda::kernels::PreparedPreprocessBinding preprocess_binding{
       binding.driver,
       binding.context,
@@ -433,34 +524,40 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
   spec.dst_w = impl_->input_w;
   spec.dst_h = impl_->input_h;
   spec.dst_order = cuda::kernels::ChannelOrder::bgr;
+  std::fill(std::begin(spec.std), std::end(spec.std), 1.0F / 255.0F);
   cuda::kernels::PreparedPreprocessKernelStatus preprocess_status{};
   if (!impl_->preprocess.ExecuteLetterboxed(preprocess_binding, spec, geometry,
                                             source, impl_->input,
                                             &preprocess_status)) {
-    (void)impl_->completion.RecordStageEnd(completion_binding, 0);
-    (void)impl_->completion.RecordCompletion(completion_binding);
-    const auto completed =
-        impl_->completion.WaitForCompletion(completion_binding, wait);
-    ++result.completion_waits;
-    result.pending_work = !completed.ok();
     result.status = PreparedCudaYunetStatus::preprocess_failed;
+    result.device_lost =
+        preprocess_status ==
+        cuda::kernels::PreparedPreprocessKernelStatus::device_lost;
+    if (result.device_lost)
+      result.status = PreparedCudaYunetStatus::device_lost;
+    (void)finish_submitted_work(true);
     return result;
   }
   const auto run = impl_->session->Execute(impl_->ort_input.data(), 1,
                                            impl_->ort_outputs.data(), kOutputs,
                                            impl_->run_evidence);
   if (!run.ok()) {
-    (void)impl_->completion.RecordStageEnd(completion_binding, 0);
-    (void)impl_->completion.RecordCompletion(completion_binding);
-    const auto completed =
-        impl_->completion.WaitForCompletion(completion_binding, wait);
-    ++result.completion_waits;
-    result.pending_work = !completed.ok();
     result.status = PreparedCudaYunetStatus::inference_failed;
+    if (run.quarantine == onnx::OrtPreparedRunQuarantine::provider) {
+      result.device_lost = true;
+      result.status = PreparedCudaYunetStatus::device_lost;
+    }
+    (void)finish_submitted_work(true);
     return result;
   }
-  if (!impl_->completion.RecordStageEnd(completion_binding, 0).ok())
+  const auto stage_end =
+      impl_->completion.RecordStageEnd(completion_binding, 0);
+  if (!stage_end.ok()) {
+    result.status = CompletionStatus(stage_end.status);
+    result.device_lost = IsDeviceLost(stage_end.status);
+    (void)finish_submitted_work(false);
     return result;
+  }
   for (std::uint32_t i = 0; i < kOutputs; ++i) {
     const auto copy = impl_->completion.EnqueueReadbackAt(
         completion_binding, i, impl_->outputs[i].tensor.ptr,
@@ -471,14 +568,8 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
     }
     ++result.enqueued_readbacks;
   }
-  if (!impl_->completion.RecordCompletion(completion_binding).ok() ||
-      !impl_->completion.WaitForCompletion(completion_binding, wait).ok()) {
-    ++result.completion_waits;
-    result.status = PreparedCudaYunetStatus::completion_failed;
+  if (!finish_submitted_work(false))
     return result;
-  }
-  result.pending_work = false;
-  result.completed_readbacks = result.enqueued_readbacks;
   if (result.completed_readbacks != kOutputs)
     return result;
   impl_->scratch.BeginFrame();
@@ -518,7 +609,6 @@ PreparedCudaYunetExecutionResult PreparedCudaYunetDetector::Execute(
   auto &cached = cache->PrepareFaceDetections(kTopK);
   cached.assign(faces.begin(), faces.end());
   result.cpu_tail_boundaries = 1;
-  result.completion_waits = 1;
   result.status = faces.empty() ? PreparedCudaYunetStatus::success_no_faces
                                 : PreparedCudaYunetStatus::success_faces;
   return result;
@@ -542,6 +632,7 @@ bool PreparedCudaYunetDetector::Shutdown(std::string *error) noexcept {
     ok = out.tensor.Free(impl_->setup.binding.driver, error) && ok;
   ok = impl_->input.Free(impl_->setup.binding.driver, error) && ok;
   if (ok) {
+    impl_->session.reset();
     impl_->ready = false;
     impl_->stopped = true;
   }

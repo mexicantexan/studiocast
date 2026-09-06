@@ -1,6 +1,7 @@
 #include "core/open_video/prepared_cuda_yunet_detector.h"
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -31,8 +32,12 @@ struct State {
   std::vector<std::size_t> sizes;
   int copies = 0, launches = 0, syncs = 0, runs = 0, invalidates = 0, frees = 0;
   int fail_copy = -1;
+  int fail_run = -1;
   bool face = false;
   cuda::CUresult query = cuda::CUDA_SUCCESS;
+  cuda::CUresult sync_result = cuda::CUDA_SUCCESS;
+  cuda::CUresult launch_result = cuda::CUDA_SUCCESS;
+  float preprocess_inverse_std = 0.0F;
 } * g;
 cuda::CUresult OkInit(unsigned) { return 0; }
 cuda::CUresult Mod(cuda::CUmodule *m, const void *) {
@@ -45,10 +50,11 @@ cuda::CUresult Fn(cuda::CUfunction *f, cuda::CUmodule, const char *) {
 }
 cuda::CUresult Unload(cuda::CUmodule) { return 0; }
 cuda::CUresult Launch(cuda::CUfunction, unsigned, unsigned, unsigned, unsigned,
-                      unsigned, unsigned, unsigned, cuda::CUstream, void **,
+                      unsigned, unsigned, unsigned, cuda::CUstream, void **args,
                       void **) {
   ++g->launches;
-  return 0;
+  g->preprocess_inverse_std = *static_cast<float *>(args[10]);
+  return g->launch_result;
 }
 cuda::CUresult Alloc(cuda::CUdeviceptr *p, std::size_t *pi, std::size_t w,
                      std::size_t h, unsigned) {
@@ -92,7 +98,7 @@ cuda::CUresult StreamCreate(cuda::CUstream *s, unsigned) {
 cuda::CUresult StreamDestroy(cuda::CUstream) { return 0; }
 cuda::CUresult Sync(cuda::CUstream) {
   ++g->syncs;
-  return 0;
+  return g->sync_result;
 }
 cuda::CUresult HostAlloc(void **p, std::size_t n, unsigned) {
   auto m = std::make_unique<std::byte[]>(n);
@@ -149,6 +155,7 @@ cuda::CUresult GetDev(cuda::CUdevice *d) {
   *d = 0;
   return 0;
 }
+bool Always(void *) noexcept { return true; }
 cuda::CudaDriverApi::Functions Functions() {
   cuda::CudaDriverApi::Functions f;
   f.cuInit = OkInit;
@@ -225,7 +232,12 @@ struct Session final : open_video::internal::IPreparedCudaYunetSession {
   Execute(const onnx::OrtSession::CudaBindingInput *, std::size_t,
           const onnx::OrtSession::CudaBindingOutput *out, std::size_t n,
           const onnx::OrtPreparedCudaRunEvidence &) noexcept override {
-    ++s->runs;
+    const int run = s->runs++;
+    if (run == s->fail_run) {
+      onnx::OrtPreparedRunResult failed;
+      failed.status = onnx::OrtPreparedRunStatus::inference_failure;
+      return failed;
+    }
     for (std::size_t k = 0; k < n; ++k)
       std::memset(out[k].device_ptr, 0, out[k].num_floats * sizeof(float));
     if (s->face) {
@@ -289,13 +301,15 @@ int main() {
       r.status == open_video::PreparedCudaYunetStatus::success_no_faces &&
       r.enqueued_readbacks == 12 && r.completed_readbacks == 12 &&
       r.completion_waits == 1 && r.cpu_tail_boundaries == 1 &&
-      state.runs == 2 && state.copies == 12 && !r.pending_work;
+      state.runs == 2 && state.copies == 12 && !r.pending_work &&
+      std::abs(state.preprocess_inverse_std - 255.0F) < 0.001F;
   state.fail_copy = state.copies + 3;
   auto partial = d.Execute(setup.binding, image, 2, &cache, wait);
   ok &=
       partial.status == open_video::PreparedCudaYunetStatus::readback_failed &&
       partial.enqueued_readbacks == 3 && partial.completed_readbacks == 3 &&
-      !partial.pending_work && state.memory.size() == allocations;
+      partial.completion_waits == 1 && !partial.pending_work &&
+      state.memory.size() == allocations;
   state.fail_copy = -1;
   state.face = true;
   auto recovered = d.Execute(setup.binding, image, 3, &cache, wait);
@@ -312,11 +326,78 @@ int main() {
   state.query = cuda::CUDA_ERROR_NOT_READY;
   auto timed = retry.Execute(setup.binding, image, 4, &retry_cache, wait);
   bool first_shutdown = retry.Shutdown(&error);
-  ok &=
-      timed.status == open_video::PreparedCudaYunetStatus::completion_failed &&
-      timed.pending_work && !first_shutdown;
+  ok &= timed.status == open_video::PreparedCudaYunetStatus::timeout &&
+        timed.pending_work && !first_shutdown;
   state.query = cuda::CUDA_SUCCESS;
   ok &= retry.Shutdown(&error);
+  open_video::PreparedCudaYunetDetector stopped;
+  ok &= stopped.PrepareForTesting(setup, id, std::make_unique<Session>(&state),
+                                  &error);
+  open_video::FrameAnalysisCache stopped_cache;
+  ok &= stopped.PrepareCache(&stopped_cache, &error);
+  auto stopped_wait = wait;
+  stopped_wait.stop_requested = Always;
+  auto stopped_result =
+      stopped.Execute(setup.binding, image, 41, &stopped_cache, stopped_wait);
+  ok &= stopped_result.status ==
+            open_video::PreparedCudaYunetStatus::stop_requested &&
+        stopped_result.completion_waits == 1 && stopped_result.pending_work;
+  state.query = cuda::CUDA_SUCCESS;
+  ok &= stopped.Shutdown(&error);
+  open_video::PreparedCudaYunetDetector inference_failed;
+  ok &= inference_failed.PrepareForTesting(
+      setup, id, std::make_unique<Session>(&state), &error);
+  open_video::FrameAnalysisCache inference_cache;
+  ok &= inference_failed.PrepareCache(&inference_cache, &error);
+  state.fail_run = state.runs;
+  auto inference_result = inference_failed.Execute(setup.binding, image, 42,
+                                                   &inference_cache, wait);
+  ok &= inference_result.status ==
+            open_video::PreparedCudaYunetStatus::inference_failed &&
+        inference_result.completion_waits == 1 &&
+        !inference_result.pending_work;
+  state.fail_run = -1;
+  const int sync_loss_invalidates = state.invalidates;
+  state.sync_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  open_video::PreparedCudaYunetDetector warmup_unquiesced;
+  ok &= !warmup_unquiesced.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error) &&
+        state.invalidates == sync_loss_invalidates &&
+        !warmup_unquiesced.ready();
+  state.sync_result = cuda::CUDA_SUCCESS;
+  open_video::PreparedCudaYunetDetector device_lost;
+  ok &= device_lost.PrepareForTesting(
+      setup, id, std::make_unique<Session>(&state), &error);
+  open_video::FrameAnalysisCache device_lost_cache;
+  ok &= device_lost.PrepareCache(&device_lost_cache, &error);
+  state.launch_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  auto device_lost_result =
+      device_lost.Execute(setup.binding, image, 43, &device_lost_cache, wait);
+  const bool device_lost_ok =
+      device_lost_result.status ==
+          open_video::PreparedCudaYunetStatus::device_lost &&
+      device_lost_result.device_lost &&
+      device_lost_result.completion_waits == 1 &&
+      !device_lost_result.pending_work;
+  ok &= device_lost_ok;
+  state.launch_result = cuda::CUDA_SUCCESS;
+  ok &= device_lost.Shutdown(&error);
+  ok &= inference_failed.Shutdown(&error);
+  const int invalidates_before_pending_destructor = state.invalidates;
+  {
+    open_video::PreparedCudaYunetDetector pending_destructor;
+    ok &= pending_destructor.PrepareForTesting(
+        setup, id, std::make_unique<Session>(&state), &error);
+    open_video::FrameAnalysisCache pending_cache;
+    ok &= pending_destructor.PrepareCache(&pending_cache, &error);
+    state.query = cuda::CUDA_ERROR_NOT_READY;
+    auto pending = pending_destructor.Execute(setup.binding, image, 40,
+                                              &pending_cache, wait);
+    ok &= pending.status == open_video::PreparedCudaYunetStatus::timeout &&
+          pending.completion_waits == 1 && pending.pending_work;
+  }
+  ok &= state.invalidates == invalidates_before_pending_destructor;
+  state.query = cuda::CUDA_SUCCESS;
   open_video::PreparedCudaYunetDetector size640;
   ok &= size640.PrepareForTesting(
             setup, id, std::make_unique<Session>(&state, true, false, 640),
@@ -330,13 +411,26 @@ int main() {
   auto bad = std::make_unique<Session>(&state, false);
   ok &= !rejected.PrepareForTesting(setup, id, std::move(bad), &error) &&
         !rejected.ready();
+  const int warmup_run = state.runs;
+  const int warmup_syncs = state.syncs;
+  const int warmup_invalidates = state.invalidates;
+  state.fail_run = warmup_run;
+  open_video::PreparedCudaYunetDetector warmup_failed;
+  ok &= !warmup_failed.PrepareForTesting(
+            setup, id, std::make_unique<Session>(&state), &error) &&
+        state.syncs == warmup_syncs + 1 &&
+        state.invalidates == warmup_invalidates + 1 && !warmup_failed.ready();
+  state.fail_run = -1;
   open_video::PreparedCudaYunetDetector missing;
   auto missing_setup = setup;
   missing_setup.models_root = "/definitely/missing/studiocast-yunet";
   missing_setup.requested_model_id = "missing";
   ok &= !missing.Prepare(missing_setup, &error) && !missing.ready();
   if (!ok) {
-    std::cerr << "lifecycle failed\n";
+    std::cerr << "lifecycle failed runs=" << state.runs
+              << " copies=" << state.copies << " syncs=" << state.syncs
+              << " invalidates=" << state.invalidates
+              << " inverse_std=" << state.preprocess_inverse_std << '\n';
     return 1;
   }
   std::cout << "PREPARED CUDA YUNET TESTS OK\n";

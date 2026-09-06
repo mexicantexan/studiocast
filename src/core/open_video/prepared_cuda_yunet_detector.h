@@ -26,6 +26,10 @@ enum class PreparedCudaYunetStatus : std::uint8_t {
   inference_failed,
   readback_failed,
   completion_failed,
+  timeout,
+  stop_requested,
+  cancelled,
+  device_lost,
   shutdown
 };
 
