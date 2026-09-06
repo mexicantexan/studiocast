@@ -689,7 +689,7 @@ CudaPreparedTransferCompletion::Shutdown() noexcept {
     shutdown_ = true;
     return {};
   }
-  if (frame_active_ && upload_enqueued_ && !quarantined_) {
+  if (frame_active_ && work_submitted_ && !quarantined_) {
     if (!completion_recorded_)
       return Failed(Status::resource_exhausted);
     const CUresult query = cuda_->f().cuEventQuery(completion_event_);

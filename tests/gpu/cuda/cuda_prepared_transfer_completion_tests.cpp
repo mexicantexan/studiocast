@@ -862,6 +862,24 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   ok &= Expect(multi_overflow.Prepare(&driver, overflow).status ==
                    Support::Status::invalid_argument,
                "multi-row source extent overflow should fail setup");
+  ok &= Expect(support.BeginFrame(binding, 74).ok() &&
+                   support.SubmitResidentWork(binding).ok() &&
+                   support.RecordStageBegin(binding, 0).ok() &&
+                   support.RecordStageEnd(binding, 0).ok() &&
+                   support.EnqueueReadbackAt(binding, 0, 0x5000, 8).ok() &&
+                   support.EnqueueReadbackAt(binding, 1, 0x6000, 12).ok() &&
+                   support.EnqueueReadbackAt(binding, 2, 0x7000, 8).ok() &&
+                   support.RecordCompletion(binding).ok(),
+               "resident retry-cleanup frame should enqueue");
+  fake.not_ready_queries = 100;
+  ok &= Expect(support.WaitForCompletion(binding, WaitPolicyFor(&fake)).status ==
+                       Support::Status::timeout &&
+                   support.Shutdown().status ==
+                       Support::Status::resource_exhausted,
+               "resident DMA should block cleanup while incomplete");
+  fake.not_ready_queries = 0;
+  ok &= Expect(support.Shutdown().ok(),
+               "resident cleanup should retry after completion");
   return ok;
 }
 
