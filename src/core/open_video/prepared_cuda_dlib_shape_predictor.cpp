@@ -16,6 +16,7 @@
 
 namespace studiocast::open_video {
 namespace {
+#if STUDIOCAST_HAVE_DLIB
 bool Same(const PreparedCudaDlibBinding &a, const PreparedCudaDlibBinding &b) {
   return a.driver == b.driver && a.context == b.context &&
          a.owner_context == b.owner_context && a.stream == b.stream &&
@@ -23,6 +24,7 @@ bool Same(const PreparedCudaDlibBinding &a, const PreparedCudaDlibBinding &b) {
          a.owner_identity == b.owner_identity &&
          a.configuration_generation == b.configuration_generation;
 }
+#endif
 struct Buffer {
   cuda::CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
@@ -120,7 +122,6 @@ bool ValidatePredictorWire(std::istream &in, std::size_t budget,
     return false;
   }
 }
-#endif
 bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
                  std::size_t n, Buffer *out, bool *pending, std::string *e) {
   if (!n)
@@ -162,6 +163,7 @@ bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
   out->staging = {};
   return true;
 }
+#endif
 } // namespace
 struct PreparedCudaDlibShapePredictor::Impl {
   PreparedCudaDlibSetup setup;
@@ -440,6 +442,14 @@ PreparedCudaDlibResult PreparedCudaDlibShapePredictor::Execute(
   PreparedCudaDlibResult r;
   if (e)
     e->clear();
+#if !STUDIOCAST_HAVE_DLIB
+  (void)b;
+  (void)im;
+  (void)box;
+  (void)seq;
+  r.status = PreparedCudaDlibStatus::unavailable;
+  return r;
+#else
   if (!impl_ || !impl_->ready || impl_->setup_quarantined || impl_->stopped) {
     r.status = PreparedCudaDlibStatus::shutdown;
     return r;
@@ -496,6 +506,7 @@ PreparedCudaDlibResult PreparedCudaDlibShapePredictor::Execute(
   r.pending_work = true;
   r.status = PreparedCudaDlibStatus::success;
   return r;
+#endif
 }
 bool PreparedCudaDlibShapePredictor::Shutdown(std::string *e) noexcept {
   if (e)
