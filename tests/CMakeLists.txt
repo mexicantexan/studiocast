@@ -1920,6 +1920,17 @@ if (BUILD_TESTING)
                 PROPERTIES SKIP_RETURN_CODE 77)
     endif ()
 
+    add_executable(studiocast-prepared-cuda-auto-frame-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_auto_frame_tests.cpp)
+    target_link_libraries(studiocast-prepared-cuda-auto-frame-tests PRIVATE
+            studiocast_open_video_backend)
+    studiocast_set_project_warnings(studiocast-prepared-cuda-auto-frame-tests)
+    studiocast_enable_sanitizers(studiocast-prepared-cuda-auto-frame-tests)
+    add_test(NAME studiocast-prepared-cuda-auto-frame-tests
+            COMMAND studiocast-prepared-cuda-auto-frame-tests)
+    studiocast_set_test_labels(studiocast-prepared-cuda-auto-frame-tests
+            integration video gpu model)
+
     add_executable(studiocast-prepared-cuda-yunet-detector-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_yunet_detector_tests.cpp)
     target_link_libraries(studiocast-prepared-cuda-yunet-detector-tests PRIVATE
