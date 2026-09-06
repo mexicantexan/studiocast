@@ -457,7 +457,9 @@ bool TestNativeLetterboxWhenRequired() {
   CUstream stream = nullptr;
   CudaImage source;
   CudaTensor destination;
-  const std::vector<std::uint8_t> pixels(3u * 2u * 3u, 64u);
+  const std::vector<std::uint8_t> pixels{
+      0,10,20, 40,50,60, 80,90,100,
+      120,130,140, 160,170,180, 200,210,220};
   bool ok = driver.CreateStream(&stream, &error) &&
             source.Allocate(&driver, 3, 2, PixelFormatGpu::rgb_u8, &error) &&
             destination.AllocateNchwF32(&driver, 1, 3, 4, 4, &error) &&
@@ -483,17 +485,37 @@ bool TestNativeLetterboxWhenRequired() {
   std::vector<float> output;
   ok = ok && destination.DownloadToCpuF32(&driver, &output, stream, &error) &&
        driver.StreamSynchronize(stream, &error);
+  auto reference = [&](int channel, int x, int y, bool letterbox) {
+      if (letterbox && y >= 3) return 0.0f;
+      const int sample_h = letterbox ? 3 : 4;
+      const float sx = 3.0f / 4.0f, sy = 2.0f / static_cast<float>(sample_h);
+      const float px = (static_cast<float>(x) + .5f) * sx - .5f;
+      const float py = (static_cast<float>(y) + .5f) * sy - .5f;
+      const int x0=std::clamp(static_cast<int>(px),0,2), y0=std::clamp(static_cast<int>(py),0,1);
+      const int x1=std::min(x0+1,2), y1=std::min(y0+1,1);
+      const float fx=px-static_cast<float>(x0), fy=py-static_cast<float>(y0);
+      auto at=[&](int xx,int yy){return static_cast<float>(pixels[static_cast<std::size_t>((yy*3+xx)*3+channel)]);};
+      const float a=at(x0,y0)+fx*(at(x1,y0)-at(x0,y0));
+      const float b=at(x0,y1)+fx*(at(x1,y1)-at(x0,y1));
+      return (a+fy*(b-a))/255.0f;
+  };
   if (ok) {
-    constexpr float expected = 64.0f / 255.0f;
     for (int channel = 0; channel < 3; ++channel) {
       for (int y = 0; y < 4; ++y) {
         for (int x = 0; x < 4; ++x) {
-          const float want = y < 3 ? expected : 0.0f;
+          const float want = reference(channel,x,y,true);
           const auto index = static_cast<std::size_t>(channel * 16 + y * 4 + x);
-          ok &= std::abs(output[index] - want) <= 1.0e-6f;
+          ok &= std::abs(output[index] - want) <= 2.0e-5f;
         }
       }
     }
+  }
+  ok = ok && bundle.Execute(binding, spec, source, destination, &status) &&
+       destination.DownloadToCpuF32(&driver, &output, stream, &error) &&
+       driver.StreamSynchronize(stream, &error);
+  if (ok) for(int c=0;c<3;++c) for(int y=0;y<4;++y) for(int x=0;x<4;++x) {
+    const auto index=static_cast<std::size_t>(c*16+y*4+x);
+    ok &= std::abs(output[index]-reference(c,x,y,false)) <= 2.0e-5f;
   }
   ok &= Expect(ok, error.empty() ? "native CUDA letterbox output mismatch"
                                  : error);
