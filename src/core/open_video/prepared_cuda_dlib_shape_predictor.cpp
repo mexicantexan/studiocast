@@ -133,7 +133,11 @@ bool AllocUpload(cuda::CudaDriverApi *d, cuda::CUstream s, const void *p,
   if (!d->AllocatePitch(row_bytes, rows, &a, e, 4) || a.pitch != row_bytes) {
     if (a.ptr) {
       std::string ignored;
-      (void)d->Free(a.ptr, &ignored);
+      if (!d->Free(a.ptr, &ignored)) {
+        out->ptr = a.ptr;
+        out->reserved_bytes = a.pitch * rows;
+        *pending = true;
+      }
     }
     if (e && e->empty())
       *e = "dlib table allocation is not contiguous";
@@ -357,6 +361,16 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   auto candidate = std::make_unique<Impl>();
   candidate->setup = s;
   candidate->artifact = validation.identity;
+  const auto reject_candidate = [&](std::string original_error) {
+    candidate->setup_quarantined = true;
+    impl_ = std::move(candidate);
+    std::string cleanup_error;
+    if (!Shutdown(&cleanup_error) && original_error.empty())
+      original_error = cleanup_error;
+    if (e)
+      *e = std::move(original_error);
+    return false;
+  };
   const void *ptrs[] = {iv.data(), ct.data(), ts.data(), tl.data(), sv.data(),
                         lv.data(), cf.data(), av.data(), dv.data()};
   std::size_t sizes[] = {iv.size() * 4, ct.size() * 4,         ts.size() * 4,
@@ -381,9 +395,7 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
       }
       return false;
     } else if (!charge_reserved(candidate->buffers[i].reserved_bytes)) {
-      if (e)
-        *e = "dlib prepared resource budget exceeded";
-      return false;
+      return reject_candidate("dlib prepared resource budget exceeded");
     }
   if (!candidate->shape.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
       !charge_reserved(candidate->shape.pitch) ||
@@ -392,9 +404,9 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
       !charge_reserved(candidate->features.pitch) ||
       !candidate->output.AllocateNchwF32(s.binding.driver, 1, 1, 1, 136, e) ||
       !charge_reserved(candidate->output.pitch)) {
-    if (e && e->empty())
-      *e = "dlib prepared resource budget exceeded";
-    return false;
+    return reject_candidate(e && !e->empty()
+                                ? *e
+                                : "dlib prepared resource budget exceeded");
   }
   if (!cuda::kernels::PrepareDlibShapePredictorKernel(
           *s.binding.driver, s.binding.owner_context, s.binding.stream,
@@ -402,13 +414,17 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
     if (candidate->kernel.module) {
       candidate->setup_quarantined = true;
       impl_ = std::move(candidate);
+      return false;
     }
-    return false;
+    return reject_candidate(e ? *e : std::string{});
   }
   if (s.binding.driver->f().cuStreamSynchronize(s.binding.stream) !=
       cuda::CUDA_SUCCESS) {
     if (e)
       *e = "dlib setup upload synchronization failed";
+    candidate->pending = true;
+    candidate->setup_quarantined = true;
+    impl_ = std::move(candidate);
     return false;
   }
   candidate->ready = true;
@@ -465,6 +481,7 @@ PreparedCudaDlibResult PreparedCudaDlibShapePredictor::Execute(
   const auto &m = to_image.get_m();
   const auto &translation = to_image.get_b();
   impl_->pending = true;
+  r.pending_work = true;
   if (!cuda::kernels::LaunchDlibShapePredictor(
           impl_->kernel, im, m(0, 0), m(0, 1), m(1, 0), m(1, 1),
           translation.x(), translation.y(), p[0].ptr, p[1].ptr, p[2].ptr,
