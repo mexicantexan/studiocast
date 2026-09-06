@@ -370,7 +370,11 @@ int main() {
   setup.models_root = oversized_root;
   setup.model_id = "oversized-dlib68";
   const int before_oversized = allocations;
-  ok &= Need(!oversized.Prepare(setup, &e) && allocations == before_oversized,
+  studiocast::open_video::PreparedCudaDlibStatus malformed_status{};
+  ok &= Need(!oversized.Prepare(setup, &e, &malformed_status) &&
+                 malformed_status == studiocast::open_video::
+                                         PreparedCudaDlibStatus::model_invalid &&
+                 allocations == before_oversized,
              "oversized wire cardinality reached GPU allocation");
   std::filesystem::remove_all(oversized_root);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -694,6 +694,26 @@ bool ConcreteSharedAnalysis() {
   CHECK(!budget_eye.Prepare(setup, &handle, &error, &budget_status));
   CHECK(budget_status == PreparedCudaEyeContactStatus::resource_exhausted);
   state.pitch_extra = 0;
+  const auto malformed_root = TinyDlibPack();
+  std::ofstream(malformed_root / "face_landmarks" / "tiny-dlib68" /
+                    "model.dat",
+                std::ios::binary | std::ios::trunc)
+      << "malformed";
+  const auto malformed_registry = ModelPackRegistry::Scan(malformed_root);
+  const auto malformed_pack =
+      malformed_registry.Find("face_landmarks", "tiny-dlib68");
+  CHECK(malformed_pack && !malformed_pack->files.empty());
+  const auto malformed_identity = ValidateModelArtifactIdentity(
+      *malformed_pack, malformed_pack->files.front());
+  CHECK(malformed_identity.ok());
+  setup.dlib_setup.models_root = malformed_root;
+  setup.models.landmarks = malformed_identity.identity;
+  Runtime malformed_runtime;
+  PreparedCudaEyeContact malformed_eye(&malformed_runtime);
+  PreparedCudaEyeContactStatus malformed_status;
+  CHECK(!malformed_eye.Prepare(setup, &handle, &error, &malformed_status));
+  CHECK(malformed_status == PreparedCudaEyeContactStatus::model_invalid);
+  std::filesystem::remove_all(malformed_root);
   CHECK(yunet.ready() && state.yunet_invalidates == 0);
   CHECK(yunet.Shutdown(&error) && state.yunet_invalidates == 1);
   CHECK(yunet.PrepareForTesting(yunet_setup, yunet_identity,
