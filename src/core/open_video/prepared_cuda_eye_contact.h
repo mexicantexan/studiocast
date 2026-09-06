@@ -56,6 +56,9 @@ struct PreparedCudaEyeModelContract {
 };
 
 struct PreparedCudaEyeContactModels {
+  const ModelPack *eye_pack = nullptr;
+  const ModelFile *left_file = nullptr;
+  const ModelFile *right_file = nullptr;
   std::filesystem::path left_path;
   std::filesystem::path right_path;
   ValidatedModelArtifactIdentity yunet;
@@ -98,6 +101,9 @@ struct PreparedCudaEyeContactAnalysisResult {
   std::uint32_t cpu_tail_boundaries = 0;
 };
 
+PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
+    const PreparedCudaDlibResult &, const cuda::CudaTensor &) noexcept;
+
 class IPreparedCudaEyeContactAnalysis {
 public:
   virtual ~IPreparedCudaEyeContactAnalysis() = default;
@@ -124,6 +130,7 @@ struct PreparedCudaEyeContactRuntimeConfig {
   int frame_width = 0;
   int frame_height = 0;
   std::size_t resource_budget_bytes = 0;
+  cuda::CudaPreparedTransferCompletion::WaitPolicy wait{};
 };
 
 struct PreparedCudaEyeContactRuntimeFrameResult {

@@ -1,10 +1,22 @@
 #include "core/open_video/native_prepared_cuda_eye_contact_runtime.h"
 
 #include <algorithm>
+#include <chrono>
+#include <limits>
+#include <thread>
 #include <vector>
 
 namespace studiocast::open_video {
 namespace {
+std::uint64_t NowNanoseconds(void *) noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+void PollWait(void *, std::uint64_t nanoseconds) noexcept {
+  std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds));
+}
 class OrtAdapter final : public IPreparedEyeContactOrtSession {
 public:
   OrtAdapter(std::unique_ptr<onnx::OrtSession> session,
@@ -35,6 +47,12 @@ private:
 };
 class OrtFactory final : public IPreparedEyeContactOrtFactory {
 public:
+  bool ValidateArtifact(
+      const ModelPack &pack, const ModelFile &file,
+      const ValidatedModelArtifactIdentity &expected) noexcept override {
+    const auto validated = ValidateModelArtifactIdentity(pack, file);
+    return validated.ok() && validated.identity == expected;
+  }
   std::unique_ptr<IPreparedEyeContactOrtSession>
   Create(const std::filesystem::path &path,
          const onnx::OrtSessionOptions &options) noexcept override {
@@ -90,27 +108,33 @@ NativePreparedCudaEyeContactRuntime::~NativePreparedCudaEyeContactRuntime() {
 
 PreparedCudaEyeContactStatus NativePreparedCudaEyeContactRuntime::Prepare(
     const PreparedCudaEyeContactRuntimeConfig &c) noexcept {
-  if (prepared_ && Shutdown() == PreparedCudaEyeContactStatus::shutdown_failed)
+  if (ownership_live_ &&
+      Shutdown() == PreparedCudaEyeContactStatus::shutdown_failed)
     return PreparedCudaEyeContactStatus::shutdown_failed;
   if (!factory_ || !c.binding.driver || !c.binding.context.Valid() ||
       !c.binding.owner_context || !c.binding.stream || c.cuda_device_id < 0 ||
       c.frame_width <= 0 || c.frame_height <= 0 || c.models.left_path.empty() ||
       c.models.right_path.empty() || !c.models.left.Valid() ||
-      !c.models.right.Valid())
+      !c.models.right.Valid() || !c.models.eye_pack || !c.models.left_file ||
+      !c.models.right_file || c.models.left_file == c.models.right_file ||
+      c.models.left_file->role != "left" ||
+      c.models.right_file->role != "right" ||
+      c.models.left_file->path != c.models.left_path ||
+      c.models.right_file->path != c.models.right_path ||
+      !factory_->ValidateArtifact(*c.models.eye_pack, *c.models.left_file,
+                                  c.models.left) ||
+      !factory_->ValidateArtifact(*c.models.eye_pack, *c.models.right_file,
+                                  c.models.right))
     return PreparedCudaEyeContactStatus::invalid_setup;
-  constexpr std::size_t kEye = 3u * 48u * 64u * sizeof(float);
-  constexpr std::size_t kAnchors = 12u * 48u * 64u * sizeof(float);
-  constexpr std::size_t kAngles = 2u * sizeof(float);
-  const std::size_t frame = static_cast<std::size_t>(c.frame_width) *
-                            static_cast<std::size_t>(c.frame_height) * 3u;
-  const std::size_t required =
-      2u * (2u * kEye + kAnchors + kAngles) + 10u * sizeof(float) + frame;
-  if (required > c.resource_budget_bytes)
+  if (static_cast<std::size_t>(c.frame_width) >
+      std::numeric_limits<std::size_t>::max() /
+          static_cast<std::size_t>(c.frame_height) / 3u)
     return PreparedCudaEyeContactStatus::resource_exhausted;
   if (c.binding.driver->BindPreparedContext(c.binding.context) !=
       cuda::CUDA_SUCCESS)
     return PreparedCudaEyeContactStatus::stale_binding;
   config_ = c;
+  ownership_live_ = true;
   std::string error;
   bool ok =
       crop_geometry_.AllocateNchwF32(c.binding.driver, 1, 2, 1, 5, &error) &&
@@ -124,6 +148,38 @@ PreparedCudaEyeContactStatus NativePreparedCudaEyeContactRuntime::Prepare(
   ok = ok && cuda::kernels::PrepareEyeContactKernels(
                  *c.binding.driver, c.binding.owner_context, c.binding.stream,
                  &kernels_, &error);
+  if (ok && (!c.binding.driver->f().cuEventCreate ||
+             c.binding.driver->f().cuEventCreate(&completion_event_,
+                                                 cuda::CU_EVENT_DEFAULT) !=
+                 cuda::CUDA_SUCCESS))
+    ok = false;
+  const auto add_reserved = [](std::size_t amount, std::size_t *total) {
+    if (amount > std::numeric_limits<std::size_t>::max() - *total)
+      return false;
+    *total += amount;
+    return true;
+  };
+  std::size_t reserved = 0;
+  if (output_.h < 0 || output_.pitch == 0 ||
+      static_cast<std::size_t>(output_.h) >
+          std::numeric_limits<std::size_t>::max() / output_.pitch ||
+      !add_reserved(crop_geometry_.bytes, &reserved) ||
+      !add_reserved(output_.pitch * static_cast<std::size_t>(output_.h),
+                    &reserved))
+    ok = false;
+  for (std::size_t i = 0; i < 2; ++i) {
+    const std::array<std::size_t, 4> bytes{
+        eye_rgb_[i].bytes, anchors_[i].bytes, angles_[i].bytes,
+        model_rgb_[i].bytes};
+    for (const auto amount : bytes) {
+      if (!add_reserved(amount, &reserved)) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  if (reserved > c.resource_budget_bytes)
+    ok = false;
   if (!ok) {
     (void)Release();
     return PreparedCudaEyeContactStatus::resource_exhausted;
@@ -189,9 +245,9 @@ PreparedCudaEyeContactStatus NativePreparedCudaEyeContactRuntime::Prepare(
     }
   }
   work_pending_ = true;
-  if (!c.binding.driver->StreamSynchronize(c.binding.stream, nullptr))
-    return PreparedCudaEyeContactStatus::synchronization_failed;
-  work_pending_ = false;
+  const auto warmup = Quiesce();
+  if (warmup != PreparedCudaEyeContactStatus::executed)
+    return warmup;
   prepared_ = true;
   return PreparedCudaEyeContactStatus::executed;
 }
@@ -232,12 +288,14 @@ NativePreparedCudaEyeContactRuntime::Execute(
       ++out.inference_successes;
     if (!succeeded[i]) {
       // A failed second session must not expose the successful left-eye write.
-      if (!binding.driver->StreamSynchronize(binding.stream, nullptr)) {
-        out.status = PreparedCudaEyeContactStatus::synchronization_failed;
+      const auto quiesced = Quiesce();
+      if (quiesced != PreparedCudaEyeContactStatus::executed) {
+        out.status = quiesced;
         out.pending_work = true;
+        out.device_lost = quiesced == PreparedCudaEyeContactStatus::device_lost;
+        out.output = nullptr;
         return out;
       }
-      work_pending_ = false;
       switch (run.status) {
       case onnx::OrtPreparedRunStatus::provider_unavailable:
       case onnx::OrtPreparedRunStatus::provider_mismatch:
@@ -278,6 +336,14 @@ bool NativePreparedCudaEyeContactRuntime::Release() noexcept {
     return false;
   bool ok = true;
   sessions_ = {};
+  if (completion_event_) {
+    if (!config_.binding.driver || !config_.binding.driver->f().cuEventDestroy ||
+        config_.binding.driver->f().cuEventDestroy(completion_event_) !=
+            cuda::CUDA_SUCCESS)
+      ok = false;
+    else
+      completion_event_ = nullptr;
+  }
   if (kernels_.live)
     ok = cuda::kernels::DestroyEyeContactKernelsPrepared(&kernels_, nullptr) &&
          ok;
@@ -298,6 +364,7 @@ bool NativePreparedCudaEyeContactRuntime::Release() noexcept {
   if (ok) {
     config_ = {};
     prepared_ = false;
+    ownership_live_ = false;
     shutdown_requested_ = false;
     evidence_ = {};
   }
@@ -305,18 +372,61 @@ bool NativePreparedCudaEyeContactRuntime::Release() noexcept {
 }
 
 PreparedCudaEyeContactStatus
+NativePreparedCudaEyeContactRuntime::Quiesce() noexcept {
+  if (!work_pending_)
+    return PreparedCudaEyeContactStatus::executed;
+  if (!completion_event_ || !config_.binding.driver ||
+      !config_.binding.driver->f().cuEventRecord ||
+      config_.binding.driver->f().cuEventRecord(completion_event_,
+                                                config_.binding.stream) !=
+          cuda::CUDA_SUCCESS)
+    return PreparedCudaEyeContactStatus::synchronization_failed;
+  const auto &wait = config_.wait;
+  if (!wait.timeout_nanoseconds || !wait.poll_interval_nanoseconds ||
+      !wait.maximum_poll_count ||
+      ((wait.now_nanoseconds == nullptr) != (wait.poll_wait == nullptr)))
+    return PreparedCudaEyeContactStatus::synchronization_failed;
+  const auto now = wait.now_nanoseconds ? wait.now_nanoseconds : NowNanoseconds;
+  const auto poll_wait = wait.poll_wait ? wait.poll_wait : PollWait;
+  const std::uint64_t started = now(wait.callback_context);
+  for (std::uint32_t polls = 0; polls < wait.maximum_poll_count; ++polls) {
+    if (wait.stop_requested && wait.stop_requested(wait.callback_context))
+      return PreparedCudaEyeContactStatus::stop_requested;
+    if (wait.cancel_requested && wait.cancel_requested(wait.callback_context))
+      return PreparedCudaEyeContactStatus::cancelled;
+    const auto query =
+        config_.binding.driver->f().cuEventQuery(completion_event_);
+    if (query == cuda::CUDA_SUCCESS) {
+      work_pending_ = false;
+      return PreparedCudaEyeContactStatus::executed;
+    }
+    if (cuda::IsCudaDeviceLossResult(query))
+      return PreparedCudaEyeContactStatus::device_lost;
+    if (query != cuda::CUDA_ERROR_NOT_READY)
+      return PreparedCudaEyeContactStatus::synchronization_failed;
+    const auto current = now(wait.callback_context);
+    const auto elapsed = current >= started ? current - started : 0;
+    if (elapsed >= wait.timeout_nanoseconds)
+      return PreparedCudaEyeContactStatus::timeout;
+    poll_wait(wait.callback_context,
+              std::min(wait.poll_interval_nanoseconds,
+                       wait.timeout_nanoseconds - elapsed));
+  }
+  return PreparedCudaEyeContactStatus::timeout;
+}
+
+PreparedCudaEyeContactStatus
 NativePreparedCudaEyeContactRuntime::Shutdown() noexcept {
-  if (!prepared_ && !work_pending_)
+  if (!ownership_live_)
     return PreparedCudaEyeContactStatus::shutdown;
   shutdown_requested_ = true;
   for (auto &session : sessions_)
     if (session)
       session->RequestShutdown();
   if (work_pending_) {
-    if (!config_.binding.driver || !config_.binding.driver->StreamSynchronize(
-                                       config_.binding.stream, nullptr))
+    const auto quiesced = Quiesce();
+    if (quiesced != PreparedCudaEyeContactStatus::executed)
       return PreparedCudaEyeContactStatus::shutdown_failed;
-    work_pending_ = false;
   }
   return Release() ? PreparedCudaEyeContactStatus::shutdown
                    : PreparedCudaEyeContactStatus::shutdown_failed;

@@ -34,6 +34,8 @@ public:
   virtual std::unique_ptr<IPreparedEyeContactOrtSession>
   Create(const std::filesystem::path &,
          const onnx::OrtSessionOptions &) noexcept = 0;
+  virtual bool ValidateArtifact(const ModelPack &, const ModelFile &,
+                                const ValidatedModelArtifactIdentity &) noexcept = 0;
 };
 
 class NativePreparedCudaEyeContactRuntime final
@@ -52,6 +54,7 @@ public:
 
 private:
   bool Release() noexcept;
+  PreparedCudaEyeContactStatus Quiesce() noexcept;
 
   IPreparedEyeContactOrtFactory *factory_ = nullptr;
   std::unique_ptr<IPreparedEyeContactOrtFactory> owned_factory_;
@@ -69,7 +72,9 @@ private:
   std::array<onnx::OrtPreparedCudaRunEvidence, 2> evidence_{};
   std::array<std::array<std::int64_t, 4>, 4> shapes_{};
   std::array<std::string, 4> names_{};
+  cuda::CUevent completion_event_ = nullptr;
   bool prepared_ = false;
+  bool ownership_live_ = false;
   bool work_pending_ = false;
   bool shutdown_requested_ = false;
 };

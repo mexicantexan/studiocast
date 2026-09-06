@@ -4,8 +4,21 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 
 namespace studiocast::open_video {
+PreparedCudaEyeContactStatus ValidateResidentDlibLandmarks(
+    const PreparedCudaDlibResult &result,
+    const cuda::CudaTensor &tensor) noexcept {
+  if (result.status != PreparedCudaDlibStatus::success)
+    return result.pending_work
+               ? PreparedCudaEyeContactStatus::synchronization_failed
+               : PreparedCudaEyeContactStatus::landmark_failed;
+  return tensor.Valid() && tensor.n == 1 && tensor.c == 1 && tensor.h == 1 &&
+                 tensor.w == 136
+             ? PreparedCudaEyeContactStatus::executed
+             : PreparedCudaEyeContactStatus::graph_mismatch;
+}
 namespace {
 std::atomic<std::uint64_t> g_next_eye_handle{1};
 
@@ -107,14 +120,10 @@ public:
                                b.owner_identity,
                                b.configuration_generation};
     const auto result = dlib_.Execute(db, image, face, sequence, nullptr);
-    if (result.pending_work)
-      return PreparedCudaEyeContactStatus::synchronization_failed;
-    if (result.status != PreparedCudaDlibStatus::success)
-      return PreparedCudaEyeContactStatus::landmark_failed;
     const auto &tensor = dlib_.resident_landmarks();
-    if (!tensor.Valid() || tensor.n != 1 || tensor.c != 1 || tensor.h != 1 ||
-        tensor.w != 136)
-      return PreparedCudaEyeContactStatus::graph_mismatch;
+    const auto status = ValidateResidentDlibLandmarks(result, tensor);
+    if (status != PreparedCudaEyeContactStatus::executed)
+      return status;
     if (resident)
       *resident = &tensor;
     return PreparedCudaEyeContactStatus::executed;
@@ -140,8 +149,16 @@ bool ValidSetup(const PreparedCudaEyeContactSetup &s) noexcept {
          s.frame_width > 0 && s.frame_height > 0 && s.resource_budget_bytes &&
          s.analysis_cache && s.models.yunet.Valid() &&
          s.models.landmarks.Valid() && s.models.left.Valid() &&
-         s.models.right.Valid() && !s.models.left_path.empty() &&
+         s.models.right.Valid() && s.models.eye_pack && s.models.left_file &&
+         s.models.right_file && !s.models.left_path.empty() &&
          !s.models.right_path.empty();
+}
+
+bool CheckedAdd(std::size_t amount, std::size_t *total) noexcept {
+  if (!total || amount > std::numeric_limits<std::size_t>::max() - *total)
+    return false;
+  *total += amount;
+  return true;
 }
 } // namespace
 
@@ -191,6 +208,14 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
   if ((impl_->ready || impl_->cleanup_pending) && !Shutdown(error))
     return false;
   auto frozen = s;
+  std::size_t accounted = 0;
+  if (!CheckedAdd(s.yunet_setup.resource_budget_bytes, &accounted) ||
+      !CheckedAdd(s.dlib_setup.resource_budget_bytes, &accounted) ||
+      accounted > s.resource_budget_bytes) {
+    if (error)
+      *error = "prepared Eye Contact aggregate resource budget exceeded";
+    return false;
+  }
   frozen.yunet_setup.binding = {
       s.binding.driver,         s.binding.context,
       s.binding.stream,         s.binding.stream_identity,
@@ -212,8 +237,9 @@ bool PreparedCudaEyeContact::Prepare(const PreparedCudaEyeContactSetup &s,
     status = PreparedCudaEyeContactStatus::model_invalid;
   if (status == PreparedCudaEyeContactStatus::executed) {
     PreparedCudaEyeContactRuntimeConfig config{
-        frozen.binding,     frozen.models,       frozen.cuda_device_id,
-        frozen.frame_width, frozen.frame_height, frozen.resource_budget_bytes};
+        frozen.binding, frozen.models, frozen.cuda_device_id,
+        frozen.frame_width, frozen.frame_height,
+        frozen.resource_budget_bytes - accounted, frozen.wait};
     status = impl_->runtime->Prepare(config);
   }
   if (status != PreparedCudaEyeContactStatus::executed) {
@@ -298,7 +324,7 @@ PreparedCudaEyeContact::Execute(const PreparedCudaEyeContactHandle &h,
   }
   auto runtime = impl_->runtime->Execute(
       binding, input, *landmarks,
-      std::clamp(impl_->setup.strength, 0, 100) / 100.0F);
+      static_cast<float>(std::clamp(impl_->setup.strength, 0, 100)) / 100.0F);
   out.status = runtime.status;
   out.output = runtime.output;
   out.pending_work = runtime.pending_work;
