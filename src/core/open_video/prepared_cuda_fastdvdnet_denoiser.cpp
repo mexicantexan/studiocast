@@ -217,6 +217,7 @@ PreparedCudaFastDvdnetFrameResult PreparedCudaFastDvdnetDenoiser::Execute(
   result.stage_elapsed_ns = frame.stage_elapsed_ns;
   result.frame_elapsed_ns = frame.frame_elapsed_ns;
   result.output_valid = frame.output_valid;
+  result.pending_work = frame.pending_work;
   result.temporal_reset = temporal.reset;
 
   if (frame.status == PreparedCudaFastDvdnetStatus::executed &&
@@ -239,7 +240,8 @@ PreparedCudaFastDvdnetFrameResult PreparedCudaFastDvdnetDenoiser::Execute(
   result.output_valid = false;
   if (failure_action == hal::FailureAction::fail_open_preserve_input &&
       frame.status != PreparedCudaFastDvdnetStatus::device_lost &&
-      frame.status != PreparedCudaFastDvdnetStatus::completion_pending) {
+      frame.status != PreparedCudaFastDvdnetStatus::completion_pending &&
+      !frame.pending_work) {
     result.status = PreparedCudaFastDvdnetStatus::optional_failed_open;
     result.reason = hal::ReasonId::optional_stage_failed_open;
     result.valid_input_preserved = true;

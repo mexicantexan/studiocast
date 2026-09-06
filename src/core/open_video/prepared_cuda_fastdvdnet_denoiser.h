@@ -112,6 +112,9 @@ struct PreparedCudaFastDvdnetRuntimeFrameResult {
   std::uint64_t stage_elapsed_ns = 0;
   std::uint64_t frame_elapsed_ns = 0;
   bool output_valid = false;
+  // Successful resident output remains stream-ordered until the outer owner's
+  // final completion. Failed work may be preserved only when this is false.
+  bool pending_work = false;
 };
 
 struct PreparedCudaFastDvdnetRuntimeTelemetry {
@@ -166,6 +169,7 @@ struct PreparedCudaFastDvdnetFrameResult {
   std::uint64_t stage_elapsed_ns = 0;
   std::uint64_t frame_elapsed_ns = 0;
   bool output_valid = false;
+  bool pending_work = false;
   bool valid_input_preserved = false;
   bool temporal_reset = false;
 };
