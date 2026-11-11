@@ -127,7 +127,8 @@ def export(upstream: Path, output: Path) -> dict:
     catalog = json.loads((repo / "installer/models/curated-model-catalog-v1.json").read_text())
     catalog["catalog_version"] = "2026-11-10-fastdvdnet-candidate"
     definition = next(p for p in catalog["packs"] if p["id"] == "fastdvdnet_sigma15")
-    definition["artifacts"][0].update(sha256=sha256(artifact), size_bytes=artifact.stat().st_size)
+    definition["artifacts"][0].update(sha256=sha256(artifact), size_bytes=artifact.stat().st_size,
+                                      source_paths=[PACK_PATH + "/model.onnx"])
     definition["provenance"]["release"] = f"upstream {UPSTREAM_COMMIT}; self-contained opset17; candidate, unpublished"
     for item in definition["metadata"]:
         item["sha256"] = sha256(pack / item["destination"])
