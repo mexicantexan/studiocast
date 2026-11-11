@@ -108,16 +108,16 @@ preserve the established measured host mirror finalizer.
 Active attribution requires a completed output and successful writer commit.
 A failed explicit or automatic temporal reset must prevent further execution
 and publication until valid preparation, and clear stale committed attribution.
-Explicit and automatic-discontinuity failure guards are integrated; final
-integrated verification remains pending at this checkpoint. A frame failure
+Explicit and automatic-discontinuity failure guards, exact unsubmitted-binding
+retirement, and disabled final-stage timing are integrated at final source
+`b204b0a`; see the evidence table for bounded final verification and review. A frame failure
 after prepared execution starts must not retry through a different backend or
 CPU provider in that frame. Native-to-host denoise/Eye Contact fallback is
 selected only during setup under unconstrained automatic intent, following a
 permitted availability failure and proven safe cleanup. Strict CUDA or
 incompatible provider requests, mixed CUDA semantics, pending cleanup, and
 quarantine never take it. Explicit typed CPU compatibility remains separate.
-Retained compatibility
-is a bounded preservation route, not family completion evidence.
+Retained compatibility is a bounded preservation route, not family completion evidence.
 
 ## Low-latency scheduling primitive
 
