@@ -2,7 +2,7 @@
 
 Status: manual regression plan for the refaced GUI and hardware desktop
 workflows.
-Last updated: 2026-11-10.
+Last updated: 2026-11-11.
 
 This document tracks manual tests that cannot be covered deterministically in
 CI because they require real V4L2 devices, v4l2loopback behavior, desktop
@@ -581,22 +581,32 @@ loader enumeration is not a successful production camera run.
 - [ ] Inject unsuccessful explicit and automatic/discontinuity temporal resets.
   Confirm execution and publication stop, stale active attribution clears, and
   only valid re-preparation permits recovery.
+- [ ] Under unconstrained automatic denoise/Eye Contact selection, force a
+  permitted native setup failure and verify host compatibility only after safe
+  cleanup. Strict CUDA or incompatible provider requests, mixed CUDA semantics,
+  pending cleanup, and quarantine must never take that fallback.
+- [ ] Reject insufficient persistent, scratch, upload/readback staging,
+  resource-count, and in-flight-slot budgets before native acquisition.
+- [ ] Fail a submitted frame before final readback and confirm the retirement
+  fence freezes normal enqueue/timing work. Lost or unproven fences must retain
+  resources rather than authorizing release.
 - [ ] Validate installed model metadata against its actual graph. In particular,
   the current YuNet template is 640x640; a stale installed 320x320 manifest needs
   an explicitly authorized transaction repair. Validation must preserve the
   installed pack and test candidates in isolated HOME/XDG roots.
 
-Current checkpoint evidence is partial. The vignette stage and alpha-capacity
-fix are integrated at `0adc8ac`; the former unintegrated-capacity blocker no
-longer describes the source. Preliminary 2026-11-10 Quadro P1000 / driver
-535.309.01 runs passed selected CUDA vignette, blur, mirror, and two-frame
-corrected-FastDVDnet/Auto Frame cases using generated RGB and an in-memory writer boundary.
-The actual Vulkan final resident integration executable passed on that device.
-Earlier Eye Contact component runs used generated input and synthetic landmarks.
-These results do not qualify the final integrated HEAD, real V4L2/camera output,
-Eye Contact/all combinations, quality, latency, AMD, or Intel.
-The automatic reset failure guard is integrated at `af2d1db`; final integrated
-verification remains pending.
+Local CUDA production composition is integrated at `c43717e`. The
+[HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+records the native seven-stage, three-frame P1000 smoke with the camera's
+100 ms / 1 ms / 100-poll completion policy, 64x48 → 96x64 geometry, and exact
+transfer/tail/writer-commit totals. Input was generated RGB, output used an
+in-memory writer, and no face was detected. This proves bounded composition,
+not real-camera transport, face correction, visual quality, latency, all vendor
+families, or release readiness. The actual Vulkan final resident executable
+also passed on that P1000; AMD/Intel remain unqualified. Layered unsubmitted
+binding retirement, final integrated build/test/self-test evidence, and fresh
+critique are pending. The expanded sixteen-topology CI enforcement is integrated
+at `d994679`; workflow execution remains a separate evidence gate.
 
 The corrected FastDVDnet candidate is distinct from the shipped default catalog
 and installed pack. Test candidate artifact identity explicitly; a successful
@@ -606,8 +616,11 @@ promotion, and the signed clean-HEAD release chain remain separate gates in
 
 Opt-in CI now requires the actual Vulkan final resident integration executable
 on each selected vendor runner. CUDA requires the production smoke executable
-with `--require`, a preinstalled read-only `cuda_model_root` and
-`cuda_model_id`, failure propagation, and retained evidence logs. A portable
+with `--require`, dlib, a preinstalled read-only `cuda_model_root`, exact
+matting/face/eye/denoise model IDs, a readable `cuda_replace_path`, failure
+propagation, and retained evidence logs. It covers fifteen strict topologies
+and an automatic six-stage resident case; automatic host mirror needs separate
+camera-level evidence. A portable
 skip, a configured workflow, or a kernel-only pass is not completed hardware
 qualification.
 

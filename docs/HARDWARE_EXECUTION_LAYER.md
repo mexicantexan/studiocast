@@ -3,7 +3,7 @@
 - Status: Active contract with a staged production migration
 - Applies To: StudioCast v0.2.9 and the current source tree
 - Audience: Video-pipeline, backend, daemon, installer, and test maintainers
-- Last Verified: 2026-11-10
+- Last Verified: 2026-11-11
 
 The StudioCast Hardware Execution Layer (HAL) separates canonical effect
 planning from backend-specific resource ownership and execution. It is an
@@ -105,7 +105,9 @@ It happens outside the frame loop. Candidate setup must roll back its resources
 on failure; retention of an old program is allowed only when the configured
 policy and identity remain compatible. Changes to the canonical plan,
 configuration, geometry, artifact/provider, device, context, or execution
-domain invalidate the program.
+domain invalidate the program. Setup checks persistent, scratch, upload-staging,
+readback-staging, resource-count, and in-flight-slot limits against the caller's
+reservation before native acquisition; it does not enlarge that reservation.
 
 V1 execution is synchronous but completion-shaped. `Execute` returns a
 completion token that may already be complete. The caller resolves the output
@@ -119,7 +121,10 @@ preserving valid input or the last valid resident frame. Required failures,
 foreign/stale resources, generation or domain mismatches, exhausted budgets,
 device loss, and synchronization failures remain typed and fail closed.
 Circuit breakers, temporal resets, frame-drop rules, shutdown, and quarantine
-are program state, not frame-time capability probes.
+are program state, not frame-time capability probes. Failed submitted CUDA frames
+receive a binding-validated retirement fence and freeze further normal enqueue
+and timing operations. A failed or device-lost fence does not prove quiescence;
+the owner retains the island until shutdown has explicit release proof.
 
 The current interface intentionally does not schedule true asynchronous work.
 Before asynchronous execution is added, the contract needs bounded in-flight
@@ -155,33 +160,36 @@ real hardware.
 ## Current production adapters and migration gates
 
 Prepared HAL completion proceeds by existing-functionality family. Open CUDA
-parity is the first completion target. Background modes, key light, geometry,
-fixed-center vignette, and the prepared YuNet, dlib-landmark, FastDVDnet,
-Auto Frame, Eye Contact, and mirror components have distinct implementation,
-production-routing, and qualification evidence. A component inventory is not a
-family parity claim. Production composition of the remaining CUDA components
-is under verification; compatibility and blocked routes remain explicit until
-the family gate in [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) passes.
+parity remains the first completion target. Local production composition is
+integrated at `c43717e`: denoise, Eye Contact and its YuNet/landmark dependencies,
+background modes, key light, Auto Frame, tracked or fixed vignette, mirror, and
+final geometry can execute in one exact CUDA island in canonical order. Model
+and provider identities, optional-stage isolation, temporal history, and
+metadata crossings stay explicit. This integration and the bounded smoke below
+do not by themselves satisfy the family gate in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md).
 
-The vignette production stage and resident alpha-capacity correction are
-integrated at `0adc8ac`. Strict CUDA MODNet executes after setup-time
-specialization of free dimensions. The corrected capacity check respects the
-one-row pitched tensor allocation rather than multiplying its complete
-allocation pitch by model height again.
+### Evidence and remaining gates
 
-The 2026-11-10 Quadro P1000 / NVIDIA driver 535.309.01 evidence is bounded:
-selected CUDA vignette, blur, mirror, and two-frame corrected-FastDVDnet and
-Auto Frame cases
-passed with generated RGB and an in-memory writer boundary in the runtime
-candidate. The actual Vulkan final resident integration executable also passed
-on this device. These runs are preliminary checkpoint evidence, not final-HEAD
-qualification, a real V4L2/camera run, visual-quality or latency evidence,
-complete Eye Contact/combination coverage, or AMD/Intel evidence.
-Earlier native YuNet, dlib landmark, Eye Contact, resize, and letterbox oracles
-likewise prove only their stated components. The installed YuNet metadata was
-stale (320x320 for the pinned 640x640 graph); the repository template is already
-640x640. Candidate tests use current metadata in an isolated root; validation
-does not repair an installed pack implicitly.
+| Evidence layer | Recorded result | Qualification boundary / remaining gate |
+| --- | --- | --- |
+| Local production integration | `c43717e`, including shared camera setup, exact dependency binding, strict-selection guards, automatic reset-failure invalidation, six-axis resource reservation, and frozen failed-frame retirement | Layered retirement of an unsubmitted bound frame is still under remediation; final integrated verification and fresh critique remain pending |
+| Native CUDA combined smoke | Smoke target `0c93225`; Quadro P1000, NVIDIA driver 535.309.01; three generated RGB frames, 64x48 input to 96x64 output, canonical denoise → Eye Contact → blur → key light → Auto Frame → tracked vignette → mirror; camera wait policy 100 ms / 1 ms / 100 polls | All seven stages executed and all three in-memory writer commits succeeded; this is not real V4L2/camera, real-face correction, visual-quality, or latency qualification |
+| Combined transfer accounting | Three uploads, three final RGB readbacks, 39 metadata readbacks, nine synchronizations, twelve CPU-tail boundaries, and three committed frames; no fallback | Metadata readbacks and CPU tracking/planning tails are deliberate measured boundaries; no zero-intermediate-crossing claim |
+| Model identity | Isolated candidate root uses corrected FastDVDnet, current 640x640 YuNet metadata, dlib landmarks, and the real FP32 left/right Eye Contact models | Generated input produced no detected face, so Eye Contact preparation/dispatch does not demonstrate face correction quality; installed packs remain untouched |
+| Vulkan final resident execution | Actual final resident integration executable passed on the P1000 / driver 535.309.01 | The exact mirror/fixed-center vignette contract remains the only production-eligible scope; no AMD/Intel or other Vulkan effect qualification is inferred |
+| Required hardware CI | `d994679` integrates sixteen CUDA topologies, including the strict seven-stage composition and automatic six-stage resident composition without mirror; dlib, exact preinstalled model IDs, and a readable replacement image are required | Workflow enforcement is implemented; it does not prove that those jobs ran, and automatic host mirror still needs camera-level evidence |
+| Integrated regression and review | Enabled Debug full build passed on `c43717e` plus CI changes; CTest is ongoing. Probe self-test has two failures under diagnosis in the tool compile-definition boundary. Optional-backend-off Release and fresh integrated critique remain pending | Record exact final source SHAs, test counts, repair evidence, and critique results before declaring the local delivery gate complete |
+| Release and external publication | Repaired FastDVDnet publication approval remains pending; shipped catalog retains its published identity | Family parity, real-camera/quality/latency evidence, claimed vendor matrices, catalog promotion, and the normal signed clean-HEAD release chain remain separate gates |
+
+The vignette stage and resident alpha-capacity correction were integrated at
+`0adc8ac`. Strict CUDA MODNet uses setup-time specialization of free dimensions.
+The corrected capacity check respects a one-row pitched tensor allocation
+rather than multiplying its complete allocation pitch by model height again.
+
+The installed YuNet metadata was stale (320x320 for the pinned 640x640 graph);
+the repository template is already 640x640. Tests use current metadata in an
+isolated root; validation does not repair an installed pack implicitly.
 
 The approved FastDVDnet decision is repair/re-export with the existing model
 ID and defaults. A self-contained corrected candidate and reproducibility
@@ -204,8 +212,8 @@ the prior valid plan.
 | CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
 | Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
 | Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; zero CPU tails | Matting, tracked-center vignette, Auto Frame, eye contact, denoise, key light, and background modes remain blocked or non-production exactly as documented |
-| Open CUDA resident | Strict CUDA and automatic CUDA selection use exact model/provider evidence; native kernel stages carry their own provider identity | Background/key-light/geometry/vignette routing is integrated; remaining component composition is under verification and is not family parity evidence |
-| Open Video compatibility | Typed host ONNX Runtime domain for the existing denoise and eye-contact route | It is not CUDA attribution and cannot satisfy strict CUDA/provider selection |
+| Open CUDA resident | Strict CUDA and automatic CUDA selection use exact model/provider evidence; canonical effect composition and geometry are integrated | Bounded generated-input/in-memory-writer evidence is recorded above; final integrated regression, lifecycle remediation, critique, and family/release gates remain required |
+| Open Video compatibility | Native-to-host denoise/Eye Contact fallback is setup-only under unconstrained automatic selection, after permitted availability failure and proven safe cleanup | Strict CUDA or incompatible provider intent, mixed CUDA semantics, pending cleanup, and quarantine never take this fallback; explicit typed CPU compatibility remains separate and is not CUDA attribution |
 
 The setup request declares a setup-only terminal
 `backend_resolved_output` marker. It is never executable. The selected setup

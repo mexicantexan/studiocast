@@ -607,16 +607,22 @@ matting stays blocked until reviewed shared-device GPU-only inference and
 converted, checksummed model artifacts satisfy the resident-runtime contract.
 
 Keep implementation, production routing, hardware qualification, and release
-publication as separate evidence. The fixed-center CUDA vignette stage and
-resident alpha-capacity correction are integrated at `0adc8ac`; the earlier
-unintegrated-candidate and MODNet CPU graph-partition diagnoses are obsolete.
-Prepared YuNet, landmarks, FastDVDnet, Auto Frame, Eye Contact, and mirror
-components do not by themselves prove the complete production camera route.
-The remaining production composition is under verification. The automatic
-temporal-reset failure guard is integrated at `af2d1db`; final integrated
-verification remains required. A failed temporal reset must invalidate stale
-output attribution and prevent execution/publication until a valid program is
-prepared; preserve this gate for both explicit reset and capture discontinuity.
+publication as separate evidence. Local canonical CUDA composition is integrated
+at `c43717e`, including denoise, Eye Contact dependencies, background modes,
+key light, Auto Frame, vignette, resident mirror, and geometry. Strict
+backend/provider constraints remain exact. Unconstrained automatic selection
+alone may fall back during setup to host denoise/Eye Contact compatibility
+after a permitted failure and proven safe cleanup; mixed CUDA semantics,
+pending cleanup, or quarantine cannot take this fallback. Explicit typed CPU
+compatibility remains separate. All six caller resource-budget
+axes are checked before native acquisition. Failed submitted frames freeze
+normal work and require a bound retirement fence; device loss is not release
+proof. Layered unsubmitted-binding retirement, final integrated verification,
+and fresh critique remain pending.
+
+A failed temporal reset must invalidate stale output attribution and prevent
+execution/publication until a valid program is prepared. Preserve this gate for
+both explicit reset and capture discontinuity.
 
 The shared `BuildProductionVideoBackendSetupRequest` builder in
 `src/core/video/production_video_setup_request.*` keeps camera and smoke-test
@@ -628,14 +634,13 @@ finalizer. CUDA face/Auto Frame analysis has separately bounded metadata
 readbacks and CPU tracking/planning tails, so do not claim every combination
 has zero intermediate crossings.
 
-On Quadro P1000 / NVIDIA driver 535.309.01, preliminary 2026-11-10 runs passed
-selected CUDA vignette, blur, mirror, and two-frame corrected-denoise/Auto Frame cases
-using generated RGB and an in-memory writer boundary. The real Vulkan final
-resident integration executable also passed on that device. Earlier dlib,
-YuNet, geometry, and Eye Contact component oracles remain component evidence.
-These results do not qualify a final integrated HEAD, real V4L2/camera output,
-Eye Contact and all combinations, visual quality, latency, AMD, or
-Intel. Short Debug-run timings are not latency qualification.
+The [HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+records the exact P1000 / driver 535.309.01 combined seven-stage smoke,
+geometry, camera completion budget, transfer/tail counts, and remaining gates.
+Three generated frames and three in-memory writer commits prove that bounded
+native execution. The input had no detected face, so it does not demonstrate
+real-face Eye Contact correction. The result does not qualify real V4L2/camera
+output, visual quality, latency, AMD, Intel, or family/release completion.
 
 A stale installed YuNet manifest declared 320x320 for its pinned 640x640 graph;
 the repository template already declares 640x640. Validate/reinstall metadata
@@ -794,7 +799,11 @@ builds and requires `studiocast-vulkan-final-stage-integration-tests` as well as
 the kernel tests; loader enumeration or a resize benchmark alone is
 insufficient. The CUDA opt-in requires both the runtime self-test and
 `studiocast-open-cuda-production-smoke-tests --require`, using the explicit
-`cuda_model_root` and `cuda_model_id` inputs for preinstalled read-only models.
+`cuda_model_root`, matting/face/eye/denoise model IDs, and `cuda_replace_path`
+inputs for preinstalled read-only models and a readable replacement image. It
+requires dlib and sixteen topologies: fifteen strict CUDA cases including the
+canonical seven-stage composition, plus automatic six-stage resident
+composition. Automatic host mirror needs separate camera-level evidence.
 The smoke step propagates command failures through log capture and preserves
 source/build/GPU/output evidence artifacts. Enabling these jobs enforces a
 gate; it does not prove that any vendor matrix has run successfully.

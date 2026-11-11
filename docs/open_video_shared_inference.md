@@ -3,7 +3,7 @@
 - Status: Shared-analysis design and prepared-runtime checkpoint
 - Applies To: Open Video shared analysis and latest-frame scheduling primitives
 - Audience: Video runtime and model-backend maintainers
-- Last Verified: 2026-11-10
+- Last Verified: 2026-11-11
 
 StudioCast’s open-source video effects can require **multiple ML inferences per frame**:
 
@@ -70,14 +70,16 @@ CPU, Maxine, or Vulkan.
 ## Prepared Open CUDA route
 
 The prepared route has expanded beyond the original single explicit
-blur/remove, same-geometry slice. Background modes, key light, final geometry,
-and fixed-center vignette have production routing; prepared native mirror,
-YuNet, landmarks, Auto Frame, Eye Contact, and temporal FastDVDnet components
-are composed by the runtime candidate under verification. Strict and automatic
-selection, exact artifact/provider identity, optional failures, temporal reset,
-and supported combinations still require the family gate in
-[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Component implementation
-must not be reported as completed production parity.
+blur/remove, same-geometry slice. Local production composition is integrated at
+`c43717e`: denoise, Eye Contact with YuNet/landmark dependencies, background
+modes, key light, Auto Frame, tracked or fixed vignette, resident mirror, and
+final geometry share one owned CUDA island in canonical order. Strict and
+automatic selection, exact artifact/provider identity, optional failures,
+temporal reset, and supported combinations remain subject to the family gate
+in [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). The
+[bounded evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+separates native generated-input execution from final regression/review,
+real-camera quality/latency, and release qualification.
 
 The camera pipeline and production smoke executable use the shared
 `BuildProductionVideoBackendSetupRequest` builder in
@@ -106,11 +108,16 @@ preserve the established measured host mirror finalizer.
 Active attribution requires a completed output and successful writer commit.
 A failed explicit or automatic temporal reset must prevent further execution
 and publication until valid preparation, and clear stale committed attribution.
-The automatic-discontinuity failure guard is integrated at `af2d1db`; final
+Explicit and automatic-discontinuity failure guards are integrated; final
 integrated verification remains pending at this checkpoint. A frame failure
 after prepared execution starts must not retry through a different backend or
-CPU provider in that frame. Retained
-compatibility is a bounded preservation route, not family completion evidence.
+CPU provider in that frame. Native-to-host denoise/Eye Contact fallback is
+selected only during setup under unconstrained automatic intent, following a
+permitted availability failure and proven safe cleanup. Strict CUDA or
+incompatible provider requests, mixed CUDA semantics, pending cleanup, and
+quarantine never take it. Explicit typed CPU compatibility remains separate.
+Retained compatibility
+is a bounded preservation route, not family completion evidence.
 
 ## Low-latency scheduling primitive
 
