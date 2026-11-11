@@ -664,6 +664,12 @@ StatusId MaxineHalResidentAdapter::Prepare(
     SetReason(reason, ReasonId::strict_backend_unavailable);
     return StatusId::blocked;
   }
+  // This route has no setup-proven metadata crossings.
+  if (program.maximum_metadata_readbacks_per_frame != 0 ||
+      program.maximum_metadata_cpu_tails_per_frame != 0) {
+    SetReason(reason, ReasonId::transfer_contract_violated);
+    return StatusId::blocked;
+  }
   const bool backend_fallback = program.requested_backend != BackendId::maxine;
   if (!BudgetContains(configuration_.capacity, program.budget)) {
     SetReason(reason, ReasonId::resource_exhausted);

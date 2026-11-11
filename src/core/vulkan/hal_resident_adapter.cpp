@@ -285,6 +285,11 @@ StatusId VulkanHalResidentAdapter::Prepare(
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   if (program.cpu_tail_count != 0)
     return fail(StatusId::blocked, ReasonId::cpu_tail_required);
+  // This route has no setup-proven metadata crossings.
+  if (program.maximum_metadata_readbacks_per_frame != 0 ||
+      program.maximum_metadata_cpu_tails_per_frame != 0) {
+    return fail(StatusId::blocked, ReasonId::transfer_contract_violated);
+  }
   if (!IsExactHostRgbImage(program.host_input, hal::Mutability::read_only) ||
       !IsExactHostRgbImage(program.host_output, hal::Mutability::write_only)) {
     return fail(StatusId::blocked, ReasonId::malformed_descriptor);

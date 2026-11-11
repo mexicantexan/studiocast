@@ -1017,6 +1017,10 @@ VulkanVideoExecutionFactory::Prepare(
       reason = ReasonId::malformed_contract;
     return fail(StatusId::blocked, reason);
   }
+  if (plan.prepared_program.maximum_metadata_readbacks_per_frame != 0 ||
+      plan.prepared_program.maximum_metadata_cpu_tails_per_frame != 0) {
+    return fail(StatusId::blocked, ReasonId::transfer_contract_violated);
+  }
   ParsedProgramOptions parsed;
   if (!ParseOptions(plan.intent, &parsed, &reason))
     return fail(StatusId::blocked, reason);
