@@ -3,7 +3,7 @@
 - Status: Active documentation lifecycle index
 - Applies To: The current repository documentation
 - Audience: Users, contributors, maintainers, and reviewers
-- Last Verified: 2026-07-23
+- Last Verified: 2026-11-10
 
 Repository policies are discovered with `docs/*POLICY*.md`; all policy files
 therefore remain at the `docs/` root. Active cross-subsystem contracts also stay
@@ -29,7 +29,8 @@ These files describe current architecture or stable cross-subsystem behavior.
 | Document | Status | Applies To | Owner/Audience | Last Verified |
 | --- | --- | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Active contract | Target layers, daemon authority, effects, and model layout | All contributors | 2026-07-23 |
-| [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md) | Active staged-migration contract | Neutral HAL, prepared adapters, execution domains, and typed status | Video/backend maintainers | 2026-07-23 |
+| [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md) | Active staged-migration contract | Neutral HAL, prepared adapters, execution domains, and typed status | Video/backend maintainers | 2026-11-10 |
+| [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) | Active migration and release contract | Family parity, route removal, and bounded hardware qualification | Video/release maintainers | 2026-09-06 |
 | [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) | Active contract | Curated model catalog and transactions | Installer/model maintainers | 2026-07-22 |
 | [INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md) | Active capability contract | Per-effect installer/runtime Vulkan evidence | Installer/Vulkan maintainers | 2026-07-22 |
 | [RELEASE_CHANNEL.md](RELEASE_CHANNEL.md) | Active security contract | Stable release transport, signing, and updates | Release/security maintainers | 2026-07-22 |
@@ -60,7 +61,7 @@ active capability contracts.
 
 | Document | Status | Baseline or Scope | Audience |
 | --- | --- | --- | --- |
-| [open_video_shared_inference.md](open_video_shared_inference.md) | Design note with implemented primitives | Shared per-frame analysis and latest-frame scheduling | Video/model maintainers |
+| [open_video_shared_inference.md](open_video_shared_inference.md) | Shared-analysis design and prepared-runtime checkpoint | Same-frame analysis, temporal/transfer boundaries, and latest-frame scheduling | Video/model maintainers |
 | [vulkan_matting_ncnn_spike.md](vulkan_matting_ncnn_spike.md) | Experimental design record | Optional ncnn Vulkan spike | Vulkan/model maintainers |
 | [V4L2_WRITER_MEASUREMENTS.md](V4L2_WRITER_MEASUREMENTS.md) | Historical measurement record | Commits named in the document | Performance maintainers |
 

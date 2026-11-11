@@ -3,7 +3,7 @@
 - Status: Active contract with a staged production migration
 - Applies To: StudioCast v0.2.9 and the current source tree
 - Audience: Video-pipeline, backend, daemon, installer, and test maintainers
-- Last Verified: 2026-07-24
+- Last Verified: 2026-11-10
 
 The StudioCast Hardware Execution Layer (HAL) separates canonical effect
 planning from backend-specific resource ownership and execution. It is an
@@ -155,30 +155,41 @@ real hardware.
 ## Current production adapters and migration gates
 
 Prepared HAL completion proceeds by existing-functionality family. Open CUDA
-parity is the first completion target because it preserves the established
-GPU-only effects before StudioCast expands production Vulkan behavior. At the
-current source checkpoint, automatic Maxine preference and Open CUDA fallback,
-strict backend/provider boundaries, background/key-light combinations, output
-geometry, and prepared YuNet, dlib-landmark, FastDVDnet, Auto Frame, Eye
-Contact, vignette, and mirror components have been implemented or staged. This
-is a component and contract inventory, not a parity claim: denoise, Auto Frame,
-Eye Contact, mirror, and vignette are not all routed through the production
-prepared island on the current main checkpoint.
+parity is the first completion target. Background modes, key light, geometry,
+fixed-center vignette, and the prepared YuNet, dlib-landmark, FastDVDnet,
+Auto Frame, Eye Contact, and mirror components have distinct implementation,
+production-routing, and qualification evidence. A component inventory is not a
+family parity claim. Production composition of the remaining CUDA components
+is under verification; compatibility and blocked routes remain explicit until
+the family gate in [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) passes.
 
-The current Quadro P1000 evidence is also bounded. Strict CUDA MODNet executes
-after setup-time specialization of its free dimensions; the later production
-smoke blocker was a capacity check that multiplied a one-row pitched NCHW
-tensor allocation by the model height even though its pitch already represented
-the full tensor allocation. The correction exists only in the unintegrated
-vignette candidate at this checkpoint. Native YuNet, dlib landmark, Eye
-Contact, mirror, vignette, resize, and letterbox runs prove their stated
-components on NVIDIA driver 535.309.01, but do not prove the complete camera
-route, face quality, latency, or every required combination and rollback case.
-The installed FastDVDnet
-artifact matches its curated identity but fails ONNX graph validation because
-a weight input has no producer or initializer; its catalog policy awaits an
-explicit decision. These routes remain compatibility-owned or blocked as
-reported by the daemon until their parity evidence passes review.
+The vignette production stage and resident alpha-capacity correction are
+integrated at `0adc8ac`. Strict CUDA MODNet executes after setup-time
+specialization of free dimensions. The corrected capacity check respects the
+one-row pitched tensor allocation rather than multiplying its complete
+allocation pitch by model height again.
+
+The 2026-11-10 Quadro P1000 / NVIDIA driver 535.309.01 evidence is bounded:
+selected CUDA vignette, blur, mirror, and two-frame corrected-FastDVDnet and
+Auto Frame cases
+passed with generated RGB and an in-memory writer boundary in the runtime
+candidate. The actual Vulkan final resident integration executable also passed
+on this device. These runs are preliminary checkpoint evidence, not final-HEAD
+qualification, a real V4L2/camera run, visual-quality or latency evidence,
+complete Eye Contact/combination coverage, or AMD/Intel evidence.
+Earlier native YuNet, dlib landmark, Eye Contact, resize, and letterbox oracles
+likewise prove only their stated components. The installed YuNet metadata was
+stale (320x320 for the pinned 640x640 graph); the repository template is already
+640x640. Candidate tests use current metadata in an isolated root; validation
+does not repair an installed pack implicitly.
+
+The approved FastDVDnet decision is repair/re-export with the existing model
+ID and defaults. A self-contained corrected candidate and reproducibility
+results exist, while the shipped catalog retains the old published identity
+and its graph-validation failure. External publication, catalog promotion,
+required CUDA qualification, and the signed clean-HEAD release chain remain
+separate gates; installed packs are untouched. See
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
 
 The camera pipeline uses one `ProductionVideoBackendManager` backed by typed
 setup leases. Backend factories own native sessions, contexts, streams/queues,
@@ -193,7 +204,7 @@ the prior valid plan.
 | CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
 | Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
 | Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; zero CPU tails | Matting, tracked-center vignette, Auto Frame, eye contact, denoise, key light, and background modes remain blocked or non-production exactly as documented |
-| Open CUDA resident | Explicit strict CUDA; model-backed stages require ONNX Runtime CUDA and exact model evidence, while native kernel stages use their own provider identity | The native CUDA-kernel provider contract permits same-domain model-free stages, but the provider ID alone is not production eligibility; each stage still requires its integration and evidence gates |
+| Open CUDA resident | Strict CUDA and automatic CUDA selection use exact model/provider evidence; native kernel stages carry their own provider identity | Background/key-light/geometry/vignette routing is integrated; remaining component composition is under verification and is not family parity evidence |
 | Open Video compatibility | Typed host ONNX Runtime domain for the existing denoise and eye-contact route | It is not CUDA attribution and cannot satisfy strict CUDA/provider selection |
 
 The setup request declares a setup-only terminal
@@ -240,9 +251,16 @@ virtual key light, and virtual-background modes retain their existing
 production, degraded, experimental, diagnostics-only, or blocked states.
 Creating a generic Vulkan adapter does not promote them.
 
-`camera_pipeline.cpp` builds the canonical request and consumes the manager's
-typed setup result. The static backend-composition target owns the optional
-Maxine, Open CUDA/Open Video, and Vulkan dependencies privately;
+`production_video_setup_request.*` owns the shared
+`BuildProductionVideoBackendSetupRequest` builder used by the camera pipeline
+and hardware smoke executable. It fixes canonical order, parameters, geometry,
+selection intent, and temporal requirements during setup. Greenscreen temporal
+history is a Maxine-only refinement after backend selection; its default must
+not make ordinary CUDA matting temporal. Denoise, Auto Frame, and Eye Contact
+retain their own declared history and discontinuity requirements. The camera
+pipeline consumes the manager's typed setup result. The static
+backend-composition target owns the optional Maxine, Open CUDA/Open Video, and
+Vulkan dependencies privately;
 `studiocast_video_runtime` exposes neutral contracts, execution runtime, video
 I/O, and support dependencies and receives no optional backend feature
 definitions. Any retained compatibility execution is still part of the live
@@ -259,12 +277,22 @@ host input -> one upload -> contiguous resident stages
            -> one final readback -> exact declared writer/format CPU tail
 ```
 
+This full-frame shape does not imply zero metadata crossings for analysis
+consumers. The CUDA analysis contract separately bounds face metadata
+readbacks (up to twelve per frame) and matte-bounds readback (up to one), plus
+their synchronization and CPU detection/tracking/crop-plan tails. Image and
+inference tensors remain resident; metadata work must be counted and reported
+rather than described as a transfer-free path.
+
 Intermediate uploads/readbacks, synchronization points, and CPU-tail
 boundaries are explicit counters. An adapter cannot hide a host round trip
 inside provider work or infer interoperation across domains. CPU-only
 passthrough remains CPU-only with zero GPU transfers.
 
-The host primitive mirror is also a typed CPU-tail activity record. It is
+Exact CUDA and Vulkan selection can include mirror in their resident island.
+Automatic selection and Maxine retain the established host mirror finalizer;
+this is an explicit limitation, even when automatic selection resolves to
+CUDA. The host primitive mirror is a typed CPU-tail activity record. It is
 published only after the same frame is committed by the writer. A dropped,
 unwritten, disabled, or fail-open frame cannot leave stale active mirror
 attribution, and this primitive record never becomes semantic-provider
