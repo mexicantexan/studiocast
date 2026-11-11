@@ -941,6 +941,18 @@ bool TestFailedFrameFenceRetainsUntilQuiescent() {
                support.counters().frame_final_readbacks == 0,
            "failure fence must not authorize reuse or writable output") &&
        ok;
+  const auto fenced_records = fake.event_records;
+  const auto fenced_copies = fake.copy_calls;
+  bool frozen = !support.RecordStageBegin(binding, 0).ok();
+  frozen &= !support.RecordStageEnd(binding, 0).ok();
+  frozen &= !support.EnqueueUpload(binding, 0x4000, 16).ok();
+  frozen &= !support.EnqueueReadbackAt(binding, 0, 0x5000, 20).ok();
+  frozen &= !support.SubmitResidentWork(binding).ok();
+  ok = Expect(frozen && fake.event_records == fenced_records &&
+                  fake.copy_calls == fenced_copies,
+              "failure fence must freeze every normal enqueue and timing "
+              "operation") &&
+       ok;
   fake.not_ready_queries = 1;
   ok =
       Expect(support.Shutdown().status == Support::Status::resource_exhausted &&
@@ -950,6 +962,22 @@ bool TestFailedFrameFenceRetainsUntilQuiescent() {
   ok = Expect(support.Shutdown().ok() && !support.prepared(),
               "completed failure fence must permit retryable release") &&
        ok;
+  Support query_lost;
+  ok = Expect(query_lost.Prepare(&driver, OptionsFor(binding)).ok() &&
+                  query_lost.BeginFrame(binding, 2).ok() &&
+                  query_lost.EnqueueUpload(binding, 0x4000, 16).ok() &&
+                  query_lost.RecordFailedFrameCompletion(binding).ok(),
+              "query-loss case must record a bound retirement fence") &&
+       ok;
+  fake.query_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  const auto query_lost_frees = fake.pinned_frees;
+  ok = Expect(!query_lost.Shutdown().ok() && query_lost.prepared() &&
+                  !query_lost.Shutdown().ok() && query_lost.prepared() &&
+                  fake.pinned_frees == query_lost_frees,
+              "failed-fence query device loss must never release unproven "
+              "storage") &&
+       ok;
+  fake.query_result = cuda::CUDA_SUCCESS;
   Support device_lost;
   ok = Expect(device_lost.Prepare(&driver, OptionsFor(binding)).ok() &&
                   device_lost.BeginFrame(binding, 2).ok() &&

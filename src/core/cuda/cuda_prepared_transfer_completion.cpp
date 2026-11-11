@@ -124,7 +124,7 @@ CudaPreparedTransferCompletion::ValidateFrameBinding(
   Result result = ValidateBinding(binding);
   if (!result.ok())
     return result;
-  if (!frame_active_)
+  if (!frame_active_ || failed_frame_completion_)
     return Failed(Status::invalid_sequence);
   return BindContext();
 }
@@ -599,11 +599,14 @@ CudaPreparedTransferCompletion::RecordCompletion(
 CudaPreparedTransferCompletion::Result
 CudaPreparedTransferCompletion::RecordFailedFrameCompletion(
     const Binding &binding) noexcept {
-  const auto validation = ValidateFrameBinding(binding);
+  const auto validation = ValidateBinding(binding);
   if (!validation.ok())
     return validation;
-  if (!work_submitted_)
+  if (!frame_active_ || !work_submitted_)
     return Failed(Status::invalid_sequence);
+  const auto context = BindContext();
+  if (!context.ok())
+    return context;
   failed_frame_completion_ = true;
   frame_reuse_blocked_ = true;
   if (completion_recorded_)
@@ -713,6 +716,8 @@ CudaPreparedTransferCompletion::Shutdown() noexcept {
   }
   if (failed_frame_completion_ && !completion_recorded_)
     return Failed(Status::resource_exhausted);
+  if (failed_frame_completion_ && quarantined_)
+    return Failed(Status::device_lost);
   if (frame_active_ && work_submitted_ && !quarantined_) {
     if (!completion_recorded_)
       return Failed(Status::resource_exhausted);
@@ -722,8 +727,11 @@ CudaPreparedTransferCompletion::Shutdown() noexcept {
       return Failed(Status::resource_exhausted, query);
     if (query != CUDA_SUCCESS && !IsCudaDeviceLossResult(query))
       return Failed(Status::event_failed, query);
-    if (IsCudaDeviceLossResult(query))
-      (void)FromCudaFailure(Status::event_failed, query);
+    if (IsCudaDeviceLossResult(query)) {
+      const auto failure = FromCudaFailure(Status::event_failed, query);
+      if (failed_frame_completion_)
+        return failure;
+    }
   }
   return ReleaseCurrent(true);
 }
