@@ -29,6 +29,13 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def compose_license(template: str, upstream_license: str) -> str:
+    # Promotion puts the full notice in the template; reproduce those same bytes.
+    marker = "\nFull upstream license at pinned commit:\n\n"
+    summary = template.split(marker, 1)[0]
+    return summary + marker + upstream_license
+
+
 def verify_upstream(upstream: Path) -> None:
     # Verify before importing Python or deserializing even a weights-only file.
     for name, expected in UPSTREAM_HASHES.items():
@@ -115,9 +122,8 @@ def export(upstream: Path, output: Path) -> dict:
                               notes="Self-contained opset-17 FP32 export of verified upstream model.pth; "
                                     "scripts/models/export_fastdvdnet.py. Dynamic N/H/W; H/W multiples of four.")
     (pack / "model.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (pack / "LICENSE.txt").write_text((template / "LICENSE.txt").read_text() +
-                                      "\nFull upstream license at pinned commit:\n\n" +
-                                      (upstream / "LICENSE").read_text())
+    (pack / "LICENSE.txt").write_text(compose_license(
+        (template / "LICENSE.txt").read_text(), (upstream / "LICENSE").read_text()))
     catalog = json.loads((repo / "installer/models/curated-model-catalog-v1.json").read_text())
     catalog["catalog_version"] = "2026-11-10-fastdvdnet-candidate"
     definition = next(p for p in catalog["packs"] if p["id"] == "fastdvdnet_sigma15")
