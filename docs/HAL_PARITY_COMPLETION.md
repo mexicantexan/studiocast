@@ -153,11 +153,12 @@ transaction was performed. Authorized publication attempts did not upload files.
   unique-owner failure and preserves retained-owner behavior; both cases pass
   against the repaired library. This is a source lifetime fix, with no host
   driver/provider change.
-- Fresh `native_cleanup_final_critique` completed source review at `b204b0a`
-  with no concrete Blocker/Critical/High and independently passed six exporter
-  tests, four workflow tests, and the lifetime binary. Final documentation
-  consistency review awaits this exact docs diff; it is not counted as a
-  completed review in this record.
+- Fresh `native_cleanup_final_critique` approved the bounded local implementation:
+  runtime source `b204b0a` and eight-doc commit `81a8989`, integrated as
+  `e619d93`, have no unresolved Blocker/Critical/High finding. The critic
+  independently passed six exporter tests, four workflow tests, and the lifetime
+  binary, and reviewed the final broad/native evidence and documentation limits.
+  This approval does not establish external publication or release completion.
 
 ### Final source verification and bounded diagnostics
 
@@ -185,7 +186,8 @@ The prior native probe abort at `2e70c1b` is superseded by the causal lifetime
 repair; disabling Vulkan ICD discovery was diagnostic isolation only and is
 not part of accepted verification. The final required Vulkan resident
 integration and combined required probe both exited 0 at `b204b0a`. All
-sixteen required CUDA cases passed with command exit 0: three commits per case, 48 committed frames/uploads/final RGB readbacks, 188 metadata
+sixteen required CUDA cases passed with command exit 0 and three commits per
+case: 48 committed frames, 48 uploads, 48 final RGB readbacks, 188 metadata
 readbacks, 71 synchronizations, 83 CPU-tail boundaries, and zero fallback.
 The strict seven-stage and automatic six-stage resident cases each committed
 three frames with three uploads/final RGB readbacks, 39 metadata readbacks,
