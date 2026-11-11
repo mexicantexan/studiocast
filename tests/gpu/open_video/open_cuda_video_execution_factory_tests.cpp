@@ -512,11 +512,12 @@ bool FullCanonicalCombinationAndOptionalTrackerFallback() {
   SetupContext context;
   auto request = Request();
   const std::array semantics{hal::SemanticEffectId::video_noise_removal,
-      hal::SemanticEffectId::eye_contact,
-      hal::SemanticEffectId::virtual_background_blur,
-      hal::SemanticEffectId::virtual_key_light,
-      hal::SemanticEffectId::auto_frame,
-      hal::SemanticEffectId::vignette, hal::SemanticEffectId::mirror};
+                             hal::SemanticEffectId::eye_contact,
+                             hal::SemanticEffectId::virtual_background_blur,
+                             hal::SemanticEffectId::virtual_key_light,
+                             hal::SemanticEffectId::auto_frame,
+                             hal::SemanticEffectId::vignette,
+                             hal::SemanticEffectId::mirror};
   request.intent.stage_count = semantics.size();
   request.intent.requested_provider = hal::SemanticEffectProviderId::invalid;
   request.intent.strict_provider_selection = false;
@@ -653,8 +654,8 @@ bool ExactPreflightAndMalformedRejection() {
   video::VideoAdapterFactoryPreflight preflight;
   REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
   REQUIRE(preflight.status == hal::StatusId::ready);
-  for (const std::size_t count : {hal::kMaxPreparedStages, std::size_t{0},
-                                  hal::kMaxPreparedStages + 1}) {
+  for (const std::size_t count :
+       {hal::kMaxPreparedStages, std::size_t{0}, hal::kMaxPreparedStages + 1}) {
     auto forged = plan;
     auto forged_config = FactoryConfig(&context, request);
     forged.prepared_program.stage_count = count;

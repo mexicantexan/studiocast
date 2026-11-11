@@ -101,7 +101,8 @@ video::VideoExecutionPlanRequest Plan() {
   plan.temporal.temporal = true;
   plan.temporal.requires_contiguous_capture_sequence = true;
   plan.temporal.history_frames = 1;
-  plan.temporal.frame_drop_behavior = hal::FrameDropBehavior::reset_temporal_state;
+  plan.temporal.frame_drop_behavior =
+      hal::FrameDropBehavior::reset_temporal_state;
   plan.host_input = Image(hal::Mutability::read_only);
   plan.host_output = Image(hal::Mutability::write_only);
   plan.invalidation_key.generations = {1, 2, 3, 4, 5, 7};
@@ -345,11 +346,12 @@ public:
     program.setup_failure_policy = request.setup_failure_policy;
     program.requested_backend = hal::BackendId::maxine;
     program.strict_backend_selection = request.intent.backend.strict;
-    program.requested_provider =
-        request.intent.requested_provider == hal::SemanticEffectProviderId::invalid
-            ? result.provider
-            : request.intent.requested_provider;
-    program.strict_provider_selection = request.intent.strict_provider_selection;
+    program.requested_provider = request.intent.requested_provider ==
+                                         hal::SemanticEffectProviderId::invalid
+                                     ? result.provider
+                                     : request.intent.requested_provider;
+    program.strict_provider_selection =
+        request.intent.strict_provider_selection;
     program.requested_execution_domain = Domain();
     program.strict_execution_domain = true;
     program.requires_upload = true;

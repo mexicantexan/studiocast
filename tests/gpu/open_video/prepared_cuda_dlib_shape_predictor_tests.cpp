@@ -227,10 +227,12 @@ int main() {
     const int before = allocations;
     studiocast::open_video::PreparedCudaDlibShapePredictor rejected;
     studiocast::open_video::PreparedCudaDlibStatus status;
-    ok &= Need(!rejected.Prepare(selected_setup, &e, &status) &&
-                   status == studiocast::open_video::PreparedCudaDlibStatus::model_invalid &&
-                   allocations == before,
-               "selected dlib pack substituted requested task or model ID");
+    ok &= Need(
+        !rejected.Prepare(selected_setup, &e, &status) &&
+            status ==
+                studiocast::open_video::PreparedCudaDlibStatus::model_invalid &&
+            allocations == before,
+        "selected dlib pack substituted requested task or model ID");
   }
   studiocast::open_video::PreparedCudaDlibShapePredictor predictor;
   const int allocations_before = allocations;

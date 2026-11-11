@@ -242,8 +242,11 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
   const ModelPack *pack = s.selected_pack;
   if (pack && (pack->task != "face_landmarks" ||
                (!s.model_id.empty() && pack->id != s.model_id))) {
-    if (e) *e = "selected face_landmarks pack does not match requested task and model ID";
-    if (status_out) *status_out = PreparedCudaDlibStatus::model_invalid;
+    if (e)
+      *e = "selected face_landmarks pack does not match requested task and "
+           "model ID";
+    if (status_out)
+      *status_out = PreparedCudaDlibStatus::model_invalid;
     return false;
   }
   if (!pack) {
@@ -251,9 +254,11 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
                         ? ModelPackRegistry::ScanDefault()
                         : ModelPackRegistry::Scan(s.models_root);
     const auto selected = s.model_id.empty()
-        ? registry.DefaultModelIdForTask("face_landmarks") : s.model_id;
+                              ? registry.DefaultModelIdForTask("face_landmarks")
+                              : s.model_id;
     discovered = registry.Find("face_landmarks", selected);
-    if (discovered) pack = &*discovered;
+    if (discovered)
+      pack = &*discovered;
   }
   if (!pack) {
     if (e)

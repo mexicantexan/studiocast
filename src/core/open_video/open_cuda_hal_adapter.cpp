@@ -396,8 +396,9 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
       (has_model_consumer &&
        !CompleteOrtCapability(prepared.evidence.capability)) ||
       prepared.evidence.stage_count != program.stage_count ||
-      (has_model_consumer && (program.invalidation_key.generations.model == 0 ||
-                              program.invalidation_key.model_artifact_hash == 0))) {
+      (has_model_consumer &&
+       (program.invalidation_key.generations.model == 0 ||
+        program.invalidation_key.model_artifact_hash == 0))) {
     SetReason(reason, ReasonId::capability_evidence_incomplete);
     return false;
   }
@@ -462,7 +463,8 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
                    HasIdentity(stage.model.model_id_hash) ||
                    HasIdentity(stage.model.artifact_set_hash) ||
                    stage.model.artifact_generation != 0
-             : stage.provider != SemanticEffectProviderId::open_video_onnxruntime_cuda ||
+             : stage.provider !=
+                       SemanticEffectProviderId::open_video_onnxruntime_cuda ||
                    !HasIdentity(stage.model.model_id_hash) ||
                    !HasIdentity(stage.model.artifact_set_hash) ||
                    stage.model.artifact_generation == 0)) {

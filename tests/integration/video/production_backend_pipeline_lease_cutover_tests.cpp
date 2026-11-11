@@ -99,7 +99,8 @@ void TestPipelineOwnsNoBackendOrCompatibilityPlanner() {
   Check(source.find("ProductionVideoBackendManager backend_manager") !=
             std::string::npos,
         "pipeline must own exactly one neutral backend manager");
-  Check(source.find("BuildProductionVideoBackendSetupRequest(") != std::string::npos,
+  Check(source.find("BuildProductionVideoBackendSetupRequest(") !=
+            std::string::npos,
         "camera setup must consume the shared canonical request builder");
 }
 
@@ -151,12 +152,14 @@ void TestFrameLoopUsesOnlyPreparedManagerLifecycle() {
                 "committed->capture_sequence == frame.sequence") !=
                 std::string::npos,
         "live attribution must reject a prior committed capture");
-  const auto builder = Read("src/core/video/production_video_setup_request.cpp");
+  const auto builder =
+      Read("src/core/video/production_video_setup_request.cpp");
   Check(builder.find("FrameDropBehavior::reset_temporal_state") !=
-            std::string::npos &&
+                std::string::npos &&
             builder.find("requires_contiguous_capture_sequence = temporal") !=
                 std::string::npos,
-        "shared canonical request must preserve temporal ordering and drop behavior");
+        "shared canonical request must preserve temporal ordering and drop "
+        "behavior");
 }
 
 void TestCpuPrimitiveLaneAndBoundedShutdown() {
@@ -169,15 +172,19 @@ void TestCpuPrimitiveLaneAndBoundedShutdown() {
   Check(source.find("PrepareRawYuyvPassthroughPlan(") != std::string::npos &&
             source.find("CopyRawYuyvFrame(") != std::string::npos,
         "zero-effect matching YUYV must retain CPU-only raw passthrough");
-  const auto builder = Read("src/core/video/production_video_setup_request.cpp");
+  const auto builder =
+      Read("src/core/video/production_video_setup_request.cpp");
   Check(builder.find("ResidentMirrorRequested") != std::string::npos &&
-            builder.find("request.resident.effects.mirror = false") != std::string::npos &&
-            source.find("!setup_request.resident.effects.mirror") != std::string::npos,
+            builder.find("request.resident.effects.mirror = false") !=
+                std::string::npos &&
+            source.find("!setup_request.resident.effects.mirror") !=
+                std::string::npos,
         "exact GPU mirror ownership must exclude the host mirror tail");
   Check(builder.find("PrimitiveOperationId::mirror") != std::string::npos &&
             source.find("cpu.mirror_rgb24_in_place(") != std::string::npos &&
             source.find("mirror_fail_open_frames") != std::string::npos,
-        "automatic and Maxine mirror must retain the explicit measured host tail");
+        "automatic and Maxine mirror must retain the explicit measured host "
+        "tail");
   const auto mirror = source.find("cpu.mirror_rgb24_in_place(");
   const auto write = source.find("writer_.WriteFrameDetailed", mirror);
   const auto commit =

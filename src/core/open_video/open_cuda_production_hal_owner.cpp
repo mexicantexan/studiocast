@@ -158,7 +158,8 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
         stage.provider !=
             (native
                  ? hal::SemanticEffectProviderId::open_cuda_production_kernels
-                 : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
+                 : hal::SemanticEffectProviderId::
+                       open_video_onnxruntime_cuda)) {
       if (reason)
         *reason = ReasonId::semantic_provider_unavailable;
       return false;
@@ -167,9 +168,9 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
   const auto aggregate_provider =
       model_count != 0 && native_count != 0
           ? hal::SemanticEffectProviderId::invalid
-          : model_count != 0
-                ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
-                : hal::SemanticEffectProviderId::open_cuda_production_kernels;
+      : model_count != 0
+          ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
+          : hal::SemanticEffectProviderId::open_cuda_production_kernels;
   if (program.requested_provider != aggregate_provider ||
       readiness.provider != aggregate_provider) {
     if (reason)

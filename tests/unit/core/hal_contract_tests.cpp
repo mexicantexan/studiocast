@@ -369,23 +369,28 @@ public:
       *reason = ReasonId::none;
     return StatusId::ready;
   }
-  StatusId DiscardUnsubmittedHostFrame(
-      const PreparedProgramHandle &program, const HostFrameTokens &tokens,
-      std::uint64_t capture_sequence, ReasonId *reason) noexcept override {
+  StatusId DiscardUnsubmittedHostFrame(const PreparedProgramHandle &program,
+                                       const HostFrameTokens &tokens,
+                                       std::uint64_t capture_sequence,
+                                       ReasonId *reason) noexcept override {
     ++discard_calls;
     if (!discard_supported)
-      return IResidentAdapter::DiscardUnsubmittedHostFrame(program, tokens, capture_sequence, reason);
-    if (!host_unsubmitted || program.program_id != prepared_program.program_id ||
+      return IResidentAdapter::DiscardUnsubmittedHostFrame(
+          program, tokens, capture_sequence, reason);
+    if (!host_unsubmitted ||
+        program.program_id != prepared_program.program_id ||
         capture_sequence != host_binding.capture_sequence ||
         tokens.input.resource_id != host_tokens.input.resource_id ||
         tokens.output.resource_id != host_tokens.output.resource_id) {
-      if (reason) *reason = ReasonId::host_frame_binding_invalid;
+      if (reason)
+        *reason = ReasonId::host_frame_binding_invalid;
       return StatusId::blocked;
     }
     host_unsubmitted = false;
     host_binding = {};
     host_tokens = {};
-    if (reason) *reason = ReasonId::none;
+    if (reason)
+      *reason = ReasonId::none;
     return StatusId::ready;
   }
   StatusId ResolveHostFrameOutput(const PreparedProgramHandle &,
@@ -1064,14 +1069,17 @@ bool TestDeclaredMetadataTransferBounds() {
     ok &= Configure(&session, &adapter, program);
     const auto frame = session.Execute(Request(program, 1));
     const bool allowed = mode == 1;
-    ok &= Require(allowed ? frame.status == StatusId::executed
-                          : frame.reason == ReasonId::transfer_contract_violated,
-                  "only explicitly bounded metadata may cross the resident boundary");
-    ok &= Require(!session.latest_committed_frame().valid,
-                  "metadata work must not create active attribution before commit");
+    ok &= Require(
+        allowed ? frame.status == StatusId::executed
+                : frame.reason == ReasonId::transfer_contract_violated,
+        "only explicitly bounded metadata may cross the resident boundary");
+    ok &= Require(
+        !session.latest_committed_frame().valid,
+        "metadata work must not create active attribution before commit");
     if (allowed) {
       ReasonId reason = ReasonId::none;
-      ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
+      ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                        StatusId::ready,
                     "bounded metadata output must remain committable");
     }
   }
@@ -1097,12 +1105,11 @@ bool TestDeclaredMetadataTransferBounds() {
 
 bool TestFatalTemporalResetInvalidatesActiveAttribution() {
   bool ok = true;
-  for (const auto status : {StatusId::failed, StatusId::quarantined,
-                            StatusId::stale, StatusId::stopped,
-                            StatusId::blocked, StatusId::resource_exhausted,
-                            StatusId::degraded, StatusId::invalid,
-                            StatusId::unavailable, StatusId::passthrough,
-                            StatusId::executed}) {
+  for (const auto status :
+       {StatusId::failed, StatusId::quarantined, StatusId::stale,
+        StatusId::stopped, StatusId::blocked, StatusId::resource_exhausted,
+        StatusId::degraded, StatusId::invalid, StatusId::unavailable,
+        StatusId::passthrough, StatusId::executed}) {
     FakeAdapter adapter;
     PreparedProgramSession session;
     const auto program = Program(197, 77, 1);
@@ -1117,7 +1124,8 @@ bool TestFatalTemporalResetInvalidatesActiveAttribution() {
         session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
                 status &&
             session.telemetry().runtime_status == status &&
-            session.telemetry().temporal_resets == 0 && adapter.reset_calls == 1 &&
+            session.telemetry().temporal_resets == 0 &&
+            adapter.reset_calls == 1 &&
             session.telemetry().runtime_reason ==
                 (status == StatusId::quarantined
                      ? ReasonId::device_lost
@@ -1308,7 +1316,8 @@ bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
                 !session.latest_committed_frame().valid &&
                 session.readiness().status == StatusId::failed &&
                 session.readiness().reason == expected_reason &&
-                !session.readiness().available && !session.readiness().degraded &&
+                !session.readiness().available &&
+                !session.readiness().degraded &&
                 session.telemetry().runtime_status == StatusId::failed &&
                 session.telemetry().runtime_reason == expected_reason &&
                 adapter.execute_calls == 1 && adapter.reset_calls == 0 &&
@@ -1463,32 +1472,39 @@ bool TestExplicitTemporalResetGuardsAndForwarding() {
   FakeAdapter adapter;
   PreparedProgramSession session;
   const auto program = Program(199, 77, 1);
-  bool ok = Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::stale,
+  bool ok = Require(session.ResetTemporalState(
+                        ReasonId::temporal_discontinuity) == StatusId::stale,
                     "unprepared reset must reject stale state");
   ok &= Configure(&session, &adapter, program);
   auto frame = session.Execute(Request(program, 1));
   ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::failed && adapter.reset_calls == 0,
-                    "reset cannot discard uncommitted output");
+                        StatusId::failed &&
+                    adapter.reset_calls == 0,
+                "reset cannot discard uncommitted output");
   ReasonId reason = ReasonId::none;
-  ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
+  ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                    StatusId::ready,
                 "initial commit failed");
   const auto committed = session.latest_committed_frame();
   adapter.reset_status = StatusId::ready;
-  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::ready && session.telemetry().temporal_resets == 1 &&
-                        session.latest_committed_frame().valid == committed.valid,
-                    "successful reset must forward and preserve writer attribution");
-  ok &= Require(session.Execute(Request(program, 1)).reason == ReasonId::frame_order_violated,
+  ok &=
+      Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                      StatusId::ready &&
+                  session.telemetry().temporal_resets == 1 &&
+                  session.latest_committed_frame().valid == committed.valid,
+              "successful reset must forward and preserve writer attribution");
+  ok &= Require(session.Execute(Request(program, 1)).reason ==
+                    ReasonId::frame_order_violated,
                 "explicit reset must preserve monotonic capture order");
   session.Invalidate(ReasonId::device_lost);
   const auto resets = adapter.reset_calls;
   ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::quarantined && adapter.reset_calls == resets,
-                    "quarantined reset must never reach adapter");
+                        StatusId::quarantined &&
+                    adapter.reset_calls == resets,
+                "quarantined reset must never reach adapter");
   session.Shutdown();
-  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) == StatusId::stopped,
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                    StatusId::stopped,
                 "stopped reset must remain stopped");
   return ok;
 }

@@ -1313,8 +1313,10 @@ bool BackendSetupSourceBindsEveryCurrentSemanticExactly() {
   // Production requests preserve the Maxine-only default without imposing its
   // history on CUDA. The selected Maxine source must add that history exactly.
   for (const bool use_automatic : {false, true}) {
-    auto temporal = use_automatic ? automatic :
-        SetupSourceRequest(hal::SemanticEffectId::virtual_background_blur);
+    auto temporal = use_automatic
+                        ? automatic
+                        : SetupSourceRequest(
+                              hal::SemanticEffectId::virtual_background_blur);
     temporal.effects.virtual_background.greenscreen_temporal = true;
     temporal.plan.intent.stages[0].parameters[3].boolean_value = true;
     CHECK(!temporal.plan.temporal.temporal);

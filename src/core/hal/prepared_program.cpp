@@ -785,7 +785,8 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
   if (host_binding_pending_ &&
       (request.capture_sequence != pending_host_binding_.capture_sequence ||
        !SameResourceToken(request.input, pending_host_tokens_.input))) {
-    return FailedExecute(StatusId::blocked, ReasonId::host_frame_binding_invalid);
+    return FailedExecute(StatusId::blocked,
+                         ReasonId::host_frame_binding_invalid);
   }
 
   bool temporal_state_reset = false;
@@ -953,8 +954,9 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
       result.transfers.final_readbacks !=
           (program_.requires_final_readback ? 1u : 0u) ||
       (result.transfers.cpu_tail_boundaries < program_.cpu_tail_count ||
-       result.transfers.cpu_tail_boundaries > program_.cpu_tail_count +
-           program_.maximum_metadata_cpu_tails_per_frame)) {
+       result.transfers.cpu_tail_boundaries >
+           program_.cpu_tail_count +
+               program_.maximum_metadata_cpu_tails_per_frame)) {
     return fail_after_adapter(
         FailedExecute(StatusId::failed, ReasonId::transfer_contract_violated));
   }
@@ -1179,7 +1181,8 @@ bool PreparedProgramSession::MayRetainOldProgram(
           program_.maximum_metadata_readbacks_per_frame ||
       candidate.maximum_metadata_cpu_tails_per_frame !=
           program_.maximum_metadata_cpu_tails_per_frame ||
-      candidate.setup_failure_policy != SetupFailurePolicy::retain_old_program) {
+      candidate.setup_failure_policy !=
+          SetupFailurePolicy::retain_old_program) {
     return false;
   }
   if (candidate.strict_backend_selection &&
@@ -1369,8 +1372,8 @@ void PreparedProgramSession::RestoreExecutionReadiness() noexcept {
   }
 }
 
-void PreparedProgramSession::HandleTemporalResetResult(StatusId status,
-                                                     ReasonId reason) noexcept {
+void PreparedProgramSession::HandleTemporalResetResult(
+    StatusId status, ReasonId reason) noexcept {
   if (status == StatusId::ready) {
     ++telemetry_.temporal_resets;
     RestoreExecutionReadiness();

@@ -675,11 +675,12 @@ bool TestDistinctModelCombinationAndMetadataAreExact() {
     open_cuda::ResidentAdapter adapter(81, executor);
     auto program = Program(103);
     const std::array semantics{hal::SemanticEffectId::video_noise_removal,
-      hal::SemanticEffectId::eye_contact,
-      hal::SemanticEffectId::virtual_background_blur,
-      hal::SemanticEffectId::virtual_key_light,
-      hal::SemanticEffectId::auto_frame,
-      hal::SemanticEffectId::vignette, hal::SemanticEffectId::mirror};
+                               hal::SemanticEffectId::eye_contact,
+                               hal::SemanticEffectId::virtual_background_blur,
+                               hal::SemanticEffectId::virtual_key_light,
+                               hal::SemanticEffectId::auto_frame,
+                               hal::SemanticEffectId::vignette,
+                               hal::SemanticEffectId::mirror};
     program.stage_count = semantics.size();
     for (std::size_t index = 0; index < semantics.size(); ++index) {
       program.stages[index] =

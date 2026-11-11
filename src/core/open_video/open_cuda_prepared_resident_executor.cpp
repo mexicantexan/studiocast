@@ -102,7 +102,8 @@ bool SameResource(const hal::ResourceHandle &lhs,
          lhs.mutable_resource == rhs.mutable_resource &&
          lhs.aliasable == rhs.aliasable &&
          lhs.adapter_opaque == rhs.adapter_opaque &&
-         lhs.destruction_owner == rhs.destruction_owner && lhs.destroy == rhs.destroy;
+         lhs.destruction_owner == rhs.destruction_owner &&
+         lhs.destroy == rhs.destroy;
 }
 
 bool SameRuntimeHandle(const PreparedOpenCudaRuntimeHandle &lhs,
@@ -122,7 +123,6 @@ bool BudgetContains(const hal::ResourceBudget &available,
          available.resource_count >= required.resource_count &&
          available.in_flight_slots >= required.in_flight_slots;
 }
-
 
 bool CheckedMul(std::uint64_t lhs, std::uint64_t rhs,
                 std::uint64_t *out) noexcept {

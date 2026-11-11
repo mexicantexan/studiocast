@@ -184,9 +184,10 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
     snapshot.status =
         host_provider ? hal::StatusId::degraded : hal::StatusId::ready;
     snapshot.reason = host_provider
-        ? (config.setup_fallback_reason == hal::ReasonId::none
-               ? hal::ReasonId::cpu_tail_required : config.setup_fallback_reason)
-        : hal::ReasonId::none;
+                          ? (config.setup_fallback_reason == hal::ReasonId::none
+                                 ? hal::ReasonId::cpu_tail_required
+                                 : config.setup_fallback_reason)
+                          : hal::ReasonId::none;
     snapshot.plan_id = config.plan.plan_id;
     snapshot.prepared = true;
     snapshot.readiness.status = snapshot.status;

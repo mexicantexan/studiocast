@@ -157,9 +157,10 @@ public:
                                       const hal::HostFrameBinding &binding,
                                       hal::HostFrameTokens *tokens,
                                       hal::ReasonId *reason) noexcept = 0;
-  virtual hal::StatusId DiscardUnsubmittedHostFrame(
-      const PreparedExecutorHandle &, const hal::HostFrameTokens &,
-      std::uint64_t, hal::ReasonId *reason) noexcept {
+  virtual hal::StatusId
+  DiscardUnsubmittedHostFrame(const PreparedExecutorHandle &,
+                              const hal::HostFrameTokens &, std::uint64_t,
+                              hal::ReasonId *reason) noexcept {
     if (reason)
       *reason = hal::ReasonId::host_frame_binding_unsupported;
     return hal::StatusId::blocked;
@@ -208,9 +209,11 @@ public:
                               const hal::HostFrameBinding &binding,
                               hal::HostFrameTokens *tokens,
                               hal::ReasonId *reason) noexcept override;
-  hal::StatusId DiscardUnsubmittedHostFrame(
-      const hal::PreparedProgramHandle &program, const hal::HostFrameTokens &tokens,
-      std::uint64_t capture_sequence, hal::ReasonId *reason) noexcept override;
+  hal::StatusId
+  DiscardUnsubmittedHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameTokens &tokens,
+                              std::uint64_t capture_sequence,
+                              hal::ReasonId *reason) noexcept override;
   hal::StatusId
   ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
                          const hal::CompletionToken &completion,

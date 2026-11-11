@@ -1,11 +1,11 @@
 #include "camera_pipeline.h"
 
 #include "core/video/capture_error_policy.h"
-#include "core/video/production_video_setup_request.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/mjpeg_decode.h"
 #include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
+#include "core/video/production_video_setup_request.h"
 #include "core/video/scaling_policy.h"
 #include "core/video/v4l2loopback.h"
 #include "core/video/yuyv_passthrough.h"
@@ -29,11 +29,9 @@ namespace studiocast::video {
 std::unique_ptr<IProductionVideoBackendSetupSource>
 CreateStaticProductionVideoBackendSetupSource() noexcept;
 
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
 
 double ToMs(Clock::duration duration) {
   return std::chrono::duration<double, std::milli>(duration).count();
@@ -171,7 +169,6 @@ hal::SemanticEffectId SemanticForEffectId(std::string_view id) {
     return hal::SemanticEffectId::mirror;
   return hal::SemanticEffectId::invalid;
 }
-
 
 struct ManagerWaitContext {
   std::atomic_bool *stop = nullptr;
@@ -1951,9 +1948,8 @@ void CameraPipeline::ThreadMain(CameraPipelineConfig config) {
           applied_generation = next_generation;
           applied_plan =
               effects::BuildBroadcastEffectsPlan(applied_effects);
-          semantic_effects =
-              setup_request.kind ==
-              ProductionVideoBackendSetupKind::resident_island;
+          semantic_effects = setup_request.kind ==
+                             ProductionVideoBackendSetupKind::resident_island;
           raw_yuyv_plan = PrepareRawYuyvPassthroughPlan(
               capture_format, output_format, applied_effects);
           manager_ready =

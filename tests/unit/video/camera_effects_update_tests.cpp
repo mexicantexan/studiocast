@@ -237,15 +237,17 @@ bool TestCanonicalProductionRequestPreservesBackendSemantics() {
                "CUDA source inherited Maxine-only greenscreen history");
   effects.vignette.enabled = true;
   request = build(ComputeBackendPreference::cuda);
-  ok &= Expect(!request.resident.plan.intent.stages[1]
-                    .intent.requires_tracked_vignette_center &&
-                   request.resident.effects.vignette.center_on_tracked_face,
-               "vignette without Auto Frame must preserve its fixed-center behavior");
+  ok &= Expect(
+      !request.resident.plan.intent.stages[1]
+              .intent.requires_tracked_vignette_center &&
+          request.resident.effects.vignette.center_on_tracked_face,
+      "vignette without Auto Frame must preserve its fixed-center behavior");
   effects.auto_frame.enabled = true;
   request = build(ComputeBackendPreference::cuda);
   ok &= Expect(request.resident.plan.intent.stages[2]
                    .intent.requires_tracked_vignette_center,
-               "Auto Frame tracked vignette intent was silently lowered to fixed center");
+               "Auto Frame tracked vignette intent was silently lowered to "
+               "fixed center");
   effects.auto_frame.enabled = false;
   effects.mirror = true;
   request = build(ComputeBackendPreference::cuda);
@@ -257,11 +259,12 @@ bool TestCanonicalProductionRequestPreservesBackendSemantics() {
   effects = {};
   effects.vignette.enabled = true;
   request = build(ComputeBackendPreference::vulkan);
-  ok &= Expect(request.resident.plan.intent.stage_count == 1 &&
-                   !request.resident.plan.intent.stages[0]
-                        .intent.requires_tracked_vignette_center &&
-                   request.resident.effects.vignette.center_on_tracked_face,
-               "default Vulkan vignette without Auto Frame was incorrectly blocked");
+  ok &= Expect(
+      request.resident.plan.intent.stage_count == 1 &&
+          !request.resident.plan.intent.stages[0]
+               .intent.requires_tracked_vignette_center &&
+          request.resident.effects.vignette.center_on_tracked_face,
+      "default Vulkan vignette without Auto Frame was incorrectly blocked");
   effects = {};
   effects.mirror = true;
   request = build(ComputeBackendPreference::auto_select);
@@ -326,10 +329,11 @@ bool TestCudaNativeMirrorDoesNotInventProviderRequest() {
   video::MultiIslandVideoRuntimeStatusSnapshot snapshot;
   const auto projected =
       video::BuildCameraPipelineHalStatusSnapshot(projection, &snapshot);
-  return Expect(projected.code == video::MultiIslandStatusValidationCode::valid &&
-                   snapshot.effects[8].requested_provider ==
-                       hal::SemanticEffectProviderId::invalid,
-               "strict CUDA native mirror fabricated an ONNX provider request");
+  return Expect(
+      projected.code == video::MultiIslandStatusValidationCode::valid &&
+          snapshot.effects[8].requested_provider ==
+              hal::SemanticEffectProviderId::invalid,
+      "strict CUDA native mirror fabricated an ONNX provider request");
 }
 
 } // namespace
