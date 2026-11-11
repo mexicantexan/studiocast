@@ -1099,6 +1099,8 @@ DaemonStatusSnapshot DaemonStatusSnapshot::Unreachable(const QString &error) {
                            QStringLiteral("Maxine"));
   out.openCuda = ParseEngine({}, QStringLiteral("open_cuda"),
                              QStringLiteral("Open Video"));
+  out.openVulkan = ParseEngine({}, QStringLiteral("open_vulkan"),
+                               QStringLiteral("Open Vulkan"));
   out.openAudio = ParseEngine({}, QStringLiteral("open_audio"),
                               QStringLiteral("Open Audio"));
   return out;
@@ -1151,6 +1153,51 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
   out.speakers = ParseSpeakers(audio);
   out.microphoneEndpoint = ParseMicrophoneEndpoint(audio, out.microphone);
   out.speakersEndpoint = ParseSpeakersEndpoint(audio, out.speakers);
+  const QJsonObject compute = ObjectValue(video, QStringLiteral("compute"));
+  out.videoComputePreference =
+      compute.value(QStringLiteral("preference")).toString();
+  out.videoComputeResolvedBackend =
+      compute.value(QStringLiteral("resolved_backend")).toString();
+  out.videoComputeActiveBackend =
+      compute.value(QStringLiteral("active_backend")).toString();
+  out.videoComputeFallbackReason =
+      compute.value(QStringLiteral("fallback_reason")).toString();
+  out.videoComputeDegradedReason =
+      compute.value(QStringLiteral("degraded_reason")).toString();
+  out.videoComputeActiveEngines =
+      StringListValue(compute, QStringLiteral("active_engines"));
+  const QJsonObject computeFallback =
+      ObjectValue(compute, QStringLiteral("fallback"));
+  out.videoComputeFallbackActive =
+      computeFallback.value(QStringLiteral("active")).toBool(false);
+  out.videoComputeFallbackFrom =
+      computeFallback.value(QStringLiteral("from")).toString().trimmed();
+  out.videoComputeFallbackTo =
+      computeFallback.value(QStringLiteral("to")).toString().trimmed();
+  out.videoComputeFallbackCode =
+      computeFallback.value(QStringLiteral("code")).toString().trimmed();
+  out.videoComputeFallbackDetail =
+      computeFallback.value(QStringLiteral("detail")).toString().trimmed();
+  const QJsonObject computeProvider =
+      ObjectValue(compute, QStringLiteral("provider"));
+  out.videoComputeProviderMode =
+      computeProvider.value(QStringLiteral("mode")).toString().trimmed();
+  out.videoComputeActiveProvider =
+      computeProvider.value(QStringLiteral("active_provider"))
+          .toString()
+          .trimmed();
+  out.videoComputeProviderDevice =
+      computeProvider.value(QStringLiteral("device")).toString().trimmed();
+  out.videoComputeTensorIoMode =
+      computeProvider.value(QStringLiteral("tensor_io_mode"))
+          .toString()
+          .trimmed();
+  const QJsonObject cpuTails =
+      ObjectValue(compute, QStringLiteral("cpu_tails"));
+  out.videoComputeCpuTailsActive =
+      cpuTails.value(QStringLiteral("active")).toBool(false);
+  out.videoComputeCpuTailStages =
+      StringListValue(cpuTails, QStringLiteral("stages"));
   out.videoEffectsEnginePreference =
       ObjectValue(video, QStringLiteral("video_effects"))
           .value(QStringLiteral("engine"))
@@ -1159,10 +1206,41 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
       ObjectValue(audio, QStringLiteral("audio_effects"))
           .value(QStringLiteral("engine"))
           .toString();
+  const QJsonObject videoPipeline =
+      ObjectValue(video, QStringLiteral("pipeline"));
+  out.videoPipelineRunning =
+      videoPipeline.value(QStringLiteral("running")).toBool(false);
+  out.videoPipelineStarting =
+      videoPipeline.value(QStringLiteral("starting")).toBool(false);
+  out.videoPipelineState =
+      videoPipeline.value(QStringLiteral("state")).toString().trimmed();
+  const QString activeCompute =
+      out.videoComputeActiveBackend.trimmed().toLower();
+  const bool nonCpuActiveCompute =
+      !activeCompute.isEmpty() && activeCompute != QStringLiteral("cpu");
+  const auto hasActiveEngine = [&](const QString &engine) {
+    return out.videoComputeActiveEngines.contains(engine);
+  };
+  const bool matchingActiveEngine =
+      (activeCompute == QStringLiteral("vulkan") &&
+       hasActiveEngine(QStringLiteral("open_vulkan"))) ||
+      (activeCompute == QStringLiteral("cuda") &&
+       (hasActiveEngine(QStringLiteral("open_cuda")) ||
+        hasActiveEngine(QStringLiteral("maxine")))) ||
+      (activeCompute == QStringLiteral("maxine") &&
+       hasActiveEngine(QStringLiteral("maxine"))) ||
+      (activeCompute != QStringLiteral("vulkan") &&
+       activeCompute != QStringLiteral("cuda") &&
+       activeCompute != QStringLiteral("maxine") &&
+       hasActiveEngine(activeCompute));
+  const bool authoritativeRunningEffects =
+      out.videoPipelineRunning && !out.videoPipelineStarting &&
+      out.videoPipelineState == QStringLiteral("running") &&
+      nonCpuActiveCompute && matchingActiveEngine;
   out.videoEffectsActiveBackends =
-      ObjectValue(video, QStringLiteral("pipeline"))
-          .value(QStringLiteral("effects_backends"))
-          .toString();
+      authoritativeRunningEffects
+          ? videoPipeline.value(QStringLiteral("effects_backends")).toString()
+          : QString();
   out.microphoneActiveBackend =
       ObjectValue(audio, QStringLiteral("pipeline"))
           .value(QStringLiteral("backend_active"))
@@ -1183,6 +1261,10 @@ DaemonStatusSnapshot DaemonStatusSnapshot::FromJson(const QString &json) {
   out.openCuda =
       ParseEngine(EngineObject(root, QStringLiteral("open_cuda")),
                   QStringLiteral("open_cuda"), QStringLiteral("Open Video"));
+  out.openVulkan =
+      ParseEngine(EngineObject(root, QStringLiteral("open_vulkan")),
+                  QStringLiteral("open_vulkan"),
+                  QStringLiteral("Open Vulkan"));
   out.openAudio =
       ParseEngine(EngineObject(root, QStringLiteral("open_audio")),
                   QStringLiteral("open_audio"), QStringLiteral("Open Audio"));

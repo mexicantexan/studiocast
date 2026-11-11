@@ -27,7 +27,7 @@ For sourcing, conversion, and hosting of the actual model binaries (ONNX / dlib 
 
 A pack is a directory containing:
 
-- `model.json` — pack metadata (see `docs/open_video_model_packs.md`)
+- `model.json` — pack metadata (see `docs/how_to_add_your_own_model.md`)
 - `LICENSE.txt` — upstream licensing summary
 - model artifacts (downloaded at install time), e.g.
   - `*.onnx`

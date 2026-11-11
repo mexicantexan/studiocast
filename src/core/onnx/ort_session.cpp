@@ -1,7 +1,11 @@
 #include "core/onnx/ort_session.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
 #include <cstdlib>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <type_traits>
@@ -25,6 +29,70 @@
 
 namespace studiocast::onnx {
 namespace {
+
+std::atomic<std::uint64_t> g_ort_session_generation{1};
+
+[[maybe_unused]] std::uint64_t NextOrtSessionGeneration() noexcept {
+  std::uint64_t value =
+      g_ort_session_generation.fetch_add(1, std::memory_order_relaxed);
+  if (value != 0)
+    return value;
+  value = g_ort_session_generation.fetch_add(1, std::memory_order_relaxed);
+  return value == 0 ? 1 : value;
+}
+
+const char *OrtPreparedRunStatusMessage(OrtPreparedRunStatus status) noexcept {
+  switch (status) {
+  case OrtPreparedRunStatus::success:
+    return "";
+  case OrtPreparedRunStatus::not_prepared:
+    return "ORT prepared CUDA session or binding is not initialized.";
+  case OrtPreparedRunStatus::invalid_input_output_contract:
+    return "ORT prepared CUDA execution contract is invalid.";
+  case OrtPreparedRunStatus::foreign_provider_evidence:
+    return "ORT prepared CUDA provider evidence is invalid or foreign.";
+  case OrtPreparedRunStatus::stale_session_generation:
+    return "ORT prepared CUDA session generation is stale.";
+  case OrtPreparedRunStatus::wrong_device:
+    return "ORT prepared CUDA device identity does not match.";
+  case OrtPreparedRunStatus::stale_context_generation:
+    return "ORT prepared CUDA context generation is stale.";
+  case OrtPreparedRunStatus::stale_stream:
+    return "ORT prepared CUDA stream identity is stale.";
+  case OrtPreparedRunStatus::stale_binding:
+    return "ORT CUDA IoBinding was not prepared for this exact "
+           "session/provider/buffer/shape contract.";
+  case OrtPreparedRunStatus::provider_unavailable:
+    return "ORT CUDA execution provider is unavailable.";
+  case OrtPreparedRunStatus::provider_mismatch:
+    return "ORT prepared execution provider does not match.";
+  case OrtPreparedRunStatus::cpu_fallback_forbidden:
+    return "ORT CPU execution fallback is forbidden for this prepared run.";
+  case OrtPreparedRunStatus::tensorrt_forbidden:
+    return "ORT TensorRT execution is forbidden for this prepared run.";
+  case OrtPreparedRunStatus::resource_exhausted:
+    return "ORT prepared execution exhausted its resource budget.";
+  case OrtPreparedRunStatus::inference_failure:
+    return "ORT prepared inference failed.";
+  case OrtPreparedRunStatus::provider_failure_quarantine:
+    return "ORT execution provider failed and was quarantined.";
+  case OrtPreparedRunStatus::cancelled_or_shutdown:
+    return "ORT prepared execution was cancelled or is shutting down.";
+  case OrtPreparedRunStatus::setup_resource_mutation:
+    return "ORT prepared CUDA execution mutated setup-only resources.";
+  }
+  return "ORT prepared execution failed.";
+}
+
+void SetCompatibilityError(std::string *error, const char *message) noexcept {
+  if (!error)
+    return;
+  try {
+    *error = message ? message : "";
+  } catch (...) {
+    error->clear();
+  }
+}
 
 bool HasProvider(const std::vector<std::string> &providers,
                  const char *provider) {
@@ -80,6 +148,147 @@ std::filesystem::path DefaultTensorRtCachePath(int cuda_device_id) {
   return base / "studiocast" / "trt_cache" /
          (std::string("gpu") + std::to_string(id));
 }
+
+bool OrtPreparedProviderEvidence::ValidStrictCuda() const noexcept {
+  return schema_version == kSchemaVersion &&
+         provider == OrtExecutionProviderId::cuda && cuda_device_id >= 0 &&
+         cuda_context_generation != 0 && cpu_ep_fallback_disabled &&
+         (requested_stream_identity == 0 ||
+          user_stream_bound || explicit_stream_synchronization);
+}
+
+bool OrtPreparedProviderEvidenceMatches(
+    const OrtPreparedProviderEvidence &prepared, int cuda_device_id,
+    std::uint64_t cuda_context_generation,
+    std::uintptr_t requested_stream_identity) noexcept {
+  return prepared.ValidStrictCuda() &&
+         prepared.cuda_device_id == cuda_device_id &&
+         prepared.cuda_context_generation == cuda_context_generation &&
+         prepared.requested_stream_identity == requested_stream_identity;
+}
+
+namespace internal {
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunContract(const OrtPreparedRunContract &contract) noexcept {
+  OrtPreparedRunResult result;
+  result.session_generation = contract.active.session_generation;
+
+  if (contract.shutdown_requested) {
+    result.status = OrtPreparedRunStatus::cancelled_or_shutdown;
+    return result;
+  }
+  if (!contract.session_present) {
+    result.status = OrtPreparedRunStatus::not_prepared;
+    return result;
+  }
+  if (!contract.requested.Valid()) {
+    result.status = OrtPreparedRunStatus::foreign_provider_evidence;
+    return result;
+  }
+  if (!contract.active.Valid()) {
+    result.status = OrtPreparedRunStatus::provider_unavailable;
+    return result;
+  }
+  if (contract.requested.session_generation !=
+      contract.active.session_generation) {
+    result.status = OrtPreparedRunStatus::stale_session_generation;
+    return result;
+  }
+  if (contract.strict_cuda_only) {
+    if (contract.active.provider.provider == OrtExecutionProviderId::cpu) {
+      result.status = OrtPreparedRunStatus::cpu_fallback_forbidden;
+      return result;
+    }
+    if (contract.active.provider.provider ==
+        OrtExecutionProviderId::tensorrt) {
+      result.status = OrtPreparedRunStatus::tensorrt_forbidden;
+      return result;
+    }
+    if (!contract.active.provider.ValidStrictCuda()) {
+      result.status = OrtPreparedRunStatus::provider_mismatch;
+      return result;
+    }
+  }
+  if (contract.requested.provider.provider !=
+      contract.active.provider.provider) {
+    result.status = OrtPreparedRunStatus::provider_mismatch;
+    return result;
+  }
+  if (contract.requested.provider.cuda_device_id !=
+      contract.active.provider.cuda_device_id) {
+    result.status = OrtPreparedRunStatus::wrong_device;
+    return result;
+  }
+  if (contract.requested.provider.cuda_context_generation !=
+      contract.active.provider.cuda_context_generation) {
+    result.status = OrtPreparedRunStatus::stale_context_generation;
+    return result;
+  }
+  if (contract.requested.provider.requested_stream_identity !=
+      contract.active.provider.requested_stream_identity) {
+    result.status = OrtPreparedRunStatus::stale_stream;
+    return result;
+  }
+  if (!(contract.requested.provider == contract.active.provider)) {
+    result.status = OrtPreparedRunStatus::provider_mismatch;
+    return result;
+  }
+  if (!contract.binding_present) {
+    result.status = OrtPreparedRunStatus::not_prepared;
+    return result;
+  }
+  if (!contract.binding_contract_matches) {
+    result.status = OrtPreparedRunStatus::stale_binding;
+    return result;
+  }
+  result.status = OrtPreparedRunStatus::success;
+  return result;
+}
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunFailure(OrtStableErrorCode code,
+                              bool exact_cuda_provider) noexcept {
+  OrtPreparedRunResult result;
+  result.error_code = code;
+  switch (code) {
+  case OrtStableErrorCode::none:
+    result.status = OrtPreparedRunStatus::success;
+    break;
+  case OrtStableErrorCode::invalid_argument:
+    result.status = OrtPreparedRunStatus::invalid_input_output_contract;
+    break;
+  case OrtStableErrorCode::allocation_failure:
+    result.status = OrtPreparedRunStatus::resource_exhausted;
+    result.quarantine = OrtPreparedRunQuarantine::session;
+    break;
+  case OrtStableErrorCode::model_load_cancelled:
+    result.status = OrtPreparedRunStatus::cancelled_or_shutdown;
+    break;
+  case OrtStableErrorCode::execution_provider_failure:
+    result.status = OrtPreparedRunStatus::provider_failure_quarantine;
+    result.quarantine = OrtPreparedRunQuarantine::provider;
+    break;
+  case OrtStableErrorCode::engine_error:
+  case OrtStableErrorCode::runtime_exception:
+  case OrtStableErrorCode::fail:
+  case OrtStableErrorCode::unknown_exception:
+    result.status = exact_cuda_provider
+                        ? OrtPreparedRunStatus::provider_failure_quarantine
+                        : OrtPreparedRunStatus::inference_failure;
+    result.quarantine = exact_cuda_provider
+                            ? OrtPreparedRunQuarantine::provider
+                            : OrtPreparedRunQuarantine::session;
+    break;
+  default:
+    result.status = OrtPreparedRunStatus::inference_failure;
+    result.quarantine = OrtPreparedRunQuarantine::session;
+    break;
+  }
+  return result;
+}
+
+} // namespace internal
 
 bool OrtErrorLooksLikeVramOom(const std::string &ort_msg) {
   // Common failure strings seen from ORT CUDA EP when VRAM is exhausted or
@@ -194,6 +403,53 @@ void MarkCreatedSessionProviders(OrtSessionInfo *info) {
   }
 }
 
+bool FinalizeStrictCudaProviderEvidence(const OrtSessionOptions &opts,
+                                        OrtSessionInfo *info,
+                                        std::string *error) {
+  if (error)
+    error->clear();
+  if (!info || opts.provider_policy != OrtProviderPolicy::strict_cuda_only)
+    return true;
+  if (opts.enable_tensorrt) {
+    if (error)
+      *error = "strict CUDA provider mode rejects TensorRT";
+    return false;
+  }
+  if (opts.cuda_context_generation == 0) {
+    if (error)
+      *error = "strict CUDA provider mode requires a context generation";
+    return false;
+  }
+  if (!info->using_cuda || info->using_tensorrt ||
+      !info->cuda_provider_appended || info->active_provider != "cuda" ||
+      !info->cpu_ep_fallback_disabled ||
+      info->cuda_device_id != opts.cuda_device_id ||
+      info->cuda_context_generation != opts.cuda_context_generation) {
+    if (error)
+      *error =
+          "strict CUDA provider mode could not prove the exact CUDA EP";
+    return false;
+  }
+
+  OrtPreparedProviderEvidence evidence;
+  evidence.provider = OrtExecutionProviderId::cuda;
+  evidence.cuda_device_id = info->cuda_device_id;
+  evidence.cuda_context_generation = info->cuda_context_generation;
+  evidence.requested_stream_identity =
+      info->cuda_user_compute_stream_identity;
+  evidence.user_stream_bound = info->cuda_user_compute_stream_bound;
+  evidence.explicit_stream_synchronization = info->cuda_needs_stream_sync;
+  evidence.cpu_ep_fallback_disabled = info->cpu_ep_fallback_disabled;
+  if (!evidence.ValidStrictCuda()) {
+    if (error)
+      *error = "strict CUDA provider evidence is incomplete";
+    return false;
+  }
+  info->prepared_provider_evidence = evidence;
+  info->strict_provider_validation_passed = true;
+  return true;
+}
+
 void PrependWarnings(OrtSessionInfo *dst,
                      const std::vector<std::string> &warnings) {
   if (!dst || warnings.empty())
@@ -226,6 +482,17 @@ OrtSessionInfo PlanOrtProviderAttempt(const OrtRuntimeInfo &runtime,
   info.using_tensorrt = false;
   info.using_cuda = false;
   info.cuda_needs_stream_sync = false;
+  info.cuda_device_id = opts.cuda_device_id;
+  info.cuda_context_generation = opts.cuda_context_generation;
+  info.cpu_ep_fallback_disabled =
+      opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+  info.strict_provider_validation_passed = false;
+  info.prepared_provider_evidence = {};
+  info.cuda_user_compute_stream_requested =
+      opts.user_compute_stream != nullptr;
+  info.cuda_user_compute_stream_bound = false;
+  info.cuda_user_compute_stream_identity =
+      reinterpret_cast<std::uintptr_t>(opts.user_compute_stream);
   info.advertised_providers.clear();
   info.cuda_provider_advertised = false;
   info.tensorrt_provider_advertised = false;
@@ -320,6 +587,10 @@ OrtSessionInfo PlanOrtProviderAttempt(const OrtRuntimeInfo &runtime,
   info.cuda_needs_stream_sync =
       (info.using_tensorrt && tensor_rt_needs_sync) ||
       (info.using_cuda && cuda_needs_sync);
+  info.cuda_user_compute_stream_bound =
+      info.cuda_user_compute_stream_requested &&
+      (info.using_tensorrt || info.using_cuda) &&
+      !info.cuda_needs_stream_sync;
   return info;
 }
 
@@ -327,6 +598,18 @@ OrtSessionCreatePlanResult
 CreateOrtSessionWithProviderFallbacks(const OrtSessionOptions &opts,
                                       const OrtSessionCreateHooks &hooks) {
   OrtSessionCreatePlanResult plan;
+
+  if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only &&
+      (opts.enable_tensorrt || !opts.prefer_cuda ||
+       opts.cuda_context_generation == 0)) {
+    plan.error = opts.enable_tensorrt
+                     ? "strict CUDA provider mode rejects TensorRT"
+                     : (!opts.prefer_cuda
+                            ? "strict CUDA provider mode requires CUDA"
+                            : "strict CUDA provider mode requires a context "
+                              "generation");
+    return plan;
+  }
 
   auto try_cpu_fallback =
       [&](const OrtSessionOptions &failed_opts,
@@ -369,12 +652,25 @@ CreateOrtSessionWithProviderFallbacks(const OrtSessionOptions &opts,
       CallCreateSession(hooks, OrtSessionCreateAttempt::Initial, opts, &info);
   if (initial.created) {
     MarkCreatedSessionProviders(&info);
+    if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only) {
+      std::string strict_error;
+      if (!FinalizeStrictCudaProviderEvidence(opts, &info, &strict_error)) {
+        plan.error.swap(strict_error);
+        return plan;
+      }
+    }
     plan.created = true;
     plan.info = std::move(info);
     return plan;
   }
 
   const std::string first_error = initial.error;
+  if (opts.provider_policy == OrtProviderPolicy::strict_cuda_only) {
+    plan.error = first_error.empty()
+                     ? "strict CUDA provider session creation failed"
+                     : first_error;
+    return plan;
+  }
   if (opts.enable_tensorrt && info.using_tensorrt &&
       opts.tensorrt_enable_cuda_fallback && opts.prefer_cuda) {
     OrtSessionOptions retry_opts = opts;
@@ -825,6 +1121,16 @@ CreateOrtSessionForPlan(void *context, internal::OrtSessionCreateAttempt,
     so.SetIntraOpNumThreads(1);
     so.SetInterOpNumThreads(1);
     so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
+    for (const auto &dimension : session_opts.free_dimension_overrides) {
+      so.AddFreeDimensionOverrideByName(dimension.name.c_str(),
+                                        dimension.extent);
+    }
+    if (session_opts.provider_policy ==
+        OrtProviderPolicy::strict_cuda_only) {
+      // Fail session construction when any graph node would otherwise be
+      // assigned to ORT's implicit CPU execution provider.
+      so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+    }
     ConfigureExecutionProviders(&so, session_opts, provider_info);
     auto session = std::make_unique<Ort::Session>(
         GlobalEnv(), create_context->model->c_str(), so);
@@ -847,54 +1153,100 @@ struct OrtSession::Impl {
 
   bool latched_failure = false;
   std::string latched_error;
+  OrtPreparedRunStatus latched_run_status =
+      OrtPreparedRunStatus::not_prepared;
+  OrtStableErrorCode latched_error_code = OrtStableErrorCode::none;
+  OrtPreparedCudaRunEvidence run_evidence;
+  std::atomic<bool> shutdown_requested{false};
 
 #if STUDIOCAST_HAVE_ONNXRUNTIME
   std::unique_ptr<Ort::Session> session;
 
-  // CUDA-only (lazily created when RunCudaIoBinding is used).
-  std::unique_ptr<Ort::IoBinding> binding;
   std::optional<Ort::MemoryInfo> cuda_mem_info;
 
-  // Scratch space to avoid per-frame heap churn in real-time processing.
-  std::vector<const char *> scratch_input_names;
-  std::vector<const char *> scratch_output_names;
-  std::vector<Ort::Value> scratch_inputs;
-  std::vector<Ort::Value> scratch_outputs;
+  struct TensorContract {
+    std::string name;
+    const void *data = nullptr;
+    std::size_t num_floats = 0;
+    std::vector<int64_t> shape;
 
-  void ClearCpuRunScratch() noexcept {
-    scratch_input_names.clear();
-    scratch_output_names.clear();
-    scratch_inputs.clear();
-    scratch_outputs.clear();
-  }
-
-  void ClearCudaRunScratch() noexcept {
-    if (binding) {
-      try {
-        binding->ClearBoundInputs();
-        binding->ClearBoundOutputs();
-      } catch (...) {
-        // Best-effort cleanup only. The caller's run result/error remains the
-        // source of truth.
-      }
+    bool Matches(const char *candidate_name, const void *candidate_data,
+                 std::size_t candidate_num_floats,
+                 const int64_t *candidate_shape,
+                 std::size_t candidate_shape_rank) const {
+      return candidate_name && name == candidate_name &&
+             data == candidate_data && num_floats == candidate_num_floats &&
+             shape.size() == candidate_shape_rank && candidate_shape &&
+             std::equal(shape.begin(), shape.end(), candidate_shape);
     }
-    ClearCpuRunScratch();
-  }
+  };
+
+  struct PreparedCpuBinding {
+    const void *session_identity = nullptr;
+    std::string provider_identity;
+    std::vector<TensorContract> input_contracts;
+    std::vector<TensorContract> output_contracts;
+    std::vector<const char *> input_names;
+    std::vector<const char *> output_names;
+    std::vector<Ort::Value> input_values;
+    std::vector<Ort::Value> output_values;
+  };
+
+  struct PreparedCudaBinding {
+    const void *session_identity = nullptr;
+    std::string provider_identity;
+    std::vector<TensorContract> input_contracts;
+    std::vector<TensorContract> output_contracts;
+    std::vector<Ort::Value> input_values;
+    std::vector<Ort::Value> output_values;
+    std::unique_ptr<Ort::IoBinding> binding;
+  };
+
+  std::array<PreparedCpuBinding, OrtSession::kPreparedBindingSlots>
+      cpu_bindings;
+  std::array<PreparedCudaBinding, OrtSession::kPreparedBindingSlots>
+      cuda_bindings;
 #endif
 
-  void LatchFailure(const std::string &err) {
+  OrtSession::PreparedRunStats prepared_run_stats;
+
+  void LatchFailure(
+      const std::string &err,
+      OrtPreparedRunStatus status = OrtPreparedRunStatus::resource_exhausted,
+      OrtStableErrorCode code = OrtStableErrorCode::allocation_failure) {
     latched_failure = true;
     latched_error = err;
+    latched_run_status = status;
+    latched_error_code = code;
 
 #if STUDIOCAST_HAVE_ONNXRUNTIME
     // Best-effort cleanup to release allocations held by this session.
-    binding.reset();
-    session.reset();
+    for (auto &binding : cpu_bindings)
+      binding = PreparedCpuBinding{};
+    for (auto &binding : cuda_bindings)
+      binding = PreparedCudaBinding{};
     cuda_mem_info.reset();
-    scratch_input_names.clear();
-    scratch_output_names.clear();
-    scratch_inputs.clear();
-    scratch_outputs.clear();
+    session.reset();
+#endif
+  }
+
+  void LatchTypedFailure(OrtPreparedRunStatus status, OrtStableErrorCode code,
+                         const char *diagnostic = nullptr) noexcept {
+    latched_failure = true;
+    latched_run_status = status;
+    latched_error_code = code;
+    try {
+      latched_error = diagnostic ? diagnostic : "";
+    } catch (...) {
+      latched_error.clear();
+    }
+#if STUDIOCAST_HAVE_ONNXRUNTIME
+    for (auto &binding : cpu_bindings)
+      binding = PreparedCpuBinding{};
+    for (auto &binding : cuda_bindings)
+      binding = PreparedCudaBinding{};
+    cuda_mem_info.reset();
+    session.reset();
 #endif
   }
 };
@@ -909,13 +1261,48 @@ void OrtSession::ReserveRunScratch(std::size_t input_count,
 #if STUDIOCAST_HAVE_ONNXRUNTIME
   if (!impl_)
     return;
-  impl_->scratch_input_names.reserve(input_count);
-  impl_->scratch_output_names.reserve(output_count);
-  impl_->scratch_inputs.reserve(input_count);
-  impl_->scratch_outputs.reserve(output_count);
+  for (auto &binding : impl_->cpu_bindings) {
+    binding.input_contracts.reserve(input_count);
+    binding.output_contracts.reserve(output_count);
+    binding.input_names.reserve(input_count);
+    binding.output_names.reserve(output_count);
+    binding.input_values.reserve(input_count);
+    binding.output_values.reserve(output_count);
+  }
+  for (auto &binding : impl_->cuda_bindings) {
+    binding.input_contracts.reserve(input_count);
+    binding.output_contracts.reserve(output_count);
+    binding.input_values.reserve(input_count);
+    binding.output_values.reserve(output_count);
+  }
 #else
   (void)input_count;
   (void)output_count;
+#endif
+}
+
+OrtSession::PreparedRunStats OrtSession::prepared_run_stats() const {
+  return impl_ ? impl_->prepared_run_stats : PreparedRunStats{};
+}
+
+OrtPreparedCudaRunEvidence
+OrtSession::prepared_cuda_run_evidence() const noexcept {
+  return impl_ ? impl_->run_evidence : OrtPreparedCudaRunEvidence{};
+}
+
+void OrtSession::RequestShutdown() noexcept {
+  if (impl_)
+    impl_->shutdown_requested.store(true, std::memory_order_release);
+}
+
+void OrtSession::InvalidatePreparedBindings() {
+#if STUDIOCAST_HAVE_ONNXRUNTIME
+  if (!impl_)
+    return;
+  for (auto &binding : impl_->cpu_bindings)
+    binding = Impl::PreparedCpuBinding{};
+  for (auto &binding : impl_->cuda_bindings)
+    binding = Impl::PreparedCudaBinding{};
 #endif
 }
 
@@ -952,6 +1339,23 @@ OrtSession::Create(const std::filesystem::path &model_path,
       if (error)
         *error = "model_path is empty";
       return nullptr;
+    }
+
+    for (std::size_t i = 0; i < opts.free_dimension_overrides.size(); ++i) {
+      const auto &dimension = opts.free_dimension_overrides[i];
+      if (dimension.name.empty() || dimension.extent <= 0) {
+        if (error)
+          *error = "free dimension overrides require a non-empty name and "
+                   "positive extent";
+        return nullptr;
+      }
+      for (std::size_t j = 0; j < i; ++j) {
+        if (opts.free_dimension_overrides[j].name == dimension.name) {
+          if (error)
+            *error = "duplicate free dimension override: " + dimension.name;
+          return nullptr;
+        }
+      }
     }
 
     std::unique_ptr<Ort::Session> session;
@@ -1050,6 +1454,29 @@ OrtSession::Create(const std::filesystem::path &model_path,
     impl->opts = opts;
     impl->model_path = model_path;
     impl->session = std::move(session);
+    impl->run_evidence.session_generation = NextOrtSessionGeneration();
+    if (info.prepared_provider_evidence.provider !=
+        OrtExecutionProviderId::invalid) {
+      impl->run_evidence.provider = info.prepared_provider_evidence;
+    } else {
+      auto &provider = impl->run_evidence.provider;
+      provider.provider =
+          info.using_tensorrt
+              ? OrtExecutionProviderId::tensorrt
+              : (info.using_cuda ? OrtExecutionProviderId::cuda
+                                 : OrtExecutionProviderId::cpu);
+      provider.cuda_device_id = info.cuda_device_id;
+      provider.cuda_context_generation = info.cuda_context_generation;
+      provider.requested_stream_identity =
+          info.cuda_user_compute_stream_identity;
+      provider.user_stream_bound = info.cuda_user_compute_stream_bound;
+      provider.explicit_stream_synchronization =
+          info.cuda_needs_stream_sync;
+      provider.cpu_ep_fallback_disabled =
+          info.cpu_ep_fallback_disabled;
+    }
+    impl->prepared_run_stats.session_generation =
+        impl->run_evidence.session_generation;
 
     if (info_out) {
       *info_out = impl->info;
@@ -1075,6 +1502,15 @@ OrtSession::Create(const std::filesystem::path &model_path,
 bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
                         const RunOutput *outputs, std::size_t output_count,
                         std::string *error) {
+  return RunCpuPrepared(0, inputs, input_count, outputs, output_count, error);
+}
+
+bool OrtSession::RunCpuPrepared(std::size_t binding_slot,
+                                const RunInput *inputs,
+                                std::size_t input_count,
+                                const RunOutput *outputs,
+                                std::size_t output_count,
+                                std::string *error) {
   if (error)
     error->clear();
 
@@ -1083,6 +1519,7 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
   (void)input_count;
   (void)outputs;
   (void)output_count;
+  (void)binding_slot;
   if (error) {
     *error = "ONNX Runtime is not available in this build "
              "(STUDIOCAST_HAVE_ONNXRUNTIME=0).";
@@ -1110,24 +1547,15 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
       *error = "ORT Run() requires at least one input and one output.";
     return false;
   }
+  if (binding_slot >= kPreparedBindingSlots) {
+    if (error)
+      *error = "ORT prepared CPU binding slot is out of range.";
+    return false;
+  }
 
   try {
-    impl_->ClearCpuRunScratch();
-    struct ScratchGuard {
-      Impl *impl = nullptr;
-      ~ScratchGuard() {
-        if (impl)
-          impl->ClearCpuRunScratch();
-      }
-    } scratch_guard{impl_.get()};
-
     static Ort::MemoryInfo mem_info =
         Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-
-    impl_->scratch_input_names.clear();
-    impl_->scratch_inputs.clear();
-    impl_->scratch_input_names.reserve(input_count);
-    impl_->scratch_inputs.reserve(input_count);
 
     for (std::size_t i = 0; i < input_count; ++i) {
       const auto &in = inputs[i];
@@ -1149,16 +1577,7 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
         return false;
       }
 
-      impl_->scratch_input_names.push_back(in.name);
-      impl_->scratch_inputs.emplace_back(Ort::Value::CreateTensor<float>(
-          mem_info, const_cast<float *>(in.data), in.num_floats, in.shape,
-          in.shape_rank));
     }
-
-    impl_->scratch_output_names.clear();
-    impl_->scratch_outputs.clear();
-    impl_->scratch_output_names.reserve(output_count);
-    impl_->scratch_outputs.reserve(output_count);
 
     for (std::size_t i = 0; i < output_count; ++i) {
       const auto &o = outputs[i];
@@ -1180,16 +1599,107 @@ bool OrtSession::RunCpu(const RunInput *inputs, std::size_t input_count,
         return false;
       }
 
-      impl_->scratch_output_names.push_back(o.name);
-      impl_->scratch_outputs.emplace_back(Ort::Value::CreateTensor<float>(
-          mem_info, o.data, o.num_floats, o.shape, o.shape_rank));
+    }
+
+    auto &prepared = impl_->cpu_bindings[binding_slot];
+    const auto contracts_match = [&]() {
+      if (prepared.session_identity != impl_->session.get() ||
+          prepared.provider_identity != impl_->info.active_provider)
+        return false;
+      if (prepared.input_contracts.size() != input_count ||
+          prepared.output_contracts.size() != output_count)
+        return false;
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        if (!prepared.input_contracts[i].Matches(
+                in.name, in.data, in.num_floats, in.shape, in.shape_rank))
+          return false;
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        if (!prepared.output_contracts[i].Matches(
+                out.name, out.data, out.num_floats, out.shape,
+                out.shape_rank))
+          return false;
+      }
+      return true;
+    };
+
+    if (!contracts_match()) {
+      Impl::PreparedCpuBinding next;
+      std::uint64_t allocation_requests = 0;
+      const auto reserve = [&](auto &storage, std::size_t count) {
+        if (count > storage.capacity())
+          ++allocation_requests;
+        storage.reserve(count);
+      };
+      next.session_identity = impl_->session.get();
+      if (impl_->info.active_provider.size() >
+          next.provider_identity.capacity())
+        ++allocation_requests;
+      next.provider_identity = impl_->info.active_provider;
+      reserve(next.input_contracts, input_count);
+      reserve(next.output_contracts, output_count);
+      reserve(next.input_values, input_count);
+      reserve(next.output_values, output_count);
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(in.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = in.name;
+        contract.data = in.data;
+        contract.num_floats = in.num_floats;
+        if (in.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(in.shape, in.shape + in.shape_rank);
+        next.input_contracts.push_back(std::move(contract));
+        next.input_values.emplace_back(Ort::Value::CreateTensor<float>(
+            mem_info, const_cast<float *>(in.data), in.num_floats, in.shape,
+            in.shape_rank));
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(out.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = out.name;
+        contract.data = out.data;
+        contract.num_floats = out.num_floats;
+        if (out.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(out.shape, out.shape + out.shape_rank);
+        next.output_contracts.push_back(std::move(contract));
+        next.output_values.emplace_back(Ort::Value::CreateTensor<float>(
+            mem_info, out.data, out.num_floats, out.shape, out.shape_rank));
+      }
+      reserve(next.input_names, input_count);
+      reserve(next.output_names, output_count);
+
+      prepared = std::move(next);
+      // Rebuild name pointers from the moved-to owned strings; do not rely on
+      // allocator-specific vector move address preservation.
+      prepared.input_names.clear();
+      prepared.output_names.clear();
+      for (const auto &contract : prepared.input_contracts)
+        prepared.input_names.push_back(contract.name.c_str());
+      for (const auto &contract : prepared.output_contracts)
+        prepared.output_names.push_back(contract.name.c_str());
+      ++impl_->prepared_run_stats.binding_rebuilds;
+      impl_->prepared_run_stats.tensor_wrapper_constructions +=
+          input_count + output_count;
+      impl_->prepared_run_stats.application_binding_allocation_requests +=
+          allocation_requests;
+    } else {
+      ++impl_->prepared_run_stats.cache_hits;
     }
 
     impl_->session->Run(Ort::RunOptions{nullptr},
-                        impl_->scratch_input_names.data(),
-                        impl_->scratch_inputs.data(), input_count,
-                        impl_->scratch_output_names.data(),
-                        impl_->scratch_outputs.data(), output_count);
+                        prepared.input_names.data(),
+                        prepared.input_values.data(), input_count,
+                        prepared.output_names.data(),
+                        prepared.output_values.data(), output_count);
+    ++impl_->prepared_run_stats.runs;
     return true;
 
   } catch (const Ort::Exception &e) {
@@ -1218,6 +1728,25 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
                                   const CudaBindingOutput *outputs,
                                   std::size_t output_count,
                                   std::string *error) {
+  return RunCudaIoBindingPrepared(0, inputs, input_count, outputs,
+                                  output_count, error);
+}
+
+bool OrtSession::RunCudaIoBindingPrepared(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
+  if (!PrepareCudaIoBinding(binding_slot, inputs, input_count, outputs,
+                            output_count, error))
+    return false;
+  return ExecutePreparedCudaIoBinding(binding_slot, inputs, input_count,
+                                      outputs, output_count, error);
+}
+
+bool OrtSession::PrepareCudaIoBinding(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
   if (error)
     error->clear();
 
@@ -1226,6 +1755,7 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
   (void)input_count;
   (void)outputs;
   (void)output_count;
+  (void)binding_slot;
   if (error) {
     *error = "ONNX Runtime is not available in this build "
              "(STUDIOCAST_HAVE_ONNXRUNTIME=0).";
@@ -1249,124 +1779,378 @@ bool OrtSession::RunCudaIoBinding(const CudaBindingInput *inputs,
   }
   if (!inputs || !outputs) {
     if (error)
-      *error = "null inputs/outputs passed to ORT RunCudaIoBinding().";
+      *error = "null inputs/outputs passed to ORT PrepareCudaIoBinding().";
     return false;
   }
   if (input_count == 0 || output_count == 0) {
     if (error)
       *error =
-          "ORT RunCudaIoBinding() requires at least one input and one output.";
+          "ORT PrepareCudaIoBinding() requires at least one input and one "
+          "output.";
+    return false;
+  }
+  if (binding_slot >= kPreparedBindingSlots) {
+    if (error)
+      *error = "ORT prepared CUDA binding slot is out of range.";
     return false;
   }
 
   try {
-    impl_->ClearCudaRunScratch();
-    struct ScratchGuard {
-      Impl *impl = nullptr;
-      ~ScratchGuard() {
-        if (impl)
-          impl->ClearCudaRunScratch();
-      }
-    } scratch_guard{impl_.get()};
-
-    if (!impl_->binding) {
-      impl_->binding = std::make_unique<Ort::IoBinding>(*impl_->session);
-    }
     if (!impl_->cuda_mem_info.has_value()) {
       impl_->cuda_mem_info.emplace("Cuda", OrtDeviceAllocator,
                                    impl_->opts.cuda_device_id,
                                    OrtMemTypeDefault);
     }
 
-    impl_->scratch_inputs.clear();
-    impl_->scratch_outputs.clear();
-    impl_->scratch_inputs.reserve(input_count);
-    impl_->scratch_outputs.reserve(output_count);
-
     for (std::size_t i = 0; i < input_count; ++i) {
       const auto &in = inputs[i];
       if (!in.name || !*in.name) {
         if (error)
-          *error = "ORT RunCudaIoBinding() input has empty name.";
+          *error = "ORT PrepareCudaIoBinding() input has empty name.";
         return false;
       }
       if (!in.device_ptr || in.num_floats == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() input '") + in.name +
+          *error = std::string("ORT PrepareCudaIoBinding() input '") + in.name +
                    "' has empty buffer.";
         return false;
       }
       if (!in.shape || in.shape_rank == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() input '") + in.name +
+          *error = std::string("ORT PrepareCudaIoBinding() input '") + in.name +
                    "' has empty shape.";
         return false;
       }
-
-      impl_->scratch_inputs.emplace_back(Ort::Value::CreateTensor<float>(
-          *impl_->cuda_mem_info, const_cast<float *>(in.device_ptr),
-          in.num_floats, in.shape, in.shape_rank));
     }
 
     for (std::size_t i = 0; i < output_count; ++i) {
       const auto &out = outputs[i];
       if (!out.name || !*out.name) {
         if (error)
-          *error = "ORT RunCudaIoBinding() output has empty name.";
+          *error = "ORT PrepareCudaIoBinding() output has empty name.";
         return false;
       }
       if (!out.device_ptr || out.num_floats == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() output '") + out.name +
+          *error = std::string("ORT PrepareCudaIoBinding() output '") + out.name +
                    "' has empty buffer.";
         return false;
       }
       if (!out.shape || out.shape_rank == 0) {
         if (error)
-          *error = std::string("ORT RunCudaIoBinding() output '") + out.name +
+          *error = std::string("ORT PrepareCudaIoBinding() output '") + out.name +
                    "' has empty shape.";
         return false;
       }
-
-      impl_->scratch_outputs.emplace_back(Ort::Value::CreateTensor<float>(
-          *impl_->cuda_mem_info, out.device_ptr, out.num_floats, out.shape,
-          out.shape_rank));
     }
 
-    for (std::size_t i = 0; i < input_count; ++i) {
-      impl_->binding->BindInput(inputs[i].name, impl_->scratch_inputs[i]);
-    }
-    for (std::size_t i = 0; i < output_count; ++i) {
-      impl_->binding->BindOutput(outputs[i].name, impl_->scratch_outputs[i]);
-    }
+    auto &prepared = impl_->cuda_bindings[binding_slot];
+    const auto contracts_match = [&]() {
+      if (prepared.session_identity != impl_->session.get() ||
+          prepared.provider_identity != impl_->info.active_provider)
+        return false;
+      if (prepared.input_contracts.size() != input_count ||
+          prepared.output_contracts.size() != output_count)
+        return false;
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        if (!prepared.input_contracts[i].Matches(
+                in.name, in.device_ptr, in.num_floats, in.shape,
+                in.shape_rank))
+          return false;
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        if (!prepared.output_contracts[i].Matches(
+                out.name, out.device_ptr, out.num_floats, out.shape,
+                out.shape_rank))
+          return false;
+      }
+      return true;
+    };
 
-    impl_->session->Run(Ort::RunOptions{nullptr}, *impl_->binding);
+    if (!contracts_match()) {
+      Impl::PreparedCudaBinding next;
+      std::uint64_t allocation_requests = 0;
+      const auto reserve = [&](auto &storage, std::size_t count) {
+        if (count > storage.capacity())
+          ++allocation_requests;
+        storage.reserve(count);
+      };
+      next.session_identity = impl_->session.get();
+      if (impl_->info.active_provider.size() >
+          next.provider_identity.capacity())
+        ++allocation_requests;
+      next.provider_identity = impl_->info.active_provider;
+      reserve(next.input_contracts, input_count);
+      reserve(next.output_contracts, output_count);
+      reserve(next.input_values, input_count);
+      reserve(next.output_values, output_count);
+      ++allocation_requests; // std::make_unique<Ort::IoBinding>
+      next.binding = std::make_unique<Ort::IoBinding>(*impl_->session);
 
-    if (impl_->info.cuda_needs_stream_sync) {
-      // Ensure outputs are ready before downstream consumers access the GPU
-      // buffers.
-      impl_->binding->SynchronizeOutputs();
+      for (std::size_t i = 0; i < input_count; ++i) {
+        const auto &in = inputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(in.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = in.name;
+        contract.data = in.device_ptr;
+        contract.num_floats = in.num_floats;
+        if (in.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(in.shape, in.shape + in.shape_rank);
+        next.input_contracts.push_back(std::move(contract));
+        next.input_values.emplace_back(Ort::Value::CreateTensor<float>(
+            *impl_->cuda_mem_info, const_cast<float *>(in.device_ptr),
+            in.num_floats, in.shape, in.shape_rank));
+      }
+      for (std::size_t i = 0; i < output_count; ++i) {
+        const auto &out = outputs[i];
+        Impl::TensorContract contract;
+        if (std::strlen(out.name) > contract.name.capacity())
+          ++allocation_requests;
+        contract.name = out.name;
+        contract.data = out.device_ptr;
+        contract.num_floats = out.num_floats;
+        if (out.shape_rank > contract.shape.capacity())
+          ++allocation_requests;
+        contract.shape.assign(out.shape, out.shape + out.shape_rank);
+        next.output_contracts.push_back(std::move(contract));
+        next.output_values.emplace_back(Ort::Value::CreateTensor<float>(
+            *impl_->cuda_mem_info, out.device_ptr, out.num_floats, out.shape,
+            out.shape_rank));
+      }
+      for (std::size_t i = 0; i < input_count; ++i)
+        next.binding->BindInput(next.input_contracts[i].name.c_str(),
+                                next.input_values[i]);
+      for (std::size_t i = 0; i < output_count; ++i)
+        next.binding->BindOutput(next.output_contracts[i].name.c_str(),
+                                 next.output_values[i]);
+
+      prepared = std::move(next);
+      ++impl_->prepared_run_stats.binding_rebuilds;
+      impl_->prepared_run_stats.tensor_wrapper_constructions +=
+          input_count + output_count;
+      ++impl_->prepared_run_stats.io_binding_constructions;
+      impl_->prepared_run_stats.application_binding_allocation_requests +=
+          allocation_requests;
     }
-
     return true;
 
   } catch (const Ort::Exception &e) {
     const std::string msg = e.what();
     const std::string human = HumanizeOrtError(msg, impl_->model_path);
-
-    if (OrtErrorLooksLikeVramOom(msg)) {
-      impl_->LatchFailure(human);
-    }
-
     if (error) {
       *error = human;
     }
     return false;
   } catch (const std::exception &e) {
     if (error) {
-      *error = std::string("ORT RunCudaIoBinding() failed: ") + e.what();
+      *error = std::string("ORT PrepareCudaIoBinding() failed: ") + e.what();
     }
     return false;
+  }
+#endif
+}
+
+bool OrtSession::ExecutePreparedCudaIoBinding(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, std::string *error) {
+  const auto expected = prepared_cuda_run_evidence();
+  return ExecutePreparedCudaIoBindingTypedImpl(
+             binding_slot, inputs, input_count, outputs, output_count, expected,
+             false, error)
+      .ok();
+}
+
+OrtPreparedRunResult OrtSession::ExecutePreparedCudaIoBindingTyped(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, const OrtPreparedCudaRunEvidence &expected,
+    bool cancellation_requested,
+    std::string *compatibility_error) noexcept {
+  return ExecutePreparedCudaIoBindingTypedImpl(
+      binding_slot, inputs, input_count, outputs, output_count, expected,
+      cancellation_requested, compatibility_error);
+}
+
+OrtPreparedRunResult OrtSession::ExecutePreparedCudaIoBindingTypedImpl(
+    std::size_t binding_slot, const CudaBindingInput *inputs,
+    std::size_t input_count, const CudaBindingOutput *outputs,
+    std::size_t output_count, const OrtPreparedCudaRunEvidence &expected,
+    bool cancellation_requested, std::string *compatibility_error) noexcept {
+  if (compatibility_error)
+    compatibility_error->clear();
+
+  OrtPreparedRunResult result;
+  if (!impl_) {
+    result.status = OrtPreparedRunStatus::not_prepared;
+    SetCompatibilityError(compatibility_error,
+                          OrtPreparedRunStatusMessage(result.status));
+    return result;
+  }
+
+  auto &stats = impl_->prepared_run_stats;
+  result.session_generation = impl_->run_evidence.session_generation;
+  result.attempt_sequence = ++stats.execute_attempts;
+  result.completed_runs = stats.execute_successes;
+  const auto fail = [&](OrtPreparedRunResult failed) noexcept {
+    failed.session_generation = impl_->run_evidence.session_generation;
+    failed.attempt_sequence = result.attempt_sequence;
+    failed.completed_runs = stats.execute_successes;
+    ++stats.execute_failures;
+    if (failed.quarantine != OrtPreparedRunQuarantine::none)
+      ++stats.quarantine_events;
+    if (compatibility_error && compatibility_error->empty())
+      SetCompatibilityError(compatibility_error,
+                            OrtPreparedRunStatusMessage(failed.status));
+    return failed;
+  };
+
+  if (impl_->latched_failure) {
+    OrtPreparedRunResult latched;
+    latched.status = impl_->latched_run_status;
+    latched.error_code = impl_->latched_error_code;
+    latched.quarantine =
+        latched.status == OrtPreparedRunStatus::provider_failure_quarantine
+            ? OrtPreparedRunQuarantine::provider
+            : OrtPreparedRunQuarantine::session;
+    SetCompatibilityError(compatibility_error, impl_->latched_error.c_str());
+    return fail(latched);
+  }
+
+#if !STUDIOCAST_HAVE_ONNXRUNTIME
+  (void)inputs;
+  (void)input_count;
+  (void)outputs;
+  (void)output_count;
+  (void)binding_slot;
+  (void)cancellation_requested;
+  (void)expected;
+  OrtPreparedRunResult unavailable;
+  unavailable.status = OrtPreparedRunStatus::provider_unavailable;
+  return fail(unavailable);
+#else
+  const bool invalid_contract =
+      !inputs || !outputs || input_count == 0 || output_count == 0 ||
+      binding_slot >= kPreparedBindingSlots;
+  if (invalid_contract) {
+    OrtPreparedRunResult invalid;
+    invalid.status = OrtPreparedRunStatus::invalid_input_output_contract;
+    return fail(invalid);
+  }
+
+  auto &prepared = impl_->cuda_bindings[binding_slot];
+  bool contracts_match = false;
+  if (prepared.binding &&
+      prepared.session_identity == impl_->session.get() &&
+      prepared.provider_identity == impl_->info.active_provider &&
+      prepared.input_contracts.size() == input_count &&
+      prepared.output_contracts.size() == output_count) {
+    contracts_match = true;
+    for (std::size_t i = 0; i < input_count; ++i) {
+      const auto &in = inputs[i];
+      if (!prepared.input_contracts[i].Matches(
+              in.name, in.device_ptr, in.num_floats, in.shape, in.shape_rank)) {
+        contracts_match = false;
+        break;
+      }
+    }
+    for (std::size_t i = 0; contracts_match && i < output_count; ++i) {
+      const auto &out = outputs[i];
+      if (!prepared.output_contracts[i].Matches(
+              out.name, out.device_ptr, out.num_floats, out.shape,
+              out.shape_rank)) {
+        contracts_match = false;
+        break;
+      }
+    }
+  }
+
+  internal::OrtPreparedRunContract contract;
+  contract.session_present = impl_->session != nullptr;
+  contract.binding_present = prepared.binding != nullptr;
+  contract.binding_contract_matches = contracts_match;
+  contract.shutdown_requested =
+      cancellation_requested ||
+      impl_->shutdown_requested.load(std::memory_order_acquire);
+  contract.active = impl_->run_evidence;
+  contract.requested = expected;
+  contract.strict_cuda_only =
+      impl_->opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+  auto classified = internal::ClassifyOrtPreparedRunContract(contract);
+  if (!classified.ok())
+    return fail(classified);
+
+  try {
+    const PreparedRunStats before = stats;
+    impl_->session->Run(Ort::RunOptions{nullptr}, *prepared.binding);
+    if (impl_->info.cuda_needs_stream_sync)
+      prepared.binding->SynchronizeOutputs();
+    ++stats.runs;
+    ++stats.cache_hits;
+    if (stats.binding_rebuilds != before.binding_rebuilds ||
+        stats.tensor_wrapper_constructions !=
+            before.tensor_wrapper_constructions ||
+        stats.io_binding_constructions != before.io_binding_constructions ||
+        stats.application_binding_allocation_requests !=
+            before.application_binding_allocation_requests) {
+      OrtPreparedRunResult mutated;
+      mutated.status = OrtPreparedRunStatus::setup_resource_mutation;
+      return fail(mutated);
+    }
+    ++stats.execute_successes;
+    classified.completed_runs = stats.execute_successes;
+    classified.attempt_sequence = result.attempt_sequence;
+    classified.session_generation = impl_->run_evidence.session_generation;
+    return classified;
+  } catch (const Ort::Exception &e) {
+    const auto code = static_cast<OrtStableErrorCode>(e.GetOrtErrorCode());
+    const bool exact_cuda =
+        impl_->run_evidence.provider.provider == OrtExecutionProviderId::cuda &&
+        impl_->opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+    auto failed = internal::ClassifyOrtPreparedRunFailure(code, exact_cuda);
+    const char *diagnostic = e.what();
+    std::string humanized;
+    try {
+      humanized = HumanizeOrtError(e.what(), impl_->model_path);
+      diagnostic = humanized.c_str();
+    } catch (...) {
+    }
+    if (failed.quarantine != OrtPreparedRunQuarantine::none)
+      impl_->LatchTypedFailure(failed.status, failed.error_code, diagnostic);
+    SetCompatibilityError(compatibility_error, diagnostic);
+    return fail(failed);
+  } catch (const std::bad_alloc &e) {
+    auto failed = internal::ClassifyOrtPreparedRunFailure(
+        OrtStableErrorCode::allocation_failure, false);
+    impl_->LatchTypedFailure(failed.status, failed.error_code, e.what());
+    SetCompatibilityError(compatibility_error, e.what());
+    return fail(failed);
+  } catch (const std::exception &e) {
+    const bool exact_cuda =
+        impl_->run_evidence.provider.provider == OrtExecutionProviderId::cuda &&
+        impl_->opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+    auto failed = internal::ClassifyOrtPreparedRunFailure(
+        OrtStableErrorCode::unknown_exception, exact_cuda);
+    impl_->LatchTypedFailure(failed.status, failed.error_code, e.what());
+    SetCompatibilityError(compatibility_error, e.what());
+    return fail(failed);
+  } catch (...) {
+    const bool exact_cuda =
+        impl_->run_evidence.provider.provider == OrtExecutionProviderId::cuda &&
+        impl_->opts.provider_policy == OrtProviderPolicy::strict_cuda_only;
+    auto failed = internal::ClassifyOrtPreparedRunFailure(
+        OrtStableErrorCode::unknown_exception, exact_cuda);
+    impl_->LatchTypedFailure(
+        failed.status, failed.error_code,
+        "ORT prepared execution failed with an unknown error.");
+    SetCompatibilityError(
+        compatibility_error,
+        "ORT prepared execution failed with an unknown error.");
+    return fail(failed);
   }
 #endif
 }

@@ -150,7 +150,7 @@ bool IsResizeBilinearAvailable(std::string *error_out) {
 }
 
 bool ResizeBilinear(const CudaImage &src, const CudaImage &dst,
-                    studiocast::maxine::CUstream stream,
+                    studiocast::cuda::CUstream stream,
                     std::string *error_out) {
   return CropResizeBilinear(src, dst, 0.0f, 0.0f, static_cast<float>(src.w),
                             static_cast<float>(src.h), stream, error_out);
@@ -158,7 +158,7 @@ bool ResizeBilinear(const CudaImage &src, const CudaImage &dst,
 
 bool CropResizeBilinear(const CudaImage &src, const CudaImage &dst,
                         float crop_x, float crop_y, float crop_w, float crop_h,
-                        studiocast::maxine::CUstream stream,
+                        studiocast::cuda::CUstream stream,
                         std::string *error_out) {
   if (error_out)
     error_out->clear();

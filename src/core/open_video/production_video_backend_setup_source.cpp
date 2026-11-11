@@ -1,0 +1,1427 @@
+#include "core/open_video/production_video_backend_setup_source.h"
+
+#include "core/open_video/model_pack_registry.h"
+#include "core/open_video/open_cuda_selection_policy.h"
+#include "core/open_video/prepared_cuda_yunet_detector.h"
+#include "core/open_video/prepared_open_video_compatibility_executor.h"
+#include "core/open_video/video_execution_factory.h"
+#include "core/video/effects/broadcast_effect_contract.h"
+#include "core/video/image_ppm.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <new>
+
+namespace studiocast::open_cuda {
+namespace {
+
+constexpr auto kProvider =
+    hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+constexpr auto kNativeProvider =
+    hal::SemanticEffectProviderId::open_cuda_production_kernels;
+constexpr std::uint64_t kHashOffset = UINT64_C(1469598103934665603);
+constexpr std::uint64_t kHashPrime = UINT64_C(1099511628211);
+
+bool IsZeroHash(const std::array<std::uint8_t, 32> &hash) noexcept {
+  for (const auto value : hash) {
+    if (value != 0)
+      return false;
+  }
+  return true;
+}
+
+bool IsSetupSuccess(hal::StatusId status) noexcept {
+  return status == hal::StatusId::ready || status == hal::StatusId::degraded;
+}
+
+video::ProductionVideoResidentSetupSourceResult
+Failure(hal::StatusId status, hal::ReasonId reason) noexcept {
+  video::ProductionVideoResidentSetupSourceResult result;
+  result.status = status;
+  result.reason = reason;
+  result.readiness.status = status;
+  result.readiness.reason = reason;
+  result.readiness.requested_backend = hal::BackendId::cuda;
+  result.readiness.selected_backend = hal::BackendId::invalid;
+  result.readiness.provider = hal::SemanticEffectProviderId::invalid;
+  result.setup_completed_outside_frame_loop = true;
+  return result;
+}
+
+std::uint64_t HashValue(std::uint64_t hash, std::uint64_t value) noexcept {
+  for (unsigned shift = 0; shift != 64; shift += 8) {
+    hash ^= static_cast<std::uint8_t>(value >> shift);
+    hash *= kHashPrime;
+  }
+  return hash;
+}
+
+template <typename Range>
+std::uint64_t HashBytes(std::uint64_t hash, const Range &bytes) noexcept {
+  for (const auto value : bytes) {
+    hash ^= static_cast<std::uint8_t>(value);
+    hash *= kHashPrime;
+  }
+  return hash;
+}
+
+std::uint64_t HashArtifact(
+    const open_video::ValidatedModelArtifactIdentity &identity) noexcept {
+  std::uint64_t hash = kHashOffset;
+  hash = HashValue(hash, identity.schema_version);
+  hash = HashValue(hash, identity.registry_generation);
+  hash = HashBytes(hash, identity.model_id_sha256);
+  hash = HashBytes(hash, identity.manifest_sha256);
+  hash = HashBytes(hash, identity.artifact_sha256);
+  hash = HashBytes(hash, identity.artifact_set_sha256);
+  return hash == 0 ? 1 : hash;
+}
+
+bool Add(std::uint64_t value, std::uint64_t *sum) noexcept {
+  if (sum == nullptr ||
+      value > std::numeric_limits<std::uint64_t>::max() - *sum) {
+    return false;
+  }
+  *sum += value;
+  return true;
+}
+
+bool Multiply(std::uint64_t left, std::uint64_t right,
+              std::uint64_t *product) noexcept {
+  if (product == nullptr ||
+      (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left)) {
+    return false;
+  }
+  *product = left * right;
+  return true;
+}
+
+bool AlignRow(std::uint64_t active, std::uint64_t *aligned) noexcept {
+  constexpr std::uint64_t kAlignment = 4096;
+  if (aligned == nullptr ||
+      active > std::numeric_limits<std::uint64_t>::max() - (kAlignment - 1)) {
+    return false;
+  }
+  *aligned = ((active + kAlignment - 1) / kAlignment) * kAlignment;
+  return true;
+}
+
+bool ExactTerminalOutputTail(const video::VideoExecutionPlanRequest &plan,
+                             hal::CpuTailId id) noexcept {
+  if (plan.intent.stage_count == 0 ||
+      plan.intent.stage_count > plan.intent.stages.size() ||
+      plan.cpu_tail_count != 1) {
+    return false;
+  }
+  const auto &tail = plan.cpu_tails[0];
+  return tail.id == id && tail.required &&
+         tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
+         tail.after_stage_id ==
+             plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id &&
+         tail.before_stage_id == 0 &&
+         tail.boundary_index == plan.intent.stage_count;
+}
+
+bool ResourceBudgetFor(std::uint32_t frame_width, std::uint32_t frame_height,
+                       std::uint32_t output_width, std::uint32_t output_height,
+                       std::uint32_t model_width, std::uint32_t model_height,
+                       hal::SemanticEffectId semantic, int strength,
+                       std::uint32_t replacement_width,
+                       std::uint32_t replacement_height,
+                       std::uint32_t stage_count,
+                       hal::ResourceBudget *budget) noexcept {
+  if (budget == nullptr || frame_width == 0 || frame_height == 0 ||
+      output_width == 0 || output_height == 0) {
+    return false;
+  }
+  std::uint64_t rgb_row = 0;
+  std::uint64_t alpha_row = 0;
+  std::uint64_t frame_rgb = 0;
+  std::uint64_t frame_alpha = 0;
+  std::uint64_t model_alpha_row = 0;
+  std::uint64_t model_tensor_row = 0;
+  std::uint64_t model_alpha = 0;
+  std::uint64_t model_tensor = 0;
+  std::uint64_t boundary = 0;
+  std::uint64_t output_boundary = 0;
+  std::uint64_t output_rgb_row = 0;
+  std::uint64_t output_device = 0;
+  const bool model_free =
+      semantic != hal::SemanticEffectId::virtual_background_blur &&
+      semantic != hal::SemanticEffectId::virtual_background_remove &&
+      semantic != hal::SemanticEffectId::virtual_background_replace &&
+      semantic != hal::SemanticEffectId::virtual_key_light;
+  if ((!model_free && (model_width == 0 || model_height == 0)) ||
+      !AlignRow(static_cast<std::uint64_t>(frame_width) * 3u, &rgb_row) ||
+      !AlignRow(static_cast<std::uint64_t>(frame_width) * 4u, &alpha_row) ||
+      !Multiply(rgb_row, frame_height, &frame_rgb) ||
+      !Multiply(alpha_row, frame_height, &frame_alpha) ||
+      !Multiply(model_width, 4u, &model_alpha_row) ||
+      !AlignRow(model_alpha_row, &model_alpha_row) ||
+      !Multiply(model_alpha_row, model_height, &model_alpha) ||
+      !Multiply(model_width, 12u, &model_tensor_row) ||
+      !AlignRow(model_tensor_row, &model_tensor_row) ||
+      !Multiply(model_tensor_row, model_height, &model_tensor) ||
+      !Multiply(frame_width, frame_height, &boundary) ||
+      !Multiply(boundary, 3u, &boundary) ||
+      !Multiply(output_width, output_height, &output_boundary) ||
+      !Multiply(output_boundary, 3u, &output_boundary) ||
+      !AlignRow(static_cast<std::uint64_t>(output_width) * 3u,
+                &output_rgb_row) ||
+      !Multiply(output_rgb_row, output_height, &output_device)) {
+    return false;
+  }
+
+  hal::ResourceBudget result;
+  if (model_free) {
+    if (!Add(frame_rgb, &result.persistent_bytes) ||
+        !Add(frame_rgb, &result.persistent_bytes) ||
+        ((output_width != frame_width || output_height != frame_height) &&
+         !Add(output_device, &result.persistent_bytes)))
+      return false;
+    result.scratch_bytes = 1;
+    result.upload_staging_bytes = boundary;
+    result.readback_staging_bytes = output_boundary;
+    // Two device images, two pinned transfer buffers, and three transfer
+    // events are always owned by the prepared native stage.
+    result.resource_count =
+        7u + 2u * (stage_count - 1u) +
+        ((output_width != frame_width || output_height != frame_height) ? 1u
+                                                                        : 0u);
+    result.in_flight_slots = 1;
+    *budget = result;
+    return true;
+  }
+  if (!Add(frame_rgb, &result.persistent_bytes) ||
+      !Add(frame_rgb, &result.persistent_bytes) ||
+      !Add(model_alpha, &result.persistent_bytes) ||
+      !Add(model_tensor, &result.persistent_bytes) ||
+      !Add(frame_alpha, &result.persistent_bytes)) {
+    return false;
+  }
+  const int canonical_strength =
+      std::clamp(strength, video::effects::contract::kVbStrengthMin,
+                 video::effects::contract::kVbStrengthMax);
+  const bool feather = std::min(4, canonical_strength / 16) > 0;
+  const bool blur = semantic == hal::SemanticEffectId::virtual_background_blur;
+  const bool key_light = semantic == hal::SemanticEffectId::virtual_key_light;
+  const bool replace =
+      semantic == hal::SemanticEffectId::virtual_background_replace;
+  const bool prepared_feather = !key_light && feather;
+  if (prepared_feather && (!Add(frame_alpha, &result.scratch_bytes) ||
+                           !Add(frame_alpha, &result.scratch_bytes))) {
+    return false;
+  }
+  if (blur && (!Add(frame_rgb, &result.scratch_bytes) ||
+               !Add(frame_rgb, &result.scratch_bytes))) {
+    return false;
+  }
+  if (replace) {
+    std::uint64_t replacement_row = 0;
+    std::uint64_t replacement_bytes = 0;
+    if (replacement_width == 0 || replacement_height == 0 ||
+        !AlignRow(static_cast<std::uint64_t>(replacement_width) * 3u,
+                  &replacement_row) ||
+        !Multiply(replacement_row, replacement_height, &replacement_bytes) ||
+        !Add(replacement_bytes, &result.persistent_bytes) ||
+        !Add(frame_rgb, &result.persistent_bytes)) {
+      return false;
+    }
+  }
+  if ((output_width != frame_width || output_height != frame_height) &&
+      !Add(output_device, &result.persistent_bytes))
+    return false;
+  result.scratch_bytes = std::max<std::uint64_t>(result.scratch_bytes, 1);
+  result.upload_staging_bytes = boundary;
+  result.readback_staging_bytes = output_boundary;
+  result.resource_count =
+      (blur ? 19u : 17u) + (prepared_feather ? 2u : 0u) + (replace ? 2u : 0u) +
+      ((output_width != frame_width || output_height != frame_height) ? 1u
+                                                                      : 0u) +
+      2u * (stage_count - 1u);
+  result.in_flight_slots = 1;
+  if (result.persistent_bytes > (UINT64_C(2) << 30) ||
+      result.scratch_bytes > (UINT64_C(1) << 30) ||
+      result.upload_staging_bytes > (UINT64_C(1) << 30) ||
+      result.readback_staging_bytes > (UINT64_C(1) << 30)) {
+    return false;
+  }
+  *budget = result;
+  return true;
+}
+
+bool TightRgb24(const hal::ImageDescriptor &image,
+                hal::Mutability mutability) noexcept {
+  if (image.width == 0 || image.height == 0 || image.plane_count != 1 ||
+      image.format != hal::PixelFormat::rgb_u8 ||
+      image.channel_order != hal::ChannelOrder::rgb ||
+      image.color_space != hal::ColorSpace::srgb ||
+      image.color_range != hal::ColorRange::full ||
+      image.alpha_meaning != hal::AlphaMeaning::none ||
+      image.orientation != hal::Orientation::top_left ||
+      image.host_coherence != hal::HostCoherence::coherent ||
+      image.mutability != mutability ||
+      image.aliasing != hal::AliasingPermission::forbidden ||
+      image.in_place_permitted || image.base_alignment_bytes != 1 ||
+      image.planes[0].offset_bytes != 0 ||
+      image.planes[0].alignment_bytes != 1 ||
+      image.planes[0].width != image.width ||
+      image.planes[0].height != image.height) {
+    return false;
+  }
+  const auto stride = static_cast<std::uint64_t>(image.width) * 3u;
+  return image.planes[0].row_stride_bytes == stride &&
+         image.planes[0].size_bytes ==
+             stride * static_cast<std::uint64_t>(image.height);
+}
+
+int Strength(const video::CanonicalVideoStage &stage) noexcept {
+  for (std::size_t index = 0; index < stage.parameter_count; ++index) {
+    const auto &parameter = stage.parameters[index];
+    if (parameter.id == video::CanonicalVideoParameterId::strength &&
+        parameter.kind == video::CanonicalVideoParameterKind::signed_integer) {
+      return static_cast<int>(parameter.signed_value);
+    }
+  }
+  return video::effects::contract::kVbStrengthDefault;
+}
+
+std::array<std::uint8_t, 3>
+RemoveColor(const video::CanonicalVideoStage &stage) noexcept {
+  for (std::size_t index = 0; index < stage.parameter_count; ++index) {
+    const auto &parameter = stage.parameters[index];
+    if (parameter.id == video::CanonicalVideoParameterId::remove_color_rgb &&
+        parameter.kind ==
+            video::CanonicalVideoParameterKind::unsigned_integer) {
+      return {
+          static_cast<std::uint8_t>((parameter.unsigned_value >> 16u) & 0xffu),
+          static_cast<std::uint8_t>((parameter.unsigned_value >> 8u) & 0xffu),
+          static_cast<std::uint8_t>(parameter.unsigned_value & 0xffu),
+      };
+    }
+  }
+  return {0, 0, 0};
+}
+
+bool ResolveModel(
+    const video::CanonicalVideoStage &stage,
+    const std::string &requested_model_id, const char *task, const char *role,
+    open_video::ModelPack *pack,
+    open_video::ValidatedModelArtifactIdentity *identity,
+    const open_video::ModelPackRegistry *selected_registry = nullptr) {
+  if (pack == nullptr || identity == nullptr)
+    return false;
+  const auto owned_registry =
+      selected_registry ? std::optional<open_video::ModelPackRegistry>{}
+                        : std::optional<open_video::ModelPackRegistry>{
+                              open_video::ModelPackRegistry::ScanDefault()};
+  const auto &registry =
+      selected_registry ? *selected_registry : *owned_registry;
+  const bool model_unbound = IsZeroHash(stage.model.model_id_hash);
+  const bool artifact_unbound = IsZeroHash(stage.model.artifact_set_hash);
+  if (model_unbound != artifact_unbound)
+    return false;
+
+  const auto accept = [&](const open_video::ModelPack &candidate) {
+    if (candidate.task != task ||
+        (candidate.task == "matting" && !candidate.matting))
+      return false;
+    const open_video::ModelFile *artifact = nullptr;
+    for (const auto &file : candidate.files)
+      if ((file.kind == "onnx" || file.kind == "dlib_shape_predictor") &&
+          (file.role == role ||
+           (std::string_view(role) == "main" && file.role.empty()))) {
+        artifact = &file;
+        break;
+      }
+    if (artifact == nullptr)
+      return false;
+    const auto validation =
+        open_video::ValidateModelArtifactIdentity(candidate, *artifact);
+    if (!validation.ok())
+      return false;
+    if (!model_unbound &&
+        (stage.model.model_id_hash != validation.identity.model_id_sha256 ||
+         stage.model.artifact_set_hash !=
+             validation.identity.artifact_set_sha256 ||
+         (stage.model.artifact_generation != 0 &&
+          stage.model.artifact_generation !=
+              validation.identity.registry_generation))) {
+      return false;
+    }
+    *pack = candidate;
+    *identity = validation.identity;
+    return true;
+  };
+
+  if (!requested_model_id.empty()) {
+    const auto requested = registry.Find(task, requested_model_id);
+    return requested.has_value() && accept(*requested);
+  }
+  const auto selected =
+      registry.Find(task, registry.DefaultModelIdForTask(task));
+  if (selected)
+    return accept(*selected);
+  return false;
+}
+
+bool CompatibilitySemantic(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::video_noise_removal ||
+         semantic == hal::SemanticEffectId::eye_contact;
+}
+
+bool VirtualBackground(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::virtual_background_blur ||
+         semantic == hal::SemanticEffectId::virtual_background_remove ||
+         semantic == hal::SemanticEffectId::virtual_background_replace;
+}
+
+bool UsesMatting(hal::SemanticEffectId semantic) noexcept {
+  return VirtualBackground(semantic) ||
+         semantic == hal::SemanticEffectId::virtual_key_light;
+}
+
+bool ComponentMember(OpenCudaSetupComponentId component,
+                     hal::SemanticEffectId semantic) noexcept {
+  switch (component) {
+  case OpenCudaSetupComponentId::shared_matting:
+    return UsesMatting(semantic);
+  case OpenCudaSetupComponentId::native_vignette:
+    return semantic == hal::SemanticEffectId::vignette;
+  case OpenCudaSetupComponentId::native_mirror:
+    return semantic == hal::SemanticEffectId::mirror;
+  case OpenCudaSetupComponentId::shared_face_analysis:
+    return semantic == hal::SemanticEffectId::auto_frame ||
+           semantic == hal::SemanticEffectId::eye_contact;
+  case OpenCudaSetupComponentId::auto_frame:
+    return semantic == hal::SemanticEffectId::auto_frame;
+  case OpenCudaSetupComponentId::eye_contact:
+    return semantic == hal::SemanticEffectId::eye_contact;
+  case OpenCudaSetupComponentId::denoise:
+    return semantic == hal::SemanticEffectId::video_noise_removal;
+  default:
+    return false;
+  }
+}
+hal::SemanticEffectProviderId
+ProviderFor(hal::SemanticEffectId semantic) noexcept;
+
+bool BudgetContains(const hal::ResourceBudget &available,
+                    const hal::ResourceBudget &required) noexcept {
+  return required.persistent_bytes <= available.persistent_bytes &&
+         required.scratch_bytes <= available.scratch_bytes &&
+         required.upload_staging_bytes <= available.upload_staging_bytes &&
+         required.readback_staging_bytes <= available.readback_staging_bytes &&
+         required.resource_count <= available.resource_count &&
+         available.in_flight_slots == 1 && required.in_flight_slots == 1;
+}
+
+hal::ExecutionDomainId
+UnavailableCudaDomain(std::uint64_t adapter,
+                      std::uint64_t generation) noexcept {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::cuda;
+  domain.api_family = hal::ApiFamily::cuda_driver;
+  domain.physical_device.vendor_id = UINT32_C(0x535443);
+  domain.physical_device.device_id = 1;
+  domain.physical_device.stable_id[0] = 0x43;
+  domain.physical_device.stable_id[1] = 0x55;
+  domain.physical_device.stable_id[2] = 0x44;
+  domain.physical_device.stable_id[3] = 0x41;
+  domain.logical_context_generation = generation == 0 ? 1 : generation;
+  domain.allocator_family = hal::AllocatorFamily::cuda_driver;
+  domain.memory_handle_family = hal::MemoryHandleFamily::cuda_device_pointer;
+  domain.queue_or_stream_identity = adapter ^ UINT64_C(0x4355444153455455);
+  if (domain.queue_or_stream_identity == 0)
+    domain.queue_or_stream_identity = 1;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::cuda_stream_ordered;
+  domain.adapter_instance_id = adapter;
+  return domain;
+}
+
+video::ProductionVideoResidentSetupSourceResult NeutralUnavailable(
+    const video::ProductionVideoResidentSetup &request,
+    const std::array<hal::StatusId, hal::kMaxPreparedStages> &statuses,
+    const std::array<hal::ReasonId, hal::kMaxPreparedStages>
+        &reasons) noexcept {
+  static std::atomic<std::uint64_t> next_adapter{UINT64_C(0x4f434e5500000000)};
+  video::ProductionVideoResidentSetupSourceResult result;
+  result.canonical_effects = request.effects;
+  result.plan = request.plan;
+  if (ExactTerminalOutputTail(result.plan,
+                              hal::CpuTailId::backend_resolved_output)) {
+    result.plan.cpu_tails = {};
+    result.plan.cpu_tail_count = 0;
+  }
+  result.plan.invalidation_key.execution_domain_hash =
+      video::kProductionVideoNeutralPassthroughExecutionHash;
+  auto &generations = result.plan.invalidation_key.generations;
+  if (generations.model == 0)
+    generations.model = 1;
+  if (generations.provider == 0)
+    generations.provider = 1;
+  if (generations.device == 0)
+    generations.device = 1;
+  if (generations.context == 0)
+    generations.context = 1;
+  result.status = hal::StatusId::degraded;
+  result.reason = hal::ReasonId::capability_evidence_incomplete;
+  result.readiness.status = result.status;
+  result.readiness.reason = result.reason;
+  result.readiness.requested_backend = hal::BackendId::cuda;
+  result.readiness.available = true;
+  result.readiness.degraded = true;
+  result.setup_completed_outside_frame_loop = true;
+  auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
+  if (adapter == 0)
+    adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
+  auto &registration = result.resolution_registration;
+  registration.adapter_instance_id = adapter;
+  registration.backend = hal::BackendId::cuda;
+  registration.execution_domain = UnavailableCudaDomain(
+      adapter, request.plan.invalidation_key.generations.context);
+  registration.selection_priority = 100;
+  registration.semantic_capability_count = request.plan.intent.stage_count;
+  for (std::size_t index = 0; index < request.plan.intent.stage_count;
+       ++index) {
+    auto &capability = registration.semantic_capabilities[index];
+    capability.semantic = request.plan.intent.stages[index].intent.semantic;
+    capability.provider = ProviderFor(capability.semantic);
+    capability.status = statuses[index] == hal::StatusId::invalid
+                            ? hal::StatusId::unavailable
+                            : statuses[index];
+    capability.reason = reasons[index] == hal::ReasonId::none
+                            ? hal::ReasonId::capability_evidence_incomplete
+                            : reasons[index];
+  }
+  return result;
+}
+
+hal::SemanticEffectProviderId
+ProviderFor(hal::SemanticEffectId semantic) noexcept {
+  return semantic == hal::SemanticEffectId::vignette ||
+                 semantic == hal::SemanticEffectId::mirror
+             ? kNativeProvider
+             : kProvider;
+}
+
+bool PreparedSemantics(
+    const video::NormalizedVideoExecutionIntent &intent) noexcept {
+  if (intent.stage_count == 0 || intent.stage_count > hal::kMaxPreparedStages)
+    return false;
+  unsigned last_rank = 0;
+  for (std::size_t i = 0; i < intent.stage_count; ++i) {
+    if (intent.stages[i].parameter_count > intent.stages[i].parameters.size())
+      return false;
+    const auto rank =
+        PreparedOpenCudaCanonicalStageRank(intent.stages[i].intent.semantic);
+    if (rank == 0 || rank <= last_rank)
+      return false;
+    last_rank = rank;
+  }
+  return true;
+}
+
+hal::ExecutionDomainId
+HostOrtDomain(std::uint32_t stage_id, std::uint64_t generation,
+              std::uint64_t adapter_instance_id) noexcept {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::open_video_onnxruntime;
+  domain.api_family = hal::ApiFamily::onnxruntime;
+  domain.physical_device.vendor_id = UINT32_C(0x535443);
+  domain.physical_device.device_id = stage_id;
+  domain.physical_device.stable_id[0] = 0x4f;
+  domain.physical_device.stable_id[1] = 0x56;
+  domain.physical_device.stable_id[2] =
+      static_cast<std::uint8_t>(stage_id & 0xffu);
+  domain.logical_context_generation = generation;
+  domain.allocator_family = hal::AllocatorFamily::onnxruntime;
+  domain.memory_handle_family = hal::MemoryHandleFamily::ort_value;
+  domain.queue_or_stream_identity = adapter_instance_id ^ UINT64_C(0x4f525451);
+  if (domain.queue_or_stream_identity == 0)
+    domain.queue_or_stream_identity = 1;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::ort_provider_synchronous;
+  domain.adapter_instance_id = adapter_instance_id;
+  return domain;
+}
+
+bool ResolveCompatibilityModel(
+    const open_video::ModelPackRegistry &registry,
+    const video::CanonicalVideoStage &stage, const char *task,
+    const std::string &requested_model_id, open_video::ModelPack *pack,
+    open_video::ValidatedModelArtifactIdentity *identity) {
+  if (task == nullptr || pack == nullptr || identity == nullptr)
+    return false;
+  const auto accept = [&](const open_video::ModelPack &candidate) {
+    if (candidate.task != task)
+      return false;
+    const open_video::ModelFile *artifact = nullptr;
+    for (const auto &file : candidate.files) {
+      if (file.kind != "onnx")
+        continue;
+      if (file.role == "main" || file.role.empty() ||
+          (std::string_view(task) == "eye_contact" && file.role == "left")) {
+        artifact = &file;
+        break;
+      }
+    }
+    if (artifact == nullptr)
+      return false;
+    const auto validation =
+        open_video::ValidateModelArtifactIdentity(candidate, *artifact);
+    if (!validation.ok())
+      return false;
+    if (!IsZeroHash(stage.model.model_id_hash) &&
+        (stage.model.model_id_hash != validation.identity.model_id_sha256 ||
+         stage.model.artifact_set_hash !=
+             validation.identity.artifact_set_sha256)) {
+      return false;
+    }
+    *pack = candidate;
+    *identity = validation.identity;
+    return true;
+  };
+  if (!requested_model_id.empty()) {
+    const auto requested = registry.Find(task, requested_model_id);
+    return requested.has_value() && accept(*requested);
+  }
+  for (const auto &candidate : registry.ListModels()) {
+    if (accept(candidate))
+      return true;
+  }
+  return false;
+}
+
+video::ProductionVideoResidentSetupSourceResult
+BuildCompatibility(const video::ProductionVideoResidentSetup &request,
+                   hal::ReasonId fallback_reason = hal::ReasonId::none) {
+  const auto &caller = request.plan;
+  if (caller.intent.stage_count == 0 ||
+      caller.intent.stage_count >
+          video::ProductionVideoResidentSetupSourceResult::
+              kMaxCompatibilityDomains) {
+    return Failure(hal::StatusId::blocked,
+                   hal::ReasonId::semantic_effect_unsupported);
+  }
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    if (!CompatibilitySemantic(caller.intent.stages[index].intent.semantic)) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::semantic_effect_unsupported);
+    }
+  }
+  if ((caller.intent.backend.mode ==
+           hal::BackendRequestMode::explicit_backend &&
+       caller.intent.backend.backend == hal::BackendId::cuda &&
+       caller.intent.backend.strict) ||
+      (caller.intent.strict_provider_selection &&
+       caller.intent.requested_provider !=
+           hal::SemanticEffectProviderId::open_video_onnxruntime_cpu)) {
+    return Failure(hal::StatusId::blocked,
+                   hal::ReasonId::semantic_provider_unavailable);
+  }
+  const bool setup_output_tail =
+      ExactTerminalOutputTail(caller, hal::CpuTailId::backend_resolved_output);
+  if (caller.cpu_tail_count != 0 && !setup_output_tail) {
+    return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
+  }
+
+  auto result = video::ProductionVideoResidentSetupSourceResult{};
+  result.execution_kind = video::ProductionVideoResidentSetupSourceResult::
+      ExecutionKind::typed_compatibility;
+  result.canonical_effects = request.effects;
+  result.plan = caller;
+  if (setup_output_tail) {
+    result.plan.cpu_tails[0] = {};
+    result.plan.cpu_tail_count = 0;
+  }
+  const auto registry = open_video::ModelPackRegistry::ScanDefault();
+  std::uint64_t artifact_hash = kHashOffset;
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    const auto semantic = caller.intent.stages[index].intent.semantic;
+    const char *task = semantic == hal::SemanticEffectId::video_noise_removal
+                           ? "video_denoise"
+                           : "eye_contact";
+    const std::string &requested =
+        semantic == hal::SemanticEffectId::video_noise_removal
+            ? request.effects.video_noise_removal.model_id
+            : request.effects.eye_contact.model_id;
+    open_video::ModelPack pack;
+    open_video::ValidatedModelArtifactIdentity identity;
+    if (!ResolveCompatibilityModel(registry, caller.intent.stages[index], task,
+                                   requested, &pack, &identity)) {
+      return Failure(hal::StatusId::unavailable,
+                     hal::ReasonId::capability_evidence_incomplete);
+    }
+    auto &model = result.plan.intent.stages[index].model;
+    model.model_id_hash = identity.model_id_sha256;
+    model.artifact_set_hash = identity.artifact_set_sha256;
+    model.artifact_generation = identity.registry_generation;
+    auto &selection = result.model_selections[result.model_selection_count++];
+    selection.semantic = semantic;
+    selection.requested_model_id = requested;
+    selection.selected_model_id = pack.id;
+    selection.artifact = model;
+    selection.default_selected = requested.empty();
+    artifact_hash = HashValue(artifact_hash, HashArtifact(identity));
+  }
+  auto &generations = result.plan.invalidation_key.generations;
+  generations.model = registry.generation();
+  if (generations.provider == 0)
+    generations.provider = 1;
+  if (generations.device == 0)
+    generations.device = 1;
+  if (generations.context == 0)
+    generations.context = 1;
+  result.plan.invalidation_key.model_artifact_hash =
+      artifact_hash == 0 ? 1 : artifact_hash;
+
+  static std::atomic<std::uint64_t> next_adapter{UINT64_C(0x4f56435000000000)};
+  auto &topology = result.compatibility_topology;
+  topology.domain_count = 1;
+  topology.boundary_count = 0;
+  topology.exact_ordered_boundaries = true;
+  topology.cross_adapter_residency_forbidden = true;
+  const auto adapter = next_adapter.fetch_add(1, std::memory_order_relaxed);
+  auto &entry = topology.domains[0];
+  entry.domain = HostOrtDomain(caller.intent.stages[0].intent.stage_id,
+                               generations.context, adapter);
+  entry.backend = hal::BackendId::open_video_onnxruntime;
+  entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  entry.first_stage_id = caller.intent.stages[0].intent.stage_id;
+  entry.last_stage_id =
+      caller.intent.stages[caller.intent.stage_count - 1].intent.stage_id;
+  const std::uint64_t domain_hash =
+      video::ProductionVideoExecutionDomainHash(entry.domain);
+  result.plan.invalidation_key.execution_domain_hash =
+      domain_hash == 0 ? 1 : domain_hash;
+
+  open_video::PreparedOpenVideoCompatibilityConfig config;
+  config.plan = result.plan;
+  config.effects = request.effects;
+  config.selected_backend = hal::BackendId::open_video_onnxruntime;
+  config.selected_provider =
+      hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  config.execution_domain = entry.domain;
+  config.expected_transfers = topology.expected_transfers;
+  config.setup_fallback_reason = fallback_reason;
+  for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+    config.providers[index] =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+    config.backends[index] = hal::BackendId::open_video_onnxruntime;
+  }
+  open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+  result.compatibility_executor =
+      open_video::PreparedOpenVideoCompatibilityExecutor::Create(config,
+                                                                 &setup);
+  if (!result.compatibility_executor) {
+    return Failure(setup.status, setup.reason);
+  }
+  result.status = setup.status;
+  result.reason = setup.reason;
+  result.readiness = setup.readiness;
+  result.setup_completed_outside_frame_loop = true;
+  return result;
+}
+
+bool AutomaticHostCompatibilityAllowed(
+    const video::VideoExecutionPlanRequest &plan) noexcept {
+  const auto &intent = plan.intent;
+  if (intent.backend.mode != hal::BackendRequestMode::automatic ||
+      intent.backend.backend != hal::BackendId::invalid ||
+      intent.backend.strict || intent.strict_provider_selection ||
+      intent.requested_provider != hal::SemanticEffectProviderId::invalid ||
+      intent.preferences.effects_engine !=
+          hal::EffectsEnginePreferenceConstraint::automatic ||
+      intent.preferences.strict_effects_engine ||
+      intent.preferences.compute_family != hal::ComputeFamilyAllowance::any ||
+      intent.stage_count == 0 || intent.stage_count > intent.stages.size())
+    return false;
+  for (std::size_t i = 0; i < intent.stage_count; ++i)
+    if (!CompatibilitySemantic(intent.stages[i].intent.semantic))
+      return false;
+  return true;
+}
+
+bool HostCompatibilityFailureReason(hal::ReasonId reason) noexcept {
+  return reason == hal::ReasonId::strict_backend_unavailable ||
+         reason == hal::ReasonId::semantic_provider_unavailable ||
+         reason == hal::ReasonId::capability_evidence_incomplete ||
+         reason == hal::ReasonId::resource_exhausted;
+}
+
+class ProductionSetupSource final
+    : public video::IProductionVideoBackendSetupSource {
+public:
+  explicit ProductionSetupSource(
+      ProductionVideoBackendSetupDependencies dependencies = {}) noexcept
+      : dependencies_(dependencies) {}
+  video::ProductionVideoResidentSetupSourceResult AcquireResidentSetup(
+      const video::ProductionVideoResidentSetup &request) noexcept override {
+    const auto &caller = request.plan;
+    if (caller.intent.stage_count > caller.intent.stages.size())
+      return Failure(hal::StatusId::blocked, hal::ReasonId::malformed_contract);
+    bool compatibility = caller.intent.stage_count != 0;
+    for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+      compatibility =
+          compatibility &&
+          CompatibilitySemantic(caller.intent.stages[index].intent.semantic);
+    }
+    if (compatibility && !AcceptsOpenCudaSelectionIntent(caller.intent))
+      return BuildCompatibility(request);
+    if (request.contract_version !=
+            video::kProductionVideoBackendManagerContractVersion ||
+        !AcceptsOpenCudaSelectionIntent(caller.intent)) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::strict_backend_unavailable);
+    }
+    if (!PreparedSemantics(caller.intent)) {
+      return Failure(hal::StatusId::blocked,
+                     caller.intent.stage_count > 3
+                         ? hal::ReasonId::cross_adapter_residency_forbidden
+                         : hal::ReasonId::semantic_effect_unsupported);
+    }
+    if (!TightRgb24(caller.host_input, hal::Mutability::read_only) ||
+        !TightRgb24(caller.host_output, hal::Mutability::write_only)) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::malformed_descriptor);
+    }
+    const bool setup_output_tail = ExactTerminalOutputTail(
+        caller, hal::CpuTailId::backend_resolved_output);
+    if (!setup_output_tail &&
+        !ExactTerminalOutputTail(caller, hal::CpuTailId::writer_copy)) {
+      return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
+    }
+
+    try {
+      const bool automatic_host_compatibility =
+          AutomaticHostCompatibilityAllowed(caller);
+      const auto host_compatibility = [&](hal::ReasonId failure) {
+        return dependencies_.acquire_compatibility
+                   ? dependencies_.acquire_compatibility(dependencies_.context,
+                                                         request, failure)
+                   : BuildCompatibility(request, failure);
+      };
+      std::array<hal::StatusId, hal::kMaxPreparedStages> statuses{};
+      std::array<hal::ReasonId, hal::kMaxPreparedStages> reasons{};
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
+        statuses[index] = hal::StatusId::ready;
+
+      const auto optional_unavailable = [&] {
+        return automatic_host_compatibility
+                   ? host_compatibility(
+                         hal::ReasonId::capability_evidence_incomplete)
+                   : NeutralUnavailable(request, statuses, reasons);
+      };
+      open_video::ModelPack pack;
+      open_video::ValidatedModelArtifactIdentity artifact;
+      const auto mark_component = [&](OpenCudaSetupComponentId component,
+                                      hal::StatusId status,
+                                      hal::ReasonId reason) {
+        for (std::size_t index = 0; index < caller.intent.stage_count;
+             ++index) {
+          const auto semantic = caller.intent.stages[index].intent.semantic;
+          const bool member =
+              ComponentMember(component, semantic) &&
+              !(component == OpenCudaSetupComponentId::shared_face_analysis &&
+                semantic == hal::SemanticEffectId::auto_frame &&
+                artifact.Valid());
+          if (member) {
+            statuses[index] = status;
+            reasons[index] = reason;
+          }
+        }
+      };
+      const auto required_unavailable = [&] {
+        for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
+          if (statuses[index] != hal::StatusId::ready &&
+              caller.intent.stages[index].intent.required)
+            return true;
+        return false;
+      };
+      const auto selected_count = [&] {
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
+          count += statuses[index] == hal::StatusId::ready ? 1u : 0u;
+        return count;
+      };
+
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        const auto provider =
+            ProviderFor(caller.intent.stages[index].intent.semantic);
+        if (caller.intent.strict_provider_selection &&
+            caller.intent.requested_provider != provider) {
+          statuses[index] = hal::StatusId::unavailable;
+          reasons[index] = hal::ReasonId::semantic_provider_unavailable;
+        }
+      }
+
+      const auto registry =
+          dependencies_.resolve_model
+              ? std::optional<open_video::ModelPackRegistry>{}
+              : std::optional<open_video::ModelPackRegistry>{
+                    open_video::ModelPackRegistry::ScanDefault()};
+
+      std::size_t first_matting = caller.intent.stage_count;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        if (statuses[index] == hal::StatusId::ready &&
+            UsesMatting(caller.intent.stages[index].intent.semantic)) {
+          first_matting = index;
+          break;
+        }
+      }
+      bool model_resolved = first_matting == caller.intent.stage_count;
+      if (!model_resolved) {
+        const auto &model_stage = caller.intent.stages[first_matting];
+        model_resolved =
+            dependencies_.resolve_model
+                ? dependencies_.resolve_model(
+                      dependencies_.context, model_stage,
+                      request.effects.virtual_background.model_id, "matting",
+                      "main", &pack, &artifact)
+                : ResolveModel(model_stage,
+                               request.effects.virtual_background.model_id,
+                               "matting", "main", &pack, &artifact,
+                               registry ? &*registry : nullptr);
+        if (!model_resolved)
+          mark_component(OpenCudaSetupComponentId::shared_matting,
+                         hal::StatusId::unavailable,
+                         hal::ReasonId::capability_evidence_incomplete);
+      }
+      PreparedOpenCudaModelDependencies dependencies;
+      const auto resolve =
+          [&](const video::CanonicalVideoStage &stage, const std::string &id,
+              const char *task, const char *role,
+              open_video::ModelPack *selected,
+              open_video::ValidatedModelArtifactIdentity *identity) {
+            return dependencies_.resolve_model
+                       ? dependencies_.resolve_model(dependencies_.context,
+                                                     stage, id, task, role,
+                                                     selected, identity)
+                       : ResolveModel(stage, id, task, role, selected, identity,
+                                      registry ? &*registry : nullptr);
+          };
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
+        if (statuses[index] != hal::StatusId::ready)
+          continue;
+        const auto &stage = caller.intent.stages[index];
+        if (stage.intent.semantic ==
+                hal::SemanticEffectId::video_noise_removal &&
+            !resolve(stage, request.effects.video_noise_removal.model_id,
+                     "video_denoise", "main", &dependencies.denoise,
+                     &dependencies.denoise_artifact))
+          mark_component(OpenCudaSetupComponentId::denoise,
+                         hal::StatusId::unavailable,
+                         hal::ReasonId::capability_evidence_incomplete);
+        if (stage.intent.semantic == hal::SemanticEffectId::auto_frame ||
+            stage.intent.semantic == hal::SemanticEffectId::eye_contact) {
+          if (!dependencies.face_artifact.Valid() &&
+              !resolve(stage, request.effects.auto_frame.model_id,
+                       "face_detection", "main", &dependencies.face,
+                       &dependencies.face_artifact)) {
+            if (stage.intent.semantic == hal::SemanticEffectId::eye_contact)
+              mark_component(OpenCudaSetupComponentId::eye_contact,
+                             hal::StatusId::unavailable,
+                             hal::ReasonId::capability_evidence_incomplete);
+          }
+        }
+        if (stage.intent.semantic == hal::SemanticEffectId::eye_contact) {
+          bool ready = resolve(stage, request.effects.eye_contact.model_id,
+                               "eye_contact", "left", &dependencies.eye,
+                               &dependencies.eye_left_artifact);
+          std::string landmark_id;
+          for (const auto &dependency : dependencies.eye.depends_on)
+            if (dependency.rfind("face_landmarks:", 0) == 0)
+              landmark_id = dependency.substr(15);
+          video::CanonicalVideoStage unbound;
+          ready =
+              ready &&
+              resolve(unbound, dependencies.eye.id, "eye_contact", "right",
+                      &dependencies.eye, &dependencies.eye_right_artifact) &&
+              resolve(unbound, landmark_id, "face_landmarks", "main",
+                      &dependencies.landmarks,
+                      &dependencies.landmarks_artifact);
+          if (!ready)
+            mark_component(OpenCudaSetupComponentId::eye_contact,
+                           hal::StatusId::unavailable,
+                           hal::ReasonId::capability_evidence_incomplete);
+        }
+      }
+      for (std::size_t i = 0; i < caller.intent.stage_count; ++i) {
+        if (statuses[i] != hal::StatusId::ready ||
+            caller.intent.stages[i].intent.semantic !=
+                hal::SemanticEffectId::auto_frame)
+          continue;
+        if (!artifact.Valid()) {
+          video::CanonicalVideoStage unbound;
+          (void)resolve(unbound, request.effects.virtual_background.model_id,
+                        "matting", "main", &pack, &artifact);
+        }
+        if (!dependencies.face_artifact.Valid() && !artifact.Valid())
+          mark_component(OpenCudaSetupComponentId::auto_frame,
+                         hal::StatusId::unavailable,
+                         hal::ReasonId::capability_evidence_incomplete);
+      }
+      if (required_unavailable())
+        return Failure(hal::StatusId::unavailable,
+                       hal::ReasonId::required_stage_failed);
+      if (selected_count() == 0)
+        return optional_unavailable();
+
+      const std::uint32_t model_width =
+          model_resolved && pack.matting
+              ? static_cast<std::uint32_t>(pack.matting->input.width)
+              : 0u;
+      const std::uint32_t model_height =
+          model_resolved && pack.matting
+              ? static_cast<std::uint32_t>(pack.matting->input.height)
+              : 0u;
+      std::vector<std::uint8_t> replacement_rgb;
+      int replacement_width = 0;
+      int replacement_height = 0;
+      bool has_replace = false;
+      for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
+        has_replace |= statuses[index] == hal::StatusId::ready &&
+                       caller.intent.stages[index].intent.semantic ==
+                           hal::SemanticEffectId::virtual_background_replace;
+      if (has_replace && (!video::LoadImageRgb24(
+                              request.effects.virtual_background.replace_path,
+                              &replacement_width, &replacement_height,
+                              &replacement_rgb, nullptr) ||
+                          replacement_width <= 0 || replacement_height <= 0)) {
+        mark_component(OpenCudaSetupComponentId::shared_matting,
+                       hal::StatusId::unavailable,
+                       hal::ReasonId::capability_evidence_incomplete);
+      }
+      if (required_unavailable())
+        return Failure(hal::StatusId::unavailable,
+                       hal::ReasonId::required_stage_failed);
+      if (selected_count() == 0)
+        return optional_unavailable();
+
+      // Each safe failed attempt removes one optional component. The fixed
+      // stage capacity bounds retries; nonquiescent failures are never retried.
+      for (std::size_t attempt = 0; attempt < hal::kMaxPreparedStages;
+           ++attempt) {
+        std::size_t first_selected = caller.intent.stage_count;
+        std::size_t last_selected = 0;
+        for (std::size_t index = 0; index < caller.intent.stage_count;
+             ++index) {
+          if (statuses[index] == hal::StatusId::ready) {
+            first_selected = std::min(first_selected, index);
+            last_selected = index;
+          }
+        }
+        if (first_selected == caller.intent.stage_count)
+          return optional_unavailable();
+
+        const auto selected_semantic =
+            caller.intent.stages[first_selected].intent.semantic;
+        bool selected_matting = false;
+        std::size_t selected_matting_index = caller.intent.stage_count;
+        hal::SemanticEffectId matting_semantic = selected_semantic;
+        for (std::size_t i = 0; i < caller.intent.stage_count; ++i)
+          if (statuses[i] == hal::StatusId::ready &&
+              UsesMatting(caller.intent.stages[i].intent.semantic)) {
+            selected_matting = true;
+            selected_matting_index = i;
+            matting_semantic = caller.intent.stages[i].intent.semantic;
+            break;
+          }
+        if (!selected_matting && artifact.Valid()) {
+          for (std::size_t i = 0; i < caller.intent.stage_count; ++i)
+            if (statuses[i] == hal::StatusId::ready &&
+                caller.intent.stages[i].intent.semantic ==
+                    hal::SemanticEffectId::auto_frame) {
+              selected_matting = true;
+              matting_semantic = hal::SemanticEffectId::virtual_key_light;
+            }
+        }
+        const int strength =
+            selected_matting_index < caller.intent.stage_count
+                ? Strength(caller.intent.stages[selected_matting_index])
+                : request.effects.virtual_background.strength;
+        hal::ResourceBudget budget;
+        if (!ResourceBudgetFor(
+                caller.host_input.width, caller.host_input.height,
+                caller.host_output.width, caller.host_output.height,
+                selected_matting ? model_width : 0u,
+                selected_matting ? model_height : 0u, matting_semantic,
+                strength, static_cast<std::uint32_t>(replacement_width),
+                static_cast<std::uint32_t>(replacement_height),
+                static_cast<std::uint32_t>(selected_count()), &budget)) {
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
+        }
+
+        bool face_used = false;
+        for (std::size_t i = 0; i < caller.intent.stage_count; ++i) {
+          if (statuses[i] != hal::StatusId::ready)
+            continue;
+          const auto semantic = caller.intent.stages[i].intent.semantic;
+          const bool analysis = semantic == hal::SemanticEffectId::auto_frame ||
+                                semantic == hal::SemanticEffectId::eye_contact;
+          if (analysis && dependencies.face_artifact.Valid() && !face_used) {
+            if (!Add(UINT64_C(64) << 20, &budget.persistent_bytes))
+              return Failure(hal::StatusId::resource_exhausted,
+                             hal::ReasonId::resource_exhausted);
+            budget.readback_staging_bytes += UINT64_C(4) << 20;
+            budget.resource_count += 32;
+            face_used = true;
+          }
+          if (semantic == hal::SemanticEffectId::mirror) {
+            std::uint64_t pitch = 0, bytes = 0;
+            if (!AlignRow(static_cast<std::uint64_t>(caller.host_output.width) *
+                              3u,
+                          &pitch) ||
+                !Multiply(pitch, caller.host_output.height, &bytes) ||
+                !Add(bytes, &budget.persistent_bytes))
+              return Failure(hal::StatusId::resource_exhausted,
+                             hal::ReasonId::resource_exhausted);
+            ++budget.resource_count;
+          }
+          if (semantic == hal::SemanticEffectId::auto_frame ||
+              semantic == hal::SemanticEffectId::eye_contact ||
+              semantic == hal::SemanticEffectId::video_noise_removal) {
+            if (!Add(UINT64_C(256) << 20, &budget.persistent_bytes))
+              return Failure(hal::StatusId::resource_exhausted,
+                             hal::ReasonId::resource_exhausted);
+            budget.resource_count += 128;
+          }
+        }
+        if (!BudgetContains(caller.budget, budget))
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
+        static std::atomic<std::uint64_t> next_adapter{
+            UINT64_C(0x4f43424d00000000)};
+        auto adapter_instance_id =
+            next_adapter.fetch_add(1, std::memory_order_relaxed);
+        if (adapter_instance_id == 0)
+          adapter_instance_id =
+              next_adapter.fetch_add(1, std::memory_order_relaxed);
+
+        OpenCudaProductionVideoExecutionFactoryRequest factory;
+        factory.factory_id = adapter_instance_id ^ UINT64_C(0x4f43534554555031);
+        if (factory.factory_id == 0)
+          factory.factory_id = 1;
+        factory.selection_priority = 100;
+        factory.plan = caller;
+        factory.plan.cpu_tails[0].id = hal::CpuTailId::writer_copy;
+        factory.plan.cpu_tails[0].after_stage_id =
+            caller.intent.stages[last_selected].intent.stage_id;
+        factory.plan.cpu_tails[0].boundary_index =
+            static_cast<std::uint32_t>(last_selected + 1);
+        factory.canonical_status = statuses;
+        factory.canonical_reason = reasons;
+        for (std::size_t index = 0; index < caller.intent.stage_count;
+             ++index) {
+          if (statuses[index] != hal::StatusId::ready)
+            continue;
+          const auto semantic = caller.intent.stages[index].intent.semantic;
+          const auto prepared = factory.stage_count++;
+          factory.semantics[prepared] = semantic;
+          if (UsesMatting(semantic)) {
+            factory.models[prepared].model_id_hash = artifact.model_id_sha256;
+            factory.models[prepared].artifact_set_hash =
+                artifact.artifact_set_sha256;
+            factory.models[prepared].artifact_generation =
+                artifact.registry_generation;
+            factory.plan.intent.stages[index].model = factory.models[prepared];
+          } else {
+            const auto *selected =
+                semantic == hal::SemanticEffectId::auto_frame
+                    ? (dependencies.face_artifact.Valid()
+                           ? &dependencies.face_artifact
+                           : &artifact)
+                : semantic == hal::SemanticEffectId::eye_contact
+                    ? &dependencies.eye_left_artifact
+                : semantic == hal::SemanticEffectId::video_noise_removal
+                    ? &dependencies.denoise_artifact
+                    : nullptr;
+            if (selected) {
+              factory.models[prepared].model_id_hash =
+                  selected->model_id_sha256;
+              factory.models[prepared].artifact_set_hash =
+                  selected->artifact_set_sha256;
+              factory.models[prepared].artifact_generation =
+                  selected->registry_generation;
+            }
+            factory.plan.intent.stages[index].model = factory.models[prepared];
+          }
+        }
+        factory.generations = caller.invalidation_key.generations;
+        factory.generations.model =
+            selected_matting
+                ? artifact.registry_generation
+                : std::max<std::uint64_t>(factory.generations.model, 1);
+        if (factory.generations.provider == 0)
+          factory.generations.provider = 1;
+        if (factory.generations.device == 0)
+          factory.generations.device = 1;
+        factory.plan.invalidation_key.generations = factory.generations;
+        std::uint64_t artifact_hash =
+            selected_matting ? HashArtifact(artifact) : 0;
+        for (const auto *dependency :
+             {&dependencies.face_artifact, &dependencies.landmarks_artifact,
+              &dependencies.eye_left_artifact, &dependencies.eye_right_artifact,
+              &dependencies.denoise_artifact}) {
+          if (!dependency->Valid())
+            continue;
+          artifact_hash =
+              artifact_hash == 0
+                  ? HashArtifact(*dependency)
+                  : HashValue(artifact_hash, HashArtifact(*dependency));
+          factory.generations.model = std::max(factory.generations.model,
+                                               dependency->registry_generation);
+        }
+        factory.plan.invalidation_key.generations = factory.generations;
+        factory.plan.invalidation_key.model_artifact_hash = artifact_hash;
+        factory.plan.budget = budget;
+        factory.reserved_budget = budget;
+        factory.backend.adapter_instance_id = adapter_instance_id;
+        factory.backend.model_pack =
+            selected_matting ? pack : open_video::ModelPack{};
+        factory.backend.model_artifact =
+            selected_matting ? artifact
+                             : open_video::ValidatedModelArtifactIdentity{};
+        factory.backend.configuration_generation =
+            factory.generations.configuration;
+        factory.backend.model_preprocess_generation =
+            artifact_hash != 0 ? factory.generations.model : 0;
+        factory.backend.model_artifact_hash = artifact_hash;
+        factory.backend.strength = strength;
+        factory.backend.remove_background_rgb =
+            selected_matting_index < caller.intent.stage_count
+                ? RemoveColor(caller.intent.stages[selected_matting_index])
+                : std::array<std::uint8_t, 3>{0, 0, 0};
+        factory.backend.replacement_rgb = replacement_rgb;
+        factory.backend.replacement_width = replacement_width;
+        factory.backend.replacement_height = replacement_height;
+        factory.backend.key_light_intensity =
+            request.effects.virtual_key_light.intensity;
+        factory.backend.key_light_temperature_preset =
+            request.effects.virtual_key_light.temperature_preset;
+        factory.backend.key_light_direction_pan_degrees =
+            request.effects.virtual_key_light.direction_pan_degrees;
+        factory.backend.vignette_intensity = request.effects.vignette.intensity;
+        factory.backend.vignette_tracked_center =
+            request.effects.vignette.center_on_tracked_face &&
+            request.effects.auto_frame.enabled;
+        factory.backend.dependencies = dependencies;
+        factory.backend.denoise_strength =
+            request.effects.video_noise_removal.strength;
+        factory.backend.auto_frame_strength =
+            request.effects.auto_frame.strength;
+        factory.backend.auto_frame_smoothing =
+            request.effects.auto_frame.smoothing;
+        factory.backend.auto_frame_headroom =
+            request.effects.auto_frame.headroom;
+        factory.backend.eye_contact_strength =
+            request.effects.eye_contact.strength;
+        factory.backend.eye_contact_look_away =
+            request.effects.eye_contact.look_away_enabled;
+        factory.backend.wait_policy.timeout_nanoseconds =
+            request.wait.timeout_nanoseconds;
+        factory.backend.wait_policy.poll_interval_nanoseconds =
+            request.wait.poll_interval_nanoseconds;
+        factory.backend.wait_policy.maximum_poll_count =
+            request.wait.maximum_poll_count;
+        factory.backend.wait_policy.stop_requested =
+            request.wait.stop_requested;
+        factory.backend.wait_policy.cancel_requested =
+            request.wait.cancel_requested;
+        factory.backend.wait_policy.now_nanoseconds =
+            request.wait.now_nanoseconds;
+        factory.backend.wait_policy.poll_wait = request.wait.poll_wait;
+        factory.backend.wait_policy.callback_context =
+            request.wait.callback_context;
+        factory.model_artifact_validated =
+            selected_matting || dependencies.face_artifact.Valid() ||
+            dependencies.denoise_artifact.Valid() ||
+            dependencies.eye_left_artifact.Valid();
+        factory.provider_runtime_validated = true;
+        factory.cuda_iobinding_validated = factory.model_artifact_validated;
+        factory.user_stream_bound = true;
+        factory.reusable_resources_supported = true;
+        factory.device_preprocess_supported = factory.model_artifact_validated;
+        factory.device_postprocess_supported = true;
+        factory.stop_aware_bounded_wait = true;
+        factory.allocation_free_execute = true;
+
+        video::ProductionVideoResidentSetupSourceResult result;
+        result.canonical_effects = request.effects;
+        result.setup_completed_outside_frame_loop = true;
+        OpenCudaProductionVideoExecutionBootstrapResult bootstrap;
+        hal::ReasonId reason = hal::ReasonId::none;
+        result.status =
+            dependencies_.acquire_lease
+                ? dependencies_.acquire_lease(dependencies_.context, factory,
+                                              &result.lease, &bootstrap,
+                                              &result.lease_acquire, &reason)
+                : OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
+                      factory, &result.lease, &bootstrap, &result.lease_acquire,
+                      &reason);
+        result.reason = reason;
+        result.readiness = bootstrap.setup_lease.readiness;
+        if (IsSetupSuccess(result.status) && result.lease.live()) {
+          if (!bootstrap.exact_candidate_ready ||
+              (bootstrap.actual_required_budget.resource_count != 0 &&
+               !BudgetContains(factory.reserved_budget,
+                               bootstrap.actual_required_budget))) {
+            return Failure(hal::StatusId::blocked,
+                           hal::ReasonId::capability_evidence_incomplete);
+          }
+          result.plan = factory.plan;
+          result.status = bootstrap.setup_lease.status;
+          result.reason = bootstrap.setup_lease.reason;
+          result.readiness = bootstrap.setup_lease.readiness;
+          result.plan.invalidation_key.generations =
+              bootstrap.setup_lease.generations;
+          result.plan.invalidation_key.execution_domain_hash =
+              video::ProductionVideoExecutionDomainHash(
+                  bootstrap.setup_lease.execution_domain);
+          result.plan.budget = bootstrap.setup_lease.reserved_budget;
+          result.resolution_registration = bootstrap.setup_lease.adapter;
+          for (std::size_t i = 0; i < factory.stage_count; ++i) {
+            const auto semantic = factory.semantics[i];
+            const std::string *requested = nullptr;
+            const std::string *selected = nullptr;
+            if (VirtualBackground(semantic)) {
+              requested = &request.effects.virtual_background.model_id;
+              selected = &pack.id;
+            } else if (semantic == hal::SemanticEffectId::auto_frame) {
+              requested = &request.effects.auto_frame.model_id;
+              selected = dependencies.face_artifact.Valid()
+                             ? &dependencies.face.id
+                             : &pack.id;
+            } else if (semantic == hal::SemanticEffectId::eye_contact) {
+              requested = &request.effects.eye_contact.model_id;
+              selected = &dependencies.eye.id;
+            } else if (semantic == hal::SemanticEffectId::video_noise_removal) {
+              requested = &request.effects.video_noise_removal.model_id;
+              selected = &dependencies.denoise.id;
+            }
+            if (!requested || !selected)
+              continue;
+            auto &selection =
+                result.model_selections[result.model_selection_count++];
+            selection.semantic = semantic;
+            selection.requested_model_id = *requested;
+            selection.selected_model_id = *selected;
+            selection.artifact = factory.models[i];
+            selection.default_selected = requested->empty();
+            if (semantic == hal::SemanticEffectId::auto_frame &&
+                !dependencies.face_artifact.Valid()) {
+              selection.analysis_fallback =
+                  video::ProductionVideoResidentSetupSourceResult::
+                      ModelSelection::AnalysisFallback::auto_frame_matte_bounds;
+              selection.requested_model_unavailable = true;
+              selection.fallback_dependency_artifact = selection.artifact;
+            }
+          }
+          return result;
+        }
+
+        const auto component = bootstrap.failed_component;
+        using OwnerStatus = OpenCudaProductionOwnerStatus;
+        const bool no_submitted_domain =
+            !bootstrap.owner.retained_cleanup_island &&
+            !bootstrap.owner.bootstrap_domain_ready &&
+            (bootstrap.owner.status == OwnerStatus::driver_initialize_failed ||
+             bootstrap.owner.status == OwnerStatus::context_unavailable ||
+             bootstrap.owner.status == OwnerStatus::stream_create_failed);
+        const bool safe_cleanup =
+            (no_submitted_domain ||
+             (bootstrap.candidate_shutdown.quiescent &&
+              bootstrap.candidate_shutdown.driver_context_release_permitted)) &&
+            !bootstrap.candidate_shutdown.pending &&
+            reason != hal::ReasonId::device_lost &&
+            result.status != hal::StatusId::quarantined;
+        if (automatic_host_compatibility && safe_cleanup &&
+            HostCompatibilityFailureReason(reason))
+          return host_compatibility(reason);
+        if (!safe_cleanup ||
+            (component == OpenCudaSetupComponentId::invalid ||
+             component == OpenCudaSetupComponentId::aggregate_island)) {
+          return result;
+        }
+        bool component_required = false;
+        for (std::size_t index = 0; index < caller.intent.stage_count;
+             ++index) {
+          const auto semantic = caller.intent.stages[index].intent.semantic;
+          const bool member =
+              ComponentMember(component, semantic) &&
+              !(component == OpenCudaSetupComponentId::shared_face_analysis &&
+                semantic == hal::SemanticEffectId::auto_frame &&
+                artifact.Valid());
+          component_required |=
+              member && caller.intent.stages[index].intent.required;
+        }
+        if (component_required)
+          return Failure(result.status, hal::ReasonId::required_stage_failed);
+        if (component == OpenCudaSetupComponentId::shared_matting) {
+          artifact = {};
+          pack = {};
+          if (!dependencies.face_artifact.Valid())
+            mark_component(OpenCudaSetupComponentId::auto_frame,
+                           hal::StatusId::unavailable,
+                           hal::ReasonId::capability_evidence_incomplete);
+        }
+        if (component == OpenCudaSetupComponentId::shared_face_analysis) {
+          dependencies.face_artifact = {};
+          dependencies.face = {};
+        }
+        mark_component(component, hal::StatusId::unavailable,
+                       reason == hal::ReasonId::none
+                           ? hal::ReasonId::capability_evidence_incomplete
+                           : reason);
+        if (selected_count() == 0)
+          return optional_unavailable();
+      }
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::capability_evidence_incomplete);
+    } catch (const std::bad_alloc &) {
+      return Failure(hal::StatusId::resource_exhausted,
+                     hal::ReasonId::resource_exhausted);
+    } catch (...) {
+      return Failure(hal::StatusId::blocked,
+                     hal::ReasonId::capability_evidence_incomplete);
+    }
+  }
+
+private:
+  ProductionVideoBackendSetupDependencies dependencies_{};
+};
+
+} // namespace
+
+std::unique_ptr<video::IProductionVideoBackendSetupSource>
+CreateProductionVideoBackendSetupSource() noexcept {
+  try {
+    return std::make_unique<ProductionSetupSource>();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+std::unique_ptr<video::IProductionVideoBackendSetupSource>
+CreateProductionVideoBackendSetupSourceForTesting(
+    ProductionVideoBackendSetupDependencies dependencies) noexcept {
+  if (!dependencies.resolve_model || !dependencies.acquire_lease)
+    return nullptr;
+  try {
+    return std::make_unique<ProductionSetupSource>(dependencies);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+} // namespace studiocast::open_cuda

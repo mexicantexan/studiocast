@@ -1,35 +1,254 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#include "core/video/effects/broadcast_effect_rules.h"
 #include "core/video/effects/broadcast_effects.h"
+#include "core/video/production_video_backend_manager.h"
+#include "core/video/production_video_setup_request.h"
+#include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
+#include "core/video/video_config_types.h"
+#include "core/video/video_runtime_status.h"
 
 namespace studiocast::video {
 
-enum class CaptureMode {
-  // Use the requested `width`/`height` (must be > 0).
-  requested,
+namespace effects {
+struct BroadcastEffectsPlan;
+}
 
-  // Auto-select a good capture mode. `width`/`height` may be <= 0 (sentinel).
-  auto_best,
-};
+namespace detail {
+struct CameraPipelineIssue1TestAccess;
+}
 
 enum class ScalingBackendPreference {
   auto_select,
   cpu,
   gpu,
 };
+
+enum class ComputeBackendKind {
+  cpu,
+  cuda,
+  vulkan,
+};
+
+struct ComputeBackendAvailability {
+  bool cuda_available = false;
+  bool vulkan_available = false;
+  std::string cuda_unavailable_reason;
+  std::string vulkan_unavailable_reason;
+};
+
+struct ComputeBackendSelection {
+  ComputeBackendPreference preference = ComputeBackendPreference::auto_select;
+  ComputeBackendKind resolved = ComputeBackendKind::cpu;
+  bool degraded = false;
+  std::string fallback_reason;
+  std::string degraded_reason;
+};
+
+std::string ComputeBackendPreferenceToString(ComputeBackendPreference pref);
+std::string ComputeBackendKindToString(ComputeBackendKind kind);
+bool ParseComputeBackendPreference(std::string_view value,
+                                   ComputeBackendPreference *out);
+ComputeBackendPreference
+ParseComputeBackendPreferenceOr(std::string_view value,
+                                ComputeBackendPreference fallback);
+ComputeBackendSelection
+ResolveComputeBackendSelection(ComputeBackendPreference pref,
+                               const ComputeBackendAvailability &available,
+                               bool compute_work_requested);
+bool ComputeBackendAllowsCudaVideoCompute(ComputeBackendPreference pref);
+std::string ResolveActiveComputeBackendName(
+    const ComputeBackendSelection &selection, bool compute_work_requested,
+    bool maxine_compute_available, bool cuda_compute_available,
+    bool vulkan_compute_available);
+bool MarkGpuBackendActiveFrame(bool &active_this_frame,
+                               std::uint64_t &active_frames);
+
+// Setup/control-plane projection input for the versioned daemon HAL status. It
+// consumes only the manager's cached neutral snapshot and canonical
+// configuration. No probing, model discovery, JSON, synchronization, or
+// backend construction is permitted here.
+struct CameraPipelineHalStatusProjectionInput {
+  const effects::BroadcastCameraEffects *effects = nullptr;
+  ComputeBackendPreference compute_backend =
+      ComputeBackendPreference::auto_select;
+  VideoRuntimeLifecycle lifecycle = VideoRuntimeLifecycle::disabled;
+  std::uint64_t status_generation = 0;
+  std::uint64_t configuration_generation = 0;
+  std::uint64_t geometry_generation = 0;
+  ProductionVideoBackendManagerSnapshot backend{};
+};
+
+[[nodiscard]] MultiIslandStatusValidationResult
+BuildCameraPipelineHalStatusSnapshot(
+    const CameraPipelineHalStatusProjectionInput &input,
+    MultiIslandVideoRuntimeStatusSnapshot *output) noexcept;
+
+bool EffectsPlanRequiresRebuild(
+    const effects::BroadcastCameraEffects &applied_effects,
+    std::uint64_t applied_generation,
+    const effects::BroadcastCameraEffects &current_effects,
+    std::uint64_t current_generation);
+
+// Production-connected instrumentation for the generation-gated frame-plan
+// decision region. A zero publication is an in-progress configuration
+// transition: the frame keeps using its already prepared generation and does
+// not contend on the configuration mutex.
+struct EffectsFramePreparationCounters {
+  std::uint64_t generation_loads = 0;
+  std::uint64_t transition_sentinel_loads = 0;
+  std::uint64_t snapshot_requests = 0;
+  std::uint64_t config_lock_acquisitions = 0;
+  std::uint64_t config_copies = 0;
+  std::uint64_t rebuilds = 0;
+
+  bool ObservePublishedGeneration(std::uint64_t published_generation,
+                                  std::uint64_t applied_generation) noexcept;
+  void RecordConfigSnapshot(bool rebuilt) noexcept;
+};
+
+// Tracks effect/backend attribution at the same boundary as a successfully
+// written output frame. Setup-time selection and an attempted effect are not
+// live evidence: callers begin a pending frame, record only completed effect
+// stages, and commit only after the writer accepts that frame.
+// Per-frame tracking is fixed-size and allocation-free; the public string is
+// rebuilt only when the committed attribution changes.
+class LiveEffectBackendAttribution {
+public:
+  LiveEffectBackendAttribution();
+
+  void BeginFrame();
+  void MarkEffectSucceeded(std::string_view effect_id,
+                           std::string_view backend);
+  bool RemoveEffect(std::string_view effect_id);
+  void DiscardFrame();
+  bool CommitSuccessfulFrame(const std::vector<std::string> &canonical_order);
+  void Clear();
+
+  const std::string &active_backends() const { return active_backends_; }
+
+private:
+  static constexpr std::size_t kEffectCount = 9;
+  using BackendSlots = std::array<std::uint8_t, kEffectCount>;
+  using EffectOrder = std::array<std::uint8_t, kEffectCount>;
+
+  static std::size_t EffectSlot(std::string_view effect_id);
+  static std::uint8_t BackendCode(std::string_view backend);
+  static std::string_view EffectId(std::size_t slot);
+  static std::string_view BackendId(std::uint8_t code);
+  void RememberOrder(const std::vector<std::string> &canonical_order);
+  void SerializeActive();
+
+  BackendSlots pending_{};
+  BackendSlots active_{};
+  EffectOrder active_order_{};
+  std::size_t active_order_size_ = 0;
+  std::string active_backends_;
+};
+
+inline constexpr std::uint32_t kCpuPrimitiveTailActivityVersion = 1;
+
+struct CpuPrimitiveTailActivityRecord {
+  std::uint32_t contract_version = kCpuPrimitiveTailActivityVersion;
+  bool valid = false;
+  bool active = false;
+  hal::CpuTailId cpu_tail = hal::CpuTailId::cpu_primitive_mirror;
+  hal::PrimitiveOperationId primitive = hal::PrimitiveOperationId::mirror;
+  hal::SemanticEffectId semantic = hal::SemanticEffectId::mirror;
+  hal::BackendId backend = hal::BackendId::cpu;
+  hal::SemanticEffectProviderId provider =
+      hal::SemanticEffectProviderId::invalid;
+  hal::StatusId status = hal::StatusId::invalid;
+  hal::ReasonId reason = hal::ReasonId::none;
+  WriterOutputCommitIdentity writer_commit{};
+  std::uint64_t elapsed_ns = 0;
+  std::uint64_t attempts = 0;
+  std::uint64_t successes = 0;
+  std::uint64_t fail_open_frames = 0;
+};
+
+class CpuPrimitiveTailActivityTracker {
+public:
+  void BeginFrame(std::uint64_t capture_sequence) noexcept;
+  void RecordMirrorResult(bool succeeded, std::uint64_t elapsed_ns) noexcept;
+  void DiscardFrame() noexcept;
+  [[nodiscard]] bool
+  CommitSuccessfulWriter(std::uint64_t output_commit_sequence) noexcept;
+  [[nodiscard]] const CpuPrimitiveTailActivityRecord &
+  snapshot() const noexcept {
+    return committed_;
+  }
+
+private:
+  CpuPrimitiveTailActivityRecord committed_{};
+  std::uint64_t pending_capture_sequence_ = 0;
+  std::uint64_t pending_elapsed_ns_ = 0;
+  std::uint64_t attempts_ = 0;
+  std::uint64_t successes_ = 0;
+  std::uint64_t fail_open_frames_ = 0;
+  bool pending_attempted_ = false;
+  bool pending_succeeded_ = false;
+};
+
+// Retained source-compatible policy helpers. They mutate only an already
+// canonical setup-time plan and are not used by CameraPipeline execution.
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedReason =
+        "vulkan_vignette_tracked_center_not_supported";
+inline constexpr std::string_view
+    kOpenVulkanVignetteTrackedCenterNotSupportedDetail =
+        "tracked-center semantics require a device-resident center/mask "
+        "implementation";
+
+struct OpenVulkanVignettePlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view detail;
+};
+
+OpenVulkanVignettePlanCompatibility ApplyOpenVulkanVignettePlanCompatibility(
+    const effects::BroadcastCameraEffects &effects,
+    effects::BroadcastEffectsPlan *retained_plan);
+
+struct OpenVulkanEyeContactPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+OpenVulkanEyeContactPlanCompatibility
+ApplyOpenVulkanEyeContactPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan);
+
+struct OpenVulkanVideoNoiseRemovalPlanCompatibility {
+  bool blocked = false;
+  std::string_view reason_code;
+  std::string_view blocker_code;
+  std::string_view detail;
+};
+
+OpenVulkanVideoNoiseRemovalPlanCompatibility
+ApplyOpenVulkanVideoNoiseRemovalPlanCompatibility(
+    effects::BroadcastEffectsPlan *retained_plan);
+
+using ProductionVideoBackendSetupSourceFactory =
+    std::unique_ptr<IProductionVideoBackendSetupSource> (*)() noexcept;
 
 struct CameraPipelineConfig {
   std::string input_device;  // e.g. /dev/video0
@@ -55,6 +274,15 @@ struct CameraPipelineConfig {
   ScalingBackendPreference scaling_backend =
       ScalingBackendPreference::auto_select;
 
+  // Video compute backend preference.
+  // - auto_select: prefer CUDA when a usable CUDA path is present; Vulkan can
+  //   be selected here once implemented and available; otherwise CPU.
+  // - cpu: keep compute effects CPU/pass-through only.
+  // - cuda/vulkan: strict explicit choices; they do not silently run the other
+  //   GPU backend.
+  ComputeBackendPreference compute_backend =
+      ComputeBackendPreference::auto_select;
+
   // When false, the pipeline will NOT perform CPU resizing when output
   // dimensions differ from the source frame.
   //
@@ -64,6 +292,12 @@ struct CameraPipelineConfig {
   bool allow_cpu_resize = true;
 
   studiocast::video::effects::BroadcastCameraEffects effects{};
+
+  // Production uses CreateStaticProductionVideoBackendSetupSource(). Tests
+  // may inject a hermetic setup source without exposing a backend factory,
+  // adapter, model registry, provider probe, or setup lease to the pipeline.
+  ProductionVideoBackendSetupSourceFactory backend_setup_source_factory =
+      nullptr;
 };
 
 struct CameraPipelineStatus {
@@ -86,6 +320,14 @@ struct CameraPipelineStatus {
   std::string scaling_backend_active;
   CaptureFormat scaling_from{};
   ActualFormat scaling_to{};
+
+  // Video compute backend selected during setup/reconfiguration. These fields
+  // are status only; they are not computed in the per-frame path.
+  std::string compute_backend_preference = "auto";
+  std::string compute_backend_resolved = "cpu";
+  std::string compute_backend_active = "cpu";
+  std::string compute_backend_fallback_reason;
+  std::string compute_backend_degraded_reason;
 
   int frame_index = 0;
 
@@ -112,6 +354,22 @@ struct CameraPipelineStatus {
     int output_format_changes = 0;
     int output_refresh_failures = 0;
     int output_write_recoveries = 0;
+    std::uint64_t output_write_syscalls = 0;
+    std::uint64_t output_frames_committed = 0;
+    std::uint64_t output_would_block_drops = 0;
+    std::uint64_t output_stopped_writes = 0;
+    std::uint64_t output_eintr_retries = 0;
+    std::uint64_t output_partial_frame_failures = 0;
+    std::uint64_t output_fatal_failures = 0;
+    std::size_t output_queue_capacity = kV4l2WriterMaxQueuedFrames;
+
+    // Actual YUYV frame-path call-site counters.
+    std::uint64_t yuyv_capture_to_rgb_calls = 0;
+    std::uint64_t yuyv_output_from_rgb_calls = 0;
+    std::uint64_t raw_yuyv_passthrough_frames = 0;
+    std::uint64_t raw_yuyv_passthrough_bytes = 0;
+
+    EffectsFramePreparationCounters effects_preparation{};
 
     // Output pacing/jitter diagnostics (useful for browser/WebRTC capture).
     double pace_sleep_ms = 0.0;
@@ -121,9 +379,10 @@ struct CameraPipelineStatus {
     std::uint64_t pace_resyncs = 0;
   } debug{};
 
-  // Optional Open CUDA transfer counters (emitted in status JSON only when
+  // Optional Open CUDA transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
   // STUDIOCAST_DEBUG_OPEN_CUDA_TRANSFERS=1 (or legacy
-  // STUDIOCAST_DEBUG_CUDA_UPLOADS=1) is set for the daemon).
+  // STUDIOCAST_DEBUG_CUDA_UPLOADS=1).
   struct OpenCudaTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t upload_calls = 0;
@@ -132,6 +391,7 @@ struct CameraPipelineStatus {
     std::uint64_t cpu_continuation_download_calls = 0;
     std::uint64_t alpha_download_calls = 0;
     std::uint64_t matte_frame_upload_calls = 0;
+    std::uint64_t matting_inference_calls = 0;
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
     std::uint64_t denoise_tensor_upload_calls = 0;
@@ -146,26 +406,132 @@ struct CameraPipelineStatus {
     std::uint64_t cpu_tail_denoise_calls = 0;
   } open_cuda_transfers{};
 
-  // Optional Maxine transfer counters (emitted in status JSON only when
-  // STUDIOCAST_DEBUG_MAXINE_TRANSFERS=1 is set for the daemon).
+  // Optional Open Vulkan transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
+  // STUDIOCAST_DEBUG_OPEN_VULKAN_TRANSFERS=1.
+  struct OpenVulkanTransfers {
+    std::uint64_t active_frames = 0;
+    std::uint64_t upload_calls = 0;
+    std::uint64_t download_calls = 0;
+    std::uint64_t final_download_calls = 0;
+    std::uint64_t cpu_continuation_download_calls = 0;
+    std::uint64_t alpha_download_calls = 0;
+    std::uint64_t matte_frame_upload_calls = 0;
+    std::uint64_t preprocess_dispatch_calls = 0;
+    std::uint64_t matting_inference_calls = 0;
+    std::uint64_t alpha_resize_dispatch_calls = 0;
+    std::uint64_t blur_dispatch_calls = 0;
+    std::uint64_t virtual_background_blur_dispatch_calls = 0;
+    std::uint64_t virtual_background_blur_alpha_readback_calls = 0;
+    std::uint64_t virtual_background_blur_cpu_fallback_calls = 0;
+    std::uint64_t virtual_background_blur_runtime_failure_frames = 0;
+    std::uint64_t virtual_background_blur_device_loss_frames = 0;
+    std::uint64_t virtual_background_remove_dispatch_calls = 0;
+    std::uint64_t virtual_background_remove_alpha_readback_calls = 0;
+    std::uint64_t virtual_background_remove_cpu_fallback_calls = 0;
+    std::uint64_t virtual_background_remove_runtime_failure_frames = 0;
+    std::uint64_t virtual_background_remove_device_loss_frames = 0;
+    std::uint64_t virtual_background_replace_asset_allocation_calls = 0;
+    std::uint64_t virtual_background_replace_asset_decode_calls = 0;
+    std::uint64_t virtual_background_replace_asset_upload_calls = 0;
+    std::uint64_t virtual_background_replace_asset_resize_dispatch_calls = 0;
+    std::uint64_t virtual_background_replace_dispatch_calls = 0;
+    std::uint64_t virtual_background_replace_alpha_readback_calls = 0;
+    std::uint64_t virtual_background_replace_cpu_fallback_calls = 0;
+    std::uint64_t virtual_background_replace_runtime_failure_frames = 0;
+    std::uint64_t virtual_background_replace_device_loss_frames = 0;
+    std::uint64_t background_upload_calls = 0;
+    std::uint64_t composite_dispatch_calls = 0;
+    std::uint64_t key_light_dispatch_calls = 0;
+    std::uint64_t virtual_key_light_shared_matte_reuse_calls = 0;
+    std::uint64_t virtual_key_light_independent_matte_inference_calls = 0;
+    std::uint64_t virtual_key_light_passthrough_frames = 0;
+    std::uint64_t virtual_key_light_alpha_readback_calls = 0;
+    std::uint64_t virtual_key_light_cpu_fallback_calls = 0;
+    std::uint64_t virtual_key_light_runtime_failure_frames = 0;
+    std::uint64_t virtual_key_light_device_loss_frames = 0;
+    std::uint64_t crop_resize_dispatch_calls = 0;
+    std::uint64_t vignette_dispatch_calls = 0;
+    std::uint64_t vignette_factor_allocation_calls = 0;
+    std::uint64_t vignette_factor_generation_calls = 0;
+    std::uint64_t vignette_factor_upload_calls = 0;
+    std::uint64_t mirror_dispatch_calls = 0;
+    std::uint64_t standalone_scaler_upload_calls = 0;
+    std::uint64_t standalone_scaler_download_calls = 0;
+    std::uint64_t forced_sync_calls = 0;
+    std::uint64_t cpu_tail_stage_calls = 0;
+    std::uint64_t cpu_tail_key_light_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_face_tracking_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_matte_tracking_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_cpu_crop_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_matte_alpha_readback_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_matte_cpu_box_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_cpu_crop_plan_smoothing_calls = 0;
+    std::uint64_t cpu_tail_auto_frame_cpu_resize_fallback_calls = 0;
+    std::uint64_t auto_frame_initialization_failures = 0;
+    std::uint64_t auto_frame_runtime_failure_frames = 0;
+    std::uint64_t auto_frame_device_loss_frames = 0;
+    std::uint64_t auto_frame_temporal_reset_calls = 0;
+    std::uint64_t fallback_frames = 0;
+    std::uint64_t runtime_failure_frames = 0;
+  } open_vulkan_transfers{};
+
+  // Optional Maxine transfer counters. Status JSON always emits compact
+  // rollups; detailed per-counter blocks are gated by
+  // STUDIOCAST_DEBUG_MAXINE_TRANSFERS=1.
   struct MaxineTransfers {
     std::uint64_t active_frames = 0;
     std::uint64_t rgb_to_bgr_calls = 0;
+    std::uint64_t upload_attempts = 0;
     std::uint64_t upload_calls = 0;
+    std::uint64_t matte_inference_attempts = 0;
     std::uint64_t green_screen_calls = 0;
     std::uint64_t duplicate_green_screen_calls = 0;
     std::uint64_t shared_green_screen_matte_reuse_calls = 0;
     std::uint64_t shared_green_screen_matte_incompatible_calls = 0;
     std::uint64_t shared_green_screen_input_incompatible_calls = 0;
     std::uint64_t download_calls = 0;
+    std::uint64_t final_download_attempts = 0;
     std::uint64_t final_download_calls = 0;
+    std::uint64_t cpu_continuation_download_attempts = 0;
     std::uint64_t cpu_continuation_download_calls = 0;
+    std::uint64_t device_bridge_attempts = 0;
+    std::uint64_t device_bridge_calls = 0;
+    std::uint64_t background_setup_upload_attempts = 0;
+    std::uint64_t background_setup_upload_calls = 0;
     std::uint64_t bgr_to_rgb_calls = 0;
     std::uint64_t deferred_readbacks = 0;
+    std::uint64_t forced_sync_attempts = 0;
     std::uint64_t forced_sync_calls = 0;
+    std::uint64_t composite_attempts = 0;
+    std::uint64_t composite_calls = 0;
+    std::uint64_t synchronous_sdk_run_attempts = 0;
+    std::uint64_t synchronous_sdk_run_calls = 0;
+    std::uint64_t asynchronous_sdk_run_attempts = 0;
+    std::uint64_t asynchronous_sdk_run_calls = 0;
+    std::uint64_t setup_attempts = 0;
+    std::uint64_t setup_successes = 0;
+    std::uint64_t cpu_tail_stage_calls = 0;
+    std::uint64_t runtime_failure_frames = 0;
+    // Legacy field names retained for status compatibility. Indices follow
+    // canonical semantic stage order rather than a backend SDK enum.
+    std::array<std::uint64_t, 9> stage_attempts{};
+    std::array<std::uint64_t, 9> stage_successes{};
     std::uint64_t standalone_scaler_upload_calls = 0;
     std::uint64_t standalone_scaler_download_calls = 0;
   } maxine_transfers{};
+
+  // Explicit host-primitive boundaries that are product-visible finalizers
+  // but are not semantic CPU providers. Timing covers the prepared copy into
+  // the mutable finalizer buffer plus the primitive call.
+  struct CpuPrimitiveTails {
+    std::uint64_t mirror_attempts = 0;
+    std::uint64_t mirror_successes = 0;
+    std::uint64_t mirror_fail_open_frames = 0;
+    std::uint64_t mirror_elapsed_ns = 0;
+  } cpu_primitive_tails{};
+  CpuPrimitiveTailActivityRecord cpu_primitive_tail_activity{};
 
   // Debug/status for effects.
   std::string
@@ -186,6 +552,13 @@ struct CameraPipelineStatus {
   // Cached on effect state transitions/config changes only. When active, the
   // effect has been bypassed and the frame loop is continuing pass-through.
   DegradedEffect degraded_effect{};
+
+  // Backend-neutral cached setup/live snapshot. Legacy status fields above are
+  // compatibility projections from this typed authority.
+  ProductionVideoBackendManagerSnapshot production_backend{};
+  // Cached typed status consumed only by the explicitly versioned
+  // GET_VIDEO_HAL_STATUS_V1 command. Legacy GET_STATUS does not serialize it.
+  MultiIslandVideoRuntimeStatusSnapshot video_hal_status{};
 
   std::string last_error;
 };
@@ -243,7 +616,7 @@ public:
 
 class CameraPipeline final : public CameraPipelineRunner {
 public:
-  CameraPipeline() = default;
+  CameraPipeline();
   ~CameraPipeline();
 
   CameraPipeline(const CameraPipeline &) = delete;
@@ -267,6 +640,12 @@ public:
   // Live update of effects while running.
   void SetEffects(const studiocast::video::effects::BroadcastCameraEffects
                       &effects) override;
+
+  // Explicitly invalidates resources derived from the current effect
+  // configuration. Unlike SetEffects(), this is an intentional generation
+  // boundary even when the canonical configuration is unchanged (for example,
+  // after a user-driven model-pack or replacement-image refresh).
+  void RefreshEffectsResources();
 
   // Convenience for legacy callers.
   void SetMirrorEnabled(bool enabled) override;
@@ -301,6 +680,11 @@ private:
   std::string scaling_backend_active_;
   CaptureFormat scaling_from_{};
   ActualFormat scaling_to_{};
+  std::string compute_backend_preference_ = "auto";
+  std::string compute_backend_resolved_ = "cpu";
+  std::string compute_backend_active_ = "cpu";
+  std::string compute_backend_fallback_reason_;
+  std::string compute_backend_degraded_reason_;
   int frame_index_ = 0;
 
   CameraPipelineStatus::MsPerFrame ms_per_frame_{};
@@ -310,11 +694,37 @@ private:
   CameraPipelineStatus::Debug debug_{};
 
   CameraPipelineStatus::OpenCudaTransfers open_cuda_transfers_{};
+  CameraPipelineStatus::OpenVulkanTransfers open_vulkan_transfers_{};
   CameraPipelineStatus::MaxineTransfers maxine_transfers_{};
+  CameraPipelineStatus::CpuPrimitiveTails cpu_primitive_tails_{};
+  CpuPrimitiveTailActivityRecord cpu_primitive_tail_activity_{};
+  ProductionVideoBackendManagerSnapshot production_backend_{};
+  MultiIslandVideoRuntimeStatusSnapshot video_hal_status_{};
+  std::uint64_t video_hal_status_generation_ = 0;
 
   // Effects: updated live by SetEffects.
+  //
+  // Update serialization is intentionally separate from effects_mu_: a
+  // replacement-image stat may occur while preparing a genuine configuration
+  // change, but the frame thread must remain able to snapshot the currently
+  // published generation while that setup work runs.
+  mutable std::mutex effects_update_mu_;
   mutable std::mutex effects_mu_;
   studiocast::video::effects::BroadcastCameraEffects effects_{};
+  detail::PreparedReplaceBackgroundSource replace_background_source_{};
+  std::uint64_t effects_generation_ = 0;
+  // Zero is a conservative transition sentinel. Effect mutations publish zero
+  // before changing canonical state, then release-publish the committed
+  // generation. The frame loop acquire-loads this value before taking the raw
+  // passthrough path, so a live change cannot leak one stale raw frame.
+  std::atomic<std::uint64_t> effects_generation_published_{0};
+  std::uint64_t effects_set_requests_ = 0;
+  std::uint64_t effects_ignored_updates_ = 0;
+  std::uint64_t effects_applied_updates_ = 0;
+  std::uint64_t effects_resource_refreshes_ = 0;
+  std::uint64_t replacement_background_preparations_ = 0;
+
+  friend struct detail::CameraPipelineIssue1TestAccess;
 
   // Effect runtime info (written by pipeline thread when effects chain
   // changes).

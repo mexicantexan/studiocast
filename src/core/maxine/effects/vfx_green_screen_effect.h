@@ -55,6 +55,9 @@ public:
   // Output matte is stored in an internal GPU `NvCVImage`.
   NvCV_Status Process(studiocast::video::GpuFrame &frame,
                       std::string *error) override;
+  bool SetExternalCudaStream(maxine::CUstream stream,
+                             std::string *error) override;
+  void InvalidateBindings() noexcept override;
 
   // Returns the most recent matte GPU image. Valid after a successful Process.
   const maxine::NvCVImage *MatteGpu() const {
@@ -64,11 +67,15 @@ public:
   maxine::CUstream cuda_stream() const { return stream_; }
 
   const Config &config() const { return cfg_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
   void SetConfig(const Config &cfg);
 
 private:
   bool EnsureEffectCreated(std::string *error);
   bool ApplyConfigLocked(std::string *error);
+  bool EnsureStreamBound(std::string *error);
   bool EnsureTemporalStateLocked(std::string *error);
   bool EnsureMatteImage(unsigned width, unsigned height, std::string *error);
 
@@ -80,7 +87,10 @@ private:
 
   maxine::vfx::NvVFX_Handle handle_ = nullptr;
   maxine::CUstream stream_ = nullptr;
+  maxine::CUstream external_stream_ = nullptr;
+  bool external_stream_selected_ = false;
   bool own_stream_ = false;
+  bool stream_bound_ = false;
 
   // Effect configuration.
   Config cfg_{};
@@ -94,6 +104,11 @@ private:
   maxine::NvCVImage matte_gpu_{};
   bool matte_ready_ = false;
   bool matte_allocated_ = false;
+  const maxine::NvCVImage *bound_input_ = nullptr;
+  maxine::NvCVImage *bound_output_ = nullptr;
+  unsigned bound_width_ = 0;
+  unsigned bound_height_ = 0;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects

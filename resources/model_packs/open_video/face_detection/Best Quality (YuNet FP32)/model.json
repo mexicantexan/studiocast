@@ -18,8 +18,8 @@
         "name": "input",
         "layout": "nchw",
         "dtype": "float32",
-        "width": 320,
-        "height": 320,
+        "width": 640,
+        "height": 640,
         "channels": 3
       }
     ],

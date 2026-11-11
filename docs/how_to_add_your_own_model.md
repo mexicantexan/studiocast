@@ -64,10 +64,16 @@ For example, `face_detection/` includes YuNet in three tiers:
 Similarly, `video_denoise/` includes FastDVDnet sigma preset packs:
 
 - **Good Quality (FastDVDnet sigma15)** — light denoise / detail-preserving (best for mild noise)
-- **Better Quality (FastDVDnet sigma25)** — balanced default for typical webcam noise
-- **Best Quality (FastDVDnet sigma50)** — strongest denoise (best for extreme low-light noise; may soften fine detail)
+- **Better Quality (FastDVDnet sigma25)** — bring-your-own preset/example for moderate noise
+- **Best Quality (FastDVDnet sigma50)** — bring-your-own stronger-noise preset/example; may soften fine detail
 
-
+The curated installer default is exactly `fastdvdnet_sigma15`; sigma25/sigma50
+are noncatalog BYO templates, not default or published curated artifacts. Their
+existing metadata/artifact hashes remain untouched by the sigma15 repair.
+Catalog `2026-11-11` promotes the corrected, reproducible sigma15 artifact
+published at immutable Hugging Face commit `8ffe9688`. This metadata update
+does not replace installed packs or complete a signed application release. See
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
 
 And `eye_contact/` includes gaze-correction-cam packs in Good/Better/Best variants:
 

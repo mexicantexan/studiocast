@@ -75,10 +75,16 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 
 ## Repo layout
 
-- [../CMakeLists.txt](../CMakeLists.txt): build graph, options, executable
-  targets, and test targets.
-- [../src/core](../src/core): shared non-Qt core code for config, IPC, audio,
-  video, effects, CUDA, Maxine, ONNX Runtime, and utility code.
+- [../CMakeLists.txt](../CMakeLists.txt): project setup, options, dependency
+  discovery, and subsystem orchestration. Target declarations live in the
+  local `CMakeLists.txt` files under `src/core`, `src/gui`,
+  `src/daemon`, `src/tools`, `installer`, and `tests`.
+- [../src/core](../src/core): shared non-Qt code built as neutral utility,
+  contract, configuration, IPC, model, audio/video support, runtime-loaded
+  CUDA, optional backend, and runtime-composition targets. The high-level
+  `studiocast_core` name remains an interface compatibility aggregate.
+  Source ownership and exact allowed edges are documented in
+  [ARCHITECTURE.md](ARCHITECTURE.md).
 - [../src/daemon](../src/daemon): `studiocastd`, the background service that
   owns runtime state and device orchestration.
 - [../src/gui](../src/gui): Qt GUI controller.
@@ -86,8 +92,8 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
 - [../installer/gui](../installer/gui): standalone Qt installer wizard.
 - [../installer/backend](../installer/backend): scriptable installer backend
   used by the GUI and CLI fallback.
-- [../tests](../tests): unit and integration-style tests that do not require
-  full desktop hardware workflows.
+- [../tests](../tests): automated tests organized by subsystem and test level,
+  plus reusable support code and hermetic fixtures.
 - [../scripts](../scripts): setup, install, uninstall, model, and developer
   helper scripts. See [../scripts/README.md](../scripts/README.md).
 - [../resources/model_packs](../resources/model_packs): metadata templates for
@@ -98,6 +104,45 @@ change, merge it to `master`, and tag the resulting commit if it is a release.
   for the standalone GUI installer bundle.
 - [../docs](../docs): architecture, setup, model installation, manual testing,
   trademark, roadmap, and design notes.
+
+## Automated test taxonomy and labels
+
+Automated test sources use these directories:
+
+- `tests/unit/{core,audio,model,video}` for small deterministic components.
+- `tests/integration/{core,audio,gui,ipc,video}` for services, pipelines,
+  daemon/GUI coordination, and other multi-component contracts.
+- `tests/installer/{backend,packaging,gui,models,privileged,release}` for the
+  complete installer and signed-release surface.
+- `tests/gpu/{cuda,maxine,open_video,vulkan}` for GPU backend contracts and
+  validators. A test in this tree may still be a no-hardware contract test.
+- `tests/support/` for reusable fake SDKs, mock implementations, generators,
+  and test metadata checks. Support files are not registered as tests.
+- `tests/data/` for hermetic fixtures. This remains the fixture root.
+
+The combined `studiocast-video-tests` executable remains intact to preserve its
+public target and CTest name. It is classified as integration because its
+dominant responsibility is the assembled video pipeline, even though it also
+contains deterministic component cases.
+
+Every registered CTest test has exactly one level label: `unit`, `integration`,
+or `system`. It also has one or more domain labels from `core`, `installer`,
+`release`, `model`, `gui`, `audio`, `video`, `ipc`, `gpu`, `vulkan`, and
+`maxine`. The `gpu`, `vulkan`, and `maxine` labels describe the contract under
+test; they do not imply that unavailable hardware is mandatory. CTest validates
+the label metadata as part of the suite.
+
+Useful selections include:
+
+```bash
+ctest --test-dir <build> -L unit
+ctest --test-dir <build> -L integration
+ctest --test-dir <build> -L system
+ctest --test-dir <build> -L installer
+ctest --test-dir <build> -L release
+ctest --test-dir <build> -L model
+ctest --test-dir <build> -L gpu
+```
 
 ## Main binaries and tools
 
@@ -131,10 +176,10 @@ backend:
   install/update/repair/uninstall/clean-install execution, and manifest writes.
 - `scripts/installer.sh` is the stable CLI entrypoint for CI, SSH, recovery,
   and debugging.
-- Existing `scripts/setup.sh`, `scripts/install.sh`, and `scripts/uninstall.sh`
-  remain compatibility entrypoints. The backend delegates dependency setup,
-  v4l2loopback setup, binary linking, model installs, and systemd user service
-  setup to those scripts instead of duplicating their logic.
+- Existing setup/install scripts remain developer compatibility entrypoints.
+  Recommended installation never elevates a selected-source script. Host work
+  is expressed as typed requests to the separately packaged root-owned helper;
+  user-local payload activation and uninstall are built into the backend.
 
 Backend examples:
 
@@ -150,25 +195,40 @@ Backend examples:
 ./scripts/installer.sh clean-install --yes
 ```
 
+The GUI installer exposes Open Vulkan as four independent, opt-in choices:
+build with the runtime-loaded backend, install loader/diagnostic packages,
+install Mesa Intel/AMD ICD packages, and install developer shader tools. The
+corresponding backend flags are `--open-vulkan`, `--vulkan-runtime`,
+`--mesa-vulkan`, and `--shader-tools`. Install, update, repair, and clean-install
+plans must preserve those selections in both the review text and the executed
+backend command. Vulkan package selection remains useful in repair flows even
+when the full dependency bundle is skipped.
+
+Installer review text must state that Open Vulkan is optional and runtime-loaded
+and still requires a working GPU driver/ICD. It must not equate loader/device
+availability with production inference parity: production Vulkan
+virtual-background matting remains blocked until a device-resident Vulkan
+inference runtime is implemented.
+
 The installer backend supports Ubuntu 22.04/Jammy, Ubuntu 24.04/Noble, and Linux
 Mint when `/etc/os-release` exposes a reliable Ubuntu base. Mint
 `UBUNTU_CODENAME=jammy` maps to Ubuntu 22.04; `UBUNTU_CODENAME=noble` maps to
 Ubuntu 24.04. If that field is absent, Mint 21.x maps to Jammy and Mint 22.x
 maps to Noble.
 
-The install manifest lives at:
+The atomic schema-v2 install manifest lives at:
 
 ```text
 ~/.local/share/studiocast/install-manifest.json
 ```
 
-It records installed version, source/build/install paths, installed binaries,
-systemd user service path/status, dependency install method, install timestamp,
-and whether config/models/logs/cache were preserved. Update and repair prefer
-manifest paths unless a source directory or release archive is explicitly
-selected. Uninstall removes app symlinks, service files, desktop entries, and
-runtime artifacts. Clean install preserves user config, downloaded models, logs,
-and cache unless `--remove-user-data` is explicitly selected.
+It records active/previous versioned payloads, desired and effective feature
+configuration, ownership evidence, service/v4l state, models, validation, and
+the operation journal. Production links target the durable `current` payload,
+not the build cache. Ordinary uninstall is packaged and self-contained and
+preserves settings/models/data by default. Clean install resets payload,
+service, cache, state/logs, and models; its single preservation option restores
+only user settings.
 
 Release packaging:
 
@@ -179,6 +239,13 @@ Release packaging:
 - The AppDir layout places the backend at
   `usr/share/studiocast/installer/studiocast-installer-backend`, which is the
   installed path the GUI already probes relative to the installer binary.
+- The Installer component stages the runtime contracts from `installer/release/`
+  as `release/release_channel.py`, the strict manifest schema, and
+  `trust/keys/`. Production public keys are named
+  `<key-id>.pem` in that trust root. The initial stable key is committed as
+  `installer/release/keys/studiocast-release-2026.pem`; test keys are never
+  copied there. Release-grade packaging must still pass the committed key
+  explicitly as `--trusted-release-key studiocast-release-2026=<path>`.
 - The same packaging script creates `StudioCast-<version>-source.tar.gz` from
   `HEAD` with `git archive` when available, stages it at
   `usr/share/studiocast/source/StudioCast-<version>-source.tar.gz`, and leaves
@@ -187,20 +254,62 @@ Release packaging:
   matching source archive. Runtime dependencies still come from supported system
   packages, ONNX Runtime/model helpers, optional SDK assets, and the installer
   backend scripts.
-- Local packaging does not download tools. If `linuxdeploy` and
-  `linuxdeploy-plugin-qt` are available, the script also creates
+- Local packaging does not download tools. If `linuxdeploy`,
+  `linuxdeploy-plugin-qt`, and the SHA-pinned type-2 AppImage runtime are
+  supplied, the script also creates
   `StudioCast-Installer-<version>-<arch>.AppImage`; otherwise it leaves the
   staged AppDir tarball as the local artifact.
 - Release CI is in `.github/workflows/release-packaging.yml`. It runs only from
   `workflow_dispatch` or a published GitHub Release event, downloads AppImage
-  packaging tools from `packaging/appimage/tools.lock`, verifies each tool's
-  SHA256 before making it executable, requires AppImage generation, and uploads
-  the installer bundle, AppDir archive, source archive, and checksum file as
-  workflow artifacts. It does not tag commits or publish release assets by
-  itself.
-- The packaged installer is still a source-build installer. The GUI defaults to
-  the bundled source archive, and users can still point it at another release
-  archive or a local checkout.
+  packaging tools and type-2 runtime from `packaging/appimage/tools.lock`,
+  verifies each SHA256 before use, forces linuxdeploy to use that runtime via
+  `LDAI_RUNTIME_FILE`, requires AppImage generation with the committed public
+  trust root, and uploads an exact unsigned set containing the installer bundle,
+  AppDir archive, source archive, and checksum file. The build job has no access
+  to signing variables or secrets. Published releases are
+  signed by a separate fresh job; workflow dispatch is unsigned unless its
+  `signing_dry_run` input is explicitly enabled on the repository default
+  branch. Signed dispatch from another ref fails closed.
+- The signing job uses the protected `release-signing` environment, which
+  names reviewer `mexicantexan` and permits branch `master` and tags matching
+  `v*`. The current environment settings allow self-review and administrator
+  bypass, so human approval is not an unconditional barrier.
+  `RELEASE_SIGNING_KEY_B64` exists only as an environment secret;
+  `RELEASE_SIGNING_KEY_ID` is the repository variable. The job downloads the
+  unsigned artifact set, validates its exact names and checksums, regenerates
+  the canonical source archive for the event commit and requires byte identity,
+  validates version/tag identity, staged source, and packaged public key, and
+  requires the event commit to be an ancestor of the fetched remote default
+  branch before injecting the secret into the signing step. Missing or
+  non-ancestral refs and forgeable pax-header-only commit claims fail closed
+  even when environment self-review or administrator bypass lets the job start.
+  It checks out signing code at the immutable workflow commit. Before secret
+  injection it verifies the pinned AppImage runtime prefix, independently
+  extracts the unique SquashFS with `/usr/bin/unsquashfs` without executing the
+  target AppImage, and compares its full topology, modes, hashes, sizes, and
+  symlink targets with the verified AppDir archive. It removes the ephemeral
+  private key before the final signed-artifact checks. The workflow does not tag
+  commits or publish release assets by itself.
+- Recommended remains a target-machine source build, but only after the backend
+  verifies the signed stable manifest and source artifact signature/hash/size.
+  `--official-source` is not proof. Local directories/archives remain
+  Advanced-only. The backend supports configurable manifest URLs, verified
+  offline caches, semantic same/downgrade policy, and a verified AppImage
+  self-update offer that never overwrites the running image or relaunches
+  without confirmation.
+
+Hermetic release inspection example:
+
+```bash
+studiocast-installer-backend verify-release \
+  --release-manifest manifest.json --release-signature manifest.json.sig \
+  --release-archive StudioCast-<version>-source.tar.gz \
+  --release-receipt-out verified-release.json
+studiocast-installer-backend release-status --release-receipt verified-release.json
+```
+
+Receipts carry paths and identities but are not bearer authorization: every
+consumer re-verifies the manifest, signature, artifact, and current trust root.
 
 First release checklist:
 
@@ -230,20 +339,27 @@ First release checklist:
 
 6. In GitHub, create and publish a Release for that tag. Publishing the Release
    triggers `.github/workflows/release-packaging.yml`.
-7. After release packaging finishes, download the
-   `studiocast-gui-installer-ubuntu-22.04` workflow artifact and attach the
-   AppImage, AppDir archive, source archive, and SHA256 file to the GitHub
-   Release.
+7. Review the `release-signing` environment deployment and, when GitHub presents
+   the gate, approve it after checking the tag and workflow run identity. The
+   environment currently allows self-review and administrator bypass; the
+   workflow's default-branch ancestry check remains mandatory after the job
+   starts.
+8. After release packaging finishes, download the
+   `studiocast-gui-installer-ubuntu-22.04-signed` workflow artifact and attach
+   the AppImage, AppDir archive, source archive, SHA256 file, release manifest,
+   and manifest signature to the GitHub Release.
 
-Pinned AppImage tool updates:
+Pinned AppImage tool and runtime updates:
 
 1. Choose fixed release asset URLs for `linuxdeploy` and
-   `linuxdeploy-plugin-qt`; do not pin to upstream `continuous` URLs.
-2. Download each AppImage and record `sha256sum <file>`.
-3. Update `packaging/appimage/tools.lock` with the matching version, URL, and
-   SHA256 values in one change.
+   `linuxdeploy-plugin-qt`; do not pin to upstream `continuous` URLs. Select the
+   type-2 runtime by immutable GitHub release asset ID rather than a moving
+   release URL.
+2. Download each tool and runtime and record `sha256sum <file>`.
+3. Update `packaging/appimage/tools.lock` with the matching tool versions/URLs,
+   runtime commit and asset ID, and all SHA256 values in one change.
 4. Run release packaging or a workflow-dispatch dry run so CI verifies the
-   checksums before either packaging tool is executed.
+   checksums and runtime/payload identity before signing.
 
 Maintainer command:
 
@@ -254,8 +370,16 @@ packaging/appimage/build_appimage.sh --clean
 For release-equivalent local validation with preinstalled packaging tools:
 
 ```bash
-packaging/appimage/build_appimage.sh --clean --appimage-required
+packaging/appimage/build_appimage.sh --clean --appimage-required \
+  --appimage-runtime /path/to/sha-pinned/runtime-x86_64 \
+  --trusted-release-key \
+  studiocast-release-2026=installer/release/keys/studiocast-release-2026.pem
 ```
+
+The runtime path must be a regular non-symlink file matching
+`APPIMAGE_RUNTIME_SHA256` in `packaging/appimage/tools.lock`. Install
+`squashfs-tools` to run `verify_bundle.sh`; verification uses the fixed
+`/usr/bin/unsquashfs` path and never invokes the produced AppImage.
 
 ## Daemon architecture
 
@@ -354,6 +478,47 @@ Video code lives mainly under [../src/core/video](../src/core/video), with
 backend-specific code under [../src/core/open_video](../src/core/open_video),
 [../src/core/maxine](../src/core/maxine), and [../src/core/cuda](../src/core/cuda).
 
+The runtime-loaded CUDA Driver API is backend-neutral. Include
+`core/cuda/cuda_driver_api.h` and use `studiocast::cuda` in new code.
+`core/maxine/cuda_driver_api.h` is a compatibility forwarding header retained
+only for the protected camera-pipeline source; other consumers must not use it.
+
+When adding code, link the smallest owning CMake target:
+
+- contracts/config/IPC/utilities: `studiocast_contracts`,
+  `studiocast_config`, `studiocast_ipc`, or `studiocast_util`;
+- hardware execution contracts and setup-time resolution:
+  `studiocast_hal_contracts`, `studiocast_hal_runtime`, or
+  `studiocast_video_execution_runtime`;
+- CUDA and ONNX support: `studiocast_cuda_support` or
+  `studiocast_onnx_support`;
+- platform support: `studiocast_audio_support`,
+  `studiocast_video_support`, or `studiocast_video_io`;
+- optional backends: `studiocast_maxine_backend`,
+  `studiocast_open_audio_backend`, `studiocast_open_video_backend`, or
+  `studiocast_vulkan_backend`;
+- service composition: `studiocast_audio_runtime`,
+  `studiocast_video_runtime`, and `studiocast_runtime_config`.
+
+Use `studiocast_core` only where compatibility or genuine full-runtime
+aggregation is required. Configure-time assertions reject unreviewed
+StudioCast target edges and duplicate production-source ownership.
+
+The Hardware Execution Layer is documented in
+[HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md). Neutral HAL targets
+must build without optional SDK headers, vendor libraries, or backend feature
+definitions. The intended end state is neutral planning and runtime ownership,
+but an ownership cutover is not evidence of behavioral parity. Complete the
+existing Open CUDA effect behavior first, including `auto` fallback and effect
+combinations such as Auto Frame, before using the route-removal gates in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Bounded compatibility may
+preserve working behavior during that migration. It must stay observable and
+must not be described as prepared-route completion. The static
+`studiocast_video_backend_composition` target privately owns optional Maxine,
+Open Video, and Vulkan dependencies; `studiocast_video_runtime` consumes its
+neutral surface and must not acquire direct optional-backend dependencies or
+vendor types.
+
 Key concepts:
 
 - v4l2loopback provides the writable virtual camera device.
@@ -365,30 +530,171 @@ Key concepts:
 - `effects/broadcast_effect_contract.h` defines stable effect IDs, parameter
   IDs, and ranges for IPC and JSON.
 
-Engine preference values:
+Effect engine preference values:
 
 - `auto` / `auto_select`: prefer Maxine when available, otherwise use Open CUDA
   for supported effects.
 - `maxine`: force the Maxine backend where supported.
 - `open_cuda`: force the Open Video/Open CUDA backend where supported.
 
+Video compute preference values:
+
+- `auto`: prefer usable CUDA on NVIDIA systems, otherwise resolve to the next
+  supported backend or CPU/pass-through.
+- `cpu`: force CPU/pass-through behavior for GPU-backed effects.
+- `cuda`: request Open CUDA; missing CUDA support must be reported as
+  unavailable or degraded. Model-backed stages additionally require ONNX
+  Runtime CUDA EP and a compatible model pack; model-free native CUDA stages
+  do not report fabricated ORT or model prerequisites.
+- `vulkan`: request Open Vulkan. This must not silently run CUDA; if Vulkan is
+  unavailable, status reports a Vulkan fallback/degraded reason and the active
+  backend reflects CPU/pass-through where applicable.
+
 Availability is daemon-owned. The GUI should use `GET_STATUS` instead of trying
 to infer local engine or model state. Daemon status reports nested engine
 diagnostics such as `engines.maxine`, `engines.open_cuda`, and
-`engines.open_audio`, plus compatibility aliases where present.
+`engines.open_vulkan` and `engines.open_audio`, plus compatibility aliases
+where present.
 
-Open CUDA video effects are GPU-only. If CUDA, ONNX Runtime, or model packs are
-missing, the effects should be marked unavailable rather than silently falling
-back to CPU.
+The normalized video backend status lives under `video.compute` and includes:
+
+- `preference`, `resolved_backend`, `active_backend`
+- `fallback_reason`, `degraded_reason`, and `fallback`
+- `active_engines`, `unavailable_reasons`, and `provider`
+- compact `cpu_tails` and `transfers` rollups
+
+Keep this status built from cached setup-time diagnostics and pipeline counters.
+Do not add provider/package/runtime checks, JSON construction, or probe logic to
+the frame loop.
+
+For typed HAL diagnostics, the daemon also accepts
+`GET_VIDEO_HAL_STATUS_V1`. It returns a standalone, versioned multi-island
+snapshot with exact execution domains, per-effect requested/selected/active
+state, committed-output identity, transfers, CPU-tail boundaries, and blocker
+reasons when all requested effects are owned by current prepared islands. The
+snapshot carries prepared-route and compatibility-uncovered effect masks. If a
+requested effect is still routed through retained compatibility orchestration,
+the command returns `ERR` rather than inventing an authoritative prepared-HAL
+blocked or unavailable state. This command is additive: legacy `GET_STATUS`
+serialization remains unchanged and remains the authority for compatibility
+routes. The GUI has not become authoritative, and installer consumption is
+still shadow-only, rejects incomplete authority, and is
+recommendation-ineligible.
+
+Open CUDA video effects are GPU-only. Missing CUDA makes them unavailable.
+Model-backed stages also become unavailable when ONNX Runtime CUDA EP or their
+model packs are missing. Native CUDA kernel stages carry their own provider
+identity and require neither an ORT session nor a model artifact. No Open CUDA
+stage silently falls back to CPU.
+
+Open Vulkan is optional and runtime-loaded. Build with
+`-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it. Ubuntu-family setup can
+install loader/diagnostic packages with `./scripts/setup.sh --vulkan-runtime`
+and Mesa Intel/AMD ICD packages with `--mesa-vulkan`; these packages do not
+promise hardware support. Runtime/device availability also does not imply
+production Vulkan virtual-background matting readiness: until a
+device-resident Vulkan matting runtime is available, daemon status must report
+Open Vulkan virtual background as blocked/degraded instead of silently running
+CUDA.
+
+Production Vulkan expansion follows CUDA parity in bounded, independently
+reviewed phases. Each phase needs an adapter with exact resource and execution-
+domain ownership, models that satisfy the documented conversion and checksum
+contract where inference is involved, and real-hardware evidence for the
+claimed device families. These are qualification requirements, not promises
+that the remaining Vulkan effects are available. In particular, Vulkan
+matting stays blocked until reviewed shared-device GPU-only inference and
+converted, checksummed model artifacts satisfy the resident-runtime contract.
+
+Keep implementation, production routing, hardware qualification, and release
+publication as separate evidence. Local canonical CUDA composition is integrated
+at `c43717e`, including denoise, Eye Contact dependencies, background modes,
+key light, Auto Frame, vignette, resident mirror, and geometry. Strict
+backend/provider constraints remain exact. Unconstrained automatic selection
+alone may fall back during setup to host denoise/Eye Contact compatibility
+after a permitted failure and proven safe cleanup; mixed CUDA semantics,
+pending cleanup, or quarantine cannot take this fallback. Explicit typed CPU
+compatibility remains separate. All six caller resource-budget
+axes are checked before native acquisition. Failed submitted frames freeze
+normal work and require a bound retirement fence; device loss is not release
+proof. Exact unsubmitted-binding retirement is integrated at `7810477`.
+Disabled final-stage timing is fixed at `2e70c1b`; Vulkan shutdown now retains
+its context until the submission guard unlocks (`2623b88`). Final source is
+`b204b0a`; current test/review results and sanitizer limits are recorded in the
+HAL evidence table.
+
+A failed temporal reset must invalidate stale output attribution and prevent
+execution/publication until a valid program is prepared. Preserve this gate for
+both explicit reset and capture discontinuity.
+
+The shared `BuildProductionVideoBackendSetupRequest` builder in
+`src/core/video/production_video_setup_request.*` keeps camera and smoke-test
+stage order, defaults, selection, geometry, and temporal intent aligned.
+Greenscreen temporal history is refined only for selected Maxine matting;
+CUDA matting must not inherit the Maxine default. Exact CUDA/Vulkan mirror can
+be resident; automatic selection and Maxine retain the measured host mirror
+finalizer. CUDA face/Auto Frame analysis has separately bounded metadata
+readbacks and CPU tracking/planning tails, so do not claim every combination
+has zero intermediate crossings.
+
+The [HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+records final-source P1000 / driver 535.309.01 matrix results, camera completion
+budget, geometry, transfer/tail evidence, and remaining gates. Generated frames
+and in-memory writer commits prove bounded native execution. The input had no
+detected face, so it does not demonstrate
+real-face Eye Contact correction. The result does not qualify real V4L2/camera
+output, visual quality, latency, AMD, Intel, or family/release completion.
+
+A stale installed YuNet manifest declared 320x320 for its pinned 640x640 graph;
+the repository template already declares 640x640. Validate/reinstall metadata
+through an explicitly authorized model transaction before relying on that
+installed pack. Tests use current repository metadata in isolated HOME/XDG
+roots and must never rewrite the user's installed pack as validation.
+
+The repaired `fastdvdnet_sigma15` is published and promoted in local catalog
+version `2026-11-11`: 9,948,304 bytes, SHA-256
+`0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
+The model ID, default selection, and seven-pack/eight-artifact contract are
+unchanged; total catalog artifact size is 140,755,803 bytes. The artifact,
+`model.json`, and full license match the approved reproducible export and the
+remotely verified bytes at
+[Hugging Face commit 8ffe9688](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044).
+Prior source paths were preserved. The initial authentication failure is
+resolved; it is no longer a publication blocker.
+
+Publication and local catalog promotion do not install a model or publish a
+signed StudioCast release. Existing unmarked packs with old metadata remain
+preserved with `curated_ownership_unverified`; do not promise automatic repair
+or weaken ownership checks. Sigma25/sigma50 remain untouched noncatalog BYO
+templates. The normal signed clean-HEAD source/AppImage chain and recorded
+camera, quality, latency, vendor, and sanitizer qualification limits still
+apply. See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for the exact
+catalog and transaction contract.
+
+The daemon persists Vulkan adapter intent as `video.vulkan.device` and
+`video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection
+and retains `STUDIOCAST_VULKAN_DEVICE_INDEX` as a compatibility override. A
+saved `v1:...` identity (vendor ID, device ID, device type, and normalized
+device name) takes precedence over the run-local index. Missing saved devices
+and indistinguishable duplicate identities fail closed; they are never replaced
+silently. CPU Vulkan remains an explicit software fallback. Adapter changes
+apply to subsequently initialized Vulkan devices, so restart the daemon before
+relying on a changed adapter for a running pipeline.
 
 Canonical video effects are persisted under `video.effects.json` in the daemon
 config.
 
 ## Model installation and validation
 
-StudioCast keeps model binaries out of git. Metadata templates live under
-[../resources/model_packs](../resources/model_packs), and install scripts fetch
-curated assets into XDG data directories.
+StudioCast discovers runtime model packs from user-local XDG data directories.
+Source-tree pack entries live under
+[../resources/model_packs](../resources/model_packs) and may include metadata,
+license summaries, placeholders, and intentionally curated artifacts. Install
+scripts fetch curated runtime assets into XDG data directories.
+
+Policy:
+
+- [MODEL_POLICY.md](MODEL_POLICY.md)
 
 Open Video / Open CUDA:
 
@@ -467,6 +773,52 @@ Useful checks:
 - Close all consumers and confirm heavy processing returns to idle.
 - Generate a debug report after failures.
 
+## Benchmarks and hardware CI
+
+Benchmark tools are opt-in:
+
+```bash
+cmake -S . -B build-bench -G Ninja \
+  -DSTUDIOCAST_BUILD_BENCHMARKS=ON \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON
+cmake --build build-bench --target \
+  studiocast-rgb-yuyv-bench \
+  studiocast-cuda-transfer-bench \
+  studiocast-resize-backend-bench \
+  studiocast-prepared-open-cuda-facade-bench
+```
+
+Coverage:
+
+- `studiocast-rgb-yuyv-bench`: CPU color conversion, CPU resize, CPU
+  background-remove primitives.
+- `studiocast-cuda-transfer-bench`: CUDA upload, download, and roundtrip
+  transfer rows.
+- `studiocast-resize-backend-bench`: CPU/CUDA/Vulkan resize comparisons when
+  each backend is compiled and available.
+- `studiocast-prepared-open-cuda-facade-bench`: synthetic fake-adapter
+  measurement of prepared-facade overhead, transfer accounting, and
+  committed-output attribution. It performs no CUDA, ONNX Runtime, or model
+  work and is not hardware evidence.
+
+CSV output includes warmup/iteration counts, avg/p95/p99/min/max timing, status
+(`ok` or `skipped`), and skip reasons for unavailable GPU backends. Hardware
+benchmarks must stay out of default push CI. The CI workflow keeps ordinary jobs
+no-GPU-safe and exposes workflow-dispatch smoke jobs for CUDA/NVIDIA and
+Vulkan/NVIDIA, Vulkan/AMD, and Vulkan/Intel runners. Each Vulkan opt-in job
+builds and requires `studiocast-vulkan-final-stage-integration-tests` as well as
+the kernel tests; loader enumeration or a resize benchmark alone is
+insufficient. The CUDA opt-in requires both the runtime self-test and
+`studiocast-open-cuda-production-smoke-tests --require`, using the explicit
+`cuda_model_root`, matting/face/eye/denoise model IDs, and `cuda_replace_path`
+inputs for preinstalled read-only models and a readable replacement image. It
+requires dlib and sixteen topologies: fifteen strict CUDA cases including the
+canonical seven-stage composition, plus automatic six-stage resident
+composition. Automatic host mirror needs separate camera-level evidence.
+The smoke step propagates command failures through log capture and preserves
+source/build/GPU/output evidence artifacts. Enabling these jobs enforces a
+gate; it does not prove that any vendor matrix has run successfully.
+
 ## Packaging and systemd notes
 
 The systemd user service template is:
@@ -503,9 +855,11 @@ distribution packaging and polished non-developer install flows as future work.
   backend setup.
 - [ARCHITECTURE.md](ARCHITECTURE.md): canonical effect model and daemon-owned
   availability notes.
+- [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md): neutral HAL
+  contracts, adapters, migration gates, telemetry, and extension rules.
 - [MANUAL_TESTING.md](MANUAL_TESTING.md): hardware and GUI manual regression
   plan.
-- [ROADMAP.md](ROADMAP.md): project direction and planned work.
+- [README.md](README.md): documentation status, ownership, and lifecycle index.
 - [TRADEMARKS.md](TRADEMARKS.md): affiliation and trademark note.
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): contribution conventions.
 - [../SECURITY.md](../SECURITY.md): security reporting.

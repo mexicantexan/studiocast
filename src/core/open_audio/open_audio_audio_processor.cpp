@@ -1169,6 +1169,12 @@ std::string OpenAudioAudioProcessor::LastStartupWarningForStatus() const {
   return warnings.empty() ? std::string{} : warnings.back();
 }
 
+OpenAudioOrtSession::PreparedRunStats
+OpenAudioAudioProcessor::PreparedRunStatsForTesting() const {
+  return ort_session_active_ ? ort_session_active_->prepared_run_stats()
+                             : OpenAudioOrtSession::PreparedRunStats{};
+}
+
 void OpenAudioAudioProcessor::UpdateFromMicrophoneConfig(
     const studiocast::audio::effects::BroadcastMicrophoneEffects &mic) {
   int s = mic.strength;
@@ -1657,9 +1663,12 @@ bool OpenAudioAudioProcessor::Process(const float *in, float *out,
 
   // Run inference.
   std::string ort_err;
-  if (!ort_session_active_->Run(ort_inputs_.data(), ort_inputs_.size(),
-                                ort_outputs_.data(), ort_outputs_.size(),
-                                &ort_err)) {
+  const std::size_t binding_slot = state_input_names_.empty()
+                                       ? 0u
+                                       : static_cast<std::size_t>(state_toggle_);
+  if (!ort_session_active_->RunPrepared(
+          binding_slot, ort_inputs_.data(), ort_inputs_.size(),
+          ort_outputs_.data(), ort_outputs_.size(), &ort_err)) {
     if (error && error->empty())
       *error = std::string("Open Audio ORT run failed: ") + ort_err;
 

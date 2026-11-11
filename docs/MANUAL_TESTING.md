@@ -2,7 +2,7 @@
 
 Status: manual regression plan for the refaced GUI and hardware desktop
 workflows.
-Last updated: 2026-07-03.
+Last updated: 2026-11-11.
 
 This document tracks manual tests that cannot be covered deterministically in
 CI because they require real V4L2 devices, v4l2loopback behavior, desktop
@@ -552,6 +552,148 @@ Expected:
   resulting video output stay consistent.
 - Failure leaves the previous working daemon state intact or clearly reports
   what changed.
+
+## HAL Hardware Qualification
+
+Before recording HAL parity or release qualification, capture the source
+commit, build options, exact model identities, GPU and driver, command and exit
+status, writer-commit evidence, and transfer, synchronization, and CPU-tail
+counters. A component oracle, skipped opt-in test, successful session setup, or
+loader enumeration is not a successful production camera run.
+
+- [ ] Run strict Open CUDA production smoke cases for each supported effect and
+  combination on every claimed NVIDIA configuration.
+- [ ] Confirm output publication and a successful writer commit before calling
+  a route active.
+- [ ] Exercise automatic Maxine preference and CUDA fallback, Auto Frame
+  dependencies, missing and invalid models, optional-stage failure, provider or
+  device loss, reconfiguration, stop, cleanup retry, and rollback.
+- [ ] Run the final Vulkan matrix on every NVIDIA, AMD, or Intel family claimed
+  by the release. Do not extrapolate one vendor's result to another.
+
+- [ ] Confirm camera and smoke execution use
+  `BuildProductionVideoBackendSetupRequest` with canonical defaults; do not
+  disable the Maxine greenscreen temporal default to make CUDA smoke pass.
+- [ ] Verify exact CUDA/Vulkan resident mirror separately from the retained
+  automatic/Maxine host mirror finalizer and its committed CPU-tail record.
+- [ ] Record bounded face/matte metadata readbacks and CPU tracking/planning
+  tails for Auto Frame and Eye Contact, in addition to full-frame transfers.
+- [ ] Inject unsuccessful explicit and automatic/discontinuity temporal resets.
+  Confirm execution and publication stop, stale active attribution clears, and
+  only valid re-preparation permits recovery.
+- [ ] Under unconstrained automatic denoise/Eye Contact selection, force a
+  permitted native setup failure and verify host compatibility only after safe
+  cleanup. Strict CUDA or incompatible provider requests, mixed CUDA semantics,
+  pending cleanup, and quarantine must never take that fallback.
+- [ ] Reject insufficient persistent, scratch, upload/readback staging,
+  resource-count, and in-flight-slot budgets before native acquisition.
+- [ ] Fail a submitted frame before final readback and confirm the retirement
+  fence freezes normal enqueue/timing work. Lost or unproven fences must retain
+  resources rather than authorizing release.
+- [ ] Validate installed model metadata against its actual graph. In particular,
+  the current YuNet template is 640x640; a stale installed 320x320 manifest needs
+  an explicitly authorized transaction repair. Validation must preserve the
+  installed pack and test candidates in isolated HOME/XDG roots.
+
+Final source checkpoint `b204b0a` includes CUDA composition, layered
+unsubmitted-frame retirement, disabled final-stage timing, and Vulkan shutdown
+context-lifetime repairs. The
+[HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+and [local verification ledger](HAL_PARITY_COMPLETION.md#local-remediation-record-2026-11-11)
+record exact broad/native tests and critique status. Native matrix input is
+generated RGB, uses an in-memory writer, and detects no face. This proves
+bounded execution, not camera transport, gaze correction, visual quality,
+optimized latency, other vendor families, or release readiness. Automatic host
+mirror needs separate camera-level evidence.
+
+The corrected FastDVDnet artifact, metadata, and full license are published
+and byte-verified at immutable Hugging Face commit `8ffe9688`; local catalog
+`2026-11-11` promotes that same sigma15 hash. Publication and catalog promotion
+do not replace an installed pack or constitute a signed application release.
+Verify model identity explicitly. Old unmarked metadata must remain preserved
+with `curated_ownership_unverified`, and sigma25/sigma50 BYO templates remain
+untouched.
+
+A native sanitizer helper no longer reports the Vulkan use-after-free, but
+unresolved LeakSanitizer/symbolizer diagnostics
+prevent a clean full-native-sanitizer claim; see the durable ledger.
+
+Opt-in CI now requires the actual Vulkan final resident integration executable
+on each selected vendor runner. CUDA requires the production smoke executable
+with `--require`, dlib, a preinstalled read-only `cuda_model_root`, exact
+matting/face/eye/denoise model IDs, a readable `cuda_replace_path`, failure
+propagation, and retained evidence logs. It covers fifteen strict topologies
+and an automatic six-stage resident case; automatic host mirror needs separate
+camera-level evidence. A portable
+skip, a configured workflow, or a kernel-only pass is not completed hardware
+qualification.
+
+## Open Vulkan Adapter Selection
+
+- [ ] On a system with multiple Vulkan devices, inspect
+  `engines.open_vulkan.device_candidates` in daemon status.
+
+Expected:
+
+- Every loader-enumerated device has a stable `enumeration_index` for that run,
+  device/vendor/type details, its compute queue family or a rejection reason,
+  and selected/eligible state.
+- Automatic selection prefers a discrete GPU, then an integrated GPU, then a
+  virtual GPU. A CPU Vulkan implementation such as lavapipe is not treated as
+  hardware acceleration by default.
+- `selected_device_index`, `device_selection_request`, and the top-level device
+  fields agree with the selected candidate.
+
+- [ ] Select a specific candidate and restart the daemon:
+
+```bash
+STUDIOCAST_VULKAN_DEVICE_INDEX=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Open Vulkan selects enumeration index `1`, or reports
+  `vulkan_requested_device_not_found` / `vulkan_requested_device_no_compute_queue`
+  without silently choosing another adapter.
+- Vulkan enumeration indices are not assumed to match NVIDIA `nvidia-smi`
+  indices or the generic `STUDIOCAST_GPU_INDEX` setting.
+
+- [ ] Persist a candidate's `stable_id` through the daemon, then restart it:
+
+```bash
+build/studiocastctl video set vulkan_device=v1:VVVV:DDDD:T:normalized-name
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- `video.vulkan_adapter.configured_device` and
+  `engines.open_vulkan.device_selection_request` report the saved identity.
+- Reordering loader enumeration does not change the selected physical adapter.
+- If the saved identity is absent, status reports
+  `vulkan_requested_device_not_found` without choosing another adapter.
+- If multiple indistinguishable adapters match the fallback identity, status
+  reports `vulkan_requested_device_ambiguous` and fails closed. The v1 identity
+  is a stable-property fallback, not a PCI/UUID identity, so identical GPUs may
+  require a future stronger platform identifier.
+- A changed selection applies to subsequently initialized Vulkan devices;
+  restart the daemon before validating an already-running pipeline.
+
+- [ ] On a CPU-only Vulkan system, test the explicit software-device opt-in:
+
+```bash
+STUDIOCAST_VULKAN_ALLOW_CPU=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Without the opt-in, status reports `vulkan_only_cpu_devices_available` and
+  explains that a working GPU driver/ICD is needed.
+- With the opt-in, the CPU candidate can initialize, but diagnostics set
+  `cpu_device_selected=true` and warn that it is software fallback rather than
+  hardware GPU acceleration.
 
 ## Error And Recovery Cases
 

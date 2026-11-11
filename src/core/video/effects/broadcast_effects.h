@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "core/video/effects/broadcast_effect_contract.h"
+
 namespace studiocast::video::effects {
 
 inline constexpr int kBroadcastEffectsSchemaVersion = 1;
@@ -172,7 +174,10 @@ inline bool operator!=(const VirtualKeyLightSettings &a,
 
 struct VignetteSettings {
   bool enabled = false;
-  int intensity = 25;
+  // The stable contract/descriptors/GUI and legacy representation all use 35.
+  // Reference that canonical source directly so default construction cannot
+  // drift from the public schema again.
+  int intensity = contract::kVignetteIntensityDefault;
 
   bool center_on_tracked_face = true;
 };

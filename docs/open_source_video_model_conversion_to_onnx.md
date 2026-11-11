@@ -21,7 +21,7 @@ This doc explains how to:
 
 If you only want to understand the directory layout and schema, start with:
 
-- `docs/open_video_model_packs.md`
+- `docs/how_to_add_your_own_model.md`
 
 ---
 
@@ -219,12 +219,14 @@ The StudioCast templates expect two ONNX models:
 - `gaze_flx_left.onnx`
 - `gaze_flx_right.onnx`
 
-With a signature roughly matching:
+The curated FP32 artifacts have this exact signature:
 
-- `eye_rgb`: float32 `[1, 3, 48, 64]` (RGB [0..1])
-- `anchors`: float32 `[1, 1, 48, 64]` (guidance map)
-- `angles`: float32 `[1, 2]` (yaw/pitch delta)
-- output `flow`: float32 `[1, 2, 48, 64]` (dense flow field)
+- `eye_rgb:0`: float32 `[1, 3, 48, 64]` (RGB [0..1])
+- `anchors:0`: float32 `[1, 12, 48, 64]` (six landmark-guidance
+  points encoded as paired x/y offset maps)
+- `angles:0`: float32 `[1, 2]` (yaw/pitch delta)
+- output `rgb:0`: float32 `[1, 3, 48, 64]` (corrected RGB eye crop in
+  NCHW layout and the 0..1 range)
 
 A typical conversion pipeline is:
 

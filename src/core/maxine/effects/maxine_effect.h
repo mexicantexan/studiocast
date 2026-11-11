@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "core/maxine/nvcv_types.h"
@@ -11,6 +12,17 @@ namespace studiocast::maxine::effects {
 enum class EffectKind {
   vfx,
   ar,
+};
+
+// Allocation-free execution telemetry recorded immediately around the raw
+// NvVFX_Run/NvAR_Run ABI call. Async VFX submissions are separate from calls
+// that complete synchronously by SDK contract. Explicit CUDA stream
+// synchronization is owned and counted by the resident executor.
+struct EffectExecutionTelemetry {
+  std::uint64_t synchronous_run_attempts = 0;
+  std::uint64_t synchronous_run_successes = 0;
+  std::uint64_t asynchronous_run_attempts = 0;
+  std::uint64_t asynchronous_run_successes = 0;
 };
 
 // Maxine-backed GPU effect interface (interfaces only).
@@ -42,6 +54,15 @@ public:
   // - populate `frame.cpu` for v4l2loopback output
   virtual NvCV_Status Process(studiocast::video::GpuFrame &frame,
                               std::string *error) = 0;
+
+  // Select a pipeline-owned CUDA stream. The effect binds but never destroys
+  // this stream. Repeating the same selection is idempotent.
+  virtual bool SetExternalCudaStream(maxine::CUstream stream,
+                                     std::string *error) = 0;
+
+  // Runtime failures invalidate pointer/stream bindings without discarding
+  // stable user configuration or ownership telemetry.
+  virtual void InvalidateBindings() noexcept = 0;
 
   virtual const char *Backend() const { return "maxine"; }
 };

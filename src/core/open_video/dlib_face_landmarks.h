@@ -50,6 +50,12 @@ public:
                                std::uint64_t capture_sequence,
                                const FaceDetection &face,
                                FrameAnalysisCache *cache, std::string *error);
+  bool EnsurePreparedLandmarksForFrame(const std::uint8_t *rgb, int width,
+                                       int height, std::size_t stride,
+                                       std::uint64_t capture_sequence,
+                                       const FaceDetection &face,
+                                       FrameAnalysisCache *cache,
+                                       std::string *error);
 
   bool initialized() const { return initialized_; }
   bool disabled() const { return disabled_; }
@@ -64,6 +70,12 @@ private:
   std::unique_ptr<Impl> impl_;
 
   void DisableAfterFailure(const std::string &why);
+  bool EnsureLandmarksForFrameImpl(const std::uint8_t *rgb, int width,
+                                   int height, std::size_t stride,
+                                   std::uint64_t capture_sequence,
+                                   const FaceDetection &face,
+                                   FrameAnalysisCache *cache, bool allow_setup,
+                                   std::string *error);
 
   bool initialized_ = false;
   bool disabled_ = false;

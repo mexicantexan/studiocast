@@ -258,6 +258,13 @@ struct DaemonVideoStatus {
   NegotiatedFormat scaling_from;
   NegotiatedFormat scaling_to;
 
+  // Video compute backend info (from daemon status).
+  QString compute_preference = QStringLiteral("auto");
+  QString compute_resolved_backend = QStringLiteral("cpu");
+  QString compute_active_backend = QStringLiteral("cpu");
+  QString compute_fallback_reason;
+  QString compute_degraded_reason;
+
   studiocast::video::effects::BroadcastCameraEffects effects{};
   bool effects_valid = false;
 
@@ -383,6 +390,26 @@ bool ParseDaemonStatusJson(const std::string &json, DaemonVideoStatus *out,
     out->scaling_backend_active.clear();
     out->scaling_from = {};
     out->scaling_to = {};
+  }
+
+  const QJsonObject compute = video.value("compute").toObject();
+  if (!compute.isEmpty()) {
+    out->compute_preference =
+        compute.value("preference").toString(QStringLiteral("auto"));
+    out->compute_resolved_backend =
+        compute.value("resolved_backend").toString(QStringLiteral("cpu"));
+    out->compute_active_backend =
+        compute.value("active_backend").toString(QStringLiteral("cpu"));
+    out->compute_fallback_reason =
+        compute.value("fallback_reason").toString();
+    out->compute_degraded_reason =
+        compute.value("degraded_reason").toString();
+  } else {
+    out->compute_preference = QStringLiteral("auto");
+    out->compute_resolved_backend = QStringLiteral("cpu");
+    out->compute_active_backend = QStringLiteral("cpu");
+    out->compute_fallback_reason.clear();
+    out->compute_degraded_reason.clear();
   }
 
   out->input_device = video.value("input_device").toString();
@@ -804,7 +831,7 @@ QString FriendlyBackendLabel(const QString &id) {
     return QStringLiteral("Maxine");
   if (v == QStringLiteral("open_cuda") || v == QStringLiteral("open_source") ||
       v == QStringLiteral("open_video") || v == QStringLiteral("open"))
-    return QStringLiteral("Open Source");
+    return QStringLiteral("Open Video");
 
   if (v == QStringLiteral("passthrough"))
     return QStringLiteral("Pass-through");
@@ -824,10 +851,26 @@ QString FriendlyBackendLabel(const QString &id) {
   return id;
 }
 
+QString FriendlyComputeBackendLabel(const QString &id) {
+  const QString v = id.trimmed().toLower();
+  if (v.isEmpty())
+    return QStringLiteral("Inactive");
+  if (v == QStringLiteral("cuda") || v == QStringLiteral("open_cuda") ||
+      v == QStringLiteral("open_video"))
+    return QStringLiteral("CUDA");
+  if (v == QStringLiteral("vulkan") || v == QStringLiteral("open_vulkan"))
+    return QStringLiteral("Vulkan");
+  if (v == QStringLiteral("maxine"))
+    return QStringLiteral("Maxine");
+  if (v == QStringLiteral("cpu"))
+    return QStringLiteral("CPU");
+  return id;
+}
+
 QString SanitizeBackendNote(QString note) {
-  note.replace(QStringLiteral("Open CUDA"), QStringLiteral("Open Source"),
+  note.replace(QStringLiteral("Open CUDA"), QStringLiteral("Open Video"),
                Qt::CaseInsensitive);
-  note.replace(QStringLiteral("open_cuda"), QStringLiteral("open_source"),
+  note.replace(QStringLiteral("open_cuda"), QStringLiteral("open_video"),
                Qt::CaseInsensitive);
   return note;
 }
@@ -1023,19 +1066,39 @@ VideoPage::VideoPage(QWidget *parent) : QWidget(parent) {
   runLayout->addLayout(ctlRow);
 
   auto *engineRow = new QHBoxLayout();
-  engineRow->addWidget(new QLabel("Backend:", runBox));
+  engineRow->addWidget(new QLabel("Effect preference:", runBox));
   engineCombo_ = new QComboBox(runBox);
   engineCombo_->addItem("Auto", "auto");
   engineCombo_->addItem("Maxine", "maxine");
-  engineCombo_->addItem("Open Source", "open_cuda");
+  engineCombo_->addItem("Open Video", "open_cuda");
   engineRow->addWidget(engineCombo_, 1);
   runLayout->addLayout(engineRow);
 
+  auto *computeRow = new QHBoxLayout();
+  computeRow->addWidget(new QLabel("Compute:", runBox));
+  computeBackendCombo_ = new QComboBox(runBox);
+  computeBackendCombo_->setObjectName(
+      QStringLiteral("videoComputeBackendCombo"));
+  computeBackendCombo_->addItem("Auto", "auto");
+  computeBackendCombo_->addItem("CPU", "cpu");
+  computeBackendCombo_->addItem("CUDA", "cuda");
+  computeBackendCombo_->addItem("Vulkan", "vulkan");
+  computeRow->addWidget(computeBackendCombo_, 1);
+  runLayout->addLayout(computeRow);
+
   auto *activeRow = new QHBoxLayout();
-  activeRow->addWidget(new QLabel("Active:", runBox));
+  activeRow->addWidget(new QLabel("Active effects:", runBox));
   effectEngineValue_ = ValueLabel("—", runBox);
   activeRow->addWidget(effectEngineValue_, 1);
   runLayout->addLayout(activeRow);
+
+  auto *computeActiveRow = new QHBoxLayout();
+  computeActiveRow->addWidget(new QLabel("Active compute:", runBox));
+  computeBackendValue_ = ValueLabel("—", runBox);
+  computeBackendValue_->setObjectName(
+      QStringLiteral("videoComputeBackendActiveValue"));
+  computeActiveRow->addWidget(computeBackendValue_, 1);
+  runLayout->addLayout(computeActiveRow);
 
   engineInfoBanner_ = new QLabel(runBox);
   engineInfoBanner_->setWordWrap(true);
@@ -1438,6 +1501,9 @@ VideoPage::VideoPage(QWidget *parent) : QWidget(parent) {
 
   connect(engineCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
           this, &VideoPage::OnEnginePreferenceChanged);
+  connect(computeBackendCombo_,
+          QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+          &VideoPage::OnComputeBackendChanged);
   connect(mirrorCheck_, &QCheckBox::toggled, this,
           &VideoPage::OnMirrorToggled);
 
@@ -1694,6 +1760,16 @@ bool VideoPage::SyncFromCachedDaemonStatus() {
     const int idx = engineCombo_->findData(v);
     engineCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     engineCombo_->blockSignals(false);
+  }
+
+  if (computeBackendCombo_) {
+    computeBackendCombo_->blockSignals(true);
+    const QString v =
+        st.compute_preference.isEmpty() ? QStringLiteral("auto")
+                                        : st.compute_preference;
+    const int idx = computeBackendCombo_->findData(v);
+    computeBackendCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+    computeBackendCombo_->blockSignals(false);
   }
 
   if (mirrorCheck_) {
@@ -2141,6 +2217,32 @@ bool VideoPage::SendDaemonVideoConfig() {
   return true;
 }
 
+bool VideoPage::SendDaemonComputeBackendPreference() {
+  if (!computeBackendCombo_)
+    return false;
+
+  const QString backend = computeBackendCombo_->currentData().toString();
+  std::ostringstream req;
+  req << "SET_VIDEO_CONFIG compute_backend=" << backend.toStdString();
+
+  QString err;
+  if (!DaemonRequest(req.str(), nullptr, &err)) {
+    if (statusText_) {
+      SetPlainTextPreservingScroll(
+          statusText_,
+          QStringLiteral("Compute backend save failed:\n%1").arg(err));
+    }
+    ShowError("Compute backend update failed",
+              QStringLiteral("Camera compute preference was not saved.\n\nOpen "
+                             "Support for technical details."));
+    emit StatusRefreshRequested();
+    return false;
+  }
+
+  emit StatusRefreshRequested();
+  return true;
+}
+
 bool VideoPage::SendDaemonVideoEffects() {
   if (effectsWriteDebounceTimer_ && effectsWriteDebounceTimer_->isActive())
     effectsWriteDebounceTimer_->stop();
@@ -2193,6 +2295,11 @@ bool VideoPage::SendDaemonEnabled(bool enabled) {
 void VideoPage::OnEnginePreferenceChanged(int /*index*/) {
   UpdateUiEnabled();
   (void)SendDaemonVideoEffects();
+}
+
+void VideoPage::OnComputeBackendChanged(int /*index*/) {
+  UpdateUiEnabled();
+  (void)SendDaemonComputeBackendPreference();
 }
 
 void VideoPage::OnMirrorToggled(bool checked) {
@@ -2320,7 +2427,7 @@ void VideoPage::OnOpenInstallHints() {
   QString title;
   QVector<QPair<QString, QString>> commands;
   if (pref == studiocast::video::effects::EffectsEnginePreference::open_cuda) {
-    title = "Open Source install hints";
+    title = "Open Video install hints";
     commands.push_back(
         {resolveProgram("studiocast-open"), QStringLiteral("studiocast-open")});
   } else if (pref ==
@@ -2781,6 +2888,9 @@ void VideoPage::UpdateUiEnabled() {
   if (engineCombo_) {
     engineCombo_->setEnabled(daemonReachable_);
   }
+  if (computeBackendCombo_) {
+    computeBackendCombo_->setEnabled(daemonReachable_);
+  }
   if (effectEngineValue_) {
     if (!daemonReachable_) {
       effectEngineValue_->setText("—");
@@ -2788,8 +2898,14 @@ void VideoPage::UpdateUiEnabled() {
     } else if (!enabled) {
       effectEngineValue_->setText(QStringLiteral("Off"));
       effectEngineValue_->setToolTip(QString());
+    } else if (!st.pipeline_running && st.pipeline_starting) {
+      effectEngineValue_->setText(QStringLiteral("Starting..."));
+      effectEngineValue_->setToolTip(QString());
+    } else if (!st.pipeline_running && st.pipeline_active_needed) {
+      effectEngineValue_->setText(QStringLiteral("Waiting for app"));
+      effectEngineValue_->setToolTip(st.pipeline_idle_reason);
     } else if (!st.pipeline_running) {
-      effectEngineValue_->setText(QStringLiteral("Starting…"));
+      effectEngineValue_->setText(QStringLiteral("Idle"));
       effectEngineValue_->setToolTip(QString());
     } else if (st.effects_backends.trimmed().isEmpty()) {
       effectEngineValue_->setText(QStringLiteral("Pass-through"));
@@ -2801,13 +2917,68 @@ void VideoPage::UpdateUiEnabled() {
       effectEngineValue_->setToolTip(raw);
     }
   }
+  if (computeBackendValue_) {
+    if (!daemonReachable_) {
+      computeBackendValue_->setText("—");
+      computeBackendValue_->setToolTip(QString());
+    } else if (!enabled) {
+      computeBackendValue_->setText(QStringLiteral("Off"));
+      computeBackendValue_->setToolTip(QString());
+    } else {
+      const QString active = st.compute_active_backend.trimmed();
+      const QString resolved = st.compute_resolved_backend.trimmed();
+      QString text;
+      if (!st.pipeline_running && st.pipeline_starting) {
+        text = QStringLiteral("Starting…");
+      } else if (active.isEmpty()) {
+        text = QStringLiteral("Inactive");
+      } else {
+        text = FriendlyComputeBackendLabel(active);
+      }
+      if (!resolved.isEmpty() && active != resolved) {
+        text += QStringLiteral(" — resolved %1")
+                    .arg(FriendlyComputeBackendLabel(resolved));
+      }
+      computeBackendValue_->setText(text);
+
+      QStringList detail;
+      detail << QStringLiteral("Preference: %1")
+                    .arg(st.compute_preference.isEmpty()
+                             ? QStringLiteral("auto")
+                             : st.compute_preference);
+      detail << QStringLiteral("Resolved: %1")
+                    .arg(resolved.isEmpty()
+                             ? QStringLiteral("None")
+                             : FriendlyComputeBackendLabel(resolved));
+      detail << QStringLiteral("Active: %1")
+                    .arg(active.isEmpty()
+                             ? QStringLiteral("None")
+                             : FriendlyComputeBackendLabel(active));
+      if (!st.compute_fallback_reason.isEmpty())
+        detail << st.compute_fallback_reason;
+      if (!st.compute_degraded_reason.isEmpty() &&
+          st.compute_degraded_reason != st.compute_fallback_reason)
+        detail << st.compute_degraded_reason;
+      computeBackendValue_->setToolTip(detail.join(QStringLiteral("\n")));
+    }
+  }
 
   if (engineInfoBanner_) {
     if (!daemonReachable_) {
       engineInfoBanner_->setVisible(false);
       engineInfoBanner_->setToolTip(QString());
     } else {
-      const QString full = SanitizeBackendNote(st.effects_note).trimmed();
+      QStringList notes;
+      QString computeNote = st.compute_degraded_reason.trimmed();
+      if (computeNote.isEmpty())
+        computeNote = st.compute_fallback_reason.trimmed();
+      if (!computeNote.trimmed().isEmpty())
+        notes << QStringLiteral("Compute degraded: %1")
+                     .arg(SanitizeBackendNote(computeNote));
+      const QString effectsNote = SanitizeBackendNote(st.effects_note).trimmed();
+      if (!effectsNote.isEmpty())
+        notes << effectsNote;
+      const QString full = notes.join(QStringLiteral("\n")).trimmed();
       const QString first = FirstLine(full);
       engineInfoBanner_->setVisible(!first.isEmpty());
       engineInfoBanner_->setText(first);
@@ -2895,7 +3066,7 @@ void VideoPage::UpdateUiEnabled() {
   if (openInstallHintsBtn_) {
     if (enginePref ==
         studiocast::video::effects::EffectsEnginePreference::open_cuda) {
-      openInstallHintsBtn_->setText("Open Source install hints");
+      openInstallHintsBtn_->setText("Open Video install hints");
     } else if (enginePref ==
                studiocast::video::effects::EffectsEnginePreference::maxine) {
       openInstallHintsBtn_->setText("Maxine install hints");
@@ -3953,6 +4124,27 @@ void VideoPage::UpdateStatusText() {
               ? std::string("rgb24")
               : st.output_format_requested.toStdString())
       << "\n";
+  oss << "  Compute:    preference="
+      << (st.compute_preference.isEmpty() ? std::string("auto")
+                                          : st.compute_preference.toStdString())
+      << ", resolved="
+      << (st.compute_resolved_backend.isEmpty()
+              ? std::string("cpu")
+              : st.compute_resolved_backend.toStdString())
+      << ", active="
+      << (st.compute_active_backend.isEmpty()
+              ? std::string("inactive")
+              : st.compute_active_backend.toStdString())
+      << "\n";
+  if (!st.compute_fallback_reason.isEmpty()) {
+    oss << "  fallback:   " << st.compute_fallback_reason.toStdString()
+        << "\n";
+  }
+  if (!st.compute_degraded_reason.isEmpty() &&
+      st.compute_degraded_reason != st.compute_fallback_reason) {
+    oss << "  degraded:   " << st.compute_degraded_reason.toStdString()
+        << "\n";
+  }
   if (st.effects_valid) {
     oss << "  mirror:     " << (st.effects.mirror ? "on" : "off") << "\n";
 

@@ -59,6 +59,8 @@ Known caveats:
 - A PulseAudio-compatible audio stack with `pactl` for virtual audio routing.
 - CMake, Ninja, Qt, and compiler dependencies for the current source-build flow.
 - Optional: NVIDIA driver/CUDA support for Open Video model backends.
+- Optional: Vulkan loader/runtime packages plus a compute-capable GPU driver/ICD
+  for Open Vulkan experiments.
 - Optional: user-installed NVIDIA Maxine SDK assets for Maxine effects.
 
 StudioCast does not ship NVIDIA Maxine SDK files or model binaries in git.
@@ -173,6 +175,9 @@ report which engines are available on the current machine.
 - Open Video / Open CUDA: ONNX Runtime with CUDA execution provider and
   user-installed model packs. See
   [docs/open_source_video_models_install.md](docs/open_source_video_models_install.md).
+- Open Vulkan: optional runtime-loaded Vulkan compute path. Build with
+  `-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON`; explicit Vulkan requests report
+  Vulkan fallback/degraded status instead of silently running CUDA.
 - Open Audio: ONNX Runtime and user-installed model packs for microphone effects.
   See [docs/open_source_audio_models_install.md](docs/open_source_audio_models_install.md).
 - NVIDIA Maxine: optional user-installed NVIDIA SDKs and feature packs. See

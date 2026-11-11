@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "core/onnx/ort_session.h"
+
 namespace studiocast::open_audio {
 
 // Best-effort ONNX Runtime runtime information.
@@ -72,6 +74,7 @@ struct OrtSessionInfo {
 // loaded by ORT and to expose basic introspection for diagnostics/tools.
 class OpenAudioOrtSession {
 public:
+  using PreparedRunStats = studiocast::onnx::OrtSession::PreparedRunStats;
   static OrtRuntimeInfo QueryRuntimeInfo();
 
   // Create an ORT session for the given model.
@@ -91,21 +94,8 @@ public:
   // Pre-size reusable run scratch buffers during setup.
   void ReserveRunScratch(std::size_t input_count, std::size_t output_count);
 
-  struct OrtRunInput {
-    const char *name = nullptr;
-    const float *data = nullptr;
-    std::size_t num_floats = 0;
-    const int64_t *shape = nullptr;
-    std::size_t shape_rank = 0;
-  };
-
-  struct OrtRunOutput {
-    const char *name = nullptr;
-    float *data = nullptr;
-    std::size_t num_floats = 0;
-    const int64_t *shape = nullptr;
-    std::size_t shape_rank = 0;
-  };
+  using OrtRunInput = studiocast::onnx::OrtSession::RunInput;
+  using OrtRunOutput = studiocast::onnx::OrtSession::RunOutput;
 
   // Run an ORT session with pre-allocated input/output tensors.
   //
@@ -114,6 +104,16 @@ public:
   bool Run(const OrtRunInput *inputs, std::size_t input_count,
            const OrtRunOutput *outputs, std::size_t output_count,
            std::string *error);
+
+  // Prepared streaming run. Slot 0/1 correspond to the two bounded recurrent
+  // state ping-pong buffer sets. Caller-owned names, shapes, and buffers must
+  // remain valid until InvalidatePreparedBindings() or session destruction.
+  bool RunPrepared(std::size_t binding_slot, const OrtRunInput *inputs,
+                   std::size_t input_count, const OrtRunOutput *outputs,
+                   std::size_t output_count, std::string *error);
+
+  void InvalidatePreparedBindings();
+  PreparedRunStats prepared_run_stats() const;
 
   // Convenience helper for waveform-style models with a single float tensor
   // input/output. The first input and first output of the underlying ORT
