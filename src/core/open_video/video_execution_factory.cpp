@@ -13,6 +13,7 @@ constexpr auto kProvider =
     hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
 constexpr auto kNativeProvider =
     hal::SemanticEffectProviderId::open_cuda_production_kernels;
+constexpr std::size_t kMaxCanonicalCudaStageCount = 7;
 
 void SetReason(hal::ReasonId *reason, hal::ReasonId value) noexcept {
   if (reason != nullptr)
@@ -1980,7 +1981,11 @@ OpenCudaVideoExecutionFactory::Prepare(
     evidence->candidate_resources_rolled_back = true;
     return nullptr;
   }
-  if (plan.route != video::VideoExecutionRoute::prepared_resident ||
+  // Reject forged counts before setup callbacks and readiness-mask creation.
+  // Canonical CUDA programs contain at most one stage in each of seven slots.
+  if (plan.prepared_program.stage_count == 0 ||
+      plan.prepared_program.stage_count > kMaxCanonicalCudaStageCount ||
+      plan.route != video::VideoExecutionRoute::prepared_resident ||
       plan.prepared_program.requested_backend != hal::BackendId::cuda ||
       plan.prepared_program.requested_provider !=
           impl_->config.cached.readiness.provider ||
