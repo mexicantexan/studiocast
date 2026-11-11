@@ -1,5 +1,4 @@
 #include "core/hal/prepared_program.h"
-#include "core/hal/domain_planner.h"
 
 #include <atomic>
 #include <cstdlib>
