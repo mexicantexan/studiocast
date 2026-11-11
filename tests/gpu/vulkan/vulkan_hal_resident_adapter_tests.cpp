@@ -479,6 +479,43 @@ bool TestPreparedExecutionAndCommittedAttribution() {
   return ok;
 }
 
+bool TestMetadataAllowancesFailBeforeNativePrepare() {
+  FakeQualifiedExecutor executor;
+  VulkanHalResidentAdapter adapter(kAdapterId, executor);
+  const auto valid = Program(199);
+  if (!Require(adapter.SetProgramOptions(Options(valid)),
+               "valid options must bind before metadata rejection"))
+    return false;
+  bool ok = true;
+  for (std::uint32_t mask = 1; mask <= 3; ++mask) {
+    auto program = valid;
+    program.maximum_metadata_readbacks_per_frame = mask & 1u;
+    program.maximum_metadata_cpu_tails_per_frame = (mask >> 1u) & 1u;
+    PreparedProgramHandle handle;
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &= Require(studiocast::hal::ValidatePreparedProgram(program, &reason),
+                  "forged metadata allowance is otherwise a valid contract");
+    ok &= Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                          StatusId::blocked &&
+                      reason == ReasonId::transfer_contract_violated &&
+                      handle.handle_id == 0 && !readiness.available &&
+                      executor.capability_calls == 0 &&
+                      executor.prepare_calls == 0,
+                  "Vulkan must reject metadata allowances before native work");
+    adapter.DestroyPrepared(&handle);
+  }
+  PreparedProgramHandle handle;
+  ReadinessSnapshot readiness;
+  ReasonId reason = ReasonId::none;
+  ok &= Require(adapter.Prepare(valid, &handle, &readiness, &reason) ==
+                        StatusId::ready &&
+                    executor.prepare_calls == 1,
+                "zero metadata allowances must preserve Vulkan preparation");
+  adapter.DestroyPrepared(&handle);
+  return ok;
+}
+
 bool TestCapabilityAndSemanticGates() {
   bool ok = true;
   {
@@ -1301,6 +1338,7 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
 int main() {
   bool ok = true;
   ok &= TestPreparedExecutionAndCommittedAttribution();
+  ok &= TestMetadataAllowancesFailBeforeNativePrepare();
   ok &= TestCapabilityAndSemanticGates();
   ok &= TestOptionalAndRequiredFailure();
   ok &= TestNeutralBindingAdversarialValidation();

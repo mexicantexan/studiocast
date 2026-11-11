@@ -848,6 +848,12 @@ MaxineVideoExecutionFactory::Prepare(
         true);
   }
 
+  if (plan.prepared_program.maximum_metadata_readbacks_per_frame != 0 ||
+      plan.prepared_program.maximum_metadata_cpu_tails_per_frame != 0) {
+    return Fail(hal::StatusId::blocked,
+                hal::ReasonId::transfer_contract_violated, true);
+  }
+
   try {
     video::PreparedMaxineHardwareRequest owner_request;
     hal::ReasonId reason = hal::ReasonId::none;

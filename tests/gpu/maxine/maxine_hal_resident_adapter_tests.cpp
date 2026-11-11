@@ -542,6 +542,35 @@ bool OptionalFailurePreservesCurrentAndRequiredFailureStops() {
   return true;
 }
 
+bool MetadataAllowancesFailBeforeNativePrepare() {
+  FakeResidentFrameExecutor executor{};
+  HooksFixture hooks{};
+  MaxineHalResidentAdapter adapter(Configuration(), executor,
+                                   hooks.Hooks(executor));
+  for (std::uint32_t mask = 1; mask <= 3; ++mask) {
+    auto program = Program();
+    program.maximum_metadata_readbacks_per_frame = mask & 1u;
+    program.maximum_metadata_cpu_tails_per_frame = (mask >> 1u) & 1u;
+    hal::PreparedProgramHandle handle{};
+    hal::ReadinessSnapshot readiness{};
+    hal::ReasonId reason = hal::ReasonId::none;
+    CHECK(hal::ValidatePreparedProgram(program, &reason));
+    CHECK(adapter.Prepare(program, &handle, &readiness, &reason) ==
+          hal::StatusId::blocked);
+    CHECK(reason == hal::ReasonId::transfer_contract_violated);
+    CHECK(handle.handle_id == 0);
+    CHECK(executor.calls().prepare == 0);
+  }
+  hal::PreparedProgramHandle handle{};
+  hal::ReadinessSnapshot readiness{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  CHECK(adapter.Prepare(Program(), &handle, &readiness, &reason) ==
+        hal::StatusId::ready);
+  CHECK(executor.calls().prepare == 1);
+  adapter.DestroyPrepared(&handle);
+  return true;
+}
+
 bool StrictBackendProviderDomainAndGenerationReject() {
   FakeResidentFrameExecutor executor{};
   HooksFixture hooks{};
@@ -1333,6 +1362,7 @@ int main() {
       NonStrictFallbackIsDegradedUntilCommitted,
       CpuTailIsExplicitAndMeasured,
       OptionalFailurePreservesCurrentAndRequiredFailureStops,
+      MetadataAllowancesFailBeforeNativePrepare,
       StrictBackendProviderDomainAndGenerationReject,
       ResourceExhaustionMalformedBindingAndOldPlanRetention,
       TemporalResetDeviceLossAndShutdownAreTyped,

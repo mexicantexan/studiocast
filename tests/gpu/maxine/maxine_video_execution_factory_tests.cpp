@@ -442,6 +442,29 @@ bool ExactPreflightAndMalformedForeignGenerationRejection() {
   return true;
 }
 
+bool ForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare() {
+  Fixture fixture;
+  CHECK(fixture.Prepare());
+  const auto valid = fixture.coordinator.Snapshot().plan;
+  const auto prepare_calls = fixture.resident.prepare_calls;
+  for (std::uint32_t mask = 1; mask <= 3; ++mask) {
+    auto forged = valid;
+    forged.prepared_program.maximum_metadata_readbacks_per_frame = mask & 1u;
+    forged.prepared_program.maximum_metadata_cpu_tails_per_frame =
+        (mask >> 1u) & 1u;
+    video::VideoAdapterPrepareEvidence evidence;
+    CHECK(!fixture.factory.Prepare(forged, &evidence));
+    CHECK(evidence.status == hal::StatusId::blocked);
+    CHECK(evidence.reason == hal::ReasonId::transfer_contract_violated);
+    CHECK(evidence.candidate_resources_rolled_back);
+    CHECK(fixture.resident.prepare_calls == prepare_calls);
+  }
+  video::VideoAdapterPrepareEvidence evidence;
+  CHECK(fixture.factory.Prepare(valid, &evidence));
+  CHECK(fixture.resident.prepare_calls == prepare_calls + 1);
+  return true;
+}
+
 bool TransfersCpuTailWriterAttributionAndAllocationFreeExecute() {
   Fixture fixture;
   CHECK(fixture.Prepare());
@@ -598,6 +621,7 @@ void operator delete[](void *memory, std::size_t) noexcept {
 
 int main() {
   if (!ExactPreflightAndMalformedForeignGenerationRejection() ||
+      !ForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare() ||
       !TransfersCpuTailWriterAttributionAndAllocationFreeExecute() ||
       !OptionalFailOpenWrongGenerationDeviceLossAndShutdown() ||
       !TemporalDiscontinuityQuarantinesUntilSetupReprepare()) {

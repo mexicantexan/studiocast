@@ -577,6 +577,35 @@ bool TestUnsupportedAndForeignPreflight() {
   return ok;
 }
 
+bool TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare() {
+  Fixture fixture;
+  if (!fixture.Initialize() || !fixture.Prepare(Request()))
+    return false;
+  const auto valid = fixture.coordinator.Snapshot().plan;
+  const auto prepare_calls = fixture.adapter.prepare_calls;
+  bool ok = true;
+  for (std::uint32_t mask = 1; mask <= 3; ++mask) {
+    auto forged = valid;
+    forged.prepared_program.maximum_metadata_readbacks_per_frame = mask & 1u;
+    forged.prepared_program.maximum_metadata_cpu_tails_per_frame =
+        (mask >> 1u) & 1u;
+    video::VideoAdapterPrepareEvidence evidence;
+    ok &= Require(!fixture.factory.Prepare(forged, &evidence) &&
+                      evidence.status == hal::StatusId::blocked &&
+                      evidence.reason ==
+                          hal::ReasonId::transfer_contract_violated &&
+                      evidence.candidate_resources_rolled_back &&
+                      fixture.adapter.prepare_calls == prepare_calls,
+                  "Vulkan factory must reject forged metadata allowances "
+                  "before invoking its adapter");
+  }
+  video::VideoAdapterPrepareEvidence evidence;
+  ok &= Require(fixture.factory.Prepare(valid, &evidence) != nullptr &&
+                    fixture.adapter.prepare_calls == prepare_calls + 1,
+                "zero metadata allowances must preserve factory preparation");
+  return ok;
+}
+
 bool TestFailureAndLifecycle() {
   bool ok = true;
   {
@@ -853,6 +882,7 @@ int main() {
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
   ok &= TestUnsupportedAndForeignPreflight();
+  ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();
   ok &= TestExecutorShutdownDoesNotOwnSharedAdapter();
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
