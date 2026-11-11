@@ -130,6 +130,7 @@ publication and catalog task is recorded separately below.
 | `probe_selftest_repair` / `codex/probe-native-cleanup-20261111`, completed by root | `f64a00d` Vulkan shutdown retains context until guard destruction; friend-only unique/shared-owner regression fixture | `2623b88` |
 | `model_disposition` / `codex/fastdvdnet-promotion-20261111` | `337f3d8` independent idempotent full-license exporter repair only | `b204b0a`; old proposal was not accepted; resumed promotion is recorded below |
 | `model_disposition` / `codex/fastdvdnet-promotion-final-20261111` | `cf68618` verified published sigma15 catalog/template/fixture promotion | `d7f7f5d`; resumed publication and validation below |
+| `qualification_docs` / `codex/fastdvdnet-publication-docs-20261111` | `f401b84` reconcile publication, catalog, and qualification evidence | `aac9b88` |
 | `model_disposition` / `codex/fastdvdnet-candidate-source-20261111` | `6ea5537` bind generated candidate catalogs to their own exported files | `fafc58b`; active published source paths and payload bytes unchanged |
 | Root integration | `8d4393c` Python test registration; `1060a6f` integration assertions follow shared setup and preserve valid bindings after forged requests; `211da52` changed-line formatting | Direct local commits |
 
@@ -280,8 +281,18 @@ with inference mocked; it fails before the fix and passes after it. A fresh
 pinned real export passed the full graph check and all nine CPU cases and
 reproduced the exact three published payloads. Candidate local-source and
 offline-cache transactions passed in temporary roots. Root reran seven exporter
-and 19 model tests after integration. Fresh final critique of this remediation
-remains pending at this documentation checkpoint.
+and 19 model tests after integration. Fresh `fastdvdnet_final_acceptance`
+independently reviewed integrated `b42c199` and approved the resumed scope with
+no unresolved findings. It verified the graph and payload hashes, candidate
+local-source and offline-cache transactions, legacy ownership rejection and byte
+preservation, unchanged remaining packs/defaults, and documentation boundaries;
+its seven exporter, 19 model, nine packaging, and 40-file documentation checks
+passed.
+
+Root's final optional-backend-off CTest suite at `b42c199` passed all 75 executed
+tests, with five explicit hardware/model opt-in skips and zero failures among
+80 registered tests (83.27 seconds). The log is
+`/tmp/studiocast-fastdvdnet-final-full-ctest-20261111.log`.
 
 The integrated installer completed an online HTTPS transaction from immutable
 `8ffe9688`, then an offline verified-cache transaction, in temporary destinations
