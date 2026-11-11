@@ -241,6 +241,12 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   }
   std::optional<ModelPack> discovered;
   const ModelPack *pack = setup.selected_pack;
+  if (pack && (pack->task != "face_detection" ||
+               (!setup.requested_model_id.empty() && pack->id != setup.requested_model_id))) {
+    if (error) *error = "selected face_detection pack does not match requested task and model ID";
+    if (status_out) *status_out = PreparedCudaYunetStatus::model_invalid;
+    return false;
+  }
   if (!pack) {
     auto registry = setup.models_root.empty()
                         ? ModelPackRegistry::ScanDefault()
