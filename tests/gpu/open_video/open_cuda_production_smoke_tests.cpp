@@ -309,7 +309,10 @@ int Run(const Options &options) {
   std::cout
       << "setup status=" << static_cast<unsigned>(status)
       << " reason=" << static_cast<unsigned>(reason)
-      << " elapsed_ns=" << setup_ns << " requested="
+      << " elapsed_ns=" << setup_ns
+      << " wait_timeout_ns=" << resident.wait.timeout_nanoseconds
+      << " wait_maximum_polls=" << resident.wait.maximum_poll_count
+      << " requested="
       << static_cast<unsigned>(setup.readiness.requested_backend)
       << " selected=" << static_cast<unsigned>(setup.readiness.selected_backend)
       << " provider=" << static_cast<unsigned>(setup.readiness.provider)
