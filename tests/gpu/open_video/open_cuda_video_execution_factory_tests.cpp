@@ -653,6 +653,26 @@ bool ExactPreflightAndMalformedRejection() {
   video::VideoAdapterFactoryPreflight preflight;
   REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
   REQUIRE(preflight.status == hal::StatusId::ready);
+  for (const std::size_t count : {hal::kMaxPreparedStages, std::size_t{0},
+                                  hal::kMaxPreparedStages + 1}) {
+    auto forged = plan;
+    auto forged_config = FactoryConfig(&context, request);
+    forged.prepared_program.stage_count = count;
+    forged_config.cached.stage_count = count;
+    for (std::size_t index = 0; index < hal::kMaxPreparedStages; ++index) {
+      forged.prepared_program.stages[index] = plan.prepared_program.stages[0];
+      forged.prepared_program.stages[index].stage_id =
+          static_cast<std::uint32_t>(11 + index);
+      forged_config.cached.models[index] = request.intent.stages[0].model;
+    }
+    open_cuda::OpenCudaVideoExecutionFactory forged_factory(forged_config);
+    video::VideoAdapterPrepareEvidence evidence;
+    const auto prepare_calls = context.prepare_calls;
+    REQUIRE(!forged_factory.Prepare(forged, &evidence));
+    REQUIRE(evidence.status == hal::StatusId::blocked);
+    REQUIRE(evidence.reason == hal::ReasonId::malformed_contract);
+    REQUIRE(context.prepare_calls == prepare_calls);
+  }
   REQUIRE(preflight.cached_evidence_only);
   REQUIRE(preflight.accepts_frozen_resolution);
   REQUIRE(!preflight.performs_selection);
