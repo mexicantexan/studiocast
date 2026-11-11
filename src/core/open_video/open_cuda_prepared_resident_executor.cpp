@@ -1638,10 +1638,13 @@ public:
       stage_result.semantic = stage.semantic;
       const bool disabled = (disabled_mask & (std::uint32_t{1} << index)) != 0;
       const auto stage_index = static_cast<std::uint32_t>(index);
-      const bool deferred_vignette =
-          !disabled && (stage.semantic == SemanticEffectId::vignette ||
-                        stage.semantic == SemanticEffectId::mirror);
-      if (!deferred_vignette) {
+      // Final effects, including disabled slots, are timed after final resize
+      // in canonical order. Recording a disabled mirror here would precede an
+      // enabled vignette's timing slot.
+      const bool deferred_final =
+          stage.semantic == SemanticEffectId::vignette ||
+          stage.semantic == SemanticEffectId::mirror;
+      if (!deferred_final) {
         const auto stage_begin = slot->transfer.RecordStageBegin(
             slot->transfer_binding, stage_index);
         if (!stage_begin.ok())
@@ -1788,7 +1791,7 @@ public:
         result.stage_failure_reason = stage_result.reason;
         result.failed_operation = failed_operation;
       }
-      if (!deferred_vignette) {
+      if (!deferred_final) {
         const auto stage_end =
             slot->transfer.RecordStageEnd(slot->transfer_binding, stage_index);
         if (!stage_end.ok())
@@ -1819,9 +1822,7 @@ public:
       if (slot->program.stages[i].semantic == SemanticEffectId::mirror)
         mirror_index = i;
     }
-    if (vignette_index < slot->program.stage_count &&
-        (disabled_mask & (std::uint32_t{1} << vignette_index)) == 0 &&
-        !required_failed) {
+    if (vignette_index < slot->program.stage_count) {
       std::string vignette_error;
       const auto vignette_begin = slot->transfer.RecordStageBegin(
           slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
@@ -1829,30 +1830,34 @@ public:
         return finish(
             TransferFailure(slot, vignette_begin.status, result.transfers,
                             PreparedOpenCudaOperationId::completion_wait));
-      const float intensity = std::clamp(
-          static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f,
-          1.0f);
-      if (!cuda::kernels::LaunchVignettePrepared(
-              slot->vignette, *readback_source, *readback_source, intensity,
-              static_cast<float>(readback_source->w) * slot->tracked_center_x,
-              static_cast<float>(readback_source->h) * slot->tracked_center_y,
-              &vignette_error)) {
-        auto &stage_result = result.stages[vignette_index];
-        stage_result.reason = ReasonId::optional_stage_failed_open;
-        result.stage_failure_status = RuntimeStatus::postprocess_failed;
-        result.stage_failure_reason = stage_result.reason;
-        result.failed_operation = PreparedOpenCudaOperationId::vignette;
-        if (slot->program.stages[vignette_index].required) {
-          stage_result.status = StageExecutionStatus::required_failed;
-          stage_result.valid_output_preserved = false;
-          required_failed = true;
+      if ((disabled_mask & (std::uint32_t{1} << vignette_index)) == 0 &&
+          !required_failed) {
+        const float intensity = std::clamp(
+            static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f,
+            1.0f);
+        if (!cuda::kernels::LaunchVignettePrepared(
+                slot->vignette, *readback_source, *readback_source, intensity,
+                static_cast<float>(readback_source->w) * slot->tracked_center_x,
+                static_cast<float>(readback_source->h) * slot->tracked_center_y,
+                &vignette_error)) {
+          auto &stage_result = result.stages[vignette_index];
+          stage_result.reason = ReasonId::optional_stage_failed_open;
+          result.stage_failure_status = RuntimeStatus::postprocess_failed;
+          result.stage_failure_reason = stage_result.reason;
+          result.failed_operation = PreparedOpenCudaOperationId::vignette;
+          if (slot->program.stages[vignette_index].required) {
+            stage_result.status = StageExecutionStatus::required_failed;
+            stage_result.valid_output_preserved = false;
+            required_failed = true;
+          } else {
+            stage_result.status = StageExecutionStatus::optional_failed_open;
+            stage_result.valid_output_preserved = true;
+            optional_failed = true;
+          }
         } else {
-          stage_result.status = StageExecutionStatus::optional_failed_open;
-          stage_result.valid_output_preserved = true;
-          optional_failed = true;
+          result.stages[vignette_index].status =
+              StageExecutionStatus::succeeded;
         }
-      } else {
-        result.stages[vignette_index].status = StageExecutionStatus::succeeded;
       }
       const auto vignette_end = slot->transfer.RecordStageEnd(
           slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
@@ -1861,30 +1866,31 @@ public:
             TransferFailure(slot, vignette_end.status, result.transfers,
                             PreparedOpenCudaOperationId::completion_wait));
     }
-    if (mirror_index < slot->program.stage_count &&
-        (disabled_mask & (std::uint32_t{1} << mirror_index)) == 0 &&
-        !required_failed) {
+    if (mirror_index < slot->program.stage_count) {
       const auto mirror_begin = slot->transfer.RecordStageBegin(
           slot->transfer_binding, static_cast<std::uint32_t>(mirror_index));
       if (!mirror_begin.ok())
         return finish(
             TransferFailure(slot, mirror_begin.status, result.transfers,
                             PreparedOpenCudaOperationId::completion_wait));
-      std::string error;
-      auto &mirrored = result.stages[mirror_index];
-      if (!cuda::kernels::LaunchMirrorPrepared(slot->mirror, *readback_source,
-                                               slot->mirror_output, &error)) {
-        mirrored.status = slot->program.stages[mirror_index].required
-                              ? StageExecutionStatus::required_failed
-                              : StageExecutionStatus::optional_failed_open;
-        mirrored.reason = ReasonId::optional_stage_failed_open;
-        mirrored.valid_output_preserved =
-            !slot->program.stages[mirror_index].required;
-        required_failed |= slot->program.stages[mirror_index].required;
-        optional_failed |= !slot->program.stages[mirror_index].required;
-      } else {
-        readback_source = &slot->mirror_output;
-        mirrored.status = StageExecutionStatus::succeeded;
+      if ((disabled_mask & (std::uint32_t{1} << mirror_index)) == 0 &&
+          !required_failed) {
+        std::string error;
+        auto &mirrored = result.stages[mirror_index];
+        if (!cuda::kernels::LaunchMirrorPrepared(slot->mirror, *readback_source,
+                                                 slot->mirror_output, &error)) {
+          mirrored.status = slot->program.stages[mirror_index].required
+                                ? StageExecutionStatus::required_failed
+                                : StageExecutionStatus::optional_failed_open;
+          mirrored.reason = ReasonId::optional_stage_failed_open;
+          mirrored.valid_output_preserved =
+              !slot->program.stages[mirror_index].required;
+          required_failed |= slot->program.stages[mirror_index].required;
+          optional_failed |= !slot->program.stages[mirror_index].required;
+        } else {
+          readback_source = &slot->mirror_output;
+          mirrored.status = StageExecutionStatus::succeeded;
+        }
       }
       const auto mirror_end = slot->transfer.RecordStageEnd(
           slot->transfer_binding, static_cast<std::uint32_t>(mirror_index));
@@ -1923,12 +1929,17 @@ public:
     }
 
     for (std::size_t index = 0; index < result.stage_count; ++index) {
-      result.stages[index].elapsed_ns =
-          slot->transfer.stage_elapsed_nanoseconds(
-              static_cast<std::uint32_t>(index));
+      // No-op slots satisfy stream timing order without attributing execution
+      // time to disabled effects or effects suppressed by a required failure.
+      if (result.stages[index].status !=
+              StageExecutionStatus::disabled_preserved &&
+          result.stages[index].status != StageExecutionStatus::not_run)
+        result.stages[index].elapsed_ns =
+            slot->transfer.stage_elapsed_nanoseconds(
+                static_cast<std::uint32_t>(index));
     }
 
-    result.stage_elapsed_ns = slot->transfer.stage_elapsed_nanoseconds(0);
+    result.stage_elapsed_ns = result.stages[0].elapsed_ns;
     const bool analysis_completed =
         analysis_ran && analysis_status != RuntimeStatus::cancelled &&
         analysis_status != RuntimeStatus::stop_requested;
