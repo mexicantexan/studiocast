@@ -651,22 +651,25 @@ through an explicitly authorized model transaction before relying on that
 installed pack. Tests use current repository metadata in isolated HOME/XDG
 roots and must never rewrite the user's installed pack as validation.
 
-FastDVDnet repair/re-export is approved while preserving `fastdvdnet_sigma15`
-and the seven-pack/eight-artifact defaults. The reproducible self-contained
-candidate is 9,948,304 bytes, SHA-256
+The repaired `fastdvdnet_sigma15` is published and promoted in local catalog
+version `2026-11-11`: 9,948,304 bytes, SHA-256
 `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
-The currently shipped catalog still references the old published artifact,
-which fails graph validation despite matching its hash and size. The offline
-exporter reproduces the artifact and metadata/license byte-for-byte, including
-idempotent full upstream license composition. Three-file publication and local
-catalog update are authorized but blocked on normal authenticated Hugging Face
-write access; HTTP 401 and the logged-out browser prevented publication. The
-staged catalog proposal remains unaccepted, and the active catalog still uses
-version `2026-07-19` (131,224,287 bytes). No corrected default has shipped.
-Publication verification, reviewed catalog integration, ownership-safe install,
-and the normal signed clean-HEAD release chain remain outstanding. No installed pack was replaced.
-See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for reproducibility
-and promotion requirements.
+The model ID, default selection, and seven-pack/eight-artifact contract are
+unchanged; total catalog artifact size is 140,755,803 bytes. The artifact,
+`model.json`, and full license match the approved reproducible export and the
+remotely verified bytes at
+[Hugging Face commit 8ffe9688](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044).
+Prior source paths were preserved. The initial authentication failure is
+resolved; it is no longer a publication blocker.
+
+Publication and local catalog promotion do not install a model or publish a
+signed StudioCast release. Existing unmarked packs with old metadata remain
+preserved with `curated_ownership_unverified`; do not promise automatic repair
+or weaken ownership checks. Sigma25/sigma50 remain untouched noncatalog BYO
+templates. The normal signed clean-HEAD source/AppImage chain and recorded
+camera, quality, latency, vendor, and sanitizer qualification limits still
+apply. See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for the exact
+catalog and transaction contract.
 
 The daemon persists Vulkan adapter intent as `video.vulkan.device` and
 `video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection

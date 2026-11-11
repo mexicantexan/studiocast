@@ -183,7 +183,7 @@ do not by themselves satisfy the family gate in
 | Integrated regression and critique | Both final Debug builds passed; enabled CTest 87 total / 81 executed / six skips / zero failures (108.12 s); disabled 80 / 75 / five / zero (95.90 s). Disabled probe also exited 0. Fresh independent critique approved runtime source `b204b0a` and docs `81a8989` / `e619d93` with no unresolved Blocker/Critical/High; six exporter tests, four workflow tests, and the lifetime binary also passed independently | Approval is bounded to local implementation and the recorded evidence. Explicit opt-in skips are not native qualification; publication and release gates remain separate |
 | Sanitizer diagnostic | Full ASan hermetic lifecycle fixture passed with leak checks. Native helper no longer reports the use-after-free, but exits 1 with LeakSanitizer reporting 12,080 bytes in 81 allocations in unloaded/unknown modules and a child-symbolizer `LD_PRELOAD` issue | No clean full-native-sanitizer claim and no source/driver attribution for these remaining diagnostics without causal evidence |
 | Required hardware CI | `d994679` enforces sixteen CUDA topologies with dlib, exact preinstalled model IDs, and a replacement image, plus required per-vendor Vulkan final execution | Local command execution is distinct from remote CI execution; automatic host mirror still needs camera-level evidence |
-| Model publication and release | Three-file FastDVDnet publication and local catalog update are authorized, but publication is authentication-blocked (HTTP 401 / no active login); no remote files, active catalog/templates, or installed packs changed | The staged promotion proposal is unaccepted; catalog promotion, family/claimed vendor qualification, and signed clean-HEAD release remain gates |
+| Model publication and release | Three approved FastDVDnet files were published and remote bytes verified at Hugging Face `8ffe968884e31ded74f857a2d0dca19f571ba044`; local catalog `2026-11-11` promotes the 9,948,304-byte sigma15 artifact, total 140,755,803 bytes; installed packs unchanged | Model ID/defaults remain seven packs/eight artifacts. Ownership-safe installation, family/claimed vendor qualification, and signed clean-HEAD release remain separate gates |
 
 The vignette stage and resident alpha-capacity correction were integrated at
 `0adc8ac`. Strict CUDA MODNet uses setup-time specialization of free dimensions.
@@ -194,13 +194,14 @@ The installed YuNet metadata was stale (320x320 for the pinned 640x640 graph);
 the repository template is already 640x640. Tests use current metadata in an
 isolated root; validation does not repair an installed pack implicitly.
 
-The approved FastDVDnet decision is repair/re-export with the existing model
-ID and defaults. A self-contained corrected candidate and reproducibility
-results exist, while the shipped catalog retains the old published identity
-and its graph-validation failure. Authorized publication remains blocked on
-authentication. Catalog promotion,
-required qualification, and the signed clean-HEAD release chain remain
-separate gates; installed packs are untouched. See
+FastDVDnet repair preserves the existing model ID and defaults. The exact
+reproducible artifact, metadata, and full license are published at
+[Hugging Face commit 8ffe9688](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044)
+and promoted in local catalog `2026-11-11`; the prior invalid catalog identity
+is superseded. Runtime source and the tested artifact hash remain unchanged,
+so the recorded `b204b0a` native evidence still names that same artifact. No
+installed pack was changed. Catalog promotion is distinct from the signed
+clean-HEAD release chain and full family qualification. See
 [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
 
 The camera pipeline uses one `ProductionVideoBackendManager` backed by typed

@@ -110,7 +110,8 @@ attribution only after the writer commits.
 
 All accepted changes below are integrated locally. Topic branches are retained
 for traceability; no Git push, remote PR, release, or user-installed-model
-transaction was performed. Authorized publication attempts did not upload files.
+transaction was performed during the runtime implementation. The resumed
+publication and catalog task is recorded separately below.
 
 | Agent / topic branch | Accepted commits | Integration |
 | --- | --- | --- |
@@ -127,7 +128,8 @@ transaction was performed. Authorized publication attempts did not upload files.
 | `cuda_factory_owner` / `codex/unsubmitted-frame-retirement-20261110` | `e73a8c6` exact unsubmitted discard through every CUDA layer; `da61119` explicit matte-coordinate conversions | `7810477` |
 | `cuda_production_integration` / `codex/disabled-stage-timing-20261111` | `9e41f5c` canonical final timing slots, zero disabled/unrun duration, native-body regression fixture | `2e70c1b` |
 | `probe_selftest_repair` / `codex/probe-native-cleanup-20261111`, completed by root | `f64a00d` Vulkan shutdown retains context until guard destruction; friend-only unique/shared-owner regression fixture | `2623b88` |
-| `model_disposition` / `codex/fastdvdnet-promotion-20261111` | `337f3d8` independent idempotent full-license exporter repair only | `b204b0a`; staged catalog/publication proposal remains unaccepted |
+| `model_disposition` / `codex/fastdvdnet-promotion-20261111` | `337f3d8` independent idempotent full-license exporter repair only | `b204b0a`; old proposal was not accepted; resumed promotion is recorded below |
+| `model_disposition` / `codex/fastdvdnet-promotion-final-20261111` | `cf68618` verified published sigma15 catalog/template/fixture promotion | `d7f7f5d`; resumed publication and validation below |
 | Root integration | `8d4393c` Python test registration; `1060a6f` integration assertions follow shared setup and preserve valid bindings after forged requests; `211da52` changed-line formatting | Direct local commits |
 
 ### Critique and remediation
@@ -225,33 +227,62 @@ generated no-face input, an isolated model root, and an in-memory writer.
 They do not qualify real camera/V4L2 transport, real-face correction, visual
 quality, optimized latency, AMD/Intel, remote CI, or signed release.
 
-### Authorized publication blocked on authentication
+### Resumed publication and local catalog promotion
 
-The user authorized the three corrected sigma15 files on Hugging Face and the
-local catalog update. Preupload returned HTTP 401; the browser required login.
-No working authentication is available; the user reported no credential
-available. Approval persists. No remote files were published, and the
-active catalog/templates and installed packs are unchanged. The active catalog
-is still `2026-07-19`, 131,224,287 total bytes, with the known-invalid
-416,788-byte sigma15 artifact.
+The resumed task starts from clean local baseline
+`cef868c3cb9e288e9ccfd97b7e71af8050790294`. Runtime source remains the tested
+`b204b0a`; this task changes catalog metadata, templates, fixture pins, and
+documentation. The initial HTTP 401/login blocker was resolved when the user
+configured normal secure Hugging Face authentication.
 
-The separate eight-file promotion proposal at
-`/tmp/studiocast-fastdvdnet-promotion-20261111` is staged and unaccepted. Its
-`2026-11-11` / 140,755,803-byte catalog is proposed only. Proposal checks passed
-19 model, 52 backend, nine packaging, and one GUI test; real corrected-artifact
-local-source/offline transactions used temporary roots only. The independent
-exporter/license fix was accepted at `b204b0a`; six exporter tests and a fresh
-full-graph/nine-case CPU export reproduced all three candidate files exactly.
-Sigma25/50 BYO templates remain untouched and are not curated defaults.
+Root published exactly the three approved corrected sigma15 files and
+verified their remote bytes at
+[Hugging Face commit 8ffe968884e31ded74f857a2d0dca19f571ba044](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044),
+whose parent is `944316407869cb72fc7e05ae86898c8738d21c1c`. Existing source
+paths were preserved. The publication helper exited 0 and receipt status is
+`published_remote_bytes_verified` in
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/publication-receipt.json`.
 
-Resume files in
-`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/` are
-`publication-plan.json`, `promotion-proposal.patch`,
-`promotion-handoff-20261111.json`, and `publish_verified_fastdvdnet.py`.
-Normal secure Hugging Face login/write access is required; credentials belong
-outside chat/source/logs. Verify the exact three-file publication receipt at an
-immutable commit, then review/update catalog provenance and rerun its checks
-before acceptance. An unmarked old installed pack remains preserved with
-`curated_ownership_unverified`; ownership protections and signed release gates
-must not be weakened. See
-[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+| Approved file | Verified bytes | Verified SHA-256 |
+| --- | ---: | --- |
+| `model.onnx` | 9,948,304 | `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac` |
+| `model.json` | 1,881 | `9daf66251194aeaab5c67f18331e18a40596b951a8049b4d359d36fe1e97285e` |
+| `LICENSE.txt` | 1,671 | `e419e198d08f7d62fbc6bbb74409836289246db14ed28a134f79e1a2ea5afedc` |
+
+The fresh local promotion is topic
+`cf686180650468830deb4be5809fe06c213982d4`, integrated as
+`d7f7f5db1323ecdbea4430ebd71b49f9d82656b6`. Active catalog `2026-11-11`
+contains 140,755,803 total artifact bytes and has SHA-256
+`ac7c199bfac83859dd192174bb43e6a5c251647ab8936cebc9639408d4bc3f7e`.
+It preserves `fastdvdnet_sigma15`, its default selection, and the seven
+packs/eight artifacts. The metadata and full license are byte-identical to the
+verified published files; the artifact source selects its corrected versioned
+path without an invalid-artifact fallback. The old unaccepted proposal at
+`/tmp/studiocast-fastdvdnet-promotion-20261111` is superseded by this fresh
+implementation, not accepted separately.
+
+The model agent passed 19 model, 52 backend, nine packaging, and one installer
+wizard test. Root post-integration model 19 and packaging nine passed; backend
+and wizard final results and the fresh independent critique are pending at this
+documentation checkpoint. Root additionally verified all three immutable HTTPS
+files without authentication; evidence is
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/publication-public-https-verification.json`.
+
+The integrated installer completed an online HTTPS transaction from immutable
+`8ffe9688`, then an offline verified-cache transaction, in temporary destinations
+under `/tmp/studiocast-published-fastdvdnet-transaction-2tIjbx/`. Both succeeded
+with the exact 9,948,304-byte artifact verified above; JSON evidence is
+`/tmp/studiocast-fastdvdnet-published-transaction-online-20261111.json` and
+`/tmp/studiocast-fastdvdnet-published-transaction-offline-20261111.json`.
+These temporary test activations did not modify user-installed packs.
+
+The artifact hash is unchanged from the corrected isolated model used in the
+recorded native matrix, and no runtime code changed; this catalog/docs task does
+not add new GPU qualification claims. No user-installed pack was changed.
+Old unmarked sigma15 metadata remains preserved with
+`curated_ownership_unverified`; an install/repair must retain ownership checks.
+Sigma25/sigma50 remain untouched noncatalog BYO templates. No Git push or
+signed application release was performed or authorized by model publication.
+The source archive/AppImage signing chain and the recorded camera, real-face
+quality, optimized latency, other vendor, and native-sanitizer limitations remain
+separate gates. See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
