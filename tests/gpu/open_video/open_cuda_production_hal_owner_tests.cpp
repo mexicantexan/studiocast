@@ -536,7 +536,8 @@ bool ExactDomainCapabilityAndQuarantineAreTyped() {
   maximum_stages.stage_count = hal::kMaxPreparedStages;
   for (std::size_t index = 0; index < maximum_stages.stage_count; ++index) {
     maximum_stages.stages[index] = program.stages[0];
-    maximum_stages.stages[index].stage_id = static_cast<std::uint32_t>(index + 1);
+    maximum_stages.stages[index].stage_id =
+        static_cast<std::uint32_t>(index + 1);
     maximum_stages.stages[index].scratch_bytes = 0;
   }
   maximum_stages.cpu_tails[0].after_stage_id =
@@ -544,19 +545,22 @@ bool ExactDomainCapabilityAndQuarantineAreTyped() {
   maximum_stages.cpu_tails[0].boundary_index =
       static_cast<std::uint32_t>(hal::kMaxPreparedStages);
   auto maximum_readiness = readiness;
-  maximum_readiness.ready_stage_mask = std::numeric_limits<std::uint32_t>::max();
+  maximum_readiness.ready_stage_mask =
+      std::numeric_limits<std::uint32_t>::max();
   hal::ReasonId validation_reason = hal::ReasonId::none;
   ok = Expect(hal::ValidatePreparedProgram(maximum_stages, &validation_reason),
               "maximum-stage regression must reach owner-specific semantic "
-              "validation") && ok;
+              "validation") &&
+       ok;
   const auto rejected_maximum =
       owner->CommitPreparedCapability(maximum_stages, maximum_readiness);
   ok = Expect(rejected_maximum.reason ==
-                  hal::ReasonId::semantic_effect_unsupported &&
+                      hal::ReasonId::semantic_effect_unsupported &&
                   !rejected_maximum.prepared_capability_committed &&
                   owner->prepared_capability_committed(),
               "maximum-stage malformed semantic sequence must safely retain "
-              "prior capability") && ok;
+              "prior capability") &&
+       ok;
 
   auto foreign_readiness = readiness;
   ++foreign_readiness.execution_domain.adapter_instance_id;
@@ -932,6 +936,13 @@ bool ProductionNewSemanticContractsAreExact() {
       setup.backend.dependencies.eye_right_artifact = Artifact();
       setup.backend.dependencies.denoise_artifact = Artifact();
     }
+    if (semantic == hal::SemanticEffectId::eye_contact) {
+      // Real eye pairs share their pack but have distinct selected-file
+      // identities.
+      setup.backend.dependencies.eye_right_artifact.artifact_sha256[0] ^= 0x7f;
+      setup.backend.dependencies.eye_right_artifact.artifact_set_sha256[0] ^=
+          0x7f;
+    }
     if (native) {
       setup.models[0] = {};
       setup.backend.dependencies = {};
@@ -968,6 +979,26 @@ bool ProductionNewSemanticContractsAreExact() {
                       state.create_calls == create_calls,
                   "mismatched task artifact must fail before CUDA ownership") &&
            ok;
+    }
+    if (semantic == hal::SemanticEffectId::eye_contact) {
+      for (int mismatch = 0; mismatch < 3; ++mismatch) {
+        auto invalid = setup;
+        auto &right = invalid.backend.dependencies.eye_right_artifact;
+        if (mismatch == 0)
+          right.manifest_sha256[0] ^= 0x7f;
+        if (mismatch == 1)
+          right.model_id_sha256[0] ^= 0x7f;
+        if (mismatch == 2)
+          ++right.registry_generation;
+        const auto create_calls = state.create_calls;
+        open_cuda::OpenCudaProductionVideoExecutionBootstrapResult rejected;
+        ok = Expect(!open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+                        invalid, &rejected) &&
+                        state.create_calls == create_calls,
+                    "foreign eye pack manifest/model/generation must fail "
+                    "before CUDA ownership") &&
+             ok;
+      }
     }
     factory.reset();
     ok =
@@ -1153,12 +1184,12 @@ bool ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() {
                 << static_cast<unsigned>(acquire_status)
                 << " reason=" << static_cast<unsigned>(reason)
                 << " bootstrap=" << static_cast<unsigned>(bootstrap.status)
-                << '/' << static_cast<unsigned>(bootstrap.reason)
-                << " prepare=" << static_cast<unsigned>(bootstrap.prepare.status)
-                << '/' << static_cast<unsigned>(bootstrap.prepare.reason) << '\n';
+                << '/' << static_cast<unsigned>(bootstrap.reason) << " prepare="
+                << static_cast<unsigned>(bootstrap.prepare.status) << '/'
+                << static_cast<unsigned>(bootstrap.prepare.reason) << '\n';
     ok = Expect(
-             acquire_status == hal::StatusId::ready &&
-                 lease.live() && runtime.prepare_calls == 1 &&
+             acquire_status == hal::StatusId::ready && lease.live() &&
+                 runtime.prepare_calls == 1 &&
                  runtime.destroy_prepared_calls == 0,
              "lease publication must perform exactly one native preparation") &&
          ok;
@@ -1186,7 +1217,8 @@ bool ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() {
     auto mismatched = request;
     mismatched.setup_failure_policy = hal::SetupFailurePolicy::stop_pipeline;
     video::VideoExecutionPrepareEvidence prepare{};
-    const auto mismatch_status = coordinator.Prepare(mismatched, &prepare, &reason);
+    const auto mismatch_status =
+        coordinator.Prepare(mismatched, &prepare, &reason);
     if (mismatch_status != hal::StatusId::blocked ||
         prepare.status != hal::StatusId::blocked ||
         prepare.reason != hal::ReasonId::incomplete_execution ||
@@ -1195,8 +1227,8 @@ bool ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() {
       std::cerr << "[DETAIL] cache mismatch status="
                 << static_cast<unsigned>(mismatch_status)
                 << " reason=" << static_cast<unsigned>(reason)
-                << " evidence=" << static_cast<unsigned>(prepare.status)
-                << '/' << static_cast<unsigned>(prepare.reason)
+                << " evidence=" << static_cast<unsigned>(prepare.status) << '/'
+                << static_cast<unsigned>(prepare.reason)
                 << " rollback=" << prepare.candidate_resources_rolled_back
                 << " calls=" << runtime.prepare_calls
                 << " destroys=" << runtime.destroy_prepared_calls << '\n';
@@ -1250,13 +1282,12 @@ bool ProductionPreparedLeaseCacheIsExactConsumedOnceAndRetiredSafely() {
     video::ProductionVideoSetupLeaseAcquireEvidence acquire{};
     open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
     hal::ReasonId reason = hal::ReasonId::none;
-    ok = Expect(
-             open_cuda::OpenCudaVideoExecutionFactory::
-                     AcquireProductionSetupLease(setup, &lease, &bootstrap,
-                                                 &acquire, &reason) ==
-                 hal::StatusId::ready &&
-                 runtime.prepare_calls == 1,
-             "unused-cache fixture must publish one prepared lease") &&
+    ok = Expect(open_cuda::OpenCudaVideoExecutionFactory::
+                            AcquireProductionSetupLease(
+                                setup, &lease, &bootstrap, &acquire, &reason) ==
+                        hal::StatusId::ready &&
+                    runtime.prepare_calls == 1,
+                "unused-cache fixture must publish one prepared lease") &&
          ok;
     const auto shutdown = lease.Shutdown();
     ok = Expect(shutdown.quiescent &&

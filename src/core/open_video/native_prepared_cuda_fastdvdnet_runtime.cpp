@@ -189,7 +189,10 @@ bool ValidatePreparedFastDvdnetSessionMetadata(
         (*actual[i])[1] != channels[i])
       return false;
     if (dynamic[i]) {
-      if ((*actual[i])[2] >= 0 || (*actual[i])[3] >= 0) return false;
+      if (model.setup_specialized_dynamic_hw) {
+        if (*actual[i] != std::vector<std::int64_t>(selected_shapes[i]->begin(), selected_shapes[i]->end()))
+          return false;
+      } else if ((*actual[i])[2] >= 0 || (*actual[i])[3] >= 0) return false;
     } else {
       const int manifest_width = i < 2 ? model.input_widths[i]
                                        : model.output_width;
@@ -343,6 +346,13 @@ NativePreparedCudaFastDvdnetRuntime::Prepare(
   options.cuda_context_generation =
       config.execution_domain.logical_context_generation;
   options.user_compute_stream = config.owner_stream;
+  // The corrected curated export declares these reviewed symbolic names.
+  // Other artifacts retain strict unsupported-symbol behavior.
+  if (config.model_pack->id == "fastdvdnet_sigma15" &&
+      model->sha256 == "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac") {
+    options.free_dimension_overrides = {{"N", 1}, {"H", h}, {"W", w}};
+    model_contract.setup_specialized_dynamic_hw = true;
+  }
   ++telemetry_.session_constructions;
   session_ = factory_->Create(model->path, options, config.tensors,
                               model_contract);

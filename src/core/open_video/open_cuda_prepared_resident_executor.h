@@ -14,6 +14,32 @@
 
 namespace studiocast::open_cuda {
 
+// Matches BuildBroadcastEffectsPlan; all background modes occupy one slot.
+inline constexpr unsigned
+PreparedOpenCudaCanonicalStageRank(hal::SemanticEffectId semantic) noexcept {
+  using S = hal::SemanticEffectId;
+  switch (semantic) {
+  case S::video_noise_removal:
+    return 1;
+  case S::eye_contact:
+    return 2;
+  case S::virtual_background_blur:
+  case S::virtual_background_remove:
+  case S::virtual_background_replace:
+    return 3;
+  case S::virtual_key_light:
+    return 4;
+  case S::auto_frame:
+    return 5;
+  case S::vignette:
+    return 6;
+  case S::mirror:
+    return 7;
+  default:
+    return 0;
+  }
+}
+
 inline constexpr std::uint32_t kPreparedOpenCudaRuntimeApiVersion = 2;
 
 // Stable executor/runtime outcomes. These are deliberately independent of
@@ -139,9 +165,9 @@ PreparedOpenCudaVbPlan PlanPreparedOpenCudaVirtualBackground(
 
 // CudaTensor stores NCHW data in one pitched allocation row. This converts
 // that exact allocation metadata into the capacity consumed by setup budgets.
-bool PreparedContiguousTensorCapacityBytes(std::uint64_t allocation_pitch_bytes,
-                                           std::uint64_t active_bytes,
-                                           std::uint64_t *capacity_bytes) noexcept;
+bool PreparedContiguousTensorCapacityBytes(
+    std::uint64_t allocation_pitch_bytes, std::uint64_t active_bytes,
+    std::uint64_t *capacity_bytes) noexcept;
 
 struct PreparedOpenCudaVignetteBudgetInput {
   std::uint64_t input_pitch_bytes = 0;
@@ -157,8 +183,7 @@ struct PreparedOpenCudaVignetteBudgetInput {
 
 PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
     const PreparedOpenCudaVignetteBudgetInput &input,
-    hal::ResourceBudget *required_budget,
-    hal::ReasonId *reason) noexcept;
+    hal::ResourceBudget *required_budget, hal::ReasonId *reason) noexcept;
 
 struct PreparedOpenCudaProductionConfig;
 hal::ReasonId ValidatePreparedOpenCudaProductionProgram(
@@ -242,8 +267,7 @@ struct PreparedOpenCudaRuntimePrepareResult {
   hal::ReasonId reason = hal::ReasonId::capability_evidence_incomplete;
   PreparedOpenCudaRuntimeHandle handle{};
   PreparedOpenCudaRuntimeEvidence evidence{};
-  OpenCudaSetupComponentId failed_component =
-      OpenCudaSetupComponentId::invalid;
+  OpenCudaSetupComponentId failed_component = OpenCudaSetupComponentId::invalid;
 };
 
 struct PreparedOpenCudaRuntimeFrame {
@@ -361,14 +385,14 @@ public:
     int key_light_temperature_preset = 0;
     int key_light_direction_pan_degrees = 0;
     int vignette_intensity = 35;
-  bool vignette_tracked_center = false;
-  PreparedOpenCudaModelDependencies dependencies{};
-  int denoise_strength = 50;
-  int auto_frame_strength = 50;
-  int auto_frame_smoothing = 50;
-  float auto_frame_headroom = .15F;
-  int eye_contact_strength = 50;
-  bool eye_contact_look_away = false;
+    bool vignette_tracked_center = false;
+    PreparedOpenCudaModelDependencies dependencies{};
+    int denoise_strength = 50;
+    int auto_frame_strength = 50;
+    int auto_frame_smoothing = 50;
+    float auto_frame_headroom = .15F;
+    int eye_contact_strength = 50;
+    bool eye_contact_look_away = false;
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
     IPreparedOpenCudaRuntime *runtime = nullptr;

@@ -1,5 +1,7 @@
+#include "core/video/cpu_primitive_hal.h"
 #include "core/video/effects/broadcast_effects.h"
 #include "core/video/production_video_backend_manager.h"
+#include "core/video/production_video_setup_request.h"
 
 #include <array>
 #include <charconv>
@@ -29,6 +31,10 @@ struct Options {
   std::string model_id = "modnet-webnn-256-fp32";
   std::filesystem::path model_root;
   std::string effects = "blur";
+  std::string replacement_path;
+  std::string face_model_id;
+  std::string eye_model_id;
+  std::string denoise_model_id;
   bool automatic = false;
   std::uint32_t input_width = 64;
   std::uint32_t input_height = 48;
@@ -39,13 +45,16 @@ struct Options {
 };
 
 bool ParseUnsigned(std::string_view value, std::uint32_t *out) {
-  const auto result = std::from_chars(value.data(), value.data() + value.size(), *out);
+  const auto result =
+      std::from_chars(value.data(), value.data() + value.size(), *out);
   return result.ec == std::errc{} && result.ptr == value.data() + value.size();
 }
 
 bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
-  options->require = std::getenv("STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE") != nullptr &&
-                     std::string_view(std::getenv("STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE")) == "1";
+  options->require =
+      std::getenv("STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE") != nullptr &&
+      std::string_view(
+          std::getenv("STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE")) == "1";
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg(argv[i]);
     const auto take = [&](std::string_view name, std::string *value) {
@@ -59,14 +68,20 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     } else if (take("--model-root", &value)) {
       options->model_root = value;
     } else if (take("--effects", &options->effects)) {
+    } else if (take("--replace-path", &options->replacement_path)) {
+    } else if (take("--face-model-id", &options->face_model_id)) {
+    } else if (take("--eye-model-id", &options->eye_model_id)) {
+    } else if (take("--denoise-model-id", &options->denoise_model_id)) {
     } else if (take("--input", &value) || take("--output", &value)) {
       const bool input = arg == "--input";
       const auto separator = value.find('x');
       if (separator == std::string::npos ||
           !ParseUnsigned(std::string_view(value).substr(0, separator),
-                         input ? &options->input_width : &options->output_width) ||
+                         input ? &options->input_width
+                               : &options->output_width) ||
           !ParseUnsigned(std::string_view(value).substr(separator + 1),
-                         input ? &options->input_height : &options->output_height)) {
+                         input ? &options->input_height
+                               : &options->output_height)) {
         *error = std::string(arg) + " must be WIDTHxHEIGHT";
         return false;
       }
@@ -86,12 +101,30 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
       return false;
     }
   }
-  if (options->effects != "blur" && options->effects != "keylight" &&
-      options->effects != "blur+keylight" && options->effects != "vignette" &&
-      options->effects != "blur+vignette" &&
-      options->effects != "keylight+vignette" &&
-      options->effects != "blur+keylight+vignette") {
-    *error = "unsupported --effects topology";
+  std::string_view effects(options->effects);
+  while (!effects.empty()) {
+    const auto separator = effects.find('+');
+    const auto effect = effects.substr(0, separator);
+    if (effect != "blur" && effect != "remove" && effect != "replace" &&
+        effect != "keylight" && effect != "vignette" &&
+        effect != "tracked_vignette" && effect != "denoise" &&
+        effect != "auto_frame" && effect != "eye_contact" &&
+        effect != "mirror") {
+      *error = "unsupported --effects token";
+      return false;
+    }
+    if (separator == std::string_view::npos)
+      break;
+    effects.remove_prefix(separator + 1);
+  }
+  if (options->effects.find("replace") != std::string::npos &&
+      options->replacement_path.empty()) {
+    *error = "replace requires --replace-path";
+    return false;
+  }
+  if (options->effects.find("tracked_vignette") != std::string::npos &&
+      options->effects.find("auto_frame") == std::string::npos) {
+    *error = "tracked_vignette requires auto_frame";
     return false;
   }
   if (options->input_width == 0 || options->input_height == 0 ||
@@ -103,54 +136,6 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     return false;
   }
   return true;
-}
-
-hal::ImageDescriptor HostRgb(std::uint32_t width, std::uint32_t height,
-                             hal::Mutability mutability) {
-  hal::ImageDescriptor image;
-  image.width = width;
-  image.height = height;
-  image.plane_count = 1;
-  image.format = hal::PixelFormat::rgb_u8;
-  image.channel_order = hal::ChannelOrder::rgb;
-  image.color_space = hal::ColorSpace::srgb;
-  image.color_range = hal::ColorRange::full;
-  image.alpha_meaning = hal::AlphaMeaning::none;
-  image.orientation = hal::Orientation::top_left;
-  image.host_coherence = hal::HostCoherence::coherent;
-  image.mutability = mutability;
-  image.aliasing = hal::AliasingPermission::forbidden;
-  image.base_alignment_bytes = 1;
-  image.planes[0].row_stride_bytes = static_cast<std::uint64_t>(width) * 3;
-  image.planes[0].size_bytes = image.planes[0].row_stride_bytes * height;
-  image.planes[0].width = width;
-  image.planes[0].height = height;
-  image.planes[0].alignment_bytes = 1;
-  return image;
-}
-
-void AddSigned(video::CanonicalVideoStage *stage,
-               video::CanonicalVideoParameterId id, std::int64_t value) {
-  auto &parameter = stage->parameters[stage->parameter_count++];
-  parameter.id = id;
-  parameter.kind = video::CanonicalVideoParameterKind::signed_integer;
-  parameter.signed_value = value;
-}
-
-void AddUnsigned(video::CanonicalVideoStage *stage,
-                 video::CanonicalVideoParameterId id, std::uint64_t value) {
-  auto &parameter = stage->parameters[stage->parameter_count++];
-  parameter.id = id;
-  parameter.kind = video::CanonicalVideoParameterKind::unsigned_integer;
-  parameter.unsigned_value = value;
-}
-
-void AddBoolean(video::CanonicalVideoStage *stage,
-                video::CanonicalVideoParameterId id, bool value) {
-  auto &parameter = stage->parameters[stage->parameter_count++];
-  parameter.id = id;
-  parameter.kind = video::CanonicalVideoParameterKind::boolean;
-  parameter.boolean_value = value;
 }
 
 bool StopNever(void *) noexcept { return false; }
@@ -165,16 +150,17 @@ void Poll(void *, std::uint64_t wait_nanoseconds) noexcept {
   std::this_thread::sleep_for(std::chrono::nanoseconds(wait_nanoseconds));
 }
 
-std::vector<std::byte> ReferenceResizeVignette(
-    const std::vector<std::byte> &input, std::uint32_t input_width,
-    std::uint32_t input_height, std::uint32_t output_width,
-    std::uint32_t output_height, float intensity) {
-  std::vector<std::byte> result(
-      static_cast<std::size_t>(output_width) * output_height * 3u);
-  const float scale_x = static_cast<float>(input_width) /
-                        static_cast<float>(output_width);
-  const float scale_y = static_cast<float>(input_height) /
-                        static_cast<float>(output_height);
+std::vector<std::byte>
+ReferenceResizeVignette(const std::vector<std::byte> &input,
+                        std::uint32_t input_width, std::uint32_t input_height,
+                        std::uint32_t output_width, std::uint32_t output_height,
+                        float intensity) {
+  std::vector<std::byte> result(static_cast<std::size_t>(output_width) *
+                                output_height * 3u);
+  const float scale_x =
+      static_cast<float>(input_width) / static_cast<float>(output_width);
+  const float scale_y =
+      static_cast<float>(input_height) / static_cast<float>(output_height);
   const float center_x = static_cast<float>(output_width) * 0.5f;
   const float center_y = static_cast<float>(output_height) * 0.5f;
   for (std::uint32_t y = 0; y < output_height; ++y) {
@@ -193,9 +179,8 @@ std::vector<std::byte> ReferenceResizeVignette(
                        (2.0f / static_cast<float>(output_width));
       const float ny = ((static_cast<float>(y) + 0.5f) - center_y) *
                        (2.0f / static_cast<float>(output_height));
-      const float radius = std::clamp(std::sqrt(nx * nx + ny * ny) *
-                                          0.70710678f,
-                                      0.0f, 1.0f);
+      const float radius =
+          std::clamp(std::sqrt(nx * nx + ny * ny) * 0.70710678f, 0.0f, 1.0f);
       const float factor = std::max(0.0f, 1.0f - intensity * radius * radius);
       for (std::size_t channel = 0; channel < 3; ++channel) {
         const auto sample = [&](int sx, int sy) {
@@ -205,133 +190,83 @@ std::vector<std::byte> ReferenceResizeVignette(
                         3u +
                     channel]));
         };
-        const float upper = sample(x0, y0) + fx * (sample(x1, y0) - sample(x0, y0));
-        const float lower = sample(x0, y1) + fx * (sample(x1, y1) - sample(x0, y1));
-        const auto resized = static_cast<unsigned>(
-            std::clamp(static_cast<int>(upper + fy * (lower - upper) + 0.5f),
-                       0, 255));
+        const float upper =
+            sample(x0, y0) + fx * (sample(x1, y0) - sample(x0, y0));
+        const float lower =
+            sample(x0, y1) + fx * (sample(x1, y1) - sample(x0, y1));
+        const auto resized = static_cast<unsigned>(std::clamp(
+            static_cast<int>(upper + fy * (lower - upper) + 0.5f), 0, 255));
         result[(static_cast<std::size_t>(y) * output_width + x) * 3u +
-               channel] = static_cast<std::byte>(std::clamp(
-            static_cast<int>(std::nearbyint(static_cast<float>(resized) * factor)),
-            0, 255));
+               channel] =
+            static_cast<std::byte>(
+                std::clamp(static_cast<int>(std::nearbyint(
+                               static_cast<float>(resized) * factor)),
+                           0, 255));
       }
     }
   }
   return result;
 }
 
-video::ProductionVideoResidentSetup BuildRequest(const Options &options) {
-  video::ProductionVideoResidentSetup request;
-  request.wait.timeout_nanoseconds = UINT64_C(5000000000);
-  request.wait.poll_interval_nanoseconds = UINT64_C(1000000);
-  request.wait.maximum_poll_count = 5000;
-  request.wait.stop_requested = &StopNever;
-  request.wait.cancel_requested = &StopNever;
-  request.wait.now_nanoseconds = &Now;
-  request.wait.poll_wait = &Poll;
-  request.wait.callback_context = &wait_context;
-  request.wait.callback_context_generation = 1;
-  request.wait.callback_context_lifetime = hal::ResourceLifetime::adapter_context;
-  auto &plan = request.plan;
-  plan.plan_id = 1;
-  plan.intent.backend.mode = options.automatic
-                                 ? hal::BackendRequestMode::automatic
-                                 : hal::BackendRequestMode::explicit_backend;
-  plan.intent.backend.backend =
-      options.automatic ? hal::BackendId::invalid : hal::BackendId::cuda;
-  plan.intent.backend.strict = !options.automatic;
-  plan.intent.preferences.compute_family =
-      options.automatic ? hal::ComputeFamilyAllowance::any
-                        : hal::ComputeFamilyAllowance::cuda_family;
-  plan.intent.preferences.effects_engine =
-      options.automatic ? hal::EffectsEnginePreferenceConstraint::automatic
-                        : hal::EffectsEnginePreferenceConstraint::open_cuda;
-  plan.intent.preferences.strict_effects_engine = !options.automatic;
-  const bool vignette = options.effects.find("vignette") != std::string::npos;
-  const bool blur = options.effects.find("blur") != std::string::npos;
-  const bool keylight = options.effects.find("keylight") != std::string::npos;
-  const bool mixed_provider = vignette && (blur || keylight);
-  plan.intent.requested_provider =
-      options.automatic || mixed_provider
-          ? hal::SemanticEffectProviderId::invalid
-          : vignette ? hal::SemanticEffectProviderId::open_cuda_production_kernels
-                     : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
-  plan.intent.strict_provider_selection = !options.automatic && !mixed_provider;
-
-  request.effects.engine = options.automatic
-                               ? video::effects::EffectsEnginePreference::auto_select
-                               : video::effects::EffectsEnginePreference::open_cuda;
-  request.effects.virtual_background.model_id = options.model_id;
-  if (blur) {
-    request.effects.virtual_background.mode =
-        video::effects::VirtualBackgroundMode::blur;
-    auto &stage = plan.intent.stages[plan.intent.stage_count++];
-    stage.intent.stage_id = 1;
-    stage.intent.semantic = hal::SemanticEffectId::virtual_background_blur;
-    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
-    AddSigned(&stage, video::CanonicalVideoParameterId::strength,
-              request.effects.virtual_background.strength);
-    AddUnsigned(&stage, video::CanonicalVideoParameterId::remove_color_rgb, 0);
-    AddUnsigned(&stage, video::CanonicalVideoParameterId::greenscreen_mode,
-                static_cast<std::uint64_t>(
-                    request.effects.virtual_background.greenscreen_mode));
-    AddBoolean(&stage, video::CanonicalVideoParameterId::greenscreen_temporal,
-               request.effects.virtual_background.greenscreen_temporal);
+video::ProductionVideoBackendSetupRequest BuildRequest(const Options &options) {
+  video::ProductionVideoBoundedWaitPolicy wait;
+  wait.timeout_nanoseconds = UINT64_C(100000000);
+  wait.poll_interval_nanoseconds = UINT64_C(1000000);
+  wait.maximum_poll_count = 100;
+  wait.stop_requested = &StopNever;
+  wait.cancel_requested = &StopNever;
+  wait.now_nanoseconds = &Now;
+  wait.poll_wait = &Poll;
+  wait.callback_context = &wait_context;
+  wait.callback_context_generation = 1;
+  wait.callback_context_lifetime = hal::ResourceLifetime::adapter_context;
+  video::effects::BroadcastCameraEffects effects;
+  effects.engine = options.automatic
+                       ? video::effects::EffectsEnginePreference::auto_select
+                       : video::effects::EffectsEnginePreference::open_cuda;
+  effects.virtual_background.model_id = options.model_id;
+  effects.auto_frame.model_id = options.face_model_id;
+  effects.eye_contact.model_id = options.eye_model_id;
+  effects.video_noise_removal.model_id = options.denoise_model_id;
+  effects.virtual_background.replace_path = options.replacement_path;
+  std::string_view tokens(options.effects);
+  while (!tokens.empty()) {
+    const auto separator = tokens.find('+');
+    const auto token = tokens.substr(0, separator);
+    if (token == "blur")
+      effects.virtual_background.mode =
+          video::effects::VirtualBackgroundMode::blur;
+    if (token == "remove")
+      effects.virtual_background.mode =
+          video::effects::VirtualBackgroundMode::remove;
+    if (token == "replace")
+      effects.virtual_background.mode =
+          video::effects::VirtualBackgroundMode::replace;
+    if (token == "keylight")
+      effects.virtual_key_light.enabled = true;
+    if (token == "vignette" || token == "tracked_vignette")
+      effects.vignette.enabled = true;
+    if (token == "denoise")
+      effects.video_noise_removal.enabled = true;
+    if (token == "auto_frame")
+      effects.auto_frame.enabled = true;
+    if (token == "eye_contact")
+      effects.eye_contact.enabled = true;
+    if (token == "mirror")
+      effects.mirror = true;
+    if (separator == std::string_view::npos)
+      break;
+    tokens.remove_prefix(separator + 1);
   }
-  if (keylight) {
-    request.effects.virtual_key_light.enabled = true;
-    auto &stage = plan.intent.stages[plan.intent.stage_count++];
-    stage.intent.stage_id = static_cast<std::uint32_t>(plan.intent.stage_count);
-    stage.intent.semantic = hal::SemanticEffectId::virtual_key_light;
-    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
-    AddSigned(&stage, video::CanonicalVideoParameterId::intensity,
-              request.effects.virtual_key_light.intensity);
-    AddSigned(&stage, video::CanonicalVideoParameterId::temperature_preset,
-              request.effects.virtual_key_light.temperature_preset);
-    AddSigned(&stage, video::CanonicalVideoParameterId::direction_pan_degrees,
-              request.effects.virtual_key_light.direction_pan_degrees);
-  }
-  if (vignette) {
-    request.effects.vignette.enabled = true;
-    request.effects.vignette.center_on_tracked_face = false;
-    auto &stage = plan.intent.stages[plan.intent.stage_count++];
-    stage.intent.stage_id = static_cast<std::uint32_t>(plan.intent.stage_count);
-    stage.intent.semantic = hal::SemanticEffectId::vignette;
-    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
-    AddSigned(&stage, video::CanonicalVideoParameterId::intensity,
-              request.effects.vignette.intensity);
-    AddBoolean(&stage, video::CanonicalVideoParameterId::center_on_tracked_face,
-               false);
-  }
-  plan.host_input = HostRgb(options.input_width, options.input_height,
-                            hal::Mutability::read_only);
-  plan.host_output = HostRgb(options.output_width, options.output_height,
-                             hal::Mutability::write_only);
-  plan.invalidation_key.generations.configuration = 1;
-  plan.invalidation_key.generations.geometry = 1;
-  plan.invalidation_key.generations.model = 0;
-  plan.invalidation_key.generations.provider = 1;
-  plan.invalidation_key.generations.device = 1;
-  plan.invalidation_key.generations.context = 0;
-  plan.invalidation_key.canonical_plan_hash = 1;
-  constexpr std::uint64_t kGiB = UINT64_C(1024) * 1024u * 1024u;
-  plan.budget.persistent_bytes = 8u * kGiB;
-  plan.budget.scratch_bytes = 4u * kGiB;
-  plan.budget.upload_staging_bytes = kGiB;
-  plan.budget.readback_staging_bytes = kGiB;
-  plan.budget.resource_count = 1024;
-  plan.budget.in_flight_slots = 1;
-  plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
-  plan.cpu_tails[0].after_stage_id =
-      plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id;
-  plan.cpu_tails[0].required = true;
-  plan.cpu_tails[0].placement = hal::DeclaredCpuTail::Placement::after_stage;
-  plan.cpu_tails[0].boundary_index =
-      static_cast<std::uint32_t>(plan.intent.stage_count);
-  plan.cpu_tail_count = 1;
-  plan.setup_failure_policy = hal::SetupFailurePolicy::retain_old_program;
-  plan.migration_policy = video::VideoExecutionMigrationPolicy::prepared_only;
-  return request;
+  return video::BuildProductionVideoBackendSetupRequest(
+      effects,
+      options.automatic ? video::ComputeBackendPreference::auto_select
+                        : video::ComputeBackendPreference::cuda,
+      static_cast<int>(options.input_width),
+      static_cast<int>(options.input_height),
+      static_cast<int>(options.output_width),
+      static_cast<int>(options.output_height), video::PixelFormat::rgb24, 1, 1,
+      1, wait, video::GetCpuPrimitiveTable());
 }
 
 std::string Hex(const std::array<std::uint8_t, 32> &bytes) {
@@ -353,15 +288,14 @@ int Run(const Options &options) {
     }
     const auto xdg = normalized.parent_path().parent_path().parent_path();
     if (setenv("XDG_DATA_HOME", xdg.c_str(), 1) != 0) {
-      std::cerr << "FAIL could not set XDG_DATA_HOME for read-only model root\n";
+      std::cerr
+          << "FAIL could not set XDG_DATA_HOME for read-only model root\n";
       return 2;
     }
   }
 
-  auto resident = BuildRequest(options);
-  video::ProductionVideoBackendSetupRequest request;
-  request.kind = video::ProductionVideoBackendSetupKind::resident_island;
-  request.resident = resident;
+  const auto request = BuildRequest(options);
+  const auto &resident = request.resident;
   video::ProductionVideoBackendManager manager(
       video::CreateStaticProductionVideoBackendSetupSource());
   video::ProductionVideoBackendSetupEvidence evidence;
@@ -372,34 +306,36 @@ int Run(const Options &options) {
                             std::chrono::steady_clock::now() - started)
                             .count();
   const auto setup = manager.Snapshot();
-  std::cout << "setup status=" << static_cast<unsigned>(status)
-            << " reason=" << static_cast<unsigned>(reason)
-            << " elapsed_ns=" << setup_ns
-            << " requested=" << static_cast<unsigned>(setup.readiness.requested_backend)
-            << " selected=" << static_cast<unsigned>(setup.readiness.selected_backend)
-            << " provider=" << static_cast<unsigned>(setup.readiness.provider)
-            << " domain_backend="
-            << static_cast<unsigned>(setup.readiness.execution_domain.backend)
-            << " model_id=" << options.model_id << " input="
-            << options.input_width << 'x' << options.input_height << " output="
-            << options.output_width << 'x' << options.output_height
-            << " prepared=" << setup.resident_prepared
-            << " source_called=" << evidence.setup_source_called
-            << " candidate_setup_only=" << evidence.candidate_setup_only
-            << " candidate_rejected=" << evidence.candidate_rejected
-            << " candidate_status="
-            << static_cast<unsigned>(evidence.candidate_readiness.status)
-            << " candidate_reason="
-            << static_cast<unsigned>(evidence.candidate_readiness.reason)
-            << " candidate_selected="
-            << static_cast<unsigned>(evidence.candidate_readiness.selected_backend)
-            << " candidate_provider="
-            << static_cast<unsigned>(evidence.candidate_readiness.provider)
-            << " prepare_status="
-            << static_cast<unsigned>(evidence.composition_prepare.status)
-            << " prepare_reason="
-            << static_cast<unsigned>(evidence.composition_prepare.reason)
-            << '\n';
+  std::cout
+      << "setup status=" << static_cast<unsigned>(status)
+      << " reason=" << static_cast<unsigned>(reason)
+      << " elapsed_ns=" << setup_ns
+      << " wait_timeout_ns=" << resident.wait.timeout_nanoseconds
+      << " wait_maximum_polls=" << resident.wait.maximum_poll_count
+      << " requested="
+      << static_cast<unsigned>(setup.readiness.requested_backend)
+      << " selected=" << static_cast<unsigned>(setup.readiness.selected_backend)
+      << " provider=" << static_cast<unsigned>(setup.readiness.provider)
+      << " domain_backend="
+      << static_cast<unsigned>(setup.readiness.execution_domain.backend)
+      << " model_id=" << options.model_id << " input=" << options.input_width
+      << 'x' << options.input_height << " output=" << options.output_width
+      << 'x' << options.output_height << " prepared=" << setup.resident_prepared
+      << " source_called=" << evidence.setup_source_called
+      << " candidate_setup_only=" << evidence.candidate_setup_only
+      << " candidate_rejected=" << evidence.candidate_rejected
+      << " candidate_status="
+      << static_cast<unsigned>(evidence.candidate_readiness.status)
+      << " candidate_reason="
+      << static_cast<unsigned>(evidence.candidate_readiness.reason)
+      << " candidate_selected="
+      << static_cast<unsigned>(evidence.candidate_readiness.selected_backend)
+      << " candidate_provider="
+      << static_cast<unsigned>(evidence.candidate_readiness.provider)
+      << " prepare_status="
+      << static_cast<unsigned>(evidence.composition_prepare.status)
+      << " prepare_reason="
+      << static_cast<unsigned>(evidence.composition_prepare.reason) << '\n';
   for (std::size_t i = 0; i < setup.resident.plan.intent.stage_count; ++i) {
     const auto &stage = setup.resident.plan.intent.stages[i];
     std::cout << "stage index=" << i
@@ -410,22 +346,33 @@ int Run(const Options &options) {
   }
   if ((status != hal::StatusId::ready && status != hal::StatusId::degraded) ||
       !setup.resident_prepared) {
-    std::cerr << "FAIL production setup did not produce a prepared resident program"
-              << " status=" << static_cast<unsigned>(status)
-              << " reason=" << static_cast<unsigned>(reason) << '\n';
+    std::cerr
+        << "FAIL production setup did not produce a prepared resident program"
+        << " status=" << static_cast<unsigned>(status)
+        << " reason=" << static_cast<unsigned>(reason) << '\n';
     return 1;
   }
-  const bool vignette = options.effects.find("vignette") != std::string::npos;
-  const bool model = options.effects.find("blur") != std::string::npos ||
-                     options.effects.find("keylight") != std::string::npos;
-  const auto expected_provider = model && vignette
-                                     ? hal::SemanticEffectProviderId::invalid
-                                     : vignette
-                                           ? hal::SemanticEffectProviderId::open_cuda_production_kernels
-                                           : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  bool native = false, model = false;
+  for (std::size_t i = 0; i < resident.plan.intent.stage_count; ++i) {
+    const auto semantic = resident.plan.intent.stages[i].intent.semantic;
+    const bool stage_native = semantic == hal::SemanticEffectId::vignette ||
+                              semantic == hal::SemanticEffectId::mirror;
+    native |= stage_native;
+    model |= !stage_native;
+  }
+  const auto expected_provider =
+      model && native ? hal::SemanticEffectProviderId::invalid
+      : native ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+               : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+  if (setup.resident.plan.prepared_program.stage_count !=
+      resident.plan.intent.stage_count) {
+    std::cerr << "FAIL an enabled effect was unavailable during setup\n";
+    return 1;
+  }
   if (setup.readiness.selected_backend != hal::BackendId::cuda ||
       setup.readiness.provider != expected_provider) {
-    std::cerr << "FAIL prepared route did not select CUDA and its CUDA provider\n";
+    std::cerr
+        << "FAIL prepared route did not select CUDA and its CUDA provider\n";
     return 1;
   }
   const auto &domain = setup.readiness.execution_domain;
@@ -434,20 +381,22 @@ int Run(const Options &options) {
             << " device_id=" << domain.physical_device.device_id
             << " context_generation=" << domain.logical_context_generation
             << " allocator=" << static_cast<unsigned>(domain.allocator_family)
-            << " memory_handle=" << static_cast<unsigned>(domain.memory_handle_family)
+            << " memory_handle="
+            << static_cast<unsigned>(domain.memory_handle_family)
             << " queue_or_stream=" << domain.queue_or_stream_identity
             << " ownership=" << static_cast<unsigned>(domain.ownership_model)
             << " synchronization="
             << static_cast<unsigned>(domain.synchronization_protocol)
             << " adapter=" << domain.adapter_instance_id << '\n';
 
-  const auto input_bytes = static_cast<std::size_t>(options.input_width) *
-                           options.input_height * 3;
+  const auto input_bytes =
+      static_cast<std::size_t>(options.input_width) * options.input_height * 3;
   const auto output_bytes = static_cast<std::size_t>(options.output_width) *
                             options.output_height * 3;
   std::vector<std::byte> input(input_bytes);
   std::vector<std::byte> output(output_bytes);
-  for (std::uint32_t frame_index = 0; frame_index < options.frames; ++frame_index) {
+  for (std::uint32_t frame_index = 0; frame_index < options.frames;
+       ++frame_index) {
     for (std::size_t i = 0; i < input.size(); ++i)
       input[i] = static_cast<std::byte>((i + frame_index * 17u) & 0xffu);
     hal::HostFrameBinding binding;
@@ -471,9 +420,12 @@ int Run(const Options &options) {
               << " elapsed_ns=" << frame.frame_elapsed_ns
               << " uploads=" << frame.transfers.uploads
               << " final_readbacks=" << frame.transfers.final_readbacks
-              << " intermediate_readbacks=" << frame.transfers.intermediate_readbacks
-              << " intermediate_uploads=" << frame.transfers.intermediate_uploads
-              << " synchronizations=" << frame.transfers.synchronizations << '\n';
+              << " intermediate_readbacks="
+              << frame.transfers.intermediate_readbacks
+              << " intermediate_uploads="
+              << frame.transfers.intermediate_uploads
+              << " synchronizations=" << frame.transfers.synchronizations
+              << '\n';
     for (std::size_t stage_index = 0; stage_index < frame.stage_count;
          ++stage_index) {
       const auto &stage = frame.stages[stage_index];
@@ -483,9 +435,18 @@ int Run(const Options &options) {
                 << " reason=" << static_cast<unsigned>(stage.reason)
                 << " elapsed_ns=" << stage.elapsed_ns << '\n';
     }
-    if (frame.status != hal::StatusId::executed || !frame.output_ready) {
+    if (frame.status != hal::StatusId::executed || !frame.output_ready ||
+        frame.stage_count != resident.plan.intent.stage_count ||
+        frame.transfers.uploads != 1 || frame.transfers.final_readbacks != 1 ||
+        frame.transfers.intermediate_uploads != 0) {
       std::cerr << "FAIL frame execution did not produce writable RGB output\n";
       return 1;
+    }
+    for (std::size_t i = 0; i < frame.stage_count; ++i) {
+      if (frame.stages[i].status != hal::StageExecutionStatus::succeeded) {
+        std::cerr << "FAIL enabled stage did not succeed\n";
+        return 1;
+      }
     }
     if (options.effects == "vignette") {
       const auto expected = ReferenceResizeVignette(
@@ -505,7 +466,8 @@ int Run(const Options &options) {
     std::cout << "commit transport=in_memory status="
               << static_cast<unsigned>(commit)
               << " reason=" << static_cast<unsigned>(reason)
-              << " before_valid=" << before.valid << " after_valid=" << after.valid
+              << " before_valid=" << before.valid
+              << " after_valid=" << after.valid
               << " committed_sequence=" << after.capture_sequence << '\n';
     if (commit != hal::StatusId::ready || !after.valid ||
         after.capture_sequence != binding.capture_sequence) {
@@ -520,7 +482,8 @@ int Run(const Options &options) {
     checksum *= UINT64_C(1099511628211);
   }
   std::cout << "summary writer=in_memory_not_v4l2 attempts="
-            << final.execution_attempts << " successes=" << final.execution_successes
+            << final.execution_attempts
+            << " successes=" << final.execution_successes
             << " committed=" << final.committed_output_frames
             << " active_backend_frames=" << final.active_backend_frames
             << " fallback_frames=" << final.fallback_frames
@@ -530,7 +493,8 @@ int Run(const Options &options) {
             << " cpu_tail_boundaries=" << final.transfers.cpu_tail_boundaries
             << " latency_samples=" << final.frame_latency.samples
             << " latency_total_ns=" << final.frame_latency.total_ns
-            << " output_rgb_fnv1a64=" << std::hex << checksum << std::dec << '\n';
+            << " output_rgb_fnv1a64=" << std::hex << checksum << std::dec
+            << '\n';
   return final.committed_output_frames == options.frames &&
                  final.active_backend_frames == options.frames &&
                  final.fallback_frames == 0
@@ -547,8 +511,9 @@ int main(int argc, char **argv) {
     return 2;
   }
   if (!options.require) {
-    std::cout << "[SKIP] Open CUDA production smoke requires "
-                 "STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE=1 or --require\n";
+    std::cout
+        << "[SKIP] Open CUDA production smoke requires "
+           "STUDIOCAST_REQUIRE_OPEN_CUDA_PRODUCTION_SMOKE=1 or --require\n";
     return 77;
   }
   return Run(options);

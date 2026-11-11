@@ -46,6 +46,7 @@ struct FakeDriver {
   int context_queries = 0;
   int context_releases = 0;
   int fail_event_create_call = -1;
+  cuda::CUresult event_record_result = cuda::CUDA_SUCCESS;
   int fail_copy_call = -1;
   cuda::CUresult copy_result = cuda::CUDA_SUCCESS;
   cuda::CUresult query_result = cuda::CUDA_SUCCESS;
@@ -92,7 +93,7 @@ cuda::CUresult FakeCopy(const cuda::CUDA_MEMCPY2D *copy,
     g_fake->copy_streams[index] = stream;
     const int call = g_fake->copy_calls++;
     return call == g_fake->fail_copy_call ? cuda::CUDA_ERROR_OUT_OF_MEMORY
-                                         : g_fake->copy_result;
+                                          : g_fake->copy_result;
   }
   return cuda::CUDA_ERROR_OUT_OF_MEMORY;
 }
@@ -151,7 +152,7 @@ cuda::CUresult FakeEventDestroy(cuda::CUevent) {
 cuda::CUresult FakeEventRecord(cuda::CUevent, cuda::CUstream) {
   if (g_fake)
     ++g_fake->event_records;
-  return cuda::CUDA_SUCCESS;
+  return g_fake->event_record_result;
 }
 cuda::CUresult FakeEventQuery(cuda::CUevent) {
   if (!g_fake)
@@ -790,28 +791,29 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   Support support;
   const auto prepared = support.Prepare(&driver, options);
   const int copies_before_resident = fake.copy_calls;
-  ok &= Expect(prepared.ok() &&
-                   support.BeginFrame(binding, 71).ok() &&
-                   support.EnqueueUpload(binding, 0x4000, 16).status ==
-                       Support::Status::invalid_sequence &&
-                   fake.copy_calls == copies_before_resident &&
-                   support.SubmitResidentWork(binding).ok() &&
-                   support.RecordStageBegin(binding, 0).ok() &&
-                   support.RecordStageEnd(binding, 0).ok() &&
-                   support.EnqueueReadbackAt(binding, 0, 0x5001, 8).status ==
-                       Support::Status::invalid_sequence &&
-                   support.EnqueueReadbackAt(binding, 0, 0x5000, 8).ok() &&
-                   support.EnqueueReadbackAt(binding, 1, 0x6000, 12).ok() &&
-                   support.EnqueueReadbackAt(binding, 2, 0x7000, 8).ok() &&
-                   support.RecordCompletion(binding).ok() &&
-                   support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
-               "three prepared readbacks should complete in order");
-  ok &= Expect(support.counters().frame_readbacks == 3 &&
-                   support.counters().frame_final_readbacks == 0 &&
-                   fake.copies[0].dstHost == support.readback_data() &&
-                   fake.copies[1].dstHost ==
-                       static_cast<std::byte *>(support.readback_data()) + 8,
-               "batch readbacks should report actual copies and frozen offsets");
+  ok &=
+      Expect(prepared.ok() && support.BeginFrame(binding, 71).ok() &&
+                 support.EnqueueUpload(binding, 0x4000, 16).status ==
+                     Support::Status::invalid_sequence &&
+                 fake.copy_calls == copies_before_resident &&
+                 support.SubmitResidentWork(binding).ok() &&
+                 support.RecordStageBegin(binding, 0).ok() &&
+                 support.RecordStageEnd(binding, 0).ok() &&
+                 support.EnqueueReadbackAt(binding, 0, 0x5001, 8).status ==
+                     Support::Status::invalid_sequence &&
+                 support.EnqueueReadbackAt(binding, 0, 0x5000, 8).ok() &&
+                 support.EnqueueReadbackAt(binding, 1, 0x6000, 12).ok() &&
+                 support.EnqueueReadbackAt(binding, 2, 0x7000, 8).ok() &&
+                 support.RecordCompletion(binding).ok() &&
+                 support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
+             "three prepared readbacks should complete in order");
+  ok &=
+      Expect(support.counters().frame_readbacks == 3 &&
+                 support.counters().frame_final_readbacks == 0 &&
+                 fake.copies[0].dstHost == support.readback_data() &&
+                 fake.copies[1].dstHost ==
+                     static_cast<std::byte *>(support.readback_data()) + 8,
+             "batch readbacks should report actual copies and frozen offsets");
 
   ok &= Expect(support.BeginFrame(binding, 72).ok() &&
                    support.SubmitResidentWork(binding).ok() &&
@@ -823,20 +825,22 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
   const auto p1 = support.EnqueueReadbackAt(binding, 1, 0x6000, 12);
   const auto record = support.RecordCompletion(binding);
   const auto wait = support.WaitForCompletion(binding, WaitPolicyFor(&fake));
-  ok &= Expect(p0.ok() && p1.status == Support::Status::resource_exhausted &&
-                   record.ok() && wait.ok(),
-               "partial readback failure should record and wait for pending work");
+  ok &= Expect(
+      p0.ok() && p1.status == Support::Status::resource_exhausted &&
+          record.ok() && wait.ok(),
+      "partial readback failure should record and wait for pending work");
   ok &= Expect(support.BeginFrame(binding, 73).ok() &&
                    support.SubmitResidentWork(binding).ok() &&
                    support.RecordStageBegin(binding, 0).ok() &&
                    support.RecordStageEnd(binding, 0).ok(),
                "completed partial frame should permit safe reuse");
   fake.fail_copy_call = fake.copy_calls;
-  ok &= Expect(support.EnqueueReadbackAt(binding, 0, 0x5000, 8).status ==
-                       Support::Status::resource_exhausted &&
-                   support.RecordCompletion(binding).ok() &&
-                   support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
-               "resident work should quiesce when its first readback fails");
+  ok &=
+      Expect(support.EnqueueReadbackAt(binding, 0, 0x5000, 8).status ==
+                     Support::Status::resource_exhausted &&
+                 support.RecordCompletion(binding).ok() &&
+                 support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok(),
+             "resident work should quiesce when its first readback fails");
   auto overlap = options;
   overlap.readbacks[1].host_offset_bytes = 4;
   Support malformed;
@@ -872,14 +876,161 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
                    support.RecordCompletion(binding).ok(),
                "resident retry-cleanup frame should enqueue");
   fake.not_ready_queries = 100;
-  ok &= Expect(support.WaitForCompletion(binding, WaitPolicyFor(&fake)).status ==
-                       Support::Status::timeout &&
-                   support.Shutdown().status ==
-                       Support::Status::resource_exhausted,
-               "resident DMA should block cleanup while incomplete");
+  ok &= Expect(
+      support.WaitForCompletion(binding, WaitPolicyFor(&fake)).status ==
+              Support::Status::timeout &&
+          support.Shutdown().status == Support::Status::resource_exhausted,
+      "resident DMA should block cleanup while incomplete");
   fake.not_ready_queries = 0;
   ok &= Expect(support.Shutdown().ok(),
                "resident cleanup should retry after completion");
+  return ok;
+}
+
+bool TestFailedFrameFenceRetainsUntilQuiescent() {
+  FakeDriver fake;
+  cuda::CudaDriverApi driver;
+  if (!Expect(Initialize(&driver, &fake),
+              "failure fence fake CUDA must initialize"))
+    return false;
+  const auto binding = BindingFor(driver, 99);
+  Support support;
+  bool ok = Expect(support.Prepare(&driver, OptionsFor(binding)).ok() &&
+                       support.BeginFrame(binding, 1).ok() &&
+                       support.EnqueueUpload(binding, 0x4000, 16).ok(),
+                   "failure fence must start after submitted upload");
+  const auto event_records = fake.event_records;
+  auto foreign = binding;
+  ++foreign.owner_identity;
+  auto stale = binding;
+  ++stale.configuration_generation;
+  auto wrong_stream = binding;
+  wrong_stream.stream_identity += 1;
+  auto stale_context = binding;
+  ++stale_context.context.logical_generation;
+  ok = Expect(support.RecordFailedFrameCompletion(wrong_stream).status ==
+                      Support::Status::wrong_stream &&
+                  support.RecordFailedFrameCompletion(stale_context).status ==
+                      Support::Status::stale_context &&
+                  support.RecordFailedFrameCompletion(foreign).status ==
+                      Support::Status::foreign_owner &&
+                  support.RecordFailedFrameCompletion(stale).status ==
+                      Support::Status::stale_context &&
+                  fake.event_records == event_records,
+              "foreign or stale failure fence must fail before native calls") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  const auto frees = fake.pinned_frees;
+  ok = Expect(
+           support.RecordFailedFrameCompletion(binding).status ==
+                   Support::Status::resource_exhausted &&
+               support.Shutdown().status ==
+                   Support::Status::resource_exhausted &&
+               fake.pinned_frees == frees && support.prepared(),
+           "unproven failure fence must retain storage after record failure") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_SUCCESS;
+  ok = Expect(support.RecordFailedFrameCompletion(binding).ok(),
+              "failed frame without readback must receive retirement fence") &&
+       ok;
+  ok = Expect(
+           support.frame_reuse_blocked() &&
+               support.BeginFrame(binding, 2).status ==
+                   Support::Status::resource_exhausted &&
+               !support.WaitForCompletion(binding, WaitPolicyFor(&fake)).ok() &&
+               support.counters().frame_final_readbacks == 0,
+           "failure fence must not authorize reuse or writable output") &&
+       ok;
+  const auto fenced_records = fake.event_records;
+  const auto fenced_copies = fake.copy_calls;
+  bool frozen = !support.RecordStageBegin(binding, 0).ok();
+  frozen &= !support.RecordStageEnd(binding, 0).ok();
+  frozen &= !support.EnqueueUpload(binding, 0x4000, 16).ok();
+  frozen &= !support.EnqueueReadbackAt(binding, 0, 0x5000, 20).ok();
+  frozen &= !support.SubmitResidentWork(binding).ok();
+  ok = Expect(frozen && fake.event_records == fenced_records &&
+                  fake.copy_calls == fenced_copies,
+              "failure fence must freeze every normal enqueue and timing "
+              "operation") &&
+       ok;
+  fake.not_ready_queries = 1;
+  ok =
+      Expect(support.Shutdown().status == Support::Status::resource_exhausted &&
+                 support.prepared(),
+             "pending failed frame must retain complete storage") &&
+      ok;
+  ok = Expect(support.Shutdown().ok() && !support.prepared(),
+              "completed failure fence must permit retryable release") &&
+       ok;
+  Support query_lost;
+  ok = Expect(query_lost.Prepare(&driver, OptionsFor(binding)).ok() &&
+                  query_lost.BeginFrame(binding, 2).ok() &&
+                  query_lost.EnqueueUpload(binding, 0x4000, 16).ok() &&
+                  query_lost.RecordFailedFrameCompletion(binding).ok(),
+              "query-loss case must record a bound retirement fence") &&
+       ok;
+  fake.query_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  const auto query_lost_frees = fake.pinned_frees;
+  ok = Expect(!query_lost.Shutdown().ok() && query_lost.prepared() &&
+                  !query_lost.Shutdown().ok() && query_lost.prepared() &&
+                  fake.pinned_frees == query_lost_frees,
+              "failed-fence query device loss must never release unproven "
+              "storage") &&
+       ok;
+  fake.query_result = cuda::CUDA_SUCCESS;
+  Support device_lost;
+  ok = Expect(device_lost.Prepare(&driver, OptionsFor(binding)).ok() &&
+                  device_lost.BeginFrame(binding, 2).ok() &&
+                  device_lost.EnqueueUpload(binding, 0x4000, 16).ok(),
+              "device-loss failure fence must start with submitted work") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_ERROR_CONTEXT_IS_DESTROYED;
+  const auto lost_frees = fake.pinned_frees;
+  ok = Expect(device_lost.RecordFailedFrameCompletion(binding).status ==
+                      Support::Status::device_lost &&
+                  device_lost.Shutdown().status ==
+                      Support::Status::resource_exhausted &&
+                  device_lost.prepared() && fake.pinned_frees == lost_frees,
+              "device loss before retirement proof must retain the island") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_SUCCESS;
+  return ok;
+}
+
+bool TestFailureFenceReplacesNormalCompletionProof() {
+  FakeDriver fake;
+  cuda::CudaDriverApi driver;
+  if (!Expect(Initialize(&driver, &fake),
+              "normal-proof fake CUDA must initialize"))
+    return false;
+  const auto binding = BindingFor(driver, 100);
+  Support support;
+  auto options = OptionsFor(binding);
+  options.resident_work = true;
+  bool ok = Expect(support.Prepare(&driver, options).ok() &&
+                       support.BeginFrame(binding, 1).ok() &&
+                       support.SubmitResidentWork(binding).ok() &&
+                       support.RecordCompletion(binding).ok() &&
+                       support.RecordStageBegin(binding, 0).ok(),
+                   "resident work may follow an early normal completion event");
+  const auto records = fake.event_records;
+  const auto frees = fake.pinned_frees;
+  fake.event_record_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  ok = Expect(support.RecordFailedFrameCompletion(binding).status ==
+                      Support::Status::resource_exhausted &&
+                  fake.event_records == records + 1 &&
+                  support.Shutdown().status ==
+                      Support::Status::resource_exhausted &&
+                  support.prepared() && fake.pinned_frees == frees,
+              "first failed latch must replace old proof and retain on "
+              "fresh-record failure") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_SUCCESS;
+  ok = Expect(
+           support.RecordFailedFrameCompletion(binding).ok() &&
+               fake.event_records == records + 2 && support.Shutdown().ok(),
+           "retry must record a fresh bound retirement fence before release") &&
+       ok;
   return ok;
 }
 
@@ -887,6 +1038,8 @@ bool TestPreparedBatchReadbacksAndPartialFailureQuiescence() {
 
 int main() {
   bool ok = true;
+  ok = TestFailureFenceReplacesNormalCompletionProof() && ok;
+  ok = TestFailedFrameFenceRetainsUntilQuiescent() && ok;
   ok = TestOptionalSymbolsDoNotBreakLegacyInitialization() && ok;
   ok = TestPreparedHappyPathHasExactTransfersWaitAndTiming() && ok;
   ok = TestBindingValidationFailsBeforeCudaCalls() && ok;

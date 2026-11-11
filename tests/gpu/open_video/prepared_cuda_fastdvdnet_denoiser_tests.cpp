@@ -154,6 +154,17 @@ int main() {
     info.input_elem_types={1,1};info.output_elem_types={1};
     ok=Check(ValidatePreparedFastDvdnetSessionMetadata(info,model,selected),
              "dynamic manifest metadata must accept setup-selected H/W bindings")&&ok;
+    auto unresolved_batch=info;unresolved_batch.input_shapes[0][0]=-1;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(unresolved_batch,model,selected),
+             "unresolved dynamic batch cannot enter the single-frame pipeline")&&ok;
+    auto specialized=info;
+    specialized.input_shapes={{1,15,8,8},{1,1,8,8}};specialized.output_shapes={{1,3,8,8}};
+    auto specialized_contract=model;specialized_contract.setup_specialized_dynamic_hw=true;
+    ok=Check(ValidatePreparedFastDvdnetSessionMetadata(specialized,specialized_contract,selected),
+             "reviewed setup specialization must validate exact selected extents")&&ok;
+    specialized.output_shapes[0][3]=12;
+    ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(specialized,specialized_contract,selected),
+             "specialization must not accept a mismatched bound output extent")&&ok;
     auto bad=info;bad.input_names[0]="input";
     ok=Check(!ValidatePreparedFastDvdnetSessionMetadata(bad,model,selected),"wrong graph input name must fail")&&ok;
     bad=info;bad.input_shapes[0][1]=3;

@@ -3,11 +3,16 @@
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/cuda_tensor.h"
 #include "core/cuda/kernels/open_cuda_vb_kernels.h"
+#include "core/cuda/kernels/prepared_matte_bounds.h"
+#include "core/cuda/kernels/prepared_mirror.h"
 #include "core/cuda/kernels/prepared_open_cuda_vb_kernel_bundle.h"
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
-#include "core/cuda/kernels/resize_bilinear.h"
 #include "core/cuda/kernels/prepared_vignette.h"
+#include "core/cuda/kernels/resize_bilinear.h"
 #include "core/open_video/matting_session.h"
+#include "core/open_video/prepared_cuda_auto_frame.h"
+#include "core/open_video/prepared_cuda_eye_contact.h"
+#include "core/open_video/prepared_cuda_fastdvdnet_denoiser.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 
 #include <algorithm>
@@ -64,11 +69,17 @@ bool SameHalModel(
 }
 
 bool UsesMatting(SemanticEffectId semantic) noexcept {
-  return semantic != SemanticEffectId::vignette;
+  return semantic == SemanticEffectId::virtual_background_blur ||
+         semantic == SemanticEffectId::virtual_background_remove ||
+         semantic == SemanticEffectId::virtual_background_replace ||
+         semantic == SemanticEffectId::virtual_key_light;
 }
 
 SemanticEffectProviderId ProviderFor(SemanticEffectId semantic) noexcept {
-  return UsesMatting(semantic) ? kOrtProvider : kNativeProvider;
+  return semantic == SemanticEffectId::vignette ||
+                 semantic == SemanticEffectId::mirror
+             ? kNativeProvider
+             : kOrtProvider;
 }
 
 bool ZeroModel(const hal::ModelArtifactIdentity &model) noexcept {
@@ -111,15 +122,6 @@ bool BudgetContains(const hal::ResourceBudget &available,
          available.in_flight_slots >= required.in_flight_slots;
 }
 
-bool SameBudget(const hal::ResourceBudget &lhs,
-                const hal::ResourceBudget &rhs) noexcept {
-  return lhs.persistent_bytes == rhs.persistent_bytes &&
-         lhs.scratch_bytes == rhs.scratch_bytes &&
-         lhs.upload_staging_bytes == rhs.upload_staging_bytes &&
-         lhs.readback_staging_bytes == rhs.readback_staging_bytes &&
-         lhs.resource_count == rhs.resource_count &&
-         lhs.in_flight_slots == rhs.in_flight_slots;
-}
 
 bool CheckedMul(std::uint64_t lhs, std::uint64_t rhs,
                 std::uint64_t *out) noexcept {
@@ -207,9 +209,9 @@ PreparedOpenCudaVbPlan BuildPreparedOpenCudaVirtualBackgroundPlan(
                    input.alpha_feather_pitch_bytes < frame_alpha_row)) ||
       input.upload_staging_bytes < frame_rgb_active ||
       input.readback_staging_bytes <
-          (final_resize ? input.final_output_width *
-                              input.final_output_height * 3u
-                        : frame_rgb_active) ||
+          (final_resize
+               ? input.final_output_width * input.final_output_height * 3u
+               : frame_rgb_active) ||
       (blur && (input.blur_scratch_pitch_bytes < frame_rgb_row ||
                 input.blurred_pitch_bytes < frame_rgb_row)) ||
       (replace && (input.replacement_source_pitch_bytes == 0 ||
@@ -488,15 +490,38 @@ bool ExactCudaDomain(const hal::ExecutionDomainId &domain,
 ReasonId ValidateProductionProgramInternal(
     const hal::PreparedProgram &program,
     const PreparedOpenCudaProductionConfig &config) noexcept {
-  if (program.stage_count == 0 || program.stage_count > 3 ||
-      program.cpu_tail_count != 1 || program.temporal.temporal ||
-      program.temporal.history_frames != 0 || !program.requires_upload ||
+  if (program.stage_count == 0 ||
+      program.stage_count > hal::kMaxPreparedStages ||
+      program.cpu_tail_count != 1 || !program.requires_upload ||
       !program.requires_final_readback ||
       program.requested_backend != BackendId::cuda ||
       !program.strict_execution_domain ||
       program.requested_execution_domain != program.execution_domain) {
     return ReasonId::malformed_contract;
   }
+  unsigned last_rank = 0;
+  for (std::size_t i = 0; i < program.stage_count; ++i) {
+    const auto rank =
+        PreparedOpenCudaCanonicalStageRank(program.stages[i].semantic);
+    if (rank == 0 || rank <= last_rank)
+      return ReasonId::semantic_effect_unsupported;
+    last_rank = rank;
+  }
+  bool temporal_effect = config.dependencies.face_artifact.Valid() ||
+                         config.dependencies.eye_left_artifact.Valid() ||
+                         config.dependencies.denoise_artifact.Valid();
+  for (std::size_t i = 0; i < program.stage_count; ++i)
+    temporal_effect |=
+        program.stages[i].semantic == SemanticEffectId::auto_frame ||
+        program.stages[i].semantic == SemanticEffectId::eye_contact ||
+        program.stages[i].semantic == SemanticEffectId::video_noise_removal;
+  bool native_only = true;
+  for (std::size_t i = 0; i < program.stage_count; ++i)
+    native_only &= ProviderFor(program.stages[i].semantic) == kNativeProvider;
+  // An optional temporal stage may be omitted from the compact executable
+  // program while the canonical request retains its reset policy.
+  if (program.temporal.temporal && !temporal_effect && !native_only)
+    return ReasonId::malformed_contract;
   if (!ExactCudaDomain(program.execution_domain, config.adapter_instance_id,
                        config.stream_identity) ||
       program.owner_adapter_instance_id != config.adapter_instance_id ||
@@ -505,25 +530,17 @@ ReasonId ValidateProductionProgramInternal(
           reinterpret_cast<std::uintptr_t>(config.prepared_stream)) {
     return ReasonId::wrong_execution_domain;
   }
-  const auto vb = [](SemanticEffectId semantic) {
-    return semantic == SemanticEffectId::virtual_background_blur ||
-           semantic == SemanticEffectId::virtual_background_remove ||
-           semantic == SemanticEffectId::virtual_background_replace;
-  };
-  const bool vignette_last = program.stages[program.stage_count - 1].semantic ==
-                             SemanticEffectId::vignette;
-  const std::size_t model_count = program.stage_count - (vignette_last ? 1u : 0u);
-  if (!((model_count == 0 && vignette_last) ||
-        (model_count == 1 &&
-         (vb(program.stages[0].semantic) ||
-          program.stages[0].semantic == SemanticEffectId::virtual_key_light)) ||
-        (model_count == 2 && vb(program.stages[0].semantic) &&
-         program.stages[1].semantic == SemanticEffectId::virtual_key_light))) {
-    return ReasonId::semantic_effect_unsupported;
+  bool has_matting = false, has_model = false, has_native = false;
+  for (std::size_t i = 0; i < program.stage_count; ++i) {
+    const auto semantic = program.stages[i].semantic;
+    has_matting |= UsesMatting(semantic);
+    has_native |= ProviderFor(semantic) == kNativeProvider;
+    has_model |= ProviderFor(semantic) == kOrtProvider;
   }
-  const auto aggregate_provider =
-      model_count != 0 && vignette_last ? SemanticEffectProviderId::invalid
-      : model_count != 0 ? kOrtProvider : kNativeProvider;
+  const auto aggregate_provider = has_model && has_native
+                                      ? SemanticEffectProviderId::invalid
+                                  : has_model ? kOrtProvider
+                                              : kNativeProvider;
   if (program.requested_provider != aggregate_provider)
     return ReasonId::semantic_provider_unavailable;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
@@ -537,26 +554,34 @@ ReasonId ValidateProductionProgramInternal(
         (!stage.required &&
          stage.failure_action != FailureAction::fail_open_preserve_input))
       return ReasonId::malformed_contract;
-    if ((UsesMatting(stage.semantic) &&
-         !SameHalModel(stage.model, config.model_artifact)) ||
-        (!UsesMatting(stage.semantic) && !ZeroModel(stage.model)))
+    const auto *artifact =
+        UsesMatting(stage.semantic) ? &config.model_artifact
+        : stage.semantic == SemanticEffectId::auto_frame
+            ? (config.dependencies.face_artifact.Valid()
+                   ? &config.dependencies.face_artifact
+                   : &config.model_artifact)
+        : stage.semantic == SemanticEffectId::eye_contact
+            ? &config.dependencies.eye_left_artifact
+        : stage.semantic == SemanticEffectId::video_noise_removal
+            ? &config.dependencies.denoise_artifact
+            : nullptr;
+    if ((artifact && !SameHalModel(stage.model, *artifact)) ||
+        (!artifact && !ZeroModel(stage.model)))
       return ReasonId::reconfiguration_required;
+    if (!artifact && stage.semantic != SemanticEffectId::vignette &&
+        stage.semantic != SemanticEffectId::mirror)
+      return ReasonId::semantic_effect_unsupported;
   }
-  if ((model_count != 0 &&
-       (program.invalidation_key.model_artifact_hash == 0 ||
-        program.invalidation_key.model_artifact_hash != config.model_artifact_hash)) ||
-      (model_count == 0 &&
-       (program.invalidation_key.model_artifact_hash != 0 ||
-        config.model_artifact_hash != 0)) ||
+  if ((has_model && (program.invalidation_key.model_artifact_hash == 0 ||
+                     program.invalidation_key.model_artifact_hash !=
+                         config.model_artifact_hash ||
+                     program.invalidation_key.generations.model !=
+                         config.model_preprocess_generation)) ||
       program.invalidation_key.generations.configuration !=
           config.configuration_generation ||
-      (model_count != 0 &&
-       program.invalidation_key.generations.model !=
-           config.model_preprocess_generation) ||
       program.invalidation_key.generations.context !=
-          program.execution_domain.logical_context_generation) {
+          program.execution_domain.logical_context_generation)
     return ReasonId::reconfiguration_required;
-  }
   if (!TightRgb(program.host_input, hal::HostCoherence::coherent,
                 hal::Mutability::read_only) ||
       !TightRgb(program.host_output, hal::HostCoherence::coherent,
@@ -566,9 +591,9 @@ ReasonId ValidateProductionProgramInternal(
   }
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
-    const auto &expected_output =
-        index + 1 == program.stage_count ? program.host_output
-                                         : program.host_input;
+    const auto &expected_output = index + 1 == program.stage_count
+                                      ? program.host_output
+                                      : program.host_input;
     if (stage.input.kind != hal::StageIoKind::image ||
         stage.output.kind != hal::StageIoKind::image ||
         !ResidentRgb(stage.input.image, hal::Mutability::read_only) ||
@@ -588,10 +613,8 @@ ReasonId ValidateProductionProgramInternal(
        tail.boundary_index != program.stage_count)) {
     return ReasonId::cpu_tail_required;
   }
-  if (model_count == 0)
-    return (!config.model_artifact.Valid() && config.model_preprocess_generation == 0)
-               ? ReasonId::none
-               : ReasonId::capability_evidence_incomplete;
+  if (!has_matting && !config.model_artifact.Valid())
+    return ReasonId::none;
   if (!config.model_pack || !config.model_artifact.Valid() ||
       config.model_pack->registry_generation !=
           config.model_artifact.registry_generation ||
@@ -822,6 +845,14 @@ PreprocessSpec(const open_video::ModelPack &pack) noexcept {
   return result;
 }
 
+bool HasSemantic(const hal::PreparedProgram &program,
+                 SemanticEffectId semantic) noexcept {
+  for (std::size_t i = 0; i < program.stage_count; ++i)
+    if (program.stages[i].semantic == semantic)
+      return true;
+  return false;
+}
+
 class ProductionPreparedOpenCudaRuntime final
     : public IPreparedOpenCudaRuntime {
 public:
@@ -848,11 +879,7 @@ public:
   Prepare(const hal::PreparedProgram &program,
           const PreparedOpenCudaProductionConfig &config) noexcept override {
     PreparedOpenCudaRuntimePrepareResult result;
-    setup_failure_component_ =
-        program.stage_count != 0 &&
-                program.stages[0].semantic == SemanticEffectId::vignette
-            ? OpenCudaSetupComponentId::native_vignette
-            : OpenCudaSetupComponentId::shared_matting;
+    setup_failure_component_ = OpenCudaSetupComponentId::aggregate_island;
     result.reason = ValidatePreparedOpenCudaProductionProgram(program, config);
     if (result.reason != ReasonId::none) {
       result.status = RuntimeStatus::malformed_contract;
@@ -885,7 +912,19 @@ public:
       candidate->program = program;
       candidate->config = config;
       candidate->config.model_pack = nullptr;
-      const bool model_free = program.stages[0].semantic == SemanticEffectId::vignette;
+      std::size_t matting_index = program.stage_count;
+      for (std::size_t i = 0; i < program.stage_count; ++i)
+        if (UsesMatting(program.stages[i].semantic)) {
+          matting_index = i;
+          break;
+        }
+      const bool model_free = !config.model_artifact.Valid();
+      const auto matting_semantic =
+          matting_index == program.stage_count
+              ? SemanticEffectId::virtual_key_light
+              : program.stages[matting_index].semantic;
+      if (matting_index == program.stage_count)
+        matting_index = 0;
       if (!model_free) {
         candidate->model_pack = *config.model_pack;
         ++telemetry_.allocation_requests;
@@ -937,16 +976,23 @@ public:
         if (!candidate->input.Allocate(config.driver, width, height,
                                        cuda::PixelFormatGpu::rgb_u8, &error) ||
             !candidate->output.Allocate(config.driver, width, height,
-                                        cuda::PixelFormatGpu::rgb_u8, &error) ||
+                                        cuda::PixelFormatGpu::rgb_u8, &error)) {
+          CleanupCandidate(candidate.get());
+          return SetupFailure(RuntimeStatus::not_prepared,
+                              ReasonId::capability_evidence_incomplete);
+        }
+        if (HasSemantic(program, SemanticEffectId::vignette) &&
             !cuda::kernels::PrepareVignetteKernel(
                 *config.driver, native_context, candidate->stream,
                 &candidate->vignette, &error)) {
           CleanupCandidate(candidate.get());
           return SetupFailure(RuntimeStatus::not_prepared,
-                              ReasonId::capability_evidence_incomplete);
+                              ReasonId::capability_evidence_incomplete,
+                              OpenCudaSetupComponentId::native_vignette);
         }
-        const bool final_resize = program.host_output.width != program.host_input.width ||
-                                  program.host_output.height != program.host_input.height;
+        const bool final_resize =
+            program.host_output.width != program.host_input.width ||
+            program.host_output.height != program.host_input.height;
         if (final_resize &&
             (!cuda::kernels::PrepareResizeBilinearKernel(
                  *config.driver, native_context, candidate->stream,
@@ -964,17 +1010,23 @@ public:
         transfer_options.binding.stream = candidate->stream;
         transfer_options.binding.stream_identity = config.stream_identity;
         transfer_options.binding.owner_identity = config.adapter_instance_id;
-        transfer_options.binding.configuration_generation = config.configuration_generation;
-        transfer_options.upload_row_bytes = program.host_input.planes[0].row_stride_bytes;
+        transfer_options.binding.configuration_generation =
+            config.configuration_generation;
+        transfer_options.upload_row_bytes =
+            program.host_input.planes[0].row_stride_bytes;
         transfer_options.upload_rows = program.host_input.height;
-        transfer_options.readback_row_bytes = program.host_output.planes[0].row_stride_bytes;
+        transfer_options.readback_row_bytes =
+            program.host_output.planes[0].row_stride_bytes;
         transfer_options.readback_rows = program.host_output.height;
-        transfer_options.timed_stage_count = static_cast<std::uint32_t>(program.stage_count);
+        transfer_options.timed_stage_count =
+            static_cast<std::uint32_t>(program.stage_count);
         transfer_options.budget.max_pinned_host_bytes =
-            program.host_input.planes[0].size_bytes + program.host_output.planes[0].size_bytes;
+            program.host_input.planes[0].size_bytes +
+            program.host_output.planes[0].size_bytes;
         transfer_options.budget.max_events =
             static_cast<std::uint32_t>(program.stage_count * 2u + 1u);
-        const auto prepared = candidate->transfer.Prepare(config.driver, transfer_options);
+        const auto prepared =
+            candidate->transfer.Prepare(config.driver, transfer_options);
         if (!prepared.ok()) {
           CleanupCandidate(candidate.get());
           return SetupFailure(TransferStatus(prepared.status),
@@ -1001,17 +1053,31 @@ public:
           CleanupCandidate(candidate.get());
           return SetupFailure(budget_status, budget_reason);
         }
+        candidate->reserved_budget.resource_count +=
+            static_cast<std::uint32_t>(2u * (program.stage_count - 1u));
+        if (!PrepareExtras(candidate.get(), native_context, &error)) {
+          const auto cleanup = CleanupSlot(candidate.get());
+          if (cleanup == RuntimeStatus::completion_pending) {
+            candidate->retired = true;
+            *destination = std::move(candidate);
+          }
+          return SetupFailure(cleanup == RuntimeStatus::completion_pending
+                                  ? cleanup
+                                  : RuntimeStatus::not_prepared,
+                              ReasonId::capability_evidence_incomplete);
+        }
         candidate->handle.handle_id = next_handle_id_++;
         candidate->handle.program_id = program.program_id;
         candidate->handle.invalidation_key = program.invalidation_key;
         candidate->handle.execution_domain = program.execution_domain;
-        candidate->handle.opaque[0] = reinterpret_cast<std::uintptr_t>(candidate->stream);
+        candidate->handle.opaque[0] =
+            reinterpret_cast<std::uintptr_t>(candidate->stream);
         result.status = RuntimeStatus::ready;
         result.reason = ReasonId::none;
         result.handle = candidate->handle;
         result.evidence.status = RuntimeStatus::ready;
-        result.evidence.semantic = SemanticEffectId::vignette;
-        result.evidence.provider = kNativeProvider;
+        result.evidence.semantic = program.stages[0].semantic;
+        result.evidence.provider = program.requested_provider;
         result.evidence.execution_domain = program.execution_domain;
         result.evidence.reserved_budget = candidate->reserved_budget;
         result.evidence.strict_cuda_only = true;
@@ -1021,12 +1087,17 @@ public:
         result.evidence.setup_warmup_complete = true;
         result.evidence.device_postprocess = true;
         result.evidence.one_upload_one_readback = true;
-        result.evidence.no_intermediate_crossings = true;
+        result.evidence.no_intermediate_crossings =
+            !candidate->yunet.ready() && !candidate->auto_frame_ready;
+        result.evidence.model_artifact = config.model_artifact;
+        result.evidence.inference_only_frame_path = true;
+        result.evidence.device_preprocess = true;
         result.evidence.single_in_flight = true;
         *destination = std::move(candidate);
         return result;
       }
 
+      setup_failure_component_ = OpenCudaSetupComponentId::shared_matting;
       const auto &image = program.stages[0].input.image;
       const auto &matting = *candidate->model_pack.matting;
       const std::uint64_t frame_width = image.width;
@@ -1050,7 +1121,7 @@ public:
       PreparedOpenCudaVbPlanInput preflight;
       preflight.island_stage_count =
           static_cast<std::uint32_t>(program.stage_count);
-      preflight.semantic = program.stages[0].semantic;
+      preflight.semantic = matting_semantic;
       preflight.frame_width = frame_width;
       preflight.frame_height = frame_height;
       preflight.model_width = model_width;
@@ -1069,10 +1140,10 @@ public:
       const int clamped_strength =
           std::clamp(config.strength, video::effects::contract::kVbStrengthMin,
                      video::effects::contract::kVbStrengthMax);
-      const bool replace = program.stages[0].semantic ==
-                           SemanticEffectId::virtual_background_replace;
+      const bool replace =
+          matting_semantic == SemanticEffectId::virtual_background_replace;
       const bool key_light =
-          program.stages[0].semantic == SemanticEffectId::virtual_key_light;
+          matting_semantic == SemanticEffectId::virtual_key_light;
       const bool feather =
           !key_light && std::min(4, clamped_strength / 16) != 0;
       preflight.alpha_scratch_pitch_bytes = feather ? frame_alpha_row : 0;
@@ -1140,8 +1211,8 @@ public:
         return SetupFailure(RuntimeStatus::not_prepared,
                             ReasonId::capability_evidence_incomplete);
       }
-      const bool blur = program.stages[0].semantic ==
-                        SemanticEffectId::virtual_background_blur;
+      const bool blur =
+          matting_semantic == SemanticEffectId::virtual_background_blur;
       if (blur && (!candidate->blur_tmp.Allocate(config.driver, width, height,
                                                  cuda::PixelFormatGpu::rgb_u8,
                                                  &error) ||
@@ -1303,11 +1374,10 @@ public:
         return SetupFailure(RuntimeStatus::not_prepared,
                             ReasonId::capability_evidence_incomplete);
       }
-      if (program.stages[program.stage_count - 1].semantic ==
-              SemanticEffectId::vignette &&
-          !cuda::kernels::PrepareVignetteKernel(
-              *config.driver, native_context, candidate->stream,
-              &candidate->vignette, &error)) {
+      if (HasSemantic(program, SemanticEffectId::vignette) &&
+          !cuda::kernels::PrepareVignetteKernel(*config.driver, native_context,
+                                                candidate->stream,
+                                                &candidate->vignette, &error)) {
         CleanupCandidate(candidate.get());
         return SetupFailure(RuntimeStatus::not_prepared,
                             ReasonId::capability_evidence_incomplete,
@@ -1380,7 +1450,7 @@ public:
       exact_plan_input.replacement_frame_pitch_bytes =
           candidate->replacement_frame.pitch;
       for (std::size_t index = 0; index < program.stage_count; ++index) {
-        if (program.stages[index].semantic == SemanticEffectId::vignette)
+        if (!UsesMatting(program.stages[index].semantic))
           continue;
         exact_plan_input.semantic = program.stages[index].semantic;
         candidate->postprocess_plans[index] =
@@ -1396,9 +1466,22 @@ public:
                               ReasonId::capability_evidence_incomplete);
         }
       }
-      const hal::ResourceBudget required =
-          candidate->postprocess_plans[0].required_budget;
+      exact_plan_input.semantic = matting_semantic;
+      const auto dependency_plan =
+          BuildPreparedOpenCudaVirtualBackgroundPlan(exact_plan_input);
+      const hal::ResourceBudget required = dependency_plan.required_budget;
       candidate->reserved_budget = required;
+      if (!PrepareExtras(candidate.get(), native_context, &error)) {
+        const auto cleanup = CleanupSlot(candidate.get());
+        if (cleanup == RuntimeStatus::completion_pending) {
+          candidate->retired = true;
+          *destination = std::move(candidate);
+        }
+        return SetupFailure(cleanup == RuntimeStatus::completion_pending
+                                ? cleanup
+                                : RuntimeStatus::not_prepared,
+                            ReasonId::capability_evidence_incomplete);
+      }
       candidate->handle.handle_id = next_handle_id_++;
       if (candidate->handle.handle_id == 0)
         candidate->handle.handle_id = next_handle_id_++;
@@ -1416,15 +1499,12 @@ public:
       result.evidence.api_version = kPreparedOpenCudaRuntimeApiVersion;
       result.evidence.status = RuntimeStatus::ready;
       result.evidence.semantic = program.stages[0].semantic;
-      result.evidence.provider =
-          program.stages[program.stage_count - 1].semantic ==
-                  SemanticEffectId::vignette
-              ? SemanticEffectProviderId::invalid
-              : kOrtProvider;
+      result.evidence.provider = program.requested_provider;
       result.evidence.execution_domain = program.execution_domain;
       result.evidence.model_artifact = config.model_artifact;
-      result.evidence.reserved_budget = required;
-      result.evidence.geometry_plan = candidate->postprocess_plans[0];
+      result.evidence.reserved_budget = candidate->reserved_budget;
+      result.evidence.geometry_plan =
+          candidate->postprocess_plans[matting_index];
       result.evidence.strict_cuda_only = true;
       result.evidence.user_stream_bound = true;
       result.evidence.cpu_provider_fallback_disabled = true;
@@ -1434,7 +1514,8 @@ public:
       result.evidence.device_preprocess = true;
       result.evidence.device_postprocess = true;
       result.evidence.one_upload_one_readback = true;
-      result.evidence.no_intermediate_crossings = true;
+      result.evidence.no_intermediate_crossings =
+          !candidate->yunet.ready() && !candidate->auto_frame_ready;
       result.evidence.single_in_flight = true;
       *destination = std::move(candidate);
       return result;
@@ -1457,7 +1538,22 @@ public:
     }
     const std::uint64_t frame_started_ns =
         MonotonicNowNanoseconds(slot->config);
+    bool frame_work_submitted = false;
+    bool frame_completion_recorded = false;
     const auto finish = [&](PreparedOpenCudaRuntimeFrameResult value) noexcept {
+      // Failed component work still needs an outer retirement fence. Recording
+      // this event does not wait, and shutdown retains storage until it
+      // completes.
+      if (frame_work_submitted && !frame_completion_recorded) {
+        const auto fence =
+            slot->transfer.RecordFailedFrameCompletion(slot->transfer_binding);
+        frame_completion_recorded = fence.ok();
+        if (!fence.ok() && value.status != RuntimeStatus::device_lost) {
+          value.status = RuntimeStatus::synchronization_failed;
+          value.reason = ReasonId::synchronization_failed;
+          value.output_valid = false;
+        }
+      }
       FinishFrameTiming(slot->config, frame_started_ns, &value);
       return value;
     };
@@ -1513,6 +1609,7 @@ public:
                                     PreparedOpenCudaOperationId::upload));
     std::memcpy(slot->transfer.upload_data(), frame.input,
                 slot->transfer.upload_size_bytes());
+    frame_work_submitted = true;
     const auto upload = slot->transfer.EnqueueUpload(
         slot->transfer_binding, slot->input.ptr, slot->input.pitch);
     if (!upload.ok())
@@ -1523,67 +1620,14 @@ public:
     RuntimeStatus analysis_status = RuntimeStatus::executed;
     bool analysis_ran = false;
     bool inference_only = false;
+    bool matte_attempted = false;
+    slot->matte_available = false;
+    slot->matte_attempted = false;
+    slot->analysis_cache.BeginFrame(frame.capture_sequence);
+    slot->tracked_center_x = slot->tracked_center_y = .5F;
     const std::uint32_t disabled_mask =
         frame.disabled_stage_mask | (frame.stage_disabled ? 1u : 0u);
-    bool model_stage_enabled = false;
-    for (std::size_t index = 0; index < slot->program.stage_count; ++index)
-      model_stage_enabled |= UsesMatting(slot->program.stages[index].semantic) &&
-          (disabled_mask & (std::uint32_t{1} << index)) == 0;
-    if (model_stage_enabled) {
-      analysis_ran = true;
-      cuda::kernels::PreparedPreprocessKernelStatus preprocess_status{};
-      if (!slot->preprocess.Execute(slot->preprocess_binding,
-                                    slot->preprocess_spec, slot->input,
-                                    slot->input_tensor, &preprocess_status)) {
-        analysis_status =
-            preprocess_status ==
-                    cuda::kernels::PreparedPreprocessKernelStatus::device_lost
-                ? RuntimeStatus::device_lost
-                : RuntimeStatus::preprocess_failed;
-      } else {
-        inference_only = true;
-        const bool cancelled = slot->config.wait_policy.cancel_requested &&
-                               slot->config.wait_policy.cancel_requested(
-                                   slot->config.wait_policy.callback_context);
-        const auto inference = slot->session->RunPreparedInferenceTyped(
-            slot->stream, &slot->alpha, slot->matting_evidence, cancelled);
-        if (!inference.ok()) {
-          if (inference.status ==
-              MattingPreparedRunStatus::cancelled_or_shutdown) {
-            analysis_status = cancelled ? RuntimeStatus::cancelled
-                                        : RuntimeStatus::stop_requested;
-          } else if (inference.quarantine !=
-                     MattingPreparedRunQuarantine::none) {
-            analysis_status = RuntimeStatus::device_lost;
-          } else {
-            analysis_status = RuntimeStatus::inference_failed;
-          }
-        }
-      }
-    }
-    if (analysis_status == RuntimeStatus::device_lost) {
-      slot->quarantined = true;
-      result.status = RuntimeStatus::device_lost;
-      result.reason = ReasonId::device_lost;
-      result.stage_failure_status = analysis_status;
-      result.stage_failure_reason = ReasonId::device_lost;
-      result.failed_operation = PreparedOpenCudaOperationId::inference;
-      result.analysis_ran = analysis_ran;
-      result.inference_only_path = inference_only;
-      return finish(result);
-    }
-    if (analysis_status == RuntimeStatus::cancelled ||
-        analysis_status == RuntimeStatus::stop_requested) {
-      result.status = analysis_status;
-      result.reason = HalReason(analysis_status);
-      result.stage_failure_status = analysis_status;
-      result.stage_failure_reason = result.reason;
-      result.failed_operation = PreparedOpenCudaOperationId::inference;
-      result.analysis_ran = analysis_ran;
-      result.inference_only_path = inference_only;
-      return finish(result);
-    }
-    bool current_is_output = false;
+    const cuda::CudaImage *current = &slot->input;
     bool required_failed = false;
     bool optional_failed = false;
     for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
@@ -1594,7 +1638,8 @@ public:
       const bool disabled = (disabled_mask & (std::uint32_t{1} << index)) != 0;
       const auto stage_index = static_cast<std::uint32_t>(index);
       const bool deferred_vignette =
-          !disabled && stage.semantic == SemanticEffectId::vignette;
+          !disabled && (stage.semantic == SemanticEffectId::vignette ||
+                        stage.semantic == SemanticEffectId::mirror);
       if (!deferred_vignette) {
         const auto stage_begin = slot->transfer.RecordStageBegin(
             slot->transfer_binding, stage_index);
@@ -1603,7 +1648,7 @@ public:
               TransferFailure(slot, stage_begin.status, result.transfers,
                               PreparedOpenCudaOperationId::completion_wait));
       }
-      RuntimeStatus stage_status = analysis_status;
+      RuntimeStatus stage_status = RuntimeStatus::executed;
       PreparedOpenCudaOperationId failed_operation =
           analysis_status == RuntimeStatus::preprocess_failed
               ? PreparedOpenCudaOperationId::preprocess
@@ -1612,30 +1657,120 @@ public:
         stage_result.status = StageExecutionStatus::disabled_preserved;
         stage_result.reason = ReasonId::circuit_breaker_open;
         stage_result.valid_output_preserved = true;
-      } else if (stage.semantic == SemanticEffectId::vignette) {
-        // Terminal fixed-center vignette is launched after any final resize.
-      } else if (analysis_status == RuntimeStatus::executed) {
-        const auto &current = current_is_output ? slot->output : slot->input;
-        const auto &next = current_is_output ? slot->input : slot->output;
-        slot->input_ptr_arg = current.ptr;
-        slot->input_pitch_arg = static_cast<std::uint32_t>(current.pitch);
-        slot->output_ptr_arg = next.ptr;
-        slot->output_pitch_arg = static_cast<std::uint32_t>(next.pitch);
-        stage_status = LaunchPostprocess(*slot, index, &failed_operation);
-        if (stage_status == RuntimeStatus::device_lost) {
-          slot->quarantined = true;
-          result.status = RuntimeStatus::device_lost;
-          result.reason = ReasonId::device_lost;
-          result.stage_failure_status = stage_status;
-          result.stage_failure_reason = ReasonId::device_lost;
-          result.failed_operation = failed_operation;
-          result.analysis_ran = analysis_ran;
-          result.inference_only_path = inference_only;
-          return finish(result);
-        }
-        if (stage_status == RuntimeStatus::executed) {
-          current_is_output = !current_is_output;
+      } else if (stage.semantic == SemanticEffectId::vignette ||
+                 stage.semantic == SemanticEffectId::mirror) {
+        // Final effects consume the prepared final output geometry below.
+      } else if (stage.semantic == SemanticEffectId::video_noise_removal) {
+        auto *next =
+            current->ptr == slot->output.ptr ? &slot->input : &slot->output;
+        const auto denoised = slot->denoise.Execute(
+            slot->denoise_handle, slot->config.dependencies.denoise_artifact,
+            slot->program.execution_domain, frame.capture_sequence, *current,
+            next, slot->config.denoise_strength, stage.failure_action);
+        AddTransfers(&result.transfers, denoised.transfers);
+        analysis_ran = true;
+        inference_only = true;
+        if (denoised.status ==
+                open_video::PreparedCudaFastDvdnetStatus::executed &&
+            denoised.output_valid) {
+          current = next;
           stage_result.status = StageExecutionStatus::succeeded;
+        } else if (denoised.pending_work) {
+          result.status = RuntimeStatus::synchronization_failed;
+          result.reason = ReasonId::synchronization_failed;
+          return finish(result);
+        } else
+          stage_status = RuntimeStatus::inference_failed;
+      } else if (stage.semantic == SemanticEffectId::auto_frame) {
+        const auto cropped = slot->auto_frame.Execute(
+            slot->auto_frame_handle, slot->auto_frame_binding,
+            frame.capture_sequence, *current);
+        AddTransfers(&result.transfers, cropped.transfers);
+        analysis_ran |= cropped.analysis_ran;
+        if (cropped.status ==
+                open_video::PreparedCudaAutoFrameStatus::executed &&
+            cropped.output) {
+          current = cropped.output;
+          if (slot->config.vignette_tracked_center && cropped.found) {
+            slot->tracked_center_x =
+                cropped.tracked_center_x / static_cast<float>(current->w);
+            slot->tracked_center_y =
+                cropped.tracked_center_y / static_cast<float>(current->h);
+          }
+          stage_result.status = StageExecutionStatus::succeeded;
+        } else if (!cropped.valid_input_preserved && !cropped.output) {
+          result.status =
+              cropped.status ==
+                      open_video::PreparedCudaAutoFrameStatus::device_lost
+                  ? RuntimeStatus::device_lost
+                  : RuntimeStatus::synchronization_failed;
+          result.reason = HalReason(result.status);
+          slot->quarantined |= result.status == RuntimeStatus::device_lost;
+          return finish(result);
+        } else
+          stage_status = RuntimeStatus::postprocess_failed;
+      } else if (stage.semantic == SemanticEffectId::eye_contact) {
+        const auto corrected =
+            slot->eye.Execute(slot->eye_handle, slot->eye_binding,
+                              frame.capture_sequence, *current);
+        result.transfers.intermediate_readbacks += corrected.enqueued_readbacks;
+        result.transfers.synchronizations += corrected.completion_waits;
+        result.transfers.cpu_tail_boundaries += corrected.cpu_tail_boundaries;
+        analysis_ran = true;
+        if ((corrected.status ==
+                 open_video::PreparedCudaEyeContactStatus::executed ||
+             corrected.status ==
+                 open_video::PreparedCudaEyeContactStatus::preserved_input) &&
+            corrected.output) {
+          current = corrected.output;
+          stage_result.status = StageExecutionStatus::succeeded;
+        } else if (corrected.pending_work || corrected.device_lost) {
+          result.status = corrected.device_lost
+                              ? RuntimeStatus::device_lost
+                              : RuntimeStatus::synchronization_failed;
+          result.reason = HalReason(result.status);
+          slot->quarantined |= corrected.device_lost;
+          return finish(result);
+        } else
+          stage_status = RuntimeStatus::inference_failed;
+      } else if (UsesMatting(stage.semantic)) {
+        if (!matte_attempted) {
+          analysis_status = AnalyzeMatte(slot, *current);
+          matte_attempted = true;
+          analysis_ran = true;
+          inference_only = true;
+        }
+        stage_status = analysis_status;
+        if (analysis_status != RuntimeStatus::executed) {
+          if (analysis_status == RuntimeStatus::device_lost) {
+            slot->quarantined = true;
+            result.status = analysis_status;
+            result.reason = ReasonId::device_lost;
+            return finish(result);
+          }
+        } else {
+          const auto &next =
+              current->ptr == slot->output.ptr ? slot->input : slot->output;
+          slot->input_ptr_arg = current->ptr;
+          slot->input_pitch_arg = static_cast<std::uint32_t>(current->pitch);
+          slot->output_ptr_arg = next.ptr;
+          slot->output_pitch_arg = static_cast<std::uint32_t>(next.pitch);
+          stage_status = LaunchPostprocess(*slot, index, &failed_operation);
+          if (stage_status == RuntimeStatus::device_lost) {
+            slot->quarantined = true;
+            result.status = RuntimeStatus::device_lost;
+            result.reason = ReasonId::device_lost;
+            result.stage_failure_status = stage_status;
+            result.stage_failure_reason = ReasonId::device_lost;
+            result.failed_operation = failed_operation;
+            result.analysis_ran = analysis_ran;
+            result.inference_only_path = inference_only;
+            return finish(result);
+          }
+          if (stage_status == RuntimeStatus::executed) {
+            current = &next;
+            stage_result.status = StageExecutionStatus::succeeded;
+          }
         }
       }
       if (!disabled && stage_status != RuntimeStatus::executed) {
@@ -1653,8 +1788,8 @@ public:
         result.failed_operation = failed_operation;
       }
       if (!deferred_vignette) {
-        const auto stage_end = slot->transfer.RecordStageEnd(
-            slot->transfer_binding, stage_index);
+        const auto stage_end =
+            slot->transfer.RecordStageEnd(slot->transfer_binding, stage_index);
         if (!stage_end.ok())
           return finish(
               TransferFailure(slot, stage_end.status, result.transfers,
@@ -1662,8 +1797,7 @@ public:
       }
     }
     result.stage_count = slot->program.stage_count;
-    const cuda::CudaImage *readback_source =
-        current_is_output ? &slot->output : &slot->input;
+    const cuda::CudaImage *readback_source = current;
     if (slot->final_output.Valid()) {
       std::string resize_error;
       if (!cuda::kernels::LaunchResizeBilinearPrepared(
@@ -1676,23 +1810,31 @@ public:
       }
       readback_source = &slot->final_output;
     }
-    const std::size_t vignette_index = slot->program.stage_count - 1;
-    if (slot->program.stages[vignette_index].semantic == SemanticEffectId::vignette &&
+    std::size_t vignette_index = slot->program.stage_count;
+    std::size_t mirror_index = slot->program.stage_count;
+    for (std::size_t i = 0; i < slot->program.stage_count; ++i) {
+      if (slot->program.stages[i].semantic == SemanticEffectId::vignette)
+        vignette_index = i;
+      if (slot->program.stages[i].semantic == SemanticEffectId::mirror)
+        mirror_index = i;
+    }
+    if (vignette_index < slot->program.stage_count &&
         (disabled_mask & (std::uint32_t{1} << vignette_index)) == 0 &&
         !required_failed) {
       std::string vignette_error;
       const auto vignette_begin = slot->transfer.RecordStageBegin(
           slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
       if (!vignette_begin.ok())
-        return finish(TransferFailure(
-            slot, vignette_begin.status, result.transfers,
-            PreparedOpenCudaOperationId::completion_wait));
+        return finish(
+            TransferFailure(slot, vignette_begin.status, result.transfers,
+                            PreparedOpenCudaOperationId::completion_wait));
       const float intensity = std::clamp(
-          static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f, 1.0f);
+          static_cast<float>(slot->config.vignette_intensity) / 100.0f, 0.0f,
+          1.0f);
       if (!cuda::kernels::LaunchVignettePrepared(
               slot->vignette, *readback_source, *readback_source, intensity,
-              static_cast<float>(readback_source->w) * 0.5f,
-              static_cast<float>(readback_source->h) * 0.5f,
+              static_cast<float>(readback_source->w) * slot->tracked_center_x,
+              static_cast<float>(readback_source->h) * slot->tracked_center_y,
               &vignette_error)) {
         auto &stage_result = result.stages[vignette_index];
         stage_result.reason = ReasonId::optional_stage_failed_open;
@@ -1709,15 +1851,46 @@ public:
           optional_failed = true;
         }
       } else {
-        result.stages[vignette_index].status =
-            StageExecutionStatus::succeeded;
+        result.stages[vignette_index].status = StageExecutionStatus::succeeded;
       }
       const auto vignette_end = slot->transfer.RecordStageEnd(
           slot->transfer_binding, static_cast<std::uint32_t>(vignette_index));
       if (!vignette_end.ok())
-        return finish(TransferFailure(
-            slot, vignette_end.status, result.transfers,
-            PreparedOpenCudaOperationId::completion_wait));
+        return finish(
+            TransferFailure(slot, vignette_end.status, result.transfers,
+                            PreparedOpenCudaOperationId::completion_wait));
+    }
+    if (mirror_index < slot->program.stage_count &&
+        (disabled_mask & (std::uint32_t{1} << mirror_index)) == 0 &&
+        !required_failed) {
+      const auto mirror_begin = slot->transfer.RecordStageBegin(
+          slot->transfer_binding, static_cast<std::uint32_t>(mirror_index));
+      if (!mirror_begin.ok())
+        return finish(
+            TransferFailure(slot, mirror_begin.status, result.transfers,
+                            PreparedOpenCudaOperationId::completion_wait));
+      std::string error;
+      auto &mirrored = result.stages[mirror_index];
+      if (!cuda::kernels::LaunchMirrorPrepared(slot->mirror, *readback_source,
+                                               slot->mirror_output, &error)) {
+        mirrored.status = slot->program.stages[mirror_index].required
+                              ? StageExecutionStatus::required_failed
+                              : StageExecutionStatus::optional_failed_open;
+        mirrored.reason = ReasonId::optional_stage_failed_open;
+        mirrored.valid_output_preserved =
+            !slot->program.stages[mirror_index].required;
+        required_failed |= slot->program.stages[mirror_index].required;
+        optional_failed |= !slot->program.stages[mirror_index].required;
+      } else {
+        readback_source = &slot->mirror_output;
+        mirrored.status = StageExecutionStatus::succeeded;
+      }
+      const auto mirror_end = slot->transfer.RecordStageEnd(
+          slot->transfer_binding, static_cast<std::uint32_t>(mirror_index));
+      if (!mirror_end.ok())
+        return finish(
+            TransferFailure(slot, mirror_end.status, result.transfers,
+                            PreparedOpenCudaOperationId::completion_wait));
     }
     const auto readback = slot->transfer.EnqueueReadback(
         slot->transfer_binding, readback_source->ptr, readback_source->pitch);
@@ -1728,13 +1901,14 @@ public:
     result.transfers.final_readbacks = 1;
     const auto completion =
         slot->transfer.RecordCompletion(slot->transfer_binding);
+    frame_completion_recorded = completion.ok();
     if (!completion.ok())
       return finish(
           TransferFailure(slot, completion.status, result.transfers,
                           PreparedOpenCudaOperationId::completion_wait));
     const auto wait = slot->transfer.WaitForCompletion(
         slot->transfer_binding, slot->config.wait_policy);
-    result.transfers.synchronizations = 1;
+    ++result.transfers.synchronizations;
     if (!wait.ok()) {
       auto failed =
           TransferFailure(slot, wait.status, result.transfers,
@@ -1748,8 +1922,9 @@ public:
     }
 
     for (std::size_t index = 0; index < result.stage_count; ++index) {
-      result.stages[index].elapsed_ns = slot->transfer.stage_elapsed_nanoseconds(
-          static_cast<std::uint32_t>(index));
+      result.stages[index].elapsed_ns =
+          slot->transfer.stage_elapsed_nanoseconds(
+              static_cast<std::uint32_t>(index));
     }
 
     result.stage_elapsed_ns = slot->transfer.stage_elapsed_nanoseconds(0);
@@ -1761,9 +1936,9 @@ public:
     if (!required_failed) {
       std::memcpy(frame.output, slot->transfer.readback_data(),
                   slot->transfer.readback_size_bytes());
-      result.transfers.cpu_tail_boundaries = 1;
+      ++result.transfers.cpu_tail_boundaries;
       result.output_valid = true;
-      result.valid_input_preserved = optional_failed || !current_is_output;
+      result.valid_input_preserved = optional_failed || current == &slot->input;
       result.status = optional_failed ? RuntimeStatus::optional_failed_open
                                       : RuntimeStatus::executed;
       result.reason = optional_failed ? ReasonId::optional_stage_failed_open
@@ -1787,8 +1962,15 @@ public:
     Slot *slot = Find(handle);
     if (!slot)
       return RuntimeStatus::foreign_handle;
-    return slot->quarantined ? RuntimeStatus::quarantined
-                             : RuntimeStatus::ready;
+    if (slot->quarantined)
+      return RuntimeStatus::quarantined;
+    slot->auto_frame.ResetTracking();
+    slot->analysis_cache.BeginFrame(0);
+    if (slot->denoise_handle.id != 0 &&
+        slot->denoise.ResetTemporalState(slot->denoise_handle) !=
+            open_video::PreparedCudaFastDvdnetStatus::ready)
+      return RuntimeStatus::synchronization_failed;
+    return RuntimeStatus::ready;
   }
 
   PreparedOpenCudaRuntimeStatus
@@ -1875,6 +2057,33 @@ private:
     cuda::CudaImage input{};
     cuda::CudaImage output{};
     cuda::CudaImage final_output{};
+    cuda::CudaImage mirror_output{};
+    cuda::kernels::PreparedMirrorKernel mirror{};
+    open_video::FrameAnalysisCache analysis_cache{};
+    open_video::PreparedCudaYunetDetector yunet{};
+    open_video::PreparedCudaYunetBinding yunet_binding{};
+    open_video::PreparedCudaYunetPreparedBinding shared_yunet{};
+    std::unique_ptr<open_video::PreparedCudaAutoFrameYunetAdapter> face_adapter;
+    std::unique_ptr<open_video::PreparedCudaAutoFrameMatteAdapter>
+        matte_adapter;
+    open_video::PreparedCudaAutoFrame auto_frame{};
+    open_video::PreparedCudaAutoFrameHandle auto_frame_handle{};
+    open_video::PreparedCudaAutoFrameBinding auto_frame_binding{};
+    bool auto_frame_ready = false;
+    open_video::PreparedCudaEyeContact eye{};
+    open_video::PreparedCudaEyeContactHandle eye_handle{};
+    open_video::PreparedCudaEyeContactBinding eye_binding{};
+    open_video::PreparedCudaFastDvdnetDenoiser denoise{};
+    open_video::PreparedCudaFastDvdnetHandle denoise_handle{};
+    cuda::kernels::PreparedMatteBounds matte_bounds{};
+    cuda::CudaPreparedTransferCompletion bounds_completion{};
+    cuda::CudaPreparedTransferCompletion::Binding bounds_binding{};
+    open_video::FrameMatteArtifactKey matte_key{};
+    bool matte_available = false;
+    bool matte_attempted = false;
+    RuntimeStatus matte_status = RuntimeStatus::not_prepared;
+    float tracked_center_x = .5F, tracked_center_y = .5F;
+
     cuda::kernels::PreparedResizeBilinearKernel resize{};
     cuda::kernels::PreparedVignetteKernel vignette{};
     cuda::CudaImage blur_tmp{};
@@ -1894,7 +2103,8 @@ private:
     cuda::kernels::PreparedPreprocessKernelBundle preprocess{};
     cuda::kernels::PreparedOpenCudaVbBinding postprocess_binding{};
     cuda::kernels::PreparedOpenCudaVbKernelBundle postprocess{};
-    std::array<PreparedOpenCudaVbPlan, hal::kMaxPreparedStages> postprocess_plans{};
+    std::array<PreparedOpenCudaVbPlan, hal::kMaxPreparedStages>
+        postprocess_plans{};
     std::array<std::array<PreparedLaunch, PreparedOpenCudaVbPlan::kMaxLaunches>,
                hal::kMaxPreparedStages>
         postprocess_launches{};
@@ -1934,6 +2144,361 @@ private:
     bool retired = false;
     bool setup_completion_unproven = false;
   };
+
+  static void AddTransfers(hal::TransferCounters *a,
+                           const hal::TransferCounters &b) noexcept {
+    a->uploads += b.uploads;
+    a->intermediate_uploads += b.intermediate_uploads;
+    a->final_readbacks += b.final_readbacks;
+    a->intermediate_readbacks += b.intermediate_readbacks;
+    a->synchronizations += b.synchronizations;
+    a->cpu_tail_boundaries += b.cpu_tail_boundaries;
+  }
+
+  static RuntimeStatus AnalyzeMatte(Slot *slot,
+                                    const cuda::CudaImage &input) noexcept {
+    if (slot->matte_attempted)
+      return slot->matte_status;
+    slot->matte_attempted = true;
+    const auto finish = [slot](RuntimeStatus status) noexcept {
+      slot->matte_status = status;
+      return status;
+    };
+    if (!slot->session)
+      return finish(RuntimeStatus::inference_failed);
+    cuda::kernels::PreparedPreprocessKernelStatus status{};
+    if (!slot->preprocess.Execute(slot->preprocess_binding,
+                                  slot->preprocess_spec, input,
+                                  slot->input_tensor, &status))
+      return finish(
+          status == cuda::kernels::PreparedPreprocessKernelStatus::device_lost
+              ? RuntimeStatus::device_lost
+              : RuntimeStatus::preprocess_failed);
+    const auto inference = slot->session->RunPreparedInferenceTyped(
+        slot->stream, &slot->alpha, slot->matting_evidence, false);
+    if (!inference.ok())
+      return finish(inference.quarantine != MattingPreparedRunQuarantine::none
+                        ? RuntimeStatus::device_lost
+                        : RuntimeStatus::inference_failed);
+    slot->matte_available = true;
+    const auto publish = [slot](open_video::FrameMatteArtifact *artifact,
+                                std::string *) {
+      artifact->handle = static_cast<std::uintptr_t>(slot->alpha.ptr);
+      return true;
+    };
+    if (!slot->analysis_cache.artifacts.GetOrComputeMatte(
+            slot->analysis_cache.capture_sequence, slot->matte_key, publish,
+            nullptr, nullptr))
+      return finish(RuntimeStatus::resource_exhausted);
+    return finish(RuntimeStatus::executed);
+  }
+
+  static open_video::PreparedCudaAutoFrameAnalysisResult MatteAnalysis(
+      void *owner, const open_video::PreparedCudaAutoFrameBinding &,
+      const cuda::CudaImage &input, std::uint64_t sequence,
+      open_video::FrameAnalysisCache *,
+      const cuda::CudaPreparedTransferCompletion::WaitPolicy &wait) noexcept {
+    auto *slot = static_cast<Slot *>(owner);
+    open_video::PreparedCudaAutoFrameAnalysisResult out;
+    if (!slot)
+      return out;
+    if (!slot->matte_available &&
+        AnalyzeMatte(slot, input) != RuntimeStatus::executed)
+      return out;
+    std::string error;
+    const auto failure = [&]() noexcept {
+      if (out.pending_work)
+        (void)slot->bounds_completion.RecordFailedFrameCompletion(
+            slot->bounds_binding);
+      return out;
+    };
+    const auto begin =
+        slot->bounds_completion.BeginFrame(slot->bounds_binding, sequence);
+    if (!begin.ok())
+      return failure();
+    if (!slot->bounds_completion.SubmitResidentWork(slot->bounds_binding)
+             .ok() ||
+        !slot->bounds_completion.RecordStageBegin(slot->bounds_binding, 0).ok())
+      return failure();
+    out.pending_work = true;
+    if (!cuda::kernels::LaunchMatteBoundsPrepared(slot->matte_bounds,
+                                                  slot->alpha_image, &error))
+      return failure();
+    if (!slot->bounds_completion.RecordStageEnd(slot->bounds_binding, 0).ok())
+      return failure();
+    const auto readback = slot->bounds_completion.EnqueueReadbackAt(
+        slot->bounds_binding, 0,
+        cuda::kernels::MatteBoundsDeviceRecord(slot->matte_bounds),
+        cuda::kernels::MatteBoundsDeviceRecordBytes(slot->matte_bounds));
+    if (!readback.ok())
+      return failure();
+    out.transfers.intermediate_readbacks = 1;
+    if (!slot->bounds_completion.RecordCompletion(slot->bounds_binding).ok())
+      return failure();
+    ++out.completion_waits;
+    ++out.transfers.synchronizations;
+    const auto completed =
+        slot->bounds_completion.WaitForCompletion(slot->bounds_binding, wait);
+    if (!completed.ok()) {
+      out.synchronization_failed = true;
+      out.device_lost =
+          completed.status ==
+          cuda::CudaPreparedTransferCompletion::Status::device_lost;
+      return out;
+    }
+    out.pending_work = false;
+    out.ok = true;
+    out.cpu_tail_boundaries = 1;
+    out.transfers.cpu_tail_boundaries = 1;
+    const auto &bounds =
+        *static_cast<const cuda::kernels::DeviceMatteBoundsRecord *>(
+            slot->bounds_completion.readback_data());
+    out.found = cuda::kernels::MatteBoundsForegroundFound(
+        bounds, slot->alpha_image.w, slot->alpha_image.h);
+    if (out.found) {
+      const float sx = static_cast<float>(slot->input.w) /
+                       static_cast<float>(slot->alpha_image.w);
+      const float sy = static_cast<float>(slot->input.h) /
+                       static_cast<float>(slot->alpha_image.h);
+      out.box.source = open_video::PreparedCudaAutoFrameSource::matte;
+      out.box.box = {bounds.x0 * sx, bounds.y0 * sy,
+                     (bounds.x1 + 1 - bounds.x0) * sx,
+                     (bounds.y1 + 1 - bounds.y0) * sy};
+      out.box.confidence = 1;
+    }
+    return out;
+  }
+
+  bool PrepareExtras(Slot *slot, cuda::CUcontext native_context,
+                     std::string *error) {
+    using namespace open_video;
+    const auto &program = slot->program;
+    const auto &config = slot->config;
+    const int width = slot->input.w, height = slot->input.h;
+    auto &deps = slot->config.dependencies;
+    // Each component receives a disjoint setup reservation. These upper bounds
+    // include explicitly owned pitched storage and component scratch, and never
+    // grow live. Private ORT provider arenas/model allocations are not measured
+    // by these reservations and must not be reported as fully accounted memory.
+    hal::ResourceBudget extra;
+    const auto charge = [&](std::uint64_t bytes, std::uint32_t resources) {
+      extra.persistent_bytes += bytes;
+      extra.resource_count += resources;
+    };
+    if (slot->session) {
+      auto &key = slot->matte_key;
+      key.provider_id = "open_cuda";
+      key.model_id = slot->model_pack.id;
+      key.storage = FrameMatteStorage::cuda_f32_alpha;
+      key.frame_width = width;
+      key.frame_height = height;
+      key.matte_width = slot->alpha_image.w;
+      key.matte_height = slot->alpha_image.h;
+      key.config_fingerprint = config.model_preprocess_generation;
+      key.device_context = reinterpret_cast<std::uintptr_t>(native_context);
+      key.stream = config.stream_identity;
+      (void)slot->analysis_cache.artifacts.GetOrComputeMatte(
+          0, key, [](FrameMatteArtifact *, std::string *) { return true; },
+          nullptr, nullptr);
+      slot->analysis_cache.artifacts.ClearArtifacts();
+    }
+    const bool auto_frame = HasSemantic(program, SemanticEffectId::auto_frame);
+    const bool eye = HasSemantic(program, SemanticEffectId::eye_contact);
+    if ((auto_frame || eye) && deps.face_artifact.Valid()) {
+      setup_failure_component_ = OpenCudaSetupComponentId::shared_face_analysis;
+      PreparedCudaYunetSetup setup;
+      slot->yunet_binding = {config.driver,
+                             slot->context,
+                             slot->stream,
+                             config.stream_identity,
+                             config.adapter_instance_id,
+                             config.configuration_generation};
+      setup.binding = slot->yunet_binding;
+      setup.selected_pack = &deps.face;
+      setup.selected_artifact = deps.face_artifact;
+      setup.requested_model_id = deps.face.id;
+      setup.cuda_device_id = config.cuda_device_id;
+      setup.frame_width = width;
+      setup.frame_height = height;
+      setup.resource_budget_bytes = UINT64_C(64) << 20;
+      if (!slot->yunet.Prepare(setup, error) ||
+          !slot->yunet.PrepareCache(&slot->analysis_cache, error) ||
+          !slot->yunet.ExportPreparedBinding(&slot->analysis_cache,
+                                             &slot->shared_yunet))
+        return false;
+      charge(UINT64_C(64) << 20, 32);
+      extra.readback_staging_bytes += UINT64_C(4) << 20;
+      ++telemetry_.session_constructions;
+      slot->face_adapter = std::make_unique<PreparedCudaAutoFrameYunetAdapter>(
+          &slot->yunet, slot->yunet_binding);
+    }
+    if (auto_frame) {
+      setup_failure_component_ = OpenCudaSetupComponentId::auto_frame;
+      slot->auto_frame_binding = {config.driver,
+                                  slot->context,
+                                  native_context,
+                                  slot->stream,
+                                  config.stream_identity,
+                                  config.adapter_instance_id,
+                                  config.configuration_generation,
+                                  config.model_preprocess_generation};
+      PreparedCudaAutoFrameSetup setup;
+      setup.binding = slot->auto_frame_binding;
+      setup.frame_width = width;
+      setup.frame_height = height;
+      setup.knobs = {config.auto_frame_strength, config.auto_frame_smoothing,
+                     config.auto_frame_headroom};
+      setup.face = slot->face_adapter.get();
+      setup.analysis_cache = &slot->analysis_cache;
+      setup.resource_budget_bytes = UINT64_C(256) << 20;
+      setup.wait = config.wait_policy;
+      if (slot->session) {
+        if (!cuda::kernels::PrepareMatteBounds(*config.driver, native_context,
+                                               slot->stream, 4096,
+                                               &slot->matte_bounds, error))
+          return false;
+        cuda::CudaPreparedTransferCompletion::PrepareOptions options;
+        options.binding = slot->transfer_binding;
+        options.resident_work = true;
+        options.timed_stage_count = 1;
+        options.readback_count = 1;
+        options.readbacks[0] = {
+            cuda::kernels::MatteBoundsDeviceRecord(slot->matte_bounds),
+            sizeof(cuda::kernels::DeviceMatteBoundsRecord), 0,
+            sizeof(cuda::kernels::DeviceMatteBoundsRecord), 1};
+        options.budget.max_pinned_host_bytes =
+            sizeof(cuda::kernels::DeviceMatteBoundsRecord);
+        options.budget.max_events = 3;
+        if (!slot->bounds_completion.Prepare(config.driver, options).ok())
+          return false;
+        slot->bounds_binding = options.binding;
+        auto &key = slot->matte_key;
+        key.provider_id = "open_cuda";
+        key.model_id = slot->model_pack.id;
+        key.storage = FrameMatteStorage::cuda_f32_alpha;
+        key.frame_width = width;
+        key.frame_height = height;
+        key.matte_width = slot->alpha_image.w;
+        key.matte_height = slot->alpha_image.h;
+        key.config_fingerprint = config.model_preprocess_generation;
+        key.device_context = reinterpret_cast<std::uintptr_t>(native_context);
+        key.stream = config.stream_identity;
+        (void)slot->analysis_cache.artifacts.GetOrComputeMatte(
+            0, key, [](FrameMatteArtifact *, std::string *) { return true; },
+            nullptr, nullptr);
+        slot->analysis_cache.artifacts.ClearArtifacts();
+        slot->matte_adapter =
+            std::make_unique<PreparedCudaAutoFrameMatteAdapter>(
+                slot, &MatteAnalysis, key, width, height);
+        setup.matte = slot->matte_adapter.get();
+      }
+      if (!slot->auto_frame.Prepare(setup, &slot->auto_frame_handle, error))
+        return false;
+      slot->auto_frame_ready = true;
+      charge(UINT64_C(256) << 20, 128);
+    }
+    if (eye) {
+      setup_failure_component_ = OpenCudaSetupComponentId::eye_contact;
+      slot->eye_binding = {config.driver,
+                           slot->context,
+                           native_context,
+                           slot->stream,
+                           config.stream_identity,
+                           config.adapter_instance_id,
+                           config.configuration_generation,
+                           config.model_preprocess_generation};
+      PreparedCudaEyeContactSetup setup;
+      setup.binding = slot->eye_binding;
+      setup.models.eye_pack = &deps.eye;
+      for (const auto &file : deps.eye.files) {
+        if (file.kind == "onnx" && file.role == "left") {
+          setup.models.left_file = &file;
+          setup.models.left_path = file.path;
+        }
+        if (file.kind == "onnx" && file.role == "right") {
+          setup.models.right_file = &file;
+          setup.models.right_path = file.path;
+        }
+      }
+      setup.models.yunet = deps.face_artifact;
+      setup.models.landmarks = deps.landmarks_artifact;
+      setup.models.left = deps.eye_left_artifact;
+      setup.models.right = deps.eye_right_artifact;
+      setup.cuda_device_id = config.cuda_device_id;
+      setup.frame_width = width;
+      setup.frame_height = height;
+      setup.strength = config.eye_contact_strength;
+      setup.look_away_enabled = config.eye_contact_look_away;
+      setup.analysis_cache = &slot->analysis_cache;
+      setup.shared_yunet = &slot->shared_yunet;
+      setup.dlib_setup.selected_pack = &deps.landmarks;
+      setup.dlib_setup.selected_artifact = deps.landmarks_artifact;
+      setup.dlib_setup.model_id = deps.landmarks.id;
+      setup.dlib_setup.resource_budget_bytes = UINT64_C(240) << 20;
+      setup.resource_budget_bytes = UINT64_C(256) << 20;
+      setup.wait = config.wait_policy;
+      if (!slot->eye.Prepare(setup, &slot->eye_handle, error))
+        return false;
+      charge(UINT64_C(256) << 20, 128);
+      telemetry_.session_constructions += 2;
+    }
+    if (HasSemantic(program, SemanticEffectId::video_noise_removal)) {
+      setup_failure_component_ = OpenCudaSetupComponentId::denoise;
+      PreparedCudaFastDvdnetConfig setup;
+      setup.driver = config.driver;
+      setup.owner_context = native_context;
+      setup.owner_stream = slot->stream;
+      setup.cuda_device_id = config.cuda_device_id;
+      setup.model_pack = &deps.denoise;
+      setup.artifact = deps.denoise_artifact;
+      setup.execution_domain = program.execution_domain;
+      setup.configuration_generation = config.configuration_generation;
+      setup.model_generation = config.model_preprocess_generation;
+      setup.source_width = static_cast<std::uint32_t>(width);
+      setup.source_height = static_cast<std::uint32_t>(height);
+      const auto pw =
+          PreparedCudaFastDvdnetDenoiser::PaddedExtent(setup.source_width);
+      const auto ph =
+          PreparedCudaFastDvdnetDenoiser::PaddedExtent(setup.source_height);
+      setup.tensors = {
+          "noisy",        "noise_map",    "denoised", {1, 15, ph, pw},
+          {1, 1, ph, pw}, {1, 3, ph, pw}, true,       true};
+      setup.available_budget.persistent_bytes = UINT64_C(256) << 20;
+      setup.available_budget.resource_count = 128;
+      setup.available_budget.in_flight_slots = 1;
+      const auto prepared = slot->denoise.Prepare(setup);
+      slot->denoise_handle = prepared.handle;
+      if (prepared.status != PreparedCudaFastDvdnetStatus::ready) {
+        return false;
+      }
+      charge(UINT64_C(256) << 20, 128);
+      ++telemetry_.session_constructions;
+    }
+    if (HasSemantic(program, SemanticEffectId::mirror)) {
+      setup_failure_component_ = OpenCudaSetupComponentId::native_mirror;
+      if (!cuda::kernels::PrepareMirrorKernel(*config.driver, native_context,
+                                              slot->stream, &slot->mirror,
+                                              error) ||
+          !slot->mirror_output.Allocate(
+              config.driver, static_cast<int>(program.host_output.width),
+              static_cast<int>(program.host_output.height),
+              cuda::PixelFormatGpu::rgb_u8, error))
+        return false;
+      charge(slot->mirror_output.pitch *
+                 static_cast<std::uint64_t>(slot->mirror_output.h),
+             1);
+    }
+    hal::ResourceBudget total = slot->reserved_budget;
+    total.persistent_bytes += extra.persistent_bytes;
+    total.readback_staging_bytes += extra.readback_staging_bytes;
+    total.resource_count += extra.resource_count;
+    if (!BudgetContains(program.budget, total)) {
+      setup_failure_component_ = OpenCudaSetupComponentId::aggregate_island;
+      return false;
+    }
+    slot->reserved_budget = total;
+    return true;
+  }
 
   PreparedOpenCudaRuntimePrepareResult
   SetupFailure(RuntimeStatus status, ReasonId reason,
@@ -1981,9 +2546,9 @@ private:
     std::string resize_error;
     (void)slot->config.driver->BindPreparedContext(slot->context);
     (void)cuda::kernels::DestroyVignetteKernelPrepared(&slot->vignette,
-                                                        &resize_error);
+                                                       &resize_error);
     (void)cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
-                                                              &resize_error);
+                                                             &resize_error);
     FreeTensor(slot->config.driver, &slot->alpha);
     FreeImage(slot->config.driver, &slot->alpha_feather);
     FreeImage(slot->config.driver, &slot->alpha_tmp);
@@ -2006,10 +2571,26 @@ private:
     if (slot->session)
       slot->session->RequestShutdown();
     const auto transfer = slot->transfer.Shutdown();
-    if (transfer.status ==
-        cuda::CudaPreparedTransferCompletion::Status::resource_exhausted) {
+    if (!transfer.ok() && slot->transfer.prepared()) {
       return RuntimeStatus::completion_pending;
     }
+    const auto bounds = slot->bounds_completion.Shutdown();
+    if (!bounds.ok() && slot->bounds_completion.prepared())
+      return RuntimeStatus::completion_pending;
+    std::string component_error;
+    if (!slot->eye.Shutdown(&component_error) ||
+        !slot->auto_frame.Shutdown(&component_error) ||
+        !slot->yunet.Shutdown(&component_error))
+      return RuntimeStatus::completion_pending;
+    if (slot->denoise_handle.id != 0 &&
+        !slot->denoise.Shutdown(slot->denoise_handle).quiescent)
+      return RuntimeStatus::completion_pending;
+    if (!cuda::kernels::DestroyMatteBoundsPrepared(&slot->matte_bounds,
+                                                   &component_error) ||
+        !cuda::kernels::DestroyMirrorKernelPrepared(&slot->mirror,
+                                                    &component_error))
+      return RuntimeStatus::completion_pending;
+    FreeImage(slot->config.driver, &slot->mirror_output);
     slot->session.reset();
     slot->preprocess.Shutdown();
     slot->postprocess.Shutdown();
@@ -2019,11 +2600,11 @@ private:
       return RuntimeStatus::completion_pending;
     }
     if (!cuda::kernels::DestroyVignetteKernelPrepared(&slot->vignette,
-                                                       &resize_error)) {
+                                                      &resize_error)) {
       return RuntimeStatus::completion_pending;
     }
     if (!cuda::kernels::DestroyResizeBilinearKernelPrepared(&slot->resize,
-                                                             &resize_error)) {
+                                                            &resize_error)) {
       return RuntimeStatus::completion_pending;
     }
     FreeTensor(slot->config.driver, &slot->alpha);
@@ -2350,8 +2931,8 @@ PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
     *required_budget = {};
   if (reason)
     *reason = hal::ReasonId::none;
-  const bool final_resize = input.final_output_pitch_bytes != 0 ||
-                            input.final_output_height != 0;
+  const bool final_resize =
+      input.final_output_pitch_bytes != 0 || input.final_output_height != 0;
   std::uint64_t input_bytes = 0;
   std::uint64_t output_bytes = 0;
   std::uint64_t final_output_bytes = 0;
@@ -2366,7 +2947,8 @@ PreparedOpenCudaRuntimeStatus PlanPreparedOpenCudaVignetteBudget(
     return RuntimeStatus::malformed_contract;
   }
   if (!CheckedMul(input.input_pitch_bytes, input.input_height, &input_bytes) ||
-      !CheckedMul(input.output_pitch_bytes, input.output_height, &output_bytes) ||
+      !CheckedMul(input.output_pitch_bytes, input.output_height,
+                  &output_bytes) ||
       (final_resize &&
        !CheckedMul(input.final_output_pitch_bytes, input.final_output_height,
                    &final_output_bytes))) {
@@ -2432,6 +3014,14 @@ struct OpenCudaPreparedResidentExecutor::Impl {
     config.key_light_direction_pan_degrees =
         options.key_light_direction_pan_degrees;
     config.vignette_intensity = options.vignette_intensity;
+    config.vignette_tracked_center = options.vignette_tracked_center;
+    config.dependencies = options.dependencies;
+    config.denoise_strength = options.denoise_strength;
+    config.auto_frame_strength = options.auto_frame_strength;
+    config.auto_frame_smoothing = options.auto_frame_smoothing;
+    config.auto_frame_headroom = options.auto_frame_headroom;
+    config.eye_contact_strength = options.eye_contact_strength;
+    config.eye_contact_look_away = options.eye_contact_look_away;
     config.wait_policy = options.wait_policy;
     if (options.runtime) {
       runtime = options.runtime;
@@ -2524,12 +3114,19 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
   const auto prepared = impl_->runtime->Prepare(program, impl_->config);
   result.failed_component = prepared.failed_component;
   const auto &evidence = prepared.evidence;
-  const bool model_free = program.stages[0].semantic == SemanticEffectId::vignette;
-  const auto expected_provider = model_free ? kNativeProvider
-      : (program.stages[program.stage_count - 1].semantic ==
-                 SemanticEffectId::vignette
-             ? SemanticEffectProviderId::invalid
-             : kOrtProvider);
+  bool model_free = true;
+  bool has_analysis = false;
+  std::size_t matting_index = program.stage_count;
+  for (std::size_t i = 0; i < program.stage_count; ++i) {
+    if (UsesMatting(program.stages[i].semantic)) {
+      model_free = false;
+      matting_index = std::min(matting_index, i);
+    }
+    has_analysis |=
+        program.stages[i].semantic == SemanticEffectId::auto_frame ||
+        program.stages[i].semantic == SemanticEffectId::eye_contact;
+  }
+  const auto expected_provider = program.requested_provider;
   const bool exact =
       prepared.status == RuntimeStatus::ready &&
       evidence.api_version == kPreparedOpenCudaRuntimeApiVersion &&
@@ -2544,24 +3141,30 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
       (model_free || evidence.inference_only_frame_path) &&
       (model_free || evidence.device_preprocess) &&
       evidence.device_postprocess && evidence.one_upload_one_readback &&
-      evidence.no_intermediate_crossings && evidence.single_in_flight &&
-      (model_free || ExactPreparedOpenCudaVirtualBackgroundPlan(evidence.geometry_plan)) &&
+      evidence.no_intermediate_crossings == !has_analysis &&
+      evidence.single_in_flight &&
+      (model_free ||
+       ExactPreparedOpenCudaVirtualBackgroundPlan(evidence.geometry_plan)) &&
       (model_free ||
        (evidence.geometry_plan.api_version ==
             kPreparedOpenCudaRuntimeApiVersion &&
-        evidence.geometry_plan.semantic == program.stages[0].semantic &&
+        evidence.geometry_plan.semantic ==
+            program.stages[matting_index].semantic &&
         evidence.geometry_plan.frame_width == program.host_input.width &&
         evidence.geometry_plan.frame_height == program.host_input.height &&
-        evidence.geometry_plan.model_width == static_cast<std::uint32_t>(
-                                                  impl_->model_pack.matting->input.width) &&
-        evidence.geometry_plan.model_height == static_cast<std::uint32_t>(
-                                                   impl_->model_pack.matting->input.height) &&
-        evidence.geometry_plan.strength == static_cast<std::uint32_t>(std::clamp(
-                                              impl_->config.strength,
-                                              video::effects::contract::kVbStrengthMin,
-                                              video::effects::contract::kVbStrengthMax)))) &&
-      (model_free || SameBudget(evidence.geometry_plan.required_budget,
-                                evidence.reserved_budget)) &&
+        evidence.geometry_plan.model_width ==
+            static_cast<std::uint32_t>(
+                impl_->model_pack.matting->input.width) &&
+        evidence.geometry_plan.model_height ==
+            static_cast<std::uint32_t>(
+                impl_->model_pack.matting->input.height) &&
+        evidence.geometry_plan.strength ==
+            static_cast<std::uint32_t>(
+                std::clamp(impl_->config.strength,
+                           video::effects::contract::kVbStrengthMin,
+                           video::effects::contract::kVbStrengthMax)))) &&
+      (model_free || BudgetContains(evidence.reserved_budget,
+                                    evidence.geometry_plan.required_budget)) &&
       evidence.reserved_budget.in_flight_slots == 1 &&
       BudgetContains(program.budget, evidence.reserved_budget) &&
       prepared.handle.handle_id != 0 &&
@@ -2615,7 +3218,21 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
   result.evidence.capability.steady_state_probe_free = true;
   result.evidence.capability.no_cpu_fallback = true;
   result.evidence.capability.shared_frame_analysis = true;
-  result.evidence.capability.completion_synchronizations_per_frame = 1;
+  const bool has_auto_frame =
+      HasSemantic(program, SemanticEffectId::auto_frame);
+  const bool has_eye = HasSemantic(program, SemanticEffectId::eye_contact);
+  const bool has_matte_fallback =
+      has_auto_frame && impl_->config.model_artifact.Valid();
+  const bool has_face_analysis =
+      (has_auto_frame || has_eye) &&
+      impl_->config.dependencies.face_artifact.Valid();
+  result.evidence.capability.completion_synchronizations_per_frame =
+      1u + (has_face_analysis ? 1u : 0u) + (has_matte_fallback ? 1u : 0u);
+  result.evidence.capability.max_intermediate_readbacks_per_frame =
+      (has_face_analysis ? 12u : 0u) + (has_matte_fallback ? 1u : 0u);
+  result.evidence.capability.max_cpu_tail_boundaries_per_frame =
+      (has_face_analysis ? 1u : 0u) + (has_auto_frame ? 1u : 0u) +
+      (has_matte_fallback ? 1u : 0u);
   result.evidence.capability.device_preprocess = true;
   result.evidence.capability.device_postprocess = true;
   result.evidence.stage_count = program.stage_count;
@@ -2631,6 +3248,15 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
         semantic == SemanticEffectId::virtual_key_light;
     result.evidence.capability.vignette |=
         semantic == SemanticEffectId::vignette;
+    result.evidence.capability.mirror |= semantic == SemanticEffectId::mirror;
+    result.evidence.capability.auto_frame |=
+        semantic == SemanticEffectId::auto_frame;
+    result.evidence.capability.eye_contact |=
+        semantic == SemanticEffectId::eye_contact;
+    result.evidence.capability.video_noise_removal |=
+        semantic == SemanticEffectId::video_noise_removal;
+    result.evidence.capability.native_mirror_kernel_prepared |=
+        semantic == SemanticEffectId::mirror;
     result.evidence.capability.native_vignette_kernel_prepared |=
         semantic == SemanticEffectId::vignette;
     auto &stage_evidence = result.evidence.stages[index];
@@ -2647,7 +3273,8 @@ ExecutorPrepareResult OpenCudaPreparedResidentExecutor::Prepare(
     stage_evidence.device_preprocess = true;
     stage_evidence.device_postprocess = true;
     stage_evidence.shared_analysis = true;
-    stage_evidence.temporal_history_device_resident = false;
+    stage_evidence.temporal_history_device_resident =
+        semantic == SemanticEffectId::video_noise_removal;
     stage_evidence.cpu_fallback_disabled = true;
   }
 

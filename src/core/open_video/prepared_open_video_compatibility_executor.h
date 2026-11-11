@@ -32,6 +32,7 @@ struct PreparedOpenVideoCompatibilityConfig {
   PreparedStageRunner prepared_stage_runner = nullptr;
   void *prepared_stage_runner_context = nullptr;
   std::shared_ptr<void> prepared_stage_runner_owner;
+  hal::ReasonId setup_fallback_reason = hal::ReasonId::none;
 };
 
 struct PreparedOpenVideoCompatibilitySetupResult {
