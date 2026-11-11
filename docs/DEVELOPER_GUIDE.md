@@ -617,8 +617,11 @@ pending cleanup, or quarantine cannot take this fallback. Explicit typed CPU
 compatibility remains separate. All six caller resource-budget
 axes are checked before native acquisition. Failed submitted frames freeze
 normal work and require a bound retirement fence; device loss is not release
-proof. Layered unsubmitted-binding retirement, final integrated verification,
-and fresh critique remain pending.
+proof. Exact unsubmitted-binding retirement is integrated at `7810477`.
+Disabled final-stage timing is fixed at `2e70c1b`; Vulkan shutdown now retains
+its context until the submission guard unlocks (`2623b88`). Final source is
+`b204b0a`; current test/review results and sanitizer limits are recorded in the
+HAL evidence table.
 
 A failed temporal reset must invalidate stale output attribution and prevent
 execution/publication until a valid program is prepared. Preserve this gate for
@@ -635,10 +638,10 @@ readbacks and CPU tracking/planning tails, so do not claim every combination
 has zero intermediate crossings.
 
 The [HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
-records the exact P1000 / driver 535.309.01 combined seven-stage smoke,
-geometry, camera completion budget, transfer/tail counts, and remaining gates.
-Three generated frames and three in-memory writer commits prove that bounded
-native execution. The input had no detected face, so it does not demonstrate
+records final-source P1000 / driver 535.309.01 matrix results, camera completion
+budget, geometry, transfer/tail evidence, and remaining gates. Generated frames
+and in-memory writer commits prove bounded native execution. The input had no
+detected face, so it does not demonstrate
 real-face Eye Contact correction. The result does not qualify real V4L2/camera
 output, visual quality, latency, AMD, Intel, or family/release completion.
 
@@ -654,9 +657,14 @@ candidate is 9,948,304 bytes, SHA-256
 `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
 The currently shipped catalog still references the old published artifact,
 which fails graph validation despite matching its hash and size. The offline
-exporter and candidate catalog are review inputs; external publication,
-catalog promotion, required CUDA qualification, and the normal signed
-clean-HEAD release chain remain outstanding. No installed pack was replaced.
+exporter reproduces the artifact and metadata/license byte-for-byte, including
+idempotent full upstream license composition. Three-file publication and local
+catalog update are authorized but blocked on normal authenticated Hugging Face
+write access; HTTP 401 and the logged-out browser prevented publication. The
+staged catalog proposal remains unaccepted, and the active catalog still uses
+version `2026-07-19` (131,224,287 bytes). No corrected default has shipped.
+Publication verification, reviewed catalog integration, ownership-safe install,
+and the normal signed clean-HEAD release chain remain outstanding. No installed pack was replaced.
 See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for reproducibility
 and promotion requirements.
 

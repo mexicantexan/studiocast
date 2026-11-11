@@ -3,7 +3,7 @@
 - Status: Active installer/model transaction contract
 - Applies To: StudioCast v0.2.9 curated catalog and installer packaging
 - Audience: Installer, model, packaging, and release maintainers
-- Last Verified: 2026-07-22
+- Last Verified: 2026-11-11
 
 ## Default catalog
 
@@ -64,16 +64,23 @@ python3 tests/installer/models/fastdvdnet_export_tests.py -v
 
 The corrected candidate is 9,948,304 bytes with SHA-256
 `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
-Two independent invocations produced identical artifact bytes. Nine CPU cases
-passed with maximum absolute output error `4.76837158203125e-7`.
+Repeated independent invocations produced identical artifact bytes. The
+`337f3d8` / `b204b0a` exporter fix composes the full upstream license
+idempotently; a fresh full-graph check and nine-case CPU export reproduced all
+three candidate files byte-for-byte. Six exporter regressions passed. Nine CPU
+cases passed with maximum absolute output error `4.76837158203125e-7`.
 The output contains an isolated source tree, candidate `model.json` and full
 license, a complete candidate catalog, and `validation.json` provenance/results.
 It never changes the shipped catalog, installed models, or external hosting.
 
 The shipped catalog below deliberately retains the existing published identity
-until promotion is authorized and complete. Promotion requires reviewed
-publication of the exact corrected artifact to a usable source, matching
-candidate metadata/license hashes, a new catalog version and measured total,
+until publication and reviewed promotion are complete. Three-file Hugging Face
+publication and local catalog update are authorized. The actual preupload
+request returned HTTP 401, and the browser was logged out. No working
+authentication is available; the user reported no credential available. This is an authentication blocker, not missing approval. No remote
+file was published, and no active catalog/template or installed pack changed.
+Promotion requires verified publication of the exact corrected artifact to a
+usable source, matching candidate metadata/license hashes, a new catalog version and measured total,
 updated pinned-catalog tests, required CUDA qualification, and the normal signed
 clean-HEAD source/AppImage release chain. The candidate catalog is review
 material, not signed release metadata and not a recommended-install trust grant.
@@ -81,6 +88,32 @@ Without publication, simply changing the default artifact hash would make the
 download fail integrity verification. Local `--source` transport may validate a
 candidate in temporary HOME/XDG roots; it must not activate it in the user's
 installed tree without a separately authorized install.
+
+The unaccepted eight-file promotion proposal is staged separately at
+`/tmp/studiocast-fastdvdnet-promotion-20261111`. It proposes catalog version
+`2026-11-11`, 140,755,803 total bytes, and the corrected sigma15 artifact; these
+are **proposed**, not active defaults. Proposal-only checks passed: 19 model
+transactions, 52 backend, nine packaging, and one GUI test, plus corrected real
+artifact local-source and offline-cache transactions in temporary roots. These
+checks do not establish remote availability or accept that proposal into the
+main tree. Sigma25/sigma50 remain untouched noncatalog BYO templates with their
+previous artifact hashes, not published defaults.
+
+Resume material is in
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/`:
+`publication-plan.json`, `promotion-proposal.patch`,
+`promotion-handoff-20261111.json`, and `publish_verified_fastdvdnet.py`.
+Establish normal secure Hugging Face authentication with write access to
+`10dallasj/studiocast`; keep credentials out of chat, source, and logs. The
+publication helper must return a verified receipt for the exact three approved
+files at an immutable commit before the orchestrator accepts catalog provenance
+and reruns its pinned checks. Publication does not install a model or bypass the
+signed release chain.
+
+An old unmarked installed sigma15 pack will fail the proposed metadata
+ownership check with `curated_ownership_unverified` and remain preserved. Do
+not weaken ownership verification or promise an automatic overwrite; any
+installed-pack repair needs a separately authorized ownership-safe transaction.
 
 Each artifact records its destination name, pinned SHA-256, source candidates,
 provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files

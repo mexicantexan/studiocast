@@ -595,24 +595,24 @@ loader enumeration is not a successful production camera run.
   an explicitly authorized transaction repair. Validation must preserve the
   installed pack and test candidates in isolated HOME/XDG roots.
 
-Local CUDA production composition is integrated at `c43717e`. The
+Final source checkpoint `b204b0a` includes CUDA composition, layered
+unsubmitted-frame retirement, disabled final-stage timing, and Vulkan shutdown
+context-lifetime repairs. The
 [HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
-records the native seven-stage, three-frame P1000 smoke with the camera's
-100 ms / 1 ms / 100-poll completion policy, 64x48 → 96x64 geometry, and exact
-transfer/tail/writer-commit totals. Input was generated RGB, output used an
-in-memory writer, and no face was detected. This proves bounded composition,
-not real-camera transport, face correction, visual quality, latency, all vendor
-families, or release readiness. The actual Vulkan final resident executable
-also passed on that P1000; AMD/Intel remain unqualified. Layered unsubmitted
-binding retirement, final integrated build/test/self-test evidence, and fresh
-critique are pending. The expanded sixteen-topology CI enforcement is integrated
-at `d994679`; workflow execution remains a separate evidence gate.
+and [local verification ledger](HAL_PARITY_COMPLETION.md#local-remediation-record-2026-11-11)
+record exact broad/native tests and critique status. Native matrix input is
+generated RGB, uses an in-memory writer, and detects no face. This proves
+bounded execution, not camera transport, gaze correction, visual quality,
+optimized latency, other vendor families, or release readiness. Automatic host
+mirror needs separate camera-level evidence.
 
-The corrected FastDVDnet candidate is distinct from the shipped default catalog
-and installed pack. Test candidate artifact identity explicitly; a successful
-candidate run cannot certify the old published artifact. Publication, catalog
-promotion, and the signed clean-HEAD release chain remain separate gates in
-[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+The corrected FastDVDnet candidate remains distinct from the shipped default
+catalog and installed pack. Publication/local catalog update are authorized but
+authentication-blocked; the staged proposal is unaccepted. A successful isolated
+candidate run cannot certify the old published artifact or authorize overwriting
+an unmarked installed pack. A native sanitizer helper no longer reports the
+Vulkan use-after-free, but unresolved LeakSanitizer/symbolizer diagnostics
+prevent a clean full-native-sanitizer claim; see the durable ledger.
 
 Opt-in CI now requires the actual Vulkan final resident integration executable
 on each selected vendor runner. CUDA requires the production smoke executable

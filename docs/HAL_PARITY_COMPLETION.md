@@ -97,7 +97,7 @@ gate is satisfied, they must also avoid claiming end-to-end parity.
 
 Branch: `v0.2.9`. Starting baseline:
 `99a7fbcb28f0f00e049c660765b192ec1f774234`. Integrated source checkpoint:
-`2e70c1b888b52fde6358b18b505554d70de092d1`.
+`b204b0aff69f7872a6687ab3470b4e513b48fb14`.
 
 The local change addresses canonical CUDA setup and temporal defaults,
 production composition, tracked vignette, reproducible FastDVDnet repair,
@@ -109,8 +109,8 @@ attribution only after the writer commits.
 ### Accepted implementation and ownership
 
 All accepted changes below are integrated locally. Topic branches are retained
-for traceability; no push, remote PR, release, or installed-model transaction was
-performed.
+for traceability; no Git push, remote PR, release, or user-installed-model
+transaction was performed. Authorized publication attempts did not upload files.
 
 | Agent / topic branch | Accepted commits | Integration |
 | --- | --- | --- |
@@ -126,6 +126,8 @@ performed.
 | `probe_selftest_repair` / `codex/probe-selftest-repair-20261110` | `a22c1c0` diagnostic target's private backend feature contracts | `56fdb20` |
 | `cuda_factory_owner` / `codex/unsubmitted-frame-retirement-20261110` | `e73a8c6` exact unsubmitted discard through every CUDA layer; `da61119` explicit matte-coordinate conversions | `7810477` |
 | `cuda_production_integration` / `codex/disabled-stage-timing-20261111` | `9e41f5c` canonical final timing slots, zero disabled/unrun duration, native-body regression fixture | `2e70c1b` |
+| `probe_selftest_repair` / `codex/probe-native-cleanup-20261111`, completed by root | `f64a00d` Vulkan shutdown retains context until guard destruction; friend-only unique/shared-owner regression fixture | `2623b88` |
+| `model_disposition` / `codex/fastdvdnet-promotion-20261111` | `337f3d8` independent idempotent full-license exporter repair only | `b204b0a`; staged catalog/publication proposal remains unaccepted |
 | Root integration | `8d4393c` Python test registration; `1060a6f` integration assertions follow shared setup and preserve valid bindings after forged requests; `211da52` changed-line formatting | Direct local commits |
 
 ### Critique and remediation
@@ -142,43 +144,112 @@ performed.
   ordering and tests actual production execution with fake CUDA functions,
   including required failure and optional failure/cooldown/retry.
 - Fresh `timing_remediation_final_critique` found no further confirmed source
-  blocker/Critical/High at `2e70c1b`, but withheld approval after the native probe
-  abort below. A new final verification/review gate remains open.
+  blocker/Critical/High at `2e70c1b`, but withheld approval after the required
+  native probe aborted. Isolation and an eight-line native ASan
+  initialize/shutdown reproducer proved a Vulkan shutdown use-after-free:
+  resetting the last context owner destroyed its mutex before the guard
+  unlocked. `f64a00d` moves that owner into condition-local storage so the
+  inner guard dies first. The two-case custom-deleter test exposes the old
+  unique-owner failure and preserves retained-owner behavior; both cases pass
+  against the repaired library. This is a source lifetime fix, with no host
+  driver/provider change.
+- Fresh `native_cleanup_final_critique` completed source review at `b204b0a`
+  with no concrete Blocker/Critical/High and independently passed six exporter
+  tests, four workflow tests, and the lifetime binary. Final documentation
+  consistency review awaits this exact docs diff; it is not counted as a
+  completed review in this record.
 
-### Verification checkpoint and active blocker
+### Final source verification and bounded diagnostics
 
-At `2e70c1b`, full Debug builds succeeded with CUDA/Vulkan/audio/dlib enabled
-and with all four disabled. Isolated HOME/XDG runs passed enabled CTest
-86 total (80 executed, six explicit opt-in skips; 65.49 seconds) and disabled
-CTest 80 total (75 executed, five skips; 59.97 seconds), with zero failures.
-The enabled six-suite lifecycle selection and disabled native-body executor
-test also passed. No skipped test is counted as native qualification.
+Final source is `b204b0aff69f7872a6687ab3470b4e513b48fb14`; later docs-only
+commits must be recorded separately from tested runtime identity. Both full
+Debug builds passed with CUDA/Vulkan/audio/dlib enabled and with all four
+disabled. Enabled CTest passed 87 total (81 executed, six explicit opt-in
+skips, zero failures; 108.12 seconds). Disabled CTest passed 80 total (75
+executed, five skips, zero failures; 95.90 seconds). Disabled probe exited 0
+with `SELFTEST OK`. The final required native matrix also passed as below.
+The previous `2e70c1b` enabled/disabled CTest results (86/80 total, six/five
+explicit skips) remain historical, not final-checkpoint evidence.
 
-The sixteen-case P1000 CUDA matrix passed at the earlier `211da52` checkpoint,
-using generated input, isolated packs, and an in-memory writer. At `2e70c1b`,
-required Vulkan final resident integration passed, but the subsequent required
-probe printed `SELFTEST OK` and aborted with `corrupted double-linked list`
-(exit 134). The final CUDA repeat correctly stopped before execution.
-GDB reproduced the abort in NVIDIA PTX compiler cleanup. Disabling only Vulkan
-ICD discovery lets the same required CUDA probe exit successfully; this is
-diagnostic isolation, not a gate waiver or an accepted fix.
+At the corrected topic checkpoint, native Vulkan kernel/final/lifetime tests
+passed three of three and the required CUDA probe passed five of five.
+Integrated hermetic Vulkan lifetime/adapter/factory selection passed three of
+three. The full ASan hermetic lifetime fixture passed with leak checks enabled.
+The actual native ASan helper no longer reports the use-after-free, but exits 1
+with LeakSanitizer reporting 12,080 bytes in 81 allocations in unloaded/unknown
+modules, plus a child-symbolizer `LD_PRELOAD` problem. This is an explicit
+remaining diagnostic limitation: no clean full-native-sanitizer claim and no
+attribution of those allocations to source, SDK, or driver without proof.
 
-Bounded incidental scope extension: `probe_selftest_repair` owns diagnosis in
-`codex/probe-native-cleanup-20261111`, from `2e70c1b`, of the combined native
-probe/loader/resize cleanup. Causal evidence and file ownership must be reviewed
-before a source fix; no host driver/provider, installation, service, or system
-change is authorized. Evidence is under
-`/tmp/studiocast-final-hardware-20261111/`, notably
-`probe-required-2e70c1b.log`, `probe-crash-gdb.log`, and
-`probe-no-vulkan-isolation.log`. Root must integrate any accepted fix, rerun
-affected and broad checks, finish the required native matrix, and obtain fresh
-critique before closing this local delivery gate.
+The prior native probe abort at `2e70c1b` is superseded by the causal lifetime
+repair; disabling Vulkan ICD discovery was diagnostic isolation only and is
+not part of accepted verification. The final required Vulkan resident
+integration and combined required probe both exited 0 at `b204b0a`. All
+sixteen required CUDA cases passed with command exit 0: three commits per case, 48 committed frames/uploads/final RGB readbacks, 188 metadata
+readbacks, 71 synchronizations, 83 CPU-tail boundaries, and zero fallback.
+The strict seven-stage and automatic six-stage resident cases each committed
+three frames with three uploads/final RGB readbacks, 39 metadata readbacks,
+nine synchronizations, and twelve tails.
 
-FastDVDnet publication/catalog promotion remains separately unapproved. The
-corrected artifact and matching metadata/license are reviewable in
-`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/`; the shipped
-catalog and installed packs remain unchanged. Real camera/V4L2 transport,
-real-face correction, visual quality, optimized latency, other claimed vendor
-families, remote CI execution, and signed release delivery remain distinct
-qualification gates. See [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md)
-and [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+Evidence is recorded under
+`/tmp/studiocast-final-hardware-20261111/`, including
+`vulkan-required-b204b0a.log`, `probe-required-b204b0a.log`,
+`cuda-matrix-b204b0a.log`, `qualification-summary.json`, and `qualification/`.
+`qualification/source.txt` records exact `b204b0a`; model identities are in
+`model-evidence.json`. Earlier sixteen-case CUDA success at `211da52` and the
+`0c93225` 64x48 → 96x64 combined run remain historical bounded evidence.
+
+Commands used for the final checkpoint (with temporary HOME/XDG roots and the
+preinstalled read-only model root) are:
+
+```bash
+cmake --build /tmp/studiocast-parity-enabled-20261110
+cmake --build /tmp/studiocast-parity-disabled-debug-20261111
+ctest --test-dir /tmp/studiocast-parity-enabled-20261110 --output-on-failure
+ctest --test-dir /tmp/studiocast-parity-disabled-debug-20261111 --output-on-failure
+STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+  /tmp/studiocast-parity-enabled-20261110/studiocast-vulkan-final-stage-integration-tests
+/tmp/studiocast-parity-enabled-20261110/studiocast-probe --self-test --require-cuda-runtime
+/tmp/studiocast-parity-disabled-debug-20261111/studiocast-probe --self-test
+bash /tmp/studiocast-final-hardware-20261111/cuda-workflow-local.sh
+```
+
+The serialized local workflow script executes the sixteen cases from required
+hardware CI with exact model/image inputs, three frames at 64x48 → 32x24, and
+the camera's 100 ms / 1 ms / 100-poll completion policy. Automatic selection
+covers six resident stages without mirror; automatic host mirror still needs
+camera-level evidence. All native runs use P1000 / driver 535.309.01,
+generated no-face input, an isolated model root, and an in-memory writer.
+They do not qualify real camera/V4L2 transport, real-face correction, visual
+quality, optimized latency, AMD/Intel, remote CI, or signed release.
+
+### Authorized publication blocked on authentication
+
+The user authorized the three corrected sigma15 files on Hugging Face and the
+local catalog update. Preupload returned HTTP 401; the browser required login.
+No working authentication is available; the user reported no credential
+available. Approval persists. No remote files were published, and the
+active catalog/templates and installed packs are unchanged. The active catalog
+is still `2026-07-19`, 131,224,287 total bytes, with the known-invalid
+416,788-byte sigma15 artifact.
+
+The separate eight-file promotion proposal at
+`/tmp/studiocast-fastdvdnet-promotion-20261111` is staged and unaccepted. Its
+`2026-11-11` / 140,755,803-byte catalog is proposed only. Proposal checks passed
+19 model, 52 backend, nine packaging, and one GUI test; real corrected-artifact
+local-source/offline transactions used temporary roots only. The independent
+exporter/license fix was accepted at `b204b0a`; six exporter tests and a fresh
+full-graph/nine-case CPU export reproduced all three candidate files exactly.
+Sigma25/50 BYO templates remain untouched and are not curated defaults.
+
+Resume files in
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/` are
+`publication-plan.json`, `promotion-proposal.patch`,
+`promotion-handoff-20261111.json`, and `publish_verified_fastdvdnet.py`.
+Normal secure Hugging Face login/write access is required; credentials belong
+outside chat/source/logs. Verify the exact three-file publication receipt at an
+immutable commit, then review/update catalog provenance and rerun its checks
+before acceptance. An unmarked old installed pack remains preserved with
+`curated_ownership_unverified`; ownership protections and signed release gates
+must not be weakened. See
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
