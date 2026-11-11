@@ -370,34 +370,38 @@ public:
         hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
     result.evidence.execution_domain = program.execution_domain;
     result.evidence.model_artifact = config.model_artifact;
-    open_cuda::PreparedOpenCudaVbPlanInput input{};
-    input.semantic = program.stages[0].semantic;
-    input.frame_width = program.host_input.width;
-    input.frame_height = program.host_input.height;
-    input.model_width =
-        static_cast<std::uint64_t>(config.model_pack->matting->input.width);
-    input.model_height =
-        static_cast<std::uint64_t>(config.model_pack->matting->input.height);
-    input.requested_strength = config.strength;
-    input.input_pitch_bytes =
-        program.stages[0].input.image.planes[0].row_stride_bytes;
-    input.output_pitch_bytes =
-        program.stages[0].output.image.planes[0].row_stride_bytes;
-    input.model_alpha_capacity_bytes =
-        input.model_width * input.model_height * sizeof(float);
-    input.input_tensor_capacity_bytes = input.model_alpha_capacity_bytes * 3;
-    input.resized_alpha_pitch_bytes = input.frame_width * sizeof(float);
-    input.alpha_scratch_pitch_bytes = input.resized_alpha_pitch_bytes;
-    input.alpha_feather_pitch_bytes = input.resized_alpha_pitch_bytes;
-    input.blur_scratch_pitch_bytes = input.input_pitch_bytes;
-    input.blurred_pitch_bytes = input.input_pitch_bytes;
-    input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
-    input.readback_staging_bytes = program.host_output.planes[0].size_bytes;
-    input.available_budget = program.budget;
-    result.evidence.geometry_plan =
-        open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
-    result.evidence.reserved_budget =
-        result.evidence.geometry_plan.required_budget;
+    if (config.model_pack && config.model_pack->matting) {
+      open_cuda::PreparedOpenCudaVbPlanInput input{};
+      input.semantic = program.stages[0].semantic;
+      input.frame_width = program.host_input.width;
+      input.frame_height = program.host_input.height;
+      input.model_width =
+          static_cast<std::uint64_t>(config.model_pack->matting->input.width);
+      input.model_height =
+          static_cast<std::uint64_t>(config.model_pack->matting->input.height);
+      input.requested_strength = config.strength;
+      input.input_pitch_bytes =
+          program.stages[0].input.image.planes[0].row_stride_bytes;
+      input.output_pitch_bytes =
+          program.stages[0].output.image.planes[0].row_stride_bytes;
+      input.model_alpha_capacity_bytes =
+          input.model_width * input.model_height * sizeof(float);
+      input.input_tensor_capacity_bytes = input.model_alpha_capacity_bytes * 3;
+      input.resized_alpha_pitch_bytes = input.frame_width * sizeof(float);
+      input.alpha_scratch_pitch_bytes = input.resized_alpha_pitch_bytes;
+      input.alpha_feather_pitch_bytes = input.resized_alpha_pitch_bytes;
+      input.blur_scratch_pitch_bytes = input.input_pitch_bytes;
+      input.blurred_pitch_bytes = input.input_pitch_bytes;
+      input.upload_staging_bytes = program.host_input.planes[0].size_bytes;
+      input.readback_staging_bytes = program.host_output.planes[0].size_bytes;
+      input.available_budget = program.budget;
+      result.evidence.geometry_plan =
+          open_cuda::PlanPreparedOpenCudaVirtualBackground(input);
+      result.evidence.reserved_budget =
+          result.evidence.geometry_plan.required_budget;
+    } else {
+      result.evidence.reserved_budget = program.budget;
+    }
     result.evidence.strict_cuda_only = true;
     result.evidence.user_stream_bound = true;
     result.evidence.cpu_provider_fallback_disabled = true;
@@ -407,7 +411,12 @@ public:
     result.evidence.device_preprocess = true;
     result.evidence.device_postprocess = true;
     result.evidence.one_upload_one_readback = true;
-    result.evidence.no_intermediate_crossings = true;
+    result.evidence.no_intermediate_crossings = std::none_of(
+        program.stages.begin(), program.stages.begin() + program.stage_count,
+        [](const auto &stage) {
+          return stage.semantic == hal::SemanticEffectId::auto_frame ||
+                 stage.semantic == hal::SemanticEffectId::eye_contact;
+        });
     result.evidence.single_in_flight = true;
     active = result.handle;
     return result;
@@ -1491,6 +1500,114 @@ bool ProductionSetupLeasePermanentPendingIsTruthfulAndFailSafe() {
   return ok;
 }
 
+bool UnsubmittedTemporalFrameRetiresAcrossProductionCudaLayers() {
+  bool ok = true;
+  for (const auto drop : {hal::FrameDropBehavior::preserve_order,
+                          hal::FrameDropBehavior::latest_frame_wins}) {
+    for (int rejected_kind = 0; rejected_kind < 3; ++rejected_kind) {
+      FakeCudaState state{};
+      PendingRuntime runtime{};
+      runtime.pending = false;
+      auto setup = ProductionFactoryRequest(&state, &runtime,
+                                            hal::SemanticEffectId::auto_frame);
+      setup.backend.dependencies.face_artifact = setup.backend.model_artifact;
+      setup.backend.model_artifact = {};
+      setup.backend.model_pack = {};
+      open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap;
+      auto factory = open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+          setup, &bootstrap);
+      ok = Expect(factory != nullptr,
+                  "real CUDA discard fixture must create production owner") &&
+           ok;
+      if (!factory)
+        continue;
+      const auto registration = factory->adapter_registration();
+      auto program = Program(registration.execution_domain);
+      program.stages[0].semantic = hal::SemanticEffectId::auto_frame;
+      program.invalidation_key.generations = setup.generations;
+      program.invalidation_key.generations.context =
+          registration.execution_domain.logical_context_generation;
+      program.temporal = {true, true, drop,
+                          hal::TemporalDiscontinuityAction::fail_frame, 1};
+      program.maximum_metadata_readbacks_per_frame = 12;
+      program.maximum_metadata_cpu_tails_per_frame = 2;
+      hal::PreparedProgramSession session;
+      hal::ReadinessSnapshot readiness;
+      hal::ReasonId reason = hal::ReasonId::none;
+      const auto configured = session.Configure(
+          program, *registration.resident_adapter, &readiness, &reason);
+      ok = Expect(configured == hal::StatusId::degraded,
+                  "real CUDA discard fixture must prepare through borrowed "
+                  "adapter") &&
+           ok;
+      if (configured != hal::StatusId::degraded)
+        continue;
+      std::array<std::byte, 384> input{}, output{};
+      hal::HostFrameBinding binding;
+      binding.input_descriptor = program.host_input;
+      binding.output_descriptor = program.host_output;
+      binding.input_plane_count = binding.output_plane_count = 1;
+      binding.input_planes[0] = {input.data(), nullptr, input.size(), 48};
+      binding.output_planes[0] = {nullptr, output.data(), output.size(), 48};
+      hal::HostFrameTokens tokens;
+      const auto execute_bound = [&](std::uint64_t sequence) {
+        binding.capture_sequence = sequence;
+        const auto bind = session.BindHostFrame(binding, &tokens, &reason);
+        ok = Expect(bind == hal::StatusId::ready,
+                    "unsubmitted frame must retire in CUDA adapter AND "
+                    "executor before retry") &&
+             ok;
+        if (bind != hal::StatusId::ready)
+          return hal::ExecuteResult{};
+        hal::ExecuteRequest request;
+        request.invalidation_key = program.invalidation_key;
+        request.execution_domain = program.execution_domain;
+        request.capture_sequence = sequence;
+        request.input = tokens.input;
+        return session.Execute(request);
+      };
+      auto frame = execute_bound(5);
+      ok = Expect(frame.output_valid &&
+                      session.CommitOutput({frame.completion, true}, &reason) ==
+                          hal::StatusId::ready,
+                  "production CUDA initial frame must commit") &&
+           ok;
+      const std::uint64_t rejected_sequence = rejected_kind == 0   ? 7u
+                                              : rejected_kind == 1 ? 5u
+                                                                   : 4u;
+      frame = execute_bound(rejected_sequence);
+      const auto expected_reason =
+          rejected_kind == 0 &&
+                  drop == hal::FrameDropBehavior::latest_frame_wins
+              ? hal::ReasonId::temporal_discontinuity
+              : hal::ReasonId::frame_order_violated;
+      ok =
+          Expect(frame.status == hal::StatusId::failed &&
+                     frame.reason == expected_reason &&
+                     runtime.execute_calls == 1 && runtime.prepare_calls == 1 &&
+                     runtime.destroy_prepared_calls == 0 &&
+                     runtime.shutdown_calls == 0 &&
+                     !session.latest_committed_frame().valid,
+                 "discarded production frame must not invoke GPU runtime or "
+                 "retain active attribution") &&
+          ok;
+      frame = execute_bound(6);
+      hal::HostFrameOutputResolution resolution;
+      ok = Expect(frame.output_valid && runtime.execute_calls == 2 &&
+                      session.ResolveHostFrameOutput(
+                          frame.completion, frame.output, &resolution,
+                          &reason) == hal::StatusId::ready &&
+                      resolution.capture_sequence == 6 &&
+                      session.CommitOutput({frame.completion, true}, &reason) ==
+                          hal::StatusId::ready,
+                  "missing frame must recover across session/factory/CUDA "
+                  "adapter/real executor") &&
+           ok;
+    }
+  }
+  return ok;
+}
+
 bool ProductionFactoryReprepareAndRollbackAreLifetimeSafe() {
   FakeCudaState state{};
   PendingRuntime runtime{};
@@ -1643,6 +1760,7 @@ int main() {
   ok = ProductionSetupLeaseMismatchRollsBackAndRetainsOldLease() && ok;
   ok = ProductionSetupLeaseShutdownRetriesPendingThenComplete() && ok;
   ok = ProductionSetupLeasePermanentPendingIsTruthfulAndFailSafe() && ok;
+  ok = UnsubmittedTemporalFrameRetiresAcrossProductionCudaLayers() && ok;
   ok = ProductionFactoryReprepareAndRollbackAreLifetimeSafe() && ok;
   g_cuda = nullptr;
   if (!ok)

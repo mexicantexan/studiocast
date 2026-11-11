@@ -1560,6 +1560,212 @@ bool TestBudgetEvidenceRollbackAndOldPlanRetention() {
   return ok;
 }
 
+bool TestUnsubmittedBindingDiscardIsExactAndCpuOnly() {
+  bool ok = true;
+  const auto counters = [](const open_cuda::ExecutorTelemetrySnapshot &t) {
+    return std::array{t.allocation_requests,
+                      t.provider_probes,
+                      t.model_scans,
+                      t.manifest_parses,
+                      t.session_constructions,
+                      t.json_serializations,
+                      t.uploads,
+                      t.final_readbacks,
+                      t.intermediate_readbacks,
+                      t.intermediate_uploads,
+                      t.synchronizations,
+                      t.cpu_tail_boundaries,
+                      t.shared_analysis_runs};
+  };
+  for (const bool submitted_failure : {false, true}) {
+    FakeRuntime runtime;
+    open_cuda::OpenCudaPreparedResidentExecutor executor(Options(&runtime));
+    auto program = Program();
+    auto prepared = executor.Prepare(program);
+    ok = Expect(prepared.status == hal::StatusId::ready,
+                "discard executor fixture must prepare") &&
+         ok;
+    std::array<std::byte, 384> input{}, output{};
+    auto binding = HostBinding(program, input.data(), output.data(), 7);
+    hal::HostFrameTokens tokens;
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok = Expect(executor.BindHostFrame(prepared.handle, binding, &tokens,
+                                       &reason) == hal::StatusId::ready,
+                "discard fixture must bind once without GPU work") &&
+         ok;
+    const auto before = counters(executor.Telemetry());
+    for (int mutation = 0; mutation < 12; ++mutation) {
+      auto handle = prepared.handle;
+      auto forged = tokens;
+      auto sequence = binding.capture_sequence;
+      if (mutation == 0)
+        --sequence;
+      if (mutation == 1)
+        ++forged.input.resource_id;
+      if (mutation == 2)
+        ++forged.output.resource_id;
+      if (mutation == 3)
+        ++forged.input.execution_domain.logical_context_generation;
+      if (mutation == 4)
+        ++forged.output.lifetime_generation;
+      if (mutation == 5)
+        forged.input.destruction_owner = &runtime;
+      if (mutation == 6)
+        forged.output.destroy = +[](void *, hal::ResourceHandle *) noexcept {};
+      if (mutation == 7)
+        ++handle.execution_domain.logical_context_generation;
+      if (mutation == 8)
+        ++handle.opaque[1];
+      if (mutation == 9)
+        ++handle.prepared_output.resource_id;
+      if (mutation == 10)
+        ++handle.reserved_budget.resource_count;
+      if (mutation == 11)
+        ++handle.program_id;
+      const auto status = executor.DiscardUnsubmittedHostFrame(
+          handle, forged, sequence, &reason);
+      ok = Expect(status != hal::StatusId::ready &&
+                      counters(executor.Telemetry()) == before &&
+                      runtime.execute_calls == 0 && runtime.reset_calls == 0 &&
+                      runtime.prepare_calls == 1,
+                  "forged discard must not clear a binding, call runtime, or "
+                  "change telemetry") &&
+           ok;
+    }
+    ok = Expect(
+             executor.DiscardUnsubmittedHostFrame(
+                 prepared.handle, tokens, 7, &reason) == hal::StatusId::ready &&
+                 reason == hal::ReasonId::none &&
+                 counters(executor.Telemetry()) == before,
+             "exact unsubmitted discard must clear only CPU binding state") &&
+         ok;
+    ok = Expect(executor.DiscardUnsubmittedHostFrame(prepared.handle, tokens, 7,
+                                                     &reason) ==
+                    hal::StatusId::blocked,
+                "discard must reject replay after binding retirement") &&
+         ok;
+    binding.capture_sequence = 6;
+    const auto stale_tokens = tokens;
+    ok = Expect(
+             executor.BindHostFrame(prepared.handle, binding, &tokens,
+                                    &reason) == hal::StatusId::ready &&
+                 executor.DiscardUnsubmittedHostFrame(
+                     prepared.handle, stale_tokens, 6, &reason) !=
+                     hal::StatusId::ready,
+             "new binding must survive replayed tokens from discarded frame") &&
+         ok;
+    hal::ExecuteRequest request;
+    request.invalidation_key = program.invalidation_key;
+    request.execution_domain = program.execution_domain;
+    request.capture_sequence = 6;
+    request.input = tokens.input;
+    if (submitted_failure)
+      runtime.execute_status = RuntimeStatus::inference_failed;
+    const auto frame = executor.Execute(prepared.handle, request);
+    const auto submitted = counters(executor.Telemetry());
+    ok = Expect(executor.DiscardUnsubmittedHostFrame(prepared.handle, tokens, 6,
+                                                     &reason) ==
+                        hal::StatusId::blocked &&
+                    counters(executor.Telemetry()) == submitted &&
+                    runtime.execute_calls == 1,
+                "discard must refuse submitted work even when output "
+                "completion failed") &&
+         ok;
+    if (!submitted_failure) {
+      hal::HostFrameOutputResolution resolution;
+      const hal::CompletionToken completion{
+          1, program.program_id, program.owner_adapter_instance_id, 6, true};
+      ok = Expect(
+               frame.output_valid &&
+                   executor.ResolveHostFrameOutput(
+                       prepared.handle, completion, frame.output, &resolution,
+                       &reason) == hal::StatusId::ready,
+               "refused post-submit discard must preserve completed output") &&
+           ok;
+    }
+    executor.DestroyPrepared(&prepared.handle);
+  }
+  return ok;
+}
+
+bool TestCudaAdapterForwardsExactUnsubmittedDiscard() {
+  Fixture fixture;
+  hal::PreparedProgramHandle handle;
+  hal::ReadinessSnapshot readiness;
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Expect(fixture.adapter.Prepare(fixture.program, &handle, &readiness,
+                                           &reason) == hal::StatusId::degraded,
+                   "real adapter discard fixture must prepare real executor");
+  const auto binding = HostBinding(fixture.program, fixture.input.data(),
+                                   fixture.output.data(), 3);
+  hal::HostFrameTokens tokens;
+  ok = Expect(fixture.adapter.BindHostFrame(handle, binding, &tokens,
+                                            &reason) == hal::StatusId::ready,
+              "real adapter must bind before discard") &&
+       ok;
+  for (int mutation = 0; mutation < 8; ++mutation) {
+    auto candidate = handle;
+    auto forged = tokens;
+    auto sequence = binding.capture_sequence;
+    if (mutation == 0)
+      --sequence;
+    if (mutation == 1)
+      ++candidate.adapter_opaque[1];
+    if (mutation == 2)
+      ++candidate.invalidation_key.generations.context;
+    if (mutation == 3)
+      ++candidate.execution_domain.logical_context_generation;
+    if (mutation == 4)
+      ++forged.input.resource_id;
+    if (mutation == 5)
+      ++forged.output.resource_id;
+    if (mutation == 6)
+      ++forged.output.lifetime_generation;
+    if (mutation == 7)
+      forged.input.destruction_owner = &fixture;
+    ok = Expect(fixture.adapter.DiscardUnsubmittedHostFrame(
+                    candidate, forged, sequence, &reason) !=
+                        hal::StatusId::ready &&
+                    fixture.runtime.execute_calls == 0 &&
+                    fixture.runtime.reset_calls == 0,
+                "adapter must reject foreign handles/tokens without consuming "
+                "current binding") &&
+         ok;
+  }
+  ok = Expect(fixture.adapter.DiscardUnsubmittedHostFrame(
+                  handle, tokens, 3, &reason) == hal::StatusId::ready &&
+                  fixture.adapter.DiscardUnsubmittedHostFrame(
+                      handle, tokens, 3, &reason) == hal::StatusId::blocked,
+              "real adapter must forward exact discard and reject replay") &&
+       ok;
+  auto next = binding;
+  next.capture_sequence = 2;
+  ok =
+      Expect(fixture.adapter.BindHostFrame(handle, next, &tokens, &reason) ==
+                 hal::StatusId::ready,
+             "real adapter and executor must both release discarded binding") &&
+      ok;
+  hal::ExecuteRequest request;
+  request.invalidation_key = fixture.program.invalidation_key;
+  request.execution_domain = fixture.program.execution_domain;
+  request.capture_sequence = 2;
+  request.input = tokens.input;
+  const auto frame = fixture.adapter.Execute(handle, request);
+  ok = Expect(frame.output_valid && fixture.runtime.execute_calls == 1 &&
+                  fixture.adapter.DiscardUnsubmittedHostFrame(
+                      handle, tokens, 2, &reason) == hal::StatusId::blocked,
+              "adapter must refuse discarding already submitted output") &&
+       ok;
+  hal::HostFrameOutputResolution resolution;
+  ok = Expect(fixture.adapter.ResolveHostFrameOutput(
+                  handle, frame.completion, frame.output, &resolution,
+                  &reason) == hal::StatusId::ready,
+              "refused discard must leave submitted output resolvable") &&
+       ok;
+  fixture.adapter.DestroyPrepared(&handle);
+  return ok;
+}
+
 bool TestStaleForeignBindingReconfigurationAndReset() {
   FakeRuntime runtime;
   auto options = Options(&runtime);
@@ -1696,6 +1902,8 @@ int main() {
   ok = TestEligibilityFailsClosedBeforeRuntimeSetup() && ok;
   ok = TestResolvedSelectionStrictnessDoesNotRejectNativeCuda() && ok;
   ok = TestBudgetEvidenceRollbackAndOldPlanRetention() && ok;
+  ok = TestUnsubmittedBindingDiscardIsExactAndCpuOnly() && ok;
+  ok = TestCudaAdapterForwardsExactUnsubmittedDiscard() && ok;
   ok = TestStaleForeignBindingReconfigurationAndReset() && ok;
   ok = TestBoundedTerminalStatesAndPendingShutdown() && ok;
   if (!ok)

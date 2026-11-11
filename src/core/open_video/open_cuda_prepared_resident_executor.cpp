@@ -101,7 +101,8 @@ bool SameResource(const hal::ResourceHandle &lhs,
          lhs.alignment_bytes == rhs.alignment_bytes &&
          lhs.mutable_resource == rhs.mutable_resource &&
          lhs.aliasable == rhs.aliasable &&
-         lhs.adapter_opaque == rhs.adapter_opaque;
+         lhs.adapter_opaque == rhs.adapter_opaque &&
+         lhs.destruction_owner == rhs.destruction_owner && lhs.destroy == rhs.destroy;
 }
 
 bool SameRuntimeHandle(const PreparedOpenCudaRuntimeHandle &lhs,
@@ -2261,9 +2262,10 @@ private:
       const float sy = static_cast<float>(slot->input.h) /
                        static_cast<float>(slot->alpha_image.h);
       out.box.source = open_video::PreparedCudaAutoFrameSource::matte;
-      out.box.box = {bounds.x0 * sx, bounds.y0 * sy,
-                     (bounds.x1 + 1 - bounds.x0) * sx,
-                     (bounds.y1 + 1 - bounds.y0) * sy};
+      out.box.box = {static_cast<float>(bounds.x0) * sx,
+                     static_cast<float>(bounds.y0) * sy,
+                     static_cast<float>(bounds.x1 + 1 - bounds.x0) * sx,
+                     static_cast<float>(bounds.y1 + 1 - bounds.y0) * sy};
       out.box.confidence = 1;
     }
     return out;
@@ -2984,6 +2986,7 @@ struct OpenCudaPreparedResidentExecutor::Impl {
     bool quarantined = false;
     bool host_bound = false;
     bool execution_completed = false;
+    bool execution_started = false;
     hal::PreparedProgram program{};
     PreparedExecutorHandle executor_handle{};
     PreparedOpenCudaRuntimeHandle runtime_handle{};
@@ -3338,6 +3341,7 @@ hal::ExecuteResult OpenCudaPreparedResidentExecutor::Execute(
   frame.stage_required = slot->program.stages[0].required;
   frame.failure_action = slot->program.stages[0].failure_action;
 
+  slot->execution_started = true;
   const auto runtime_before = impl_->runtime->Telemetry();
   const auto executed =
       impl_->runtime->ExecuteFrame(slot->runtime_handle, frame);
@@ -3473,7 +3477,47 @@ hal::StatusId OpenCudaPreparedResidentExecutor::BindHostFrame(
       reinterpret_cast<std::uintptr_t>(binding.output_planes[0].write_data));
   slot->host_bound = true;
   slot->execution_completed = false;
+  slot->execution_started = false;
   *tokens = slot->host_tokens;
+  return StatusId::ready;
+}
+
+hal::StatusId OpenCudaPreparedResidentExecutor::DiscardUnsubmittedHostFrame(
+    const PreparedExecutorHandle &program, const hal::HostFrameTokens &tokens,
+    std::uint64_t capture_sequence, hal::ReasonId *reason) noexcept {
+  if (reason)
+    *reason = ReasonId::none;
+  if (!impl_ || impl_->shutdown_requested) {
+    if (reason)
+      *reason = ReasonId::shutdown_requested;
+    return StatusId::stopped;
+  }
+  Impl::Slot *slot = impl_->Find(program);
+  if (!slot || !SameResource(program.prepared_output,
+                             slot->executor_handle.prepared_output)) {
+    if (reason)
+      *reason = ReasonId::stale_program;
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    if (reason)
+      *reason = ReasonId::device_lost;
+    return StatusId::quarantined;
+  }
+  if (!slot->host_bound || slot->execution_started ||
+      slot->execution_completed || capture_sequence == 0 ||
+      capture_sequence != slot->host_binding.capture_sequence ||
+      !SameResource(tokens.input, slot->host_tokens.input) ||
+      !SameResource(tokens.output, slot->host_tokens.output)) {
+    if (reason)
+      *reason = ReasonId::host_frame_binding_invalid;
+    return StatusId::blocked;
+  }
+  slot->host_bound = false;
+  slot->execution_started = false;
+  slot->execution_completed = false;
+  slot->host_binding = {};
+  slot->host_tokens = {};
   return StatusId::ready;
 }
 

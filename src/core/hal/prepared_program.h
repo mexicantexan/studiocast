@@ -484,6 +484,16 @@ public:
       *reason = ReasonId::host_frame_binding_unsupported;
     return StatusId::blocked;
   }
+  // Ready proves that only this exact, never-submitted binding was released.
+  // Implementations must not allocate, probe, synchronize, or submit GPU work.
+  // Unsupported adapters require the session to reconfigure before reuse.
+  virtual StatusId DiscardUnsubmittedHostFrame(
+      const PreparedProgramHandle &, const HostFrameTokens &, std::uint64_t,
+      ReasonId *reason) noexcept {
+    if (reason)
+      *reason = ReasonId::host_frame_binding_unsupported;
+    return StatusId::blocked;
+  }
   virtual StatusId ResolveHostFrameOutput(const PreparedProgramHandle &,
                                           const CompletionToken &,
                                           const ResourceHandle &,
