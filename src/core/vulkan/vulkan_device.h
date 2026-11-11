@@ -107,6 +107,8 @@ enum class VulkanSubmissionPhase {
 
 namespace detail {
 
+struct VulkanDeviceTestAccess;
+
 class VulkanContextState final {
 public:
   VulkanContextState() = default;
@@ -449,6 +451,7 @@ public:
                                             VkResult result);
 
 private:
+  friend struct detail::VulkanDeviceTestAccess;
   friend class VulkanBuffer;
   friend class VulkanCommandBatch;
   bool LoadInstanceFunctions(std::string *error_out);
