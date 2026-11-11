@@ -1,4 +1,5 @@
 #include "core/video/production_video_backend_manager.h"
+#include "core/video/production_video_setup_request.h"
 
 #include <cstddef>
 #include <utility>
@@ -613,8 +614,10 @@ bool CompatibleGenerations(const hal::ProgramGenerations &caller,
          compatible(caller.context, bound.context);
 }
 
-bool SameCanonicalPlanRequest(const VideoExecutionPlanRequest &caller,
-                              const VideoExecutionPlanRequest &bound) noexcept {
+bool SameCanonicalPlanRequest(const ProductionVideoResidentSetup &request,
+                              const VideoExecutionPlanRequest &bound,
+                              hal::BackendId selected_backend) noexcept {
+  const auto &caller = request.plan;
   if (caller.contract_version != bound.contract_version ||
       caller.plan_id != bound.plan_id ||
       !SameCanonicalIntent(caller.intent, bound.intent) ||
@@ -629,7 +632,9 @@ bool SameCanonicalPlanRequest(const VideoExecutionPlanRequest &caller,
            bound.invalidation_key.model_artifact_hash) ||
       caller.invalidation_key.execution_domain_hash != 0 ||
       bound.invalidation_key.execution_domain_hash == 0 ||
-      !SameTemporal(caller.temporal, bound.temporal) ||
+      !SameTemporal(ProductionVideoTemporalForSelectedBackend(
+                        request, selected_backend),
+                    bound.temporal) ||
       !BudgetWithin(caller.budget, bound.budget) ||
       !CompatibleCpuTails(caller, bound) ||
       caller.setup_failure_policy != bound.setup_failure_policy ||
@@ -1118,7 +1123,8 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     return Fail(hal::StatusId::resource_exhausted,
                 hal::ReasonId::resource_exhausted, retained, evidence, reason);
   }
-  if (!SameCanonicalPlanRequest(request.resident.plan, candidate.plan)) {
+  if (!SameCanonicalPlanRequest(request.resident, candidate.plan,
+                                candidate.readiness.execution_domain.backend)) {
     return Fail(hal::StatusId::blocked, hal::ReasonId::malformed_contract,
                 retained, evidence, reason);
   }
