@@ -11,6 +11,8 @@ namespace studiocast::hal {
 
 inline constexpr std::size_t kMaxPreparedStages = 32;
 inline constexpr std::size_t kMaxCpuTails = 8;
+inline constexpr std::size_t kMaxExecutionBoundaries =
+    (kMaxPreparedStages * 2) + kMaxCpuTails;
 inline constexpr std::size_t kMaxLatencyHistogramBuckets = 16;
 inline constexpr std::size_t kMaxCapabilityEvidenceRecords = 24;
 
@@ -238,6 +240,10 @@ struct PreparedProgram {
   bool strict_execution_domain = false;
   bool requires_upload = true;
   bool requires_final_readback = true;
+  // Setup-proven bounded metadata only. These allowances never permit host
+  // image/model tensors or intermediate frame uploads.
+  std::uint32_t maximum_metadata_readbacks_per_frame = 0;
+  std::uint32_t maximum_metadata_cpu_tails_per_frame = 0;
 };
 
 struct CapabilityEvidenceRecord {
@@ -513,6 +519,7 @@ public:
   [[nodiscard]] StatusId ResolveHostFrameOutput(
       const CompletionToken &completion, const ResourceHandle &output,
       HostFrameOutputResolution *resolution, ReasonId *reason) noexcept;
+  [[nodiscard]] StatusId ResetTemporalState(ReasonId reason) noexcept;
   void Invalidate(ReasonId reason) noexcept;
   void Shutdown() noexcept;
 

@@ -16,6 +16,11 @@ enum class OpenCudaSetupComponentId : std::uint8_t {
   aggregate_island,
   shared_matting,
   native_vignette,
+  native_mirror,
+  shared_face_analysis,
+  auto_frame,
+  eye_contact,
+  denoise,
 };
 
 // Cached setup evidence consumed by the HAL registry. None of these fields may
@@ -46,6 +51,14 @@ struct ResidentCapabilityFacts {
   bool virtual_background_replace = false;
   bool virtual_key_light = false;
   bool vignette = false;
+  bool mirror = false;
+  bool auto_frame = false;
+  bool eye_contact = false;
+  bool video_noise_removal = false;
+  bool native_mirror_kernel_prepared = false;
+  // Bounded metadata only; frame/tensor payloads remain device resident.
+  std::uint32_t max_intermediate_readbacks_per_frame = 0;
+  std::uint32_t max_cpu_tail_boundaries_per_frame = 0;
 };
 
 struct ResidentSemanticCapability {
@@ -207,6 +220,8 @@ private:
     PreparedExecutorHandle executor_handle{};
     bool requires_explicit_provider_sync = false;
     std::uint32_t completion_synchronizations_per_frame = 0;
+    std::uint32_t max_intermediate_readbacks_per_frame = 0;
+    std::uint32_t max_cpu_tail_boundaries_per_frame = 0;
     bool quarantined = false;
     hal::HostFrameBinding host_binding{};
     hal::HostFrameTokens host_tokens{};
