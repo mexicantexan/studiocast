@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       require_cuda_runtime:
-        description: "Run the opt-in CUDA runtime self-test that fails on CUDA smoke skips."
+        description: "Run required CUDA runtime and model-backed production smoke tests."
         required: false
         type: boolean
         default: false
@@ -14,6 +14,16 @@ on:
         required: false
         type: string
         default: '["self-hosted","linux","x64","gpu"]'
+      cuda_model_root:
+        description: "Preinstalled read-only model root ending in studiocast/models/open_video (required for CUDA opt-in)."
+        required: false
+        type: string
+        default: ''
+      cuda_model_id:
+        description: "Preinstalled CUDA matting model identity for production smoke. No model downloads are performed."
+        required: false
+        type: string
+        default: 'modnet-webnn-256-fp32'
       require_vulkan_nvidia_runtime:
         description: "Run opt-in Vulkan runtime smoke tests on an NVIDIA Vulkan runner."
         required: false
@@ -84,6 +94,9 @@ jobs:
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev
+
+      - name: Validate hardware workflow gates without hardware
+        run: python3 tests/gpu/hardware_ci_workflow_tests.py
 
       - name: Toolchain versions
         run: |
@@ -309,9 +322,11 @@ jobs:
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
             -DSTUDIOCAST_ENABLE_DLIB=OFF
 
-      - name: Build probe
+      - name: Build probe and production smoke
         run: |
-          cmake --build build --target studiocast-probe
+          cmake --build build --target \
+            studiocast-probe \
+            studiocast-open-cuda-production-smoke-tests
 
       - name: Portable self-test
         run: |
@@ -320,6 +335,36 @@ jobs:
       - name: Required CUDA runtime self-test
         run: |
           ./build/studiocast-probe --self-test --require-cuda-runtime
+
+      - name: Required CUDA production smoke
+        env:
+          CUDA_MODEL_ROOT: ${{ inputs.cuda_model_root }}
+          CUDA_MODEL_ID: ${{ inputs.cuda_model_id }}
+        run: |
+          : "${CUDA_MODEL_ROOT:?Set cuda_model_root to a preinstalled read-only model root}"
+          : "${CUDA_MODEL_ID:?Set cuda_model_id to a preinstalled matting model}"
+          test -d "${CUDA_MODEL_ROOT}"
+          mkdir -p build/qualification
+          git rev-parse HEAD | tee build/qualification/source.txt
+          grep -E '^CMAKE_BUILD_TYPE:STRING=|^STUDIOCAST_ENABLE_(OPEN_CUDA|OPEN_VULKAN|OPEN_AUDIO|DLIB):BOOL=' \
+            build/CMakeCache.txt | tee build/qualification/build-options.txt
+          nvidia-smi --query-gpu=name,driver_version,uuid --format=csv \
+            | tee build/qualification/gpu.csv
+          for effects in blur keylight blur+keylight vignette blur+vignette keylight+vignette blur+keylight+vignette; do
+            ./build/studiocast-open-cuda-production-smoke-tests \
+              --require --cuda --model-root "${CUDA_MODEL_ROOT}" \
+              --model-id "${CUDA_MODEL_ID}" --effects "${effects}" \
+              --input 64x48 --output 32x24 --frames 3 \
+              2>&1 | tee "build/qualification/cuda-${effects}.log"
+          done
+
+      - name: Preserve CUDA qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-production-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
 
   # Push CI intentionally avoids hard Vulkan runtime requirements. These jobs are
   # opt-in because the runner must provide a real vendor ICD and GPU.
@@ -364,12 +409,18 @@ jobs:
         run: |
           cmake --build build --target \
             studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
             studiocast-resize-backend-bench
 
       - name: Required Vulkan kernel tests
         run: |
           STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
             ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
 
       - name: Vulkan resize benchmark smoke
         run: |
@@ -415,12 +466,18 @@ jobs:
         run: |
           cmake --build build --target \
             studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
             studiocast-resize-backend-bench
 
       - name: Required Vulkan kernel tests
         run: |
           STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
             ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
 
       - name: Vulkan resize benchmark smoke
         run: |
@@ -466,12 +523,18 @@ jobs:
         run: |
           cmake --build build --target \
             studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
             studiocast-resize-backend-bench
 
       - name: Required Vulkan kernel tests
         run: |
           STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
             ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
 
       - name: Vulkan resize benchmark smoke
         run: |
