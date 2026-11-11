@@ -20,6 +20,7 @@ struct PreparedFastDvdnetModelContract {
   int output_height = 0;
   std::array<bool, 2> input_dynamic_hw{};
   bool output_dynamic_hw = false;
+  bool setup_specialized_dynamic_hw = false;
 };
 
 bool ValidatePreparedFastDvdnetSessionMetadata(
@@ -31,15 +32,17 @@ class IPreparedFastDvdnetOrtSession {
 public:
   virtual ~IPreparedFastDvdnetOrtSession() = default;
   virtual onnx::OrtPreparedCudaRunEvidence evidence() const noexcept = 0;
-  virtual bool PrepareBinding(const onnx::OrtSession::CudaBindingInput *inputs,
-                              std::size_t input_count,
-                              const onnx::OrtSession::CudaBindingOutput *outputs,
-                              std::size_t output_count) noexcept = 0;
-  virtual onnx::OrtPreparedRunResult Execute(
-      const onnx::OrtSession::CudaBindingInput *inputs, std::size_t input_count,
-      const onnx::OrtSession::CudaBindingOutput *outputs,
-      std::size_t output_count,
-      const onnx::OrtPreparedCudaRunEvidence &expected) noexcept = 0;
+  virtual bool
+  PrepareBinding(const onnx::OrtSession::CudaBindingInput *inputs,
+                 std::size_t input_count,
+                 const onnx::OrtSession::CudaBindingOutput *outputs,
+                 std::size_t output_count) noexcept = 0;
+  virtual onnx::OrtPreparedRunResult
+  Execute(const onnx::OrtSession::CudaBindingInput *inputs,
+          std::size_t input_count,
+          const onnx::OrtSession::CudaBindingOutput *outputs,
+          std::size_t output_count,
+          const onnx::OrtPreparedCudaRunEvidence &expected) noexcept = 0;
   virtual void RequestShutdown() noexcept = 0;
 };
 
@@ -62,11 +65,11 @@ public:
 
   PreparedCudaFastDvdnetRuntimePrepareResult
   Prepare(const PreparedCudaFastDvdnetConfig &config) noexcept override;
-  PreparedCudaFastDvdnetRuntimeFrameResult Execute(
-      std::uint64_t runtime_handle,
-      const PreparedCudaFastDvdnetTemporalPlan &temporal,
-      const cuda::CudaImage &input, cuda::CudaImage *output,
-      float noise_sigma_over_255) noexcept override;
+  PreparedCudaFastDvdnetRuntimeFrameResult
+  Execute(std::uint64_t runtime_handle,
+          const PreparedCudaFastDvdnetTemporalPlan &temporal,
+          const cuda::CudaImage &input, cuda::CudaImage *output,
+          float noise_sigma_over_255) noexcept override;
   PreparedCudaFastDvdnetStatus
   ResetTemporalState(std::uint64_t runtime_handle) noexcept override;
   PreparedCudaFastDvdnetShutdownSnapshot
@@ -79,8 +82,9 @@ private:
   PreparedCudaFastDvdnetStatus QuiesceFrame() noexcept;
   bool QuiescePending() noexcept;
   bool Release() noexcept;
-  void FinishFailedPrepare(PreparedCudaFastDvdnetStatus status,
-                           PreparedCudaFastDvdnetRuntimePrepareResult *result) noexcept;
+  void FinishFailedPrepare(
+      PreparedCudaFastDvdnetStatus status,
+      PreparedCudaFastDvdnetRuntimePrepareResult *result) noexcept;
   void Quarantine() noexcept;
 
   IPreparedFastDvdnetOrtFactory *factory_ = nullptr;
