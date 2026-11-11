@@ -130,6 +130,7 @@ publication and catalog task is recorded separately below.
 | `probe_selftest_repair` / `codex/probe-native-cleanup-20261111`, completed by root | `f64a00d` Vulkan shutdown retains context until guard destruction; friend-only unique/shared-owner regression fixture | `2623b88` |
 | `model_disposition` / `codex/fastdvdnet-promotion-20261111` | `337f3d8` independent idempotent full-license exporter repair only | `b204b0a`; old proposal was not accepted; resumed promotion is recorded below |
 | `model_disposition` / `codex/fastdvdnet-promotion-final-20261111` | `cf68618` verified published sigma15 catalog/template/fixture promotion | `d7f7f5d`; resumed publication and validation below |
+| `model_disposition` / `codex/fastdvdnet-candidate-source-20261111` | `6ea5537` bind generated candidate catalogs to their own exported files | `fafc58b`; active published source paths and payload bytes unchanged |
 | Root integration | `8d4393c` Python test registration; `1060a6f` integration assertions follow shared setup and preserve valid bindings after forged requests; `211da52` changed-line formatting | Direct local commits |
 
 ### Critique and remediation
@@ -262,11 +263,25 @@ path without an invalid-artifact fallback. The old unaccepted proposal at
 implementation, not accepted separately.
 
 The model agent passed 19 model, 52 backend, nine packaging, and one installer
-wizard test. Root post-integration model 19 and packaging nine passed; backend
-and wizard final results and the fresh independent critique are pending at this
-documentation checkpoint. Root additionally verified all three immutable HTTPS
+wizard test. Root post-integration checks passed 19 model tests, 52 backend
+tests (57.874 seconds), nine packaging tests, and installer wizard CTest one of
+one (1.96 seconds). Seven exporter regressions and the 40-file documentation
+validator also passed. Root additionally verified all three immutable HTTPS
 files without authentication; evidence is
 `/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/publication-public-https-verification.json`.
+
+Fresh `fastdvdnet_promotion_critique` found no Blocker/Critical/High in the
+publication, catalog, or documentation. It reproduced one Medium regression:
+the exporter inherited published versioned paths for a candidate whose payload
+was written to a flat local source tree. `6ea5537` corrects only generated
+candidate paths; the active catalog stays versioned. The new regression uses
+actual export layout, metadata, catalog parsing, and a local-source transaction
+with inference mocked; it fails before the fix and passes after it. A fresh
+pinned real export passed the full graph check and all nine CPU cases and
+reproduced the exact three published payloads. Candidate local-source and
+offline-cache transactions passed in temporary roots. Root reran seven exporter
+and 19 model tests after integration. Fresh final critique of this remediation
+remains pending at this documentation checkpoint.
 
 The integrated installer completed an online HTTPS transaction from immutable
 `8ffe9688`, then an offline verified-cache transaction, in temporary destinations

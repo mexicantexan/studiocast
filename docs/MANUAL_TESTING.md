@@ -614,7 +614,8 @@ Verify model identity explicitly. Old unmarked metadata must remain preserved
 with `curated_ownership_unverified`, and sigma25/sigma50 BYO templates remain
 untouched.
 
-A native sanitizer helper no longer reports the Vulkan use-after-free, but unresolved LeakSanitizer/symbolizer diagnostics
+A native sanitizer helper no longer reports the Vulkan use-after-free, but
+unresolved LeakSanitizer/symbolizer diagnostics
 prevent a clean full-native-sanitizer claim; see the durable ledger.
 
 Opt-in CI now requires the actual Vulkan final resident integration executable

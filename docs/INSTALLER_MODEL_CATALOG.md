@@ -72,6 +72,8 @@ cases passed with maximum absolute output error `4.76837158203125e-7`.
 The output contains an isolated source tree, candidate `model.json` and full
 license, a complete candidate catalog, and `validation.json` provenance/results.
 It never changes the shipped catalog, installed models, or external hosting.
+The generated candidate catalog points to its own `source/` layout for local
+validation; the active catalog below retains the published versioned path.
 
 The user-authorized publication added exactly `model.onnx`, `model.json`, and
 `LICENSE.txt` to the existing `10dallasj/studiocast` Hugging Face model repository
