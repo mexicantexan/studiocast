@@ -29,7 +29,16 @@ bool IsVirtualBackground(SemanticEffectId semantic) noexcept {
 bool IsSupportedResidentSemantic(SemanticEffectId semantic) noexcept {
   return IsVirtualBackground(semantic) ||
          semantic == SemanticEffectId::virtual_key_light ||
-         semantic == SemanticEffectId::vignette;
+         semantic == SemanticEffectId::vignette ||
+         semantic == SemanticEffectId::mirror ||
+         semantic == SemanticEffectId::auto_frame ||
+         semantic == SemanticEffectId::eye_contact ||
+         semantic == SemanticEffectId::video_noise_removal;
+}
+
+bool IsNative(SemanticEffectId semantic) noexcept {
+  return semantic == SemanticEffectId::vignette ||
+         semantic == SemanticEffectId::mirror;
 }
 
 bool HasIdentity(const std::array<std::uint8_t, 32> &identity) noexcept {
@@ -166,6 +175,8 @@ bool CompleteCapability(const ResidentCapabilityFacts &facts) noexcept {
          facts.steady_state_probe_free && facts.no_cpu_fallback &&
          facts.completion_synchronizations_per_frame != 0 &&
          facts.completion_synchronizations_per_frame <= 4 &&
+         facts.max_intermediate_readbacks_per_frame <= 13 &&
+         facts.max_cpu_tail_boundaries_per_frame <= kMaxCpuTails &&
          facts.device_postprocess;
 }
 
@@ -296,7 +307,7 @@ bool AnyModelStageRan(const ExecuteResult &result) noexcept {
   for (std::size_t index = 0;
        index < result.stage_count && index < result.stages.size(); ++index) {
     const auto status = result.stages[index].status;
-    if (result.stages[index].semantic != SemanticEffectId::vignette &&
+    if (!IsNative(result.stages[index].semantic) &&
         status != StageExecutionStatus::not_run &&
         status != StageExecutionStatus::disabled_preserved) {
       return true;
@@ -361,10 +372,29 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
     return false;
   }
   bool has_model_consumer = false;
-  for (std::size_t index = 0; index < program.stage_count; ++index)
-    has_model_consumer |= program.stages[index].semantic != SemanticEffectId::vignette;
-  if (!CompleteCapability(prepared.evidence.capability) ||
-      (has_model_consumer && !CompleteOrtCapability(prepared.evidence.capability)) ||
+  bool has_auto_frame = false;
+  bool has_eye_contact = false;
+  for (std::size_t index = 0; index < program.stage_count; ++index) {
+    const auto semantic = program.stages[index].semantic;
+    has_model_consumer |= !IsNative(semantic);
+    has_auto_frame |= semantic == SemanticEffectId::auto_frame;
+    has_eye_contact |= semantic == SemanticEffectId::eye_contact;
+  }
+  if (prepared.evidence.capability.max_intermediate_readbacks_per_frame >
+          (has_auto_frame    ? 13u
+           : has_eye_contact ? 12u
+                             : 0u) ||
+      prepared.evidence.capability.max_cpu_tail_boundaries_per_frame >
+          (has_auto_frame    ? 3u
+           : has_eye_contact ? 1u
+                             : 0u) ||
+      prepared.evidence.capability.max_intermediate_readbacks_per_frame >
+          program.maximum_metadata_readbacks_per_frame ||
+      prepared.evidence.capability.max_cpu_tail_boundaries_per_frame >
+          program.maximum_metadata_cpu_tails_per_frame ||
+      !CompleteCapability(prepared.evidence.capability) ||
+      (has_model_consumer &&
+       !CompleteOrtCapability(prepared.evidence.capability)) ||
       prepared.evidence.stage_count != program.stage_count ||
       (has_model_consumer && (program.invalidation_key.generations.model == 0 ||
                               program.invalidation_key.model_artifact_hash == 0))) {
@@ -386,34 +416,49 @@ bool ValidatePreparedEvidence(const PreparedProgram &program,
     return false;
   }
 
-  const ModelArtifactIdentity &island_model = program.stages[0].model;
+  const ModelArtifactIdentity *matting_model = nullptr;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
+    const auto capability = EvaluateResidentCapability(
+        stage.semantic, prepared.evidence.capability);
+    if (!capability.production_eligible ||
+        capability.provider != stage.provider) {
+      SetReason(reason, capability.reason);
+      return false;
+    }
+    if (IsVirtualBackground(stage.semantic) ||
+        stage.semantic == SemanticEffectId::virtual_key_light) {
+      if (matting_model && !SameModel(*matting_model, stage.model)) {
+        SetReason(reason, ReasonId::capability_evidence_incomplete);
+        return false;
+      }
+      matting_model = &stage.model;
+    }
     const auto *evidence = FindEvidence(prepared.evidence, stage.stage_id);
     if (!evidence || evidence->semantic != stage.semantic ||
         evidence->provider != stage.provider ||
         !SameIo(evidence->input, stage.input) ||
         !SameIo(evidence->output, stage.output) ||
         !SameModel(evidence->model, stage.model) ||
-        (stage.semantic != SemanticEffectId::vignette &&
-         !SameModel(stage.model, island_model)) ||
         !evidence->production_qualified || !evidence->cuda_device_input ||
         !evidence->cuda_device_output ||
-        (stage.semantic != SemanticEffectId::vignette &&
+        (!IsNative(stage.semantic) &&
          (!evidence->cuda_iobinding || !evidence->device_preprocess ||
           !evidence->shared_analysis)) ||
         !evidence->device_postprocess || !evidence->cpu_fallback_disabled) {
       SetReason(reason, ReasonId::capability_evidence_incomplete);
       return false;
     }
-    if (program.temporal.temporal &&
+    if (stage.semantic == SemanticEffectId::video_noise_removal &&
+        program.temporal.temporal &&
         !evidence->temporal_history_device_resident) {
       SetReason(reason, ReasonId::capability_evidence_incomplete);
       return false;
     }
     if (!IsSupportedResidentSemantic(stage.semantic) ||
-        (stage.semantic == SemanticEffectId::vignette
-             ? stage.provider != SemanticEffectProviderId::open_cuda_production_kernels ||
+        (IsNative(stage.semantic)
+             ? stage.provider !=
+                       SemanticEffectProviderId::open_cuda_production_kernels ||
                    HasIdentity(stage.model.model_id_hash) ||
                    HasIdentity(stage.model.artifact_set_hash) ||
                    stage.model.artifact_generation != 0
@@ -443,7 +488,8 @@ bool ValidateTelemetry(const ExecutorTelemetrySnapshot &before,
                        const ExecutorTelemetrySnapshot &after,
                        const ExecuteResult &result,
                        std::size_t declared_cpu_tails,
-                       std::uint32_t expected_synchronizations, bool completed,
+                       std::uint32_t expected_synchronizations,
+                       bool variable_metadata, bool completed,
                        bool analysis_ran) noexcept {
   std::uint64_t allocation_delta = 0;
   std::uint64_t probe_delta = 0;
@@ -485,7 +531,9 @@ bool ValidateTelemetry(const ExecutorTelemetrySnapshot &before,
                      &analyses);
   if (!monotonic || allocation_delta != 0 || probe_delta != 0 ||
       scan_delta != 0 || parse_delta != 0 || session_delta != 0 ||
-      json_delta != 0 || analyses != (analysis_ran ? 1u : 0u)) {
+      json_delta != 0 ||
+      (variable_metadata ? analyses > 1u
+                         : analyses != (analysis_ran ? 1u : 0u))) {
     return false;
   }
   return uploads == result.transfers.uploads &&
@@ -493,9 +541,14 @@ bool ValidateTelemetry(const ExecutorTelemetrySnapshot &before,
          intermediate_readbacks == result.transfers.intermediate_readbacks &&
          intermediate_uploads == result.transfers.intermediate_uploads &&
          synchronizations == result.transfers.synchronizations &&
-         (!completed || synchronizations == expected_synchronizations) &&
+         (!completed ||
+          (variable_metadata
+               ? synchronizations >= 1 &&
+                     synchronizations <= expected_synchronizations
+               : synchronizations == expected_synchronizations)) &&
          cpu_tails == result.transfers.cpu_tail_boundaries &&
-         (!completed || cpu_tails == declared_cpu_tails);
+         (!completed || (variable_metadata ? cpu_tails >= declared_cpu_tails
+                                           : cpu_tails == declared_cpu_tails));
 }
 
 } // namespace
@@ -530,13 +583,23 @@ EvaluateResidentCapability(SemanticEffectId semantic,
     capability.provider = SemanticEffectProviderId::open_cuda_production_kernels;
     break;
   case SemanticEffectId::video_noise_removal:
+    semantic_ready = facts.video_noise_removal;
+    break;
   case SemanticEffectId::eye_contact:
+    semantic_ready = facts.eye_contact;
+    break;
   case SemanticEffectId::auto_frame:
+    semantic_ready = facts.auto_frame;
+    break;
   case SemanticEffectId::mirror:
+    semantic_ready = facts.mirror && facts.native_mirror_kernel_prepared;
+    capability.provider =
+        SemanticEffectProviderId::open_cuda_production_kernels;
+    break;
   case SemanticEffectId::invalid:
     break;
   }
-  const bool native = semantic == SemanticEffectId::vignette;
+  const bool native = IsNative(semantic);
   if (!facts.cuda_driver_ready ||
       (!native && (!facts.ort_cuda_provider_ready ||
                    !facts.ort_cuda_iobinding_ready))) {
@@ -629,6 +692,11 @@ StatusId ResidentAdapter::Prepare(const PreparedProgram &program,
   slot->completion_synchronizations_per_frame =
       prepared.evidence.capability.completion_synchronizations_per_frame;
 
+  slot->max_intermediate_readbacks_per_frame =
+      prepared.evidence.capability.max_intermediate_readbacks_per_frame;
+  slot->max_cpu_tail_boundaries_per_frame =
+      prepared.evidence.capability.max_cpu_tail_boundaries_per_frame;
+
   candidate->handle_id = slot->public_handle_id;
   candidate->program_id = program.program_id;
   candidate->adapter_instance_id = adapter_instance_id_;
@@ -648,16 +716,10 @@ StatusId ResidentAdapter::Prepare(const PreparedProgram &program,
                : (cpu_tail ? ReasonId::cpu_tail_required : ReasonId::none);
   readiness->requested_backend = program.requested_backend;
   readiness->selected_backend = BackendId::cuda;
-  const bool vignette_last =
-      program.stages[program.stage_count - 1].semantic ==
-      SemanticEffectId::vignette;
-  const bool has_model_consumer =
-      program.stage_count > (vignette_last ? 1u : 0u);
-  readiness->provider =
-      has_model_consumer && vignette_last
-          ? SemanticEffectProviderId::invalid
-          : has_model_consumer ? SemanticEffectProviderId::open_video_onnxruntime_cuda
-                               : SemanticEffectProviderId::open_cuda_production_kernels;
+  readiness->provider = program.stages[0].provider;
+  for (std::size_t index = 1; index < program.stage_count; ++index)
+    if (program.stages[index].provider != readiness->provider)
+      readiness->provider = SemanticEffectProviderId::invalid;
   readiness->execution_domain = program.execution_domain;
   readiness->available = true;
   readiness->degraded = readiness->status == StatusId::degraded;
@@ -714,20 +776,24 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
                          result.status == StatusId::degraded;
 
   if (!ValidateTelemetry(before, after, result, slot->program.cpu_tail_count,
-                         slot->completion_synchronizations_per_frame, completed,
-                         AnyModelStageRan(result))) {
+                         slot->completion_synchronizations_per_frame,
+                         slot->max_intermediate_readbacks_per_frame != 0,
+                         completed, AnyModelStageRan(result))) {
     slot->host_binding_active = false;
     slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::synchronization_failed);
   }
-  if (result.transfers.intermediate_readbacks != 0 ||
+  if (result.transfers.intermediate_readbacks >
+          slot->max_intermediate_readbacks_per_frame ||
       result.transfers.intermediate_uploads != 0 ||
       result.transfers.uploads > (slot->program.requires_upload ? 1u : 0u) ||
       result.transfers.final_readbacks >
           (slot->program.requires_final_readback ? 1u : 0u) ||
       result.transfers.synchronizations >
           slot->completion_synchronizations_per_frame ||
-      result.transfers.cpu_tail_boundaries > slot->program.cpu_tail_count) {
+      result.transfers.cpu_tail_boundaries >
+          slot->program.cpu_tail_count +
+              slot->max_cpu_tail_boundaries_per_frame) {
     slot->host_binding_active = false;
     slot->host_execution_completed = false;
     return Failed(StatusId::failed, ReasonId::synchronization_failed);
@@ -791,7 +857,8 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
        result.transfers.final_readbacks != 1) ||
       (!slot->program.requires_final_readback &&
        result.transfers.final_readbacks != 0) ||
-      result.transfers.intermediate_readbacks != 0 ||
+      result.transfers.intermediate_readbacks >
+          slot->max_intermediate_readbacks_per_frame ||
       result.transfers.intermediate_uploads != 0 ||
       (slot->requires_explicit_provider_sync &&
        result.transfers.synchronizations == 0)) {

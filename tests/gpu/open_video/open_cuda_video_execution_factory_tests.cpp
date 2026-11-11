@@ -508,6 +508,138 @@ hal::HostFrameBinding Binding(std::array<std::uint8_t, 24> *input,
   return binding;
 }
 
+bool FullCanonicalCombinationAndOptionalTrackerFallback() {
+  SetupContext context;
+  auto request = Request();
+  const std::array semantics{hal::SemanticEffectId::video_noise_removal,
+      hal::SemanticEffectId::eye_contact,
+      hal::SemanticEffectId::virtual_background_blur,
+      hal::SemanticEffectId::virtual_key_light,
+      hal::SemanticEffectId::auto_frame,
+      hal::SemanticEffectId::vignette, hal::SemanticEffectId::mirror};
+  request.intent.stage_count = semantics.size();
+  request.intent.requested_provider = hal::SemanticEffectProviderId::invalid;
+  request.intent.strict_provider_selection = false;
+  request.temporal = {true, true, hal::FrameDropBehavior::reset_temporal_state,
+                      hal::TemporalDiscontinuityAction::reset_and_continue, 5};
+  FakeOpenCudaResident adapter(context.domain, ExecuteMode::success, 1);
+  auto registration = Registration(&adapter, context.domain, semantics[0]);
+  registration.semantic_capability_count = semantics.size();
+  auto config = FactoryConfig(&context, request);
+  config.cached.stage_count = semantics.size();
+  config.cached.readiness.provider = hal::SemanticEffectProviderId::invalid;
+  config.cached.readiness.ready_stage_mask = 127;
+  config.cached.no_intermediate_crossings = false;
+  config.cached.maximum_metadata_readbacks_per_frame = 13;
+  config.cached.maximum_metadata_cpu_tails_per_frame = 3;
+  config.cached.maximum_metadata_synchronizations_per_frame = 2;
+  for (std::size_t index = 0; index < semantics.size(); ++index) {
+    auto &stage = request.intent.stages[index];
+    stage = request.intent.stages[0];
+    stage.intent.stage_id = static_cast<std::uint32_t>(11 + index);
+    stage.intent.semantic = semantics[index];
+    const bool native = index >= 5;
+    stage.model = native ? hal::ModelArtifactIdentity{}
+                         : Model(static_cast<std::uint8_t>(index + 7));
+    if (index == 3)
+      stage.model = request.intent.stages[2].model;
+    config.cached.models[index] = stage.model;
+    auto &capability = registration.semantic_capabilities[index];
+    capability = Capability(semantics[index]);
+    capability.provider =
+        native ? hal::SemanticEffectProviderId::open_cuda_production_kernels
+               : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    capability.cpu_tail = index + 1 == semantics.size()
+                              ? hal::CpuTailId::writer_copy
+                              : hal::CpuTailId::invalid;
+  }
+  request.cpu_tails[0].after_stage_id = 17;
+  request.cpu_tails[0].boundary_index = 7;
+  open_cuda::OpenCudaVideoExecutionFactory factory(config);
+  video::FrozenVideoExecutionPlan plan;
+  video::VideoAdapterFactoryPreflight preflight;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.stage_count == 7);
+  REQUIRE(preflight.prepared_program.maximum_metadata_readbacks_per_frame ==
+          13);
+  REQUIRE(preflight.per_frame_transfers.variable_boundaries_declared);
+  REQUIRE(preflight.per_frame_transfers.maximum_intermediate_readbacks == 13);
+  REQUIRE(preflight.per_frame_transfers.maximum_cpu_tail_boundaries == 4);
+  REQUIRE(preflight.per_frame_transfers.maximum_synchronizations == 3);
+  REQUIRE(preflight.prepared_program.requested_provider ==
+          hal::SemanticEffectProviderId::invalid);
+  for (std::size_t index = 0; index < semantics.size(); ++index)
+    REQUIRE(preflight.prepared_program.stages[index].semantic ==
+            semantics[index]);
+  std::swap(request.intent.stages[0], request.intent.stages[1]);
+  request.intent.stages[0].intent.stage_id = 11;
+  request.intent.stages[1].intent.stage_id = 12;
+  REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+
+  // A failed optional tracker preserves the native vignette at fixed center.
+  auto fallback = Request(hal::SemanticEffectId::auto_frame);
+  fallback.intent.requested_provider = hal::SemanticEffectProviderId::invalid;
+  fallback.intent.strict_provider_selection = false;
+  fallback.intent.stage_count = 2;
+  fallback.intent.stages[1] = fallback.intent.stages[0];
+  fallback.intent.stages[1].intent.stage_id = 22;
+  fallback.intent.stages[1].intent.semantic = hal::SemanticEffectId::vignette;
+  fallback.intent.stages[1].intent.requires_tracked_vignette_center = true;
+  fallback.intent.stages[1].model = {};
+  fallback.temporal = {true, true, hal::FrameDropBehavior::reset_temporal_state,
+                       hal::TemporalDiscontinuityAction::reset_and_continue, 1};
+  fallback.cpu_tails[0].after_stage_id = 22;
+  fallback.cpu_tails[0].boundary_index = 2;
+  auto fallback_config = FactoryConfig(&context, fallback);
+  fallback_config.cached.models[0] = {};
+  fallback_config.cached.readiness.provider =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  open_cuda::OpenCudaVideoExecutionFactory fallback_factory(fallback_config);
+  auto fallback_registration =
+      Registration(&adapter, context.domain, hal::SemanticEffectId::auto_frame);
+  auto &missing = fallback_registration.semantic_capabilities[0];
+  missing.status = hal::StatusId::blocked;
+  missing.reason = hal::ReasonId::capability_evidence_incomplete;
+  missing.production_eligible = missing.exact_evidence = false;
+  auto &vignette = fallback_registration.semantic_capabilities[1];
+  vignette = Capability(hal::SemanticEffectId::vignette);
+  vignette.provider =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  vignette.supports_tracked_vignette_center = true;
+  fallback_registration.semantic_capability_count = 2;
+  REQUIRE(BuildFrozen(fallback, fallback_registration, &fallback_factory, &plan,
+                      &preflight));
+  REQUIRE(preflight.status == hal::StatusId::ready);
+  REQUIRE(preflight.prepared_program.stage_count == 1);
+  REQUIRE(preflight.prepared_program.stages[0].semantic ==
+          hal::SemanticEffectId::vignette);
+  REQUIRE(preflight.prepared_program.maximum_metadata_readbacks_per_frame == 0);
+  hal::StaticAdapterRegistry fallback_registry;
+  hal::ReasonId registration_reason = hal::ReasonId::none;
+  REQUIRE(
+      fallback_registry.Register(fallback_registration, &registration_reason) ==
+      hal::StatusId::ready);
+  auto required_tracker = fallback;
+  required_tracker.intent.stages[0].intent.required = true;
+  required_tracker.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_closed;
+  const auto required_resolution = hal::ResolveSemanticStages(
+      fallback_registry,
+      video::BuildVideoResolutionRequest(required_tracker.intent));
+  REQUIRE(required_resolution.status == hal::StatusId::blocked);
+  auto no_tracker = fallback;
+  no_tracker.intent.stages[0] = no_tracker.intent.stages[1];
+  no_tracker.intent.stage_count = 1;
+  no_tracker.temporal = {};
+  no_tracker.cpu_tails[0].boundary_index = 1;
+  REQUIRE(BuildFrozen(no_tracker, fallback_registration, &fallback_factory,
+                      &plan, &preflight));
+  REQUIRE(preflight.status == hal::StatusId::blocked);
+  return true;
+}
+
 bool ExactPreflightAndMalformedRejection() {
   auto request = Request();
   SetupContext context;
@@ -860,7 +992,8 @@ void operator delete[](void *memory, std::size_t) noexcept {
 }
 
 int main() {
-  if (!ExactPreflightAndMalformedRejection() ||
+  if (!FullCanonicalCombinationAndOptionalTrackerFallback() ||
+      !ExactPreflightAndMalformedRejection() ||
       !ExecuteTransferCommitAndAllocationContract() ||
       !OptionalFailureDeviceLossAndRollback() ||
       !CoordinatorStrictSelectionAndStopAwareShutdown()) {
