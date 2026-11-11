@@ -293,6 +293,13 @@ bool PreparedCudaAutoFrame::Prepare(const PreparedCudaAutoFrameSetup &s,
   return true;
 }
 
+void PreparedCudaAutoFrame::ResetTracking() noexcept {
+  if (!impl_) return;
+  impl_->last_seq = impl_->last_matte_seq = 0;
+  impl_->have_seq = impl_->have_smooth = impl_->have_matte = false;
+  impl_->last_source = PreparedCudaAutoFrameSource::none;
+}
+
 float PreparedCudaAutoFrame::SmoothingAlpha(int p) noexcept {
   return 1.F / (1.F + 9.F * (std::clamp(p, 0, 100) / 100.F));
 }

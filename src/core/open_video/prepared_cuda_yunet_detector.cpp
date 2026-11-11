@@ -239,13 +239,17 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
       *error = "invalid prepared YuNet setup";
     return false;
   }
-  auto registry = setup.models_root.empty()
-                      ? ModelPackRegistry::ScanDefault()
-                      : ModelPackRegistry::Scan(setup.models_root);
-  std::string selected = setup.requested_model_id.empty()
-                             ? registry.DefaultModelIdForTask("face_detection")
-                             : setup.requested_model_id;
-  const auto pack = registry.Find("face_detection", selected);
+  std::optional<ModelPack> discovered;
+  const ModelPack *pack = setup.selected_pack;
+  if (!pack) {
+    auto registry = setup.models_root.empty()
+                        ? ModelPackRegistry::ScanDefault()
+                        : ModelPackRegistry::Scan(setup.models_root);
+    const auto selected = setup.requested_model_id.empty()
+        ? registry.DefaultModelIdForTask("face_detection") : setup.requested_model_id;
+    discovered = registry.Find("face_detection", selected);
+    if (discovered) pack = &*discovered;
+  }
   if (!pack) {
     if (error)
       *error = "requested YuNet model is not installed";
@@ -278,7 +282,8 @@ bool PreparedCudaYunetDetector::Prepare(const PreparedCudaYunetSetup &setup,
   // Validation follows parsing so its manifest checksum proves that the
   // frozen tensor declaration came from this registry generation.
   const auto validation = ValidateModelArtifactIdentity(*pack, *main);
-  if (!validation.ok()) {
+  if (!validation.ok() ||
+      (setup.selected_pack && !(validation.identity == setup.selected_artifact))) {
     if (error)
       *error = validation.detail;
     if (status_out)

@@ -70,6 +70,8 @@ struct PreparedCudaYunetSetup {
   // Production Prepare overwrites this from the validated manifest; the test
   // seam supplies it directly with its synthetic artifact identity.
   ModelTensorSpec declared_input{};
+  const ModelPack *selected_pack = nullptr;
+  ValidatedModelArtifactIdentity selected_artifact{};
 };
 
 struct PreparedCudaYunetExecutionResult {
