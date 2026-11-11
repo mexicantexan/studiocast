@@ -45,19 +45,18 @@ bool SamePlane(const hal::PlaneDescriptor &left,
 
 bool SameImage(const hal::ImageDescriptor &left,
                const hal::ImageDescriptor &right) noexcept {
-  bool exact = left.width == right.width && left.height == right.height &&
-               left.plane_count == right.plane_count &&
-               left.format == right.format &&
-               left.channel_order == right.channel_order &&
-               left.color_space == right.color_space &&
-               left.color_range == right.color_range &&
-               left.alpha_meaning == right.alpha_meaning &&
-               left.orientation == right.orientation &&
-               left.host_coherence == right.host_coherence &&
-               left.mutability == right.mutability &&
-               left.aliasing == right.aliasing &&
-               left.in_place_permitted == right.in_place_permitted &&
-               left.base_alignment_bytes == right.base_alignment_bytes;
+  bool exact =
+      left.width == right.width && left.height == right.height &&
+      left.plane_count == right.plane_count && left.format == right.format &&
+      left.channel_order == right.channel_order &&
+      left.color_space == right.color_space &&
+      left.color_range == right.color_range &&
+      left.alpha_meaning == right.alpha_meaning &&
+      left.orientation == right.orientation &&
+      left.host_coherence == right.host_coherence &&
+      left.mutability == right.mutability && left.aliasing == right.aliasing &&
+      left.in_place_permitted == right.in_place_permitted &&
+      left.base_alignment_bytes == right.base_alignment_bytes;
   for (std::size_t index = 0; exact && index < left.planes.size(); ++index)
     exact = SamePlane(left.planes[index], right.planes[index]);
   return exact;
@@ -177,25 +176,22 @@ bool SameTransfers(const video::PerFrameTransferContract &left,
              right.maximum_intermediate_uploads &&
          left.minimum_cpu_tail_boundaries ==
              right.minimum_cpu_tail_boundaries &&
-         left.maximum_cpu_tail_boundaries ==
-             right.maximum_cpu_tail_boundaries;
+         left.maximum_cpu_tail_boundaries == right.maximum_cpu_tail_boundaries;
 }
 
 bool SameIntent(const video::NormalizedVideoExecutionIntent &left,
                 const video::NormalizedVideoExecutionIntent &right) noexcept {
-  bool exact = left.backend.mode == right.backend.mode &&
-               left.backend.backend == right.backend.backend &&
-               left.backend.strict == right.backend.strict &&
-               left.preferences.compute_family ==
-                   right.preferences.compute_family &&
-               left.preferences.effects_engine ==
-                   right.preferences.effects_engine &&
-               left.preferences.strict_effects_engine ==
-                   right.preferences.strict_effects_engine &&
-               left.requested_provider == right.requested_provider &&
-               left.strict_provider_selection ==
-                   right.strict_provider_selection &&
-               left.stage_count == right.stage_count;
+  bool exact =
+      left.backend.mode == right.backend.mode &&
+      left.backend.backend == right.backend.backend &&
+      left.backend.strict == right.backend.strict &&
+      left.preferences.compute_family == right.preferences.compute_family &&
+      left.preferences.effects_engine == right.preferences.effects_engine &&
+      left.preferences.strict_effects_engine ==
+          right.preferences.strict_effects_engine &&
+      left.requested_provider == right.requested_provider &&
+      left.strict_provider_selection == right.strict_provider_selection &&
+      left.stage_count == right.stage_count;
   for (std::size_t index = 0; exact && index < left.stage_count; ++index) {
     const auto &a = left.stages[index];
     const auto &b = right.stages[index];
@@ -205,9 +201,10 @@ bool SameIntent(const video::NormalizedVideoExecutionIntent &left,
             a.intent.failure_action == b.intent.failure_action &&
             a.intent.requires_tracked_vignette_center ==
                 b.intent.requires_tracked_vignette_center &&
-            a.parameter_count == b.parameter_count && SameModel(a.model, b.model);
-    for (std::size_t parameter = 0;
-         exact && parameter < a.parameter_count; ++parameter) {
+            a.parameter_count == b.parameter_count &&
+            SameModel(a.model, b.model);
+    for (std::size_t parameter = 0; exact && parameter < a.parameter_count;
+         ++parameter) {
       const auto &x = a.parameters[parameter];
       const auto &y = b.parameters[parameter];
       exact = x.id == y.id && x.kind == y.kind &&
@@ -222,47 +219,42 @@ bool SameIntent(const video::NormalizedVideoExecutionIntent &left,
 
 bool SameResolution(const hal::ResolutionResult &left,
                     const hal::ResolutionResult &right) noexcept {
-  bool exact = left.request_mode == right.request_mode &&
-               left.strict_backend_selection ==
-                   right.strict_backend_selection &&
-               left.status == right.status && left.reason == right.reason &&
-               left.requested_backend == right.requested_backend &&
-               left.preferences.compute_family ==
-                   right.preferences.compute_family &&
-               left.preferences.effects_engine ==
-                   right.preferences.effects_engine &&
-               left.preferences.strict_effects_engine ==
-                   right.preferences.strict_effects_engine &&
-               left.selected_backend == right.selected_backend &&
-               left.active_backend == right.active_backend &&
-               left.selected_provider == right.selected_provider &&
-               left.stage_count == right.stage_count &&
-               left.available == right.available &&
-               left.degraded == right.degraded &&
-               left.fallback == right.fallback &&
-               left.passthrough == right.passthrough;
+  bool exact =
+      left.request_mode == right.request_mode &&
+      left.strict_backend_selection == right.strict_backend_selection &&
+      left.status == right.status && left.reason == right.reason &&
+      left.requested_backend == right.requested_backend &&
+      left.preferences.compute_family == right.preferences.compute_family &&
+      left.preferences.effects_engine == right.preferences.effects_engine &&
+      left.preferences.strict_effects_engine ==
+          right.preferences.strict_effects_engine &&
+      left.selected_backend == right.selected_backend &&
+      left.active_backend == right.active_backend &&
+      left.selected_provider == right.selected_provider &&
+      left.stage_count == right.stage_count &&
+      left.available == right.available && left.degraded == right.degraded &&
+      left.fallback == right.fallback && left.passthrough == right.passthrough;
   for (std::size_t index = 0; exact && index < left.stage_count; ++index) {
     const auto &a = left.stages[index];
     const auto &b = right.stages[index];
-    exact = a.intent.stage_id == b.intent.stage_id &&
-            a.intent.semantic == b.intent.semantic &&
-            a.intent.required == b.intent.required &&
-            a.intent.failure_action == b.intent.failure_action &&
-            a.intent.requires_tracked_vignette_center ==
-                b.intent.requires_tracked_vignette_center &&
-            a.status == b.status && a.reason == b.reason &&
-            a.selected_backend == b.selected_backend &&
-            a.provider == b.provider &&
-            a.adapter_instance_id == b.adapter_instance_id &&
-            a.execution_domain == b.execution_domain &&
-            a.cpu_tail == b.cpu_tail &&
-            a.cpu_tail_scratch_bytes == b.cpu_tail_scratch_bytes &&
-            a.cpu_tail_placement == b.cpu_tail_placement &&
-            a.evidence_count == b.evidence_count &&
-            a.skipped_optional == b.skipped_optional &&
-            a.fallback_selected == b.fallback_selected;
-    for (std::size_t evidence = 0;
-         exact && evidence < a.evidence_count; ++evidence) {
+    exact =
+        a.intent.stage_id == b.intent.stage_id &&
+        a.intent.semantic == b.intent.semantic &&
+        a.intent.required == b.intent.required &&
+        a.intent.failure_action == b.intent.failure_action &&
+        a.intent.requires_tracked_vignette_center ==
+            b.intent.requires_tracked_vignette_center &&
+        a.status == b.status && a.reason == b.reason &&
+        a.selected_backend == b.selected_backend && a.provider == b.provider &&
+        a.adapter_instance_id == b.adapter_instance_id &&
+        a.execution_domain == b.execution_domain && a.cpu_tail == b.cpu_tail &&
+        a.cpu_tail_scratch_bytes == b.cpu_tail_scratch_bytes &&
+        a.cpu_tail_placement == b.cpu_tail_placement &&
+        a.evidence_count == b.evidence_count &&
+        a.skipped_optional == b.skipped_optional &&
+        a.fallback_selected == b.fallback_selected;
+    for (std::size_t evidence = 0; exact && evidence < a.evidence_count;
+         ++evidence) {
       const auto &x = a.evidence[evidence];
       const auto &y = b.evidence[evidence];
       exact = x.code == y.code && x.status == y.status &&
@@ -275,22 +267,22 @@ bool SameResolution(const hal::ResolutionResult &left,
 
 bool SameDomainPlan(const hal::DomainPlan &left,
                     const hal::DomainPlan &right) noexcept {
-  bool exact = left.status == right.status && left.reason == right.reason &&
-               left.island_count == right.island_count &&
-               left.boundary_count == right.boundary_count &&
-               left.expected_transfers.uploads ==
-                   right.expected_transfers.uploads &&
-               left.expected_transfers.final_readbacks ==
-                   right.expected_transfers.final_readbacks &&
-               left.expected_transfers.intermediate_readbacks ==
-                   right.expected_transfers.intermediate_readbacks &&
-               left.expected_transfers.intermediate_uploads ==
-                   right.expected_transfers.intermediate_uploads &&
-               left.expected_transfers.synchronizations ==
-                   right.expected_transfers.synchronizations &&
-               left.expected_transfers.cpu_tail_boundaries ==
-                   right.expected_transfers.cpu_tail_boundaries &&
-               left.passthrough == right.passthrough;
+  bool exact =
+      left.status == right.status && left.reason == right.reason &&
+      left.island_count == right.island_count &&
+      left.boundary_count == right.boundary_count &&
+      left.expected_transfers.uploads == right.expected_transfers.uploads &&
+      left.expected_transfers.final_readbacks ==
+          right.expected_transfers.final_readbacks &&
+      left.expected_transfers.intermediate_readbacks ==
+          right.expected_transfers.intermediate_readbacks &&
+      left.expected_transfers.intermediate_uploads ==
+          right.expected_transfers.intermediate_uploads &&
+      left.expected_transfers.synchronizations ==
+          right.expected_transfers.synchronizations &&
+      left.expected_transfers.cpu_tail_boundaries ==
+          right.expected_transfers.cpu_tail_boundaries &&
+      left.passthrough == right.passthrough;
   for (std::size_t index = 0; exact && index < left.island_count; ++index) {
     const auto &a = left.islands[index];
     const auto &b = right.islands[index];
@@ -301,15 +293,15 @@ bool SameDomainPlan(const hal::DomainPlan &left,
             a.requires_upload == b.requires_upload &&
             a.requires_final_readback == b.requires_final_readback;
     for (std::size_t stage = 0; exact && stage < a.stage_count; ++stage)
-      exact = a.resolved_stage_indices[stage] == b.resolved_stage_indices[stage];
+      exact =
+          a.resolved_stage_indices[stage] == b.resolved_stage_indices[stage];
   }
   for (std::size_t index = 0; exact && index < left.boundary_count; ++index) {
     const auto &a = left.boundaries[index];
     const auto &b = right.boundaries[index];
     exact = a.kind == b.kind && a.after_stage_id == b.after_stage_id &&
             a.before_stage_id == b.before_stage_id &&
-            a.boundary_index == b.boundary_index &&
-            a.cpu_tail == b.cpu_tail &&
+            a.boundary_index == b.boundary_index && a.cpu_tail == b.cpu_tail &&
             a.scratch_bytes == b.scratch_bytes &&
             a.source_domain == b.source_domain &&
             a.destination_domain == b.destination_domain &&
@@ -321,24 +313,23 @@ bool SameDomainPlan(const hal::DomainPlan &left,
 
 bool SamePrimedPlan(const video::FrozenVideoExecutionPlan &left,
                     const video::FrozenVideoExecutionPlan &right) noexcept {
-  bool exact = left.contract_version == right.contract_version &&
-               left.plan_id == right.plan_id && left.route == right.route &&
-               SameIntent(left.intent, right.intent) &&
-               SameImage(left.host_input, right.host_input) &&
-               SameImage(left.host_output, right.host_output) &&
-               left.invalidation_key == right.invalidation_key &&
-               SameTemporal(left.temporal, right.temporal) &&
-               SameBudget(left.budget, right.budget) &&
-               left.cpu_tail_count == right.cpu_tail_count &&
-               left.setup_failure_policy == right.setup_failure_policy &&
-               left.migration_policy == right.migration_policy &&
-               SameResolution(left.resolution, right.resolution) &&
-               SameDomainPlan(left.domain_plan, right.domain_plan) &&
-               left.factory_id == right.factory_id &&
-               SameTransfers(left.per_frame_transfers,
-                             right.per_frame_transfers) &&
-               SamePreparedProgram(left.prepared_program,
-                                   right.prepared_program);
+  bool exact =
+      left.contract_version == right.contract_version &&
+      left.plan_id == right.plan_id && left.route == right.route &&
+      SameIntent(left.intent, right.intent) &&
+      SameImage(left.host_input, right.host_input) &&
+      SameImage(left.host_output, right.host_output) &&
+      left.invalidation_key == right.invalidation_key &&
+      SameTemporal(left.temporal, right.temporal) &&
+      SameBudget(left.budget, right.budget) &&
+      left.cpu_tail_count == right.cpu_tail_count &&
+      left.setup_failure_policy == right.setup_failure_policy &&
+      left.migration_policy == right.migration_policy &&
+      SameResolution(left.resolution, right.resolution) &&
+      SameDomainPlan(left.domain_plan, right.domain_plan) &&
+      left.factory_id == right.factory_id &&
+      SameTransfers(left.per_frame_transfers, right.per_frame_transfers) &&
+      SamePreparedProgram(left.prepared_program, right.prepared_program);
   for (std::size_t index = 0; exact && index < left.cpu_tail_count; ++index)
     exact = SameTail(left.cpu_tails[index], right.cpu_tails[index]);
   return exact;
@@ -398,16 +389,17 @@ hal::SemanticEffectProviderId AggregateProvider(
   return first;
 }
 
-std::size_t SelectedStageCount(const hal::ResolutionResult &resolution) noexcept {
+std::size_t
+SelectedStageCount(const hal::ResolutionResult &resolution) noexcept {
   std::size_t count = 0;
   for (std::size_t index = 0; index < resolution.stage_count; ++index)
     count += resolution.stages[index].skipped_optional ? 0u : 1u;
   return count;
 }
 
-video::NormalizedVideoExecutionIntent CompactIntent(
-    const video::VideoExecutionPlanRequest &request,
-    const hal::ResolutionResult &resolution) noexcept {
+video::NormalizedVideoExecutionIntent
+CompactIntent(const video::VideoExecutionPlanRequest &request,
+              const hal::ResolutionResult &resolution) noexcept {
   auto compact = request.intent;
   compact.stage_count = 0;
   for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
@@ -536,8 +528,7 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
   for (std::size_t index = 0; index < compact.stage_count; ++index)
     has_model_consumer |= UsesModel(compact.stages[index].intent.semantic);
   if ((has_model_consumer && !cached.model_artifact_validated) ||
-      !cached.provider_runtime_validated ||
-      !cached.device_context_validated ||
+      !cached.provider_runtime_validated || !cached.device_context_validated ||
       (has_model_consumer && !cached.cuda_iobinding_validated) ||
       !cached.user_stream_bound || !cached.reusable_resources_supported ||
       (has_model_consumer && !cached.device_preprocess_supported) ||
@@ -675,7 +666,8 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
       request.cpu_tails[0].before_stage_id != 0 ||
       request.cpu_tails[0].boundary_index !=
           domain_plan.islands[0]
-                  .resolved_stage_indices[domain_plan.islands[0].stage_count - 1] +
+                  .resolved_stage_indices[domain_plan.islands[0].stage_count -
+                                          1] +
               1 ||
       !domain_plan.islands[0].requires_upload ||
       !domain_plan.islands[0].requires_final_readback ||
@@ -744,10 +736,10 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.input.image = resident;
     stage.input.image.mutability = hal::Mutability::read_only;
     stage.output.kind = hal::StageIoKind::image;
-    stage.output.image = prepared_index + 1 == SelectedStageCount(resolution)
-                             ? ResidentImage(request.host_output,
-                                             hal::Mutability::read_write)
-                             : resident;
+    stage.output.image =
+        prepared_index + 1 == SelectedStageCount(resolution)
+            ? ResidentImage(request.host_output, hal::Mutability::read_write)
+            : resident;
     stage.model = request.intent.stages[index].model;
     stage.required = intent.required;
     stage.failure_action = intent.failure_action;
@@ -788,8 +780,8 @@ bool ExactRegistration(const hal::AdapterRegistration &registration,
       const auto &capability = registration.semantic_capabilities[index];
       found |=
           capability.semantic == plan.prepared_program.stages[stage].semantic &&
-          capability.provider == ProviderFor(
-              plan.prepared_program.stages[stage].semantic) &&
+          capability.provider ==
+              ProviderFor(plan.prepared_program.stages[stage].semantic) &&
           hal::IsSelectableSemanticCapability(capability);
     }
     if (!found)
@@ -1307,7 +1299,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
   const bool supported_semantic = SupportedStages(supported_intent);
   const bool has_canonical_plan = request.plan.intent.stage_count != 0;
   const std::size_t canonical_stage_count =
-      has_canonical_plan ? request.plan.intent.stage_count : request.stage_count;
+      has_canonical_plan ? request.plan.intent.stage_count
+                         : request.stage_count;
   const auto checked_count =
       std::min(request.stage_count, request.semantics.size());
   const bool has_replace =
@@ -1378,8 +1371,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       exact_model &=
           deps.face_artifact.Valid() && deps.landmarks_artifact.Valid() &&
           deps.eye_right_artifact.Valid() &&
-          deps.eye_right_artifact.artifact_set_sha256 ==
-              artifact.artifact_set_sha256 &&
+          deps.eye_right_artifact.manifest_sha256 == artifact.manifest_sha256 &&
           deps.eye_right_artifact.model_id_sha256 == artifact.model_id_sha256 &&
           deps.eye_right_artifact.registry_generation ==
               artifact.registry_generation;
@@ -1418,8 +1410,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
                    optional_auto_frame_unavailable;
   if (request.factory_id == 0 || canonical_stage_count == 0 ||
       canonical_stage_count > hal::kMaxPreparedStages || !supported_semantic ||
-      !replacement_contract ||
-      !key_light_contract || !exact_model ||
+      !replacement_contract || !key_light_contract || !exact_model ||
       !ValidReservedBudget(request.reserved_budget) ||
       request.generations.configuration == 0 ||
       request.generations.geometry == 0 ||
@@ -1431,8 +1422,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
                                  request.generations.model) ||
       (has_model_consumer && !request.model_artifact_validated) ||
       !request.provider_runtime_validated ||
-      (has_model_consumer && !request.cuda_iobinding_validated) || !request.user_stream_bound ||
-      !request.reusable_resources_supported ||
+      (has_model_consumer && !request.cuda_iobinding_validated) ||
+      !request.user_stream_bound || !request.reusable_resources_supported ||
       (has_model_consumer && !request.device_preprocess_supported) ||
       !request.device_postprocess_supported ||
       !request.stop_aware_bounded_wait || !request.allocation_free_execute) {
@@ -1464,7 +1455,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.readiness.available = true;
     if (has_canonical_plan && canonical_stage_count != request.stage_count) {
       config.cached.readiness.status = hal::StatusId::degraded;
-      config.cached.readiness.reason = hal::ReasonId::optional_stage_failed_open;
+      config.cached.readiness.reason =
+          hal::ReasonId::optional_stage_failed_open;
       config.cached.readiness.degraded = true;
     }
     config.cached.models = request.models;
@@ -1479,7 +1471,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.cuda_iobinding_validated = request.cuda_iobinding_validated;
     config.cached.user_stream_bound = true;
     config.cached.reusable_resources_supported = true;
-    config.cached.device_preprocess_supported = request.device_preprocess_supported;
+    config.cached.device_preprocess_supported =
+        request.device_preprocess_supported;
     config.cached.device_postprocess_supported = true;
     config.cached.one_upload_one_readback = true;
     config.cached.no_intermediate_crossings = std::none_of(
@@ -1539,9 +1532,9 @@ OpenCudaVideoExecutionFactory::CreateProduction(
       }
     }
     for (std::size_t index = 0; index < canonical_stage_count; ++index) {
-      const auto semantic = has_canonical_plan
-                                ? request.plan.intent.stages[index].intent.semantic
-                                : request.semantics[index];
+      const auto semantic =
+          has_canonical_plan ? request.plan.intent.stages[index].intent.semantic
+                             : request.semantics[index];
       const auto status = has_canonical_plan ? request.canonical_status[index]
                                              : hal::StatusId::ready;
       const auto reason = has_canonical_plan ? request.canonical_reason[index]
@@ -1702,7 +1695,8 @@ hal::StatusId OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
     const auto resolution =
         setup_status == hal::StatusId::ready
             ? hal::ResolveSemanticStages(
-                  registry, video::BuildVideoResolutionRequest(exact_request.intent))
+                  registry,
+                  video::BuildVideoResolutionRequest(exact_request.intent))
             : hal::ResolutionResult{};
     const auto domain_plan =
         setup_status == hal::StatusId::ready && resolution.available &&
@@ -1723,9 +1717,9 @@ hal::StatusId OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
 
     video::VideoAdapterFactoryPreflight preflight;
     if (setup_status == hal::StatusId::ready) {
-      preflight = factory->Preflight(
-          exact_request, resolution, domain_plan,
-          video::VideoExecutionRoute::prepared_resident);
+      preflight =
+          factory->Preflight(exact_request, resolution, domain_plan,
+                             video::VideoExecutionRoute::prepared_resident);
       setup_status = preflight.status;
       setup_reason = preflight.reason;
     }
@@ -1777,7 +1771,8 @@ hal::StatusId OpenCudaVideoExecutionFactory::AcquireProductionSetupLease(
       const auto shutdown = factory->RequestProductionOwnerShutdown();
       bootstrap->candidate_shutdown.status = shutdown.hal_status;
       bootstrap->candidate_shutdown.reason = shutdown.reason;
-      bootstrap->candidate_shutdown.shutdown_attempts = shutdown.shutdown_attempts;
+      bootstrap->candidate_shutdown.shutdown_attempts =
+          shutdown.shutdown_attempts;
       bootstrap->candidate_shutdown.shutdown_requested =
           shutdown.shutdown_requested;
       bootstrap->candidate_shutdown.pending =
