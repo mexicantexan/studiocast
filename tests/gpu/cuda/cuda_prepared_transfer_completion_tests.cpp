@@ -997,10 +997,48 @@ bool TestFailedFrameFenceRetainsUntilQuiescent() {
   return ok;
 }
 
+bool TestFailureFenceReplacesNormalCompletionProof() {
+  FakeDriver fake;
+  cuda::CudaDriverApi driver;
+  if (!Expect(Initialize(&driver, &fake),
+              "normal-proof fake CUDA must initialize"))
+    return false;
+  const auto binding = BindingFor(driver, 100);
+  Support support;
+  auto options = OptionsFor(binding);
+  options.resident_work = true;
+  bool ok = Expect(support.Prepare(&driver, options).ok() &&
+                       support.BeginFrame(binding, 1).ok() &&
+                       support.SubmitResidentWork(binding).ok() &&
+                       support.RecordCompletion(binding).ok() &&
+                       support.RecordStageBegin(binding, 0).ok(),
+                   "resident work may follow an early normal completion event");
+  const auto records = fake.event_records;
+  const auto frees = fake.pinned_frees;
+  fake.event_record_result = cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  ok = Expect(support.RecordFailedFrameCompletion(binding).status ==
+                      Support::Status::resource_exhausted &&
+                  fake.event_records == records + 1 &&
+                  support.Shutdown().status ==
+                      Support::Status::resource_exhausted &&
+                  support.prepared() && fake.pinned_frees == frees,
+              "first failed latch must replace old proof and retain on "
+              "fresh-record failure") &&
+       ok;
+  fake.event_record_result = cuda::CUDA_SUCCESS;
+  ok = Expect(
+           support.RecordFailedFrameCompletion(binding).ok() &&
+               fake.event_records == records + 2 && support.Shutdown().ok(),
+           "retry must record a fresh bound retirement fence before release") &&
+       ok;
+  return ok;
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
+  ok = TestFailureFenceReplacesNormalCompletionProof() && ok;
   ok = TestFailedFrameFenceRetainsUntilQuiescent() && ok;
   ok = TestOptionalSymbolsDoNotBreakLegacyInitialization() && ok;
   ok = TestPreparedHappyPathHasExactTransfersWaitAndTiming() && ok;

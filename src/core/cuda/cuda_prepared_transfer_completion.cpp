@@ -607,6 +607,8 @@ CudaPreparedTransferCompletion::RecordFailedFrameCompletion(
   const auto context = BindContext();
   if (!context.ok())
     return context;
+  if (!failed_frame_completion_)
+    completion_recorded_ = false;
   failed_frame_completion_ = true;
   frame_reuse_blocked_ = true;
   if (completion_recorded_)
