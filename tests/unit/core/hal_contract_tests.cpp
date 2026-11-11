@@ -1074,7 +1074,11 @@ bool TestDeclaredMetadataTransferBounds() {
 bool TestFatalTemporalResetInvalidatesActiveAttribution() {
   bool ok = true;
   for (const auto status : {StatusId::failed, StatusId::quarantined,
-                            StatusId::stale, StatusId::stopped}) {
+                            StatusId::stale, StatusId::stopped,
+                            StatusId::blocked, StatusId::resource_exhausted,
+                            StatusId::degraded, StatusId::invalid,
+                            StatusId::unavailable, StatusId::passthrough,
+                            StatusId::executed}) {
     FakeAdapter adapter;
     PreparedProgramSession session;
     const auto program = Program(197, 77, 1);
@@ -1089,6 +1093,11 @@ bool TestFatalTemporalResetInvalidatesActiveAttribution() {
         session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
                 status &&
             session.telemetry().runtime_status == status &&
+            session.telemetry().temporal_resets == 0 && adapter.reset_calls == 1 &&
+            session.telemetry().runtime_reason ==
+                (status == StatusId::quarantined
+                     ? ReasonId::device_lost
+                     : ReasonId::temporal_discontinuity) &&
             !session.latest_committed_frame().valid &&
             !session.readiness().available,
         "fatal reset must clear active success and report exact failure");
@@ -1121,10 +1130,6 @@ bool TestExplicitTemporalResetGuardsAndForwarding() {
   ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
                 "initial commit failed");
   const auto committed = session.latest_committed_frame();
-  adapter.reset_status = StatusId::blocked;
-  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::blocked && session.telemetry().temporal_resets == 0,
-                    "reset must return exact adapter failure");
   adapter.reset_status = StatusId::ready;
   ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
                         StatusId::ready && session.telemetry().temporal_resets == 1 &&

@@ -1308,8 +1308,7 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
     ++telemetry_.temporal_resets;
     telemetry_.runtime_status = readiness_.status;
     telemetry_.runtime_reason = readiness_.reason;
-  } else if (status == StatusId::failed || status == StatusId::quarantined ||
-             status == StatusId::stale || status == StatusId::stopped) {
+  } else {
     latest_committed_frame_ = {};
     telemetry_.runtime_status = status;
     telemetry_.runtime_reason =
