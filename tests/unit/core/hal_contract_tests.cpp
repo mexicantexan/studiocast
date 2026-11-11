@@ -217,6 +217,9 @@ public:
   std::uint64_t destroy_calls = 0;
   std::uint64_t reset_calls = 0;
   std::uint64_t shutdown_calls = 0;
+  std::uint64_t discard_calls = 0;
+  bool discard_supported = true;
+  bool host_unsubmitted = false;
   PreparedProgram prepared_program{};
   HostFrameBinding host_binding{};
   HostFrameTokens host_tokens{};
@@ -278,6 +281,7 @@ public:
   ExecuteResult Execute(const PreparedProgramHandle &,
                         const ExecuteRequest &request) noexcept override {
     ++execute_calls;
+    host_unsubmitted = false;
     ExecuteResult result;
     result.status = StatusId::executed;
     result.reason = ReasonId::none;
@@ -357,11 +361,31 @@ public:
                          HostFrameTokens *tokens,
                          ReasonId *reason) noexcept override {
     host_binding = binding;
+    host_unsubmitted = true;
     tokens->input = Resource(prepared_program, 5001);
     tokens->output = Resource(prepared_program, 5002);
     host_tokens = *tokens;
     if (reason)
       *reason = ReasonId::none;
+    return StatusId::ready;
+  }
+  StatusId DiscardUnsubmittedHostFrame(
+      const PreparedProgramHandle &program, const HostFrameTokens &tokens,
+      std::uint64_t capture_sequence, ReasonId *reason) noexcept override {
+    ++discard_calls;
+    if (!discard_supported)
+      return IResidentAdapter::DiscardUnsubmittedHostFrame(program, tokens, capture_sequence, reason);
+    if (!host_unsubmitted || program.program_id != prepared_program.program_id ||
+        capture_sequence != host_binding.capture_sequence ||
+        tokens.input.resource_id != host_tokens.input.resource_id ||
+        tokens.output.resource_id != host_tokens.output.resource_id) {
+      if (reason) *reason = ReasonId::host_frame_binding_invalid;
+      return StatusId::blocked;
+    }
+    host_unsubmitted = false;
+    host_binding = {};
+    host_tokens = {};
+    if (reason) *reason = ReasonId::none;
     return StatusId::ready;
   }
   StatusId ResolveHostFrameOutput(const PreparedProgramHandle &,
@@ -1287,7 +1311,8 @@ bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
                 !session.readiness().available && !session.readiness().degraded &&
                 session.telemetry().runtime_status == StatusId::failed &&
                 session.telemetry().runtime_reason == expected_reason &&
-                adapter.execute_calls == 1 && adapter.reset_calls == 0,
+                adapter.execute_calls == 1 && adapter.reset_calls == 0 &&
+                adapter.discard_calls == (host_bound ? 1u : 0u),
             "rejected temporal frame must retire its binding and stale active "
             "state");
         if (explicit_recovery) {
@@ -1349,7 +1374,7 @@ bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
                 "forged-request fixture must bind a valid current frame");
   auto valid = Request(program, 6);
   valid.input = tokens.input;
-  for (int mutation = 0; mutation < 4; ++mutation) {
+  for (int mutation = 0; mutation < 6; ++mutation) {
     auto forged = valid;
     if (mutation == 0)
       forged.capture_sequence = 5;
@@ -1359,10 +1384,14 @@ bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
       ++forged.invalidation_key.generations.configuration;
     if (mutation == 3)
       ++forged.execution_domain.adapter_instance_id;
+    if (mutation == 4)
+      forged.input.destruction_owner = &adapter;
+    if (mutation == 5)
+      forged.input.destroy = +[](void *, ResourceHandle *) noexcept {};
     const auto rejected = session.Execute(forged);
     ok &=
         Require(!rejected.output_valid && adapter.execute_calls == 1 &&
-                    adapter.reset_calls == 0 &&
+                    adapter.reset_calls == 0 && adapter.discard_calls == 0 &&
                     session.latest_committed_frame().valid &&
                     session.readiness().available &&
                     session.telemetry().runtime_status == StatusId::executed &&
@@ -1380,6 +1409,53 @@ bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
           session.CommitOutput({frame.completion, true}, &reason) ==
               StatusId::ready,
       "valid bound frame must survive forged requests and remain committable");
+  return ok;
+}
+
+bool TestUnsupportedUnsubmittedDiscardRequiresReconfiguration() {
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> input{}, output{};
+  FakeAdapter adapter;
+  adapter.discard_supported = false;
+  PreparedProgramSession session;
+  auto program = Program(193, 77, 1);
+  program.temporal.frame_drop_behavior = FrameDropBehavior::preserve_order;
+  bool ok = Configure(&session, &adapter, program);
+  auto first = session.Execute(Request(program, 1));
+  ReasonId reason = ReasonId::none;
+  ok &= Require(session.CommitOutput({first.completion, true}, &reason) ==
+                    StatusId::ready,
+                "unsupported discard fixture must commit initial output");
+  HostFrameBinding binding;
+  binding.input_descriptor = program.host_input;
+  binding.output_descriptor = program.host_output;
+  binding.input_plane_count = binding.output_plane_count = 1;
+  binding.capture_sequence = 3;
+  binding.input_planes[0] = {input.data(), nullptr, input.size(), 640 * 3};
+  binding.output_planes[0] = {nullptr, output.data(), output.size(), 640 * 3};
+  HostFrameTokens tokens;
+  ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                    StatusId::ready,
+                "unsupported discard fixture must bind rejected frame");
+  auto request = Request(program, 3);
+  request.input = tokens.input;
+  const auto frame = session.Execute(request);
+  ok &= Require(frame.status == StatusId::stale &&
+                    frame.reason == ReasonId::reconfiguration_required &&
+                    session.rebuild_requested() &&
+                    !session.latest_committed_frame().valid &&
+                    !session.readiness().available &&
+                    adapter.discard_calls == 1 && adapter.host_unsubmitted &&
+                    adapter.execute_calls == 1,
+                "unsupported backend discard must fail closed without claiming "
+                "native release");
+  binding.capture_sequence = 2;
+  ok &= Require(
+      session.BindHostFrame(binding, &tokens, &reason) == StatusId::stale &&
+          reason == ReasonId::reconfiguration_required &&
+          session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+              StatusId::stale,
+      "unsupported discard must require reconfiguration rather than deadlock "
+      "on output commit");
   return ok;
 }
 
@@ -1631,6 +1707,7 @@ int main() {
   ok &= TestFatalTemporalResetInvalidatesActiveAttribution();
   ok &= TestHostBoundTemporalDiscontinuityResetResults();
   ok &= TestRejectedTemporalFramesRetireOnlyTheirOwnBinding();
+  ok &= TestUnsupportedUnsubmittedDiscardRequiresReconfiguration();
   ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();

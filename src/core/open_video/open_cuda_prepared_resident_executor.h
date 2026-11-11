@@ -416,6 +416,9 @@ public:
                               const hal::HostFrameBinding &binding,
                               hal::HostFrameTokens *tokens,
                               hal::ReasonId *reason) noexcept override;
+  hal::StatusId DiscardUnsubmittedHostFrame(
+      const PreparedExecutorHandle &program, const hal::HostFrameTokens &tokens,
+      std::uint64_t capture_sequence, hal::ReasonId *reason) noexcept override;
   hal::StatusId
   ResolveHostFrameOutput(const PreparedExecutorHandle &program,
                          const hal::CompletionToken &completion,

@@ -172,7 +172,9 @@ bool SameResourceToken(const ResourceHandle &left,
          left.alignment_bytes == right.alignment_bytes &&
          left.mutable_resource == right.mutable_resource &&
          left.aliasable == right.aliasable &&
-         left.adapter_opaque == right.adapter_opaque;
+         left.adapter_opaque == right.adapter_opaque &&
+         left.destruction_owner == right.destruction_owner &&
+         left.destroy == right.destroy;
 }
 
 bool ValidCapabilityEvidence(
@@ -1327,6 +1329,21 @@ void PreparedProgramSession::RetirePendingFrame() noexcept {
 
 ExecuteResult
 PreparedProgramSession::RejectTemporalFrame(ReasonId reason) noexcept {
+  if (host_binding_pending_) {
+    ReasonId discard_reason = ReasonId::none;
+    const auto discarded = adapter_->DiscardUnsubmittedHostFrame(
+        handle_, pending_host_tokens_, pending_host_binding_.capture_sequence,
+        &discard_reason);
+    if (discarded != StatusId::ready) {
+      const bool device_lost = discarded == StatusId::quarantined ||
+                               discard_reason == ReasonId::device_lost;
+      const auto status = device_lost ? StatusId::quarantined : StatusId::stale;
+      const auto failure = device_lost ? ReasonId::device_lost
+                                       : ReasonId::reconfiguration_required;
+      HandleTemporalResetResult(status, failure);
+      return FailedExecute(status, failure);
+    }
+  }
   RetirePendingFrame();
   latest_committed_frame_ = {};
   telemetry_.runtime_status = readiness_.status = StatusId::failed;

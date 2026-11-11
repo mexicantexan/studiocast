@@ -769,6 +769,7 @@ ExecuteResult ResidentAdapter::Execute(const PreparedProgramHandle &program,
     return Failed(StatusId::blocked, ReasonId::host_frame_binding_invalid);
   }
 
+  slot->host_execution_started = true;
   const ExecutorTelemetrySnapshot before = executor_->Telemetry();
   ExecuteResult result = executor_->Execute(slot->executor_handle, request);
   const ExecutorTelemetrySnapshot after = executor_->Telemetry();
@@ -959,12 +960,61 @@ StatusId ResidentAdapter::BindHostFrame(const PreparedProgramHandle &program,
     return StatusId::blocked;
   }
 
+  slot->host_execution_started = false;
   slot->host_binding = binding;
   slot->host_tokens = candidate;
   slot->host_completion = {};
   slot->host_binding_active = true;
   slot->host_execution_completed = false;
   *tokens = candidate;
+  SetReason(reason, ReasonId::none);
+  return StatusId::ready;
+}
+
+StatusId ResidentAdapter::DiscardUnsubmittedHostFrame(
+    const PreparedProgramHandle &program, const HostFrameTokens &tokens,
+    std::uint64_t capture_sequence, ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (stopped_ || !executor_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  Slot *slot = Find(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (!slot->host_binding_active || slot->host_execution_started ||
+      slot->host_execution_completed || capture_sequence == 0 ||
+      capture_sequence != slot->host_binding.capture_sequence ||
+      !SameResource(tokens.input, slot->host_tokens.input) ||
+      !SameResource(tokens.output, slot->host_tokens.output)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  const auto before = executor_->Telemetry();
+  const auto status = executor_->DiscardUnsubmittedHostFrame(
+      slot->executor_handle, tokens, capture_sequence, reason);
+  const auto after = executor_->Telemetry();
+  if (!SameTelemetry(before, after)) {
+    SetReason(reason, ReasonId::synchronization_failed);
+    return StatusId::failed;
+  }
+  if (status != StatusId::ready) {
+    if (status == StatusId::quarantined)
+      slot->quarantined = true;
+    return status;
+  }
+  slot->host_binding_active = false;
+  slot->host_execution_started = false;
+  slot->host_execution_completed = false;
+  slot->host_binding = {};
+  slot->host_tokens = {};
+  slot->host_completion = {};
   SetReason(reason, ReasonId::none);
   return StatusId::ready;
 }

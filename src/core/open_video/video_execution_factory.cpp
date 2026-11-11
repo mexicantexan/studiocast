@@ -1041,6 +1041,16 @@ struct OpenCudaVideoExecutionFactory::Impl {
         return Stopped(nullptr, reason);
       return adapter->BindHostFrame(program, binding, tokens, reason);
     }
+    hal::StatusId DiscardUnsubmittedHostFrame(
+        const hal::PreparedProgramHandle &program,
+        const hal::HostFrameTokens &tokens, std::uint64_t capture_sequence,
+        hal::ReasonId *reason) noexcept override {
+      auto *adapter = NativeAdapter();
+      if (!adapter)
+        return Stopped(nullptr, reason);
+      return adapter->DiscardUnsubmittedHostFrame(program, tokens,
+                                                   capture_sequence, reason);
+    }
     hal::StatusId
     ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
                            const hal::CompletionToken &completion,
