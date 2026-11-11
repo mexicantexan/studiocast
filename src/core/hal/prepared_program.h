@@ -513,6 +513,7 @@ public:
   [[nodiscard]] StatusId ResolveHostFrameOutput(
       const CompletionToken &completion, const ResourceHandle &output,
       HostFrameOutputResolution *resolution, ReasonId *reason) noexcept;
+  [[nodiscard]] StatusId ResetTemporalState(ReasonId reason) noexcept;
   void Invalidate(ReasonId reason) noexcept;
   void Shutdown() noexcept;
 

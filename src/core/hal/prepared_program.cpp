@@ -1276,6 +1276,21 @@ void PreparedProgramSession::UpdateCircuitBreakers(
   }
 }
 
+StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
+  if (stopped_)
+    return StatusId::stopped;
+  if (quarantined_)
+    return StatusId::quarantined;
+  if (rebuild_requested_ || !prepared_ || adapter_ == nullptr)
+    return StatusId::stale;
+  if (completion_pending_ || host_binding_pending_)
+    return StatusId::failed;
+  const auto status = adapter_->ResetTemporalState(handle_, reason);
+  if (status == StatusId::ready)
+    ++telemetry_.temporal_resets;
+  return status;
+}
+
 void PreparedProgramSession::Invalidate(ReasonId reason) noexcept {
   completion_pending_ = false;
   host_binding_pending_ = false;
