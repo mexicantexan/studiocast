@@ -163,6 +163,7 @@ public:
                                            std::uint64_t,
                                            const cuda::CudaImage &) noexcept;
   bool Shutdown(std::string *) noexcept;
+  void ResetTracking() noexcept;
   static PreparedCudaAutoFrameRect CenterCrop(int, int, float, float) noexcept;
   static PreparedCudaAutoFrameRect
   TargetCrop(const PreparedCudaAutoFrameTrackingBox &, int, int, float,

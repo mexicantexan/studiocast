@@ -409,6 +409,24 @@ int main() {
   id.registry_generation = 1;
   id.model_id_sha256[0] = id.manifest_sha256[0] = id.artifact_sha256[0] =
       id.artifact_set_sha256[0] = 1;
+  for (const bool wrong_task : {true, false}) {
+    open_video::ModelPack selected;
+    selected.id = wrong_task ? "configured-face" : "different-face";
+    selected.task = wrong_task ? "matting" : "face_detection";
+    auto selected_setup = setup;
+    selected_setup.requested_model_id = "configured-face";
+    selected_setup.selected_pack = &selected;
+    selected_setup.selected_artifact = id;
+    const auto allocations = state.allocations;
+    open_video::PreparedCudaYunetDetector rejected;
+    open_video::PreparedCudaYunetStatus status;
+    if (rejected.Prepare(selected_setup, &error, &status) ||
+        status != open_video::PreparedCudaYunetStatus::model_invalid ||
+        state.allocations != allocations) {
+      std::cerr << "selected YuNet pack substituted requested task or model ID";
+      return 1;
+    }
+  }
   open_video::PreparedCudaYunetDetector d;
   if (!d.PrepareForTesting(setup, id, std::make_unique<Session>(&state),
                            &error)) {

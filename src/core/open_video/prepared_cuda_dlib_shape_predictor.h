@@ -22,6 +22,8 @@ struct PreparedCudaDlibSetup {
   std::filesystem::path models_root;
   std::string model_id;
   std::size_t resource_budget_bytes = 0;
+  const ModelPack *selected_pack = nullptr;
+  ValidatedModelArtifactIdentity selected_artifact{};
 };
 struct PreparedCudaFaceBox {
   float left = 0, top = 0, right = 0, bottom = 0;

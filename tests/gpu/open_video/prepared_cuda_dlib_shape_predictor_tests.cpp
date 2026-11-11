@@ -218,6 +218,20 @@ int main() {
                                                           1,  2,        3};
   studiocast::open_video::PreparedCudaDlibSetup setup{binding, root,
                                                       "tiny-dlib68", 1u << 20};
+  for (const bool wrong_task : {true, false}) {
+    studiocast::open_video::ModelPack selected;
+    selected.id = wrong_task ? "tiny-dlib68" : "different-landmarks";
+    selected.task = wrong_task ? "eye_contact" : "face_landmarks";
+    auto selected_setup = setup;
+    selected_setup.selected_pack = &selected;
+    const int before = allocations;
+    studiocast::open_video::PreparedCudaDlibShapePredictor rejected;
+    studiocast::open_video::PreparedCudaDlibStatus status;
+    ok &= Need(!rejected.Prepare(selected_setup, &e, &status) &&
+                   status == studiocast::open_video::PreparedCudaDlibStatus::model_invalid &&
+                   allocations == before,
+               "selected dlib pack substituted requested task or model ID");
+  }
   studiocast::open_video::PreparedCudaDlibShapePredictor predictor;
   const int allocations_before = allocations;
   syncs = 0;

@@ -238,13 +238,23 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
     *status_out = PreparedCudaDlibStatus::unavailable;
   return false;
 #else
-  auto registry = s.models_root.empty()
-                      ? ModelPackRegistry::ScanDefault()
-                      : ModelPackRegistry::Scan(s.models_root);
-  auto id = s.model_id.empty()
-                ? registry.DefaultModelIdForTask("face_landmarks")
-                : s.model_id;
-  auto pack = registry.Find("face_landmarks", id);
+  std::optional<ModelPack> discovered;
+  const ModelPack *pack = s.selected_pack;
+  if (pack && (pack->task != "face_landmarks" ||
+               (!s.model_id.empty() && pack->id != s.model_id))) {
+    if (e) *e = "selected face_landmarks pack does not match requested task and model ID";
+    if (status_out) *status_out = PreparedCudaDlibStatus::model_invalid;
+    return false;
+  }
+  if (!pack) {
+    auto registry = s.models_root.empty()
+                        ? ModelPackRegistry::ScanDefault()
+                        : ModelPackRegistry::Scan(s.models_root);
+    const auto selected = s.model_id.empty()
+        ? registry.DefaultModelIdForTask("face_landmarks") : s.model_id;
+    discovered = registry.Find("face_landmarks", selected);
+    if (discovered) pack = &*discovered;
+  }
   if (!pack) {
     if (e)
       *e = "dlib landmark pack unavailable";
@@ -266,7 +276,8 @@ bool PreparedCudaDlibShapePredictor::Prepare(const PreparedCudaDlibSetup &s,
     return false;
   }
   auto validation = ValidateModelArtifactIdentity(*pack, *file);
-  if (!validation.ok()) {
+  if (!validation.ok() ||
+      (s.selected_pack && !(validation.identity == s.selected_artifact))) {
     if (e)
       *e = "dlib landmark artifact identity mismatch";
     if (status_out)
