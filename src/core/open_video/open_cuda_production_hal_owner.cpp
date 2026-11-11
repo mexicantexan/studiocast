@@ -103,42 +103,60 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
       *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
-  if (program.stage_count == 0 || program.stage_count > 3 ||
+  if (program.stage_count == 0 ||
+      program.stage_count > hal::kMaxPreparedStages ||
       readiness.ready_stage_mask !=
-          ((std::uint32_t{1} << program.stage_count) - 1u) ||
+          (program.stage_count == 32
+               ? std::numeric_limits<std::uint32_t>::max()
+               : (std::uint32_t{1} << program.stage_count) - 1u) ||
       readiness.blocked_stage_mask != 0 || readiness.disabled_stage_mask != 0) {
     if (reason)
       *reason = ReasonId::capability_evidence_incomplete;
     return false;
   }
-  const auto vb = [](hal::SemanticEffectId semantic) {
-    return semantic == hal::SemanticEffectId::virtual_background_blur ||
-           semantic == hal::SemanticEffectId::virtual_background_remove ||
-           semantic == hal::SemanticEffectId::virtual_background_replace;
+  int previous_order = 0;
+  std::size_t model_count = 0;
+  std::size_t native_count = 0;
+  const auto order = [](hal::SemanticEffectId semantic) {
+    using S = hal::SemanticEffectId;
+    switch (semantic) {
+    case S::video_noise_removal:
+      return 1;
+    case S::virtual_background_blur:
+    case S::virtual_background_remove:
+    case S::virtual_background_replace:
+      return 3;
+    case S::virtual_key_light:
+      return 4;
+    case S::auto_frame:
+      return 5;
+    case S::eye_contact:
+      return 2;
+    case S::vignette:
+      return 6;
+    case S::mirror:
+      return 7;
+    default:
+      return 0;
+    }
   };
-  const bool vignette_last =
-      program.stages[program.stage_count - 1].semantic ==
-      hal::SemanticEffectId::vignette;
-  const std::size_t model_count =
-      program.stage_count - (vignette_last ? 1u : 0u);
-  if (!((model_count == 0 && vignette_last) ||
-        (model_count == 1 &&
-         (vb(program.stages[0].semantic) ||
-          program.stages[0].semantic ==
-              hal::SemanticEffectId::virtual_key_light)) ||
-        (model_count == 2 && vb(program.stages[0].semantic) &&
-         program.stages[1].semantic ==
-             hal::SemanticEffectId::virtual_key_light))) {
-    if (reason)
-      *reason = ReasonId::semantic_effect_unsupported;
-    return false;
-  }
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
+    const auto stage_order = order(stage.semantic);
+    if (stage_order <= previous_order) {
+      if (reason)
+        *reason = ReasonId::semantic_effect_unsupported;
+      return false;
+    }
+    previous_order = stage_order;
+    const bool native = stage.semantic == hal::SemanticEffectId::vignette ||
+                        stage.semantic == hal::SemanticEffectId::mirror;
+    model_count += native ? 0u : 1u;
+    native_count += native ? 1u : 0u;
     if (stage.backend != hal::BackendId::cuda ||
         stage.execution_domain != domain ||
         stage.provider !=
-            (stage.semantic == hal::SemanticEffectId::vignette
+            (native
                  ? hal::SemanticEffectProviderId::open_cuda_production_kernels
                  : hal::SemanticEffectProviderId::open_video_onnxruntime_cuda)) {
       if (reason)
@@ -147,7 +165,7 @@ bool ExactPreparedCapability(const hal::PreparedProgram &program,
     }
   }
   const auto aggregate_provider =
-      model_count != 0 && vignette_last
+      model_count != 0 && native_count != 0
           ? hal::SemanticEffectProviderId::invalid
           : model_count != 0
                 ? hal::SemanticEffectProviderId::open_video_onnxruntime_cuda
@@ -271,9 +289,9 @@ OpenCudaProductionHalOwner::CreateBackend(
     if (request.api_version != kOpenCudaProductionOwnerApiVersion ||
         request.adapter_instance_id == 0 || request.cuda_device_id < 0 ||
         request.configuration_generation == 0 ||
-        ((request.model_artifact.Valid()) !=
-         (request.model_preprocess_generation != 0 &&
-          request.model_artifact_hash != 0)) ||
+        (request.model_artifact.Valid() &&
+         (request.model_preprocess_generation == 0 ||
+          request.model_artifact_hash == 0)) ||
         (request.require_expected_context &&
          !request.expected_context.Valid())) {
       SetResult(result, OwnerStatus::malformed_request, StatusId::blocked,
@@ -422,6 +440,14 @@ OpenCudaProductionHalOwner::CreateBackend(
     options.key_light_direction_pan_degrees =
         request.key_light_direction_pan_degrees;
     options.vignette_intensity = request.vignette_intensity;
+    options.vignette_tracked_center = request.vignette_tracked_center;
+    options.dependencies = request.dependencies;
+    options.denoise_strength = request.denoise_strength;
+    options.auto_frame_strength = request.auto_frame_strength;
+    options.auto_frame_smoothing = request.auto_frame_smoothing;
+    options.auto_frame_headroom = request.auto_frame_headroom;
+    options.eye_contact_strength = request.eye_contact_strength;
+    options.eye_contact_look_away = request.eye_contact_look_away;
     options.wait_policy = request.wait_policy;
     options.runtime = request.runtime;
     state.executor =

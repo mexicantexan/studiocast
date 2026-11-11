@@ -72,6 +72,9 @@ struct OpenCudaVideoExecutionCachedEvidence {
   bool allocation_free_execute = false;
   std::uint64_t minimum_synchronizations_per_frame = 0;
   std::uint64_t maximum_synchronizations_per_frame = 0;
+  std::uint32_t maximum_metadata_readbacks_per_frame = 0;
+  std::uint32_t maximum_metadata_cpu_tails_per_frame = 0;
+  std::uint32_t maximum_metadata_synchronizations_per_frame = 0;
 };
 
 struct OpenCudaVideoExecutionFactoryConfig {
