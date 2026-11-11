@@ -1,8 +1,10 @@
 #include "core/open_video/native_prepared_cuda_eye_contact_runtime.h"
 #include "core/open_video/prepared_cuda_eye_contact.h"
 
+#if STUDIOCAST_TEST_HAVE_DLIB
 #include <dlib/image_processing/shape_predictor.h>
 #include <dlib/serialize.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -320,11 +322,14 @@ struct YunetSession final : internal::IPreparedCudaYunetSession {
 };
 
 std::filesystem::path TinyDlibPack() {
-  const auto root = std::filesystem::temp_directory_path() /
-                    ("studiocast-eye-shared-dlib-" +
-                     std::to_string(::getpid()));
+  static unsigned fixture_number = 0;
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("studiocast-eye-shared-dlib-" + std::to_string(::getpid()) + "-" +
+       std::to_string(++fixture_number));
   const auto dir = root / "face_landmarks" / "tiny-dlib68";
   std::filesystem::create_directories(dir);
+#if STUDIOCAST_TEST_HAVE_DLIB
   dlib::matrix<float, 0, 1> shape(136);
   for (long i = 0; i < 68; ++i) {
     shape(2 * i) = 0.2F + 0.005F * static_cast<float>(i);
@@ -341,6 +346,10 @@ std::filesystem::path TinyDlibPack() {
       {{0.5F, 0.5F}, {0.25F, 0.25F}}};
   dlib::serialize((dir / "model.dat").string())
       << dlib::shape_predictor(shape, forests, pixels);
+#else
+  // The disabled runtime must report unavailable before parsing any artifact.
+  std::ofstream(dir / "model.dat") << "dlib-disabled-test-fixture\n";
+#endif
   std::ofstream(dir / "LICENSE.txt") << "synthetic test fixture\n";
   std::ofstream(dir / "model.json")
       << R"({"schema_version":2,"id":"tiny-dlib68","display_name":"tiny","task":"face_landmarks","files":[{"name":"model.dat","kind":"dlib_shape_predictor","role":"main","sha256":""}],"dlib":{"predictor_kind":"shape_predictor_68_face_landmarks","num_landmarks":68}})";
@@ -662,17 +671,38 @@ bool ConcreteSharedAnalysis() {
   setup.frame_height = 48;
   setup.models.yunet = yunet_identity;
   setup.models.landmarks = dlib_identity.identity;
-  ++setup.models.landmarks.registry_generation;
   setup.shared_yunet = &shared;
   setup.dlib_setup.models_root = dlib_root;
   setup.dlib_setup.model_id = "tiny-dlib68";
+  setup.dlib_setup.selected_pack = &*dlib_pack;
+  setup.dlib_setup.selected_artifact = dlib_identity.identity;
   setup.dlib_setup.resource_budget_bytes = 1U << 20;
   setup.resource_budget_bytes = setup.dlib_setup.resource_budget_bytes + 4096;
-  PreparedCudaEyeContactHandle handle;
-  if (!eye.Prepare(setup, &handle, &error)) {
-    std::cerr << "concrete shared prepare: " << error << '\n';
-    return false;
+  auto probe_setup = setup.dlib_setup;
+  probe_setup.binding = {setup.binding.driver,
+                         setup.binding.context,
+                         setup.binding.owner_context,
+                         setup.binding.stream,
+                         setup.binding.stream_identity,
+                         setup.binding.owner_identity,
+                         setup.binding.configuration_generation};
+  PreparedCudaDlibShapePredictor dlib_probe;
+  PreparedCudaDlibStatus dlib_status;
+  const bool dlib_available =
+      dlib_probe.Prepare(probe_setup, &error, &dlib_status);
+  CHECK(dlib_available == bool(STUDIOCAST_TEST_HAVE_DLIB));
+  if (dlib_available) {
+    CHECK(dlib_status == PreparedCudaDlibStatus::success && dlib_probe.ready());
+    CHECK(dlib_probe.artifact() == dlib_identity.identity);
+  } else {
+    CHECK(dlib_status == PreparedCudaDlibStatus::unavailable &&
+          !dlib_probe.ready());
   }
+  CHECK(dlib_probe.Shutdown(&error));
+
+  PreparedCudaEyeContactHandle handle;
+  PreparedCudaEyeContactStatus prepare_status;
+  const bool prepared = eye.Prepare(setup, &handle, &error, &prepare_status);
   CHECK(state.yunet_runs == runs_after_warmup);
   cuda::CudaImage input;
   input.ptr = 1;
@@ -680,42 +710,62 @@ bool ConcreteSharedAnalysis() {
   input.w = 64;
   input.h = 48;
   input.format = cuda::PixelFormatGpu::rgb_u8;
-  auto result = eye.Execute(handle, setup.binding, 50, input);
-  CHECK(result.status == PreparedCudaEyeContactStatus::preserved_input &&
-        !result.face_found && state.yunet_runs == runs_after_warmup + 1);
-  const auto direct = yunet.Execute(yunet_setup.binding, input, 50, &cache,
-                                    setup.wait);
-  CHECK(direct.status == PreparedCudaYunetStatus::success_no_faces &&
-        direct.enqueued_readbacks == 0 && direct.completion_waits == 0 &&
+  if (dlib_available) {
+    CHECK(prepared && prepare_status == PreparedCudaEyeContactStatus::executed);
+    auto result = eye.Execute(handle, setup.binding, 50, input);
+    CHECK(result.status == PreparedCudaEyeContactStatus::preserved_input &&
+          !result.face_found && state.yunet_runs == runs_after_warmup + 1);
+  } else {
+    CHECK(!prepared &&
+          prepare_status == PreparedCudaEyeContactStatus::invalid_setup);
+    CHECK(!eye.ready() && handle.id == 0 && runtime.prepare == 0);
+    CHECK(yunet.ready() && state.yunet_invalidates == 0);
+    // The unavailable optional consumer must leave its borrowed producer
+    // usable.
+    const auto direct =
+        yunet.Execute(yunet_setup.binding, input, 50, &cache, setup.wait);
+    CHECK(direct.status == PreparedCudaYunetStatus::success_no_faces &&
+          state.yunet_runs == runs_after_warmup + 1);
+  }
+  const auto cached =
+      yunet.Execute(yunet_setup.binding, input, 50, &cache, setup.wait);
+  CHECK(cached.status == PreparedCudaYunetStatus::success_no_faces &&
+        cached.enqueued_readbacks == 0 && cached.completion_waits == 0 &&
         state.yunet_runs == runs_after_warmup + 1);
   CHECK(eye.Shutdown(&error));
-  PreparedCudaEyeContactStatus budget_status;
-  Runtime budget_runtime;
-  PreparedCudaEyeContact budget_eye(&budget_runtime);
-  state.pitch_extra = 1U << 20;
-  CHECK(!budget_eye.Prepare(setup, &handle, &error, &budget_status));
-  CHECK(budget_status == PreparedCudaEyeContactStatus::resource_exhausted);
-  state.pitch_extra = 0;
-  const auto malformed_root = TinyDlibPack();
-  std::ofstream(malformed_root / "face_landmarks" / "tiny-dlib68" /
-                    "model.dat",
-                std::ios::binary | std::ios::trunc)
-      << "malformed";
-  const auto malformed_registry = ModelPackRegistry::Scan(malformed_root);
-  const auto malformed_pack =
-      malformed_registry.Find("face_landmarks", "tiny-dlib68");
-  CHECK(malformed_pack && !malformed_pack->files.empty());
-  const auto malformed_identity = ValidateModelArtifactIdentity(
-      *malformed_pack, malformed_pack->files.front());
-  CHECK(malformed_identity.ok());
-  setup.dlib_setup.models_root = malformed_root;
-  setup.models.landmarks = malformed_identity.identity;
-  Runtime malformed_runtime;
-  PreparedCudaEyeContact malformed_eye(&malformed_runtime);
-  PreparedCudaEyeContactStatus malformed_status;
-  CHECK(!malformed_eye.Prepare(setup, &handle, &error, &malformed_status));
-  CHECK(malformed_status == PreparedCudaEyeContactStatus::model_invalid);
-  std::filesystem::remove_all(malformed_root);
+  if (dlib_available) {
+    PreparedCudaEyeContactStatus budget_status;
+    Runtime budget_runtime;
+    PreparedCudaEyeContact budget_eye(&budget_runtime);
+    state.pitch_extra = 1U << 20;
+    CHECK(!budget_eye.Prepare(setup, &handle, &error, &budget_status));
+    CHECK(budget_status == PreparedCudaEyeContactStatus::resource_exhausted);
+    state.pitch_extra = 0;
+    const auto malformed_root = TinyDlibPack();
+    Cleanup malformed_cleanup{malformed_root};
+    std::ofstream(malformed_root / "face_landmarks" / "tiny-dlib68" /
+                      "model.dat",
+                  std::ios::binary | std::ios::trunc)
+        << "malformed";
+    const auto malformed_registry = ModelPackRegistry::Scan(malformed_root);
+    const auto malformed_pack =
+        malformed_registry.Find("face_landmarks", "tiny-dlib68");
+    CHECK(malformed_pack && !malformed_pack->files.empty());
+    const auto malformed_identity = ValidateModelArtifactIdentity(
+        *malformed_pack, malformed_pack->files.front());
+    CHECK(malformed_identity.ok());
+    auto malformed_setup = setup;
+    malformed_setup.dlib_setup.models_root = malformed_root;
+    malformed_setup.dlib_setup.selected_pack = &*malformed_pack;
+    malformed_setup.dlib_setup.selected_artifact = malformed_identity.identity;
+    malformed_setup.models.landmarks = malformed_identity.identity;
+    Runtime malformed_runtime;
+    PreparedCudaEyeContact malformed_eye(&malformed_runtime);
+    PreparedCudaEyeContactStatus malformed_status;
+    CHECK(!malformed_eye.Prepare(malformed_setup, &handle, &error,
+                                 &malformed_status));
+    CHECK(malformed_status == PreparedCudaEyeContactStatus::model_invalid);
+  }
   CHECK(yunet.ready() && state.yunet_invalidates == 0);
   CHECK(yunet.Shutdown(&error) && state.yunet_invalidates == 1);
   CHECK(yunet.PrepareForTesting(yunet_setup, yunet_identity,
