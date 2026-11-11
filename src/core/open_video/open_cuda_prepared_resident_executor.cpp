@@ -2262,9 +2262,10 @@ private:
       const float sy = static_cast<float>(slot->input.h) /
                        static_cast<float>(slot->alpha_image.h);
       out.box.source = open_video::PreparedCudaAutoFrameSource::matte;
-      out.box.box = {bounds.x0 * sx, bounds.y0 * sy,
-                     (bounds.x1 + 1 - bounds.x0) * sx,
-                     (bounds.y1 + 1 - bounds.y0) * sy};
+      out.box.box = {static_cast<float>(bounds.x0) * sx,
+                     static_cast<float>(bounds.y0) * sy,
+                     static_cast<float>(bounds.x1 + 1 - bounds.x0) * sx,
+                     static_cast<float>(bounds.y1 + 1 - bounds.y0) * sy};
       out.box.confidence = 1;
     }
     return out;
