@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-07-19",
+  "catalog_version": "2026-11-11",
   "policy_version": 1,
   "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/main",
   "size_metadata": {
@@ -112,13 +112,13 @@
       "default": true,
       "pack_path": "video_denoise/Good Quality (FastDVDnet sigma15)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.json", "destination": "model.json", "sha256": "17b38aa66cb3850713f8ff7d8173864c1a42ea4dd62fd2325c11ebcc7683c3ac"},
-        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "e5d8003230e9dc4c6dd46b28fe8b0bc019c9cba1be8c6df3eef8a1012beccd88"}
+        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.json", "destination": "model.json", "sha256": "9daf66251194aeaab5c67f18331e18a40596b951a8049b4d359d36fe1e97285e"},
+        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "e419e198d08f7d62fbc6bbb74409836289246db14ed28a134f79e1a2ea5afedc"}
       ],
       "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "FastDVDnet MIT license summary and paper provenance are installed with the pack."},
-      "provenance": {"project": "FastDVDnet", "url": "https://github.com/m-tassano/fastdvdnet", "release": "StudioCast-compatible ONNX export"},
+      "provenance": {"project": "FastDVDnet", "url": "https://github.com/m-tassano/fastdvdnet", "release": "upstream c8fdf6182a0340e89dd18f5df25b47337cbede6f; exporter 9384cd12bfa3ed56f0d7693964376897d18ebb9f; self-contained FP32 opset17; Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc", "size_bytes": 416788, "size_status": "known", "source_paths": ["open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx", "open_cuda/video_denoise/Good Quality (FastDVDnet sigma15)/model.onnx"]}
+        {"name": "model.onnx", "sha256": "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac", "size_bytes": 9948304, "size_status": "known", "source_paths": ["open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac/model.onnx"]}
       ]
     }
   ]

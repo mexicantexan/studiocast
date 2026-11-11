@@ -27,11 +27,11 @@ These are seven packs and eight artifacts because the gaze-correction pack has
 separate left- and right-eye ONNX files. Maxine is not redistributed and its
 presence never removes these open-source fallback defaults.
 
-### FastDVDnet correction decision and promotion gate (2026-11-10)
+### FastDVDnet corrected artifact and publication (2026-11-11)
 
 The approved product decision is to repair/re-export `fastdvdnet_sigma15`,
 preserving its ID, default selection, and the seven-pack/eight-artifact contract.
-The currently published 416,788-byte artifact matches its pinned hash but is
+The previous 416,788-byte artifact matched its pinned hash but is
 invalid: 26 convolution-weight references have no producer/initializer, and 68
 initializer tensors reference an absent `fastdvdnet.onnx.data`. Hash verification
 proves identity, not graph validity. Keep this failure visible; never substitute
@@ -62,7 +62,7 @@ python3 -m venv /tmp/fastdvdnet-export-env
 python3 tests/installer/models/fastdvdnet_export_tests.py -v
 ```
 
-The corrected candidate is 9,948,304 bytes with SHA-256
+The corrected artifact is 9,948,304 bytes with SHA-256
 `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
 Repeated independent invocations produced identical artifact bytes. The
 `337f3d8` / `b204b0a` exporter fix composes the full upstream license
@@ -73,55 +73,57 @@ The output contains an isolated source tree, candidate `model.json` and full
 license, a complete candidate catalog, and `validation.json` provenance/results.
 It never changes the shipped catalog, installed models, or external hosting.
 
-The shipped catalog below deliberately retains the existing published identity
-until publication and reviewed promotion are complete. Three-file Hugging Face
-publication and local catalog update are authorized. The actual preupload
-request returned HTTP 401, and the browser was logged out. No working
-authentication is available; the user reported no credential available. This is an authentication blocker, not missing approval. No remote
-file was published, and no active catalog/template or installed pack changed.
-Promotion requires verified publication of the exact corrected artifact to a
-usable source, matching candidate metadata/license hashes, a new catalog version and measured total,
-updated pinned-catalog tests, required CUDA qualification, and the normal signed
-clean-HEAD source/AppImage release chain. The candidate catalog is review
-material, not signed release metadata and not a recommended-install trust grant.
-Without publication, simply changing the default artifact hash would make the
-download fail integrity verification. Local `--source` transport may validate a
-candidate in temporary HOME/XDG roots; it must not activate it in the user's
-installed tree without a separately authorized install.
+The user-authorized publication added exactly `model.onnx`, `model.json`, and
+`LICENSE.txt` to the existing `10dallasj/studiocast` Hugging Face model repository
+in one additive commit:
+[`8ffe968884e31ded74f857a2d0dca19f571ba044`](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044).
+All three remote files were downloaded at that immutable revision and their
+actual sizes and SHA-256 values matched the approved export:
 
-The unaccepted eight-file promotion proposal is staged separately at
-`/tmp/studiocast-fastdvdnet-promotion-20261111`. It proposes catalog version
-`2026-11-11`, 140,755,803 total bytes, and the corrected sigma15 artifact; these
-are **proposed**, not active defaults. Proposal-only checks passed: 19 model
-transactions, 52 backend, nine packaging, and one GUI test, plus corrected real
-artifact local-source and offline-cache transactions in temporary roots. These
-checks do not establish remote availability or accept that proposal into the
-main tree. Sigma25/sigma50 remain untouched noncatalog BYO templates with their
-previous artifact hashes, not published defaults.
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `model.onnx` | 9,948,304 | `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac` |
+| `model.json` | 1,881 | `9daf66251194aeaab5c67f18331e18a40596b951a8049b4d359d36fe1e97285e` |
+| `LICENSE.txt` | 1,671 | `e419e198d08f7d62fbc6bbb74409836289246db14ed28a134f79e1a2ea5afedc` |
 
-Resume material is in
-`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/`:
-`publication-plan.json`, `promotion-proposal.patch`,
-`promotion-handoff-20261111.json`, and `publish_verified_fastdvdnet.py`.
-Establish normal secure Hugging Face authentication with write access to
-`10dallasj/studiocast`; keep credentials out of chat, source, and logs. The
-publication helper must return a verified receipt for the exact three approved
-files at an immutable commit before the orchestrator accepts catalog provenance
-and reruns its pinned checks. Publication does not install a model or bypass the
-signed release chain.
+The active local catalog selects only
+`open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac/model.onnx`.
+It has no fallback to the invalid artifact. The packaged manifest and full
+license are byte-identical to the approved published files. Previous repository
+paths were preserved for users of older catalogs; those catalogs retain their
+previous identities and do not silently select the corrected bytes.
 
-An old unmarked installed sigma15 pack will fail the proposed metadata
-ownership check with `curated_ownership_unverified` and remain preserved. Do
-not weaken ownership verification or promise an automatic overwrite; any
-installed-pack repair needs a separately authorized ownership-safe transaction.
+The publication receipt is
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/publication-receipt.json`.
+The earlier staged proposal at
+`/tmp/studiocast-fastdvdnet-promotion-20261111` remains preserved for historical
+review; its authentication-blocked status is superseded by the verified
+publication and current catalog. Sigma25/sigma50 remain untouched noncatalog
+BYO templates with their previous artifact hashes; no additional packs were
+published or promoted.
+
+Publication and local catalog promotion do not install a model, publish a
+StudioCast release, or grant production Recommended trust. The normal signed
+clean-HEAD source/AppImage release chain remains required. Artifact graph and
+CPU equivalence results, and the bounded native CUDA evidence in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md), do not qualify the complete
+camera route, visual quality, optimized latency, or other hardware families.
+
+An old unmarked installed sigma15 pack fails the corrected metadata ownership
+check with `curated_ownership_unverified` and remains preserved. Marked curated
+packs can use normal verified update/repair. For an unmarked pack, review and
+back up that exact directory before a separately authorized ownership-safe
+reinstall; preserve custom siblings and never bypass ownership checks or remove
+the whole model root. This publication/catalog change leaves installed packs
+untouched.
 
 Each artifact records its destination name, pinned SHA-256, source candidates,
 provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files
 come only from hash-pinned files in the verified StudioCast source/package
 surface; they are not accepted from a model download source.
 
-Catalog version `2026-07-19` records the independently verified local byte
-counts paired with the pre-existing pinned hashes:
+Catalog version `2026-11-11` records independently verified artifact byte
+counts paired with pinned hashes:
 
 | Pack/artifact | Bytes |
 | --- | ---: |
@@ -132,9 +134,9 @@ counts paired with the pre-existing pinned hashes:
 | `dlib_68_ibug_300w/shape_predictor_68_face_landmarks.dat` | 99,693,937 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.onnx` | 1,062,936 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.onnx` | 1,062,994 |
-| `fastdvdnet_sigma15/model.onnx` | 416,788 |
+| `fastdvdnet_sigma15/model.onnx` | 9,948,304 |
 
-The total is 131,224,287 bytes. Every entry is `size_status: known`, and the
+The total is 140,755,803 bytes. Every entry is `size_status: known`, and the
 catalog-level evidence reason is
 `artifact_sizes_independently_verified_against_pinned_sha256`. A trusted
 catalog requires every artifact to have a strictly positive integer size; a

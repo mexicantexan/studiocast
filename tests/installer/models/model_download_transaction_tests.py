@@ -181,13 +181,13 @@ class CatalogContractTests(TempTest):
             ("dlib_68_ibug_300w", "shape_predictor_68_face_landmarks.dat"): (99693937, "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f"),
             ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_left.onnx"): (1062936, "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00"),
             ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_right.onnx"): (1062994, "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"),
-            ("fastdvdnet_sigma15", "model.onnx"): (416788, "500517e2706130ab84d140add26353ded2afb1317b6ab747c6417fa7134963dc"),
+            ("fastdvdnet_sigma15", "model.onnx"): (9948304, "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac"),
         }
         actual = {(pack["id"], item["name"]): (item["size_bytes"], item["sha256"])
                   for pack in catalog["packs"] for item in pack["artifacts"]}
         self.assertEqual(actual, expected)
-        self.assertEqual(sum(size for size, _ in actual.values()), 131224287)
-        self.assertEqual(catalog["catalog_version"], "2026-07-19")
+        self.assertEqual(sum(size for size, _ in actual.values()), 140755803)
+        self.assertEqual(catalog["catalog_version"], "2026-11-11")
         self.assertEqual(catalog["size_metadata"], {
             "trusted": True,
             "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
@@ -207,6 +207,32 @@ class CatalogContractTests(TempTest):
             self.assertEqual(destinations, {"model.json", "LICENSE.txt"})
             self.assertTrue(pack["license"]["spdx"])
             self.assertTrue(pack["provenance"]["url"])
+
+    def test_curated_fastdvdnet_repair_uses_only_versioned_verified_artifact(self):
+        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        pack = next(item for item in catalog["packs"] if item["id"] == "fastdvdnet_sigma15")
+        artifact, = pack["artifacts"]
+        expected_hash = "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac"
+        self.assertEqual(artifact["source_paths"], [
+            "open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/"
+            + expected_hash + "/model.onnx",
+        ])
+        self.assertIn("Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044",
+                      pack["provenance"]["release"])
+        metadata = json.loads((REPO_ROOT / pack["metadata"][0]["source"]).read_text())
+        self.assertEqual(metadata["id"], "fastdvdnet_sigma15")
+        self.assertEqual(metadata["files"], [{"name": "model.onnx", "kind": "onnx",
+                                             "role": "main", "sha256": expected_hash}])
+        self.assertEqual(metadata["origin"]["upstream_commit"],
+                         "c8fdf6182a0340e89dd18f5df25b47337cbede6f")
+        self.assertEqual(metadata["origin"]["weights_sha256"],
+                         "9d9d8413c33e3d9d961d07c530237befa1197610b9d60602ff42fd77975d2a17")
+        self.assertEqual([(item["name"], item["channels"], item["dtype"], item["dynamic_hw"])
+                          for item in metadata["onnx"]["inputs"]],
+                         [("noisy", 15, "float32", True), ("noise_map", 1, "float32", True)])
+        license_text = (REPO_ROOT / pack["metadata"][1]["source"]).read_text()
+        self.assertIn("Copyright 2024 Matias Tassano", license_text)
+        self.assertIn("THE SOFTWARE IS PROVIDED", license_text)
 
     def test_curated_yunet_fp32_artifact_has_verified_tensor_contract(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
@@ -372,6 +398,29 @@ class CatalogContractTests(TempTest):
 
 
 class InstallTransactionTests(TempTest):
+    def test_versioned_artifact_source_and_offline_cache_install_without_old_source(self):
+        fixture = Fixture(self.root)
+        pack = fixture.catalog["packs"][0]
+        artifact = pack["artifacts"][0]
+        original = fixture.source / artifact["source_paths"][0]
+        relative = f"objects/{pack['id']}/revisions/{artifact['sha256']}/model.onnx"
+        versioned = fixture.source / relative
+        versioned.parent.mkdir(parents=True)
+        shutil.copyfile(original, versioned)
+        original.write_bytes(b"old revision must not be selected or changed")
+        artifact["source_paths"] = [relative]
+        first = fixture.installer().install("open_audio")
+        self.assertEqual(first["state"], "succeeded")
+        self.assertEqual((fixture.destination / pack["pack_path"] / "model.onnx").read_bytes(),
+                         fixture.artifacts[pack["id"]])
+        versioned.unlink()
+        offline = model_tx.ModelTransactionInstaller(
+            fixture.catalog, fixture.repo, self.root / "offline-models", fixture.cache,
+            None, offline=True, retries=0,
+        ).install("open_audio")
+        self.assertEqual(offline["state"], "succeeded")
+        self.assertEqual(original.read_bytes(), b"old revision must not be selected or changed")
+
     def test_local_install_stages_metadata_license_and_artifact_atomically(self):
         fixture = Fixture(self.root)
         custom = fixture.destination / "my_custom_pack"
