@@ -13,6 +13,13 @@ spec.loader.exec_module(exporter)
 
 
 class ExportTrustTests(unittest.TestCase):
+    def test_reexport_preserves_exact_license_after_template_promotion(self):
+        summary = "StudioCast model summary\n"
+        upstream_license = "Copyright fixture\nPermission is hereby granted...\n"
+        published = summary + "\nFull upstream license at pinned commit:\n\n" + upstream_license
+        self.assertEqual(exporter.compose_license(summary, upstream_license), published)
+        self.assertEqual(exporter.compose_license(published, upstream_license), published)
+
     def test_missing_and_modified_upstream_rejected_before_execution(self):
         with tempfile.TemporaryDirectory() as root:
             upstream = Path(root)
