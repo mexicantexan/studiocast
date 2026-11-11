@@ -218,6 +218,7 @@ set(_studiocast_video_execution_runtime_sources
         ${PROJECT_SOURCE_DIR}/src/core/video/video_runtime_status.cpp)
 
 set(_studiocast_video_backend_composition_sources
+        ${PROJECT_SOURCE_DIR}/src/core/video/production_video_setup_request.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/production_video_backend_manager.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/production_video_execution_composition.cpp
         ${PROJECT_SOURCE_DIR}/src/core/video/static_production_video_backend_setup_source.cpp)
@@ -645,7 +646,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 157)
+set(_studiocast_expected_source_count 158)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

@@ -98,6 +98,10 @@ video::VideoExecutionPlanRequest Plan() {
   plan.intent.stages[0].parameters[3].boolean_value = true;
   plan.intent.stages[0].parameter_count = 4;
   plan.intent.stage_count = 1;
+  plan.temporal.temporal = true;
+  plan.temporal.requires_contiguous_capture_sequence = true;
+  plan.temporal.history_frames = 1;
+  plan.temporal.frame_drop_behavior = hal::FrameDropBehavior::reset_temporal_state;
   plan.host_input = Image(hal::Mutability::read_only);
   plan.host_output = Image(hal::Mutability::write_only);
   plan.invalidation_key.generations = {1, 2, 3, 4, 5, 7};
@@ -340,9 +344,12 @@ public:
     program.budget = request.budget;
     program.setup_failure_policy = request.setup_failure_policy;
     program.requested_backend = hal::BackendId::maxine;
-    program.strict_backend_selection = true;
-    program.requested_provider = result.provider;
-    program.strict_provider_selection = true;
+    program.strict_backend_selection = request.intent.backend.strict;
+    program.requested_provider =
+        request.intent.requested_provider == hal::SemanticEffectProviderId::invalid
+            ? result.provider
+            : request.intent.requested_provider;
+    program.strict_provider_selection = request.intent.strict_provider_selection;
     program.requested_execution_domain = Domain();
     program.strict_execution_domain = true;
     program.requires_upload = true;
@@ -491,6 +498,9 @@ video::ProductionVideoSetupLeaseSnapshot LeaseSnapshot(
 
 enum class SourceMode {
   ready,
+  maxine_temporal_refinement,
+  erased_temporal,
+  excessive_temporal_history,
   optional_passthrough,
   malformed_optional_passthrough,
   nondeterministic_optional_passthrough_hash,
@@ -522,6 +532,20 @@ public:
     video::ProductionVideoResidentSetupSourceResult result;
     result.plan = request.plan;
     result.canonical_effects = request.effects;
+    if (mode == SourceMode::maxine_temporal_refinement ||
+        mode == SourceMode::excessive_temporal_history) {
+      result.plan.temporal.temporal = true;
+      result.plan.temporal.requires_contiguous_capture_sequence = true;
+      result.plan.temporal.history_frames =
+          mode == SourceMode::excessive_temporal_history ? 5 : 1;
+      result.plan.temporal.frame_drop_behavior =
+          hal::FrameDropBehavior::reset_temporal_state;
+      result.plan.temporal.discontinuity_action =
+          hal::TemporalDiscontinuityAction::reset_and_continue;
+    }
+    if (mode == SourceMode::erased_temporal)
+      result.plan.temporal = {};
+
     if (mode == SourceMode::optional_passthrough ||
         mode == SourceMode::malformed_optional_passthrough ||
         mode == SourceMode::nondeterministic_optional_passthrough_hash) {
@@ -1251,10 +1275,67 @@ bool TestFailedTemporalResetRequiresSetupReprepare() {
   return ok;
 }
 
+bool TestOnlySelectedMaxineMayAddGreenscreenHistory() {
+  bool ok = true;
+  for (const bool automatic : {false, true}) {
+    Counters counters;
+    auto source = std::make_unique<FakeSetupSource>(&counters);
+    source->mode = SourceMode::maxine_temporal_refinement;
+    auto *raw = source.get();
+    video::ProductionVideoBackendManager manager(std::move(source));
+    auto request = ResidentRequest();
+    request.resident.plan.temporal = {};
+    if (automatic) {
+      request.resident.plan.intent.backend = {};
+      request.resident.plan.intent.requested_provider =
+          hal::SemanticEffectProviderId::invalid;
+      request.resident.plan.intent.strict_provider_selection = false;
+    }
+    video::ProductionVideoBackendSetupEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto refinement_status = manager.Setup(request, &evidence, &reason);
+    ok &= Require(refinement_status == hal::StatusId::ready,
+                  "selected Maxine must add its default greenscreen history "
+                  "for auto and explicit intent");
+    request.resident.effects.virtual_background.greenscreen_temporal = false;
+    request.resident.plan.intent.stages[0].parameters[3].boolean_value = false;
+    ok &= Require(
+        manager.Setup(request, &evidence, &reason) == hal::StatusId::blocked &&
+            reason == hal::ReasonId::malformed_contract,
+        "Maxine must not add history when its canonical knob is disabled");
+    request.resident.effects.virtual_background.greenscreen_temporal = true;
+    request.resident.plan.intent.stages[0].parameters[3].boolean_value = true;
+    raw->mode = SourceMode::excessive_temporal_history;
+    ok &= Require(
+        manager.Setup(request, &evidence, &reason) == hal::StatusId::blocked &&
+            reason == hal::ReasonId::malformed_contract,
+        "Maxine greenscreen refinement must not add arbitrary history");
+    raw->mode = SourceMode::erased_temporal;
+    request.resident.plan.temporal.temporal = true;
+    request.resident.plan.temporal.requires_contiguous_capture_sequence = true;
+    request.resident.plan.temporal.history_frames = 5;
+    request.resident.plan.temporal.frame_drop_behavior =
+        hal::FrameDropBehavior::reset_temporal_state;
+    request.resident.plan.temporal.discontinuity_action =
+        hal::TemporalDiscontinuityAction::reset_and_continue;
+    ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                          hal::StatusId::blocked &&
+                      reason == hal::ReasonId::malformed_contract,
+                  "setup source must not erase meaningful temporal history");
+    raw->mode = SourceMode::maxine_temporal_refinement;
+    ok &= Require(manager.Setup(request, &evidence, &reason) ==
+                          hal::StatusId::blocked &&
+                      reason == hal::ReasonId::malformed_contract,
+                  "Maxine must not shorten meaningful temporal history");
+  }
+  return ok;
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
+  ok &= TestOnlySelectedMaxineMayAddGreenscreenHistory();
   ok &= TestCpuPrimitiveOnlyIsExplicitAndNonSemantic();
   ok &= TestPreparedExecutionAndWriterGatedCommit();
   ok &= TestOptionalUnavailableUsesNeutralPassthrough();
