@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string_view>
 
 namespace {
@@ -530,6 +531,32 @@ bool ExactDomainCapabilityAndQuarantineAreTyped() {
                   owner->prepared_capability_committed(),
               "only exact adapter readiness should commit capability") &&
        ok;
+
+  auto maximum_stages = program;
+  maximum_stages.stage_count = hal::kMaxPreparedStages;
+  for (std::size_t index = 0; index < maximum_stages.stage_count; ++index) {
+    maximum_stages.stages[index] = program.stages[0];
+    maximum_stages.stages[index].stage_id = static_cast<std::uint32_t>(index + 1);
+    maximum_stages.stages[index].scratch_bytes = 0;
+  }
+  maximum_stages.cpu_tails[0].after_stage_id =
+      static_cast<std::uint32_t>(hal::kMaxPreparedStages);
+  maximum_stages.cpu_tails[0].boundary_index =
+      static_cast<std::uint32_t>(hal::kMaxPreparedStages);
+  auto maximum_readiness = readiness;
+  maximum_readiness.ready_stage_mask = std::numeric_limits<std::uint32_t>::max();
+  hal::ReasonId validation_reason = hal::ReasonId::none;
+  ok = Expect(hal::ValidatePreparedProgram(maximum_stages, &validation_reason),
+              "maximum-stage regression must reach owner-specific semantic "
+              "validation") && ok;
+  const auto rejected_maximum =
+      owner->CommitPreparedCapability(maximum_stages, maximum_readiness);
+  ok = Expect(rejected_maximum.reason ==
+                  hal::ReasonId::semantic_effect_unsupported &&
+                  !rejected_maximum.prepared_capability_committed &&
+                  owner->prepared_capability_committed(),
+              "maximum-stage malformed semantic sequence must safely retain "
+              "prior capability") && ok;
 
   auto foreign_readiness = readiness;
   ++foreign_readiness.execution_domain.adapter_instance_id;
