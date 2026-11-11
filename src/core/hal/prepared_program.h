@@ -549,6 +549,7 @@ public:
 private:
   void DestroyActive() noexcept;
   void AccumulateExecuteTelemetry(const ExecuteResult &result) noexcept;
+  void HandleTemporalResetResult(StatusId status, ReasonId reason) noexcept;
   [[nodiscard]] bool
   MayRetainOldProgram(const PreparedProgram &candidate) const noexcept;
   void RejectOldProgramRetention(ReasonId reason) noexcept;
