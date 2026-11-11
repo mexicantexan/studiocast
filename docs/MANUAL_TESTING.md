@@ -2,7 +2,7 @@
 
 Status: manual regression plan for the refaced GUI and hardware desktop
 workflows.
-Last updated: 2026-07-03.
+Last updated: 2026-11-10.
 
 This document tracks manual tests that cannot be covered deterministically in
 CI because they require real V4L2 devices, v4l2loopback behavior, desktop
@@ -553,7 +553,7 @@ Expected:
 - Failure leaves the previous working daemon state intact or clearly reports
   what changed.
 
-## Open Vulkan Adapter Selection
+## HAL Hardware Qualification
 
 Before recording HAL parity or release qualification, capture the source
 commit, build options, exact model identities, GPU and driver, command and exit
@@ -571,17 +571,47 @@ loader enumeration is not a successful production camera run.
 - [ ] Run the final Vulkan matrix on every NVIDIA, AMD, or Intel family claimed
   by the release. Do not extrapolate one vendor's result to another.
 
-Current checkpoint evidence is partial. Quadro P1000 / driver 535.309.01 runs
-cover selected CUDA and Vulkan components, including both FP32 Eye Contact
-models with generated input and synthetic landmarks. They do not cover the
-full production route or camera/quality/latency behavior. Strict MODNet runs
-after free-dimension specialization, but the main-checkpoint production smoke
-still fails before writer commit because its capacity check multiplies the
-one-row pitched tensor allocation by model height even though the pitch already
-represents the full allocation;
-its correction is only in an unintegrated candidate. The final Vulkan matrix
-has not run, `vulkaninfo` is absent on the test host, and no AMD or Intel
-hardware has been qualified.
+- [ ] Confirm camera and smoke execution use
+  `BuildProductionVideoBackendSetupRequest` with canonical defaults; do not
+  disable the Maxine greenscreen temporal default to make CUDA smoke pass.
+- [ ] Verify exact CUDA/Vulkan resident mirror separately from the retained
+  automatic/Maxine host mirror finalizer and its committed CPU-tail record.
+- [ ] Record bounded face/matte metadata readbacks and CPU tracking/planning
+  tails for Auto Frame and Eye Contact, in addition to full-frame transfers.
+- [ ] Inject unsuccessful explicit and automatic/discontinuity temporal resets.
+  Confirm execution and publication stop, stale active attribution clears, and
+  only valid re-preparation permits recovery.
+- [ ] Validate installed model metadata against its actual graph. In particular,
+  the current YuNet template is 640x640; a stale installed 320x320 manifest needs
+  an explicitly authorized transaction repair. Validation must preserve the
+  installed pack and test candidates in isolated HOME/XDG roots.
+
+Current checkpoint evidence is partial. The vignette stage and alpha-capacity
+fix are integrated at `0adc8ac`; the former unintegrated-capacity blocker no
+longer describes the source. Preliminary 2026-11-10 Quadro P1000 / driver
+535.309.01 runs passed selected CUDA vignette, blur, mirror, and two-frame
+corrected-FastDVDnet/Auto Frame cases using generated RGB and an in-memory writer boundary.
+The actual Vulkan final resident integration executable passed on that device.
+Earlier Eye Contact component runs used generated input and synthetic landmarks.
+These results do not qualify the final integrated HEAD, real V4L2/camera output,
+Eye Contact/all combinations, quality, latency, AMD, or Intel.
+The automatic reset failure guard is integrated at `af2d1db`; final integrated
+verification remains pending.
+
+The corrected FastDVDnet candidate is distinct from the shipped default catalog
+and installed pack. Test candidate artifact identity explicitly; a successful
+candidate run cannot certify the old published artifact. Publication, catalog
+promotion, and the signed clean-HEAD release chain remain separate gates in
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+
+Opt-in CI now requires the actual Vulkan final resident integration executable
+on each selected vendor runner. CUDA requires the production smoke executable
+with `--require`, a preinstalled read-only `cuda_model_root` and
+`cuda_model_id`, failure propagation, and retained evidence logs. A portable
+skip, a configured workflow, or a kernel-only pass is not completed hardware
+qualification.
+
+## Open Vulkan Adapter Selection
 
 - [ ] On a system with multiple Vulkan devices, inspect
   `engines.open_vulkan.device_candidates` in daemon status.

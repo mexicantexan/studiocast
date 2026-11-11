@@ -1,9 +1,9 @@
 # Open Video shared inference contract
 
-- Status: Design note with an implemented cache/worker contract
+- Status: Shared-analysis design and prepared-runtime checkpoint
 - Applies To: Open Video shared analysis and latest-frame scheduling primitives
 - Audience: Video runtime and model-backend maintainers
-- Last Verified: 2026-07-23
+- Last Verified: 2026-11-10
 
 StudioCast’s open-source video effects can require **multiple ML inferences per frame**:
 
@@ -34,8 +34,11 @@ It provides:
   - `face_detections`
   - `face_landmarks`
 
-Future phases will extend this contract with additional cached artifacts (e.g. eye-crop tensors
-or denoise frame history) and wire it into the video pipeline.
+The prepared CUDA owner also composes same-frame matting, face detection,
+landmarks, and dependent effects in one owned execution domain. That bounded
+resident composition has its own prepared resources and temporal history; the
+host `FrameAnalysisCache` example alone does not describe its GPU ownership or
+prove production routing.
 
 ## Expected usage pattern
 
@@ -66,29 +69,48 @@ CPU, Maxine, or Vulkan.
 
 ## Prepared Open CUDA route
 
-The first production Open CUDA HAL route is intentionally smaller than the
-shared-inference design above. It owns one strict ONNX Runtime CUDA
-virtual-background blur or remove stage with:
+The prepared route has expanded beyond the original single explicit
+blur/remove, same-geometry slice. Background modes, key light, final geometry,
+and fixed-center vignette have production routing; prepared native mirror,
+YuNet, landmarks, Auto Frame, Eye Contact, and temporal FastDVDnet components
+are composed by the runtime candidate under verification. Strict and automatic
+selection, exact artifact/provider identity, optional failures, temporal reset,
+and supported combinations still require the family gate in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md). Component implementation
+must not be reported as completed production parity.
 
-- one setup-validated Open Video matting pack and artifact identity;
-- one owned CUDA execution domain, stream, allocator, and context generation;
-- prepared preprocessing, CUDA IoBinding inference, postprocessing, buffers,
-  scratch, and bounded completion waiting;
-- one upload, no intermediate host crossing, one final readback, one
-  synchronization, and one declared writer-copy CPU tail; and
-- active attribution only after the completed output is written successfully.
+The camera pipeline and production smoke executable use the shared
+`BuildProductionVideoBackendSetupRequest` builder in
+`src/core/video/production_video_setup_request.*`. It freezes canonical stage
+order, parameters, selection, geometry, and temporal intent during setup.
+Selected Maxine matting alone adds greenscreen temporal history; the Maxine
+knob does not make CUDA matting temporal. Denoise keeps five-frame history;
+Auto Frame and Eye Contact retain their own history/discontinuity contracts.
 
-Eligibility currently requires an explicit Open CUDA effect engine, CUDA (or
-automatic compute allowance), tight same-geometry RGB24 host transport, one
-blur/remove semantic, TensorRT disabled, and no replacement, mixed resident
-stage, shared-analysis consumer, temporal history, scaling, or output
-conversion. Model discovery, manifest parsing, hashing, provider selection,
-session construction, and resource sizing happen during setup, not per frame.
+An eligible CUDA island owns one exact CUDA domain, stream, allocator, and
+context generation. Setup validates model packs/artifact identity, prepares
+preprocessing and postprocessing kernels, IoBinding sessions, replacement
+images, buffers, scratch, and bounded completion waiting. Model discovery,
+manifest parsing, hashing, provider selection, and resource sizing stay outside
+the frame loop. Native kernels use their exact CUDA-kernel provider; inference
+uses ONNX Runtime CUDA. No strict CUDA stage silently uses a CPU provider.
 
-If prepared setup is ineligible or unavailable, the same explicit Open CUDA
-compatibility route may remain in use. Once prepared execution begins, a frame
-failure does not retry through the compatibility implementation in that frame
-and never selects a different GPU backend or CPU provider.
+Frame pixels use one upload and one final readback, followed by the declared
+writer/output tail. Analysis consumers additionally declare bounded metadata
+readbacks and CPU detection/tracking/crop-plan tails: face analysis allows at
+most twelve metadata readbacks per frame, and matte bounds at most one. These
+are measured crossings, not an unqualified zero-intermediate-readback claim.
+Exact CUDA and Vulkan mirror can stay resident; automatic selection and Maxine
+preserve the established measured host mirror finalizer.
+
+Active attribution requires a completed output and successful writer commit.
+A failed explicit or automatic temporal reset must prevent further execution
+and publication until valid preparation, and clear stale committed attribution.
+The automatic-discontinuity failure guard is integrated at `af2d1db`; final
+integrated verification remains pending at this checkpoint. A frame failure
+after prepared execution starts must not retry through a different backend or
+CPU provider in that frame. Retained
+compatibility is a bounded preservation route, not family completion evidence.
 
 ## Low-latency scheduling primitive
 
@@ -101,7 +123,7 @@ growing a queue. Each task carries the current generation; model, configuration,
 or frame-size changes can advance the generation so late results from older
 work are rejected instead of being published.
 
-This worker is not wired into the prepared Open CUDA virtual-background route.
+This worker is not wired into the synchronous prepared CUDA execution island.
 The current matting and virtual-background behavior remains synchronous and
 deterministic. The HAL completion token is evolution-shaped but already
 complete in v1; genuine asynchronous scheduling must first define bounded

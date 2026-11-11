@@ -607,26 +607,53 @@ matting stays blocked until reviewed shared-device GPU-only inference and
 converted, checksummed model artifacts satisfy the resident-runtime contract.
 
 Keep implementation, production routing, hardware qualification, and release
-publication as separate evidence. At source checkpoint `0225a358`, prepared
-denoise, Auto Frame, Eye Contact, and mirror components are present, but their
-full production routing is incomplete; the fixed-center vignette production
-stage and its alpha-capacity correction are still an unintegrated candidate.
-Strict MODNet inference succeeds after setup-time free-dimension
-specialization, so an earlier CPU graph-partition diagnosis is obsolete. The
-remaining observed production-smoke failure at this checkpoint is the
-resident alpha capacity check multiplying the one-row allocation pitch by model
-height, before a successful writer commit.
+publication as separate evidence. The fixed-center CUDA vignette stage and
+resident alpha-capacity correction are integrated at `0adc8ac`; the earlier
+unintegrated-candidate and MODNet CPU graph-partition diagnoses are obsolete.
+Prepared YuNet, landmarks, FastDVDnet, Auto Frame, Eye Contact, and mirror
+components do not by themselves prove the complete production camera route.
+The remaining production composition is under verification. The automatic
+temporal-reset failure guard is integrated at `af2d1db`; final integrated
+verification remains required. A failed temporal reset must invalidate stale
+output attribution and prevent execution/publication until a valid program is
+prepared; preserve this gate for both explicit reset and capture discontinuity.
 
-On a Quadro P1000 with NVIDIA driver 535.309.01, component evidence includes
-exact dlib landmark parity across 20 generated cases, YuNet metadata/readback
-accounting, mirror, geometry, and Eye Contact execution with both FP32 eye
-models. The Eye Contact run used generated input and synthetic landmarks;
-strength zero was an exact identity and strength 0.5 changed pixels without a
-CPU provider fallback. These results do not qualify face detection, the full
-camera route, visual quality, or latency. The curated FastDVDnet artifact still
-fails graph validation despite matching its hash and size. Do not quarantine,
-remove, replace, or change the seven-pack catalog contract without the pending
-explicit product decision.
+The shared `BuildProductionVideoBackendSetupRequest` builder in
+`src/core/video/production_video_setup_request.*` keeps camera and smoke-test
+stage order, defaults, selection, geometry, and temporal intent aligned.
+Greenscreen temporal history is refined only for selected Maxine matting;
+CUDA matting must not inherit the Maxine default. Exact CUDA/Vulkan mirror can
+be resident; automatic selection and Maxine retain the measured host mirror
+finalizer. CUDA face/Auto Frame analysis has separately bounded metadata
+readbacks and CPU tracking/planning tails, so do not claim every combination
+has zero intermediate crossings.
+
+On Quadro P1000 / NVIDIA driver 535.309.01, preliminary 2026-11-10 runs passed
+selected CUDA vignette, blur, mirror, and two-frame corrected-denoise/Auto Frame cases
+using generated RGB and an in-memory writer boundary. The real Vulkan final
+resident integration executable also passed on that device. Earlier dlib,
+YuNet, geometry, and Eye Contact component oracles remain component evidence.
+These results do not qualify a final integrated HEAD, real V4L2/camera output,
+Eye Contact and all combinations, visual quality, latency, AMD, or
+Intel. Short Debug-run timings are not latency qualification.
+
+A stale installed YuNet manifest declared 320x320 for its pinned 640x640 graph;
+the repository template already declares 640x640. Validate/reinstall metadata
+through an explicitly authorized model transaction before relying on that
+installed pack. Tests use current repository metadata in isolated HOME/XDG
+roots and must never rewrite the user's installed pack as validation.
+
+FastDVDnet repair/re-export is approved while preserving `fastdvdnet_sigma15`
+and the seven-pack/eight-artifact defaults. The reproducible self-contained
+candidate is 9,948,304 bytes, SHA-256
+`0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
+The currently shipped catalog still references the old published artifact,
+which fails graph validation despite matching its hash and size. The offline
+exporter and candidate catalog are review inputs; external publication,
+catalog promotion, required CUDA qualification, and the normal signed
+clean-HEAD release chain remain outstanding. No installed pack was replaced.
+See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for reproducibility
+and promotion requirements.
 
 The daemon persists Vulkan adapter intent as `video.vulkan.device` and
 `video.vulkan.allow_cpu` in `daemon.conf`. `auto` uses hardware-first selection
@@ -762,7 +789,15 @@ CSV output includes warmup/iteration counts, avg/p95/p99/min/max timing, status
 (`ok` or `skipped`), and skip reasons for unavailable GPU backends. Hardware
 benchmarks must stay out of default push CI. The CI workflow keeps ordinary jobs
 no-GPU-safe and exposes workflow-dispatch smoke jobs for CUDA/NVIDIA and
-Vulkan/NVIDIA, Vulkan/AMD, and Vulkan/Intel runners.
+Vulkan/NVIDIA, Vulkan/AMD, and Vulkan/Intel runners. Each Vulkan opt-in job
+builds and requires `studiocast-vulkan-final-stage-integration-tests` as well as
+the kernel tests; loader enumeration or a resize benchmark alone is
+insufficient. The CUDA opt-in requires both the runtime self-test and
+`studiocast-open-cuda-production-smoke-tests --require`, using the explicit
+`cuda_model_root` and `cuda_model_id` inputs for preinstalled read-only models.
+The smoke step propagates command failures through log capture and preserves
+source/build/GPU/output evidence artifacts. Enabling these jobs enforces a
+gate; it does not prove that any vendor matrix has run successfully.
 
 ## Packaging and systemd notes
 
