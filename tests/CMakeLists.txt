@@ -1235,6 +1235,18 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-documentation-validation-tests
                 unit core)
 
+        add_test(NAME studiocast-hardware-ci-workflow-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/gpu/hardware_ci_workflow_tests.py")
+        studiocast_set_test_labels(studiocast-hardware-ci-workflow-tests
+                unit gpu video)
+
+        add_test(NAME studiocast-fastdvdnet-export-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/installer/models/fastdvdnet_export_tests.py")
+        studiocast_set_test_labels(studiocast-fastdvdnet-export-tests
+                unit installer model)
+
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
