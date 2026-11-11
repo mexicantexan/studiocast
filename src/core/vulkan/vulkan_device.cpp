@@ -1171,10 +1171,9 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
 }
 
 void VulkanDevice::Shutdown() noexcept {
-  if (context_) {
-    std::lock_guard<std::mutex> submit_lock(context_->submission_mutex);
-    context_->MarkShutdown();
-    context_.reset();
+  if (auto context = std::move(context_)) {
+    std::lock_guard<std::mutex> submit_lock(context->submission_mutex);
+    context->MarkShutdown();
   } else {
     DestroyUnownedHandles();
   }

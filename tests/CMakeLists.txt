@@ -1776,6 +1776,21 @@ if (BUILD_TESTING)
             unit video gpu vulkan)
 
     if (STUDIOCAST_ENABLE_OPEN_VULKAN)
+        add_executable(studiocast-vulkan-device-lifetime-tests
+                ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_device_lifetime_tests.cpp)
+        target_link_libraries(studiocast-vulkan-device-lifetime-tests PRIVATE
+                studiocast_vulkan_backend)
+        target_include_directories(studiocast-vulkan-device-lifetime-tests PRIVATE
+                "${PROJECT_SOURCE_DIR}/src")
+        studiocast_set_project_warnings(studiocast-vulkan-device-lifetime-tests)
+        studiocast_enable_sanitizers(studiocast-vulkan-device-lifetime-tests)
+        set_target_properties(studiocast-vulkan-device-lifetime-tests PROPERTIES
+                AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+        add_test(NAME studiocast-vulkan-device-lifetime-tests
+                COMMAND studiocast-vulkan-device-lifetime-tests)
+        studiocast_set_test_labels(studiocast-vulkan-device-lifetime-tests
+                unit video gpu vulkan)
+
         add_executable(studiocast-vulkan-kernel-tests
                 ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_kernel_tests.cpp
         )
