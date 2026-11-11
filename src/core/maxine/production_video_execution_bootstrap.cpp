@@ -3,6 +3,7 @@
 #include "core/cuda/cuda_driver_api.h"
 #include "core/maxine/ar_api.h"
 #include "core/maxine/maxine_manager.h"
+#include "core/video/production_video_setup_request.h"
 #include "core/maxine/nvcv_api.h"
 #include "core/maxine/vfx_api.h"
 #include "core/video/image_ppm.h"
@@ -1066,7 +1067,9 @@ public:
     };
 
     try {
-      const auto &plan = request.plan;
+      auto plan = request.plan;
+      plan.temporal = video::ProductionVideoTemporalForSelectedBackend(
+          request, hal::BackendId::maxine);
       const bool strict_constraint_mismatch =
           (plan.intent.preferences.strict_effects_engine &&
            plan.intent.preferences.effects_engine ==

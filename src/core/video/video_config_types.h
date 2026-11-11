@@ -5,6 +5,13 @@
 
 namespace studiocast::video {
 
+enum class ComputeBackendPreference {
+  auto_select,
+  cpu,
+  cuda,
+  vulkan,
+};
+
 enum class CaptureMode {
   // Use the requested width and height; both must be positive.
   requested,

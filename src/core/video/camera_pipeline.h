@@ -16,6 +16,7 @@
 #include "core/video/effects/broadcast_effects.h"
 #include "core/video/effects/broadcast_effect_rules.h"
 #include "core/video/production_video_backend_manager.h"
+#include "core/video/production_video_setup_request.h"
 #include "core/video/replace_background_cache_policy.h"
 #include "core/video/v4l2_capture.h"
 #include "core/video/v4l2_writer.h"
@@ -38,25 +39,11 @@ enum class ScalingBackendPreference {
   gpu,
 };
 
-enum class ComputeBackendPreference {
-  auto_select,
-  cpu,
-  cuda,
-  vulkan,
-};
-
 enum class ComputeBackendKind {
   cpu,
   cuda,
   vulkan,
 };
-
-// Applies only backend/engine intent. An independently supplied exact provider
-// constraint remains caller-owned and is never rewritten here.
-void ApplyCameraBackendSelectionIntent(
-    effects::EffectsEnginePreference engine,
-    ComputeBackendPreference compute_backend,
-    NormalizedVideoExecutionIntent *intent) noexcept;
 
 struct ComputeBackendAvailability {
   bool cuda_available = false;

@@ -1310,6 +1310,24 @@ bool BackendSetupSourceBindsEveryCurrentSemanticExactly() {
   CHECK(automatic_result.status == hal::StatusId::ready);
   CHECK(automatic_result.canonical_effects == automatic.effects);
   CHECK(automatic_result.lease.Shutdown().status == hal::StatusId::stopped);
+  // Production requests preserve the Maxine-only default without imposing its
+  // history on CUDA. The selected Maxine source must add that history exactly.
+  for (const bool use_automatic : {false, true}) {
+    auto temporal = use_automatic ? automatic :
+        SetupSourceRequest(hal::SemanticEffectId::virtual_background_blur);
+    temporal.effects.virtual_background.greenscreen_temporal = true;
+    temporal.plan.intent.stages[0].parameters[3].boolean_value = true;
+    CHECK(!temporal.plan.temporal.temporal);
+    auto temporal_result = source->AcquireResidentSetup(temporal);
+    CHECK(temporal_result.status == hal::StatusId::ready);
+    CHECK(temporal_result.canonical_effects == temporal.effects);
+    CHECK(temporal_result.plan.temporal.temporal);
+    CHECK(temporal_result.plan.temporal.requires_contiguous_capture_sequence);
+    CHECK(temporal_result.plan.temporal.history_frames == 1);
+    CHECK(temporal_result.plan.temporal.frame_drop_behavior ==
+          hal::FrameDropBehavior::reset_temporal_state);
+    CHECK(temporal_result.lease.Shutdown().status == hal::StatusId::stopped);
+  }
   std::error_code cleanup_error;
   std::filesystem::remove(replacement, cleanup_error);
   CHECK(!cleanup_error);

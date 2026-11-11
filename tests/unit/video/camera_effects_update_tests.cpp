@@ -152,9 +152,10 @@ bool TestExplicitEffectsResourceRefreshIsSeparateInvalidation() {
               "explicit refresh did not create one generation boundary") ||
       !Expect(refreshed.resource_refreshes == 1,
               "explicit refresh counter was not recorded") ||
-      !Expect(refreshed.replacement_preparations == 0 &&
-                  before.replacement_preparations == 0,
-              "explicit refresh performed pipeline-side replacement scanning")) {
+      !Expect(
+          refreshed.replacement_preparations == 0 &&
+              before.replacement_preparations == 0,
+          "explicit refresh performed pipeline-side replacement scanning")) {
     return false;
   }
 
@@ -173,7 +174,8 @@ bool TestCameraBackendSelectionPreservesExplicitProviderIntent() {
   studiocast::video::NormalizedVideoExecutionIntent intent;
   studiocast::video::ApplyCameraBackendSelectionIntent(
       Engine::open_cuda, ComputeBackendPreference::auto_select, &intent);
-  if (!Expect(intent.backend.mode == hal::BackendRequestMode::explicit_backend &&
+  if (!Expect(intent.backend.mode ==
+                      hal::BackendRequestMode::explicit_backend &&
                   intent.backend.backend == hal::BackendId::cuda &&
                   intent.backend.strict &&
                   intent.preferences.effects_engine ==
@@ -199,6 +201,137 @@ bool TestCameraBackendSelectionPreservesExplicitProviderIntent() {
       "backend mapping erased a caller-owned exact provider constraint");
 }
 
+bool TestCanonicalProductionRequestPreservesBackendSemantics() {
+  namespace video = studiocast::video;
+  namespace hal = studiocast::hal;
+  BroadcastCameraEffects effects;
+  effects.engine = video::effects::EffectsEnginePreference::open_cuda;
+  effects.virtual_background.mode = VirtualBackgroundMode::blur;
+  const video::CpuPrimitiveTable cpu_table;
+  const auto build = [&](ComputeBackendPreference compute) {
+    return video::BuildProductionVideoBackendSetupRequest(
+        effects, compute, 64, 48, 80, 60, video::PixelFormat::rgb24, 7, 3, 11,
+        {}, cpu_table);
+  };
+  auto request = build(ComputeBackendPreference::cuda);
+  bool ok =
+      Expect(request.resident.effects.virtual_background.greenscreen_temporal &&
+                 request.resident.plan.intent.stages[0]
+                     .parameters[3]
+                     .boolean_value,
+             "default Maxine greenscreen flag was erased") &&
+      Expect(!request.resident.plan.temporal.temporal &&
+                 request.resident.plan.temporal.history_frames == 0,
+             "Maxine-only default greenscreen history blocked CUDA background");
+  const auto maxine_temporal = video::ProductionVideoTemporalForSelectedBackend(
+      request.resident, hal::BackendId::maxine);
+  ok &=
+      Expect(maxine_temporal.temporal && maxine_temporal.history_frames == 1 &&
+                 maxine_temporal.requires_contiguous_capture_sequence &&
+                 maxine_temporal.frame_drop_behavior ==
+                     hal::FrameDropBehavior::reset_temporal_state,
+             "selected Maxine lost canonical greenscreen temporal history");
+  const auto cuda_temporal = video::ProductionVideoTemporalForSelectedBackend(
+      request.resident, hal::BackendId::cuda);
+  ok &= Expect(!cuda_temporal.temporal && cuda_temporal.history_frames == 0,
+               "CUDA source inherited Maxine-only greenscreen history");
+  effects.vignette.enabled = true;
+  request = build(ComputeBackendPreference::cuda);
+  ok &= Expect(!request.resident.plan.intent.stages[1]
+                    .intent.requires_tracked_vignette_center &&
+                   request.resident.effects.vignette.center_on_tracked_face,
+               "vignette without Auto Frame must preserve its fixed-center behavior");
+  effects.auto_frame.enabled = true;
+  request = build(ComputeBackendPreference::cuda);
+  ok &= Expect(request.resident.plan.intent.stages[2]
+                   .intent.requires_tracked_vignette_center,
+               "Auto Frame tracked vignette intent was silently lowered to fixed center");
+  effects.auto_frame.enabled = false;
+  effects.mirror = true;
+  request = build(ComputeBackendPreference::cuda);
+  ok &= Expect(request.resident.effects.mirror &&
+                   request.resident.plan.intent.stage_count == 3 &&
+                   request.resident.plan.intent.stages[2].intent.semantic ==
+                       hal::SemanticEffectId::mirror,
+               "CUDA resident combination lost final mirror");
+  effects = {};
+  effects.vignette.enabled = true;
+  request = build(ComputeBackendPreference::vulkan);
+  ok &= Expect(request.resident.plan.intent.stage_count == 1 &&
+                   !request.resident.plan.intent.stages[0]
+                        .intent.requires_tracked_vignette_center &&
+                   request.resident.effects.vignette.center_on_tracked_face,
+               "default Vulkan vignette without Auto Frame was incorrectly blocked");
+  effects = {};
+  effects.mirror = true;
+  request = build(ComputeBackendPreference::auto_select);
+  ok &= Expect(request.kind ==
+                   video::ProductionVideoBackendSetupKind::cpu_primitives_only,
+               "automatic mirror-only path created a heavy execution island");
+  request = build(ComputeBackendPreference::cuda);
+  ok &= Expect(
+      request.kind == video::ProductionVideoBackendSetupKind::resident_island &&
+          request.resident.plan.intent.stage_count == 1 &&
+          request.resident.plan.intent.stages[0].intent.semantic ==
+              hal::SemanticEffectId::mirror,
+      "strict CUDA mirror-only request lost resident ownership");
+  effects.engine = video::effects::EffectsEnginePreference::open_cuda;
+  request = build(ComputeBackendPreference::cpu);
+  ok &=
+      Expect(request.kind ==
+                 video::ProductionVideoBackendSetupKind::cpu_primitives_only,
+             "explicit CPU mirror-only path created a heavy execution island");
+  effects.engine = video::effects::EffectsEnginePreference::maxine;
+  effects.virtual_background.mode = VirtualBackgroundMode::blur;
+  request = build(ComputeBackendPreference::auto_select);
+  ok &= Expect(
+      !request.resident.effects.mirror &&
+          request.resident.plan.intent.stage_count == 1,
+      "Maxine resident request lost its established host mirror finalizer");
+  effects.engine = video::effects::EffectsEnginePreference::auto_select;
+  request = build(ComputeBackendPreference::auto_select);
+  ok &= Expect(
+      !request.resident.effects.mirror &&
+          request.resident.plan.intent.stage_count == 1,
+      "automatic selection lost Maxine-compatible host mirror ownership");
+  for (int effect = 0; effect < 3; ++effect) {
+    effects = {};
+    effects.auto_frame.enabled = effect == 0;
+    effects.eye_contact.enabled = effect == 1;
+    effects.video_noise_removal.enabled = effect == 2;
+    request = build(ComputeBackendPreference::cuda);
+    ok &= Expect(request.resident.plan.temporal.temporal &&
+                     request.resident.plan.temporal
+                         .requires_contiguous_capture_sequence &&
+                     request.resident.plan.temporal.history_frames ==
+                         (effect == 2 ? 5u : 1u),
+                 "meaningful CUDA effect history was lost");
+  }
+
+  return ok;
+}
+
+bool TestCudaNativeMirrorDoesNotInventProviderRequest() {
+  namespace video = studiocast::video;
+  namespace hal = studiocast::hal;
+  BroadcastCameraEffects effects;
+  effects.mirror = true;
+  video::CameraPipelineHalStatusProjectionInput projection;
+  projection.effects = &effects;
+  projection.compute_backend = ComputeBackendPreference::cuda;
+  projection.lifecycle = video::VideoRuntimeLifecycle::starting;
+  projection.status_generation = 1;
+  projection.configuration_generation = 1;
+  projection.geometry_generation = 1;
+  video::MultiIslandVideoRuntimeStatusSnapshot snapshot;
+  const auto projected =
+      video::BuildCameraPipelineHalStatusSnapshot(projection, &snapshot);
+  return Expect(projected.code == video::MultiIslandStatusValidationCode::valid &&
+                   snapshot.effects[8].requested_provider ==
+                       hal::SemanticEffectProviderId::invalid,
+               "strict CUDA native mirror fabricated an ONNX provider request");
+}
+
 } // namespace
 
 namespace studiocast::tests {
@@ -209,7 +342,9 @@ bool TestCameraPipelineIdenticalEffectsPreserveRuntimeGeneration() {
 
 bool TestCameraPipelineExplicitEffectsRefreshIsSeparateInvalidation() {
   return TestExplicitEffectsResourceRefreshIsSeparateInvalidation() &&
-         TestCameraBackendSelectionPreservesExplicitProviderIntent();
+         TestCameraBackendSelectionPreservesExplicitProviderIntent() &&
+         TestCanonicalProductionRequestPreservesBackendSemantics() &&
+         TestCudaNativeMirrorDoesNotInventProviderRequest();
 }
 
 } // namespace studiocast::tests
