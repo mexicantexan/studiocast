@@ -1,4 +1,5 @@
 #include "core/hal/prepared_program.h"
+#include "core/hal/domain_planner.h"
 
 #include <algorithm>
 #include <limits>
@@ -325,6 +326,9 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
   if (program.program_id == 0 || program.owner_adapter_instance_id == 0 ||
       program.stage_count == 0 || program.stage_count > program.stages.size() ||
       program.cpu_tail_count > program.cpu_tails.size() ||
+      program.maximum_metadata_readbacks_per_frame > kMaxExecutionBoundaries ||
+      program.maximum_metadata_cpu_tails_per_frame >
+          kMaxCpuTails - program.cpu_tail_count ||
       (program.setup_failure_policy != SetupFailurePolicy::retain_old_program &&
        program.setup_failure_policy != SetupFailurePolicy::stop_pipeline) ||
       (program.temporal.frame_drop_behavior !=
@@ -338,6 +342,15 @@ bool ValidatePreparedProgram(const PreparedProgram &program,
        program.temporal.discontinuity_action !=
            TemporalDiscontinuityAction::fail_frame) ||
       !ValidateExecutionDomain(program.execution_domain)) {
+    SetReason(reason, ReasonId::malformed_contract);
+    return false;
+  }
+  if ((program.maximum_metadata_readbacks_per_frame != 0 ||
+       program.maximum_metadata_cpu_tails_per_frame != 0) &&
+      (!program.requires_upload || !program.requires_final_readback ||
+       (program.execution_domain.api_family != ApiFamily::cuda_driver &&
+        program.execution_domain.api_family != ApiFamily::maxine_nvcv &&
+        program.execution_domain.api_family != ApiFamily::vulkan))) {
     SetReason(reason, ReasonId::malformed_contract);
     return false;
   }
@@ -933,12 +946,15 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
         FailedExecute(StatusId::failed, ReasonId::host_frame_binding_invalid));
   }
 
-  if (result.transfers.intermediate_readbacks != 0 ||
+  if (result.transfers.intermediate_readbacks >
+          program_.maximum_metadata_readbacks_per_frame ||
       result.transfers.intermediate_uploads != 0 ||
       result.transfers.uploads != (program_.requires_upload ? 1u : 0u) ||
       result.transfers.final_readbacks !=
           (program_.requires_final_readback ? 1u : 0u) ||
-      result.transfers.cpu_tail_boundaries != program_.cpu_tail_count) {
+      (result.transfers.cpu_tail_boundaries < program_.cpu_tail_count ||
+       result.transfers.cpu_tail_boundaries > program_.cpu_tail_count +
+           program_.maximum_metadata_cpu_tails_per_frame)) {
     return fail_after_adapter(
         FailedExecute(StatusId::failed, ReasonId::transfer_contract_violated));
   }
@@ -1150,8 +1166,11 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
 
 bool PreparedProgramSession::MayRetainOldProgram(
     const PreparedProgram &candidate) const noexcept {
-  if (!prepared_ || candidate.setup_failure_policy !=
-                        SetupFailurePolicy::retain_old_program) {
+  if (!prepared_ || candidate.maximum_metadata_readbacks_per_frame !=
+                        program_.maximum_metadata_readbacks_per_frame ||
+      candidate.maximum_metadata_cpu_tails_per_frame !=
+          program_.maximum_metadata_cpu_tails_per_frame ||
+      candidate.setup_failure_policy != SetupFailurePolicy::retain_old_program) {
     return false;
   }
   if (candidate.strict_backend_selection &&
