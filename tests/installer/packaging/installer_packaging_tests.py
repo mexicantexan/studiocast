@@ -34,17 +34,17 @@ MODEL_PACK_SIZE_ROWS = [
     ("yunet_opencv_zoo_2023mar_fp32", 1, 232589),
     ("dlib_68_ibug_300w", 1, 99693937),
     ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
-    ("fastdvdnet_sigma15", 1, 416788),
+    ("fastdvdnet_sigma15", 1, 9948304),
 ]
 
 
 def catalog_size_summary() -> dict:
     return {
-        "schema_version": 1, "catalog_version": "2026-07-19",
-        "catalog_sha256": "sha256:d2b23cab9ddad91adfe5cac4b2ad4433fa624714d40cb0d7ebdb8deebe93414d",
+        "schema_version": 1, "catalog_version": "2026-11-11",
+        "catalog_sha256": "sha256:ac7c199bfac83859dd192174bb43e6a5c251647ab8936cebc9639408d4bc3f7e",
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
-        "pack_count": 7, "artifact_count": 8, "download_bytes": 131224287,
+        "pack_count": 7, "artifact_count": 8, "download_bytes": 140755803,
         "packs": [
             {"id": pack_id, "artifact_count": artifact_count,
              "download_bytes": download_bytes, "size_status": "known"}
@@ -391,10 +391,10 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(model_downloads), 8)
         self.assertEqual([item["size"] for item in model_downloads],
                          [832775, 2033628, 25888640, 232589, 99693937,
-                          1062936, 1062994, 416788])
+                          1062936, 1062994, 9948304])
         self.assertNotIn("artifact_sizes_untrusted",
                          {item["code"] for item in plan["blockers"]})
-        expected_downloads = receipt["archive_size"] + 131224287
+        expected_downloads = receipt["archive_size"] + 140755803
         self.assertEqual(plan["disk"]["download_bytes"], expected_downloads)
         self.assertEqual(plan["disk"]["required_bytes"], expected_downloads + 3)
 

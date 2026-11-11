@@ -138,7 +138,7 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
   for (const QString &pack : DefaultPacks())
     packs.append(pack);
   const QList<qint64> sizes = {832775, 2033628, 25888640, 232589,
-                               99693937, 1062936, 1062994, 416788};
+                               99693937, 1062936, 1062994, 9948304};
   const QStringList artifacts = {
       QStringLiteral("fastenhancer_s_vd_v1:model.onnx"),
       QStringLiteral("fastenhancer_m_vd_v1:model.onnx"),
@@ -156,7 +156,7 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
         {QStringLiteral("pack_id"), artifactId.section(QLatin1Char(':'), 0, 0)},
         {QStringLiteral("size"), sizes.at(index)}});
   }
-  const qint64 modelBytes = 131224287;
+  const qint64 modelBytes = 140755803;
   return {{QStringLiteral("schema_version"), 1},
           {QStringLiteral("plan_version"), QStringLiteral("installer-plan/v1")},
           {QStringLiteral("policy_version"),
@@ -793,11 +793,11 @@ bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
   ok = Expect(reviewText && reviewText->toPlainText().contains(
                                   QStringLiteral("Models/downloads (7 pack IDs)")) &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("8 verified artifact files, 131224287 model bytes")) &&
+                      QStringLiteral("8 verified artifact files, 140755803 model bytes")) &&
                   reviewText->toPlainText().contains(
                       QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_face_landmarks.dat: 99693937 bytes")) &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("disk required/free: 131224290/20000000000 bytes")),
+                      QStringLiteral("disk required/free: 140755806/20000000000 bytes")),
               "review should derive exact pack, artifact, size, and disk totals from the plan") && ok;
 
   auto *progress = dynamic_cast<studiocast::installer::ProgressPage *>(
