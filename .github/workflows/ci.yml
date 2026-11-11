@@ -24,6 +24,26 @@ on:
         required: false
         type: string
         default: 'modnet-webnn-256-fp32'
+      cuda_face_model_id:
+        description: "Preinstalled face detector ID for Auto Frame and Eye Contact; metadata must match the graph."
+        required: false
+        type: string
+        default: 'yunet_opencv_zoo_2023mar_fp32'
+      cuda_eye_model_id:
+        description: "Preinstalled Eye Contact ID; its declared dlib landmark dependency must also be installed."
+        required: false
+        type: string
+        default: 'gaze_correction_cam_flx_v0_1_1'
+      cuda_denoise_model_id:
+        description: "Preinstalled graph-validated FastDVDnet ID. The shipped old artifact is not qualification evidence."
+        required: false
+        type: string
+        default: 'fastdvdnet_sigma15'
+      cuda_replace_path:
+        description: "Preinstalled readable replacement image for CUDA background-replace smoke. No image or model downloads."
+        required: false
+        type: string
+        default: ''
       require_vulkan_nvidia_runtime:
         description: "Run opt-in Vulkan runtime smoke tests on an NVIDIA Vulkan runner."
         required: false
@@ -317,10 +337,15 @@ jobs:
 
       - name: Configure (Open CUDA runtime validation)
         run: |
+          set -euo pipefail
+          mkdir -p build/qualification
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            2>&1 | tee build/qualification/configure.log
+          grep -F 'dlib found; Open Video Eye Contact (dlib landmarks) enabled.' \
+            build/qualification/configure.log
 
       - name: Build probe and production smoke
         run: |
@@ -340,23 +365,52 @@ jobs:
         env:
           CUDA_MODEL_ROOT: ${{ inputs.cuda_model_root }}
           CUDA_MODEL_ID: ${{ inputs.cuda_model_id }}
+          CUDA_FACE_MODEL_ID: ${{ inputs.cuda_face_model_id }}
+          CUDA_EYE_MODEL_ID: ${{ inputs.cuda_eye_model_id }}
+          CUDA_DENOISE_MODEL_ID: ${{ inputs.cuda_denoise_model_id }}
+          CUDA_REPLACE_PATH: ${{ inputs.cuda_replace_path }}
         run: |
           set -euo pipefail
           : "${CUDA_MODEL_ROOT:?Set cuda_model_root to a preinstalled read-only model root}"
           : "${CUDA_MODEL_ID:?Set cuda_model_id to a preinstalled matting model}"
+          : "${CUDA_FACE_MODEL_ID:?Set cuda_face_model_id to a preinstalled face detector}"
+          : "${CUDA_EYE_MODEL_ID:?Set cuda_eye_model_id to a preinstalled eye model with its landmark dependency}"
+          : "${CUDA_DENOISE_MODEL_ID:?Set cuda_denoise_model_id to a preinstalled graph-validated denoiser}"
+          : "${CUDA_REPLACE_PATH:?Set cuda_replace_path to a preinstalled readable image}"
           test -d "${CUDA_MODEL_ROOT}"
+          test -f "${CUDA_REPLACE_PATH}"
+          test -r "${CUDA_REPLACE_PATH}"
           mkdir -p build/qualification
           git rev-parse HEAD | tee build/qualification/source.txt
           grep -E '^CMAKE_BUILD_TYPE:STRING=|^STUDIOCAST_ENABLE_(OPEN_CUDA|OPEN_VULKAN|OPEN_AUDIO|DLIB):BOOL=' \
             build/CMakeCache.txt | tee build/qualification/build-options.txt
           nvidia-smi --query-gpu=name,driver_version,uuid --format=csv \
             | tee build/qualification/gpu.csv
-          for effects in blur keylight blur+keylight vignette blur+vignette keylight+vignette blur+keylight+vignette; do
-            ./build/studiocast-open-cuda-production-smoke-tests \
-              --require --cuda --model-root "${CUDA_MODEL_ROOT}" \
-              --model-id "${CUDA_MODEL_ID}" --effects "${effects}" \
-              --input 64x48 --output 32x24 --frames 3 \
-              2>&1 | tee "build/qualification/cuda-${effects}.log"
+          # Preserve the original topologies, then cover each new effect and
+          # tracked vignette with its required Auto Frame dependency.
+          effects_cases=(blur keylight blur+keylight vignette blur+vignette
+            keylight+vignette blur+keylight+vignette denoise auto_frame
+            eye_contact mirror remove replace auto_frame+tracked_vignette)
+          full_composition=denoise+auto_frame+eye_contact+blur+keylight+tracked_vignette+mirror
+          automatic_resident_composition=denoise+auto_frame+eye_contact+blur+keylight+tracked_vignette
+          for selection in cuda auto; do
+            cases=("${automatic_resident_composition}")
+            if [[ "${selection}" == cuda ]]; then
+              cases=("${effects_cases[@]}" "${full_composition}")
+            fi
+            # Auto verifies CUDA selection/resident stages; camera's retained
+            # automatic host mirror finalizer still needs camera-level evidence.
+            for effects in "${cases[@]}"; do
+              ./build/studiocast-open-cuda-production-smoke-tests \
+                --require "--${selection}" --model-root "${CUDA_MODEL_ROOT}" \
+                --model-id "${CUDA_MODEL_ID}" \
+                --face-model-id "${CUDA_FACE_MODEL_ID}" \
+                --eye-model-id "${CUDA_EYE_MODEL_ID}" \
+                --denoise-model-id "${CUDA_DENOISE_MODEL_ID}" \
+                --replace-path "${CUDA_REPLACE_PATH}" --effects "${effects}" \
+                --input 64x48 --output 32x24 --frames 3 \
+                2>&1 | tee "build/qualification/${selection}-${effects}.log"
+            done
           done
 
       - name: Preserve CUDA qualification evidence
