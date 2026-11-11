@@ -11,7 +11,11 @@ set_target_properties(studiocast-probe PROPERTIES
         AUTORCC OFF
 )
 
-target_link_libraries(studiocast-probe PRIVATE studiocast_runtime_config)
+# The diagnostic tool consumes backend APIs and their feature contracts directly.
+target_link_libraries(studiocast-probe PRIVATE
+        studiocast_runtime_config
+        studiocast_open_video_backend
+        studiocast_vulkan_backend)
 
 target_include_directories(studiocast-probe PRIVATE
         "${PROJECT_SOURCE_DIR}/src"
