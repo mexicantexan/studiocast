@@ -1,4 +1,5 @@
 #include "core/hal/prepared_program.h"
+#include "core/hal/domain_planner.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -208,6 +209,9 @@ public:
   bool provide_evidence = false;
   bool invalid_evidence = false;
   FakeExecuteMode execute_mode = FakeExecuteMode::success;
+  std::uint64_t metadata_readbacks = 0;
+  std::uint64_t metadata_tails = 0;
+  std::uint64_t extra_uploads = 0;
   std::uint64_t next_token = 1;
   std::uint64_t prepare_calls = 0;
   std::uint64_t execute_calls = 0;
@@ -295,6 +299,9 @@ public:
         prepared_program.requires_final_readback ? 1 : 0;
     result.transfers.cpu_tail_boundaries = prepared_program.cpu_tail_count;
     result.transfers.synchronizations = 1;
+    result.transfers.intermediate_readbacks = metadata_readbacks;
+    result.transfers.intermediate_uploads = extra_uploads;
+    result.transfers.cpu_tail_boundaries += metadata_tails;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
       result.stages[index].stage_id = prepared_program.stages[index].stage_id;
       result.stages[index].semantic = prepared_program.stages[index].semantic;
@@ -1020,6 +1027,51 @@ bool TestCircuitBreakerActionsAndRetryTransitions() {
   return ok;
 }
 
+bool TestDeclaredMetadataTransferBounds() {
+  bool ok = true;
+  for (int mode = 0; mode < 5; ++mode) {
+    FakeAdapter adapter;
+    auto program = Program(198, 77, 1);
+    program.maximum_metadata_readbacks_per_frame = mode == 0 ? 0 : 12;
+    program.maximum_metadata_cpu_tails_per_frame = mode == 0 ? 0 : 2;
+    adapter.metadata_readbacks = mode == 2 ? 13 : 12;
+    adapter.metadata_tails = mode == 3 ? 3 : 2;
+    adapter.extra_uploads = mode == 4 ? 1 : 0;
+    PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    const auto frame = session.Execute(Request(program, 1));
+    const bool allowed = mode == 1;
+    ok &= Require(allowed ? frame.status == StatusId::executed
+                          : frame.reason == ReasonId::transfer_contract_violated,
+                  "only explicitly bounded metadata may cross the resident boundary");
+    ok &= Require(!session.latest_committed_frame().valid,
+                  "metadata work must not create active attribution before commit");
+    if (allowed) {
+      ReasonId reason = ReasonId::none;
+      ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
+                    "bounded metadata output must remain committable");
+    }
+  }
+  auto malformed = Program(198, 77, 1);
+  malformed.maximum_metadata_readbacks_per_frame = kMaxExecutionBoundaries + 1;
+  ReasonId reason = ReasonId::none;
+  ok &= Require(!ValidatePreparedProgram(malformed, &reason),
+                "metadata declarations must remain bounded");
+  malformed.maximum_metadata_readbacks_per_frame = 12;
+  malformed.requires_upload = false;
+  ok &= Require(!ValidatePreparedProgram(malformed, &reason),
+                "metadata allowance requires an uploaded resident GPU frame");
+  malformed.requires_upload = true;
+  malformed.requires_final_readback = false;
+  ok &= Require(!ValidatePreparedProgram(malformed, &reason),
+                "metadata allowance requires final host output");
+  malformed.requires_final_readback = true;
+  malformed.maximum_metadata_cpu_tails_per_frame = kMaxCpuTails + 1;
+  ok &= Require(!ValidatePreparedProgram(malformed, &reason),
+                "metadata and declared tails must fit total tail capacity");
+  return ok;
+}
+
 bool TestExplicitTemporalResetGuardsAndForwarding() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -1268,6 +1320,7 @@ int main() {
   ok &= TestExplicitFallbackReadinessAndCommittedAttribution();
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestCircuitBreakerActionsAndRetryTransitions();
+  ok &= TestDeclaredMetadataTransferBounds();
   ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();

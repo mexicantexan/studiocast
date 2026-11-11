@@ -238,6 +238,10 @@ struct PreparedProgram {
   bool strict_execution_domain = false;
   bool requires_upload = true;
   bool requires_final_readback = true;
+  // Setup-proven bounded metadata only. These allowances never permit host
+  // image/model tensors or intermediate frame uploads.
+  std::uint32_t maximum_metadata_readbacks_per_frame = 0;
+  std::uint32_t maximum_metadata_cpu_tails_per_frame = 0;
 };
 
 struct CapabilityEvidenceRecord {
