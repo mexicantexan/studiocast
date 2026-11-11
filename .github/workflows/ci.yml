@@ -341,6 +341,7 @@ jobs:
           CUDA_MODEL_ROOT: ${{ inputs.cuda_model_root }}
           CUDA_MODEL_ID: ${{ inputs.cuda_model_id }}
         run: |
+          set -euo pipefail
           : "${CUDA_MODEL_ROOT:?Set cuda_model_root to a preinstalled read-only model root}"
           : "${CUDA_MODEL_ID:?Set cuda_model_id to a preinstalled matting model}"
           test -d "${CUDA_MODEL_ROOT}"

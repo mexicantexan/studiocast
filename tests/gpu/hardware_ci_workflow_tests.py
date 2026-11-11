@@ -102,7 +102,7 @@ class HardwareWorkflowTests(unittest.TestCase):
                        INVOCATIONS=str(calls))
             for code in (0, 1, 77):
                 calls.unlink(missing_ok=True)
-                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                result = subprocess.run(["bash", "-e", "-c", script],
                                         cwd=root, env=dict(env, FAKE_EXIT=str(code)),
                                         capture_output=True, text=True)
                 self.assertEqual(code, result.returncode, result.stderr)
@@ -116,7 +116,7 @@ class HardwareWorkflowTests(unittest.TestCase):
                 self.assertEqual(expected, arguments)
                 self.assertFalse((root / "escaped").exists())
             calls.unlink()
-            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+            result = subprocess.run(["bash", "-e", "-c", script], cwd=root,
                                     env=dict(env, CUDA_MODEL_ROOT="", FAKE_EXIT="0"),
                                     capture_output=True, text=True)
             self.assertNotEqual(0, result.returncode)
