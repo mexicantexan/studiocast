@@ -122,6 +122,11 @@ bool ParseOptions(int argc, char **argv, Options *options, std::string *error) {
     *error = "replace requires --replace-path";
     return false;
   }
+  if (options->effects.find("tracked_vignette") != std::string::npos &&
+      options->effects.find("auto_frame") == std::string::npos) {
+    *error = "tracked_vignette requires auto_frame";
+    return false;
+  }
   if (options->input_width == 0 || options->input_height == 0 ||
       options->output_width == 0 || options->output_height == 0 ||
       options->input_width > 4096 || options->input_height > 4096 ||
@@ -205,9 +210,9 @@ ReferenceResizeVignette(const std::vector<std::byte> &input,
 
 video::ProductionVideoBackendSetupRequest BuildRequest(const Options &options) {
   video::ProductionVideoBoundedWaitPolicy wait;
-  wait.timeout_nanoseconds = UINT64_C(5000000000);
+  wait.timeout_nanoseconds = UINT64_C(100000000);
   wait.poll_interval_nanoseconds = UINT64_C(1000000);
-  wait.maximum_poll_count = 5000;
+  wait.maximum_poll_count = 100;
   wait.stop_requested = &StopNever;
   wait.cancel_requested = &StopNever;
   wait.now_nanoseconds = &Now;
