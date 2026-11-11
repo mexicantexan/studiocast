@@ -173,6 +173,15 @@ struct PreparedOpenCudaRuntimeHandle {
   std::array<std::uint64_t, 2> opaque{};
 };
 
+// Setup-selected model dependencies. Each artifact stays bound to its exact
+// pack; no frame-time discovery or substitution is permitted.
+struct PreparedOpenCudaModelDependencies {
+  open_video::ModelPack face{}, landmarks{}, eye{}, denoise{};
+  open_video::ValidatedModelArtifactIdentity face_artifact{},
+      landmarks_artifact{}, eye_left_artifact{}, eye_right_artifact{},
+      denoise_artifact{};
+};
+
 struct PreparedOpenCudaProductionConfig {
   cuda::CudaDriverApi *driver = nullptr;
   cuda::CUstream prepared_stream = nullptr;
@@ -194,6 +203,14 @@ struct PreparedOpenCudaProductionConfig {
   int key_light_temperature_preset = 0;
   int key_light_direction_pan_degrees = 0;
   int vignette_intensity = 35;
+  bool vignette_tracked_center = false;
+  PreparedOpenCudaModelDependencies dependencies{};
+  int denoise_strength = 50;
+  int auto_frame_strength = 50;
+  int auto_frame_smoothing = 50;
+  float auto_frame_headroom = .15F;
+  int eye_contact_strength = 50;
+  bool eye_contact_look_away = false;
   cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
 };
 
@@ -344,6 +361,14 @@ public:
     int key_light_temperature_preset = 0;
     int key_light_direction_pan_degrees = 0;
     int vignette_intensity = 35;
+  bool vignette_tracked_center = false;
+  PreparedOpenCudaModelDependencies dependencies{};
+  int denoise_strength = 50;
+  int auto_frame_strength = 50;
+  int auto_frame_smoothing = 50;
+  float auto_frame_headroom = .15F;
+  int eye_contact_strength = 50;
+  bool eye_contact_look_away = false;
     cuda::CudaPreparedTransferCompletion::WaitPolicy wait_policy{};
     // Null selects the production CUDA/ORT implementation.
     IPreparedOpenCudaRuntime *runtime = nullptr;

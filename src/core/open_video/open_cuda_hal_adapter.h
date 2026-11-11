@@ -16,6 +16,11 @@ enum class OpenCudaSetupComponentId : std::uint8_t {
   aggregate_island,
   shared_matting,
   native_vignette,
+  native_mirror,
+  shared_face_analysis,
+  auto_frame,
+  eye_contact,
+  denoise,
 };
 
 // Cached setup evidence consumed by the HAL registry. None of these fields may
@@ -46,6 +51,11 @@ struct ResidentCapabilityFacts {
   bool virtual_background_replace = false;
   bool virtual_key_light = false;
   bool vignette = false;
+  bool mirror = false;
+  bool auto_frame = false;
+  bool eye_contact = false;
+  bool video_noise_removal = false;
+  bool native_mirror_kernel_prepared = false;
 };
 
 struct ResidentSemanticCapability {
