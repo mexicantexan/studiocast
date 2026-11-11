@@ -343,8 +343,9 @@ public:
   StatusId ResetTemporalState(const PreparedProgramHandle &,
                               ReasonId) noexcept override {
     ++reset_calls;
-    return StatusId::ready;
+    return reset_status;
   }
+  StatusId reset_status = StatusId::ready;
   StatusId BindHostFrame(const PreparedProgramHandle &,
                          const HostFrameBinding &binding,
                          HostFrameTokens *tokens,
@@ -1019,6 +1020,44 @@ bool TestCircuitBreakerActionsAndRetryTransitions() {
   return ok;
 }
 
+bool TestExplicitTemporalResetGuardsAndForwarding() {
+  FakeAdapter adapter;
+  PreparedProgramSession session;
+  const auto program = Program(199, 77, 1);
+  bool ok = Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                        StatusId::stale,
+                    "unprepared reset must reject stale state");
+  ok &= Configure(&session, &adapter, program);
+  auto frame = session.Execute(Request(program, 1));
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                        StatusId::failed && adapter.reset_calls == 0,
+                    "reset cannot discard uncommitted output");
+  ReasonId reason = ReasonId::none;
+  ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
+                "initial commit failed");
+  const auto committed = session.latest_committed_frame();
+  adapter.reset_status = StatusId::blocked;
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                        StatusId::blocked && session.telemetry().temporal_resets == 0,
+                    "reset must return exact adapter failure");
+  adapter.reset_status = StatusId::ready;
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                        StatusId::ready && session.telemetry().temporal_resets == 1 &&
+                        session.latest_committed_frame().valid == committed.valid,
+                    "successful reset must forward and preserve writer attribution");
+  ok &= Require(session.Execute(Request(program, 1)).reason == ReasonId::frame_order_violated,
+                "explicit reset must preserve monotonic capture order");
+  session.Invalidate(ReasonId::device_lost);
+  const auto resets = adapter.reset_calls;
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                        StatusId::quarantined && adapter.reset_calls == resets,
+                    "quarantined reset must never reach adapter");
+  session.Shutdown();
+  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) == StatusId::stopped,
+                "stopped reset must remain stopped");
+  return ok;
+}
+
 bool TestRollbackReconfigurationTemporalAndShutdown() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -1229,6 +1268,7 @@ int main() {
   ok &= TestExplicitFallbackReadinessAndCommittedAttribution();
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestCircuitBreakerActionsAndRetryTransitions();
+  ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();
   ok &= TestStrictSafeOldPlanRetention();
