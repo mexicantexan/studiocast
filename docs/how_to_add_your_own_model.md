@@ -70,8 +70,9 @@ Similarly, `video_denoise/` includes FastDVDnet sigma preset packs:
 The curated installer default is exactly `fastdvdnet_sigma15`; sigma25/sigma50
 are noncatalog BYO templates, not default or published curated artifacts. Their
 existing metadata/artifact hashes remain untouched by the sigma15 repair.
-The active sigma15 catalog still points to the known invalid published graph;
-the corrected candidate's authorized publication is authentication-blocked. See
+Catalog `2026-11-11` promotes the corrected, reproducible sigma15 artifact
+published at immutable Hugging Face commit `8ffe9688`. This metadata update
+does not replace installed packs or complete a signed application release. See
 [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
 
 And `eye_contact/` includes gaze-correction-cam packs in Good/Better/Best variants:

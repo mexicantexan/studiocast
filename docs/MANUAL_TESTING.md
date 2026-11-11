@@ -606,12 +606,15 @@ bounded execution, not camera transport, gaze correction, visual quality,
 optimized latency, other vendor families, or release readiness. Automatic host
 mirror needs separate camera-level evidence.
 
-The corrected FastDVDnet candidate remains distinct from the shipped default
-catalog and installed pack. Publication/local catalog update are authorized but
-authentication-blocked; the staged proposal is unaccepted. A successful isolated
-candidate run cannot certify the old published artifact or authorize overwriting
-an unmarked installed pack. A native sanitizer helper no longer reports the
-Vulkan use-after-free, but unresolved LeakSanitizer/symbolizer diagnostics
+The corrected FastDVDnet artifact, metadata, and full license are published
+and byte-verified at immutable Hugging Face commit `8ffe9688`; local catalog
+`2026-11-11` promotes that same sigma15 hash. Publication and catalog promotion
+do not replace an installed pack or constitute a signed application release.
+Verify model identity explicitly. Old unmarked metadata must remain preserved
+with `curated_ownership_unverified`, and sigma25/sigma50 BYO templates remain
+untouched.
+
+A native sanitizer helper no longer reports the Vulkan use-after-free, but unresolved LeakSanitizer/symbolizer diagnostics
 prevent a clean full-native-sanitizer claim; see the durable ledger.
 
 Opt-in CI now requires the actual Vulkan final resident integration executable
