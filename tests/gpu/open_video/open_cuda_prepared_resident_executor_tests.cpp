@@ -250,6 +250,414 @@ hal::HostFrameBinding HostBinding(const hal::PreparedProgram &program,
   return binding;
 }
 
+// Exercise the production runtime and real transfer state machine without a
+// GPU. Kernel bodies are not emulated; calls, timing and completion are
+// observable.
+namespace native_driver {
+struct State {
+  cuda::CUcontext current = nullptr;
+  std::array<std::array<std::byte, 4096>, 4> device{};
+  std::array<std::array<std::byte, 4096>, 2> pinned{};
+  std::uint32_t allocations = 0, pinned_allocations = 0, frees = 0;
+  std::uint32_t events = 0, records = 0, queries = 0;
+  std::uint32_t vignette_launches = 0, mirror_launches = 0;
+  bool fail_vignette = false;
+};
+State *state = nullptr;
+cuda::CUresult Init(unsigned int) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Module(cuda::CUmodule *out, const void *) {
+  *out = reinterpret_cast<cuda::CUmodule>(0x100);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Unload(cuda::CUmodule) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Function(cuda::CUfunction *out, cuda::CUmodule,
+                        const char *name) {
+  if (std::string_view(name) != "vignette_u8x3" &&
+      std::string_view(name) != "mirror_horizontal_u8x3")
+    return cuda::CUDA_ERROR_UNKNOWN;
+  *out = reinterpret_cast<cuda::CUfunction>(
+      std::string_view(name) == "vignette_u8x3" ? 1 : 2);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Launch(cuda::CUfunction function, unsigned int, unsigned int,
+                      unsigned int, unsigned int, unsigned int, unsigned int,
+                      unsigned int, cuda::CUstream, void **, void **) {
+  if (reinterpret_cast<std::uintptr_t>(function) == 1) {
+    ++state->vignette_launches;
+    if (state->fail_vignette)
+      return cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  } else {
+    ++state->mirror_launches;
+  }
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Alloc(cuda::CUdeviceptr *out, std::size_t *pitch,
+                     std::size_t width, std::size_t height, unsigned int) {
+  if (state->allocations >= state->device.size() || width * height > 4096)
+    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  *out = reinterpret_cast<std::uintptr_t>(
+      state->device[state->allocations++].data());
+  *pitch = width;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Free(cuda::CUdeviceptr) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Copy(const cuda::CUDA_MEMCPY2D *copy, cuda::CUstream) {
+  const auto *src = copy->srcMemoryType == cuda::CU_MEMORYTYPE_HOST
+                        ? static_cast<const std::byte *>(copy->srcHost)
+                        : reinterpret_cast<const std::byte *>(copy->srcDevice);
+  auto *dst = copy->dstMemoryType == cuda::CU_MEMORYTYPE_HOST
+                  ? static_cast<std::byte *>(copy->dstHost)
+                  : reinterpret_cast<std::byte *>(copy->dstDevice);
+  for (std::size_t row = 0; row < copy->Height; ++row)
+    std::memcpy(dst + row * copy->dstPitch, src + row * copy->srcPitch,
+                copy->WidthInBytes);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Memset(cuda::CUdeviceptr, unsigned char, std::size_t,
+                      cuda::CUstream) {
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult StreamCreate(cuda::CUstream *out, unsigned int) {
+  *out = reinterpret_cast<cuda::CUstream>(0xCAFE);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Stream(cuda::CUstream) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Count(int *out) {
+  *out = 1;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Device(cuda::CUdevice *out, int ordinal) {
+  *out = ordinal;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Uuid(cuda::CUuuid *out, cuda::CUdevice) {
+  std::memset(out->bytes, 0, sizeof(out->bytes));
+  out->bytes[0] = 0x42;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Pci(char *out, int length, cuda::CUdevice) {
+  constexpr char pci[] = "0000:01:00.0";
+  if (length < static_cast<int>(sizeof(pci)))
+    return cuda::CUDA_ERROR_UNKNOWN;
+  std::memcpy(out, pci, sizeof(pci));
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Retain(cuda::CUcontext *out, cuda::CUdevice) {
+  *out = reinterpret_cast<cuda::CUcontext>(0x200);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Release(cuda::CUdevice) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Set(cuda::CUcontext context) {
+  state->current = context;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Get(cuda::CUcontext *out) {
+  *out = state->current;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult ContextDevice(cuda::CUdevice *out) {
+  *out = 0;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Pinned(void **out, std::size_t size, unsigned int) {
+  if (state->pinned_allocations >= state->pinned.size() || size > 4096)
+    return cuda::CUDA_ERROR_OUT_OF_MEMORY;
+  *out = state->pinned[state->pinned_allocations++].data();
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult FreePinned(void *) {
+  ++state->frees;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Event(cuda::CUevent *out, unsigned int) {
+  *out = reinterpret_cast<cuda::CUevent>(0x300 + ++state->events);
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult DestroyEvent(cuda::CUevent) { return cuda::CUDA_SUCCESS; }
+cuda::CUresult Record(cuda::CUevent, cuda::CUstream) {
+  ++state->records;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Query(cuda::CUevent) {
+  ++state->queries;
+  return cuda::CUDA_SUCCESS;
+}
+cuda::CUresult Elapsed(float *out, cuda::CUevent, cuda::CUevent) {
+  *out = 1.25F;
+  return cuda::CUDA_SUCCESS;
+}
+
+bool Initialize(cuda::CudaDriverApi *driver, State *fake) {
+  state = fake;
+  cuda::CudaDriverApi::Functions f{};
+  f.cuInit = Init;
+  f.cuModuleLoadData = Module;
+  f.cuModuleUnload = Unload;
+  f.cuModuleGetFunction = Function;
+  f.cuLaunchKernel = Launch;
+  f.cuMemAllocPitch = Alloc;
+  f.cuMemFree = Free;
+  f.cuMemcpy2DAsync = Copy;
+  f.cuMemsetD8Async = Memset;
+  f.cuStreamCreate = StreamCreate;
+  f.cuStreamDestroy = Stream;
+  f.cuStreamSynchronize = Stream;
+  f.cuDeviceGetCount = Count;
+  f.cuDeviceGet = Device;
+  f.cuDeviceGetUuid = Uuid;
+  f.cuDeviceGetPCIBusId = Pci;
+  f.cuDevicePrimaryCtxRetain = Retain;
+  f.cuDevicePrimaryCtxRelease = Release;
+  f.cuCtxSetCurrent = Set;
+  f.cuCtxGetCurrent = Get;
+  f.cuCtxGetDevice = ContextDevice;
+  f.cuMemHostAlloc = Pinned;
+  f.cuMemFreeHost = FreePinned;
+  f.cuEventCreate = Event;
+  f.cuEventDestroy = DestroyEvent;
+  f.cuEventRecord = Record;
+  f.cuEventQuery = Query;
+  f.cuEventElapsedTime = Elapsed;
+  std::string error;
+  return driver->InitializeForTesting(f, &error) &&
+         driver->EnsureContextForDevice(0, &error);
+}
+} // namespace native_driver
+
+hal::PreparedProgram NativeFinalProgram(const cuda::CudaDriverApi &driver,
+                                        bool required = false) {
+  auto program = Program(hal::SemanticEffectId::vignette, required);
+  program.execution_domain.logical_context_generation =
+      driver.context_identity()->logical_generation;
+  program.invalidation_key.generations.context =
+      program.execution_domain.logical_context_generation;
+  program.requested_execution_domain = program.execution_domain;
+  program.requested_provider =
+      hal::SemanticEffectProviderId::open_cuda_production_kernels;
+  auto &vignette = program.stages[0];
+  vignette.provider = program.requested_provider;
+  vignette.execution_domain = program.execution_domain;
+  vignette.model = {};
+  program.stages[1] = vignette;
+  program.stages[1].stage_id = 2;
+  program.stages[1].semantic = hal::SemanticEffectId::mirror;
+  program.stage_count = 2;
+  program.cpu_tails[0].after_stage_id = 2;
+  program.cpu_tails[0].boundary_index = 2;
+  return program;
+}
+
+open_cuda::OpenCudaPreparedResidentExecutor::Options
+NativeOptions(cuda::CudaDriverApi *driver) {
+  auto options = Options(nullptr);
+  options.driver = driver;
+  options.model_artifact = {};
+  options.wait_policy.timeout_nanoseconds = 100'000'000;
+  options.wait_policy.poll_interval_nanoseconds = 1'000'000;
+  options.wait_policy.maximum_poll_count = 100;
+  return options;
+}
+
+bool TestNativeFinalStageTimingAndRecovery() {
+  bool ok = true;
+  for (std::uint32_t mask = 0; mask < 4; ++mask) {
+    native_driver::State state;
+    cuda::CudaDriverApi driver;
+    if (!Expect(native_driver::Initialize(&driver, &state),
+                "native fake driver"))
+      return false;
+    const auto program = NativeFinalProgram(driver);
+    open_cuda::OpenCudaPreparedResidentExecutor executor(
+        NativeOptions(&driver));
+    const auto prepared = executor.Prepare(program);
+    if (!Expect(prepared.status == hal::StatusId::ready,
+                "native final prepare"))
+      return false;
+    std::array<std::byte, 384> input{}, output{};
+    for (std::uint64_t sequence = 1; sequence <= 2; ++sequence) {
+      hal::HostFrameTokens tokens;
+      hal::ReasonId reason{};
+      ok = Expect(executor.BindHostFrame(prepared.handle,
+                                         HostBinding(program, input.data(),
+                                                     output.data(), sequence),
+                                         &tokens,
+                                         &reason) == hal::StatusId::ready,
+                  "native frame must bind after previous completion") &&
+           ok;
+      hal::ExecuteRequest request;
+      request.invalidation_key = program.invalidation_key;
+      request.execution_domain = program.execution_domain;
+      request.capture_sequence = sequence;
+      request.input = tokens.input;
+      request.disabled_stage_mask = mask;
+      const auto result = executor.Execute(prepared.handle, request);
+      if (result.status != hal::StatusId::executed)
+        std::cerr << "[native mask=" << mask << " sequence=" << sequence
+                  << "] status=" << static_cast<int>(result.status)
+                  << " reason=" << static_cast<int>(result.reason)
+                  << " stages=" << result.stage_count
+                  << " records=" << state.records << '\n';
+      ok = Expect(result.status == hal::StatusId::executed &&
+                      result.output_valid && result.stage_count == 2 &&
+                      result.transfers.uploads == 1 &&
+                      result.transfers.final_readbacks == 1 &&
+                      result.transfers.synchronizations == 1,
+                  "every native final mask must complete without timing-order "
+                  "failure") &&
+           ok;
+      for (std::size_t index = 0; index < 2; ++index) {
+        const bool disabled = (mask & (1u << index)) != 0;
+        ok = Expect(result.stages[index].status ==
+                            (disabled
+                                 ? hal::StageExecutionStatus::disabled_preserved
+                                 : hal::StageExecutionStatus::succeeded) &&
+                        result.stages[index].elapsed_ns ==
+                            (disabled ? 0u : 1'250'000u),
+                    "disabled native stage reports zero time despite nonzero "
+                    "CUDA events") &&
+             ok;
+      }
+    }
+    ok = Expect(state.vignette_launches == ((mask & 1u) ? 0u : 2u) &&
+                    state.mirror_launches == ((mask & 2u) ? 0u : 2u) &&
+                    state.records == 10 && state.allocations == 3,
+                "only enabled final kernels launch; all timing slots retire "
+                "without frame allocations") &&
+         ok;
+    const auto shutdown = executor.RequestShutdown();
+    ok = Expect(shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted &&
+                    state.frees == 2,
+                "native completed frames release only after quiescence") &&
+         ok;
+  }
+  return ok;
+}
+
+bool TestNativeRequiredFailureRetiresFinalTiming() {
+  native_driver::State state;
+  cuda::CudaDriverApi driver;
+  if (!native_driver::Initialize(&driver, &state))
+    return false;
+  const auto program = NativeFinalProgram(driver, true);
+  open_cuda::OpenCudaPreparedResidentExecutor executor(NativeOptions(&driver));
+  const auto prepared = executor.Prepare(program);
+  if (!Expect(prepared.status == hal::StatusId::ready,
+              "required native prepare"))
+    return false;
+  state.fail_vignette = true;
+  std::array<std::byte, 384> input{}, output;
+  output.fill(std::byte{0xEE});
+  hal::HostFrameTokens tokens;
+  hal::ReasonId reason{};
+  bool ok = Expect(executor.BindHostFrame(
+                       prepared.handle,
+                       HostBinding(program, input.data(), output.data(), 1),
+                       &tokens, &reason) == hal::StatusId::ready,
+                   "required native bind");
+  hal::ExecuteRequest request;
+  request.invalidation_key = program.invalidation_key;
+  request.execution_domain = program.execution_domain;
+  request.capture_sequence = 1;
+  request.input = tokens.input;
+  const auto result = executor.Execute(prepared.handle, request);
+  ok = Expect(result.status == hal::StatusId::failed &&
+                  result.reason == hal::ReasonId::required_stage_failed &&
+                  !result.output_valid && result.stage_count == 2 &&
+                  result.stages[0].status ==
+                      hal::StageExecutionStatus::required_failed &&
+                  result.stages[1].status ==
+                      hal::StageExecutionStatus::not_run &&
+                  result.stages[1].elapsed_ns == 0 &&
+                  result.transfers.final_readbacks == 1 &&
+                  result.transfers.cpu_tail_boundaries == 0 &&
+                  state.records == 5 && state.vignette_launches == 1 &&
+                  state.mirror_launches == 0 &&
+                  std::all_of(
+                      output.begin(), output.end(),
+                      [](std::byte value) { return value == std::byte{0xEE}; }),
+              "required failure retires all timing slots without mirror or "
+              "writer output") &&
+       ok;
+  const auto shutdown = executor.RequestShutdown();
+  return Expect(shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted &&
+                    state.frees == 2,
+                "required failure remains safely releasable") &&
+         ok;
+}
+
+bool TestNativeFinalCircuitBreakerCooldown() {
+  native_driver::State state;
+  cuda::CudaDriverApi driver;
+  if (!native_driver::Initialize(&driver, &state))
+    return false;
+  auto program = NativeFinalProgram(driver);
+  program.stages[0].circuit_breaker.consecutive_failure_limit = 1;
+  program.stages[0].circuit_breaker.cooldown_frames = 2;
+  open_cuda::OpenCudaPreparedResidentExecutor executor(NativeOptions(&driver));
+  open_cuda::ResidentAdapter adapter(81, executor);
+  hal::PreparedProgramSession session;
+  hal::ReadinessSnapshot readiness;
+  hal::ReasonId reason{};
+  if (!Expect(session.Configure(program, adapter, &readiness, &reason) ==
+                  hal::StatusId::degraded,
+              "native breaker session prepare"))
+    return false;
+  bool ok = true;
+  std::array<std::byte, 384> input{}, output{};
+  for (std::uint64_t sequence = 1; sequence <= 4; ++sequence) {
+    state.fail_vignette = sequence == 1;
+    hal::HostFrameTokens tokens;
+    if (!Expect(session.BindHostFrame(
+                    HostBinding(program, input.data(), output.data(), sequence),
+                    &tokens, &reason) == hal::StatusId::ready,
+                "native breaker next frame binds"))
+      return false;
+    hal::ExecuteRequest request;
+    request.invalidation_key = program.invalidation_key;
+    request.execution_domain = program.execution_domain;
+    request.capture_sequence = sequence;
+    request.input = tokens.input;
+    const auto result = session.Execute(request);
+    const bool disabled = sequence == 2 || sequence == 3;
+    ok =
+        Expect(
+            result.output_valid && result.stage_count == 2 &&
+                (result.status == hal::StatusId::executed ||
+                 result.status == hal::StatusId::degraded) &&
+                result.stages[0].status ==
+                    (sequence == 1
+                         ? hal::StageExecutionStatus::optional_failed_open
+                     : disabled ? hal::StageExecutionStatus::disabled_preserved
+                                : hal::StageExecutionStatus::succeeded) &&
+                result.stages[0].elapsed_ns == (disabled ? 0u : 1'250'000u) &&
+                result.stages[1].status == hal::StageExecutionStatus::succeeded,
+            "native optional failure preserves mirror and cooldown obeys HAL "
+            "zero timing") &&
+        ok;
+    hal::HostFrameOutputResolution resolution;
+    ok = Expect(session.ResolveHostFrameOutput(result.completion, result.output,
+                                               &resolution,
+                                               &reason) == hal::StatusId::ready,
+                "native breaker output resolves") &&
+         ok;
+    hal::OutputCommit commit;
+    commit.completion = result.completion;
+    commit.output_write_succeeded = true;
+    ok = Expect(session.CommitOutput(commit, &reason) == hal::StatusId::ready,
+                "native breaker output remains writer committable") &&
+         ok;
+  }
+  ok = Expect(state.vignette_launches == 2 && state.mirror_launches == 4 &&
+                  state.records == 20 && state.allocations == 3,
+              "cooldown skips exactly two vignette launches then retries "
+              "without setup") &&
+       ok;
+  session.Shutdown();
+  return ok;
+}
+
 class FakeRuntime final : public open_cuda::IPreparedOpenCudaRuntime {
 public:
   struct Slot {
@@ -1891,6 +2299,9 @@ bool TestBoundedTerminalStatesAndPendingShutdown() {
 
 int main() {
   bool ok = true;
+  ok = TestNativeFinalStageTimingAndRecovery() && ok;
+  ok = TestNativeRequiredFailureRetiresFinalTiming() && ok;
+  ok = TestNativeFinalCircuitBreakerCooldown() && ok;
   ok = TestPreparedGeometryStrengthLaunchesAndBudgets() && ok;
   ok = TestContiguousTensorPitchBudgetBoundary() && ok;
   ok = TestNativeVignetteExactAllocationBudgetBoundary() && ok;
