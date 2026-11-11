@@ -9,8 +9,6 @@
 namespace studiocast::hal {
 
 inline constexpr std::size_t kMaxResidentIslands = kMaxPreparedStages;
-inline constexpr std::size_t kMaxExecutionBoundaries =
-    (kMaxPreparedStages * 2) + kMaxCpuTails;
 
 enum class CrossAdapterPolicy : std::uint8_t {
   reject = 1,

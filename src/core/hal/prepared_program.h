@@ -11,6 +11,8 @@ namespace studiocast::hal {
 
 inline constexpr std::size_t kMaxPreparedStages = 32;
 inline constexpr std::size_t kMaxCpuTails = 8;
+inline constexpr std::size_t kMaxExecutionBoundaries =
+    (kMaxPreparedStages * 2) + kMaxCpuTails;
 inline constexpr std::size_t kMaxLatencyHistogramBuckets = 16;
 inline constexpr std::size_t kMaxCapabilityEvidenceRecords = 24;
 
