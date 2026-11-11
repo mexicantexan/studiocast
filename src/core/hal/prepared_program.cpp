@@ -780,6 +780,11 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
 
   if (request.capture_sequence == 0)
     return FailedExecute(StatusId::blocked, ReasonId::malformed_contract);
+  if (host_binding_pending_ &&
+      (request.capture_sequence != pending_host_binding_.capture_sequence ||
+       !SameResourceToken(request.input, pending_host_tokens_.input))) {
+    return FailedExecute(StatusId::blocked, ReasonId::host_frame_binding_invalid);
+  }
 
   bool temporal_state_reset = false;
   std::uint64_t dropped_capture_frames = 0;
@@ -787,9 +792,7 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
     if (request.capture_sequence <= last_capture_sequence_) {
       ++telemetry_.frame_drop_events;
       ++telemetry_.preserve_order_failures;
-      telemetry_.runtime_status = StatusId::failed;
-      telemetry_.runtime_reason = ReasonId::frame_order_violated;
-      return FailedExecute(StatusId::failed, ReasonId::frame_order_violated);
+      return RejectTemporalFrame(ReasonId::frame_order_violated);
     }
     if (request.capture_sequence != last_capture_sequence_ + 1) {
       dropped_capture_frames =
@@ -799,9 +802,7 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
       switch (program_.temporal.frame_drop_behavior) {
       case FrameDropBehavior::preserve_order:
         ++telemetry_.preserve_order_failures;
-        telemetry_.runtime_status = StatusId::failed;
-        telemetry_.runtime_reason = ReasonId::frame_order_violated;
-        return FailedExecute(StatusId::failed, ReasonId::frame_order_violated);
+        return RejectTemporalFrame(ReasonId::frame_order_violated);
       case FrameDropBehavior::reset_temporal_state: {
         const StatusId reset = adapter_->ResetTemporalState(
             handle_, ReasonId::temporal_discontinuity);
@@ -817,8 +818,7 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
             program_.temporal.requires_contiguous_capture_sequence) {
           if (program_.temporal.discontinuity_action ==
               TemporalDiscontinuityAction::fail_frame) {
-            return FailedExecute(StatusId::failed,
-                                 ReasonId::temporal_discontinuity);
+            return RejectTemporalFrame(ReasonId::temporal_discontinuity);
           }
           const StatusId reset = adapter_->ResetTemporalState(
               handle_, ReasonId::temporal_discontinuity);
@@ -842,8 +842,7 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
       readiness_.blocked_stage_mask &= ~bit;
     }
   }
-  if (disabled_stage_mask_ == 0 && !quarantined_ && !rebuild_requested_)
-    readiness_ = configured_readiness_;
+  RestoreExecutionReadiness();
   telemetry_.disabled_stage_mask = disabled_stage_mask_;
   readiness_.disabled_stage_mask = disabled_stage_mask_;
   ExecuteRequest effective_request = request;
@@ -1317,19 +1316,51 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
   return status;
 }
 
+void PreparedProgramSession::RetirePendingFrame() noexcept {
+  completion_pending_ = false;
+  host_binding_pending_ = false;
+  pending_host_binding_ = {};
+  pending_host_tokens_ = {};
+  pending_completion_ = {};
+  pending_stage_count_ = 0;
+}
+
+ExecuteResult
+PreparedProgramSession::RejectTemporalFrame(ReasonId reason) noexcept {
+  RetirePendingFrame();
+  latest_committed_frame_ = {};
+  telemetry_.runtime_status = readiness_.status = StatusId::failed;
+  telemetry_.runtime_reason = readiness_.reason = reason;
+  readiness_.available = false;
+  readiness_.degraded = false;
+  return FailedExecute(StatusId::failed, reason);
+}
+
+void PreparedProgramSession::RestoreExecutionReadiness() noexcept {
+  if (quarantined_ || rebuild_requested_)
+    return;
+  if (disabled_stage_mask_ == 0) {
+    readiness_ = configured_readiness_;
+  } else if (readiness_.status == StatusId::failed) {
+    // A rejected frame does not change the existing optional-stage breaker.
+    readiness_.status = StatusId::degraded;
+    readiness_.available = true;
+    readiness_.degraded = true;
+    readiness_.reason = disabled_stage_mask_ == permanent_disabled_stage_mask_
+                            ? ReasonId::circuit_breaker_permanently_disabled
+                            : ReasonId::circuit_breaker_retry_pending;
+  }
+}
+
 void PreparedProgramSession::HandleTemporalResetResult(StatusId status,
                                                      ReasonId reason) noexcept {
   if (status == StatusId::ready) {
     ++telemetry_.temporal_resets;
+    RestoreExecutionReadiness();
     telemetry_.runtime_status = readiness_.status;
     telemetry_.runtime_reason = readiness_.reason;
   } else {
-    completion_pending_ = false;
-    host_binding_pending_ = false;
-    pending_host_binding_ = {};
-    pending_host_tokens_ = {};
-    pending_completion_ = {};
-    pending_stage_count_ = 0;
+    RetirePendingFrame();
     latest_committed_frame_ = {};
     telemetry_.runtime_status = status;
     telemetry_.runtime_reason =

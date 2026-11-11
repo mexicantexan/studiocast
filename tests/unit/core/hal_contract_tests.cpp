@@ -1227,6 +1227,162 @@ bool TestHostBoundTemporalDiscontinuityResetResults() {
   return ok;
 }
 
+bool TestRejectedTemporalFramesRetireOnlyTheirOwnBinding() {
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> input{}, output{};
+  bool ok = true;
+  for (const bool host_bound : {false, true}) {
+    for (const bool explicit_recovery : {false, true}) {
+      for (int mode = 0; mode < 4; ++mode) {
+        FakeAdapter adapter;
+        PreparedProgramSession session;
+        auto program = Program(195, 77, 1);
+        program.temporal.frame_drop_behavior =
+            mode == 3 ? FrameDropBehavior::latest_frame_wins
+                      : FrameDropBehavior::preserve_order;
+        program.temporal.discontinuity_action =
+            TemporalDiscontinuityAction::fail_frame;
+        ok &= Configure(&session, &adapter, program);
+        if (mode == 2)
+          adapter.execute_mode = FakeExecuteMode::optional_failure;
+        auto frame = session.Execute(Request(program, 5));
+        ReasonId reason = ReasonId::none;
+        ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                          StatusId::ready,
+                      "initial temporal order test output must commit");
+        adapter.execute_mode = FakeExecuteMode::success;
+        HostFrameBinding binding;
+        binding.input_descriptor = program.host_input;
+        binding.output_descriptor = program.host_output;
+        binding.input_plane_count = binding.output_plane_count = 1;
+        binding.input_planes[0] = {input.data(), nullptr, input.size(),
+                                   640 * 3};
+        binding.output_planes[0] = {nullptr, output.data(), output.size(),
+                                    640 * 3};
+        HostFrameTokens tokens;
+        const auto make_request = [&](std::uint64_t sequence) {
+          auto request = Request(program, sequence);
+          if (host_bound) {
+            binding.capture_sequence = sequence;
+            ok &= Require(
+                session.BindHostFrame(binding, &tokens, &reason) ==
+                    StatusId::ready,
+                "rejected frame must release its borrowed binding for retry");
+            request.input = tokens.input;
+          }
+          return request;
+        };
+        const std::uint64_t rejected_sequence = mode == 0   ? 5u
+                                                : mode == 1 ? 4u
+                                                            : 7u;
+        const auto expected_reason = mode == 3
+                                         ? ReasonId::temporal_discontinuity
+                                         : ReasonId::frame_order_violated;
+        frame = session.Execute(make_request(rejected_sequence));
+        ok &= Require(
+            frame.status == StatusId::failed &&
+                frame.reason == expected_reason &&
+                !session.latest_committed_frame().valid &&
+                session.readiness().status == StatusId::failed &&
+                session.readiness().reason == expected_reason &&
+                !session.readiness().available && !session.readiness().degraded &&
+                session.telemetry().runtime_status == StatusId::failed &&
+                session.telemetry().runtime_reason == expected_reason &&
+                adapter.execute_calls == 1 && adapter.reset_calls == 0,
+            "rejected temporal frame must retire its binding and stale active "
+            "state");
+        if (explicit_recovery) {
+          ok &= Require(
+              session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                      StatusId::ready &&
+                  session.readiness().available && adapter.reset_calls == 1,
+              "explicit reset must recover after retiring a rejected frame");
+          frame = session.Execute(make_request(rejected_sequence));
+          ok &= Require(
+              frame.status == StatusId::failed &&
+                  frame.reason == expected_reason && adapter.reset_calls == 1,
+              "explicit reset must preserve frame-order rejection policy");
+        }
+        frame = session.Execute(make_request(6));
+        ok &= Require(frame.status == StatusId::executed &&
+                          !frame.temporal_state_reset &&
+                          session.readiness().available &&
+                          (mode != 2 || (session.disabled_stage_mask() == 2 &&
+                                         session.readiness().status ==
+                                             StatusId::degraded)) &&
+                          adapter.reset_calls == (explicit_recovery ? 1u : 0u),
+                      "missing next frame must recover without an implicit "
+                      "policy-changing reset");
+        if (host_bound) {
+          HostFrameOutputResolution resolution;
+          ok &= Require(session.ResolveHostFrameOutput(
+                            frame.completion, frame.output, &resolution,
+                            &reason) == StatusId::ready &&
+                            resolution.capture_sequence == 6,
+                        "recovered host output binding must remain valid");
+        }
+        ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                          StatusId::ready,
+                      "recovered temporal output must commit");
+      }
+    }
+  }
+
+  FakeAdapter adapter;
+  PreparedProgramSession session;
+  const auto program = Program(194, 77, 1);
+  ok &= Configure(&session, &adapter, program);
+  auto frame = session.Execute(Request(program, 5));
+  ReasonId reason = ReasonId::none;
+  ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                    StatusId::ready,
+                "forged-request fixture must start with committed output");
+  HostFrameBinding binding;
+  binding.input_descriptor = program.host_input;
+  binding.output_descriptor = program.host_output;
+  binding.input_plane_count = binding.output_plane_count = 1;
+  binding.capture_sequence = 6;
+  binding.input_planes[0] = {input.data(), nullptr, input.size(), 640 * 3};
+  binding.output_planes[0] = {nullptr, output.data(), output.size(), 640 * 3};
+  HostFrameTokens tokens;
+  ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                    StatusId::ready,
+                "forged-request fixture must bind a valid current frame");
+  auto valid = Request(program, 6);
+  valid.input = tokens.input;
+  for (int mutation = 0; mutation < 4; ++mutation) {
+    auto forged = valid;
+    if (mutation == 0)
+      forged.capture_sequence = 5;
+    if (mutation == 1)
+      ++forged.input.resource_id;
+    if (mutation == 2)
+      ++forged.invalidation_key.generations.configuration;
+    if (mutation == 3)
+      ++forged.execution_domain.adapter_instance_id;
+    const auto rejected = session.Execute(forged);
+    ok &=
+        Require(!rejected.output_valid && adapter.execute_calls == 1 &&
+                    adapter.reset_calls == 0 &&
+                    session.latest_committed_frame().valid &&
+                    session.readiness().available &&
+                    session.telemetry().runtime_status == StatusId::executed &&
+                    session.telemetry().frame_drop_events == 0,
+                "unrelated forged request must not discard a valid binding or "
+                "mutate frame order");
+  }
+  frame = session.Execute(valid);
+  HostFrameOutputResolution resolution;
+  ok &= Require(
+      frame.status == StatusId::executed &&
+          session.ResolveHostFrameOutput(frame.completion, frame.output,
+                                         &resolution,
+                                         &reason) == StatusId::ready &&
+          session.CommitOutput({frame.completion, true}, &reason) ==
+              StatusId::ready,
+      "valid bound frame must survive forged requests and remain committable");
+  return ok;
+}
+
 bool TestExplicitTemporalResetGuardsAndForwarding() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -1474,6 +1630,7 @@ int main() {
   ok &= TestDeclaredMetadataTransferBounds();
   ok &= TestFatalTemporalResetInvalidatesActiveAttribution();
   ok &= TestHostBoundTemporalDiscontinuityResetResults();
+  ok &= TestRejectedTemporalFramesRetireOnlyTheirOwnBinding();
   ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();
