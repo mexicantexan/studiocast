@@ -1203,6 +1203,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
       evidence->status = candidate.status;
       evidence->reason = candidate.reason;
     }
+    SetReason(reason, candidate.reason);
     return candidate.status;
   }
   if (candidate.execution_kind != ProductionVideoResidentSetupSourceResult::

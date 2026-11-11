@@ -22,9 +22,14 @@ struct ProductionVideoBackendSetupDependencies {
       video::ProductionVideoSetupLeaseAcquireEvidence *evidence,
       hal::ReasonId *reason) noexcept;
 
+  using AcquireCompatibility = video::ProductionVideoResidentSetupSourceResult (
+          *)(void *context, const video::ProductionVideoResidentSetup &request,
+             hal::ReasonId cuda_failure_reason) noexcept;
+
   ResolveModel resolve_model = nullptr;
   AcquireLease acquire_lease = nullptr;
   void *context = nullptr;
+  AcquireCompatibility acquire_compatibility = nullptr;
 };
 
 // Creates the production setup-only Open CUDA/Open Video source. The returned

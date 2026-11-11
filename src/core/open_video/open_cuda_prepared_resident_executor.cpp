@@ -2277,7 +2277,9 @@ private:
     const int width = slot->input.w, height = slot->input.h;
     auto &deps = slot->config.dependencies;
     // Each component receives a disjoint setup reservation. These upper bounds
-    // include pitched storage and model-owned scratch, and never grow live.
+    // include explicitly owned pitched storage and component scratch, and never
+    // grow live. Private ORT provider arenas/model allocations are not measured
+    // by these reservations and must not be reported as fully accounted memory.
     hal::ResourceBudget extra;
     const auto charge = [&](std::uint64_t bytes, std::uint32_t resources) {
       extra.persistent_bytes += bytes;

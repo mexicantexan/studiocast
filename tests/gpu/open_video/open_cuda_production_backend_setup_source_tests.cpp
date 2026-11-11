@@ -1,3 +1,4 @@
+#include "core/open_video/prepared_open_video_compatibility_executor.h"
 #include "core/open_video/production_video_backend_setup_source.h"
 #include "core/video/cpu_primitive_hal.h"
 #include "core/video/production_video_setup_request.h"
@@ -326,6 +327,14 @@ struct InjectionState {
   std::size_t fail_attempts = 0;
   bool mismatch_artifact = false;
   std::size_t acquire_calls = 0;
+  std::size_t compatibility_calls = 0;
+  hal::StatusId acquire_failure_status = hal::StatusId::resource_exhausted;
+  hal::ReasonId acquire_failure_reason = hal::ReasonId::resource_exhausted;
+  video::effects::BroadcastCameraEffects compatibility_effects;
+  open_cuda::OpenCudaProductionOwnerStatus owner_failure_status =
+      open_cuda::OpenCudaProductionOwnerStatus::invalid;
+  bool owner_retained_cleanup = false;
+
   open_cuda::OpenCudaSetupComponentId failed_component =
       open_cuda::OpenCudaSetupComponentId::invalid;
   bool cleanup_quiescent = true;
@@ -334,13 +343,15 @@ struct InjectionState {
 };
 
 bool ResolveFakeModel(
-    void *context, const video::CanonicalVideoStage &, const std::string &,
-    const char *task, const char *, open_video::ModelPack *pack,
+    void *context, const video::CanonicalVideoStage &,
+    const std::string &requested_model_id, const char *task, const char *,
+    open_video::ModelPack *pack,
     open_video::ValidatedModelArtifactIdentity *identity) noexcept {
   if (!pack || !identity ||
       (context && static_cast<InjectionState *>(context)->missing_task == task))
     return false;
-  pack->id = std::string("prepared-") + task;
+  pack->id = requested_model_id.empty() ? std::string("prepared-") + task
+                                        : requested_model_id;
   pack->task = task;
   pack->registry_generation = 13;
   open_video::MattingSpec matting;
@@ -375,9 +386,11 @@ hal::StatusId AcquireFakeLease(
   state->last_request = request;
   if (state->fail_acquire || state->acquire_calls <= state->fail_attempts) {
     if (bootstrap) {
-      bootstrap->status = hal::StatusId::resource_exhausted;
-      bootstrap->reason = hal::ReasonId::resource_exhausted;
+      bootstrap->status = state->acquire_failure_status;
+      bootstrap->reason = state->acquire_failure_reason;
       bootstrap->failed_component = state->failed_component;
+      bootstrap->owner.status = state->owner_failure_status;
+      bootstrap->owner.retained_cleanup_island = state->owner_retained_cleanup;
       bootstrap->candidate_shutdown.status = state->cleanup_quiescent
                                                  ? hal::StatusId::stopped
                                                  : hal::StatusId::degraded;
@@ -389,10 +402,15 @@ hal::StatusId AcquireFakeLease(
       bootstrap->candidate_shutdown.quiescent = state->cleanup_quiescent;
       bootstrap->candidate_shutdown.driver_context_release_permitted =
           state->cleanup_quiescent;
+      if (state->owner_failure_status !=
+          open_cuda::OpenCudaProductionOwnerStatus::invalid) {
+        bootstrap->candidate_shutdown = {};
+        bootstrap->candidate_shutdown.pending = state->owner_retained_cleanup;
+      }
     }
     if (reason)
-      *reason = hal::ReasonId::resource_exhausted;
-    return hal::StatusId::resource_exhausted;
+      *reason = state->acquire_failure_reason;
+    return state->acquire_failure_status;
   }
   auto owner = std::make_unique<FakeOwner>();
   video::ProductionVideoSetupLeaseSnapshot snapshot;
@@ -515,6 +533,94 @@ hal::StatusId AcquireFakeLease(
   }
   return video::ProductionVideoSetupLease::Acquire(
       snapshot, std::move(owner), destination, evidence, reason);
+}
+
+bool FakeHostStage(void *, const video::CanonicalVideoStage &, std::uint64_t,
+                   std::uint8_t *, int, int, std::size_t,
+                   std::string *) noexcept {
+  return true;
+}
+
+video::ProductionVideoResidentSetupSourceResult
+AcquireFakeCompatibility(void *context,
+                         const video::ProductionVideoResidentSetup &request,
+                         hal::ReasonId failure) noexcept {
+  auto *state = static_cast<InjectionState *>(context);
+  ++state->compatibility_calls;
+  state->compatibility_effects = request.effects;
+  video::ProductionVideoResidentSetupSourceResult result;
+  result.execution_kind = decltype(result.execution_kind)::typed_compatibility;
+  result.canonical_effects = request.effects;
+  result.plan = request.plan;
+  result.plan.cpu_tails = {};
+  result.plan.cpu_tail_count = 0;
+  auto &generations = result.plan.invalidation_key.generations;
+  generations.model = 13;
+  generations.provider = 1;
+  generations.device = 1;
+  generations.context = 1;
+  auto domain = FakeCudaDomain();
+  domain.backend = hal::BackendId::open_video_onnxruntime;
+  domain.api_family = hal::ApiFamily::onnxruntime;
+  domain.allocator_family = hal::AllocatorFamily::onnxruntime;
+  domain.memory_handle_family = hal::MemoryHandleFamily::ort_value;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::ort_provider_synchronous;
+  domain.logical_context_generation = 1;
+  result.plan.invalidation_key.execution_domain_hash =
+      video::ProductionVideoExecutionDomainHash(domain);
+  result.plan.invalidation_key.model_artifact_hash = 3;
+  auto &topology = result.compatibility_topology;
+  topology.domain_count = 1;
+  topology.exact_ordered_boundaries = true;
+  topology.cross_adapter_residency_forbidden = true;
+  auto &entry = topology.domains[0];
+  entry.domain = domain;
+  entry.backend = domain.backend;
+  entry.provider = hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
+  entry.first_stage_id = result.plan.intent.stages[0].intent.stage_id;
+  entry.last_stage_id =
+      result.plan.intent.stages[result.plan.intent.stage_count - 1]
+          .intent.stage_id;
+  for (std::size_t i = 0; i < result.plan.intent.stage_count; ++i) {
+    const auto semantic = result.plan.intent.stages[i].intent.semantic;
+    auto &model = result.plan.intent.stages[i].model;
+    model.model_id_hash[0] = 1;
+    model.artifact_set_hash[0] = 2;
+    model.artifact_generation = 13;
+    auto &selection = result.model_selections[result.model_selection_count++];
+    selection.semantic = semantic;
+    selection.requested_model_id =
+        semantic == hal::SemanticEffectId::eye_contact
+            ? request.effects.eye_contact.model_id
+            : request.effects.video_noise_removal.model_id;
+    selection.selected_model_id = selection.requested_model_id.empty()
+                                      ? "default-host-pack"
+                                      : selection.requested_model_id;
+    selection.default_selected = selection.requested_model_id.empty();
+    selection.artifact = model;
+  }
+  open_video::PreparedOpenVideoCompatibilityConfig config;
+  config.plan = result.plan;
+  config.effects = request.effects;
+  config.selected_backend = domain.backend;
+  config.execution_domain = domain;
+  config.selected_provider = entry.provider;
+  config.prepared_stage_runner = &FakeHostStage;
+  config.setup_fallback_reason = failure;
+  for (std::size_t i = 0; i < result.plan.intent.stage_count; ++i) {
+    config.backends[i] = domain.backend;
+    config.providers[i] = entry.provider;
+  }
+  open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+  result.compatibility_executor =
+      open_video::PreparedOpenVideoCompatibilityExecutor::Create(config,
+                                                                 &setup);
+  result.status = setup.status;
+  result.reason = setup.reason;
+  result.readiness = setup.readiness;
+  result.setup_completed_outside_frame_loop = true;
+  return result;
 }
 
 bool Check(bool condition, const char *message) {
@@ -844,7 +950,7 @@ bool CompatibilityTopologyNeverMasqueradesAsStrictCuda() {
     (void)unsetenv("XDG_DATA_HOME");
 
   ok &= Check(
-      result.status == hal::StatusId::degraded &&
+      result.status == hal::StatusId::unavailable &&
           result.reason == hal::ReasonId::capability_evidence_incomplete &&
           result.setup_completed_outside_frame_loop && !result.lease.live(),
       "automatic compatibility did not fail during model setup");
@@ -1448,6 +1554,7 @@ bool StrictCudaComponentsReachProductionSetup() {
     auto source = open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
         dependencies);
     auto request = StrictRequest(semantic);
+    request.plan.budget.resource_count = 512;
     request.plan.intent.strict_provider_selection = false;
     request.plan.intent.requested_provider =
         hal::SemanticEffectProviderId::invalid;
@@ -1673,10 +1780,141 @@ bool AllUnavailableSharedRequestStaysCpuOnly() {
   return ok;
 }
 
+bool AutomaticHostCompatibilityIsSetupOnlyAndNarrow() {
+  bool ok = true;
+  for (int mode = 0; mode < 10; ++mode) {
+    InjectionState state;
+    state.fail_acquire = mode != 7;
+    state.acquire_failure_status =
+        mode == 6 ? hal::StatusId::quarantined : hal::StatusId::unavailable;
+    state.acquire_failure_reason =
+        mode == 6 ? hal::ReasonId::device_lost
+                  : hal::ReasonId::strict_backend_unavailable;
+    state.cleanup_quiescent = mode != 5 && mode != 8 && mode != 9;
+    if (mode >= 8)
+      state.owner_failure_status =
+          open_cuda::OpenCudaProductionOwnerStatus::driver_initialize_failed;
+    state.owner_retained_cleanup = mode == 9;
+    open_cuda::ProductionVideoBackendSetupDependencies dependencies;
+    dependencies.resolve_model = &ResolveFakeModel;
+    dependencies.acquire_lease = &AcquireFakeLease;
+    dependencies.acquire_compatibility = &AcquireFakeCompatibility;
+    dependencies.context = &state;
+    video::ProductionVideoBackendManager manager(
+        open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+            dependencies));
+    video::effects::BroadcastCameraEffects effects;
+    effects.video_noise_removal.enabled = true;
+    effects.video_noise_removal.model_id = "configured-denoise";
+    effects.eye_contact.enabled = true;
+    effects.eye_contact.model_id = "configured-eyes";
+    if (mode == 1)
+      effects.engine = video::effects::EffectsEnginePreference::open_cuda;
+    if (mode == 3)
+      effects.vignette.enabled = true;
+    video::ProductionVideoBoundedWaitPolicy wait;
+    wait.timeout_nanoseconds = 1000;
+    wait.poll_interval_nanoseconds = 10;
+    wait.maximum_poll_count = 100;
+    wait.stop_requested = &StopNever;
+    wait.now_nanoseconds = &Now;
+    wait.poll_wait = &Poll;
+    wait.callback_context = &state;
+    wait.callback_context_generation = 1;
+    wait.callback_context_lifetime = hal::ResourceLifetime::adapter_context;
+    auto request = video::BuildProductionVideoBackendSetupRequest(
+        effects,
+        mode == 2 ? video::ComputeBackendPreference::cuda
+                  : video::ComputeBackendPreference::auto_select,
+        64, 48, 64, 48, video::PixelFormat::rgb24, 1, 1, 51, wait,
+        video::GetCpuPrimitiveTable());
+    if (mode == 4) {
+      request.resident.plan.intent.requested_provider =
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+      request.resident.plan.intent.strict_provider_selection = true;
+    }
+    video::ProductionVideoBackendSetupEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status = manager.Setup(request, &evidence, &reason);
+    const auto snapshot = manager.Snapshot();
+    if (mode == 0 || mode == 8) {
+      if (status != hal::StatusId::degraded || !snapshot.compatibility.prepared)
+        std::cerr << "auto host status=" << static_cast<unsigned>(status)
+                  << " reason=" << static_cast<unsigned>(reason)
+                  << " calls=" << state.compatibility_calls
+                  << " prepared=" << snapshot.compatibility.prepared
+                  << " source=" << evidence.setup_source_called << " candidate="
+                  << static_cast<unsigned>(evidence.candidate_readiness.status)
+                  << '/'
+                  << static_cast<unsigned>(evidence.candidate_readiness.reason)
+                  << '\n';
+      ok &= Check(
+          status == hal::StatusId::degraded && state.compatibility_calls == 1 &&
+              !snapshot.resident_prepared && snapshot.compatibility.prepared &&
+              snapshot.readiness.selected_backend ==
+                  hal::BackendId::open_video_onnxruntime &&
+              snapshot.readiness.provider ==
+                  hal::SemanticEffectProviderId::open_video_onnxruntime_cpu &&
+              reason == hal::ReasonId::strict_backend_unavailable &&
+              state.compatibility_effects == effects,
+          "fully automatic quiescent CUDA failure did not preserve exact typed "
+          "host compatibility");
+    } else {
+      ok &= Check(state.compatibility_calls == 0,
+                  "strict, mixed, pending, quarantined or working CUDA request "
+                  "invoked host fallback");
+      if (mode == 7)
+        ok &= Check(
+            snapshot.resident_prepared && state.acquire_calls == 1,
+            "working automatic CUDA route did not retain its prepared lease");
+    }
+  }
+  return ok;
+}
+
+bool CallerBudgetStopsBeforeNativeAcquisition() {
+  bool ok = true;
+  for (int axis = 0; axis < 6; ++axis) {
+    InjectionState state;
+    open_cuda::ProductionVideoBackendSetupDependencies dependencies;
+    dependencies.resolve_model = &ResolveFakeModel;
+    dependencies.acquire_lease = &AcquireFakeLease;
+    dependencies.context = &state;
+    auto source = open_cuda::CreateProductionVideoBackendSetupSourceForTesting(
+        dependencies);
+    auto request = StrictRequest(hal::SemanticEffectId::eye_contact);
+    request.plan.budget.resource_count = 512;
+    if (axis == 0)
+      request.plan.budget.persistent_bytes = 0;
+    if (axis == 1)
+      request.plan.budget.scratch_bytes = 0;
+    if (axis == 2)
+      request.plan.budget.upload_staging_bytes = 0;
+    if (axis == 3)
+      request.plan.budget.readback_staging_bytes = 0;
+    if (axis == 4)
+      request.plan.budget.resource_count = 0;
+    if (axis == 5)
+      request.plan.budget.in_flight_slots = 0;
+    const auto original = request.plan.budget;
+    const auto result = source->AcquireResidentSetup(request);
+    ok &= Check(result.status == hal::StatusId::resource_exhausted &&
+                    result.reason == hal::ReasonId::resource_exhausted &&
+                    !result.lease.live() && state.acquire_calls == 0 &&
+                    request.plan.budget.persistent_bytes ==
+                        original.persistent_bytes,
+                "undersized caller budget reached native owner allocation or "
+                "mutated intent");
+  }
+  return ok;
+}
+
 } // namespace
 
 int main() {
-  if (!AllUnavailableSharedRequestStaysCpuOnly() ||
+  if (!CallerBudgetStopsBeforeNativeAcquisition() ||
+      !AutomaticHostCompatibilityIsSetupOnlyAndNarrow() ||
+      !AllUnavailableSharedRequestStaysCpuOnly() ||
       !MatteFallbackSelectionIsNarrowAndExplicit() ||
       !OptionalDenoiseSetupFailurePreservesNativeStage() ||
       !StrictCudaComponentsReachProductionSetup() ||

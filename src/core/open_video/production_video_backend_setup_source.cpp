@@ -82,7 +82,6 @@ std::uint64_t HashArtifact(
   return hash == 0 ? 1 : hash;
 }
 
-
 bool Add(std::uint64_t value, std::uint64_t *sum) noexcept {
   if (sum == nullptr ||
       value > std::numeric_limits<std::uint64_t>::max() - *sum) {
@@ -519,6 +518,8 @@ bool PreparedSemantics(
     return false;
   unsigned last_rank = 0;
   for (std::size_t i = 0; i < intent.stage_count; ++i) {
+    if (intent.stages[i].parameter_count > intent.stages[i].parameters.size())
+      return false;
     const auto rank =
         PreparedOpenCudaCanonicalStageRank(intent.stages[i].intent.semantic);
     if (rank == 0 || rank <= last_rank)
@@ -601,7 +602,8 @@ bool ResolveCompatibilityModel(
 }
 
 video::ProductionVideoResidentSetupSourceResult
-BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
+BuildCompatibility(const video::ProductionVideoResidentSetup &request,
+                   hal::ReasonId fallback_reason = hal::ReasonId::none) {
   const auto &caller = request.plan;
   if (caller.intent.stage_count == 0 ||
       caller.intent.stage_count >
@@ -710,6 +712,7 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
       hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
   config.execution_domain = entry.domain;
   config.expected_transfers = topology.expected_transfers;
+  config.setup_fallback_reason = fallback_reason;
   for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
     config.providers[index] =
         hal::SemanticEffectProviderId::open_video_onnxruntime_cpu;
@@ -729,6 +732,32 @@ BuildCompatibility(const video::ProductionVideoResidentSetup &request) {
   return result;
 }
 
+bool AutomaticHostCompatibilityAllowed(
+    const video::VideoExecutionPlanRequest &plan) noexcept {
+  const auto &intent = plan.intent;
+  if (intent.backend.mode != hal::BackendRequestMode::automatic ||
+      intent.backend.backend != hal::BackendId::invalid ||
+      intent.backend.strict || intent.strict_provider_selection ||
+      intent.requested_provider != hal::SemanticEffectProviderId::invalid ||
+      intent.preferences.effects_engine !=
+          hal::EffectsEnginePreferenceConstraint::automatic ||
+      intent.preferences.strict_effects_engine ||
+      intent.preferences.compute_family != hal::ComputeFamilyAllowance::any ||
+      intent.stage_count == 0 || intent.stage_count > intent.stages.size())
+    return false;
+  for (std::size_t i = 0; i < intent.stage_count; ++i)
+    if (!CompatibilitySemantic(intent.stages[i].intent.semantic))
+      return false;
+  return true;
+}
+
+bool HostCompatibilityFailureReason(hal::ReasonId reason) noexcept {
+  return reason == hal::ReasonId::strict_backend_unavailable ||
+         reason == hal::ReasonId::semantic_provider_unavailable ||
+         reason == hal::ReasonId::capability_evidence_incomplete ||
+         reason == hal::ReasonId::resource_exhausted;
+}
+
 class ProductionSetupSource final
     : public video::IProductionVideoBackendSetupSource {
 public:
@@ -738,6 +767,8 @@ public:
   video::ProductionVideoResidentSetupSourceResult AcquireResidentSetup(
       const video::ProductionVideoResidentSetup &request) noexcept override {
     const auto &caller = request.plan;
+    if (caller.intent.stage_count > caller.intent.stages.size())
+      return Failure(hal::StatusId::blocked, hal::ReasonId::malformed_contract);
     bool compatibility = caller.intent.stage_count != 0;
     for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
       compatibility =
@@ -771,11 +802,25 @@ public:
     }
 
     try {
+      const bool automatic_host_compatibility =
+          AutomaticHostCompatibilityAllowed(caller);
+      const auto host_compatibility = [&](hal::ReasonId failure) {
+        return dependencies_.acquire_compatibility
+                   ? dependencies_.acquire_compatibility(dependencies_.context,
+                                                         request, failure)
+                   : BuildCompatibility(request, failure);
+      };
       std::array<hal::StatusId, hal::kMaxPreparedStages> statuses{};
       std::array<hal::ReasonId, hal::kMaxPreparedStages> reasons{};
       for (std::size_t index = 0; index < caller.intent.stage_count; ++index)
         statuses[index] = hal::StatusId::ready;
 
+      const auto optional_unavailable = [&] {
+        return automatic_host_compatibility
+                   ? host_compatibility(
+                         hal::ReasonId::capability_evidence_incomplete)
+                   : NeutralUnavailable(request, statuses, reasons);
+      };
       open_video::ModelPack pack;
       open_video::ValidatedModelArtifactIdentity artifact;
       const auto mark_component = [&](OpenCudaSetupComponentId component,
@@ -929,7 +974,7 @@ public:
         return Failure(hal::StatusId::unavailable,
                        hal::ReasonId::required_stage_failed);
       if (selected_count() == 0)
-        return NeutralUnavailable(request, statuses, reasons);
+        return optional_unavailable();
 
       const std::uint32_t model_width =
           model_resolved && pack.matting
@@ -960,7 +1005,7 @@ public:
         return Failure(hal::StatusId::unavailable,
                        hal::ReasonId::required_stage_failed);
       if (selected_count() == 0)
-        return NeutralUnavailable(request, statuses, reasons);
+        return optional_unavailable();
 
       // Each safe failed attempt removes one optional component. The fixed
       // stage capacity bounds retries; nonquiescent failures are never retried.
@@ -976,7 +1021,7 @@ public:
           }
         }
         if (first_selected == caller.intent.stage_count)
-          return NeutralUnavailable(request, statuses, reasons);
+          return optional_unavailable();
 
         const auto selected_semantic =
             caller.intent.stages[first_selected].intent.semantic;
@@ -1052,6 +1097,9 @@ public:
             budget.resource_count += 128;
           }
         }
+        if (!BudgetContains(caller.budget, budget))
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
         static std::atomic<std::uint64_t> next_adapter{
             UINT64_C(0x4f43424d00000000)};
         auto adapter_instance_id =
@@ -1283,12 +1331,23 @@ public:
         }
 
         const auto component = bootstrap.failed_component;
+        using OwnerStatus = OpenCudaProductionOwnerStatus;
+        const bool no_submitted_domain =
+            !bootstrap.owner.retained_cleanup_island &&
+            !bootstrap.owner.bootstrap_domain_ready &&
+            (bootstrap.owner.status == OwnerStatus::driver_initialize_failed ||
+             bootstrap.owner.status == OwnerStatus::context_unavailable ||
+             bootstrap.owner.status == OwnerStatus::stream_create_failed);
         const bool safe_cleanup =
-            bootstrap.candidate_shutdown.quiescent &&
-            bootstrap.candidate_shutdown.driver_context_release_permitted &&
+            (no_submitted_domain ||
+             (bootstrap.candidate_shutdown.quiescent &&
+              bootstrap.candidate_shutdown.driver_context_release_permitted)) &&
             !bootstrap.candidate_shutdown.pending &&
             reason != hal::ReasonId::device_lost &&
             result.status != hal::StatusId::quarantined;
+        if (automatic_host_compatibility && safe_cleanup &&
+            HostCompatibilityFailureReason(reason))
+          return host_compatibility(reason);
         if (!safe_cleanup ||
             (component == OpenCudaSetupComponentId::invalid ||
              component == OpenCudaSetupComponentId::aggregate_island)) {
@@ -1325,7 +1384,7 @@ public:
                            ? hal::ReasonId::capability_evidence_incomplete
                            : reason);
         if (selected_count() == 0)
-          return NeutralUnavailable(request, statuses, reasons);
+          return optional_unavailable();
       }
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::capability_evidence_incomplete);
