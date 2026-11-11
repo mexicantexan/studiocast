@@ -27,6 +27,61 @@ These are seven packs and eight artifacts because the gaze-correction pack has
 separate left- and right-eye ONNX files. Maxine is not redistributed and its
 presence never removes these open-source fallback defaults.
 
+### FastDVDnet correction decision and promotion gate (2026-11-10)
+
+The approved product decision is to repair/re-export `fastdvdnet_sigma15`,
+preserving its ID, default selection, and the seven-pack/eight-artifact contract.
+The currently published 416,788-byte artifact matches its pinned hash but is
+invalid: 26 convolution-weight references have no producer/initializer, and 68
+initializer tensors reference an absent `fastdvdnet.onnx.data`. Hash verification
+proves identity, not graph validity. Keep this failure visible; never substitute
+random weights, alias missing tensors, silently switch models, or overwrite an
+installed pack during validation.
+
+`scripts/models/export_fastdvdnet.py` provides an offline, reproducible correction
+using the upstream network and pretrained `model.pth` at commit
+`c8fdf6182a0340e89dd18f5df25b47337cbede6f`. Its embedded hashes verify the Python
+source, checkpoint, and full license before import/deserialization. Source:
+[upstream immutable tree](https://github.com/m-tassano/fastdvdnet/tree/c8fdf6182a0340e89dd18f5df25b47337cbede6f).
+It exports the established FP32 RGB NCHW `noisy`/`noise_map`/`denoised` contract
+as one opset-17 ONNX file with dynamic N/H/W, validates a complete graph without
+external data, and compares ONNX Runtime CPU output with the strictly loaded
+upstream network across nine geometry/noise cases. H/W must be multiples of four.
+CPU equivalence is artifact evidence, not CUDA or full-camera qualification.
+
+Reproduction uses Python 3.10 on Linux x86_64 and an isolated environment:
+
+```bash
+python3 -m venv /tmp/fastdvdnet-export-env
+/tmp/fastdvdnet-export-env/bin/python -m pip install \
+  -r scripts/models/fastdvdnet-export.requirements.txt
+# Manually fetch models.py, model.pth, LICENSE from the immutable raw GitHub URL
+# printed as UPSTREAM_BASE in the script, into /tmp/fastdvdnet-upstream.
+/tmp/fastdvdnet-export-env/bin/python scripts/models/export_fastdvdnet.py \
+  --upstream /tmp/fastdvdnet-upstream --output /tmp/fastdvdnet-candidate
+python3 tests/installer/models/fastdvdnet_export_tests.py -v
+```
+
+The corrected candidate is 9,948,304 bytes with SHA-256
+`0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
+Two independent invocations produced identical artifact bytes. Nine CPU cases
+passed with maximum absolute output error `4.76837158203125e-7`.
+The output contains an isolated source tree, candidate `model.json` and full
+license, a complete candidate catalog, and `validation.json` provenance/results.
+It never changes the shipped catalog, installed models, or external hosting.
+
+The shipped catalog below deliberately retains the existing published identity
+until promotion is authorized and complete. Promotion requires reviewed
+publication of the exact corrected artifact to a usable source, matching
+candidate metadata/license hashes, a new catalog version and measured total,
+updated pinned-catalog tests, required CUDA qualification, and the normal signed
+clean-HEAD source/AppImage release chain. The candidate catalog is review
+material, not signed release metadata and not a recommended-install trust grant.
+Without publication, simply changing the default artifact hash would make the
+download fail integrity verification. Local `--source` transport may validate a
+candidate in temporary HOME/XDG roots; it must not activate it in the user's
+installed tree without a separately authorized install.
+
 Each artifact records its destination name, pinned SHA-256, source candidates,
 provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files
 come only from hash-pinned files in the verified StudioCast source/package
