@@ -881,12 +881,40 @@ ProductionFactoryRequest(FakeCudaState *state, PendingRuntime *runtime,
 
 bool ProductionNewSemanticContractsAreExact() {
   bool ok = true;
-  for (const auto semantic : {hal::SemanticEffectId::virtual_background_replace,
-                              hal::SemanticEffectId::virtual_key_light}) {
+  for (const auto semantic :
+       {hal::SemanticEffectId::virtual_background_replace,
+        hal::SemanticEffectId::virtual_key_light,
+        hal::SemanticEffectId::auto_frame, hal::SemanticEffectId::eye_contact,
+        hal::SemanticEffectId::video_noise_removal,
+        hal::SemanticEffectId::vignette, hal::SemanticEffectId::mirror}) {
     FakeCudaState state{};
     PendingRuntime runtime{};
     runtime.pending = false;
     auto setup = ProductionFactoryRequest(&state, &runtime, semantic);
+    const bool matte =
+        semantic == hal::SemanticEffectId::virtual_background_replace ||
+        semantic == hal::SemanticEffectId::virtual_key_light;
+    const bool native = semantic == hal::SemanticEffectId::vignette ||
+                        semantic == hal::SemanticEffectId::mirror;
+    if (!matte) {
+      setup.backend.model_pack = {};
+      setup.backend.model_artifact = {};
+      setup.backend.dependencies.face_artifact = Artifact();
+      setup.backend.dependencies.landmarks_artifact = Artifact();
+      setup.backend.dependencies.eye_left_artifact = Artifact();
+      setup.backend.dependencies.eye_right_artifact = Artifact();
+      setup.backend.dependencies.denoise_artifact = Artifact();
+    }
+    if (native) {
+      setup.models[0] = {};
+      setup.backend.dependencies = {};
+      setup.backend.model_preprocess_generation = 0;
+      setup.backend.model_artifact_hash = 0;
+      setup.generations.model = 0;
+      setup.model_artifact_validated = false;
+      setup.cuda_iobinding_validated = false;
+      setup.device_preprocess_supported = false;
+    }
     open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
     auto factory = open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
         setup, &bootstrap);
@@ -898,9 +926,22 @@ bool ProductionNewSemanticContractsAreExact() {
                     factory->adapter_registration()
                         .semantic_capabilities[0]
                         .production_eligible,
-                "replace/key-light production capability must be exact and "
-                "selectable") &&
+                "each production semantic requires its exact selected artifact "
+                "and provider") &&
          ok;
+    if (!matte && !native) {
+      auto invalid = setup;
+      invalid.models[0].artifact_set_hash[0] ^= 0x7f;
+      open_cuda::OpenCudaProductionVideoExecutionBootstrapResult rejected{};
+      const auto create_calls = state.create_calls;
+      ok = Expect(!open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+                      invalid, &rejected) &&
+                      rejected.reason ==
+                          hal::ReasonId::capability_evidence_incomplete &&
+                      state.create_calls == create_calls,
+                  "mismatched task artifact must fail before CUDA ownership") &&
+           ok;
+    }
     factory.reset();
     ok =
         Expect(state.destroy_successes == 1 && runtime.stream_destructions == 1,
@@ -908,6 +949,40 @@ bool ProductionNewSemanticContractsAreExact() {
         ok;
   }
 
+  {
+    FakeCudaState state{};
+    PendingRuntime runtime{};
+    runtime.pending = false;
+    auto fallback = ProductionFactoryRequest(&state, &runtime,
+                                             hal::SemanticEffectId::auto_frame);
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult bootstrap{};
+    auto factory = open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+        fallback, &bootstrap);
+    ok =
+        Expect(
+            factory &&
+                bootstrap.setup_lease.status == hal::StatusId::degraded &&
+                bootstrap.setup_lease.reason ==
+                    hal::ReasonId::capability_evidence_incomplete &&
+                factory->adapter_registration()
+                        .semantic_capabilities[0]
+                        .status == hal::StatusId::degraded &&
+                bootstrap.setup_lease.artifacts[0].artifact.artifact_set_hash ==
+                    fallback.backend.model_artifact.artifact_set_sha256,
+            "matte-only Auto Frame fallback must report degradation and exact "
+            "analysis identity") &&
+        ok;
+    fallback.backend.dependencies.face_artifact = Artifact();
+    fallback.backend.dependencies.face_artifact.model_id_sha256[0] ^= 0x7f;
+    const auto create_calls = state.create_calls;
+    open_cuda::OpenCudaProductionVideoExecutionBootstrapResult rejected{};
+    ok = Expect(!open_cuda::OpenCudaVideoExecutionFactory::CreateProduction(
+                    fallback, &rejected) &&
+                    state.create_calls == create_calls,
+                "valid selected face identity must never be silently replaced "
+                "with matte") &&
+         ok;
+  }
   {
     FakeCudaState state{};
     PendingRuntime runtime{};

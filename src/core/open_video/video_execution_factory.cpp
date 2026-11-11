@@ -120,6 +120,10 @@ bool SamePreparedProgram(const hal::PreparedProgram &left,
       SameBudget(left.budget, right.budget) &&
       left.setup_failure_policy == right.setup_failure_policy &&
       left.stage_count == right.stage_count &&
+      left.maximum_metadata_readbacks_per_frame ==
+          right.maximum_metadata_readbacks_per_frame &&
+      left.maximum_metadata_cpu_tails_per_frame ==
+          right.maximum_metadata_cpu_tails_per_frame &&
       left.cpu_tail_count == right.cpu_tail_count &&
       left.requested_backend == right.requested_backend &&
       left.strict_backend_selection == right.strict_backend_selection &&
@@ -346,8 +350,40 @@ bool UsesMatting(hal::SemanticEffectId semantic) noexcept {
          semantic == hal::SemanticEffectId::virtual_key_light;
 }
 
-hal::SemanticEffectProviderId ProviderFor(hal::SemanticEffectId semantic) noexcept {
-  return UsesMatting(semantic) ? kProvider : kNativeProvider;
+bool UsesModel(hal::SemanticEffectId semantic) noexcept {
+  return UsesMatting(semantic) ||
+         semantic == hal::SemanticEffectId::auto_frame ||
+         semantic == hal::SemanticEffectId::eye_contact ||
+         semantic == hal::SemanticEffectId::video_noise_removal;
+}
+
+int StageOrder(hal::SemanticEffectId semantic) noexcept {
+  using S = hal::SemanticEffectId;
+  switch (semantic) {
+  case S::video_noise_removal:
+    return 1;
+  case S::virtual_background_blur:
+  case S::virtual_background_remove:
+  case S::virtual_background_replace:
+    return 3;
+  case S::virtual_key_light:
+    return 4;
+  case S::auto_frame:
+    return 5;
+  case S::eye_contact:
+    return 2;
+  case S::vignette:
+    return 6;
+  case S::mirror:
+    return 7;
+  default:
+    return 0;
+  }
+}
+
+hal::SemanticEffectProviderId
+ProviderFor(hal::SemanticEffectId semantic) noexcept {
+  return UsesModel(semantic) ? kProvider : kNativeProvider;
 }
 
 hal::SemanticEffectProviderId AggregateProvider(
@@ -450,40 +486,54 @@ hal::ImageDescriptor ResidentImage(const hal::ImageDescriptor &host,
 
 bool SupportedStages(
     const video::NormalizedVideoExecutionIntent &intent) noexcept {
-  if (intent.stage_count == 0 || intent.stage_count > 3)
+  if (intent.stage_count == 0 || intent.stage_count > hal::kMaxPreparedStages)
     return false;
-  const auto vb = [](hal::SemanticEffectId semantic) {
-    return semantic == hal::SemanticEffectId::virtual_background_blur ||
-           semantic == hal::SemanticEffectId::virtual_background_remove ||
-           semantic == hal::SemanticEffectId::virtual_background_replace;
-  };
-  const bool vignette_last = intent.stages[intent.stage_count - 1].intent.semantic ==
-                             hal::SemanticEffectId::vignette;
-  const std::size_t resident_count = intent.stage_count - (vignette_last ? 1u : 0u);
-  if (resident_count == 0)
-    return vignette_last;
-  return ((resident_count == 1 &&
-          (vb(intent.stages[0].intent.semantic) ||
-           intent.stages[0].intent.semantic ==
-               hal::SemanticEffectId::virtual_key_light)) ||
-         (resident_count == 2 && vb(intent.stages[0].intent.semantic) &&
-          intent.stages[1].intent.semantic ==
-              hal::SemanticEffectId::virtual_key_light)) &&
-         resident_count + (vignette_last ? 1u : 0u) == intent.stage_count;
+  int previous = 0;
+  for (std::size_t index = 0; index < intent.stage_count; ++index) {
+    const auto order = StageOrder(intent.stages[index].intent.semantic);
+    if (order <= previous)
+      return false;
+    previous = order;
+  }
+  return true;
+}
+
+video::PerFrameTransferContract
+TransferContract(const OpenCudaVideoExecutionCachedEvidence &cached,
+                 const video::NormalizedVideoExecutionIntent &intent,
+                 const hal::DomainPlan &domain_plan) noexcept {
+  (void)intent;
+  if (cached.maximum_metadata_readbacks_per_frame == 0 &&
+      cached.maximum_metadata_cpu_tails_per_frame == 0 &&
+      cached.maximum_metadata_synchronizations_per_frame == 0)
+    return video::BuildPerFrameTransferContract(
+        domain_plan, cached.minimum_synchronizations_per_frame,
+        cached.maximum_synchronizations_per_frame);
+  video::VariablePerFrameTransferBounds bounds;
+  bounds.maximum_intermediate_readbacks =
+      cached.maximum_metadata_readbacks_per_frame;
+  bounds.minimum_cpu_tail_boundaries =
+      domain_plan.expected_transfers.cpu_tail_boundaries;
+  bounds.maximum_cpu_tail_boundaries =
+      bounds.minimum_cpu_tail_boundaries +
+      cached.maximum_metadata_cpu_tails_per_frame;
+  return video::BuildVariablePerFrameTransferContract(
+      domain_plan, cached.minimum_synchronizations_per_frame,
+      cached.maximum_synchronizations_per_frame +
+          cached.maximum_metadata_synchronizations_per_frame,
+      bounds);
 }
 
 bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
                          const video::VideoExecutionPlanRequest &request,
                          const hal::ResolutionResult &resolution,
                          const hal::DomainPlan &domain_plan) noexcept {
-  const auto transfer_contract = video::BuildPerFrameTransferContract(
-      domain_plan, cached.minimum_synchronizations_per_frame,
-      cached.maximum_synchronizations_per_frame);
-  hal::ReasonId transfer_reason = hal::ReasonId::none;
   const auto compact = CompactIntent(request, resolution);
+  const auto transfer_contract = TransferContract(cached, compact, domain_plan);
+  hal::ReasonId transfer_reason = hal::ReasonId::none;
   bool has_model_consumer = false;
   for (std::size_t index = 0; index < compact.stage_count; ++index)
-    has_model_consumer |= UsesMatting(compact.stages[index].intent.semantic);
+    has_model_consumer |= UsesModel(compact.stages[index].intent.semantic);
   if ((has_model_consumer && !cached.model_artifact_validated) ||
       !cached.provider_runtime_validated ||
       !cached.device_context_validated ||
@@ -491,8 +541,9 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
       !cached.user_stream_bound || !cached.reusable_resources_supported ||
       (has_model_consumer && !cached.device_preprocess_supported) ||
       !cached.device_postprocess_supported || !cached.one_upload_one_readback ||
-      !cached.no_intermediate_crossings || !cached.stop_aware_bounded_wait ||
-      !cached.allocation_free_execute ||
+      (!cached.no_intermediate_crossings &&
+       !transfer_contract.variable_boundaries_declared) ||
+      !cached.stop_aware_bounded_wait || !cached.allocation_free_execute ||
       !hal::ValidateExecutionDomain(cached.execution_domain) ||
       domain_plan.island_count != 1 ||
       cached.execution_domain != domain_plan.islands[0].execution_domain ||
@@ -528,10 +579,9 @@ bool ExactCachedEvidence(const OpenCudaVideoExecutionCachedEvidence &cached,
     if (resolution.stages[index].skipped_optional)
       continue;
     const auto semantic = request.intent.stages[index].intent.semantic;
-    if ((UsesMatting(semantic) &&
-         !SameModel(request.intent.stages[index].model,
-                    cached.models[prepared_index])) ||
-        (!UsesMatting(semantic) &&
+    if ((UsesModel(semantic) && !SameModel(request.intent.stages[index].model,
+                                           cached.models[prepared_index])) ||
+        (!UsesModel(semantic) &&
          (!ZeroModel(request.intent.stages[index].model) ||
           !ZeroModel(cached.models[prepared_index]))))
       return false;
@@ -569,7 +619,9 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
     }
     if (resolution.stages[index].selected_backend != hal::BackendId::cuda ||
         resolution.stages[index].provider != ProviderFor(intent.semantic) ||
-        intent.stage_id == 0 || intent.requires_tracked_vignette_center ||
+        intent.stage_id == 0 ||
+        (intent.requires_tracked_vignette_center &&
+         intent.semantic != hal::SemanticEffectId::vignette) ||
         (intent.required &&
          intent.failure_action != hal::FailureAction::fail_closed) ||
         (!intent.required &&
@@ -579,11 +631,40 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
       return false;
     }
   }
+  bool has_auto_frame = false;
+  for (std::size_t index = 0; index < compact.stage_count; ++index) {
+    const auto semantic = compact.stages[index].intent.semantic;
+    has_auto_frame |= semantic == hal::SemanticEffectId::auto_frame;
+  }
+  bool optional_auto_frame_skipped = false;
+  bool canonical_needs_history = false;
+  for (std::size_t index = 0; index < request.intent.stage_count; ++index) {
+    const auto &stage = request.intent.stages[index].intent;
+    canonical_needs_history |=
+        stage.semantic == hal::SemanticEffectId::auto_frame ||
+        stage.semantic == hal::SemanticEffectId::eye_contact ||
+        stage.semantic == hal::SemanticEffectId::video_noise_removal;
+    optional_auto_frame_skipped |=
+        stage.semantic == hal::SemanticEffectId::auto_frame &&
+        !stage.required && resolution.stages[index].skipped_optional;
+  }
+  for (std::size_t index = 0; index < compact.stage_count; ++index)
+    if (compact.stages[index].intent.requires_tracked_vignette_center &&
+        !has_auto_frame && !optional_auto_frame_skipped) {
+      SetReason(reason, hal::ReasonId::semantic_effect_unsupported);
+      return false;
+    }
+  if (request.temporal.temporal != canonical_needs_history ||
+      (canonical_needs_history &&
+       (!request.temporal.temporal ||
+        !request.temporal.requires_contiguous_capture_sequence ||
+        request.temporal.history_frames == 0))) {
+    SetReason(reason, hal::ReasonId::malformed_contract);
+    return false;
+  }
   const auto &intent = compact.stages[compact.stage_count - 1].intent;
   if (!TightRgb24(request.host_input, hal::Mutability::read_only) ||
       !TightRgb24(request.host_output, hal::Mutability::write_only) ||
-      request.temporal.temporal ||
-      request.temporal.requires_contiguous_capture_sequence ||
       request.cpu_tail_count != 1 ||
       request.cpu_tails[0].id != hal::CpuTailId::writer_copy ||
       request.cpu_tails[0].after_stage_id != intent.stage_id ||
@@ -611,8 +692,13 @@ bool ConservativeRoute(const video::VideoExecutionPlanRequest &request,
 hal::PreparedProgram
 BuildProgram(const video::VideoExecutionPlanRequest &request,
              const hal::ResolutionResult &resolution,
-             const hal::DomainPlan &domain_plan) noexcept {
+             const hal::DomainPlan &domain_plan,
+             const OpenCudaVideoExecutionCachedEvidence &cached) noexcept {
   hal::PreparedProgram program;
+  program.maximum_metadata_readbacks_per_frame =
+      cached.maximum_metadata_readbacks_per_frame;
+  program.maximum_metadata_cpu_tails_per_frame =
+      cached.maximum_metadata_cpu_tails_per_frame;
   const auto &domain = domain_plan.islands[0].execution_domain;
   program.program_id = request.plan_id;
   program.owner_adapter_instance_id = domain.adapter_instance_id;
@@ -811,16 +897,15 @@ public:
   }
 
   hal::StatusId ResetTemporal(hal::ReasonId reason) noexcept override {
-    (void)reason;
     if (!session_)
       return hal::StatusId::stale;
-    if (session_->stopped())
-      return hal::StatusId::stopped;
-    if (session_->quarantined())
-      return hal::StatusId::quarantined;
-    // The first Open CUDA route rejects all temporal history at preflight, so
-    // there is no resident history to reset.
-    return session_->prepared() ? hal::StatusId::ready : hal::StatusId::stale;
+    const auto status = session_->ResetTemporalState(reason);
+    if (candidate_.owner && candidate_.observe_runtime_owner)
+      candidate_.observe_runtime_owner(candidate_.owner, status,
+                                       status == hal::StatusId::quarantined
+                                           ? hal::ReasonId::device_lost
+                                           : reason);
+    return status;
   }
 
   void Shutdown() noexcept override {
@@ -1251,22 +1336,85 @@ OpenCudaVideoExecutionFactory::CreateProduction(
        request.backend.key_light_direction_pan_degrees >= -90 &&
        request.backend.key_light_direction_pan_degrees <= 90);
   bool has_model_consumer = false;
-  bool exact_model = true;
-  for (std::size_t i = 0; i < request.stage_count; ++i) {
-    if (!UsesMatting(request.semantics[i])) {
+  bool has_matting = false;
+  bool exact_model = request.stage_count <= request.semantics.size();
+  for (std::size_t i = 0; i < checked_count; ++i) {
+    const auto semantic = request.semantics[i];
+    const auto percent = [](int value) { return value >= 0 && value <= 100; };
+    if (semantic == hal::SemanticEffectId::video_noise_removal)
+      exact_model &= percent(request.backend.denoise_strength);
+    if (semantic == hal::SemanticEffectId::auto_frame)
+      exact_model &= percent(request.backend.auto_frame_strength) &&
+                     percent(request.backend.auto_frame_smoothing) &&
+                     request.backend.auto_frame_headroom >= 0.F &&
+                     request.backend.auto_frame_headroom <= 1.F;
+    if (semantic == hal::SemanticEffectId::eye_contact)
+      exact_model &= percent(request.backend.eye_contact_strength);
+    if (semantic == hal::SemanticEffectId::vignette)
+      exact_model &= percent(request.backend.vignette_intensity);
+    has_matting |= UsesMatting(semantic);
+    if (!UsesModel(semantic)) {
       exact_model &= ZeroModel(request.models[i]);
       continue;
     }
     has_model_consumer = true;
-    exact_model &= request.models[i].model_id_hash ==
-                       request.backend.model_artifact.model_id_sha256 &&
-                   request.models[i].artifact_set_hash ==
-                       request.backend.model_artifact.artifact_set_sha256 &&
-                   request.models[i].artifact_generation ==
-                       request.backend.model_artifact.registry_generation;
+    const auto &artifact =
+        UsesMatting(semantic) ? request.backend.model_artifact
+        : semantic == hal::SemanticEffectId::auto_frame
+            ? (request.backend.dependencies.face_artifact.Valid()
+                   ? request.backend.dependencies.face_artifact
+                   : request.backend.model_artifact)
+        : semantic == hal::SemanticEffectId::eye_contact
+            ? request.backend.dependencies.eye_left_artifact
+            : request.backend.dependencies.denoise_artifact;
+    exact_model &=
+        artifact.Valid() &&
+        request.models[i].model_id_hash == artifact.model_id_sha256 &&
+        request.models[i].artifact_set_hash == artifact.artifact_set_sha256 &&
+        request.models[i].artifact_generation == artifact.registry_generation;
+    if (semantic == hal::SemanticEffectId::eye_contact) {
+      const auto &deps = request.backend.dependencies;
+      exact_model &=
+          deps.face_artifact.Valid() && deps.landmarks_artifact.Valid() &&
+          deps.eye_right_artifact.Valid() &&
+          deps.eye_right_artifact.artifact_set_sha256 ==
+              artifact.artifact_set_sha256 &&
+          deps.eye_right_artifact.model_id_sha256 == artifact.model_id_sha256 &&
+          deps.eye_right_artifact.registry_generation ==
+              artifact.registry_generation;
+    }
   }
-  exact_model &= has_model_consumer ? request.backend.model_artifact.Valid()
-                                    : !request.backend.model_artifact.Valid();
+  const bool has_auto_frame =
+      std::find(request.semantics.begin(),
+                request.semantics.begin() + checked_count,
+                hal::SemanticEffectId::auto_frame) !=
+      request.semantics.begin() + checked_count;
+  const bool has_eye = std::find(request.semantics.begin(),
+                                 request.semantics.begin() + checked_count,
+                                 hal::SemanticEffectId::eye_contact) !=
+                       request.semantics.begin() + checked_count;
+  const bool face_analysis = (has_auto_frame || has_eye) &&
+                             request.backend.dependencies.face_artifact.Valid();
+  const bool matte_bounds =
+      has_auto_frame && request.backend.model_artifact.Valid();
+  exact_model &=
+      has_matting ? request.backend.model_artifact.Valid()
+                  : (!request.backend.model_artifact.Valid() || has_auto_frame);
+  const bool matte_auto_frame_fallback =
+      has_auto_frame && !face_analysis && matte_bounds;
+  bool optional_auto_frame_unavailable = false;
+  for (std::size_t index = 0;
+       index < canonical_stage_count &&
+       index < request.plan.intent.stages.size() && has_canonical_plan;
+       ++index) {
+    const auto &stage = request.plan.intent.stages[index].intent;
+    optional_auto_frame_unavailable |=
+        stage.semantic == hal::SemanticEffectId::auto_frame &&
+        !stage.required && !IsSetupSuccess(request.canonical_status[index]);
+  }
+  if (request.backend.vignette_tracked_center)
+    exact_model &= (has_auto_frame && (face_analysis || matte_bounds)) ||
+                   optional_auto_frame_unavailable;
   if (request.factory_id == 0 || canonical_stage_count == 0 ||
       canonical_stage_count > hal::kMaxPreparedStages || !supported_semantic ||
       !replacement_contract ||
@@ -1333,11 +1481,29 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     config.cached.device_preprocess_supported = request.device_preprocess_supported;
     config.cached.device_postprocess_supported = true;
     config.cached.one_upload_one_readback = true;
-    config.cached.no_intermediate_crossings = true;
+    config.cached.no_intermediate_crossings = std::none_of(
+        request.semantics.begin(), request.semantics.begin() + checked_count,
+        [](hal::SemanticEffectId semantic) {
+          return semantic == hal::SemanticEffectId::auto_frame ||
+                 semantic == hal::SemanticEffectId::eye_contact;
+        });
     config.cached.stop_aware_bounded_wait = true;
     config.cached.allocation_free_execute = true;
     config.cached.minimum_synchronizations_per_frame = 1;
     config.cached.maximum_synchronizations_per_frame = 1;
+    config.cached.maximum_metadata_readbacks_per_frame =
+        (face_analysis ? 12u : 0u) + (matte_bounds ? 1u : 0u);
+    config.cached.maximum_metadata_cpu_tails_per_frame =
+        (face_analysis ? 1u : 0u) + (has_auto_frame ? 1u : 0u) +
+        (matte_bounds ? 1u : 0u);
+    config.cached.maximum_metadata_synchronizations_per_frame =
+        (face_analysis ? 1u : 0u) + (matte_bounds ? 1u : 0u);
+    if (matte_auto_frame_fallback) {
+      config.cached.readiness.status = hal::StatusId::degraded;
+      config.cached.readiness.reason =
+          hal::ReasonId::capability_evidence_incomplete;
+      config.cached.readiness.degraded = true;
+    }
 
     auto factory = std::unique_ptr<OpenCudaVideoExecutionFactory>(
         new OpenCudaVideoExecutionFactory(std::move(config)));
@@ -1385,13 +1551,23 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           impl.production_registration.semantic_capabilities[index];
       capability.semantic = semantic;
       capability.provider = ProviderFor(semantic);
-      capability.status = status;
-      capability.reason = reason;
+      capability.status = matte_auto_frame_fallback &&
+                                  semantic == hal::SemanticEffectId::auto_frame
+                              ? hal::StatusId::degraded
+                              : status;
+      capability.reason = matte_auto_frame_fallback &&
+                                  semantic == hal::SemanticEffectId::auto_frame
+                              ? hal::ReasonId::capability_evidence_incomplete
+                              : reason;
       capability.cpu_tail = index == final_selected_capability
                                 ? hal::CpuTailId::writer_copy
                                 : hal::CpuTailId::invalid;
       capability.cpu_tail_placement =
           hal::DeclaredCpuTail::Placement::after_stage;
+      capability.supports_tracked_vignette_center =
+          selectable && semantic == hal::SemanticEffectId::vignette &&
+          request.backend.vignette_tracked_center &&
+          (has_auto_frame || optional_auto_frame_unavailable);
       capability.live_stage = selectable;
       capability.production_eligible = selectable;
       capability.exact_evidence = selectable;
@@ -1403,7 +1579,7 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           hal::BackendId::cuda,
           true};
       capability.evidence[1] = {
-          UsesMatting(semantic)
+          UsesModel(semantic)
               ? hal::CapabilityEvidenceCode::model_artifact_identity_valid
               : hal::CapabilityEvidenceCode::synchronization_evidence_valid,
           hal::StatusId::ready,
@@ -1418,8 +1594,8 @@ OpenCudaVideoExecutionFactory::CreateProduction(
           semantic,
           hal::BackendId::cuda,
           true};
-      capability.evidence_count = selectable ? (UsesMatting(semantic) ? 3 : 2)
-                                             : 0;
+      capability.evidence_count =
+          selectable ? (UsesModel(semantic) ? 3 : 2) : 0;
     }
     impl.production_registration.semantic_capability_count =
         canonical_stage_count;
@@ -1443,11 +1619,12 @@ OpenCudaVideoExecutionFactory::CreateProduction(
     snapshot.provider_count = 1;
     for (std::size_t index = 1; index < request.stage_count; ++index) {
       const auto provider = ProviderFor(request.semantics[index]);
-      if (provider != snapshot.providers[0])
+      if (provider != snapshot.providers[0] &&
+          (snapshot.provider_count < 2 || provider != snapshot.providers[1]))
         snapshot.providers[snapshot.provider_count++] = provider;
     }
     for (std::size_t index = 0; index < request.stage_count; ++index) {
-      if (!UsesMatting(request.semantics[index]))
+      if (!UsesModel(request.semantics[index]))
         continue;
       auto &leased = snapshot.artifacts[snapshot.artifact_count++];
       leased.semantic = request.semantics[index];
@@ -1756,10 +1933,9 @@ video::VideoAdapterFactoryPreflight OpenCudaVideoExecutionFactory::Preflight(
   }
   result.execution_domain = impl_->config.cached.execution_domain;
   result.readiness = impl_->config.cached.readiness;
-  result.per_frame_transfers = video::BuildPerFrameTransferContract(
-      frozen_domain_plan,
-      impl_->config.cached.minimum_synchronizations_per_frame,
-      impl_->config.cached.maximum_synchronizations_per_frame);
+  result.per_frame_transfers = TransferContract(
+      impl_->config.cached, CompactIntent(request, frozen_resolution),
+      frozen_domain_plan);
   if (route != video::VideoExecutionRoute::prepared_resident) {
     result.status = hal::StatusId::blocked;
     result.reason = hal::ReasonId::semantic_effect_unsupported;
@@ -1778,8 +1954,8 @@ video::VideoAdapterFactoryPreflight OpenCudaVideoExecutionFactory::Preflight(
     result.reason = hal::ReasonId::capability_evidence_incomplete;
     return result;
   }
-  result.prepared_program =
-      BuildProgram(request, frozen_resolution, frozen_domain_plan);
+  result.prepared_program = BuildProgram(
+      request, frozen_resolution, frozen_domain_plan, impl_->config.cached);
   if (!hal::ValidatePreparedProgram(result.prepared_program, &reason)) {
     result.status = hal::StatusId::blocked;
     result.reason = reason;

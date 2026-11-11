@@ -1,5 +1,5 @@
-#include "core/open_video/open_cuda_hal_adapter.h"
 #include "core/open_video/matting_session.h"
+#include "core/open_video/open_cuda_hal_adapter.h"
 
 #include <array>
 #include <cstddef>
@@ -229,6 +229,10 @@ public:
   };
 
   bool fail_prepare = false;
+  bool new_semantics_qualified = false;
+  std::uint32_t metadata_readbacks = 0;
+  std::uint32_t metadata_tails = 0;
+  std::uint32_t frame_synchronizations = 1;
   bool incomplete_evidence = false;
   bool mutate_evidence_layout = false;
   bool explicit_provider_sync = false;
@@ -292,6 +296,15 @@ public:
         Resource(program, 700 + result.handle.handle_id, true);
     result.handle.opaque[0] = result.handle.handle_id + 100;
     result.evidence.capability = CompleteFacts();
+    if (new_semantics_qualified) {
+      auto &facts = result.evidence.capability;
+      facts.auto_frame = facts.eye_contact = facts.video_noise_removal =
+          facts.mirror = true;
+      facts.native_mirror_kernel_prepared = true;
+      facts.max_intermediate_readbacks_per_frame = 13;
+      facts.max_cpu_tail_boundaries_per_frame = 3;
+      facts.completion_synchronizations_per_frame = 3;
+    }
     if (incomplete_evidence)
       result.evidence.capability.no_cpu_fallback = false;
     if (explicit_provider_sync) {
@@ -318,6 +331,7 @@ public:
       evidence.device_postprocess = true;
       evidence.shared_analysis = true;
       evidence.temporal_history_device_resident =
+          new_semantics_qualified ||
           stage.semantic != hal::SemanticEffectId::video_noise_removal;
       evidence.cpu_fallback_disabled = true;
     }
@@ -402,16 +416,18 @@ public:
     result.transfers.uploads = slot->program.requires_upload ? 1 : 0;
     result.transfers.final_readbacks =
         slot->program.requires_final_readback && !required_stage_failed ? 1 : 0;
-    result.transfers.intermediate_readbacks = add_intermediate_transfer ? 1 : 0;
-    result.transfers.cpu_tail_boundaries = slot->program.cpu_tail_count;
+    result.transfers.intermediate_readbacks =
+        metadata_readbacks + (add_intermediate_transfer ? 1u : 0u);
+    result.transfers.cpu_tail_boundaries =
+        slot->program.cpu_tail_count + metadata_tails;
     if (!hide_upload)
       telemetry.uploads += result.transfers.uploads;
     telemetry.final_readbacks += result.transfers.final_readbacks;
     telemetry.intermediate_readbacks += result.transfers.intermediate_readbacks;
     telemetry.cpu_tail_boundaries += result.transfers.cpu_tail_boundaries;
     if (!hide_sync) {
-      ++telemetry.synchronizations;
-      result.transfers.synchronizations = 1;
+      telemetry.synchronizations += frame_synchronizations;
+      result.transfers.synchronizations = frame_synchronizations;
     }
     bool model_stage_ran = false;
     for (std::size_t index = 0; index < result.stage_count; ++index) {
@@ -420,7 +436,8 @@ public:
           result.stages[index].status != hal::StageExecutionStatus::not_run &&
           result.stages[index].status !=
               hal::StageExecutionStatus::disabled_preserved &&
-          semantic != hal::SemanticEffectId::vignette;
+          semantic != hal::SemanticEffectId::vignette &&
+          semantic != hal::SemanticEffectId::mirror;
     }
     if (model_stage_ran)
       ++telemetry.shared_analysis_runs;
@@ -583,9 +600,30 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
         open_cuda::EvaluateResidentCapability(semantic, facts);
     ok &= Require(capability.status == hal::StatusId::blocked &&
                       capability.reason ==
-                          hal::ReasonId::semantic_effect_unsupported &&
+                          hal::ReasonId::capability_evidence_incomplete &&
                       !capability.production_eligible,
                   "CPU-tensor or unsupported semantics must remain blocked");
+  }
+  facts.auto_frame = true;
+  facts.eye_contact = true;
+  facts.video_noise_removal = true;
+  facts.mirror = true;
+  facts.native_mirror_kernel_prepared = true;
+  for (const auto semantic :
+       {hal::SemanticEffectId::auto_frame, hal::SemanticEffectId::eye_contact,
+        hal::SemanticEffectId::video_noise_removal,
+        hal::SemanticEffectId::mirror}) {
+    const auto capability =
+        open_cuda::EvaluateResidentCapability(semantic, facts);
+    ok &= Require(capability.production_eligible && capability.exact_evidence &&
+                      capability.status == hal::StatusId::ready &&
+                      capability.provider ==
+                          (semantic == hal::SemanticEffectId::mirror
+                               ? hal::SemanticEffectProviderId::
+                                     open_cuda_production_kernels
+                               : hal::SemanticEffectProviderId::
+                                     open_video_onnxruntime_cuda),
+                  "new resident semantics require exact individual evidence");
   }
   facts.no_cpu_fallback = false;
   ok &=
@@ -623,6 +661,63 @@ bool TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders() {
           hal::SemanticEffectId::virtual_background_remove, facts)
               .production_eligible,
       "missing key-light evidence must not demote independently proven remove");
+  return ok;
+}
+
+bool TestDistinctModelCombinationAndMetadataAreExact() {
+  bool ok = true;
+  for (int mode = 0; mode < 4; ++mode) {
+    FakeExecutor executor;
+    executor.new_semantics_qualified = true;
+    executor.metadata_readbacks = mode == 1 ? 14 : 13;
+    executor.metadata_tails = mode == 2 ? 4 : 3;
+    executor.frame_synchronizations = mode == 3 ? 4 : 3;
+    open_cuda::ResidentAdapter adapter(81, executor);
+    auto program = Program(103);
+    const std::array semantics{hal::SemanticEffectId::video_noise_removal,
+      hal::SemanticEffectId::eye_contact,
+      hal::SemanticEffectId::virtual_background_blur,
+      hal::SemanticEffectId::virtual_key_light,
+      hal::SemanticEffectId::auto_frame,
+      hal::SemanticEffectId::vignette, hal::SemanticEffectId::mirror};
+    program.stage_count = semantics.size();
+    for (std::size_t index = 0; index < semantics.size(); ++index) {
+      program.stages[index] =
+          Stage(static_cast<std::uint32_t>(index + 1), semantics[index]);
+      if (semantics[index] == hal::SemanticEffectId::virtual_key_light)
+        program.stages[index].model = program.stages[2].model;
+      if (semantics[index] == hal::SemanticEffectId::vignette ||
+          semantics[index] == hal::SemanticEffectId::mirror) {
+        program.stages[index].model = {};
+        program.stages[index].provider =
+            hal::SemanticEffectProviderId::open_cuda_production_kernels;
+      }
+    }
+    program.maximum_metadata_readbacks_per_frame = 13;
+    program.maximum_metadata_cpu_tails_per_frame = 3;
+    program.temporal.temporal = true;
+    program.temporal.requires_contiguous_capture_sequence = true;
+    program.temporal.history_frames = 5;
+    program.temporal.frame_drop_behavior =
+        hal::FrameDropBehavior::reset_temporal_state;
+    hal::PreparedProgramSession session;
+    ok &= Configure(&session, &adapter, program);
+    ok &= Require(session.readiness().provider ==
+                      hal::SemanticEffectProviderId::invalid,
+                  "mixed native and model stages retain exact stage providers");
+    const auto frame = session.Execute(Request(program));
+    ok &= Require(mode == 0 ? frame.status == hal::StatusId::executed &&
+                                  frame.output_valid
+                            : frame.status == hal::StatusId::failed,
+                  "combination permits only declared metadata/tails/waits");
+    if (mode == 0) {
+      hal::ReasonId reason = hal::ReasonId::none;
+      ok &= Require(!session.latest_committed_frame().valid &&
+                        session.CommitOutput({frame.completion, true},
+                                             &reason) == hal::StatusId::ready,
+                    "combined frame attribution requires writer commit");
+    }
+  }
   return ok;
 }
 
@@ -763,7 +858,7 @@ bool TestMalformedAndForeignProgramsFailClosed() {
     hal::ReasonId reason = hal::ReasonId::none;
     ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
                           hal::StatusId::blocked &&
-                      reason == hal::ReasonId::semantic_effect_unsupported,
+                      reason == hal::ReasonId::capability_evidence_incomplete,
                   "non-resident FastDVDnet path must remain blocked");
   }
   {
@@ -1518,6 +1613,7 @@ bool TestMattingExecutionRequiresExactSetupPreparation() {
 int main() {
   bool ok = true;
   ok &= TestCapabilityIsExactAndDoesNotPromoteCpuTensorProviders();
+  ok &= TestDistinctModelCombinationAndMetadataAreExact();
   ok &= TestNativeVignetteDoesNotRequireModelAnalysisTelemetry();
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestMalformedAndForeignProgramsFailClosed();

@@ -1304,8 +1304,29 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
   if (completion_pending_ || host_binding_pending_)
     return StatusId::failed;
   const auto status = adapter_->ResetTemporalState(handle_, reason);
-  if (status == StatusId::ready)
+  if (status == StatusId::ready) {
     ++telemetry_.temporal_resets;
+    telemetry_.runtime_status = readiness_.status;
+    telemetry_.runtime_reason = readiness_.reason;
+  } else {
+    latest_committed_frame_ = {};
+    telemetry_.runtime_status = status;
+    telemetry_.runtime_reason =
+        status == StatusId::quarantined ? ReasonId::device_lost : reason;
+    readiness_.status = status;
+    readiness_.reason = telemetry_.runtime_reason;
+    readiness_.available = false;
+    if (status == StatusId::quarantined) {
+      quarantined_ = true;
+      ++telemetry_.device_losses;
+    } else {
+      // History is no longer proven valid. Reconfiguration is the recovery
+      // boundary; a contiguous next frame cannot skip the failed reset.
+      rebuild_requested_ = true;
+      readiness_.rebuild_requested = true;
+      ++telemetry_.rebuild_requests;
+    }
+  }
   return status;
 }
 

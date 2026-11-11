@@ -1071,6 +1071,49 @@ bool TestDeclaredMetadataTransferBounds() {
   return ok;
 }
 
+bool TestFatalTemporalResetInvalidatesActiveAttribution() {
+  bool ok = true;
+  for (const auto status : {StatusId::failed, StatusId::quarantined,
+                            StatusId::stale, StatusId::stopped,
+                            StatusId::blocked, StatusId::resource_exhausted,
+                            StatusId::degraded, StatusId::invalid,
+                            StatusId::unavailable, StatusId::passthrough,
+                            StatusId::executed}) {
+    FakeAdapter adapter;
+    PreparedProgramSession session;
+    const auto program = Program(197, 77, 1);
+    ok &= Configure(&session, &adapter, program);
+    const auto frame = session.Execute(Request(program, 1));
+    ReasonId reason = ReasonId::none;
+    ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                      StatusId::ready,
+                  "initial reset test output must commit");
+    adapter.reset_status = status;
+    ok &= Require(
+        session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
+                status &&
+            session.telemetry().runtime_status == status &&
+            session.telemetry().temporal_resets == 0 && adapter.reset_calls == 1 &&
+            session.telemetry().runtime_reason ==
+                (status == StatusId::quarantined
+                     ? ReasonId::device_lost
+                     : ReasonId::temporal_discontinuity) &&
+            !session.latest_committed_frame().valid &&
+            !session.readiness().available,
+        "fatal reset must clear active success and report exact failure");
+    const auto next = session.Execute(Request(program, 2));
+    ok &= Require(
+        next.status == (status == StatusId::quarantined ? StatusId::quarantined
+                                                        : StatusId::stale) &&
+            adapter.execute_calls == 1,
+        "failed reset cannot continue with unproven temporal history");
+    ok &= Require(status != StatusId::quarantined ||
+                      session.telemetry().device_losses == 1,
+                  "reset device loss must latch quarantine telemetry");
+  }
+  return ok;
+}
+
 bool TestExplicitTemporalResetGuardsAndForwarding() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -1087,10 +1130,6 @@ bool TestExplicitTemporalResetGuardsAndForwarding() {
   ok &= Require(session.CommitOutput({frame.completion, true}, &reason) == StatusId::ready,
                 "initial commit failed");
   const auto committed = session.latest_committed_frame();
-  adapter.reset_status = StatusId::blocked;
-  ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
-                        StatusId::blocked && session.telemetry().temporal_resets == 0,
-                    "reset must return exact adapter failure");
   adapter.reset_status = StatusId::ready;
   ok &= Require(session.ResetTemporalState(ReasonId::temporal_discontinuity) ==
                         StatusId::ready && session.telemetry().temporal_resets == 1 &&
@@ -1320,6 +1359,7 @@ int main() {
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestCircuitBreakerActionsAndRetryTransitions();
   ok &= TestDeclaredMetadataTransferBounds();
+  ok &= TestFatalTemporalResetInvalidatesActiveAttribution();
   ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();
