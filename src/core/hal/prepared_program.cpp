@@ -805,9 +805,9 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
       case FrameDropBehavior::reset_temporal_state: {
         const StatusId reset = adapter_->ResetTemporalState(
             handle_, ReasonId::temporal_discontinuity);
+        HandleTemporalResetResult(reset, ReasonId::temporal_discontinuity);
         if (reset != StatusId::ready)
-          return FailedExecute(reset, ReasonId::temporal_discontinuity);
-        ++telemetry_.temporal_resets;
+          return FailedExecute(reset, telemetry_.runtime_reason);
         temporal_state_reset = true;
         break;
       }
@@ -822,9 +822,9 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
           }
           const StatusId reset = adapter_->ResetTemporalState(
               handle_, ReasonId::temporal_discontinuity);
+          HandleTemporalResetResult(reset, ReasonId::temporal_discontinuity);
           if (reset != StatusId::ready)
-            return FailedExecute(reset, ReasonId::temporal_discontinuity);
-          ++telemetry_.temporal_resets;
+            return FailedExecute(reset, telemetry_.runtime_reason);
           temporal_state_reset = true;
         }
         break;
@@ -984,6 +984,14 @@ StatusId PreparedProgramSession::BindHostFrame(const HostFrameBinding &binding,
   if (stopped_) {
     SetReason(reason, ReasonId::shutdown_requested);
     return StatusId::stopped;
+  }
+  if (quarantined_) {
+    SetReason(reason, readiness_.reason);
+    return StatusId::quarantined;
+  }
+  if (rebuild_requested_) {
+    SetReason(reason, ReasonId::reconfiguration_required);
+    return StatusId::stale;
   }
   if (!prepared_ || adapter_ == nullptr || tokens == nullptr ||
       completion_pending_ || host_binding_pending_) {
@@ -1165,8 +1173,9 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
 
 bool PreparedProgramSession::MayRetainOldProgram(
     const PreparedProgram &candidate) const noexcept {
-  if (!prepared_ || candidate.maximum_metadata_readbacks_per_frame !=
-                        program_.maximum_metadata_readbacks_per_frame ||
+  if (!prepared_ || quarantined_ || rebuild_requested_ ||
+      candidate.maximum_metadata_readbacks_per_frame !=
+          program_.maximum_metadata_readbacks_per_frame ||
       candidate.maximum_metadata_cpu_tails_per_frame !=
           program_.maximum_metadata_cpu_tails_per_frame ||
       candidate.setup_failure_policy != SetupFailurePolicy::retain_old_program) {
@@ -1304,11 +1313,23 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
   if (completion_pending_ || host_binding_pending_)
     return StatusId::failed;
   const auto status = adapter_->ResetTemporalState(handle_, reason);
+  HandleTemporalResetResult(status, reason);
+  return status;
+}
+
+void PreparedProgramSession::HandleTemporalResetResult(StatusId status,
+                                                     ReasonId reason) noexcept {
   if (status == StatusId::ready) {
     ++telemetry_.temporal_resets;
     telemetry_.runtime_status = readiness_.status;
     telemetry_.runtime_reason = readiness_.reason;
   } else {
+    completion_pending_ = false;
+    host_binding_pending_ = false;
+    pending_host_binding_ = {};
+    pending_host_tokens_ = {};
+    pending_completion_ = {};
+    pending_stage_count_ = 0;
     latest_committed_frame_ = {};
     telemetry_.runtime_status = status;
     telemetry_.runtime_reason =
@@ -1327,7 +1348,6 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
       ++telemetry_.rebuild_requests;
     }
   }
-  return status;
 }
 
 void PreparedProgramSession::Invalidate(ReasonId reason) noexcept {

@@ -1114,6 +1114,119 @@ bool TestFatalTemporalResetInvalidatesActiveAttribution() {
   return ok;
 }
 
+bool TestHostBoundTemporalDiscontinuityResetResults() {
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> input{}, output{};
+  bool ok = true;
+  for (const auto drop : {FrameDropBehavior::reset_temporal_state,
+                          FrameDropBehavior::latest_frame_wins}) {
+    for (const auto reset_status :
+         {StatusId::ready, StatusId::quarantined, StatusId::failed,
+          StatusId::blocked, StatusId::resource_exhausted, StatusId::degraded,
+          StatusId::invalid}) {
+      FakeAdapter adapter;
+      PreparedProgramSession session;
+      auto program = Program(196, 77, 1);
+      program.temporal.frame_drop_behavior = drop;
+      ok &= Configure(&session, &adapter, program);
+      HostFrameBinding binding;
+      binding.input_descriptor = program.host_input;
+      binding.output_descriptor = program.host_output;
+      binding.input_plane_count = binding.output_plane_count = 1;
+      binding.input_planes[0] = {input.data(), nullptr, input.size(), 640 * 3};
+      binding.output_planes[0] = {nullptr, output.data(), output.size(),
+                                  640 * 3};
+      binding.capture_sequence = 1;
+      HostFrameTokens tokens;
+      ReasonId reason = ReasonId::none;
+      ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                        StatusId::ready,
+                    "initial temporal host binding failed");
+      auto request = Request(program, 1);
+      request.input = tokens.input;
+      auto frame = session.Execute(request);
+      ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                        StatusId::ready,
+                    "initial temporal output must commit");
+      binding.capture_sequence = 3;
+      ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                        StatusId::ready,
+                    "discontinuous temporal host binding failed");
+      request = Request(program, 3);
+      request.input = tokens.input;
+      adapter.reset_status = reset_status;
+      frame = session.Execute(request);
+      if (reset_status == StatusId::ready) {
+        HostFrameOutputResolution resolution;
+        ok &= Require(
+            frame.status == StatusId::executed && frame.temporal_state_reset &&
+                adapter.reset_calls == 1 &&
+                session.telemetry().temporal_resets == 1 &&
+                session.ResolveHostFrameOutput(frame.completion, frame.output,
+                                               &resolution,
+                                               &reason) == StatusId::ready &&
+                resolution.capture_sequence == 3 &&
+                session.CommitOutput({frame.completion, true}, &reason) ==
+                    StatusId::ready,
+            "successful automatic reset must preserve current host output "
+            "binding");
+        binding.capture_sequence = 4;
+        ok &= Require(
+            session.BindHostFrame(binding, &tokens, &reason) == StatusId::ready,
+            "host binding after successful reset must remain reusable");
+        request = Request(program, 4);
+        request.input = tokens.input;
+        frame = session.Execute(request);
+        ok &= Require(
+            frame.status == StatusId::executed && !frame.temporal_state_reset &&
+                adapter.reset_calls == 1 &&
+                session.telemetry().temporal_resets == 1,
+            "successful reset must preserve capture order and count once");
+        ok &= Require(session.CommitOutput({frame.completion, true}, &reason) ==
+                          StatusId::ready,
+                      "post-reset contiguous host frame must commit");
+      } else {
+        const auto failure_reason = reset_status == StatusId::quarantined
+                                        ? ReasonId::device_lost
+                                        : ReasonId::temporal_discontinuity;
+        ok &= Require(
+            frame.status == reset_status && frame.reason == failure_reason &&
+                !frame.output_valid &&
+                !session.latest_committed_frame().valid &&
+                !session.readiness().available &&
+                session.readiness().status == reset_status &&
+                session.readiness().reason == failure_reason &&
+                session.telemetry().runtime_status == reset_status &&
+                session.telemetry().runtime_reason == failure_reason &&
+                adapter.execute_calls == 1 && adapter.reset_calls == 1 &&
+                session.telemetry().temporal_resets == 0,
+            "failed automatic reset must revoke active history and propagate "
+            "exact failure");
+        binding.capture_sequence = 4;
+        const auto next_bind = session.BindHostFrame(binding, &tokens, &reason);
+        ok &= Require(reset_status == StatusId::quarantined
+                          ? next_bind == StatusId::quarantined &&
+                                reason == ReasonId::device_lost &&
+                                session.quarantined() &&
+                                session.telemetry().device_losses == 1
+                          : next_bind == StatusId::stale &&
+                                reason == ReasonId::reconfiguration_required &&
+                                session.rebuild_requested(),
+                      "failed reset must retire binding and reject reuse with "
+                      "its recovery state");
+        adapter.prepare_status = StatusId::blocked;
+        adapter.prepare_reason = ReasonId::resource_exhausted;
+        ReadinessSnapshot readiness;
+        ok &= Require(
+            session.Configure(Program(296, 77, 2), adapter, &readiness,
+                              &reason) == StatusId::blocked &&
+                !session.prepared(),
+            "failed reconfiguration cannot retain unproven temporal history");
+      }
+    }
+  }
+  return ok;
+}
+
 bool TestExplicitTemporalResetGuardsAndForwarding() {
   FakeAdapter adapter;
   PreparedProgramSession session;
@@ -1360,6 +1473,7 @@ int main() {
   ok &= TestCircuitBreakerActionsAndRetryTransitions();
   ok &= TestDeclaredMetadataTransferBounds();
   ok &= TestFatalTemporalResetInvalidatesActiveAttribution();
+  ok &= TestHostBoundTemporalDiscontinuityResetResults();
   ok &= TestExplicitTemporalResetGuardsAndForwarding();
   ok &= TestRollbackReconfigurationTemporalAndShutdown();
   ok &= TestObservableFrameDropPolicies();
