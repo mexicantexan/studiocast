@@ -24,9 +24,10 @@ int failures = 0;
     }                                                                          \
   } while (false)
 
-std::string ReadPipelineSource() {
+std::string ReadSource(
+    std::string_view relative_path = "src/core/video/camera_pipeline.cpp") {
   const auto root = std::filesystem::path(STUDIOCAST_SOURCE_DIR);
-  std::ifstream input(root / "src/core/video/camera_pipeline.cpp");
+  std::ifstream input(root / relative_path);
   std::ostringstream contents;
   contents << input.rdbuf();
   return contents.str();
@@ -43,7 +44,7 @@ std::size_t Count(std::string_view text, std::string_view needle) {
 }
 
 void TestNeutralManagerOwnsThePipeline() {
-  const std::string source = ReadPipelineSource();
+  const std::string source = ReadSource();
   CHECK(!source.empty());
   if (source.empty())
     return;
@@ -73,12 +74,17 @@ void TestNeutralManagerOwnsThePipeline() {
   CHECK(Count(source, "backend_manager.Execute(binding)") == 1);
   CHECK(source.find("CreateStaticProductionVideoBackendSetupSource") !=
         std::string::npos);
-  CHECK(source.find("hal::CpuTailId::backend_resolved_output") !=
+  CHECK(source.find("BuildProductionVideoBackendSetupRequest(") !=
+        std::string::npos);
+  const auto builder =
+      ReadSource("src/core/video/production_video_setup_request.cpp");
+  CHECK(!builder.empty());
+  CHECK(builder.find("hal::CpuTailId::backend_resolved_output") !=
         std::string::npos);
 }
 
 void TestBackendConstructionAndDiscoveryStayOutOfThePipeline() {
-  const std::string source = ReadPipelineSource();
+  const std::string source = ReadSource();
   CHECK(!source.empty());
   if (source.empty())
     return;
@@ -116,7 +122,7 @@ void TestBackendConstructionAndDiscoveryStayOutOfThePipeline() {
 }
 
 void TestFrameLoopHasNoDiscoveryOrSerialization() {
-  const std::string source = ReadPipelineSource();
+  const std::string source = ReadSource();
   const auto loop = source.find("while (!stop_.load())");
   CHECK(loop != std::string::npos);
   if (loop == std::string::npos)

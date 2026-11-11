@@ -740,14 +740,18 @@ bool TestNeutralBindingAdversarialValidation() {
   auto forged_input = tokens.input;
   ++forged_input.adapter_opaque[2];
   ok &= Require(session.Execute(Request(program, forged_input, 1)).reason ==
-                        ReasonId::invalid_resource &&
+                        ReasonId::host_frame_binding_invalid &&
                     executor.execute_calls == 0,
                 "neutral input token mutation must fail before executor "
                 "entry");
+  HostFrameTokens rejected_tokens;
   ok &= Require(session.BindHostFrame(CommonBinding(program, input, output, 1),
-                                      &tokens, &reason) == StatusId::ready,
-                "adapter-side token rejection must release the neutral "
-                "binding for exact replay");
+                                      &rejected_tokens,
+                                      &reason) == StatusId::blocked &&
+                    reason == ReasonId::output_not_committed &&
+                    executor.execute_calls == 0,
+                "forged input must preserve the legitimate binding for exact "
+                "replay rather than permit replacement");
 
   const auto result = session.Execute(Request(program, tokens.input, 1));
   ok &= Require(result.status == StatusId::executed &&
