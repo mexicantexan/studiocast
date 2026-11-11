@@ -190,6 +190,7 @@ void CudaPreparedTransferCompletion::ResetFrameState() noexcept {
   readback_enqueued_ = false;
   next_readback_index_ = 0;
   completion_recorded_ = false;
+  failed_frame_completion_ = false;
   wait_attempted_ = false;
 }
 
@@ -287,8 +288,7 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
                          &readback_bytes))
       return Failed(Status::invalid_argument);
     readback_count = 1;
-    readbacks[0] = {0, 0, 0, options.readback_row_bytes,
-                    options.readback_rows};
+    readbacks[0] = {0, 0, 0, options.readback_row_bytes, options.readback_rows};
   } else {
     if (readback_count > kMaxReadbacks)
       return Failed(Status::invalid_argument);
@@ -311,12 +311,12 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
       const auto remaining = maximum - descriptor.source - descriptor.row_bytes;
       if (last_row > 0 && descriptor.source_pitch > remaining / last_row)
         return Failed(Status::invalid_argument);
-      readback_bytes = std::max(
-          readback_bytes, descriptor.host_offset_bytes + bytes);
+      readback_bytes =
+          std::max(readback_bytes, descriptor.host_offset_bytes + bytes);
       for (std::uint32_t prior = 0; prior < index; ++prior) {
         const auto &other = readbacks[prior];
-        const std::size_t other_end = other.host_offset_bytes +
-                                      other.row_bytes * other.rows;
+        const std::size_t other_end =
+            other.host_offset_bytes + other.row_bytes * other.rows;
         const std::size_t this_end = descriptor.host_offset_bytes + bytes;
         if (descriptor.host_offset_bytes < other_end &&
             other.host_offset_bytes < this_end)
@@ -348,8 +348,8 @@ CudaPreparedTransferCompletion::Result CudaPreparedTransferCompletion::Prepare(
   const auto &functions = cuda->f();
   CUresult result = CUDA_SUCCESS;
   if (!options.resident_work) {
-    result = functions.cuMemHostAlloc(
-        &candidate.upload_host, upload_bytes, CU_MEMHOSTALLOC_DEFAULT);
+    result = functions.cuMemHostAlloc(&candidate.upload_host, upload_bytes,
+                                      CU_MEMHOSTALLOC_DEFAULT);
     if (result != CUDA_SUCCESS || !candidate.upload_host) {
       cuda_ = nullptr;
       return FromCudaFailure(Status::resource_exhausted, result);
@@ -551,9 +551,8 @@ CudaPreparedTransferCompletion::EnqueueReadbackAt(
   if (!validation.ok())
     return validation;
   if (!work_submitted_ || readback_enqueued_ || index != next_readback_index_ ||
-      index >= readback_count_ ||
-      next_stage_index_ != timed_stage_count_ || source == 0 ||
-      source_pitch < readbacks_[index].row_bytes) {
+      index >= readback_count_ || next_stage_index_ != timed_stage_count_ ||
+      source == 0 || source_pitch < readbacks_[index].row_bytes) {
     return Failed(Status::invalid_sequence);
   }
   CUDA_MEMCPY2D copy{};
@@ -565,8 +564,8 @@ CudaPreparedTransferCompletion::EnqueueReadbackAt(
   if (descriptor.source != 0 &&
       (source != descriptor.source || source_pitch != descriptor.source_pitch))
     return Failed(Status::invalid_sequence);
-  copy.dstHost = static_cast<std::byte *>(readback_host_) +
-                 descriptor.host_offset_bytes;
+  copy.dstHost =
+      static_cast<std::byte *>(readback_host_) + descriptor.host_offset_bytes;
   copy.dstPitch = descriptor.row_bytes;
   copy.WidthInBytes = descriptor.row_bytes;
   copy.Height = descriptor.rows;
@@ -586,7 +585,7 @@ CudaPreparedTransferCompletion::RecordCompletion(
   if (!validation.ok())
     return validation;
   if (!work_submitted_ || (!resident_work_ && !readback_enqueued_) ||
-      completion_recorded_)
+      failed_frame_completion_ || completion_recorded_)
     return Failed(Status::invalid_sequence);
   const CUresult result =
       cuda_->f().cuEventRecord(completion_event_, binding_.stream);
@@ -598,11 +597,34 @@ CudaPreparedTransferCompletion::RecordCompletion(
 }
 
 CudaPreparedTransferCompletion::Result
+CudaPreparedTransferCompletion::RecordFailedFrameCompletion(
+    const Binding &binding) noexcept {
+  const auto validation = ValidateFrameBinding(binding);
+  if (!validation.ok())
+    return validation;
+  if (!work_submitted_)
+    return Failed(Status::invalid_sequence);
+  failed_frame_completion_ = true;
+  frame_reuse_blocked_ = true;
+  if (completion_recorded_)
+    return {};
+  const auto recorded =
+      cuda_->f().cuEventRecord(completion_event_, binding_.stream);
+  if (recorded != CUDA_SUCCESS)
+    return FromCudaFailure(Status::event_failed, recorded);
+  completion_recorded_ = true;
+  ++counters_.event_records;
+  return {};
+}
+
+CudaPreparedTransferCompletion::Result
 CudaPreparedTransferCompletion::WaitForCompletion(
     const Binding &binding, const WaitPolicy &policy) noexcept {
   Result validation = ValidateFrameBinding(binding);
   if (!validation.ok())
     return validation;
+  if (failed_frame_completion_)
+    return Failed(Status::invalid_sequence);
   if (!completion_recorded_ || wait_attempted_ ||
       policy.timeout_nanoseconds == 0 ||
       policy.poll_interval_nanoseconds == 0 || policy.maximum_poll_count == 0 ||
@@ -689,6 +711,8 @@ CudaPreparedTransferCompletion::Shutdown() noexcept {
     shutdown_ = true;
     return {};
   }
+  if (failed_frame_completion_ && !completion_recorded_)
+    return Failed(Status::resource_exhausted);
   if (frame_active_ && work_submitted_ && !quarantined_) {
     if (!completion_recorded_)
       return Failed(Status::resource_exhausted);

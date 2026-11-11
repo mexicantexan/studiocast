@@ -150,6 +150,9 @@ public:
                            CUdeviceptr source,
                            std::size_t source_pitch) noexcept;
   Result RecordCompletion(const Binding &binding) noexcept;
+  // Failure-only retirement fence: never publishes output or permits reuse.
+  // Shutdown retains submitted resources until this event proves quiescence.
+  Result RecordFailedFrameCompletion(const Binding &binding) noexcept;
   Result WaitForCompletion(const Binding &binding,
                            const WaitPolicy &policy) noexcept;
   // Shutdown never waits. If DMA is still outstanding it returns
@@ -238,6 +241,7 @@ private:
   bool work_submitted_ = false;
   bool readback_enqueued_ = false;
   bool completion_recorded_ = false;
+  bool failed_frame_completion_ = false;
   bool wait_attempted_ = false;
   Counters counters_{};
 };
