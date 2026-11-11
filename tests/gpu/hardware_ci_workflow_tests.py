@@ -179,7 +179,9 @@ class HardwareWorkflowTests(unittest.TestCase):
                                          f"{case_selection}-{case_effect}.log").is_file())
                     self.assertEqual(expected, arguments)
                     self.assertFalse((root / "escaped").exists())
-            missing = [{key: ""} for key in env if key.startswith("CUDA_")]
+            missing = [{"CUDA_" + suffix: ""} for suffix in
+                       ("MODEL_ROOT", "MODEL_ID", "FACE_MODEL_ID", "EYE_MODEL_ID",
+                        "DENOISE_MODEL_ID", "REPLACE_PATH")]
             missing.extend([{"CUDA_MODEL_ROOT": str(root / "absent")},
                             {"CUDA_REPLACE_PATH": str(root / "absent.png")},
                             {"CUDA_REPLACE_PATH": str(root)}])
