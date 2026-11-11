@@ -193,8 +193,7 @@ bool IsTerminalBackendResolvedOutputTail(
     return false;
   return tail.id == hal::CpuTailId::backend_resolved_output &&
          tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
-         tail.after_stage_id == final_stage_id &&
-         tail.before_stage_id == 0 &&
+         tail.after_stage_id == final_stage_id && tail.before_stage_id == 0 &&
          tail.boundary_index == plan.intent.stage_count;
 }
 
@@ -233,8 +232,7 @@ bool CompatibleCpuTails(const VideoExecutionPlanRequest &caller,
 bool ValidWaitPolicy(const ProductionVideoBoundedWaitPolicy &wait) noexcept {
   return wait.contract_version ==
              kProductionVideoBackendManagerContractVersion &&
-         wait.timeout_nanoseconds != 0 &&
-         wait.poll_interval_nanoseconds != 0 &&
+         wait.timeout_nanoseconds != 0 && wait.poll_interval_nanoseconds != 0 &&
          wait.poll_interval_nanoseconds <= wait.timeout_nanoseconds &&
          wait.maximum_poll_count != 0 && wait.stop_requested != nullptr &&
          wait.now_nanoseconds != nullptr && wait.poll_wait != nullptr &&
@@ -244,9 +242,9 @@ bool ValidWaitPolicy(const ProductionVideoBoundedWaitPolicy &wait) noexcept {
              hal::ResourceLifetime::adapter_context;
 }
 
-const std::string *ConfiguredModelId(
-    const effects::BroadcastCameraEffects &effects,
-    hal::SemanticEffectId semantic) noexcept {
+const std::string *
+ConfiguredModelId(const effects::BroadcastCameraEffects &effects,
+                  hal::SemanticEffectId semantic) noexcept {
   switch (semantic) {
   case hal::SemanticEffectId::virtual_background_blur:
   case hal::SemanticEffectId::virtual_background_remove:
@@ -374,11 +372,9 @@ bool StageParametersMatchEffects(
     return ParseRgb(effects.virtual_background.remove_color, &rgb) &&
            SignedParameter(stage, CanonicalVideoParameterId::strength,
                            effects.virtual_background.strength) &&
-           UnsignedParameter(stage,
-                             CanonicalVideoParameterId::remove_color_rgb,
+           UnsignedParameter(stage, CanonicalVideoParameterId::remove_color_rgb,
                              rgb) &&
-           UnsignedParameter(stage,
-                             CanonicalVideoParameterId::greenscreen_mode,
+           UnsignedParameter(stage, CanonicalVideoParameterId::greenscreen_mode,
                              effects.virtual_background.greenscreen_mode) &&
            BooleanParameter(stage,
                             CanonicalVideoParameterId::greenscreen_temporal,
@@ -394,8 +390,7 @@ bool StageParametersMatchEffects(
   case hal::SemanticEffectId::eye_contact:
     return SignedParameter(stage, CanonicalVideoParameterId::strength,
                            effects.eye_contact.strength) &&
-           BooleanParameter(stage,
-                            CanonicalVideoParameterId::look_away_enabled,
+           BooleanParameter(stage, CanonicalVideoParameterId::look_away_enabled,
                             effects.eye_contact.look_away_enabled);
   case hal::SemanticEffectId::video_noise_removal:
     return SignedParameter(stage, CanonicalVideoParameterId::strength,
@@ -403,18 +398,17 @@ bool StageParametersMatchEffects(
   case hal::SemanticEffectId::virtual_key_light:
     return SignedParameter(stage, CanonicalVideoParameterId::intensity,
                            effects.virtual_key_light.intensity) &&
-           SignedParameter(
-               stage, CanonicalVideoParameterId::temperature_preset,
-               effects.virtual_key_light.temperature_preset) &&
-           SignedParameter(
-               stage, CanonicalVideoParameterId::direction_pan_degrees,
-               effects.virtual_key_light.direction_pan_degrees);
+           SignedParameter(stage, CanonicalVideoParameterId::temperature_preset,
+                           effects.virtual_key_light.temperature_preset) &&
+           SignedParameter(stage,
+                           CanonicalVideoParameterId::direction_pan_degrees,
+                           effects.virtual_key_light.direction_pan_degrees);
   case hal::SemanticEffectId::vignette:
     return SignedParameter(stage, CanonicalVideoParameterId::intensity,
                            effects.vignette.intensity) &&
-           BooleanParameter(
-               stage, CanonicalVideoParameterId::center_on_tracked_face,
-               effects.vignette.center_on_tracked_face);
+           BooleanParameter(stage,
+                            CanonicalVideoParameterId::center_on_tracked_face,
+                            effects.vignette.center_on_tracked_face);
   case hal::SemanticEffectId::mirror:
     return stage.parameter_count == 0;
   case hal::SemanticEffectId::invalid:
@@ -427,8 +421,8 @@ bool IsZeroModel(const hal::ModelArtifactIdentity &model) noexcept;
 
 bool StageSelectable(const hal::AdapterRegistration &registration,
                      hal::SemanticEffectId semantic) noexcept {
-  for (std::size_t index = 0;
-       index < registration.semantic_capability_count; ++index) {
+  for (std::size_t index = 0; index < registration.semantic_capability_count;
+       ++index) {
     if (registration.semantic_capabilities[index].semantic == semantic &&
         hal::IsSelectableSemanticCapability(
             registration.semantic_capabilities[index]))
@@ -437,8 +431,9 @@ bool StageSelectable(const hal::AdapterRegistration &registration,
   return false;
 }
 
-bool SameResolutionRegistration(const hal::AdapterRegistration &left,
-                                const hal::AdapterRegistration &right) noexcept {
+bool SameResolutionRegistration(
+    const hal::AdapterRegistration &left,
+    const hal::AdapterRegistration &right) noexcept {
   if (left.adapter_instance_id != right.adapter_instance_id ||
       left.backend != right.backend ||
       left.execution_domain != right.execution_domain ||
@@ -470,15 +465,62 @@ bool ValidModelSelections(
     if (configured == nullptr || selection.selected_model_id.empty() ||
         IsZeroModel(selection.artifact))
       return false;
-    if ((!configured->empty() &&
-         (selection.requested_model_id != *configured ||
-          selection.selected_model_id != *configured ||
-          selection.default_selected)) ||
-        (configured->empty() &&
-         (!selection.requested_model_id.empty() ||
-          !selection.default_selected))) {
+    using Fallback = ProductionVideoResidentSetupSourceResult::ModelSelection::
+        AnalysisFallback;
+    const bool matte_fallback =
+        selection.analysis_fallback == Fallback::auto_frame_matte_bounds;
+    if (selection.analysis_fallback != Fallback::none && !matte_fallback)
       return false;
-    }
+    if (matte_fallback) {
+      if (selection.semantic != hal::SemanticEffectId::auto_frame ||
+          candidate.readiness.selected_backend != hal::BackendId::cuda ||
+          candidate.readiness.execution_domain.backend !=
+              hal::BackendId::cuda ||
+          candidate.resolution_registration.backend != hal::BackendId::cuda ||
+          candidate.status != hal::StatusId::degraded ||
+          candidate.reason != hal::ReasonId::capability_evidence_incomplete ||
+          candidate.readiness.status != hal::StatusId::degraded ||
+          candidate.readiness.reason !=
+              hal::ReasonId::capability_evidence_incomplete ||
+          !candidate.readiness.degraded ||
+          !selection.requested_model_unavailable ||
+          !IsZeroModel(selection.requested_model_artifact) ||
+          !SameModel(selection.fallback_dependency_artifact,
+                     selection.artifact) ||
+          selection.requested_model_id != *configured ||
+          selection.default_selected != configured->empty())
+        return false;
+      bool proven = false;
+      for (std::size_t i = 0;
+           i < candidate.resolution_registration.semantic_capability_count;
+           ++i) {
+        const auto &capability =
+            candidate.resolution_registration.semantic_capabilities[i];
+        if (capability.semantic != selection.semantic ||
+            capability.status != hal::StatusId::degraded ||
+            capability.reason !=
+                hal::ReasonId::capability_evidence_incomplete ||
+            !capability.live_stage || !capability.production_eligible ||
+            !capability.exact_evidence)
+          continue;
+        for (std::size_t j = 0; j < capability.evidence_count; ++j)
+          proven |=
+              capability.evidence[j].code ==
+                  hal::CapabilityEvidenceCode::model_artifact_identity_valid &&
+              capability.evidence[j].satisfied;
+      }
+      if (!proven)
+        return false;
+    } else if (selection.requested_model_unavailable ||
+               !IsZeroModel(selection.requested_model_artifact) ||
+               !IsZeroModel(selection.fallback_dependency_artifact) ||
+               (!configured->empty() &&
+                (selection.requested_model_id != *configured ||
+                 selection.selected_model_id != *configured ||
+                 selection.default_selected)) ||
+               (configured->empty() && (!selection.requested_model_id.empty() ||
+                                        !selection.default_selected)))
+      return false;
     for (std::size_t previous = 0; previous < index; ++previous) {
       if (candidate.model_selections[previous].semantic == selection.semantic)
         return false;
@@ -494,13 +536,10 @@ bool ValidModelSelections(
       continue;
     bool found = false;
     for (std::size_t selection_index = 0;
-         selection_index < candidate.model_selection_count;
-         ++selection_index) {
-      const auto &selection =
-          candidate.model_selections[selection_index];
-      found = found ||
-              (selection.semantic == stage.intent.semantic &&
-               SameModel(selection.artifact, stage.model));
+         selection_index < candidate.model_selection_count; ++selection_index) {
+      const auto &selection = candidate.model_selections[selection_index];
+      found = found || (selection.semantic == stage.intent.semantic &&
+                        SameModel(selection.artifact, stage.model));
     }
     if (!found)
       return false;
@@ -572,8 +611,7 @@ bool ValidCompatibilityTopology(
         domain.first_stage_id == 0 ||
         domain.last_stage_id < domain.first_stage_id ||
         (index != 0 &&
-         topology.domains[index - 1].last_stage_id >=
-             domain.first_stage_id)) {
+         topology.domains[index - 1].last_stage_id >= domain.first_stage_id)) {
       return false;
     }
     if (index == 0)
@@ -587,8 +625,7 @@ bool ValidCompatibilityTopology(
         boundary.source_domain != previous.domain ||
         boundary.destination_domain != domain.domain ||
         boundary.source_domain == boundary.destination_domain ||
-        !boundary.readback_required ||
-        !boundary.following_upload_required) {
+        !boundary.readback_required || !boundary.following_upload_required) {
       return false;
     }
     ++readbacks;
@@ -601,13 +638,12 @@ bool ValidCompatibilityTopology(
 
 bool CompatibleGenerations(const hal::ProgramGenerations &caller,
                            const hal::ProgramGenerations &bound) noexcept {
-  const auto compatible = [](std::uint64_t requested,
-                             std::uint64_t selected) {
+  const auto compatible = [](std::uint64_t requested, std::uint64_t selected) {
     return selected != 0 && (requested == 0 || requested == selected);
   };
   return caller.configuration != 0 &&
-         caller.configuration == bound.configuration &&
-         caller.geometry != 0 && caller.geometry == bound.geometry &&
+         caller.configuration == bound.configuration && caller.geometry != 0 &&
+         caller.geometry == bound.geometry &&
          compatible(caller.model, bound.model) &&
          compatible(caller.provider, bound.provider) &&
          compatible(caller.device, bound.device) &&
@@ -632,9 +668,9 @@ bool SameCanonicalPlanRequest(const ProductionVideoResidentSetup &request,
            bound.invalidation_key.model_artifact_hash) ||
       caller.invalidation_key.execution_domain_hash != 0 ||
       bound.invalidation_key.execution_domain_hash == 0 ||
-      !SameTemporal(ProductionVideoTemporalForSelectedBackend(
-                        request, selected_backend),
-                    bound.temporal) ||
+      !SameTemporal(
+          ProductionVideoTemporalForSelectedBackend(request, selected_backend),
+          bound.temporal) ||
       !BudgetWithin(caller.budget, bound.budget) ||
       !CompatibleCpuTails(caller, bound) ||
       caller.setup_failure_policy != bound.setup_failure_policy ||
@@ -647,13 +683,21 @@ bool SameCanonicalPlanRequest(const ProductionVideoResidentSetup &request,
 bool SamePassthroughPlanRequest(
     const VideoExecutionPlanRequest &caller,
     const VideoExecutionPlanRequest &bound) noexcept {
+  auto expected_generations = caller.invalidation_key.generations;
+  if (expected_generations.model == 0)
+    expected_generations.model = 1;
+  if (expected_generations.provider == 0)
+    expected_generations.provider = 1;
+  if (expected_generations.device == 0)
+    expected_generations.device = 1;
+  if (expected_generations.context == 0)
+    expected_generations.context = 1;
   if (caller.contract_version != bound.contract_version ||
       caller.plan_id != bound.plan_id ||
       !SameCanonicalIntent(caller.intent, bound.intent) ||
       !SameImage(caller.host_input, bound.host_input) ||
       !SameImage(caller.host_output, bound.host_output) ||
-      caller.invalidation_key.generations !=
-          bound.invalidation_key.generations ||
+      expected_generations != bound.invalidation_key.generations ||
       caller.invalidation_key.canonical_plan_hash !=
           bound.invalidation_key.canonical_plan_hash ||
       caller.invalidation_key.model_artifact_hash !=
@@ -663,14 +707,12 @@ bool SamePassthroughPlanRequest(
           kProductionVideoNeutralPassthroughExecutionHash ||
       !SameTemporal(caller.temporal, bound.temporal) ||
       !SameBudget(caller.budget, bound.budget) ||
-      caller.cpu_tail_count != bound.cpu_tail_count ||
+      !CompatibleCpuTails(caller, bound) ||
+      (IsTerminalBackendResolvedOutputTail(caller) &&
+       bound.cpu_tail_count != 0) ||
       caller.setup_failure_policy != bound.setup_failure_policy ||
       caller.migration_policy != bound.migration_policy) {
     return false;
-  }
-  for (std::size_t index = 0; index < caller.cpu_tail_count; ++index) {
-    if (!SameTail(caller.cpu_tails[index], bound.cpu_tails[index]))
-      return false;
   }
   return true;
 }
@@ -698,9 +740,9 @@ bool ContainsProvider(const ProductionVideoSetupLeaseSnapshot &snapshot,
   return false;
 }
 
-hal::SemanticEffectProviderId ProviderForStage(
-    const ProductionVideoSetupLeaseSnapshot &snapshot,
-    hal::SemanticEffectId semantic) noexcept {
+hal::SemanticEffectProviderId
+ProviderForStage(const ProductionVideoSetupLeaseSnapshot &snapshot,
+                 hal::SemanticEffectId semantic) noexcept {
   hal::SemanticEffectProviderId provider =
       hal::SemanticEffectProviderId::invalid;
   for (std::size_t index = 0;
@@ -733,8 +775,8 @@ bool HasExactArtifact(const ProductionVideoSetupLeaseSnapshot &snapshot,
   return false;
 }
 
-hal::StatusId Fail(hal::StatusId status, hal::ReasonId failure,
-                   bool retained, ProductionVideoBackendSetupEvidence *evidence,
+hal::StatusId Fail(hal::StatusId status, hal::ReasonId failure, bool retained,
+                   ProductionVideoBackendSetupEvidence *evidence,
                    hal::ReasonId *reason) noexcept {
   SetReason(reason, failure);
   if (evidence != nullptr) {
@@ -750,8 +792,7 @@ bool ValidateCpuPrimitiveTable(const ProductionVideoCpuPrimitiveSetup &setup,
                                hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
   const auto *table = setup.table;
-  if (setup.contract_version !=
-          kProductionVideoBackendManagerContractVersion ||
+  if (setup.contract_version != kProductionVideoBackendManagerContractVersion ||
       table == nullptr || table->table_version != kCpuPrimitiveTableVersion ||
       table->struct_size != sizeof(CpuPrimitiveTable) ||
       table->backend != hal::BackendId::cpu ||
@@ -762,8 +803,8 @@ bool ValidateCpuPrimitiveTable(const ProductionVideoCpuPrimitiveSetup &setup,
     return false;
   }
 
-  const auto conversion =
-      CpuPrimitiveCapabilityBit(hal::PrimitiveOperationId::convert_pixel_format);
+  const auto conversion = CpuPrimitiveCapabilityBit(
+      hal::PrimitiveOperationId::convert_pixel_format);
   const auto resize =
       CpuPrimitiveCapabilityBit(hal::PrimitiveOperationId::resize);
   const auto mirror =
@@ -771,8 +812,7 @@ bool ValidateCpuPrimitiveTable(const ProductionVideoCpuPrimitiveSetup &setup,
   if (((table->capability_bits & conversion) != 0 &&
        (table->yuyv_to_rgb24 == nullptr ||
         table->rgb24_to_yuyv_scratch_bytes == nullptr ||
-        table->rgb24_to_yuyv == nullptr ||
-        table->rgb24_bgr24 == nullptr)) ||
+        table->rgb24_to_yuyv == nullptr || table->rgb24_bgr24 == nullptr)) ||
       ((table->capability_bits & resize) != 0 &&
        (table->resize_rgb24_bilinear_plan_scratch_bytes == nullptr ||
         table->prepare_resize_rgb24_bilinear == nullptr ||
@@ -785,10 +825,10 @@ bool ValidateCpuPrimitiveTable(const ProductionVideoCpuPrimitiveSetup &setup,
   return true;
 }
 
-hal::StatusId ValidateResidentCandidate(
-    const VideoExecutionPlanRequest &plan,
-    const ProductionVideoSetupLeaseSnapshot &candidate,
-    hal::ReasonId *reason) noexcept {
+hal::StatusId
+ValidateResidentCandidate(const VideoExecutionPlanRequest &plan,
+                          const ProductionVideoSetupLeaseSnapshot &candidate,
+                          hal::ReasonId *reason) noexcept {
   SetReason(reason, hal::ReasonId::none);
   hal::ReasonId plan_reason = hal::ReasonId::none;
   if (!ValidateVideoExecutionPlanRequest(plan, &plan_reason)) {
@@ -816,7 +856,7 @@ hal::StatusId ValidateResidentCandidate(
   if (backend.mode == hal::BackendRequestMode::explicit_backend &&
       backend.backend != candidate.backend) {
     SetReason(reason, backend.strict ? hal::ReasonId::strict_backend_unavailable
-                                    : hal::ReasonId::foreign_adapter);
+                                     : hal::ReasonId::foreign_adapter);
     return hal::StatusId::blocked;
   }
   const auto requested_provider = plan.intent.requested_provider;
@@ -843,8 +883,7 @@ hal::StatusId ValidateResidentCandidate(
     return hal::StatusId::blocked;
   }
 
-  for (std::size_t index = 0; index < plan.intent.stage_count;
-       ++index) {
+  for (std::size_t index = 0; index < plan.intent.stage_count; ++index) {
     const auto &stage = plan.intent.stages[index];
     if (resolution.stages[index].skipped_optional) {
       if (stage.intent.required) {
@@ -923,23 +962,21 @@ hal::StatusId ProductionVideoBackendManager::Setup(
   ++snapshot_.setup_attempts;
   const bool retained = HasRetainableSetup();
   if (snapshot_.state == ProductionVideoBackendManagerState::stopped ||
-      snapshot_.state ==
-          ProductionVideoBackendManagerState::shutdown_pending) {
-    return Fail(snapshot_.state ==
-                        ProductionVideoBackendManagerState::shutdown_pending
-                    ? snapshot_.shutdown.status
-                    : hal::StatusId::stopped,
-                snapshot_.state ==
-                        ProductionVideoBackendManagerState::shutdown_pending
-                    ? snapshot_.shutdown.reason
-                    : hal::ReasonId::shutdown_requested,
-                retained, evidence, reason);
+      snapshot_.state == ProductionVideoBackendManagerState::shutdown_pending) {
+    return Fail(
+        snapshot_.state == ProductionVideoBackendManagerState::shutdown_pending
+            ? snapshot_.shutdown.status
+            : hal::StatusId::stopped,
+        snapshot_.state == ProductionVideoBackendManagerState::shutdown_pending
+            ? snapshot_.shutdown.reason
+            : hal::ReasonId::shutdown_requested,
+        retained, evidence, reason);
   }
   if (request.contract_version !=
       kProductionVideoBackendManagerContractVersion) {
     return Fail(hal::StatusId::blocked,
-                hal::ReasonId::unsupported_contract_version, retained,
-                evidence, reason);
+                hal::ReasonId::unsupported_contract_version, retained, evidence,
+                reason);
   }
 
   if (request.kind == ProductionVideoBackendSetupKind::cpu_primitives_only) {
@@ -960,8 +997,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
       compatibility_executor_.reset();
     }
     resident_selected_ = false;
-    snapshot_.state =
-        ProductionVideoBackendManagerState::cpu_primitives_only;
+    snapshot_.state = ProductionVideoBackendManagerState::cpu_primitives_only;
     snapshot_.status = hal::StatusId::ready;
     snapshot_.reason = hal::ReasonId::none;
     snapshot_.readiness = {};
@@ -1006,11 +1042,10 @@ hal::StatusId ProductionVideoBackendManager::Setup(
       !ValidWaitPolicy(request.resident.wait) ||
       request.resident.plan.invalidation_key.execution_domain_hash != 0 ||
       !ValidateVideoExecutionPlanRequest(validation_plan, &plan_reason)) {
-    const auto failure =
-        request.resident.contract_version !=
-                kProductionVideoBackendManagerContractVersion
-            ? hal::ReasonId::unsupported_contract_version
-            : hal::ReasonId::malformed_contract;
+    const auto failure = request.resident.contract_version !=
+                                 kProductionVideoBackendManagerContractVersion
+                             ? hal::ReasonId::unsupported_contract_version
+                             : hal::ReasonId::malformed_contract;
     return Fail(hal::StatusId::blocked, failure, retained, evidence, reason);
   }
   if (setup_source_ == nullptr) {
@@ -1021,8 +1056,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
 
   if (evidence != nullptr)
     evidence->setup_source_called = true;
-  auto candidate =
-      setup_source_->AcquireResidentSetup(request.resident);
+  auto candidate = setup_source_->AcquireResidentSetup(request.resident);
   if (evidence != nullptr) {
     evidence->candidate_readiness = candidate.readiness;
     evidence->lease_acquire = candidate.lease_acquire;
@@ -1100,10 +1134,9 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     const auto status = candidate.status == hal::StatusId::invalid
                             ? hal::StatusId::blocked
                             : candidate.status;
-    const auto failure =
-        candidate.reason == hal::ReasonId::none
-            ? hal::ReasonId::capability_evidence_incomplete
-            : candidate.reason;
+    const auto failure = candidate.reason == hal::ReasonId::none
+                             ? hal::ReasonId::capability_evidence_incomplete
+                             : candidate.reason;
     return Fail(status, failure, retained, evidence, reason);
   }
   if (candidate.canonical_effects != request.resident.effects ||
@@ -1134,9 +1167,8 @@ hal::StatusId ProductionVideoBackendManager::Setup(
                 reason);
   }
 
-  if (candidate.execution_kind ==
-      ProductionVideoResidentSetupSourceResult::ExecutionKind::
-          typed_compatibility) {
+  if (candidate.execution_kind == ProductionVideoResidentSetupSourceResult::
+                                      ExecutionKind::typed_compatibility) {
     if (candidate.lease.live() || !candidate.compatibility_executor ||
         !ValidCompatibilityTopology(candidate.compatibility_topology)) {
       return Fail(hal::StatusId::blocked, hal::ReasonId::malformed_contract,
@@ -1156,8 +1188,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
       compatibility_executor_->Shutdown();
     compatibility_executor_ = std::move(candidate.compatibility_executor);
     resident_selected_ = false;
-    snapshot_.state =
-        ProductionVideoBackendManagerState::compatibility_ready;
+    snapshot_.state = ProductionVideoBackendManagerState::compatibility_ready;
     snapshot_.status = candidate.status;
     snapshot_.reason = candidate.reason;
     snapshot_.readiness = candidate.readiness;
@@ -1174,9 +1205,8 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     }
     return candidate.status;
   }
-  if (candidate.execution_kind !=
-          ProductionVideoResidentSetupSourceResult::ExecutionKind::
-              resident_island ||
+  if (candidate.execution_kind != ProductionVideoResidentSetupSourceResult::
+                                      ExecutionKind::resident_island ||
       !candidate.lease.live() || candidate.compatibility_executor) {
     return Fail(hal::StatusId::blocked, hal::ReasonId::malformed_contract,
                 retained, evidence, reason);
@@ -1233,14 +1263,14 @@ hal::StatusId ProductionVideoBackendManager::Setup(
   snapshot_.setup_complete = true;
   ++snapshot_.setup_successes;
   RefreshResidentSnapshot();
-  const auto final_status =
-      candidate.status == hal::StatusId::degraded ||
-              status == hal::StatusId::degraded
-          ? hal::StatusId::degraded
-          : hal::StatusId::ready;
-  const auto final_reason = candidate.status == hal::StatusId::degraded
-                                ? candidate.reason
-                                : (reason != nullptr ? *reason : prepare.reason);
+  const auto final_status = candidate.status == hal::StatusId::degraded ||
+                                    status == hal::StatusId::degraded
+                                ? hal::StatusId::degraded
+                                : hal::StatusId::ready;
+  const auto final_reason =
+      candidate.status == hal::StatusId::degraded
+          ? candidate.reason
+          : (reason != nullptr ? *reason : prepare.reason);
   if (final_status == hal::StatusId::degraded) {
     snapshot_.status = final_status;
     snapshot_.reason = final_reason;
@@ -1261,9 +1291,8 @@ VideoExecutionFrameResult ProductionVideoBackendManager::Execute(
   if (compatibility_executor_) {
     auto result = compatibility_executor_->Execute(binding);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
-    snapshot_.frame_pending =
-        result.status == hal::StatusId::executed ||
-        result.status == hal::StatusId::degraded;
+    snapshot_.frame_pending = result.status == hal::StatusId::executed ||
+                              result.status == hal::StatusId::degraded;
     return result;
   }
   if (!resident_selected_) {
@@ -1303,10 +1332,10 @@ hal::StatusId ProductionVideoBackendManager::CommitOutput(
     return status;
   }
   if (!resident_selected_) {
-    SetReason(reason, snapshot_.state ==
-                          ProductionVideoBackendManagerState::stopped
-                          ? hal::ReasonId::shutdown_requested
-                          : hal::ReasonId::output_not_committed);
+    SetReason(reason,
+              snapshot_.state == ProductionVideoBackendManagerState::stopped
+                  ? hal::ReasonId::shutdown_requested
+                  : hal::ReasonId::output_not_committed);
     return snapshot_.state == ProductionVideoBackendManagerState::stopped
                ? hal::StatusId::stopped
                : hal::StatusId::blocked;
@@ -1395,9 +1424,9 @@ ProductionVideoBackendManager::Shutdown() noexcept {
   if (!result.shutdown_requested)
     result = ImmediateShutdown();
   snapshot_.shutdown = result;
-  snapshot_.state =
-      result.pending ? ProductionVideoBackendManagerState::shutdown_pending
-                     : ProductionVideoBackendManagerState::stopped;
+  snapshot_.state = result.pending
+                        ? ProductionVideoBackendManagerState::shutdown_pending
+                        : ProductionVideoBackendManagerState::stopped;
   snapshot_.status = result.status;
   snapshot_.reason = result.reason;
   snapshot_.readiness.status = result.status;

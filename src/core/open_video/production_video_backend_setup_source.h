@@ -1,18 +1,19 @@
 #pragma once
 
-#include "core/video/production_video_backend_manager.h"
 #include "core/open_video/model_pack_registry.h"
 #include "core/open_video/video_execution_factory.h"
+#include "core/video/production_video_backend_manager.h"
 
 #include <memory>
 
 namespace studiocast::open_cuda {
 
 struct ProductionVideoBackendSetupDependencies {
-  using ResolveModel = bool (*)(
-      void *context, const video::CanonicalVideoStage &stage,
-      const std::string &requested_model_id, open_video::ModelPack *pack,
-      open_video::ValidatedModelArtifactIdentity *identity) noexcept;
+  using ResolveModel =
+      bool (*)(void *context, const video::CanonicalVideoStage &stage,
+               const std::string &requested_model_id, const char *task,
+               const char *role, open_video::ModelPack *pack,
+               open_video::ValidatedModelArtifactIdentity *identity) noexcept;
   using AcquireLease = hal::StatusId (*)(
       void *context,
       const OpenCudaProductionVideoExecutionFactoryRequest &request,

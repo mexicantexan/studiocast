@@ -37,8 +37,7 @@ struct ProductionVideoCpuPrimitiveSetup {
 };
 
 using ProductionVideoWaitPredicate = bool (*)(void *context) noexcept;
-using ProductionVideoNowNanoseconds =
-    std::uint64_t (*)(void *context) noexcept;
+using ProductionVideoNowNanoseconds = std::uint64_t (*)(void *context) noexcept;
 using ProductionVideoPollWait =
     void (*)(void *context, std::uint64_t wait_nanoseconds) noexcept;
 
@@ -112,11 +111,19 @@ struct ProductionVideoResidentSetupSourceResult {
   // needs no discovery, probing, session construction, or allocation.
   bool setup_completed_outside_frame_loop = false;
   struct ModelSelection {
+    enum class AnalysisFallback : std::uint8_t {
+      none = 0,
+      auto_frame_matte_bounds
+    };
     hal::SemanticEffectId semantic = hal::SemanticEffectId::invalid;
     std::string requested_model_id;
     std::string selected_model_id;
     hal::ModelArtifactIdentity artifact{};
     bool default_selected = false;
+    AnalysisFallback analysis_fallback = AnalysisFallback::none;
+    bool requested_model_unavailable = false;
+    hal::ModelArtifactIdentity requested_model_artifact{};
+    hal::ModelArtifactIdentity fallback_dependency_artifact{};
   };
   std::array<ModelSelection, hal::kMaxPreparedStages> model_selections{};
   std::size_t model_selection_count = 0;
@@ -156,8 +163,8 @@ public:
   virtual ~IProductionVideoBackendSetupSource() = default;
 
   [[nodiscard]] virtual ProductionVideoResidentSetupSourceResult
-  AcquireResidentSetup(const ProductionVideoResidentSetup &request) noexcept =
-      0;
+  AcquireResidentSetup(
+      const ProductionVideoResidentSetup &request) noexcept = 0;
 };
 
 // Implemented by the backend-composition target. The returned setup source
@@ -280,8 +287,7 @@ public:
       std::unique_ptr<IProductionVideoBackendSetupSource> setup_source);
   ~ProductionVideoBackendManager() override;
 
-  ProductionVideoBackendManager(const ProductionVideoBackendManager &) =
-      delete;
+  ProductionVideoBackendManager(const ProductionVideoBackendManager &) = delete;
   ProductionVideoBackendManager &
   operator=(const ProductionVideoBackendManager &) = delete;
 
