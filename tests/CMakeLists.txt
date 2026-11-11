@@ -1936,6 +1936,15 @@ if (BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}/tests/gpu/open_video/prepared_cuda_eye_contact_tests.cpp)
     target_link_libraries(studiocast-prepared-cuda-eye-contact-tests PRIVATE
             studiocast_open_video_backend)
+    target_compile_definitions(studiocast-prepared-cuda-eye-contact-tests PRIVATE
+            STUDIOCAST_TEST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>)
+    if (_studiocast_have_dlib)
+        if (TARGET dlib::dlib)
+            target_link_libraries(studiocast-prepared-cuda-eye-contact-tests PRIVATE dlib::dlib)
+        elseif (TARGET dlib)
+            target_link_libraries(studiocast-prepared-cuda-eye-contact-tests PRIVATE dlib)
+        endif ()
+    endif ()
     studiocast_set_project_warnings(studiocast-prepared-cuda-eye-contact-tests)
     studiocast_enable_sanitizers(studiocast-prepared-cuda-eye-contact-tests)
     add_test(NAME studiocast-prepared-cuda-eye-contact-tests
