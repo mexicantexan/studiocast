@@ -98,7 +98,8 @@ public:
         !caller.intent.backend.strict ||
         caller.intent.requested_provider != kProvider ||
         !caller.intent.strict_provider_selection ||
-        caller.intent.stage_count == 0) {
+        caller.intent.stage_count == 0 ||
+        caller.intent.stage_count > caller.intent.stages.size()) {
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::strict_backend_unavailable);
     }
@@ -301,6 +302,17 @@ public:
       snapshot.generations = generations;
       snapshot.reserved_budget = result.plan.budget;
       snapshot.providers[snapshot.provider_count++] = kProvider;
+      for (std::size_t index = 0; index < result.plan.intent.stage_count;
+           ++index) {
+        const auto &stage = result.plan.intent.stages[index];
+        if (stage.model.artifact_generation == 0)
+          continue;
+        if (snapshot.artifact_count == snapshot.artifacts.size())
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
+        snapshot.artifacts[snapshot.artifact_count++] = {
+            stage.intent.semantic, kProvider, stage.model};
+      }
       snapshot.adapter = adapter;
       snapshot.factory = factory_registration;
       snapshot.readiness.status = initialized;

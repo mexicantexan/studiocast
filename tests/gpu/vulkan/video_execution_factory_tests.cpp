@@ -651,6 +651,19 @@ bool TestShutdownRetainsUnprovenNativeOwner() {
   return ok;
 }
 
+bool TestMalformedSourceStageCount() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.plan.intent.stage_count = request.plan.intent.stages.size() + 1;
+  const auto result = source->AcquireResidentSetup(request);
+  return Require(result.status == hal::StatusId::blocked &&
+                     !result.lease.live() &&
+                     result.setup_completed_outside_frame_loop,
+                 "an oversized Vulkan setup stage count must fail before "
+                 "scanning or native acquisition");
+}
+
 bool TestUnsupportedAndForeignPreflight() {
   Fixture fixture;
   if (!fixture.Initialize() || !fixture.Prepare(Request()))
@@ -1041,6 +1054,7 @@ int main() {
   ok &= TestExactFactoryAndCommit();
   ok &= TestMattingFinalGeometryContract();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
+  ok &= TestMalformedSourceStageCount();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();
