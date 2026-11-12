@@ -2,6 +2,7 @@
 
 #include "core/vulkan/video_execution_factory.h"
 
+#include <algorithm>
 #include <memory>
 #include <new>
 #include <utility>
@@ -24,8 +25,7 @@ bool ExactTerminalBackendResolvedOutputTail(
     return false;
   }
   const auto &tail = plan.cpu_tails[0];
-  return tail.id == hal::CpuTailId::backend_resolved_output &&
-         tail.required &&
+  return tail.id == hal::CpuTailId::backend_resolved_output && tail.required &&
          tail.placement == hal::DeclaredCpuTail::Placement::after_stage &&
          tail.after_stage_id ==
              plan.intent.stages[plan.intent.stage_count - 1].intent.stage_id &&
@@ -59,8 +59,7 @@ public:
                     : nullptr;
   }
 
-  video::IVideoAdapterFactory *
-  video_adapter_factory() const noexcept override {
+  video::IVideoAdapterFactory *video_adapter_factory() const noexcept override {
     return factory_.get();
   }
 
@@ -93,22 +92,124 @@ public:
       return Failure(hal::StatusId::blocked,
                      hal::ReasonId::strict_backend_unavailable);
     }
+    bool needs_matting = false;
     for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
       const auto semantic = caller.intent.stages[index].intent.semantic;
+      const bool consumer =
+          semantic == hal::SemanticEffectId::virtual_background_blur ||
+          semantic == hal::SemanticEffectId::virtual_background_remove ||
+          semantic == hal::SemanticEffectId::virtual_background_replace ||
+          semantic == hal::SemanticEffectId::virtual_key_light;
+      needs_matting = needs_matting || consumer;
       if (semantic != hal::SemanticEffectId::mirror &&
-          semantic != hal::SemanticEffectId::vignette) {
+          semantic != hal::SemanticEffectId::vignette && !consumer) {
         return Failure(hal::StatusId::blocked,
                        hal::ReasonId::semantic_effect_unsupported);
       }
     }
     if (caller.cpu_tail_count != 0 &&
         !ExactTerminalBackendResolvedOutputTail(caller)) {
-      return Failure(hal::StatusId::blocked,
-                     hal::ReasonId::cpu_tail_required);
+      return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
     }
 
     try {
-      auto factory = std::make_unique<VulkanVideoExecutionFactory>();
+      VulkanVideoExecutionFactoryConfiguration configuration;
+      configuration.reservation = caller.budget;
+      configuration.input_width = static_cast<int>(caller.host_input.width);
+      configuration.input_height = static_cast<int>(caller.host_input.height);
+      configuration.effects =
+          std::make_shared<const video::effects::BroadcastCameraEffects>(
+              request.effects);
+      if (needs_matting) {
+        // Native graph resources are reserved before context/session
+        // acquisition.
+        constexpr std::uint64_t native_bytes = UINT64_C(256) * 1024 * 1024;
+        const auto pixels =
+            static_cast<std::uint64_t>(caller.host_input.width) *
+            caller.host_input.height;
+        const auto output_pixels =
+            static_cast<std::uint64_t>(caller.host_output.width) *
+            caller.host_output.height;
+        if (pixels > (UINT64_MAX - native_bytes) / 64 ||
+            output_pixels > (UINT64_MAX-native_bytes-pixels*64)/16 ||
+            caller.budget.persistent_bytes <
+                native_bytes + pixels * 64 + output_pixels * 16 ||
+            caller.budget.scratch_bytes < pixels * 32 + output_pixels * 4 ||
+            caller.budget.upload_staging_bytes < pixels * 4 ||
+            caller.budget.readback_staging_bytes < output_pixels * 4 ||
+            caller.budget.resource_count < 544 ||
+            caller.budget.in_flight_slots != 1)
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
+        const auto registry = open_video::ModelPackRegistry::ScanDefault();
+        const auto &id = request.effects.virtual_background.model_id;
+        std::optional<open_video::ModelPack> selected;
+        if (!id.empty())
+          selected = registry.Find("matting", id);
+        else {
+          for (const auto preferred :
+               {"modnet-webnn-256-fp32", "birefnet_lite"}) {
+            auto candidate = registry.Find("matting", preferred);
+            if (candidate && candidate->ncnn_vulkan) {
+              selected = std::move(candidate);
+              break;
+            }
+          }
+          if (!selected)
+            for (const auto &candidate : registry.ListModels())
+              if (candidate.task == "matting" && candidate.ncnn_vulkan) {
+                selected = candidate;
+                break;
+              }
+        }
+        std::string error;
+        if (!selected || !selected->ncnn_vulkan || !selected->matting ||
+            !open_video::ValidateProductionNcnnVulkanMattingPack(*selected,
+                                                                 &error))
+          return Failure(hal::StatusId::unavailable,
+                         hal::ReasonId::capability_evidence_incomplete);
+        const auto artifact = std::find_if(
+            selected->files.begin(), selected->files.end(),
+            [&](const auto &file) {
+              return file.name == selected->ncnn_vulkan->param_file;
+            });
+        if (artifact == selected->files.end())
+          return Failure(hal::StatusId::blocked,
+                         hal::ReasonId::capability_evidence_incomplete);
+        const auto identity =
+            open_video::ValidateModelArtifactIdentity(*selected, *artifact);
+        if (!identity.ok())
+          return Failure(hal::StatusId::blocked,
+                         hal::ReasonId::capability_evidence_incomplete);
+        const auto &spec = *selected->matting;
+        if (spec.input.width <= 0 || spec.input.height <= 0 ||
+            spec.output.width <= 0 || spec.output.height <= 0 ||
+            spec.input.width > 4096 || spec.input.height > 4096 ||
+            spec.output.width > 4096 || spec.output.height > 4096)
+          return Failure(hal::StatusId::blocked,
+                         hal::ReasonId::malformed_descriptor);
+        const auto model_bytes =
+            static_cast<std::uint64_t>(spec.input.width) *
+                static_cast<std::uint64_t>(spec.input.height) * 12u +
+            static_cast<std::uint64_t>(spec.output.width) *
+                static_cast<std::uint64_t>(spec.output.height) * 4u;
+        if (caller.budget.persistent_bytes <
+            native_bytes + pixels * 64 + output_pixels * 16 + model_bytes)
+          return Failure(hal::StatusId::resource_exhausted,
+                         hal::ReasonId::resource_exhausted);
+        configuration.matting_identity.model_id_hash =
+            identity.identity.model_id_sha256;
+        configuration.matting_identity.artifact_set_hash =
+            identity.identity.artifact_set_sha256;
+        configuration.matting_identity.artifact_generation =
+            identity.identity.registry_generation;
+        configuration.matting_pack =
+            std::make_shared<const open_video::ModelPack>(std::move(*selected));
+        configuration.maximum_synchronizations_per_frame = 32;
+        configuration.minimum_synchronizations_per_frame = 2;
+      }
+      auto factory =
+          std::make_unique<VulkanVideoExecutionFactory>(configuration);
       hal::ReasonId reason = hal::ReasonId::none;
       const auto initialized = factory->Initialize(&reason);
       if (!IsSetupSuccess(initialized))
@@ -128,6 +229,44 @@ public:
       result.canonical_effects = request.effects;
       result.setup_completed_outside_frame_loop = true;
       result.plan = caller;
+      result.resolution_registration = adapter;
+      if (needs_matting) {
+        for (std::size_t i = 0; i < result.plan.intent.stage_count; ++i) {
+          auto &stage = result.plan.intent.stages[i];
+          if (stage.intent.semantic == hal::SemanticEffectId::mirror ||
+              stage.intent.semantic == hal::SemanticEffectId::vignette)
+            continue;
+          const auto &identity = configuration.matting_identity;
+          if (stage.model.artifact_generation != 0 &&
+              (stage.model.artifact_generation !=
+                   identity.artifact_generation ||
+               stage.model.model_id_hash != identity.model_id_hash ||
+               stage.model.artifact_set_hash != identity.artifact_set_hash))
+            return Failure(hal::StatusId::blocked,
+                           hal::ReasonId::reconfiguration_required);
+          stage.model = identity;
+          if (stage.intent.semantic !=
+              hal::SemanticEffectId::virtual_key_light) {
+            auto &selection =
+                result.model_selections[result.model_selection_count++];
+            selection.semantic = stage.intent.semantic;
+            selection.requested_model_id =
+                request.effects.virtual_background.model_id;
+            selection.selected_model_id = configuration.matting_pack->id;
+            selection.default_selected = selection.requested_model_id.empty();
+            selection.artifact = identity;
+          }
+        }
+        result.plan.invalidation_key.generations.model =
+            configuration.matting_identity.artifact_generation;
+        std::uint64_t hash = UINT64_C(1469598103934665603);
+        for (const auto value :
+             configuration.matting_identity.artifact_set_hash) {
+          hash ^= value;
+          hash *= UINT64_C(1099511628211);
+        }
+        result.plan.invalidation_key.model_artifact_hash = hash ? hash : 1;
+      }
       if (ExactTerminalBackendResolvedOutputTail(result.plan)) {
         result.plan.cpu_tails[0] = {};
         result.plan.cpu_tail_count = 0;
@@ -139,11 +278,9 @@ public:
         generations.provider = 1;
       if (generations.device == 0)
         generations.device = 1;
-      generations.context =
-          adapter.execution_domain.logical_context_generation;
+      generations.context = adapter.execution_domain.logical_context_generation;
       result.plan.invalidation_key.execution_domain_hash =
-          video::ProductionVideoExecutionDomainHash(
-              adapter.execution_domain);
+          video::ProductionVideoExecutionDomainHash(adapter.execution_domain);
 
       video::ProductionVideoSetupLeaseSnapshot snapshot;
       snapshot.state = video::ProductionVideoSetupLeaseState::live;
@@ -163,14 +300,12 @@ public:
       snapshot.readiness.provider = kProvider;
       snapshot.readiness.execution_domain = adapter.execution_domain;
       snapshot.readiness.available = true;
-      snapshot.readiness.degraded =
-          initialized == hal::StatusId::degraded;
+      snapshot.readiness.degraded = initialized == hal::StatusId::degraded;
 
-      auto owner =
-          std::make_unique<VulkanSetupLeaseOwner>(std::move(factory));
+      auto owner = std::make_unique<VulkanSetupLeaseOwner>(std::move(factory));
       result.status = video::ProductionVideoSetupLease::Acquire(
-          snapshot, std::move(owner), &result.lease,
-          &result.lease_acquire, &result.reason);
+          snapshot, std::move(owner), &result.lease, &result.lease_acquire,
+          &result.reason);
       result.readiness = result.lease_acquire.readiness;
       if (!IsSetupSuccess(result.status) || !result.lease.live())
         return result;

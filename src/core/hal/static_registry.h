@@ -96,7 +96,11 @@ private:
 [[nodiscard]] constexpr bool
 IsVulkanProductionSemantic(SemanticEffectId semantic) noexcept {
   return semantic == SemanticEffectId::mirror ||
-         semantic == SemanticEffectId::vignette;
+         semantic == SemanticEffectId::vignette ||
+         semantic == SemanticEffectId::virtual_background_blur ||
+         semantic == SemanticEffectId::virtual_background_remove ||
+         semantic == SemanticEffectId::virtual_background_replace ||
+         semantic == SemanticEffectId::virtual_key_light;
 }
 
 } // namespace studiocast::hal

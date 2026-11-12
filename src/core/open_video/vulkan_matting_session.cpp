@@ -43,6 +43,7 @@ struct OpenVulkanMattingSession::Impl {
   studiocast::vulkan::VulkanTensor input_tensor;
   VulkanMattingGraphDescriptor graph;
   VulkanMattingPersistentResources resources;
+  const studiocast::vulkan::VulkanImage *fixed_alpha = nullptr;
   std::unique_ptr<VulkanMattingRuntimeLifecycle> runtime_lifecycle;
 
   bool PackValidationFailure(std::string message, std::string *error_out) {
@@ -286,6 +287,32 @@ bool OpenVulkanMattingSession::LatchExternalFailure(
   return impl_->Latch(failure, std::move(detail), error_out);
 }
 
+bool OpenVulkanMattingSession::BindAlphaOutputForSetup(
+    const studiocast::vulkan::VulkanImage *alpha, std::string *error_out) {
+  if (impl_->buffers_ready || !alpha || !impl_->device ||
+      !impl_->pack.matting || !alpha->BelongsTo(*impl_->device) ||
+      !alpha->device_local() || alpha->mapped() ||
+      alpha->format() != studiocast::vulkan::VulkanPixelFormat::f32_1 ||
+      alpha->width() != impl_->pack.matting->output.width ||
+      alpha->height() != impl_->pack.matting->output.height) {
+    if (error_out)
+      *error_out = "Matting requires a fixed model-sized device-local alpha "
+                   "output before setup.";
+    return false;
+  }
+  impl_->fixed_alpha = alpha;
+  return true;
+}
+
+void OpenVulkanMattingSession::UpdateCachedReadiness(
+    VulkanMattingReadiness *readiness) const {
+  if (!readiness || !impl_->runtime_lifecycle)
+    return;
+  impl_->runtime_lifecycle->RefreshExecutionEvidence(&readiness->runtime);
+  readiness->production_ready = impl_->runtime_lifecycle->available() &&
+                                impl_->device->health_state().healthy();
+}
+
 bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
                                                  std::string *error_out) {
   if (error_out)
@@ -380,6 +407,14 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
             size_error,
         error_out);
   }
+  if (!impl_->fixed_alpha)
+    return impl_->Latch(
+        VulkanMattingRuntimeFailure::invalid_shape,
+        "No fixed alpha output was bound before matting preparation.",
+        error_out);
+  impl_->resources.input_buffer = OpaqueHandle(impl_->input_tensor.buffer());
+  impl_->resources.alpha_buffer = OpaqueHandle(impl_->fixed_alpha->buffer());
+  impl_->resources.alpha_row_stride_bytes = impl_->fixed_alpha->pitch_bytes();
   impl_->resources.input_bytes = impl_->input_tensor.bytes();
   impl_->resources.alpha_bytes = alpha_size.bytes;
   impl_->resources.allow_cpu_layers = false;
@@ -429,7 +464,7 @@ bool OpenVulkanMattingSession::Run(
     studiocast::vulkan::VulkanImage *output_alpha_gpu, std::string *error_out) {
   if (error_out)
     error_out->clear();
-  if (!output_alpha_gpu) {
+  if (!output_alpha_gpu || output_alpha_gpu != impl_->fixed_alpha) {
     return impl_->Latch(
         VulkanMattingRuntimeFailure::invalid_shape,
         "OpenVulkanMattingSession::Run: output_alpha_gpu is null.", error_out);

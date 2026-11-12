@@ -47,6 +47,13 @@ bool CommonEvidenceReady(
          evidence.one_upload_transport && evidence.one_final_readback_transport;
 }
 
+bool IsMattingSemantic(SemanticEffectId semantic) noexcept {
+  return semantic == SemanticEffectId::virtual_background_blur ||
+         semantic == SemanticEffectId::virtual_background_remove ||
+         semantic == SemanticEffectId::virtual_background_replace ||
+         semantic == SemanticEffectId::virtual_key_light;
+}
+
 bool IsZeroModelIdentity(const hal::ModelArtifactIdentity &identity) noexcept {
   return identity.artifact_generation == 0 &&
          std::all_of(identity.model_id_hash.begin(),
@@ -303,6 +310,9 @@ StatusId VulkanHalResidentAdapter::Prepare(
 
   bool has_mirror = false;
   bool has_vignette = false;
+  bool has_matting = false;
+  bool has_background = false;
+  bool has_keylight = false;
   const hal::ImageDescriptor *previous_output = nullptr;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
@@ -324,10 +334,25 @@ StatusId VulkanHalResidentAdapter::Prepare(
                                    hal::Mutability::read_write) ||
         (previous_output &&
          !SameImageStorage(*previous_output, stage.input.image)) ||
-        !IsZeroModelIdentity(stage.model)) {
+        (IsMattingSemantic(stage.semantic)
+             ? IsZeroModelIdentity(stage.model)
+             : !IsZeroModelIdentity(stage.model))) {
       return fail(StatusId::blocked, ReasonId::malformed_descriptor);
     }
-    if (stage.semantic == SemanticEffectId::mirror) {
+    if (IsMattingSemantic(stage.semantic)) {
+      const bool key = stage.semantic == SemanticEffectId::virtual_key_light;
+      if (has_mirror || has_vignette ||
+          (key ? has_keylight : (has_background || has_keylight)))
+        return fail(StatusId::blocked, ReasonId::malformed_contract);
+      has_matting = true;
+      if (key)
+        has_keylight = true;
+      else
+        has_background = true;
+      if ((key && !pending_options_.request_keylight) ||
+          (!key && pending_options_.background != stage.semantic))
+        return fail(StatusId::blocked, ReasonId::malformed_contract);
+    } else if (stage.semantic == SemanticEffectId::mirror) {
       if (has_mirror)
         return fail(StatusId::blocked, ReasonId::malformed_contract);
       has_mirror = true;
@@ -347,7 +372,10 @@ StatusId VulkanHalResidentAdapter::Prepare(
     previous_output = &stage.output.image;
   }
   if (has_mirror != pending_options_.request_mirror ||
-      has_vignette != pending_options_.request_vignette) {
+      has_vignette != pending_options_.request_vignette ||
+      has_keylight != pending_options_.request_keylight ||
+      has_background !=
+          (pending_options_.background != SemanticEffectId::invalid)) {
     return fail(StatusId::blocked, ReasonId::malformed_contract);
   }
   if (has_vignette && pending_options_.vignette_center !=
@@ -367,6 +395,7 @@ StatusId VulkanHalResidentAdapter::Prepare(
       executor_->CapabilityEvidence();
   if (evidence.execution_domain != program.execution_domain ||
       !CommonEvidenceReady(evidence) ||
+      (has_matting && !evidence.matting_production_ready) ||
       (has_mirror && !evidence.mirror_production_ready) ||
       (has_vignette && !evidence.vignette_fixed_center_production_ready)) {
     return fail(StatusId::blocked,
@@ -710,6 +739,13 @@ VulkanHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   for (std::size_t index = 0; index < slot->program.stage_count; ++index) {
     const std::uint32_t bit = std::uint32_t{1} << index;
     if ((request.disabled_stage_mask & bit) != 0) {
+      if (IsMattingSemantic(slot->program.stages[index].semantic)) {
+        if (slot->program.stages[index].semantic ==
+            SemanticEffectId::virtual_key_light)
+          execution_options.request_keylight = false;
+        else
+          execution_options.background = SemanticEffectId::invalid;
+      }
       if (slot->program.stages[index].semantic == SemanticEffectId::mirror)
         execution_options.request_mirror = false;
       if (slot->program.stages[index].semantic == SemanticEffectId::vignette)

@@ -2,6 +2,8 @@
 
 #include "core/video/video_adapter_factory.h"
 
+#include "core/open_video/model_pack_registry.h"
+#include "core/video/effects/broadcast_effects.h"
 #include <cstdint>
 #include <memory>
 
@@ -15,6 +17,12 @@ struct VulkanVideoExecutionFactoryConfiguration {
   std::uint32_t selection_priority = 300;
   std::uint64_t minimum_synchronizations_per_frame = 2;
   std::uint64_t maximum_synchronizations_per_frame = 3;
+  std::shared_ptr<const open_video::ModelPack> matting_pack;
+  std::shared_ptr<const video::effects::BroadcastCameraEffects> effects;
+  hal::ModelArtifactIdentity matting_identity{};
+  hal::ResourceBudget reservation{};
+  int input_width = 0;
+  int input_height = 0;
 };
 
 class VulkanVideoExecutionFactory final : public video::IVideoAdapterFactory {

@@ -21,6 +21,13 @@ enum class VulkanVignetteCenterMode : std::uint8_t {
 struct VulkanResidentProgramOptions {
   std::uint64_t program_id = 0;
   std::uint64_t canonical_plan_hash = 0;
+  hal::SemanticEffectId background = hal::SemanticEffectId::invalid;
+  bool request_keylight = false;
+  int background_strength = 1;
+  std::uint32_t remove_color_rgb = 0;
+  int keylight_intensity = 0;
+  int keylight_temperature = 0;
+  int keylight_pan = 0;
   bool request_mirror = false;
   bool request_vignette = false;
   VulkanVignetteCenterMode vignette_center =
@@ -47,6 +54,7 @@ struct VulkanResidentCapabilityEvidence {
   bool one_final_readback_transport = false;
   bool mirror_production_ready = false;
   bool vignette_fixed_center_production_ready = false;
+  bool matting_production_ready = false;
   hal::ReasonId blocker = hal::ReasonId::none;
 };
 

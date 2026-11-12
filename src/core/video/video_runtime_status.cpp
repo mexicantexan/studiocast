@@ -154,6 +154,19 @@ HasSatisfiedEvidence(const hal::SemanticCapabilityEvidence &capability,
     if (!HasSatisfiedEvidence(capability, code))
       return false;
   }
+  const bool matting =
+      capability.semantic == hal::SemanticEffectId::virtual_background_blur ||
+      capability.semantic == hal::SemanticEffectId::virtual_background_remove ||
+      capability.semantic ==
+          hal::SemanticEffectId::virtual_background_replace ||
+      capability.semantic == hal::SemanticEffectId::virtual_key_light;
+  if (matting)
+    return HasSatisfiedEvidence(
+               capability,
+               hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready) &&
+           HasSatisfiedEvidence(
+               capability,
+               hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
   const auto effect_code =
       capability.semantic == hal::SemanticEffectId::mirror
           ? hal::CapabilityEvidenceCode::open_vulkan_mirror_production_ready
@@ -501,7 +514,11 @@ CapabilityValidationResult ValidateProductCapabilitySnapshot(
     if (lane.lane == ProductCapabilityLaneId::open_vulkan) {
       const bool production_effect =
           lane.effect == hal::SemanticEffectId::mirror ||
-          lane.effect == hal::SemanticEffectId::vignette;
+          lane.effect == hal::SemanticEffectId::vignette ||
+          lane.effect == hal::SemanticEffectId::virtual_background_blur ||
+          lane.effect == hal::SemanticEffectId::virtual_background_remove ||
+          lane.effect == hal::SemanticEffectId::virtual_background_replace ||
+          lane.effect == hal::SemanticEffectId::virtual_key_light;
       if (hal_selectable && !production_effect) {
         result.code = CapabilityValidationCode::vulkan_capability_promoted;
         return result;
@@ -511,8 +528,11 @@ CapabilityValidationResult ValidateProductCapabilitySnapshot(
             lane.effect == hal::SemanticEffectId::mirror
                 ? effects::EffectCapabilityCode::
                       open_vulkan_mirror_production_ready
+            : lane.effect == hal::SemanticEffectId::vignette
+                ? effects::EffectCapabilityCode::
+                      open_vulkan_vignette_fixed_center_production_ready
                 : effects::EffectCapabilityCode::
-                      open_vulkan_vignette_fixed_center_production_ready;
+                      open_vulkan_matting_production_ready;
         if (lane.code != expected ||
             lane.semantic.provider !=
                 hal::SemanticEffectProviderId::open_vulkan_production_kernels ||
