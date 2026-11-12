@@ -791,6 +791,8 @@ bool ReviewedMattingProfile(const open_video::ModelPack &pack) {
                                 "466c58d1310af8a1bd" &&
          native.bin_sha256 == "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db"
                               "2cf09d29a17e3fa2" &&
+         native.input_blob == "input" && native.output_blob == "output" &&
+         model.input.name == "input" && model.output.name == "output" &&
          native.precision == "fp32" && model.input.width == 256 &&
          model.input.height == 256 && model.output.width == 256 &&
          model.output.height == 256 && model.preprocess.color == "rgb" &&
