@@ -1021,13 +1021,13 @@ VulkanDevice::~VulkanDevice() { Shutdown(); }
 
 bool VulkanDevice::ChooseAdoptionPhysicalDevice(
     VkInstance instance, const VulkanDeviceSelection &selection,
-    std::shared_ptr<void> owner, VkPhysicalDevice *physical_device,
-    std::string *error_out) {
+    PFN_vkGetInstanceProcAddr entry_point, std::shared_ptr<void> owner,
+    VkPhysicalDevice *physical_device, std::string *error_out) {
   if (!instance || !owner || !physical_device)
     return false;
   VulkanDevice probe;
   probe.selection_ = selection;
-  if (!probe.loader_->Load(error_out))
+  if (!probe.loader_->AdoptEntryPoint(entry_point, owner, error_out))
     return false;
   probe.instance_ = instance;
   probe.adopted_owner_ = std::move(owner);
@@ -1055,8 +1055,13 @@ bool VulkanDevice::ResolveSelection(VulkanDeviceSelection *selection,
 
 bool VulkanDevice::Initialize(std::string *error_out) {
   VulkanDeviceSelection selection;
-  if (!ResolveSelection(&selection, error_out))
+  if (!ResolveSelection(&selection, error_out)) {
+    diagnostics_ = OpenVulkanDiagnostics{};
+    diagnostics_.error =
+        error_out ? *error_out : "Invalid Vulkan device selection.";
+    diagnostics_.fallback_reason = "vulkan_device_selection_invalid";
     return false;
+  }
   return Initialize(selection, error_out);
 }
 
@@ -1071,8 +1076,9 @@ bool VulkanDevice::InitializeAdopted(const VulkanDeviceSelection &selection,
                                      VulkanDeviceAdoption adoption,
                                      std::string *error_out) {
   if (initialized_ || !adoption.instance || !adoption.physical_device ||
-      !adoption.device || !adoption.queue || !adoption.owner ||
-      adoption.owner_kind.empty() || config.fence_timeout_ns == 0) {
+      !adoption.device || !adoption.queue || !adoption.entry_point ||
+      !adoption.owner || adoption.owner_kind.empty() ||
+      config.fence_timeout_ns == 0) {
     if (error_out)
       *error_out = "Invalid or already initialized Vulkan adoption.";
     return false;
@@ -1082,7 +1088,8 @@ bool VulkanDevice::InitializeAdopted(const VulkanDeviceSelection &selection,
   diagnostics_ = OpenVulkanDiagnostics{};
   diagnostics_.device_selection_source = selection.source;
   diagnostics_.device_selection_request = selection.request;
-  if (!loader_->Load(error_out))
+  if (!loader_->AdoptEntryPoint(adoption.entry_point, adoption.owner,
+                                error_out))
     return false;
   diagnostics_.runtime_library_found = true;
   diagnostics_.runtime_library_path = loader_->LibraryPath().string();
