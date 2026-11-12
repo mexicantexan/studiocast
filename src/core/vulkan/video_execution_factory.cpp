@@ -311,7 +311,8 @@ bool ParseOptions(const video::NormalizedVideoExecutionIntent &intent,
                    p.id == video::CanonicalVideoParameterId::greenscreen_mode &&
                    p.kind ==
                        video::CanonicalVideoParameterKind::unsigned_integer &&
-                   p.unsigned_value <= 2) {
+                   p.unsigned_value <=
+                       std::numeric_limits<std::uint32_t>::max()) {
           bit = 4;
         } else if (!key &&
                    p.id ==
