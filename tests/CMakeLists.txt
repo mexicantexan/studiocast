@@ -1926,7 +1926,7 @@ if (BUILD_TESTING)
             add_executable(studiocast-ncnn-vulkan-matting-runtime-tests
                     ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/ncnn_vulkan_matting_runtime_tests.cpp)
             target_link_libraries(studiocast-ncnn-vulkan-matting-runtime-tests PRIVATE
-                    studiocast_vulkan_backend)
+                    studiocast_vulkan_backend "${_studiocast_ncnn_target}")
             target_include_directories(studiocast-ncnn-vulkan-matting-runtime-tests PRIVATE
                     "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
             studiocast_set_project_warnings(studiocast-ncnn-vulkan-matting-runtime-tests)
