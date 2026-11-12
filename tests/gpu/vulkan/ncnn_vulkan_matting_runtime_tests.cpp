@@ -2,6 +2,7 @@
 #include "core/open_video/vulkan_matting_runtime.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <unistd.h>
+#include <vector>
 namespace {
 namespace ov = studiocast::open_vulkan;
 namespace vk = studiocast::vulkan;
@@ -88,6 +90,132 @@ bool Transfer(vk::VulkanDevice &device, vk::VkBuffer source, vk::VkBuffer dest,
                                     &command);
   return ok;
 }
+bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
+  const char *param = std::getenv("STUDIOCAST_NCNN_MATTING_PARAM");
+  const char *bin = std::getenv("STUDIOCAST_NCNN_MATTING_BIN");
+  const char *golden = std::getenv("STUDIOCAST_NCNN_MATTING_GOLDEN_ROOT");
+  if (!param && !bin && !golden)
+    return true;
+  if (!param || !bin || !golden)
+    return Check(
+        false,
+        "Real-model parity requires param, bin and golden root together.");
+  constexpr int width = 256, height = 256;
+  constexpr std::size_t elements = width * height;
+  vk::VulkanTensor input;
+  vk::VulkanImage alpha;
+  vk::VulkanBuffer upload, readback;
+  if (!input.AllocateNchwF32(&device, 1, 3, height, width, false, error) ||
+      !alpha.Allocate(&device, width, height, vk::VulkanPixelFormat::f32_1,
+                      false, error) ||
+      !upload.Allocate(&device, input.bytes(),
+                       vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                       vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true, error) ||
+      !readback.Allocate(&device, alpha.byte_size(),
+                         vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                         vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true, error))
+    return false;
+  ov::VulkanMattingGraphDescriptor graph;
+  graph.param_path = param;
+  graph.bin_path = bin;
+  graph.param_sha256 = std::string(64, 'a');
+  graph.bin_sha256 = std::string(64, 'b');
+  graph.input_blob = "input";
+  graph.output_blob = "output";
+  graph.converter_name = "onnx2ncnn";
+  graph.converter_version = "24ea07e";
+  graph.precision = "fp32";
+  graph.input_h = graph.output_h = height;
+  graph.input_w = graph.output_w = width;
+  ov::VulkanMattingPersistentResources resources;
+  resources.input_bytes = input.bytes();
+  resources.alpha_bytes = elements * sizeof(float);
+  resources.input_buffer = Opaque(input.buffer());
+  resources.alpha_buffer = Opaque(alpha.buffer());
+  resources.alpha_row_stride_bytes = alpha.pitch_bytes();
+  resources.alpha_buffer_capacity_bytes = alpha.byte_size();
+  ov::VulkanMattingRuntimeLifecycle runtime(
+      ov::CreateProductionVulkanMattingRuntime());
+  if (!runtime.Prepare(Context(device), graph, resources, error) ||
+      !runtime.Warmup(error))
+    return false;
+  ov::VulkanMattingBufferBinding in, out;
+  auto bind = [&](auto &b, std::uintptr_t buffer, std::size_t bytes, int c) {
+    b.ownership_domain = &device;
+    b.logical_device = Opaque(device.device());
+    b.buffer = buffer;
+    b.byte_size = bytes;
+    b.n = 1;
+    b.c = c;
+    b.h = height;
+    b.w = width;
+    b.device_resident = b.device_local_memory = b.access_synchronized =
+        b.runtime_queue_ownership = true;
+    b.context_id = device.context_identity().context_id;
+    b.context_generation = device.context_identity().generation;
+  };
+  bind(in, resources.input_buffer, resources.input_bytes, 3);
+  bind(out, resources.alpha_buffer, resources.alpha_bytes, 1);
+  auto read = [](const std::filesystem::path &path, void *bytes,
+                 std::size_t count) {
+    std::ifstream file(path, std::ios::binary);
+    file.read(static_cast<char *>(bytes), static_cast<std::streamsize>(count));
+    return bool(file) && file.peek() == std::char_traits<char>::eof();
+  };
+  bool all_ok = true;
+  std::vector<float> expected(elements);
+  const auto before = device.allocation_stats();
+  for (const char *name :
+       {"black", "white", "gray", "gradient", "checker", "seeded_noise"}) {
+    const auto root = std::filesystem::path(golden);
+    if (!read(root / (std::string(name) + ".input.f32"), upload.mapped(),
+              input.bytes()) ||
+        !read(root / (std::string(name) + ".expected.f32"), expected.data(),
+              expected.size() * sizeof(float)))
+      return Check(false, "Missing or wrong-size real-model fixture.");
+    if (!upload.Flush(error) ||
+        !Transfer(device, upload.buffer(), input.buffer(), input.bytes(),
+                  error) ||
+        !runtime.Run(in, out, error) ||
+        !Transfer(device, alpha.buffer(), readback.buffer(), alpha.byte_size(),
+                  error) ||
+        !readback.Invalidate(error))
+      return false;
+    double total = 0, maximum = 0;
+    std::uint64_t intersection = 0, union_count = 0;
+    bool finite = true;
+    for (int y = 0; y < height; ++y) {
+      const auto *row = reinterpret_cast<const float *>(
+          static_cast<const char *>(readback.mapped()) +
+          std::size_t(y) * alpha.pitch_bytes());
+      for (int x = 0; x < width; ++x) {
+        const float actual = row[x],
+                    reference = expected[std::size_t(y) * width + x];
+        finite = finite && std::isfinite(actual) && std::isfinite(reference);
+        const double difference = std::fabs(double(actual) - reference);
+        total += difference;
+        maximum = std::max(maximum, difference);
+        const bool a = actual >= 0.5f, b = reference >= 0.5f;
+        intersection += a && b;
+        union_count += a || b;
+      }
+    }
+    const double mae = total / elements,
+                 iou = union_count ? double(intersection) / union_count : 1.0;
+    const bool ok = finite && maximum <= 2e-4 && mae <= 2e-5 && iou >= 0.999;
+    std::cout << "MODNet " << name << " max_abs=" << maximum << " mae=" << mae
+              << " iou=" << iou << " finite=" << finite << " pass=" << ok
+              << '\n';
+    all_ok = all_ok && ok;
+  }
+  const auto after = device.allocation_stats();
+  return Check(before.allocation_count == after.allocation_count,
+               "real-model replay allocated new device memory") &&
+         all_ok;
+}
+
 } // namespace
 int main() {
   std::string error;
@@ -160,6 +288,7 @@ int main() {
   resources.input_buffer = Opaque(input.buffer());
   resources.alpha_buffer = Opaque(alpha.buffer());
   resources.alpha_row_stride_bytes = alpha.pitch_bytes();
+  resources.alpha_buffer_capacity_bytes = alpha.byte_size();
   auto fill = [&](float value) {
     auto *pixels = static_cast<float *>(upload.mapped());
     for (int i = 0; i < 48; ++i)
@@ -233,6 +362,8 @@ int main() {
   if (!Check(cpu->LoadGraph(graph).failure ==
                  ov::VulkanMattingRuntimeFailure::cpu_layer_rejected,
              "CPU-only layer was accepted"))
+    return 1;
+  if (!Check(RealModelParity(device, &error), error))
     return 1;
   // A timed-out submitted replay must poison the domain and retain its program.
   device.InjectNextSubmissionResultForTesting(

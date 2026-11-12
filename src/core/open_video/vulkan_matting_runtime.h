@@ -89,6 +89,7 @@ struct VulkanMattingPersistentResources {
   std::size_t input_offset = 0;
   std::size_t alpha_offset = 0;
   std::size_t alpha_row_stride_bytes = 0;
+  std::size_t alpha_buffer_capacity_bytes = 0;
   std::size_t allocation_budget_bytes = 256u * 1024u * 1024u;
   std::size_t allocation_resource_limit = 512;
   bool allow_cpu_layers = false;

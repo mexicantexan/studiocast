@@ -9,7 +9,8 @@ import argparse
 import hashlib
 import json
 import pathlib
-import shutil
+import io
+import tarfile
 import subprocess
 
 REVISION = '24ea07e87f544a3fbc59980b57885a92c75f2d24'
@@ -31,14 +32,19 @@ def main():
     for path, revision in ((source, REVISION), (source/'glslang', GLSLANG_REVISION)):
         if run('git', '-C', str(path), 'rev-parse', 'HEAD', capture_output=True).stdout.strip() != revision:
             parser.error(f'{path} must be pinned to {revision}')
-        if run('git', '-C', str(path), 'status', '--porcelain', '--untracked-files=no', capture_output=True).stdout.strip():
-            parser.error(f'{path} must have no tracked modifications')
     patch = pathlib.Path(__file__).resolve().parents[1]/'cmake/patches/ncnn-studiocast-replay.patch'
     output.mkdir(parents=True)
     destination = output/'source'
-    shutil.copytree(source, destination, ignore=shutil.ignore_patterns('.git'))
-    run('git', 'apply', '--check', str(patch), cwd=destination)
-    run('git', 'apply', str(patch), cwd=destination)
+    destination.mkdir()
+    for repository, revision, target in ((source, REVISION, destination),
+            (source/'glslang', GLSLANG_REVISION, destination/'glslang')):
+        target.mkdir(exist_ok=True)
+        archive = subprocess.run(['git', '-C', str(repository), 'archive', revision],
+                                 check=True, stdout=subprocess.PIPE).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+            tree.extractall(target, filter='data')
+    run('git', 'apply', '--unidiff-zero', '--check', str(patch), cwd=destination)
+    run('git', 'apply', '--unidiff-zero', str(patch), cwd=destination)
     receipt = {'upstream_revision': REVISION, 'glslang_revision': GLSLANG_REVISION,
                'replay_abi': 1, 'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest()}
     (output/'dependency.json').write_text(json.dumps(receipt, indent=2)+'\n')
@@ -51,6 +57,12 @@ def main():
         f'-DCMAKE_INSTALL_PREFIX={output / "prefix"}')
     run('cmake', '--build', str(output/'build'), '-j', str(args.jobs))
     run('cmake', '--install', str(output/'build'))
+    license_root = output/'prefix/share/licenses/studiocast-ncnn'
+    license_root.mkdir(parents=True)
+    import shutil
+    shutil.copyfile(destination/'LICENSE.txt', license_root/'ncnn-LICENSE.txt')
+    shutil.copyfile(destination/'glslang/LICENSE.txt', license_root/'glslang-LICENSE.txt')
+    shutil.copyfile(output/'dependency.json', license_root/'dependency.json')
     print(output/'prefix/lib/cmake/ncnn')
 
 if __name__ == '__main__':
