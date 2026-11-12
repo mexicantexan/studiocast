@@ -46,7 +46,7 @@ def main():
     run('git', 'apply', '--unidiff-zero', '--check', str(patch), cwd=destination)
     run('git', 'apply', '--unidiff-zero', str(patch), cwd=destination)
     receipt = {'upstream_revision': REVISION, 'glslang_revision': GLSLANG_REVISION,
-               'replay_abi': 1, 'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest()}
+               'replay_abi': 2, 'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest()}
     (output/'dependency.json').write_text(json.dumps(receipt, indent=2)+'\n')
     if args.prepare_only:
         return

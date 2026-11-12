@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include "core/util/dynlib.h"
@@ -151,8 +152,7 @@ constexpr VkFlags VK_PIPELINE_STAGE_TRANSFER_BIT = 0x00001000u;
 constexpr VkFlags VK_PIPELINE_STAGE_HOST_BIT = 0x00004000u;
 constexpr VkFlags VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = 0x00010000u;
 
-constexpr VkFlags VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT =
-    0x00000002u;
+constexpr VkFlags VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 0x00000002u;
 constexpr VkFlags VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT = 0x00000004u;
 
 struct VkExtent3D {
@@ -450,16 +450,17 @@ struct VkBufferMemoryBarrier {
 };
 
 using PFN_vkVoidFunction = void (*)();
-using PFN_vkGetInstanceProcAddr =
-    PFN_vkVoidFunction (*)(VkInstance, const char *);
+using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (*)(VkInstance,
+                                                         const char *);
 using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction (*)(VkDevice, const char *);
 using PFN_vkEnumerateInstanceVersion = VkResult (*)(std::uint32_t *);
-using PFN_vkCreateInstance = VkResult (*)(
-    const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance *);
+using PFN_vkCreateInstance = VkResult (*)(const VkInstanceCreateInfo *,
+                                          const VkAllocationCallbacks *,
+                                          VkInstance *);
 using PFN_vkDestroyInstance = void (*)(VkInstance,
                                        const VkAllocationCallbacks *);
-using PFN_vkEnumeratePhysicalDevices =
-    VkResult (*)(VkInstance, std::uint32_t *, VkPhysicalDevice *);
+using PFN_vkEnumeratePhysicalDevices = VkResult (*)(VkInstance, std::uint32_t *,
+                                                    VkPhysicalDevice *);
 using PFN_vkGetPhysicalDeviceProperties =
     void (*)(VkPhysicalDevice, VkPhysicalDeviceProperties *);
 using PFN_vkGetPhysicalDeviceProperties2 =
@@ -468,56 +469,59 @@ using PFN_vkGetPhysicalDeviceQueueFamilyProperties =
     void (*)(VkPhysicalDevice, std::uint32_t *, VkQueueFamilyProperties *);
 using PFN_vkGetPhysicalDeviceMemoryProperties =
     void (*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *);
-using PFN_vkCreateDevice = VkResult (*)(
-    VkPhysicalDevice, const VkDeviceCreateInfo *,
-    const VkAllocationCallbacks *, VkDevice *);
+using PFN_vkCreateDevice = VkResult (*)(VkPhysicalDevice,
+                                        const VkDeviceCreateInfo *,
+                                        const VkAllocationCallbacks *,
+                                        VkDevice *);
 
 using PFN_vkDestroyDevice = void (*)(VkDevice, const VkAllocationCallbacks *);
-using PFN_vkGetDeviceQueue =
-    void (*)(VkDevice, std::uint32_t, std::uint32_t, VkQueue *);
+using PFN_vkGetDeviceQueue = void (*)(VkDevice, std::uint32_t, std::uint32_t,
+                                      VkQueue *);
 using PFN_vkDeviceWaitIdle = VkResult (*)(VkDevice);
-using PFN_vkCreateCommandPool =
-    VkResult (*)(VkDevice, const VkCommandPoolCreateInfo *,
-                 const VkAllocationCallbacks *, VkCommandPool *);
-using PFN_vkDestroyCommandPool =
-    void (*)(VkDevice, VkCommandPool, const VkAllocationCallbacks *);
-using PFN_vkAllocateCommandBuffers =
-    VkResult (*)(VkDevice, const VkCommandBufferAllocateInfo *,
-                 VkCommandBuffer *);
-using PFN_vkFreeCommandBuffers =
-    void (*)(VkDevice, VkCommandPool, std::uint32_t, const VkCommandBuffer *);
-using PFN_vkCreateFence =
-    VkResult (*)(VkDevice, const VkFenceCreateInfo *,
-                 const VkAllocationCallbacks *, VkFence *);
-using PFN_vkDestroyFence =
-    void (*)(VkDevice, VkFence, const VkAllocationCallbacks *);
-using PFN_vkResetFences =
-    VkResult (*)(VkDevice, std::uint32_t, const VkFence *);
-using PFN_vkWaitForFences =
-    VkResult (*)(VkDevice, std::uint32_t, const VkFence *, VkBool32,
-                 std::uint64_t);
-using PFN_vkQueueSubmit =
-    VkResult (*)(VkQueue, std::uint32_t, const VkSubmitInfo *, VkFence);
+using PFN_vkCreateCommandPool = VkResult (*)(VkDevice,
+                                             const VkCommandPoolCreateInfo *,
+                                             const VkAllocationCallbacks *,
+                                             VkCommandPool *);
+using PFN_vkDestroyCommandPool = void (*)(VkDevice, VkCommandPool,
+                                          const VkAllocationCallbacks *);
+using PFN_vkAllocateCommandBuffers = VkResult (*)(
+    VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *);
+using PFN_vkFreeCommandBuffers = void (*)(VkDevice, VkCommandPool,
+                                          std::uint32_t,
+                                          const VkCommandBuffer *);
+using PFN_vkCreateFence = VkResult (*)(VkDevice, const VkFenceCreateInfo *,
+                                       const VkAllocationCallbacks *,
+                                       VkFence *);
+using PFN_vkDestroyFence = void (*)(VkDevice, VkFence,
+                                    const VkAllocationCallbacks *);
+using PFN_vkResetFences = VkResult (*)(VkDevice, std::uint32_t,
+                                       const VkFence *);
+using PFN_vkWaitForFences = VkResult (*)(VkDevice, std::uint32_t,
+                                         const VkFence *, VkBool32,
+                                         std::uint64_t);
+using PFN_vkQueueSubmit = VkResult (*)(VkQueue, std::uint32_t,
+                                       const VkSubmitInfo *, VkFence);
 
-using PFN_vkCreateBuffer =
-    VkResult (*)(VkDevice, const VkBufferCreateInfo *,
-                 const VkAllocationCallbacks *, VkBuffer *);
-using PFN_vkDestroyBuffer =
-    void (*)(VkDevice, VkBuffer, const VkAllocationCallbacks *);
-using PFN_vkGetBufferMemoryRequirements =
-    void (*)(VkDevice, VkBuffer, VkMemoryRequirements *);
-using PFN_vkAllocateMemory =
-    VkResult (*)(VkDevice, const VkMemoryAllocateInfo *,
-                 const VkAllocationCallbacks *, VkDeviceMemory *);
-using PFN_vkFreeMemory =
-    void (*)(VkDevice, VkDeviceMemory, const VkAllocationCallbacks *);
-using PFN_vkBindBufferMemory =
-    VkResult (*)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+using PFN_vkCreateBuffer = VkResult (*)(VkDevice, const VkBufferCreateInfo *,
+                                        const VkAllocationCallbacks *,
+                                        VkBuffer *);
+using PFN_vkDestroyBuffer = void (*)(VkDevice, VkBuffer,
+                                     const VkAllocationCallbacks *);
+using PFN_vkGetBufferMemoryRequirements = void (*)(VkDevice, VkBuffer,
+                                                   VkMemoryRequirements *);
+using PFN_vkAllocateMemory = VkResult (*)(VkDevice,
+                                          const VkMemoryAllocateInfo *,
+                                          const VkAllocationCallbacks *,
+                                          VkDeviceMemory *);
+using PFN_vkFreeMemory = void (*)(VkDevice, VkDeviceMemory,
+                                  const VkAllocationCallbacks *);
+using PFN_vkBindBufferMemory = VkResult (*)(VkDevice, VkBuffer, VkDeviceMemory,
+                                            VkDeviceSize);
 using PFN_vkMapMemory = VkResult (*)(VkDevice, VkDeviceMemory, VkDeviceSize,
                                      VkDeviceSize, VkFlags, void **);
 using PFN_vkUnmapMemory = void (*)(VkDevice, VkDeviceMemory);
-using PFN_vkFlushMappedMemoryRanges =
-    VkResult (*)(VkDevice, std::uint32_t, const VkMappedMemoryRange *);
+using PFN_vkFlushMappedMemoryRanges = VkResult (*)(VkDevice, std::uint32_t,
+                                                   const VkMappedMemoryRange *);
 using PFN_vkInvalidateMappedMemoryRanges =
     VkResult (*)(VkDevice, std::uint32_t, const VkMappedMemoryRange *);
 
@@ -529,53 +533,53 @@ using PFN_vkDestroyDescriptorSetLayout =
 using PFN_vkCreateDescriptorPool =
     VkResult (*)(VkDevice, const VkDescriptorPoolCreateInfo *,
                  const VkAllocationCallbacks *, VkDescriptorPool *);
-using PFN_vkDestroyDescriptorPool =
-    void (*)(VkDevice, VkDescriptorPool, const VkAllocationCallbacks *);
-using PFN_vkAllocateDescriptorSets =
-    VkResult (*)(VkDevice, const VkDescriptorSetAllocateInfo *,
-                 VkDescriptorSet *);
-using PFN_vkUpdateDescriptorSets =
-    void (*)(VkDevice, std::uint32_t, const VkWriteDescriptorSet *,
-             std::uint32_t, const void *);
+using PFN_vkDestroyDescriptorPool = void (*)(VkDevice, VkDescriptorPool,
+                                             const VkAllocationCallbacks *);
+using PFN_vkAllocateDescriptorSets = VkResult (*)(
+    VkDevice, const VkDescriptorSetAllocateInfo *, VkDescriptorSet *);
+using PFN_vkUpdateDescriptorSets = void (*)(VkDevice, std::uint32_t,
+                                            const VkWriteDescriptorSet *,
+                                            std::uint32_t, const void *);
 using PFN_vkCreatePipelineLayout =
     VkResult (*)(VkDevice, const VkPipelineLayoutCreateInfo *,
                  const VkAllocationCallbacks *, VkPipelineLayout *);
-using PFN_vkDestroyPipelineLayout =
-    void (*)(VkDevice, VkPipelineLayout, const VkAllocationCallbacks *);
-using PFN_vkCreateShaderModule =
-    VkResult (*)(VkDevice, const VkShaderModuleCreateInfo *,
-                 const VkAllocationCallbacks *, VkShaderModule *);
-using PFN_vkDestroyShaderModule =
-    void (*)(VkDevice, VkShaderModule, const VkAllocationCallbacks *);
+using PFN_vkDestroyPipelineLayout = void (*)(VkDevice, VkPipelineLayout,
+                                             const VkAllocationCallbacks *);
+using PFN_vkCreateShaderModule = VkResult (*)(VkDevice,
+                                              const VkShaderModuleCreateInfo *,
+                                              const VkAllocationCallbacks *,
+                                              VkShaderModule *);
+using PFN_vkDestroyShaderModule = void (*)(VkDevice, VkShaderModule,
+                                           const VkAllocationCallbacks *);
 using PFN_vkCreateComputePipelines =
     VkResult (*)(VkDevice, VkPipelineCache, std::uint32_t,
                  const VkComputePipelineCreateInfo *,
                  const VkAllocationCallbacks *, VkPipeline *);
-using PFN_vkDestroyPipeline =
-    void (*)(VkDevice, VkPipeline, const VkAllocationCallbacks *);
+using PFN_vkDestroyPipeline = void (*)(VkDevice, VkPipeline,
+                                       const VkAllocationCallbacks *);
 
-using PFN_vkBeginCommandBuffer =
-    VkResult (*)(VkCommandBuffer, const VkCommandBufferBeginInfo *);
+using PFN_vkBeginCommandBuffer = VkResult (*)(VkCommandBuffer,
+                                              const VkCommandBufferBeginInfo *);
 using PFN_vkEndCommandBuffer = VkResult (*)(VkCommandBuffer);
 using PFN_vkResetCommandBuffer = VkResult (*)(VkCommandBuffer, VkFlags);
-using PFN_vkCmdBindPipeline =
-    void (*)(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
+using PFN_vkCmdBindPipeline = void (*)(VkCommandBuffer, VkPipelineBindPoint,
+                                       VkPipeline);
 using PFN_vkCmdBindDescriptorSets =
     void (*)(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout,
              std::uint32_t, std::uint32_t, const VkDescriptorSet *,
              std::uint32_t, const std::uint32_t *);
-using PFN_vkCmdPushConstants =
-    void (*)(VkCommandBuffer, VkPipelineLayout, VkFlags, std::uint32_t,
-             std::uint32_t, const void *);
-using PFN_vkCmdDispatch =
-    void (*)(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t);
-using PFN_vkCmdCopyBuffer =
-    void (*)(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t,
-             const VkBufferCopy *);
-using PFN_vkCmdPipelineBarrier =
-    void (*)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, std::uint32_t,
-             const void *, std::uint32_t, const VkBufferMemoryBarrier *,
-             std::uint32_t, const void *);
+using PFN_vkCmdPushConstants = void (*)(VkCommandBuffer, VkPipelineLayout,
+                                        VkFlags, std::uint32_t, std::uint32_t,
+                                        const void *);
+using PFN_vkCmdDispatch = void (*)(VkCommandBuffer, std::uint32_t,
+                                   std::uint32_t, std::uint32_t);
+using PFN_vkCmdCopyBuffer = void (*)(VkCommandBuffer, VkBuffer, VkBuffer,
+                                     std::uint32_t, const VkBufferCopy *);
+using PFN_vkCmdPipelineBarrier = void (*)(VkCommandBuffer, VkFlags, VkFlags,
+                                          VkFlags, std::uint32_t, const void *,
+                                          std::uint32_t,
+                                          const VkBufferMemoryBarrier *,
+                                          std::uint32_t, const void *);
 
 struct VulkanFunctions {
   PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -587,8 +591,8 @@ struct VulkanFunctions {
   PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
   PFN_vkGetPhysicalDeviceQueueFamilyProperties
       vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
-  PFN_vkGetPhysicalDeviceMemoryProperties
-      vkGetPhysicalDeviceMemoryProperties = nullptr;
+  PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties =
+      nullptr;
   PFN_vkCreateDevice vkCreateDevice = nullptr;
 
   PFN_vkDestroyDevice vkDestroyDevice = nullptr;
@@ -652,9 +656,15 @@ public:
   VulkanLoader &operator=(VulkanLoader &&) noexcept = default;
 
   bool Load(std::string *error_out);
+  bool AdoptEntryPoint(PFN_vkGetInstanceProcAddr entry_point,
+                       std::shared_ptr<void> owner, std::string *error_out);
 
-  bool IsLoaded() const { return library_.IsOpen(); }
-  const std::filesystem::path &LibraryPath() const { return library_.path(); }
+  bool IsLoaded() const {
+    return library_.IsOpen() || adopted_owner_ != nullptr;
+  }
+  const std::filesystem::path &LibraryPath() const {
+    return adopted_owner_ ? adopted_path_ : library_.path();
+  }
   const VulkanFunctions &f() const { return f_; }
   VulkanFunctions &f() { return f_; }
 
@@ -665,6 +675,8 @@ private:
   bool LoadGlobalProc(const char *name, PFN_vkVoidFunction *out,
                       std::string *error_out);
 
+  std::shared_ptr<void> adopted_owner_;
+  std::filesystem::path adopted_path_ = "ncnn-owned-vulkan-provider";
   studiocast::util::DynLib library_;
   VulkanFunctions f_{};
 };

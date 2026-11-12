@@ -1,10 +1,12 @@
 #include "core/open_video/ncnn_vulkan_context.h"
+#include "core/open_video/ncnn_vulkan_context_internal.h"
 #include "core/open_video/vulkan_matting_runtime.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <command.h>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -90,6 +92,88 @@ bool Transfer(vk::VulkanDevice &device, vk::VkBuffer source, vk::VkBuffer dest,
                                     &command);
   return ok;
 }
+VKAPI_ATTR VkResult VKAPI_CALL FailBegin(VkCommandBuffer,
+                                         const VkCommandBufferBeginInfo *) {
+  return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+vk::PFN_vkVoidFunction MissingProvider(vk::VkInstance, const char *) {
+  return nullptr;
+}
+bool ProviderGuards() {
+  vk::VkPhysicalDevice physical = nullptr;
+  std::string error;
+  if (!Check(!vk::VulkanDevice::ChooseAdoptionPhysicalDevice(
+                 reinterpret_cast<vk::VkInstance>(1), {}, MissingProvider,
+                 std::make_shared<int>(1), &physical, &error),
+             "adoption accepted missing provider functions"))
+    return false;
+  const char *prior = std::getenv("STUDIOCAST_VULKAN_LIBRARY");
+  const bool existed = prior != nullptr;
+  const std::string saved = prior ? prior : "";
+  struct Restore {
+    bool existed;
+    std::string saved;
+    ~Restore() {
+      if (existed)
+        setenv("STUDIOCAST_VULKAN_LIBRARY", saved.c_str(), 1);
+      else
+        unsetenv("STUDIOCAST_VULKAN_LIBRARY");
+    }
+  } restore{existed, saved};
+  setenv("STUDIOCAST_VULKAN_LIBRARY",
+         "/missing/studiocast-explicit-vulkan-provider.so", 1);
+  vk::VulkanDevice rejected;
+  return Check(!ov::InitializeProductionVulkanMattingDevice(&rejected, &error),
+               "explicit invalid provider override was silently ignored");
+}
+
+bool ReplayGuards(vk::VulkanDevice &device) {
+  auto owner = std::static_pointer_cast<ov::detail::NcnnVulkanContext>(
+      device.NativeOwner(ov::detail::kNcnnOwnerKind));
+  if (!owner)
+    return false;
+  const auto before = device.health_state();
+  {
+    ncnn::VkCompute replay(owner->device.get(), true);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!Check(replay.submit_and_wait() != 0 && replay.reset() != 0 &&
+                   !replay.studiocast_valid() &&
+                   replay.studiocast_finalize(&command) != 0,
+               "replay permitted internal submission/reset"))
+      return false;
+    ncnn::VkTransfer early_reset(owner->device.get(), true);
+    if (!Check(early_reset.reset() != 0 && !early_reset.studiocast_valid(),
+               "compute-only upload reset without external finalization"))
+      return false;
+    ncnn::VkTransfer upload(owner->device.get(), true);
+    if (!Check(upload.submit_and_wait() != 0 && !upload.studiocast_valid(),
+               "compute-only upload permitted internal submission"))
+      return false;
+  }
+  {
+    struct RestoreBegin {
+      PFN_vkBeginCommandBuffer saved = ncnn::vkBeginCommandBuffer;
+      ~RestoreBegin() { ncnn::vkBeginCommandBuffer = saved; }
+    } restore;
+    ncnn::vkBeginCommandBuffer = FailBegin;
+    ncnn::VkCompute failed(owner->device.get(), true);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!Check((!owner->device->info.support_VK_KHR_push_descriptor() ||
+                !failed.studiocast_valid()) &&
+                   failed.studiocast_finalize(&command) != 0,
+               "compute initial-begin failure was ignored"))
+      return false;
+    ncnn::VkTransfer upload(owner->device.get(), true);
+    if (!Check(!upload.studiocast_valid() &&
+                   upload.studiocast_finalize(&command) != 0,
+               "upload initial-begin failure was ignored"))
+      return false;
+  }
+  return Check(device.health_state().submitted_serial ==
+                   before.submitted_serial,
+               "replay guard submitted work");
+}
+
 bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
   const char *param = std::getenv("STUDIOCAST_NCNN_MATTING_PARAM");
   const char *bin = std::getenv("STUDIOCAST_NCNN_MATTING_BIN");
@@ -167,6 +251,10 @@ bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
   bool all_ok = true;
   std::vector<float> expected(elements);
   const auto before = device.allocation_stats();
+  std::cout << "MODNet retained native allocations="
+            << runtime.Evidence().persistent_allocation_count
+            << " context_current_bytes=" << before.current_bytes
+            << " context_high_water_bytes=" << before.high_water_bytes << '\n';
   for (const char *name :
        {"black", "white", "gray", "gradient", "checker", "seeded_noise"}) {
     const auto root = std::filesystem::path(golden);
@@ -226,6 +314,8 @@ int main() {
     std::cout << "SKIP: native ncnn Vulkan unavailable: " << error << '\n';
     return 77;
   }
+  if (!ProviderGuards() || !ReplayGuards(device))
+    return 1;
   char pattern[] = "/tmp/studiocast-native-ncnn-test-XXXXXX";
   const char *root = mkdtemp(pattern);
   if (!root)

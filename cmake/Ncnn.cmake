@@ -121,8 +121,11 @@ int main() {
 #include <gpu.h>
 #include <command.h>
 #include <string_view>
-#if !defined(NCNN_VULKAN) || NCNN_VULKAN != 1 || !defined(NCNN_STUDIOCAST_REPLAY_ABI) || NCNN_STUDIOCAST_REPLAY_ABI != 1
+#if !defined(NCNN_VULKAN) || NCNN_VULKAN != 1 || !defined(NCNN_STUDIOCAST_REPLAY_ABI) || NCNN_STUDIOCAST_REPLAY_ABI != 2
 #error "Production matting requires pinned StudioCast replay API"
+#endif
+#if !NCNN_SIMPLEVK
+#error "Production adoption requires the pinned SIMPLEVK provider entry point"
 #endif
 #if NCNN_COVERAGE
 #error "Production replay forbids ncnn coverage teardown waits"
@@ -131,7 +134,7 @@ int main() {
   static_assert(std::string_view(NCNN_STUDIOCAST_UPSTREAM_REVISION) == "24ea07e87f544a3fbc59980b57885a92c75f2d24");
   if (ncnn::studiocast_acquire_gpu_instance() != 0) return 1;
   ncnn::VulkanDevice device(0, true);
-  ncnn::VkCompute compute(&device);
+  ncnn::VkCompute compute(&device, true);
   ncnn::VkTransfer transfer(&device, true);
   VkCommandBuffer buffer = VK_NULL_HANDLE;
   ncnn::Option option;
