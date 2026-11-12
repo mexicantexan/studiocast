@@ -22,7 +22,8 @@ VulkanBuffer::~VulkanBuffer() { Free(); }
 bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
                             VkFlags usage, VkFlags required_memory_flags,
                             VkFlags preferred_memory_flags, bool map_memory,
-                            std::string *error_out) {
+                            std::string *error_out,
+                            VkDeviceSize allocation_limit) {
   Free();
   if (error_out)
     error_out->clear();
@@ -59,10 +60,10 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
 
   VkMemoryRequirements req{};
   vf.vkGetBufferMemoryRequirements(context->device, buffer, &req);
-  if (req.size == 0) {
+  if (req.size == 0 || (allocation_limit && req.size > allocation_limit)) {
     if (error_out)
       *error_out = "[vulkan_allocation_size_invalid] Vulkan buffer reported "
-                   "zero memory requirements.";
+                   "invalid or over-reservation memory requirements.";
     vf.vkDestroyBuffer(context->device, buffer, nullptr);
     return false;
   }
@@ -121,6 +122,7 @@ bool VulkanBuffer::Allocate(VulkanDevice *device, VkDeviceSize size,
   size_ = size;
   allocation_size_ = req.size;
   mapped_ = mapped;
+  memory_type_index_ = memory_type;
   memory_property_flags_ =
       device->memory_properties().memoryTypes[memory_type].propertyFlags;
   return true;

@@ -60,7 +60,7 @@ function(studiocast_configure_ncnn out_found out_target out_has_vulkan)
 #include <net.h>
 #include <gpu.h>
 
-#ifndef NCNN_VULKAN
+#if !defined(NCNN_VULKAN) || NCNN_VULKAN != 1
 #error "ncnn was not built with Vulkan support"
 #endif
 
@@ -110,6 +110,34 @@ int main() {
 
     if (_studiocast_ncnn_vulkan_probe_ok)
       set(_has_vulkan TRUE)
+    endif()
+  endif()
+
+  if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING AND _found)
+    set(CMAKE_REQUIRED_LIBRARIES "${_target}")
+    unset(_studiocast_ncnn_replay_link_ok CACHE)
+    check_cxx_source_compiles([==[
+#include <net.h>
+#include <gpu.h>
+#include <command.h>
+#include <string_view>
+#if !defined(NCNN_VULKAN) || NCNN_VULKAN != 1 || !defined(NCNN_STUDIOCAST_REPLAY_ABI) || NCNN_STUDIOCAST_REPLAY_ABI != 1
+#error "Production matting requires pinned StudioCast replay API"
+#endif
+int main() {
+  static_assert(std::string_view(NCNN_STUDIOCAST_UPSTREAM_REVISION) == "24ea07e87f544a3fbc59980b57885a92c75f2d24");
+  ncnn::VulkanDevice device(0, true);
+  ncnn::VkCompute compute(&device);
+  ncnn::VkTransfer transfer(&device, true);
+  VkCommandBuffer buffer = VK_NULL_HANDLE;
+  ncnn::Option option;
+  option.studiocast_model_upload = &transfer;
+  return compute.studiocast_finalize(&buffer) + transfer.studiocast_finalize(&buffer) + device.studiocast_initialize_dummy(&buffer);
+}
+]==] _studiocast_ncnn_replay_link_ok)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if (NOT _studiocast_ncnn_replay_link_ok)
+      message(FATAL_ERROR "Production ncnn matting requires upstream 24ea07e87f544a3fbc59980b57885a92c75f2d24 with cmake/patches/ncnn-studiocast-replay.patch. Build the isolated dependency with scripts/build_ncnn_vulkan_dependency.py.")
     endif()
   endif()
 

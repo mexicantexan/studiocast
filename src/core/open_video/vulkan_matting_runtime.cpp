@@ -506,7 +506,9 @@ bool VulkanMattingRuntimeLifecycle::Prepare(
   device_ = device;
   graph_ = graph;
   resources_ = resources;
-  if (!AcceptResult(runtime_->Initialize(device_), "runtime initialization",
+  if (!AcceptResult(runtime_->ConfigureResourceBudget(resources_),
+                    "resource reservation", error_out) ||
+      !AcceptResult(runtime_->Initialize(device_), "runtime initialization",
                     error_out) ||
       !VerifyDeviceIdentity(runtime_->Evidence(), error_out) ||
       !AcceptResult(runtime_->LoadGraph(graph_), "graph load", error_out) ||
@@ -517,6 +519,7 @@ bool VulkanMattingRuntimeLifecycle::Prepare(
   }
   persistent_allocation_count_ =
       runtime_->Evidence().persistent_allocation_count;
+  execution_evidence_ = runtime_->Evidence();
   prepared_ = true;
   return true;
 }
@@ -616,8 +619,9 @@ bool VulkanMattingRuntimeLifecycle::Run(
   }
   if (!AcceptResult(runtime_->Run(input, alpha_output), "execution", error_out))
     return false;
-  const auto evidence = runtime_->Evidence();
-  return VerifyExecutionEvidence(evidence, /*warmup=*/false, error_out);
+  runtime_->RefreshExecutionEvidence(&execution_evidence_);
+  return VerifyExecutionEvidence(execution_evidence_, /*warmup=*/false,
+                                 error_out);
 }
 
 bool VulkanMattingRuntimeLifecycle::LatchExternalFailure(
@@ -670,20 +674,27 @@ bool ProductionVulkanMattingBuildEnabled() {
 #endif
 }
 
+#if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+std::unique_ptr<VulkanMattingRuntime> CreateNcnnVulkanMattingRuntime();
+#endif
+
+void VulkanMattingRuntimeLifecycle::RefreshExecutionEvidence(
+    VulkanMattingRuntimeEvidence *out) const {
+  if (runtime_ && out)
+    runtime_->RefreshExecutionEvidence(out);
+}
+
 bool ProductionVulkanMattingAdapterAvailable() {
-  // ncnn's public Vulkan runtime owns/chooses its Vulkan device. The CPU-Mat
-  // spike cannot import StudioCast's live context or buffers, so it is never a
-  // production adapter.
-  return false;
+  return ProductionVulkanMattingBuildEnabled();
 }
 
 std::unique_ptr<VulkanMattingRuntime> CreateProductionVulkanMattingRuntime() {
-  const char *reason = ProductionVulkanMattingBuildEnabled()
-                           ? "Production ncnn is linked, but no reviewed "
-                             "shared-device Vulkan adapter is available."
-                           : "Production ncnn Vulkan matting is disabled in "
-                             "this build.";
-  return CreateUnavailableVulkanMattingRuntime(reason);
+#if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  return CreateNcnnVulkanMattingRuntime();
+#else
+  return CreateUnavailableVulkanMattingRuntime(
+      "Production ncnn Vulkan matting is disabled in this build.");
+#endif
 }
 
 } // namespace studiocast::open_vulkan

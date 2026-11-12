@@ -247,13 +247,13 @@ VkDeviceSize DerivedAllocationBudget(
   return total;
 }
 
-void QuarantineUnsafeContextLoader(std::shared_ptr<VulkanLoader> loader) {
+void QuarantineUnsafeContextLoader(std::shared_ptr<void> loader) {
   // An uncompleted submitted command means command buffers/resources may still
   // be in use. Calling child destruction or vkDestroyDevice can violate Vulkan
   // lifetime rules or block indefinitely. Retain the loader until process
   // teardown and let the OS reclaim the abandoned poisoned context.
   static auto *mutex = new std::mutex();
-  static auto *loaders = new std::vector<std::shared_ptr<VulkanLoader>>();
+  static auto *loaders = new std::vector<std::shared_ptr<void>>();
   std::lock_guard<std::mutex> lock(*mutex);
   loaders->push_back(std::move(loader));
 }
@@ -321,6 +321,8 @@ VulkanContextState::~VulkanContextState() {
     return;
   if (!SafeToDestroyChildren()) {
     QuarantineUnsafeContextLoader(std::move(loader));
+    if (native_owner)
+      QuarantineUnsafeContextLoader(std::move(native_owner));
     return;
   }
   const auto &vf = loader->f();
@@ -331,13 +333,13 @@ VulkanContextState::~VulkanContextState() {
     if (command_pool && vf.vkDestroyCommandPool)
       vf.vkDestroyCommandPool(device, command_pool, nullptr);
     command_pool = nullptr;
-    if (vf.vkDestroyDevice)
+    if (!native_owner && vf.vkDestroyDevice)
       vf.vkDestroyDevice(device, nullptr);
     device = nullptr;
   }
   queue = nullptr;
   physical_device = nullptr;
-  if (instance && vf.vkDestroyInstance)
+  if (!native_owner && instance && vf.vkDestroyInstance)
     vf.vkDestroyInstance(instance, nullptr);
   instance = nullptr;
 }
@@ -803,18 +805,18 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   oss << "\"blocked_effects\":";
   AppendJsonStringMap(&oss, blocked_effects);
   oss << ",";
-  oss << "\"mirror_production_ready\":"
-      << BoolJson(mirror_production_ready) << ",";
-  oss << "\"mirror_readiness_code\":\""
-      << JsonEscape(mirror_readiness_code) << "\",";
+  oss << "\"mirror_production_ready\":" << BoolJson(mirror_production_ready)
+      << ",";
+  oss << "\"mirror_readiness_code\":\"" << JsonEscape(mirror_readiness_code)
+      << "\",";
   oss << "\"mirror_blocker_code\":\"" << JsonEscape(mirror_blocker_code)
       << "\",";
   oss << "\"vignette_fixed_center_production_ready\":"
       << BoolJson(vignette_fixed_center_production_ready) << ",";
-  oss << "\"vignette_readiness_code\":\""
-      << JsonEscape(vignette_readiness_code) << "\",";
-  oss << "\"vignette_blocker_code\":\""
-      << JsonEscape(vignette_blocker_code) << "\",";
+  oss << "\"vignette_readiness_code\":\"" << JsonEscape(vignette_readiness_code)
+      << "\",";
+  oss << "\"vignette_blocker_code\":\"" << JsonEscape(vignette_blocker_code)
+      << "\",";
   oss << "\"vignette_parameter_contract\":\""
       << JsonEscape(vignette_parameter_contract) << "\",";
   oss << "\"auto_frame_crop_stage_implemented\":"
@@ -823,22 +825,20 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << BoolJson(auto_frame_production_ready) << ",";
   oss << "\"auto_frame_readiness_code\":\""
       << JsonEscape(auto_frame_readiness_code) << "\",";
-  oss << "\"auto_frame_blocker_code\":\""
-      << JsonEscape(auto_frame_blocker_code) << "\",";
-  oss << "\"auto_frame_cpu_tail\":" << BoolJson(auto_frame_cpu_tail)
-      << ",";
+  oss << "\"auto_frame_blocker_code\":\"" << JsonEscape(auto_frame_blocker_code)
+      << "\",";
+  oss << "\"auto_frame_cpu_tail\":" << BoolJson(auto_frame_cpu_tail) << ",";
   oss << "\"auto_frame_degraded_reason_code\":\""
       << JsonEscape(auto_frame_degraded_reason_code) << "\",";
   oss << "\"auto_frame_selectable_cpu_fallback\":"
       << BoolJson(auto_frame_selectable_cpu_fallback) << ",";
   oss << "\"eye_contact_production_ready\":"
       << BoolJson(eye_contact_production_ready) << ",";
-  oss << "\"eye_contact_reason_code\":\""
-      << JsonEscape(eye_contact_reason_code) << "\",";
+  oss << "\"eye_contact_reason_code\":\"" << JsonEscape(eye_contact_reason_code)
+      << "\",";
   oss << "\"eye_contact_blocker_code\":\""
       << JsonEscape(eye_contact_blocker_code) << "\",";
-  oss << "\"eye_contact_detail\":\"" << JsonEscape(eye_contact_detail)
-      << "\",";
+  oss << "\"eye_contact_detail\":\"" << JsonEscape(eye_contact_detail) << "\",";
   oss << "\"eye_contact_backend_compiled\":"
       << BoolJson(eye_contact_backend_compiled) << ",";
   oss << "\"eye_contact_live_stage_implemented\":"
@@ -875,12 +875,11 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << BoolJson(eye_contact_parity_validated) << ",";
   oss << "\"eye_contact_selectable_cpu_fallback\":"
       << BoolJson(eye_contact_selectable_cpu_fallback) << ",";
-  oss << "\"eye_contact_dispatch_count\":" << eye_contact_dispatch_count
+  oss << "\"eye_contact_dispatch_count\":" << eye_contact_dispatch_count << ",";
+  oss << "\"eye_contact_cpu_readback_count\":" << eye_contact_cpu_readback_count
       << ",";
-  oss << "\"eye_contact_cpu_readback_count\":"
-      << eye_contact_cpu_readback_count << ",";
-  oss << "\"eye_contact_cpu_fallback_count\":"
-      << eye_contact_cpu_fallback_count << ",";
+  oss << "\"eye_contact_cpu_fallback_count\":" << eye_contact_cpu_fallback_count
+      << ",";
   oss << "\"video_noise_removal_production_ready\":"
       << BoolJson(video_noise_removal_production_ready) << ",";
   oss << "\"video_noise_removal_reason_code\":\""
@@ -1017,25 +1016,146 @@ VulkanDevice::VulkanDevice()
 
 VulkanDevice::~VulkanDevice() { Shutdown(); }
 
-bool VulkanDevice::Initialize(std::string *error_out) {
-  if (const auto process_selection = ProcessSelection())
-    return Initialize(*process_selection, error_out);
+bool VulkanDevice::ChooseAdoptionPhysicalDevice(
+    VkInstance instance, const VulkanDeviceSelection &selection,
+    std::shared_ptr<void> owner, VkPhysicalDevice *physical_device,
+    std::string *error_out) {
+  if (!instance || !owner || !physical_device)
+    return false;
+  VulkanDevice probe;
+  probe.selection_ = selection;
+  if (!probe.loader_->Load(error_out))
+    return false;
+  probe.instance_ = instance;
+  probe.adopted_owner_ = std::move(owner);
+  if (!probe.LoadInstanceFunctions(error_out) ||
+      !probe.PickPhysicalDevice(error_out))
+    return false;
+  *physical_device = probe.physical_device_;
+  return true;
+}
 
-  VulkanDeviceSelection selection;
-  std::string e;
+bool VulkanDevice::ResolveSelection(VulkanDeviceSelection *selection,
+                                    std::string *error_out) {
+  if (!selection)
+    return false;
+  if (const auto process_selection = ProcessSelection()) {
+    *selection = *process_selection;
+    return true;
+  }
   const char *requested_index = std::getenv("STUDIOCAST_VULKAN_DEVICE_INDEX");
   const char *allow_cpu = std::getenv("STUDIOCAST_VULKAN_ALLOW_CPU");
-  if (!detail::ParseVulkanDeviceSelection(
-          requested_index ? requested_index : "", allow_cpu ? allow_cpu : "",
-          &selection, &e)) {
-    diagnostics_ = OpenVulkanDiagnostics{};
-    diagnostics_.error = e;
-    diagnostics_.fallback_reason = "vulkan_device_selection_invalid";
+  return detail::ParseVulkanDeviceSelection(
+      requested_index ? requested_index : "", allow_cpu ? allow_cpu : "",
+      selection, error_out);
+}
+
+bool VulkanDevice::Initialize(std::string *error_out) {
+  VulkanDeviceSelection selection;
+  if (!ResolveSelection(&selection, error_out))
+    return false;
+  return Initialize(selection, error_out);
+}
+
+std::shared_ptr<void> VulkanDevice::NativeOwner(std::string_view kind) const {
+  return context_ && context_->native_owner_kind == kind
+             ? context_->native_owner
+             : nullptr;
+}
+
+bool VulkanDevice::InitializeAdopted(const VulkanDeviceSelection &selection,
+                                     const VulkanDeviceConfig &config,
+                                     VulkanDeviceAdoption adoption,
+                                     std::string *error_out) {
+  if (initialized_ || !adoption.instance || !adoption.physical_device ||
+      !adoption.device || !adoption.queue || !adoption.owner ||
+      adoption.owner_kind.empty() || config.fence_timeout_ns == 0) {
     if (error_out)
-      *error_out = e;
+      *error_out = "Invalid or already initialized Vulkan adoption.";
     return false;
   }
-  return Initialize(selection, error_out);
+  selection_ = selection;
+  config_ = config;
+  diagnostics_ = OpenVulkanDiagnostics{};
+  diagnostics_.device_selection_source = selection.source;
+  diagnostics_.device_selection_request = selection.request;
+  if (!loader_->Load(error_out))
+    return false;
+  diagnostics_.runtime_library_found = true;
+  diagnostics_.runtime_library_path = loader_->LibraryPath().string();
+  instance_ = adoption.instance;
+  adopted_owner_ = adoption.owner;
+  diagnostics_.instance_created = true;
+  if (!LoadInstanceFunctions(error_out) || !PickPhysicalDevice(error_out) ||
+      physical_device_ != adoption.physical_device) {
+    if (error_out && error_out->empty())
+      *error_out =
+          "Selected physical Vulkan device differs from adopted device.";
+    DestroyUnownedHandles();
+    return false;
+  }
+  // ncnn may prefer a dedicated compute family. Validate that actual family.
+  std::uint32_t count = 0;
+  f().vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &count,
+                                               nullptr);
+  std::vector<VkQueueFamilyProperties> families(count);
+  f().vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &count,
+                                               families.data());
+  if (adoption.queue_family_index >= count ||
+      !(families[adoption.queue_family_index].queueFlags &
+        VK_QUEUE_COMPUTE_BIT)) {
+    if (error_out)
+      *error_out = "Adopted Vulkan queue is not a compute queue.";
+    DestroyUnownedHandles();
+    return false;
+  }
+  queue_family_index_ = adoption.queue_family_index;
+  diagnostics_.compute_queue_family_index = queue_family_index_;
+  device_ = adoption.device;
+  queue_ = adoption.queue;
+  diagnostics_.logical_device_created = true;
+  if (!LoadDeviceFunctions(error_out) ||
+      !CreateCommandInfrastructure(error_out)) {
+    DestroyUnownedHandles();
+    return false;
+  }
+  const auto derived = DerivedAllocationBudget(memory_properties_);
+  const auto budget = config.allocation_budget_bytes == 0
+                          ? derived
+                          : std::min(derived, config.allocation_budget_bytes);
+  if (!budget) {
+    if (error_out)
+      *error_out = "Adopted Vulkan device has no allocation budget.";
+    DestroyUnownedHandles();
+    return false;
+  }
+  context_identity_ = {context_id_, ++next_generation_};
+  context_ = std::make_shared<detail::VulkanContextState>();
+  context_->loader = loader_;
+  context_->native_owner = std::move(adopted_owner_);
+  context_->native_owner_kind = std::move(adoption.owner_kind);
+  context_->identity = context_identity_;
+  context_->instance = instance_;
+  context_->physical_device = physical_device_;
+  context_->device = device_;
+  context_->queue = queue_;
+  context_->command_pool = command_pool_;
+  context_->fence = fence_;
+  context_->memory_properties = memory_properties_;
+  context_->allocation_budget_bytes = budget;
+  context_->fence_timeout_ns = config.fence_timeout_ns;
+  context_->health.health = VulkanContextHealth::healthy;
+  context_->health.reason_code = "vulkan_context_healthy";
+  context_->allocation_stats.budget_bytes = budget;
+  diagnostics_.context_created = diagnostics_.context_healthy = true;
+  diagnostics_.context_health = "healthy";
+  diagnostics_.context_failure_reason.clear();
+  diagnostics_.context_id = context_identity_.context_id;
+  diagnostics_.context_generation = context_identity_.generation;
+  diagnostics_.allocation_budget_bytes = budget;
+  diagnostics_.production_hardware_ready = diagnostics_.non_cpu_device_selected;
+  diagnostics_.ok = initialized_ = true;
+  return true;
 }
 
 bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
@@ -1196,15 +1316,16 @@ void VulkanDevice::DestroyUnownedHandles() noexcept {
     if (command_pool_ && vf.vkDestroyCommandPool)
       vf.vkDestroyCommandPool(device_, command_pool_, nullptr);
     command_pool_ = nullptr;
-    if (vf.vkDestroyDevice)
+    if (!adopted_owner_ && vf.vkDestroyDevice)
       vf.vkDestroyDevice(device_, nullptr);
     device_ = nullptr;
   }
   queue_ = nullptr;
   physical_device_ = nullptr;
-  if (instance_ && vf.vkDestroyInstance)
+  if (!adopted_owner_ && instance_ && vf.vkDestroyInstance)
     vf.vkDestroyInstance(instance_, nullptr);
   instance_ = nullptr;
+  adopted_owner_.reset();
 }
 
 bool VulkanDevice::LoadInstanceFunctions(std::string *error_out) {
@@ -1461,7 +1582,8 @@ bool VulkanDevice::LoadDeviceFunctions(std::string *error_out) {
 
 bool VulkanDevice::CreateCommandInfrastructure(std::string *error_out) {
   const auto &vf = loader_->f();
-  vf.vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
+  if (!queue_)
+    vf.vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
   if (!queue_) {
     if (error_out)
       *error_out = "vkGetDeviceQueue returned a null queue.";
@@ -1523,6 +1645,11 @@ bool VulkanDevice::FindMemoryType(std::uint32_t type_bits,
 
 bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
                                  std::string *error_out) {
+  return SubmitAndWait(&command_buffer, 1, error_out);
+}
+
+bool VulkanDevice::SubmitAndWait(const VkCommandBuffer *command_buffers,
+                                 std::uint32_t count, std::string *error_out) {
   if (error_out)
     error_out->clear();
   if (!initialized_ || !context_) {
@@ -1531,7 +1658,9 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
                    "initialized.";
     return false;
   }
-  if (!command_buffer) {
+  if (!command_buffers || count == 0 || count > 8 ||
+      std::any_of(command_buffers, command_buffers + count,
+                  [](auto p) { return !p; })) {
     if (error_out)
       *error_out = "[vulkan_command_buffer_invalid] Cannot submit a null "
                    "Vulkan command buffer.";
@@ -1574,8 +1703,8 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
   }
 
   VkSubmitInfo submit{};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &command_buffer;
+  submit.commandBufferCount = count;
+  submit.pCommandBuffers = command_buffers;
   const auto submit_failure =
       consume_injected_failure(VulkanSubmissionPhase::queue_submit);
   result = submit_failure ? *submit_failure
