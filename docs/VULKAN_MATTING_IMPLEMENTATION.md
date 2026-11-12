@@ -66,6 +66,16 @@ headers (syntax check exit 0), the optional-backend-off Open Video target built,
 all nine packaging tests passed, shell syntax passed, and the 41-file docs
 validator passed. Broad integrated verification remains pending.
 
+Root added a separate opt-in `vulkan-matting-production` CI job using an
+explicit preprovisioned ncnn prefix, model root/identity, replacement image, and
+runner labels. It builds the production configuration and invokes the actual
+manager smoke executable in temporary HOME/XDG roots. Missing inputs, a missing
+binary, native failure, and native skip 77 fail the job; logs retain exact source
+and configuration. Five hermetic workflow tests pass, including literal handling
+of shell metacharacters in input paths. An installer regression verifies all four
+matting consumers require complete runtime evidence and that missing matting
+evidence does not disable mirror. This change does not execute remote GPU CI.
+
 Pending: runtime, model, and pipeline implementation; focused tests; integrated
 optional-backend-off/on builds and CTest; available P1000 native model-backed
 tests; model-source publication decision; documentation reconciliation; and fresh

@@ -74,6 +74,36 @@ on:
         required: false
         type: string
         default: '["self-hosted","linux","x64","intel","vulkan"]'
+      require_vulkan_matting_runtime:
+        description: "Run required model-backed production Vulkan matting on a provisioned GPU runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_matting_runner_labels:
+        description: "JSON runner labels; select the GPU vendor being qualified."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","vulkan"]'
+      vulkan_ncnn_prefix:
+        description: "Preinstalled pinned StudioCast-patched ncnn prefix. No dependency installation is performed."
+        required: false
+        type: string
+        default: ''
+      vulkan_matting_model_root:
+        description: "Preinstalled read-only open_video model root containing validated ncnn MODNet artifacts."
+        required: false
+        type: string
+        default: ''
+      vulkan_matting_model_id:
+        description: "Exact installed matting model identity."
+        required: false
+        type: string
+        default: 'modnet-webnn-256-fp32'
+      vulkan_matting_replace_path:
+        description: "Preinstalled readable replacement image. No image or model downloads are performed."
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -418,6 +448,67 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cuda-production-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
+
+  vulkan-matting-production:
+    name: Production Vulkan matting (opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_matting_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_matting_runner_labels || '["ubuntu-24.04"]') }}
+    env:
+      VULKAN_NCNN_PREFIX: ${{ inputs.vulkan_ncnn_prefix }}
+      VULKAN_MODEL_ROOT: ${{ inputs.vulkan_matting_model_root }}
+      VULKAN_MODEL_ID: ${{ inputs.vulkan_matting_model_id }}
+      VULKAN_REPLACE_PATH: ${{ inputs.vulkan_matting_replace_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure production Vulkan matting
+        run: |
+          set -euo pipefail
+          : "${VULKAN_NCNN_PREFIX:?Provide the pinned patched ncnn prefix}"
+          test -d "${VULKAN_NCNN_PREFIX}"
+          mkdir -p build/qualification
+          git rev-parse HEAD > build/qualification/source.txt
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${VULKAN_NCNN_PREFIX}" \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF \
+            2>&1 | tee build/qualification/configure.log
+
+      - name: Build production Vulkan matting smoke
+        run: |
+          cmake --build build --target studiocast-vulkan-matting-production-smoke
+
+      - name: Required production Vulkan matting smoke
+        run: |
+          set -euo pipefail
+          : "${VULKAN_MODEL_ROOT:?Provide a preinstalled validated model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          test -d "${VULKAN_MODEL_ROOT}"
+          test -f "${VULKAN_REPLACE_PATH}" && test -r "${VULKAN_REPLACE_PATH}"
+          mkdir -p build/qualification
+          test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/studiocast-vulkan-matting.XXXXXX")"
+          HOME="${test_root}/home" XDG_CONFIG_HOME="${test_root}/config" \
+            XDG_DATA_HOME="${test_root}/data" XDG_CACHE_HOME="${test_root}/cache" \
+            XDG_STATE_HOME="${test_root}/state" STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-matting-production-smoke --require \
+              --model-root "${VULKAN_MODEL_ROOT}" --model-id "${VULKAN_MODEL_ID}" \
+              --replace-path "${VULKAN_REPLACE_PATH}" --frames 3 \
+              2>&1 | tee build/qualification/matting-production.log
+
+      - name: Preserve Vulkan matting qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-matting-qualification-${{ github.sha }}
           path: build/qualification/
           if-no-files-found: ignore
 

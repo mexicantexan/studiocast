@@ -25,6 +25,7 @@ def run_step(job, name):
 class HardwareWorkflowTests(unittest.TestCase):
     def test_hardware_jobs_are_explicit_dispatch_opt_ins(self):
         inputs = {"cuda-runtime-smoke": "require_cuda_runtime"}
+        inputs["vulkan-matting-production"] = "require_vulkan_matting_runtime"
         inputs.update({f"vulkan-runtime-smoke-{vendor}":
                        f"require_vulkan_{vendor}_runtime"
                        for vendor in ("nvidia", "amd", "intel")})
@@ -67,6 +68,56 @@ class HardwareWorkflowTests(unittest.TestCase):
                     result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
                                             cwd=root, env=env, capture_output=True, text=True)
                     self.assertNotEqual(0, result.returncode)
+
+    def test_vulkan_matting_requires_models_and_propagates_native_failures(self):
+        job = "vulkan-matting-production"
+        self.assertIn("-DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON",
+                      run_step(job, "Configure production Vulkan matting"))
+        self.assertIn('"${VULKAN_NCNN_PREFIX}"',
+                      run_step(job, "Configure production Vulkan matting"))
+        self.assertIn("studiocast-vulkan-matting-production-smoke",
+                      run_step(job, "Build production Vulkan matting smoke"))
+        script = run_step(job, "Required production Vulkan matting smoke")
+        self.assertNotIn("${{", script)
+        self.assertIn("if: ${{ always() }}", JOBS[job])
+        self.assertNotIn("curl ", JOBS[job])
+        self.assertNotIn("apt-get", JOBS[job])
+        with tempfile.TemporaryDirectory(prefix="studiocast-vulkan-matting-ci-") as directory:
+            root = Path(directory)
+            (root / "build").mkdir()
+            model_root = root / "model $(touch escaped)"
+            model_root.mkdir()
+            replacement = root / "replacement '$(touch escaped)'.png"
+            replacement.write_bytes(b"fixture")
+            binary = root / "build/studiocast-vulkan-matting-production-smoke"
+            binary.write_text('#!/bin/bash\n'
+                              '[[ "$STUDIOCAST_REQUIRE_VULKAN_RUNTIME" == 1 ]] || exit 99\n'
+                              'printf "%s\\0" "$@" > "$INVOCATIONS"\nexit "$FAKE_EXIT"\n')
+            binary.chmod(0o755)
+            calls = root / "calls"
+            env = dict(os.environ, VULKAN_MODEL_ROOT=str(model_root), VULKAN_MODEL_ID="model; false",
+                       VULKAN_REPLACE_PATH=str(replacement), RUNNER_TEMP=str(root), INVOCATIONS=str(calls))
+            for code in (0, 1, 77):
+                with self.subTest(code=code):
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                            cwd=root, env=env | {"FAKE_EXIT": str(code)},
+                                            capture_output=True, text=True)
+                    self.assertEqual(code, result.returncode, result.stderr)
+                    self.assertEqual(["--require", "--model-root", str(model_root), "--model-id",
+                                      env["VULKAN_MODEL_ID"], "--replace-path", str(replacement),
+                                      "--frames", "3"], calls.read_bytes().decode().split("\0")[:-1])
+                    self.assertFalse((root / "escaped").exists())
+            for field in ("VULKAN_MODEL_ROOT", "VULKAN_MODEL_ID", "VULKAN_REPLACE_PATH"):
+                calls.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                                        env=env | {field: "", "FAKE_EXIT": "0"},
+                                        capture_output=True, text=True)
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(calls.exists())
+            binary.unlink()
+            self.assertNotEqual(0, subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], cwd=root, env=env,
+                capture_output=True, text=True).returncode)
 
     def test_cuda_configuration_requires_available_dlib(self):
         script = run_step("cuda-runtime-smoke", "Configure (Open CUDA runtime validation)")

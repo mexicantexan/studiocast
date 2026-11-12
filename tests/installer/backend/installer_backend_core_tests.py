@@ -26,6 +26,7 @@ sys.path.insert(0, str(BACKEND_PACKAGE.parent))
 from studiocast_installer_backend.typed_video_status import (  # noqa: E402
     parse_typed_multi_island_video_status,
 )
+from studiocast_installer_backend.facts import effect_capabilities  # noqa: E402
 
 BACKEND_MODULES = (
     "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
@@ -1621,6 +1622,57 @@ class InstallerBackendCoreTests(unittest.TestCase):
             self.assertEqual(
                 matrix["blocker_reason_codes"]["cpu"],
                 [f"effect.{effect}.cpu.no_selectable_production_path"])
+
+    def test_all_vulkan_matting_consumers_require_complete_runtime_evidence(self):
+        consumers = ("virtual_background.blur", "virtual_background.remove",
+                     "virtual_background.replace", "virtual_key_light")
+        required = (
+            "matting_production_ready", "matting_build_enabled", "matting_adapter_available",
+            "matting_runtime_created", "matting_graph_loaded", "matting_model_pack_selected",
+            "matting_model_contract_validated", "matting_warmup_complete",
+            "matting_shared_device_imported", "matting_queue_ownership_explicit",
+            "input_device_resident", "alpha_device_resident", "output_device_resident",
+            "matting_synchronous_completion", "matting_bounded_reusable_allocations",
+            "matting_parity_validated",
+        )
+        engine = dict.fromkeys(required, True)
+        engine.update(dict.fromkeys((
+            "compiled_enabled", "ok", "runtime_library_found", "instance_created",
+            "physical_device_found", "non_cpu_device_selected", "compute_queue_available",
+            "logical_device_created", "context_created", "context_healthy",
+            "production_hardware_ready", "shader_pipeline_created",
+        ), True))
+        engine.update(available_effects=[*consumers, "mirror"],
+                      device_residency_mode="device_resident", matting_cpu_layers_used=False,
+                      matting_dynamic_allocation_count=0, matting_cpu_readback_count=0,
+                      matting_cpu_fallback_count=0, mirror_production_ready=True,
+                      mirror_readiness_code="open_vulkan_mirror_production_ready")
+
+        def capabilities(value):
+            return effect_capabilities({"engines": {"open_vulkan": value}}, {})
+
+        ready = capabilities(engine)
+        for effect in consumers:
+            self.assertEqual("production_usable", ready[effect]["vulkan"])
+            self.assertEqual(["open_vulkan_matting_production_ready"],
+                             ready[effect]["success_reason_codes"]["vulkan"])
+        # Removing any proof must block all consumers without disabling mirror.
+        for field in (*required, "device_residency_mode", "matting_cpu_layers_used",
+                      "matting_dynamic_allocation_count", "matting_cpu_readback_count",
+                      "matting_cpu_fallback_count"):
+            with self.subTest(missing=field):
+                incomplete = dict(engine)
+                incomplete.pop(field)
+                result = capabilities(incomplete)
+                for effect in consumers:
+                    self.assertNotEqual("production_usable", result[effect]["vulkan"])
+                self.assertEqual("production_usable", result["mirror"]["vulkan"])
+        for field in ("matting_dynamic_allocation_count", "matting_cpu_readback_count",
+                      "matting_cpu_fallback_count"):
+            with self.subTest(nonzero=field):
+                result = capabilities(engine | {field: 1})
+                for effect in consumers:
+                    self.assertFalse(result[effect]["vulkan_evidence"]["production_ready"])
 
     def test_effect_specific_vulkan_evidence_cannot_be_forged_by_composites(self):
         adversarial_cases = (
