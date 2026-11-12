@@ -54,7 +54,7 @@ DEFAULT_MODEL_PACKS = (
     "dlib_68_ibug_300w", "gaze_correction_cam_flx_v0_1_1",
     "fastdvdnet_sigma15",
 )
-DEFAULT_MODEL_ARTIFACT_COUNT = 8
+DEFAULT_MODEL_ARTIFACT_COUNT = 10
 ALLOWED_OPERATION_KINDS = {
     "preflight", "settings_snapshot", "release_acquire", "source_extract", "build_cache_prepare",
     "build_configure", "build_compile", "payload_stage", "payload_validate",

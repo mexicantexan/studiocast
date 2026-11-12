@@ -154,7 +154,7 @@ class TempTest(unittest.TestCase):
 
 
 class CatalogContractTests(TempTest):
-    def test_real_catalog_has_exact_seven_defaults_and_eight_artifacts(self):
+    def test_real_catalog_has_exact_seven_defaults_and_ten_artifacts(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
         ids = [pack["id"] for pack in catalog["packs"] if pack["default"]]
         self.assertEqual(
@@ -170,13 +170,15 @@ class CatalogContractTests(TempTest):
             },
         )
         self.assertEqual(len(ids), 7)
-        self.assertEqual(sum(len(pack["artifacts"]) for pack in catalog["packs"]), 8)
+        self.assertEqual(sum(len(pack["artifacts"]) for pack in catalog["packs"]), 10)
         gaze = next(pack for pack in catalog["packs"] if pack["id"] == "gaze_correction_cam_flx_v0_1_1")
         self.assertEqual({item["name"] for item in gaze["artifacts"]}, {"gaze_flx_left.onnx", "gaze_flx_right.onnx"})
         expected = {
             ("fastenhancer_s_vd_v1", "model.onnx"): (832775, "e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8"),
             ("fastenhancer_m_vd_v1", "model.onnx"): (2033628, "367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa"),
             ("modnet-webnn-256-fp32", "model.onnx"): (25888640, "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9"),
+            ("modnet-webnn-256-fp32", "model.ncnn.param"): (12113, "4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61466c58d1310af8a1bd"),
+            ("modnet-webnn-256-fp32", "model.ncnn.bin"): (25844000, "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2"),
             ("yunet_opencv_zoo_2023mar_fp32", "model.onnx"): (232589, "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"),
             ("dlib_68_ibug_300w", "shape_predictor_68_face_landmarks.dat"): (99693937, "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f"),
             ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_left.onnx"): (1062936, "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00"),
@@ -186,8 +188,8 @@ class CatalogContractTests(TempTest):
         actual = {(pack["id"], item["name"]): (item["size_bytes"], item["sha256"])
                   for pack in catalog["packs"] for item in pack["artifacts"]}
         self.assertEqual(actual, expected)
-        self.assertEqual(sum(size for size, _ in actual.values()), 140755803)
-        self.assertEqual(catalog["catalog_version"], "2026-11-11")
+        self.assertEqual(sum(size for size, _ in actual.values()), 166611916)
+        self.assertEqual(catalog["catalog_version"], "2026-11-12")
         self.assertEqual(catalog["size_metadata"], {
             "trusted": True,
             "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
@@ -207,6 +209,48 @@ class CatalogContractTests(TempTest):
             self.assertEqual(destinations, {"model.json", "LICENSE.txt"})
             self.assertTrue(pack["license"]["spdx"])
             self.assertTrue(pack["provenance"]["url"])
+
+    def test_curated_modnet_adds_only_published_ncnn_artifacts_and_exact_metadata(self):
+        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        pack = next(item for item in catalog["packs"] if item["id"] == "modnet-webnn-256-fp32")
+        self.assertEqual(pack["pack_path"], "matting/Good Quality")
+        self.assertTrue(pack["default"])
+        onnx, param, weights = pack["artifacts"]
+        self.assertEqual(onnx, {
+            "name": "model.onnx",
+            "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",
+            "size_bytes": 25888640, "size_status": "known",
+            "source_paths": ["open_video/matting/Good Quality/model.onnx",
+                             "matting/Good Quality/model.onnx",
+                             "open_cuda/matting/Good Quality/model.onnx"],
+        })
+        prefix = ("open_video/matting/Good Quality/revisions/ncnn-fp32-20261020-"
+                  "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2/")
+        for artifact in (param, weights):
+            self.assertEqual(artifact["source_paths"], [prefix + artifact["name"]])
+        self.assertIn("Hugging Face publication f6be359c49ba07163287fe3732dc4a3024b91f60",
+                      pack["provenance"]["release"])
+        expected_metadata = {
+            "model.json": "3b94bc7bac4ae116659bf7b6bac93fe3a4d90448553661de536eb6c428f13bcc",
+            "LICENSE.txt": "77b9ad63b2659c31905d1a820403fea0ba0729c7d0530b6e6c6f8b717fd40f81",
+        }
+        self.assertEqual({item["destination"]: item["sha256"] for item in pack["metadata"]},
+                         expected_metadata)
+        manifest = json.loads((REPO_ROOT / pack["metadata"][0]["source"]).read_text())
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["id"], pack["id"])
+        self.assertEqual(manifest["onnx_filename"], onnx["name"])
+        self.assertEqual(manifest["files"], [
+            {"name": artifact["name"], "kind": kind, "role": role, "sha256": artifact["sha256"]}
+            for artifact, kind, role in ((onnx, "onnx", "main"),
+                                         (param, "ncnn_param", "vulkan_matting"),
+                                         (weights, "ncnn_bin", "vulkan_matting"))
+        ])
+        self.assertEqual(manifest["ncnn_vulkan"], {
+            "param_file": param["name"], "bin_file": weights["name"],
+            "input_blob": "input", "output_blob": "output", "precision": "fp32",
+            "converter": {"name": "pnnx", "version": "20261020"},
+        })
 
     def test_curated_fastdvdnet_repair_uses_only_versioned_verified_artifact(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)

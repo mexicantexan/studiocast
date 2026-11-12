@@ -193,8 +193,8 @@ summary = json.loads(sys.argv[1])
 defaults = [pack for pack in summary["packs"] if pack["default"]]
 if len(defaults) != 7:
     raise SystemExit(f"packaged catalog has {len(defaults)} default packs, expected 7")
-if sum(len(pack["artifacts"]) for pack in defaults) != 8:
-    raise SystemExit("packaged default catalog does not contain exactly 8 artifacts")
+if sum(len(pack["artifacts"]) for pack in defaults) != 10:
+    raise SystemExit("packaged default catalog does not contain exactly 10 artifacts")
 if summary.get("size_metadata", {}).get("trusted") is not True:
     raise SystemExit("packaged default catalog does not have trusted artifact sizes")
 if not summary.get("size_metadata", {}).get("reason_code"):
@@ -205,6 +205,8 @@ for pack in defaults:
                 artifact["size_bytes"] <= 0 or
                 artifact.get("size_status") != "known"):
             raise SystemExit("packaged default catalog has incomplete trusted artifact sizes")
+if sum(artifact["size_bytes"] for pack in defaults for artifact in pack["artifacts"]) != 166611916:
+    raise SystemExit("packaged default catalog does not contain exactly 166611916 model bytes")
 PY
 
   local forbidden

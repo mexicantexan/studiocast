@@ -14,7 +14,11 @@
   "output": {
     "name": "output",
     "kind": "alpha",
-    "dtype": "float32"
+    "dtype": "float32",
+    "layout": "nchw",
+    "width": 256,
+    "height": 256,
+    "channels": 1
   },
   "preprocess": {
     "mean": [
@@ -37,6 +41,35 @@
       "kind": "onnx",
       "role": "main",
       "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9"
+    },
+    {
+      "name": "model.ncnn.param",
+      "kind": "ncnn_param",
+      "role": "vulkan_matting",
+      "sha256": "4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61466c58d1310af8a1bd"
+    },
+    {
+      "name": "model.ncnn.bin",
+      "kind": "ncnn_bin",
+      "role": "vulkan_matting",
+      "sha256": "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2"
     }
-  ]
+  ],
+  "ncnn_vulkan": {
+    "param_file": "model.ncnn.param",
+    "bin_file": "model.ncnn.bin",
+    "input_blob": "input",
+    "output_blob": "output",
+    "precision": "fp32",
+    "converter": {
+      "name": "pnnx",
+      "version": "20261020"
+    }
+  },
+  "origin": {
+    "onnx_sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",
+    "url": "https://huggingface.co/onnx-community/modnet-webnn",
+    "revision": "f67d848345da34a2598d45ccb39bf657715ea937",
+    "notes": "Original ONNX retained; offline fixed-256 FP32 ncnn conversion via scripts/models/convert_modnet_ncnn.py; no retraining."
+  }
 }
