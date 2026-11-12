@@ -1,7 +1,7 @@
 # Production Vulkan matting implementation
 
 - Status: Local implementation and native matrix complete; broad verification complete;
-  independent final critique in progress; model publication/catalog pending approval
+  final critique remediation in progress; model publication/catalog pending approval
 - Baseline: `51b96122ab2ccca92af9bed35c86c7fe8e5060a0`, branch `v0.2.9`
 - User decision, 2026-11-11: implement production Vulkan matting and its model
   and validation requirements; validate available hardware and record unavailable
@@ -179,6 +179,10 @@ Python entry-point wrapper cannot import its user-site package under temporary
 HOME). The required real-model tests and camera matrix above passed separately;
 opt-in skips are not hardware qualification. Logs are
 `/tmp/studiocast-vulkan-matting-final-{production,disabled}-ctest-20261111.log`.
+The separate all-optional CUDA/Vulkan/audio/dlib Debug build (ncnn OFF) also
+passed; CTest passed 88 total / 82 executed / six expected skips / zero failures
+(25.11 s), log
+`/tmp/studiocast-vulkan-matting-final-all-enabled-ctest-20261111.log`.
 The documentation validator passed all 41 files, capability audit passed, and
 `git diff --check` passed.
 
@@ -201,8 +205,16 @@ free-dimension overrides (actual pinned ORT 1.17.3 syntax check passed), and sta
 `typed_video_status.py` in packaging. Packaging fixtures now import the actual
 CMake-selected module list. Original evidence:
 `/tmp/studiocast-vulkan-task-pr-ci-failures-20261111.log`.
-A fresh final independent critique follows integrated broad tests; any valid
-blocker/high finding requires focused remediation, revalidation, and fresh review.
+Fresh independent critique `vulkan_final_critique` reviewed integrated
+`b346f969ec530a69937d1215e292739b61273513` after the broad tests. No
+Blocker/Critical/High finding was confirmed. It independently passed converter
+7/7, workflow 5/5, packaging 9/9 and six integrated snapshot/lifecycle/adapter/
+capability/model/status binaries. It found one valid Medium gap: ncnn-enabled
+Runtime install omitted the full ncnn/glslang notices and dependency receipt,
+which existed only in the isolated SDK prefix. The Qt-only Installer AppImage
+does not link ncnn. Root accepted and delegated the repair to
+`vulkan_runtime_notices` on `codex/vulkan-runtime-notices-20261111`; a fresh
+post-remediation independent critique will follow integration and revalidation.
 
 ## Remaining delivery boundaries
 
