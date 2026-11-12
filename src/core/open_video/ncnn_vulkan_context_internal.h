@@ -3,7 +3,7 @@
 #include <gpu.h>
 #include <memory>
 namespace studiocast::open_vulkan::detail {
-inline constexpr char kNcnnOwnerKind[] = "ncnn-studiocast-replay-v1";
+inline constexpr char kNcnnOwnerKind[] = "ncnn-studiocast-replay-v2";
 struct NcnnVulkanContext {
   std::shared_ptr<void> instance;
   std::unique_ptr<ncnn::VulkanDevice> device;

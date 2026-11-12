@@ -396,6 +396,7 @@ struct VulkanDeviceAdoption {
   VkDevice device = nullptr;
   VkQueue queue = nullptr;
   std::uint32_t queue_family_index = 0;
+  PFN_vkGetInstanceProcAddr entry_point = nullptr;
   std::shared_ptr<void> owner;
   std::string owner_kind;
 };
@@ -409,8 +410,8 @@ public:
 
   static bool ChooseAdoptionPhysicalDevice(
       VkInstance instance, const VulkanDeviceSelection &selection,
-      std::shared_ptr<void> owner, VkPhysicalDevice *physical_device,
-      std::string *error_out);
+      PFN_vkGetInstanceProcAddr entry_point, std::shared_ptr<void> owner,
+      VkPhysicalDevice *physical_device, std::string *error_out);
   static bool ResolveSelection(VulkanDeviceSelection *selection,
                                std::string *error_out);
   bool Initialize(std::string *error_out);

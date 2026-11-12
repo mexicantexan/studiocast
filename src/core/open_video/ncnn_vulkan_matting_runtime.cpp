@@ -36,6 +36,7 @@ public:
   struct Block {
     std::unique_ptr<vk::VulkanBuffer> storage;
     ncnn::VkBufferMemory memory{};
+    bool free = false;
   };
   ResidentAllocator(vk::VulkanDevice *device, const ncnn::VulkanDevice *native,
                     AllocationBudget *budget, bool staging)
@@ -49,6 +50,17 @@ public:
     if (!size || size > std::numeric_limits<std::size_t>::max() - 255)
       return nullptr;
     size = (size + 255) & ~std::size_t(255);
+    if (!budget_->frozen) {
+      Block *best = nullptr;
+      for (const auto &block : blocks)
+        if (block->free && block->memory.capacity >= size &&
+            (!best || block->memory.capacity < best->memory.capacity))
+          best = block.get();
+      if (best) {
+        best->free = false;
+        return &best->memory;
+      }
+    }
     if (budget_->frozen || size > budget_->cap - budget_->bytes ||
         budget_->resources >= budget_->resource_cap) {
       budget_->rejected = true;
@@ -82,7 +94,23 @@ public:
     blocks.push_back(std::move(block));
     return out;
   }
-  void fastFree(ncnn::VkBufferMemory *) override {}
+  void fastFree(ncnn::VkBufferMemory *memory) override {
+    for (const auto &block : blocks)
+      if (&block->memory == memory) {
+        block->free = true;
+        return;
+      }
+  }
+  void ReleaseFreeBlocks() {
+    for (auto it = blocks.begin(); it != blocks.end();) {
+      if ((*it)->free) {
+        budget_->bytes -= (*it)->storage->allocation_size();
+        --budget_->resources;
+        it = blocks.erase(it);
+      } else
+        ++it;
+    }
+  }
   ncnn::VkImageMemory *fastMalloc(int, int, int, std::size_t, int) override {
     budget_->rejected = true;
     return nullptr;
@@ -220,8 +248,8 @@ public:
     net.set_vulkan_device(program_->owner->device.get());
     auto &opt = net.opt;
     opt.use_vulkan_compute = true;
-    opt.lightmode = false;
-    opt.use_packing_layout = false;
+    opt.lightmode = true;
+    opt.use_packing_layout = true;
     opt.use_fp16_packed = opt.use_fp16_storage = opt.use_fp16_arithmetic =
         false;
     opt.use_bf16_packed = opt.use_bf16_storage = false;
@@ -235,6 +263,10 @@ public:
     if (net.load_param(graph.param_path.c_str()) != 0)
       return Fail(Failure::invalid_graph, "ncnn parameter load failed.");
     for (const auto *layer : net.layers()) {
+      if (layer && layer->typeindex == ncnn::LayerType::MultiHeadAttention)
+        return Fail(Failure::invalid_graph,
+                    "MultiHeadAttention requires unsupported internal queue "
+                    "submission.");
       if (!layer ||
           (layer->typeindex != ncnn::LayerType::Input &&
            (!layer->support_vulkan || (layer->featmask & (1 << 4))))) {
@@ -260,6 +292,10 @@ public:
     if (program_->upload->studiocast_finalize(&upload) != 0 ||
         !device_->SubmitAndWait(Handle<vk::VkCommandBuffer>(upload), &error))
       return DriverFailure(error);
+    if (program_->upload->reset() != 0)
+      return Fail(Failure::synchronization_failed,
+                  "Completed model upload could not reset staging ownership.");
+    program_->staging->ReleaseFreeBlocks();
     for (const auto *layer : net.layers()) {
       if (!layer ||
           (layer->typeindex != ncnn::LayerType::Input &&
@@ -319,23 +355,37 @@ public:
     program_->input =
         ncnn::VkMat(graph_.input_w, graph_.input_h, graph_.input_c, &memory,
                     sizeof(float), program_->resident.get());
+    // ncnn light mode inspects input refcounts for in-place safety. This
+    // descriptor is borrowed and its allocator never recycles the foreign
+    // buffer.
+    memory.refcount = 1;
+    program_->input.refcount = &memory.refcount;
     program_->inference =
-        std::make_unique<ncnn::VkCompute>(program_->owner->device.get());
+        std::make_unique<ncnn::VkCompute>(program_->owner->device.get(), true);
     if (!program_->inference->studiocast_valid())
       return Fail(Failure::out_of_memory,
                   "ncnn replay command infrastructure failed.");
     program_->extractor =
         std::make_unique<ncnn::Extractor>(program_->net->create_extractor());
-    if (program_->extractor->input(graph_.input_blob.c_str(),
-                                   program_->input) != 0 ||
-        program_->extractor->extract(graph_.output_blob.c_str(),
-                                     program_->output,
-                                     *program_->inference) != 0 ||
-        program_->budget.rejected)
-      return Fail(program_->budget.rejected
-                      ? Failure::allocation_contract_failed
-                      : Failure::invalid_graph,
-                  "ncnn fixed graph recording failed.");
+    const int input_result =
+        program_->extractor->input(graph_.input_blob.c_str(), program_->input);
+    const int extract_result = input_result == 0
+                                   ? program_->extractor->extract(
+                                         graph_.output_blob.c_str(),
+                                         program_->output, *program_->inference)
+                                   : input_result;
+    if (input_result != 0 || extract_result != 0 || program_->budget.rejected)
+      return Fail(
+          program_->budget.rejected ? Failure::allocation_contract_failed
+                                    : Failure::invalid_graph,
+          "ncnn fixed graph recording failed: input=" +
+              std::to_string(input_result) +
+              ", extract=" + std::to_string(extract_result) +
+              ", input dims=" + std::to_string(program_->input.dims) +
+              ", blobs=" + std::to_string(program_->net->blobs().size()) +
+              ", native resources=" +
+              std::to_string(program_->budget.resources) +
+              ", native bytes=" + std::to_string(program_->budget.bytes));
     const auto &out = program_->output;
     if (!out.data || out.w != graph_.output_w || out.h != graph_.output_h ||
         out.c != 1 || out.elempack != 1 || out.elemsize != sizeof(float) ||
@@ -508,11 +558,13 @@ private:
             vk::VulkanBufferAccess::transfer_read, error))
       return false;
     std::vector<vk::VkBufferCopy> rows;
-    rows.reserve(graph_.output_h);
+    rows.reserve(static_cast<std::size_t>(graph_.output_h));
     for (int y = 0; y < graph_.output_h; ++y) {
       vk::VkBufferCopy row;
       row.srcOffset = p.output.data->offset +
-                      std::size_t(y) * graph_.output_w * sizeof(float);
+                      std::size_t(y) *
+                          static_cast<std::size_t>(graph_.output_w) *
+                          sizeof(float);
       row.dstOffset = resources_.alpha_offset +
                       std::size_t(y) * resources_.alpha_row_stride_bytes;
       row.size = std::size_t(graph_.output_w) * sizeof(float);

@@ -76,10 +76,33 @@ bool VulkanLoader::LoadGlobalProc(const char *name, PFN_vkVoidFunction *out,
   return true;
 }
 
+bool VulkanLoader::AdoptEntryPoint(PFN_vkGetInstanceProcAddr entry_point,
+                                   std::shared_ptr<void> owner,
+                                   std::string *error_out) {
+  if (IsLoaded() || !entry_point || !owner) {
+    if (error_out)
+      *error_out = "Invalid or already initialized Vulkan loader adoption.";
+    return false;
+  }
+  f_ = VulkanFunctions{};
+  f_.vkGetInstanceProcAddr = entry_point;
+  PFN_vkVoidFunction proc = nullptr;
+  if (!LoadGlobalProc("vkCreateInstance", &proc, error_out)) {
+    f_ = VulkanFunctions{};
+    return false;
+  }
+  f_.vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(proc);
+  if (LoadGlobalProc("vkEnumerateInstanceVersion", &proc, nullptr))
+    f_.vkEnumerateInstanceVersion =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(proc);
+  adopted_owner_ = std::move(owner);
+  return true;
+}
+
 bool VulkanLoader::Load(std::string *error_out) {
   if (error_out)
     error_out->clear();
-  if (library_.IsOpen())
+  if (IsLoaded())
     return true;
 
   std::string last_open_error;
@@ -95,9 +118,8 @@ bool VulkanLoader::Load(std::string *error_out) {
 
   if (!library_.IsOpen()) {
     if (error_out) {
-      *error_out = last_open_error.empty()
-                       ? "Vulkan runtime library not found."
-                       : last_open_error;
+      *error_out = last_open_error.empty() ? "Vulkan runtime library not found."
+                                           : last_open_error;
     }
     return false;
   }

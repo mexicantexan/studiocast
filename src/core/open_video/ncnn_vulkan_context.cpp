@@ -1,6 +1,7 @@
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_context_internal.h"
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+#include <cstdlib>
 #include <mutex>
 namespace {
 struct InstanceOwner {
@@ -27,6 +28,19 @@ bool InitializeProductionVulkanMattingDevice(
       *error_out = "Matting adoption requires a fresh Vulkan device.";
     return false;
   }
+  // An explicit StudioCast provider must load successfully and expose the same
+  // entry point ncnn actually retained. Never dispatch foreign instance handles
+  // through an independently guessed library or silently ignore an override.
+  studiocast::util::DynLib requested_library;
+  vulkan::PFN_vkGetInstanceProcAddr requested_entry = nullptr;
+  if (const char *requested = std::getenv("STUDIOCAST_VULKAN_LIBRARY");
+      requested && *requested) {
+    if (!requested_library.Open(
+            requested, studiocast::util::DynLib::Scope::Local, error_out) ||
+        !requested_library.GetSymbol("vkGetInstanceProcAddr", &requested_entry,
+                                     error_out))
+      return false;
+  }
   auto owner = std::make_shared<detail::NcnnVulkanContext>();
   owner->instance = AcquireInstance();
   if (!owner->instance) {
@@ -36,14 +50,29 @@ bool InitializeProductionVulkanMattingDevice(
   }
   vulkan::VkPhysicalDevice selected = nullptr;
   auto instance = Handle<vulkan::VkInstance>(ncnn::get_gpu_instance());
+  auto entry_point = reinterpret_cast<vulkan::PFN_vkGetInstanceProcAddr>(
+      ncnn::vkGetInstanceProcAddr);
+  if (requested_entry && requested_entry != entry_point) {
+    if (error_out)
+      *error_out = "[open_vulkan_matting_driver_override_conflict] "
+                   "STUDIOCAST_VULKAN_LIBRARY differs from the active ncnn "
+                   "Vulkan provider; use the same provider for both runtimes.";
+    return false;
+  }
   if (!vulkan::VulkanDevice::ChooseAdoptionPhysicalDevice(
-          instance, selection, owner->instance, &selected, error_out))
+          instance, selection, entry_point, owner->instance, &selected,
+          error_out))
     return false;
   int index = -1;
   for (int i = 0; i < ncnn::get_gpu_count(); ++i)
     if (Handle<vulkan::VkPhysicalDevice>(
             ncnn::get_gpu_info(i).physical_device()) == selected)
       index = i;
+  if (index >= 0 && ncnn::get_gpu_info(index).type() == 3) {
+    if (error_out)
+      *error_out = "Production ncnn matting requires a non-CPU Vulkan device.";
+    return false;
+  }
   if (index < 0) {
     if (error_out)
       *error_out = "Selected Vulkan device is unavailable to ncnn.";
@@ -59,6 +88,7 @@ bool InitializeProductionVulkanMattingDevice(
       owner->device->info.compute_queue_family_index());
   vulkan::VulkanDeviceAdoption adopted;
   adopted.instance = instance;
+  adopted.entry_point = entry_point;
   adopted.physical_device = selected;
   adopted.device = Handle<vulkan::VkDevice>(owner->device->vkdevice());
   adopted.queue = Handle<vulkan::VkQueue>(owner->queue);
