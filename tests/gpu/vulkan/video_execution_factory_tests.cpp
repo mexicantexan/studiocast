@@ -965,7 +965,9 @@ bool RunProductionCombination(vulkan::VulkanVideoExecutionFactory *factory,
 }
 
 int TestProductionRuntimeIfAvailable() {
-  vulkan::VulkanVideoExecutionFactory factory({kFactoryId + 1, 300});
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId + 1;
+  vulkan::VulkanVideoExecutionFactory factory(configuration);
   hal::ReasonId reason = hal::ReasonId::none;
   if (factory.Initialize(&reason) != hal::StatusId::ready)
     return OptionalVulkanSkip(reason);

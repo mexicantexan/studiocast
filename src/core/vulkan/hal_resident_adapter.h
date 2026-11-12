@@ -91,8 +91,8 @@ struct VulkanExecutorResult {
 };
 
 // Implementations must be synchronous and must not retain a frame binding.
-// Production implementations are expected to wrap the existing canonical
-// OpenVulkan final resident stage and report actual queue submissions and
+// Production implementations wrap canonical resident matting consumers and
+// the final visual stage, and report actual queue submissions and
 // transport crossings. This interface deliberately provides no import/export
 // hook for another adapter or runtime.
 class IQualifiedVulkanResidentExecutor {
