@@ -109,6 +109,24 @@ bool ValidateSemanticCapability(
        capability.supports_tracked_vignette_center)) {
     return false;
   }
+  if (registration.backend == BackendId::vulkan &&
+      capability.production_eligible &&
+      capability.semantic != SemanticEffectId::mirror &&
+      capability.semantic != SemanticEffectId::vignette) {
+    bool model = false, runtime = false;
+    for (std::size_t i = 0; i < capability.evidence_count; ++i) {
+      const auto &record = capability.evidence[i];
+      if (!record.satisfied || record.status != StatusId::ready ||
+          record.reason != ReasonId::none)
+        continue;
+      model |=
+          record.code == CapabilityEvidenceCode::vulkan_model_artifacts_valid;
+      runtime |=
+          record.code == CapabilityEvidenceCode::vulkan_matting_runtime_ready;
+    }
+    if (!model || !runtime)
+      return false;
+  }
   return true;
 }
 

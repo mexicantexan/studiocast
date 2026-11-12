@@ -172,7 +172,8 @@ bool IsMattingSemantic(SemanticEffectId semantic) noexcept;
 
 bool ExactRegistration(const hal::AdapterRegistration &registration,
                        ReasonId *reason) noexcept {
-  if (registration.semantic_capability_count > registration.semantic_capabilities.size() ||
+  if (registration.semantic_capability_count >
+          registration.semantic_capabilities.size() ||
       registration.adapter_instance_id == 0 ||
       registration.backend != BackendId::vulkan ||
       registration.resident_adapter == nullptr ||
@@ -475,7 +476,8 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.backend = resolved.selected_backend;
     stage.execution_domain = resolved.execution_domain;
     stage.input.kind = hal::StageIoKind::image;
-    const bool native_size = IsMattingSemantic(stage.semantic);
+    const bool native_size = IsMattingSemantic(stage.semantic) &&
+                             resolved_index + 1 < resolution.stage_count;
     const bool previous_native =
         prepared_index > 0 &&
         IsMattingSemantic(program.stages[prepared_index - 1].semantic);

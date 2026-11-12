@@ -513,6 +513,78 @@ bool TestExactFactoryAndCommit() {
   return ok;
 }
 
+bool TestMattingFinalGeometryContract() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  const auto semantic = hal::SemanticEffectId::virtual_background_remove;
+  auto capability = Capability(
+      semantic, hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready);
+  capability.evidence[capability.evidence_count++] = {
+      hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid,
+      hal::StatusId::ready,
+      hal::ReasonId::none,
+      semantic,
+      hal::BackendId::vulkan,
+      true};
+  registration.semantic_capabilities[registration.semantic_capability_count++] =
+      capability;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId;
+  configuration.matting_pack = std::make_shared<open_video::ModelPack>();
+  configuration.matting_identity.artifact_generation = 1;
+  configuration.matting_identity.model_id_hash[0] = 3;
+  configuration.matting_identity.artifact_set_hash[0] = 4;
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(
+          factory.Initialize(&reason) == hal::StatusId::ready &&
+              registry.Register(factory.adapter_registration(), &reason) ==
+                  hal::StatusId::ready &&
+              coordinator.RegisterFactory(factory.factory_registration(),
+                                          &reason) == hal::StatusId::ready,
+          "model-backed factory must initialize from exact injected evidence"))
+    return false;
+  auto request = Request();
+  request.intent.stage_count = 1;
+  auto &stage = request.intent.stages[0];
+  stage = {};
+  stage.intent.stage_id = 8;
+  stage.intent.semantic = semantic;
+  stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  stage.model = configuration.matting_identity;
+  stage.parameter_count = 4;
+  stage.parameters[0].id = video::CanonicalVideoParameterId::strength;
+  stage.parameters[0].kind = video::CanonicalVideoParameterKind::signed_integer;
+  stage.parameters[0].signed_value = 8;
+  stage.parameters[1].id = video::CanonicalVideoParameterId::remove_color_rgb;
+  stage.parameters[1].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  stage.parameters[2].id = video::CanonicalVideoParameterId::greenscreen_mode;
+  stage.parameters[2].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  stage.parameters[3].id =
+      video::CanonicalVideoParameterId::greenscreen_temporal;
+  stage.parameters[3].kind = video::CanonicalVideoParameterKind::boolean;
+  stage.parameters[3].boolean_value = true;
+  request.host_output.width = 2;
+  request.host_output.height = 1;
+  request.host_output.planes[0].width = 2;
+  request.host_output.planes[0].height = 1;
+  request.host_output.planes[0].row_stride_bytes = 6;
+  request.host_output.planes[0].size_bytes = 6;
+  video::VideoExecutionPrepareEvidence evidence;
+  const auto status = coordinator.Prepare(request, &evidence, &reason);
+  const auto snapshot = coordinator.Snapshot();
+  return Require(
+      status == hal::StatusId::ready &&
+          snapshot.plan.prepared_program.stages[0].output.image.width == 2 &&
+          snapshot.plan.prepared_program.stages[0].output.image.height == 1,
+      "standalone matting consumer must bind its final resident resize to "
+      "writer geometry");
+}
+
 bool TestUnsupportedAndForeignPreflight() {
   Fixture fixture;
   if (!fixture.Initialize() || !fixture.Prepare(Request()))
@@ -899,6 +971,7 @@ int TestProductionSetupSourceIfAvailable() {
 int main() {
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
+  ok &= TestMattingFinalGeometryContract();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();
