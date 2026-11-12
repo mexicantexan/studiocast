@@ -2,11 +2,13 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <string>
+#include <sys/stat.h>
 #include <utility>
 #include <vector>
 
@@ -998,10 +1000,93 @@ bool TestOnnxWarningsPropagateToDiagnosticsJson() {
                         "tensorrt_session_create_failed_fell_back_to_cuda");
 }
 
+bool TestVerifiedModelFileSnapshot() {
+  namespace ov = studiocast::open_video;
+  const std::string digest =
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  char pattern[] = "/tmp/studiocast-model-snapshot-XXXXXX";
+  char *root = mkdtemp(pattern);
+  if (!root)
+    return false;
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+    }
+  } cleanup{root};
+  const auto path = cleanup.path / "model.bin";
+  auto write = [&](const std::filesystem::path &where, const char *bytes) {
+    std::ofstream file(where, std::ios::binary | std::ios::trunc);
+    file << bytes;
+    return bool(file);
+  };
+  auto contents = [](std::FILE *file) {
+    std::rewind(file);
+    char data[8]{};
+    const auto n = std::fread(data, 1, sizeof(data), file);
+    return std::string(data, n);
+  };
+  std::string error;
+  if (!write(path, "abc"))
+    return false;
+  auto snapshot = ov::OpenVerifiedModelFileSnapshot(path, digest, 3, &error);
+  if (!Expect(bool(snapshot), "verified snapshot creation: " + error))
+    return false;
+  if (!write(path, "xyz") ||
+      !ExpectEq("mutable inode cannot change verified snapshot",
+                contents(snapshot.get()), "abc"))
+    return false;
+  if (!Expect(!ov::OpenVerifiedModelFileSnapshot(path, digest, 3, &error),
+              "changed inode must not satisfy old digest"))
+    return false;
+  if (!write(path, "abc"))
+    return false;
+  snapshot = ov::OpenVerifiedModelFileSnapshot(path, digest, 3, &error);
+  const auto replacement = cleanup.path / "replacement";
+  if (!write(replacement, "xyz"))
+    return false;
+  std::filesystem::rename(replacement, path);
+  if (!ExpectEq("atomic replacement cannot change verified snapshot",
+                contents(snapshot.get()), "abc") ||
+      !Expect(!ov::OpenVerifiedModelFileSnapshot(path, digest, 3, &error),
+              "replacement before loading must reject stale identity"))
+    return false;
+  errno = 0;
+  if (!Expect(pwrite(fileno(snapshot.get()), "z", 1, 0) == -1 && errno == EPERM,
+              "snapshot must be kernel-sealed against writes"))
+    return false;
+  if (!write(path, "abc"))
+    return false;
+  if (!Expect(!ov::OpenVerifiedModelFileSnapshot(path, digest, 2, &error),
+              "oversized artifact must fail before copying") ||
+      !Expect(!ov::OpenVerifiedModelFileSnapshot(path, "invalid", 3, &error),
+              "malformed digest must fail closed"))
+    return false;
+  const auto symlink = cleanup.path / "symlink";
+  std::filesystem::create_symlink(path, symlink);
+  if (!Expect(!ov::OpenVerifiedModelFileSnapshot(symlink, digest, 3, &error),
+              "leaf symlink must not be followed"))
+    return false;
+  const auto fifo = cleanup.path / "fifo";
+  if (mkfifo(fifo.c_str(), 0600) != 0 ||
+      !Expect(!ov::OpenVerifiedModelFileSnapshot(fifo, digest, 3, &error),
+              "FIFO must reject without blocking"))
+    return false;
+  if (!Expect(
+          !ov::OpenVerifiedModelFileSnapshot(cleanup.path, digest, 3, &error),
+          "directory must not be consumed as a model"))
+    return false;
+  return true;
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
+  ok = RunNamedTest("verified_model_file_snapshot",
+                    TestVerifiedModelFileSnapshot) &&
+       ok;
   ok = RunNamedTest("open_video_integrity", TestOpenVideoIntegrity) && ok;
   ok = RunNamedTest("production_ncnn_vulkan_model_contract",
                     TestProductionNcnnVulkanModelContract) &&
