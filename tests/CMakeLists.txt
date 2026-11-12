@@ -1247,6 +1247,12 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-fastdvdnet-export-tests
                 unit installer model)
 
+        add_test(NAME studiocast-modnet-ncnn-conversion-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/installer/models/modnet_ncnn_conversion_tests.py")
+        studiocast_set_test_labels(studiocast-modnet-ncnn-conversion-tests
+                unit installer model)
+
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
@@ -1898,6 +1904,25 @@ if (BUILD_TESTING)
                 COMMAND studiocast-vulkan-matting-runtime-tests)
         studiocast_set_test_labels(studiocast-vulkan-matting-runtime-tests
                 unit video gpu vulkan model)
+
+        if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+            add_executable(studiocast-ncnn-vulkan-matting-runtime-tests
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/ncnn_vulkan_matting_runtime_tests.cpp)
+            target_link_libraries(studiocast-ncnn-vulkan-matting-runtime-tests PRIVATE
+                    studiocast_vulkan_backend)
+            target_include_directories(studiocast-ncnn-vulkan-matting-runtime-tests PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+            studiocast_set_project_warnings(studiocast-ncnn-vulkan-matting-runtime-tests)
+            studiocast_enable_sanitizers(studiocast-ncnn-vulkan-matting-runtime-tests)
+            set_target_properties(studiocast-ncnn-vulkan-matting-runtime-tests PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-ncnn-vulkan-matting-runtime-tests
+                    COMMAND studiocast-ncnn-vulkan-matting-runtime-tests)
+            set_tests_properties(studiocast-ncnn-vulkan-matting-runtime-tests PROPERTIES
+                    SKIP_RETURN_CODE 77)
+            studiocast_set_test_labels(studiocast-ncnn-vulkan-matting-runtime-tests
+                    integration video gpu vulkan model)
+        endif()
     endif()
 
     add_executable(studiocast-v4l2loopback-diagnostics-tests

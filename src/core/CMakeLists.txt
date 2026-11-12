@@ -181,6 +181,8 @@ set(_studiocast_vulkan_backend_sources
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/video_execution_factory.cpp)
 
 set(_studiocast_vulkan_backend_optional_sources
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/ncnn_vulkan_context.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/ncnn_vulkan_matting_runtime.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_runtime.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_session.cpp
         ${PROJECT_SOURCE_DIR}/src/core/vulkan/vulkan_loader.cpp
