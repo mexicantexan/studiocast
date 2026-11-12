@@ -245,11 +245,12 @@ These results do not claim architecture-independent CPU equivalence or camera
 quality. CPU reference buffers are offline artifact evidence and never become
 a production Vulkan fallback.
 
-The candidate preserves `modnet-webnn-256-fp32` and existing defaults.
-Publication of its two ncnn artifacts, updated metadata, and full license is
-pending separate approval; the active catalog remains seven packs/eight
-artifacts. Do not substitute unpublished candidate URLs into the shipped
-catalog or alter installed user packs for validation. See
+The approved publication preserves `modnet-webnn-256-fp32` and existing defaults.
+Its two ncnn artifacts, updated metadata, and full license were independently
+verified at immutable Hugging Face commit `f6be359c49ba07163287fe3732dc4a3024b91f60`.
+The active `2026-11-12` catalog has seven packs and ten artifacts. Future exports
+remain candidates until separately reviewed and published; do not substitute
+unpublished URLs or alter installed user packs for validation. See
 [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for current publication
 and ownership-safe transaction state, and
 [MANUAL_TESTING.md](MANUAL_TESTING.md#resident-vulkan-matting-validation) for

@@ -4,7 +4,7 @@
 - Applies To: Prepared HAL ownership, compatibility-route removal, and backend
   capability claims
 - Audience: Video runtime, backend, daemon, test, and release maintainers
-- Last Verified: 2026-11-11
+- Last Verified: 2026-11-12
 
 The Hardware Execution Layer is StudioCast's intended video execution
 architecture. Neutral contracts, planning, and ownership are necessary
@@ -259,7 +259,7 @@ paths were preserved. The publication helper exited 0 and receipt status is
 
 The fresh local promotion is topic
 `cf686180650468830deb4be5809fe06c213982d4`, integrated as
-`d7f7f5db1323ecdbea4430ebd71b49f9d82656b6`. Active catalog `2026-11-11`
+`d7f7f5db1323ecdbea4430ebd71b49f9d82656b6`. At that checkpoint catalog `2026-11-11`
 contains 140,755,803 total artifact bytes and has SHA-256
 `ac7c199bfac83859dd192174bb43e6a5c251647ab8936cebc9639408d4bc3f7e`.
 It preserves `fastdvdnet_sigma15`, its default selection, and the seven
@@ -318,3 +318,16 @@ signed application release was performed or authorized by model publication.
 The source archive/AppImage signing chain and the recorded camera, real-face
 quality, optimized latency, other vendor, and native-sanitizer limitations remain
 separate gates. See [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+
+## MODNet catalog promotion (2026-11-12)
+
+The user-approved additive publication at Hugging Face commit
+`f6be359c49ba07163287fe3732dc4a3024b91f60` was verified by unauthenticated
+immutable downloads before promotion. Catalog `2026-11-12` contains seven packs,
+ten artifacts, and 166,611,916 bytes, including the preserved MODNet ONNX and
+two ncnn artifacts. All IDs/defaults and the other six packs are unchanged.
+This closes the model publication prerequisite for opt-in Vulkan matting, not
+family/vendor qualification or signed release. Exact hashes, transaction tests,
+critique, and remaining deployment gates are recorded in
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) and
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).

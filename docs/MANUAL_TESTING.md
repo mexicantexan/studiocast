@@ -2,7 +2,7 @@
 
 Status: manual regression plan for the refaced GUI and hardware desktop
 workflows.
-Last updated: 2026-11-11.
+Last updated: 2026-11-12.
 
 This document tracks manual tests that cannot be covered deterministically in
 CI because they require real V4L2 devices, v4l2loopback behavior, desktop
@@ -632,7 +632,8 @@ qualification.
 
 Build the opt-in patched dependency and production configuration described in
 [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting).
-Use a verified converted MODNet candidate and the original ONNX golden tensors
+Use the approved curated MODNet pack (catalog `2026-11-12`) or a verified
+converted candidate, and the original ONNX golden tensors
 from [how_to_add_your_own_model.md](how_to_add_your_own_model.md#vulkan-matting-schema-v2).
 Keep candidates and HOME/XDG state isolated; never repair installed packs as a
 side effect of validation.
@@ -711,7 +712,9 @@ This is generated-input/in-memory-writer evidence. No AMD/Intel GPU or Khronos
 validation layers were available. Forced non-push-descriptor execution, real
 portrait quality, real camera/V4L2 transport, optimized latency, and clean
 full-native-sanitizer qualification remain open deployment feedback items.
-Model publication and signed application release remain separate; consult
+The approved model publication is complete at Hugging Face commit
+`f6be359c49ba07163287fe3732dc4a3024b91f60`; signed application release remains
+separate. Consult
 [VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) for the
 exact current integration and validation record.
 

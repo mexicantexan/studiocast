@@ -3,7 +3,7 @@
 - Status: Active release and trust contract
 - Applies To: Stable-channel manifests, packaging, signing, and installer updates
 - Audience: Release, installer, packaging, and security maintainers
-- Last Verified: 2026-07-22
+- Last Verified: 2026-11-12
 
 ## Outcome and trust model
 
@@ -156,7 +156,7 @@ module, catalog, and referenced `model.json`/`LICENSE.txt` resources. These
 files form a trusted metadata and transaction surface independent of a
 user-selected source tree. No ONNX, dlib, TensorRT, or other model binary is
 redistributed in the AppDir. The verifier asserts the exact seven default packs
-represent eight artifacts, requires their catalog sizes to be trusted, known,
+represent ten artifacts, requires their catalog sizes to be trusted, known,
 and strictly positive, and rejects staged model binaries.
 
 Manifest v1 does not enumerate model artifacts. The model sizes and pinned

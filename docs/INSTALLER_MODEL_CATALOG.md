@@ -3,7 +3,7 @@
 - Status: Active installer/model transaction contract
 - Applies To: StudioCast v0.2.9 curated catalog and installer packaging
 - Audience: Installer, model, packaging, and release maintainers
-- Last Verified: 2026-11-11
+- Last Verified: 2026-11-12
 
 ## Default catalog
 
@@ -23,14 +23,58 @@ Open Video:
 - `gaze_correction_cam_flx_v0_1_1`
 - `fastdvdnet_sigma15`
 
-These are seven packs and eight artifacts because the gaze-correction pack has
-separate left- and right-eye ONNX files. Maxine is not redistributed and its
+These are seven packs and ten artifacts: gaze correction has separate left-
+and right-eye ONNX files, and MODNet includes its preserved ONNX file plus two
+reviewed ncnn Vulkan artifacts. Maxine is not redistributed and its
 presence never removes these open-source fallback defaults.
+
+### MODNet Vulkan artifacts and publication (2026-11-12)
+
+The user approved adding the verified FP32 ncnn export to the existing
+`modnet-webnn-256-fp32` pack. Publication added exactly four files to
+`10dallasj/studiocast` in one additive
+[Hugging Face commit f6be359c](https://huggingface.co/10dallasj/studiocast/commit/f6be359c49ba07163287fe3732dc4a3024b91f60),
+with parent `8ffe968884e31ded74f857a2d0dca19f571ba044`. All 58 existing files
+retain their paths, blob identities, and byte sizes. Each new file was downloaded
+without authentication at the immutable resulting commit and independently
+verified before local catalog promotion:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `model.ncnn.param` | 12,113 | `4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61466c58d1310af8a1bd` |
+| `model.ncnn.bin` | 25,844,000 | `38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2` |
+| `model.json` | 1,825 | `3b94bc7bac4ae116659bf7b6bac93fe3a4d90448553661de536eb6c428f13bcc` |
+| `LICENSE.txt` | 11,976 | `77b9ad63b2659c31905d1a820403fea0ba0729c7d0530b6e6c6f8b717fd40f81` |
+
+The new files live below
+`open_video/matting/Good Quality/revisions/ncnn-fp32-20261020-38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2/`.
+Only the two model artifacts become downloads; exact published metadata and the
+full Apache license/provenance are packaged in the trusted source surface.
+The existing ONNX artifact object, all three source candidates, model ID,
+default, destination, and other six packs are preserved. The original ONNX file
+was independently verified at its actual legacy source
+`matting/Good Quality/model.onnx` (25,888,640 bytes and its existing pinned hash).
+The catalog's first source candidate was absent; publication checks were corrected
+to verify that existing fallback before any remote mutation.
+
+The four published files total 25,869,914 bytes. The two additional model
+artifacts add 25,856,113 download bytes, making the active `2026-11-12` catalog
+seven packs, ten artifacts, and 166,611,916 artifact bytes. The ncnn sources have
+only the verified versioned paths, with no unpublished fallback. Receipt:
+`/tmp/studiocast-modnet-conversion-design-20261111/publication-receipt.json`.
+Conversion, six-case numerical equivalence, and bounded P1000 manager evidence
+are recorded in [VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
+This promotion does not qualify additional vendors or install/update an existing
+user pack. Marked curated packs use normal verified update/repair; an unmarked
+old manifest/license mismatch remains `curated_ownership_unverified` and is
+preserved. Do not bypass ownership checks. Signed application release and the
+opt-in patched runtime remain separate prerequisites.
 
 ### FastDVDnet corrected artifact and publication (2026-11-11)
 
 The approved product decision is to repair/re-export `fastdvdnet_sigma15`,
-preserving its ID, default selection, and the seven-pack/eight-artifact contract.
+preserving its ID and default selection. That checkpoint retained seven packs
+and eight artifacts; the later MODNet promotion above adds two artifacts.
 The previous 416,788-byte artifact matched its pinned hash but is
 invalid: 26 convolution-weight references have no producer/initializer, and 68
 initializer tensors reference an absent `fastdvdnet.onnx.data`. Hash verification
@@ -124,7 +168,7 @@ provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files
 come only from hash-pinned files in the verified StudioCast source/package
 surface; they are not accepted from a model download source.
 
-Catalog version `2026-11-11` records independently verified artifact byte
+Catalog version `2026-11-12` records independently verified artifact byte
 counts paired with pinned hashes:
 
 | Pack/artifact | Bytes |
@@ -132,13 +176,15 @@ counts paired with pinned hashes:
 | `fastenhancer_s_vd_v1/model.onnx` | 832,775 |
 | `fastenhancer_m_vd_v1/model.onnx` | 2,033,628 |
 | `modnet-webnn-256-fp32/model.onnx` | 25,888,640 |
+| `modnet-webnn-256-fp32/model.ncnn.param` | 12,113 |
+| `modnet-webnn-256-fp32/model.ncnn.bin` | 25,844,000 |
 | `yunet_opencv_zoo_2023mar_fp32/model.onnx` | 232,589 |
 | `dlib_68_ibug_300w/shape_predictor_68_face_landmarks.dat` | 99,693,937 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.onnx` | 1,062,936 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.onnx` | 1,062,994 |
 | `fastdvdnet_sigma15/model.onnx` | 9,948,304 |
 
-The total is 140,755,803 bytes. Every entry is `size_status: known`, and the
+The total is 166,611,916 bytes. Every entry is `size_status: known`, and the
 catalog-level evidence reason is
 `artifact_sizes_independently_verified_against_pinned_sha256`. A trusted
 catalog requires every artifact to have a strictly positive integer size; a
@@ -198,7 +244,7 @@ succeed and another fails, the overall state is `degraded` with reason
 `optional_model_failure`; callers can offer Retry or Continue without hiding
 the committed packs.
 
-Recommended review plans carry all eight exact sizes and bind the selected
+Recommended review plans carry all ten exact sizes and bind the selected
 catalog version/hash, canonical pack objects, download rows, and disk totals.
 Apply reloads the packaged catalog and revalidates those bindings before any
 operation can mutate the filesystem. Custom and Advanced routes retain their

@@ -3,7 +3,7 @@
 - Status: Active contract with a staged production migration
 - Applies To: StudioCast v0.2.9 and the current source tree
 - Audience: Video-pipeline, backend, daemon, installer, and test maintainers
-- Last Verified: 2026-11-11
+- Last Verified: 2026-11-12
 
 The StudioCast Hardware Execution Layer (HAL) separates canonical effect
 planning from backend-specific resource ownership and execution. It is an
@@ -209,6 +209,13 @@ so the recorded `b204b0a` native evidence still names that same artifact. No
 installed pack was changed. Catalog promotion is distinct from the signed
 clean-HEAD release chain and full family qualification. See
 [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
+
+The later approved MODNet publication at immutable Hugging Face commit
+`f6be359c49ba07163287fe3732dc4a3024b91f60` adds verified ncnn param/bin files
+and matching metadata/license. Active catalog `2026-11-12` contains seven packs,
+ten artifacts, and 166,611,916 bytes, preserving the original ONNX artifact and
+all IDs/defaults. It does not change the bounded native evidence or qualify new
+vendors; details are in [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md).
 
 The camera pipeline uses one `ProductionVideoBackendManager` backed by typed
 setup leases. Backend factories own native sessions, contexts, streams/queues,

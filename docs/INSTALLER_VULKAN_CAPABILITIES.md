@@ -3,7 +3,7 @@
 - Status: Active cross-subsystem capability contract
 - Applies To: StudioCast v0.2.9 installer recommendation and runtime evidence
 - Audience: Installer, runtime, packaging, and test maintainers
-- Last Verified: 2026-11-11
+- Last Verified: 2026-11-12
 
 This document is the per-effect installer policy input for StudioCast `v0.2.9`.
 It describes the canonical live pipeline after the Vulkan production program,
@@ -43,8 +43,10 @@ build and reviewed converted MODNet profile, successfully prepared and warmed on
 the analyzed machine. Every recommendation still requires exact per-effect
 `production_ready` and common runtime facts. Missing prerequisites remain
 blocked; no Auto Frame, eye-contact, or video-denoise capability is promoted.
-The active curated catalog remains ONNX-only for MODNet pending separately
-approved publication; local converted packs can satisfy the explicit contract.
+The active curated catalog includes the approved, remotely verified ncnn MODNet
+artifacts alongside the preserved ONNX file. Installing them does not enable a
+missing production runtime or establish exact-device readiness. See
+[INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) for publication evidence.
 
 ## Evidence layers and fail-closed facts
 

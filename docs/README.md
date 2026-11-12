@@ -3,7 +3,7 @@
 - Status: Active documentation lifecycle index
 - Applies To: The current repository documentation
 - Audience: Users, contributors, maintainers, and reviewers
-- Last Verified: 2026-11-11
+- Last Verified: 2026-11-12
 
 Repository policies are discovered with `docs/*POLICY*.md`; all policy files
 therefore remain at the `docs/` root. Active cross-subsystem contracts also stay
@@ -29,9 +29,9 @@ These files describe current architecture or stable cross-subsystem behavior.
 | Document | Status | Applies To | Owner/Audience | Last Verified |
 | --- | --- | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Active contract | Target layers, daemon authority, effects, and model layout | All contributors | 2026-07-23 |
-| [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md) | Active staged-migration contract | Neutral HAL, prepared adapters, bounded evidence and qualification gates, execution domains, and typed status | Video/backend maintainers | 2026-11-11 |
-| [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) | Active migration and release contract | Family parity, route removal, and bounded hardware qualification | Video/release maintainers | 2026-11-11 |
-| [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) | Active contract | Curated model catalog and transactions | Installer/model maintainers | 2026-11-11 |
+| [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md) | Active staged-migration contract | Neutral HAL, prepared adapters, bounded evidence and qualification gates, execution domains, and typed status | Video/backend maintainers | 2026-11-12 |
+| [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) | Active migration and release contract | Family parity, route removal, and bounded hardware qualification | Video/release maintainers | 2026-11-12 |
+| [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) | Active contract | Curated model catalog and transactions | Installer/model maintainers | 2026-11-12 |
 | [INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md) | Active capability contract | Per-effect installer/runtime Vulkan evidence | Installer/Vulkan maintainers | 2026-07-22 |
 | [RELEASE_CHANNEL.md](RELEASE_CHANNEL.md) | Active security contract | Stable release transport, signing, and updates | Release/security maintainers | 2026-07-22 |
 | [SYSTEM_HELPER_PACKAGING.md](SYSTEM_HELPER_PACKAGING.md) | Active security contract | Privileged helper and polkit packaging | Packaging/security maintainers | 2026-07-22 |

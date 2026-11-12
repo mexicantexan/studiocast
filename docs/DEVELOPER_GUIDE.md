@@ -659,8 +659,10 @@ roots and must never rewrite the user's installed pack as validation.
 The repaired `fastdvdnet_sigma15` is published and promoted in local catalog
 version `2026-11-11`: 9,948,304 bytes, SHA-256
 `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
-The model ID, default selection, and seven-pack/eight-artifact contract are
-unchanged; total catalog artifact size is 140,755,803 bytes. The artifact,
+That checkpoint preserved the model ID/default and seven packs/eight artifacts
+(140,755,803 bytes). Catalog `2026-11-12` additionally includes the verified
+MODNet ncnn pair, retaining seven packs with ten artifacts and 166,611,916 bytes.
+The sigma15 artifact,
 `model.json`, and full license match the approved reproducible export and the
 remotely verified bytes at
 [Hugging Face commit 8ffe9688](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044).
@@ -746,6 +748,9 @@ active state: the writer must successfully commit the output first.
 
 Model conversion, schema, exact artifact identities, and isolated validation
 are documented in [how_to_add_your_own_model.md](how_to_add_your_own_model.md).
+The active `2026-11-12` catalog supplies both published ncnn artifacts and the
+original ONNX file under the same MODNet ID; installed user packs remain
+unchanged until an ownership-safe explicit model transaction.
 For required native commands and remaining hardware/quality gates, use
 [MANUAL_TESTING.md](MANUAL_TESTING.md). The original
 [vulkan_matting_ncnn_spike.md](vulkan_matting_ncnn_spike.md) remains a historical

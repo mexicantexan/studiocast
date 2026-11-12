@@ -1,11 +1,13 @@
 # Production Vulkan matting implementation
 
-- Status: Local implementation, native matrix, broad verification, and fresh final
-  critique complete; model publication/catalog pending explicit approval
+- Status: Runtime implementation/review complete; approved model publication
+  remotely verified; catalog promotion integrated; final validation/review in progress
 - Baseline: `51b96122ab2ccca92af9bed35c86c7fe8e5060a0`, branch `v0.2.9`
 - User decision, 2026-11-11: implement production Vulkan matting and its model
   and validation requirements; validate available hardware and record unavailable
   hardware coverage for deployment feedback.
+- User decision, 2026-11-12: explicitly approved publishing the four verified
+  MODNet files to the existing source and activating their local catalog entry.
 
 ## Scope and contract
 
@@ -67,6 +69,7 @@ files; implementation agents used isolated worktrees.
 | `vulkan_model_design` / `codex/modnet-ncnn-conversion-20261111` | `ac93711` | `46f743f` |
 | `vulkan_matting_docs` / `codex/vulkan-matting-docs-20261111` | `0dc32c4` | `0219ee6` |
 | `vulkan_runtime_notices` / `codex/vulkan-runtime-notices-20261111` | `aeb9266` | `8300939` |
+| `modnet_catalog_promotion` / `codex/modnet-catalog-promotion-20261112` | `3a02d3e` | `eb13d5b` |
 | Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743`, `b346f96`, `763b5ee`, `acad9d0` | Direct focused commits; no parallel writes to shared files |
 | `vulkan_matting_safety_audit` | Read-only interim audit; no commit | Confirmed findings repaired as described below |
 | `vulkan_final_critique` | Read-only first final critique; no commit | One Medium packaging finding, repaired and integrated |
@@ -109,7 +112,7 @@ No architecture-independent CPU qualification or relaxed threshold is claimed.
 Candidate evidence, numerical fixtures, and publication plan are retained under
 `/tmp/studiocast-modnet-conversion-design-20261111/`. The existing ONNX artifact,
 model ID `modnet-webnn-256-fp32`, defaults, and other packs are preserved.
-The additive publication candidate has exactly four files (25,869,914 bytes):
+The approved additive publication contains exactly four files (25,869,914 bytes):
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -118,13 +121,29 @@ The additive publication candidate has exactly four files (25,869,914 bytes):
 | `model.json` | 1,825 | `3b94bc7bac4ae116659bf7b6bac93fe3a4d90448553661de536eb6c428f13bcc` |
 | `LICENSE.txt` | 11,976 | `77b9ad63b2659c31905d1a820403fea0ba0729c7d0530b6e6c6f8b717fd40f81` |
 
-Publication to the existing `10dallasj/studiocast` source requires the pending
-explicit approval requested under AGENTS.md. The prepared helper verifies exact
-file bindings, hashes, sizes, parent commit, additive delta, and unauthenticated
-remote bytes. It has only been dry-run. Active catalog/templates remain unchanged
-(seven packs/eight artifacts; ONNX-only MODNet). Only verified published bytes may
-be promoted into catalog URLs. Candidate installation is distinct from signed
-application release and never modifies installed user packs.
+The user explicitly approved publication on 2026-11-12. Root published exactly
+these four new files in one additive
+[Hugging Face commit f6be359c](https://huggingface.co/10dallasj/studiocast/commit/f6be359c49ba07163287fe3732dc4a3024b91f60),
+parent `8ffe968884e31ded74f857a2d0dca19f571ba044`. Each file was downloaded
+without authentication at that immutable commit; actual bytes matched every
+approved size/hash. All 58 existing paths, blob IDs, and sizes were independently
+compared across parent/child commits and remain unchanged. The initial preflight
+correctly stopped before mutation because the first catalog ONNX source path
+was absent. Root then verified its actual legacy fallback
+`matting/Good Quality/model.onnx` against the existing 25,888,640-byte hash and
+corrected only that guard; the four approved publication destinations stayed
+unchanged.
+
+Receipt: `/tmp/studiocast-modnet-conversion-design-20261111/publication-receipt.json`
+(`published_remote_bytes_verified`). Independently downloaded payloads are under
+`published-public-https-f6be359c49ba07163287fe3732dc4a3024b91f60/` in the same
+task directory. Local catalog `2026-11-12` adds only the two verified versioned
+ncnn sources; the exact remote metadata/license are promoted to templates.
+The original ONNX artifact object, all IDs/defaults, and the other six pack
+objects remain unchanged. Totals become seven packs, ten artifacts, and
+166,611,916 download bytes (+25,856,113). Publication is distinct from signed
+application release and does not modify installed user packs. Unmarked packs
+with old metadata remain protected by `curated_ownership_unverified`.
 
 ## Native and integrated validation
 
@@ -250,13 +269,44 @@ Final handoff is on `v0.2.9`; subsequent ledger-only changes do not change the
 reviewed runtime or packaging behavior. No accepted implementation remains on
 an unmerged topic branch.
 
+## Approved catalog promotion validation (2026-11-12)
+
+Root reviewed and merged focused topic `3a02d3e` from
+`codex/modnet-catalog-promotion-20261112` as `eb13d5b`. Catalog SHA-256 is
+`f9032f14672d9e811998e3a2de142aa488f2284e8bb467148c555bf76dd546e6`.
+Root independently compared the baseline: the other six pack objects, original
+ONNX artifact object, every ID/default/destination, and all three original ONNX
+source candidates remain unchanged. Promoted manifest/license bytes exactly
+match the unauthenticated immutable remote downloads. Only reviewed metadata,
+license, catalog, artifact-count guards/UI copy, and relevant tests changed;
+no model binary or core inference source was committed.
+
+The first focused test run exposed `DEFAULT_MODEL_ARTIFACT_COUNT=8` in the
+installer trust contract. It correctly rejected the expanded catalog. The
+one-line correction to ten, matching packaging guard and UI copy changes,
+preserves strict size/hash/count checks. New regressions reject historical
+eight-artifact facts, inconsistent totals, untrusted sizes, and zero sizes.
+The implementation agent passed transaction 20/20, converter 7/7, backend 54/54
+(21.428 s), packaging 13/13 (8.062 s), one final backend trust test, and the rebuilt
+offscreen Qt wizard (exit 0), with temporary HOME/XDG roots. Shell syntax and
+diff checks passed. Actual promoted-catalog local-source and offline-cache
+transactions succeeded with all five pack files exact; receipt:
+`/tmp/studiocast-modnet-promoted-transaction-20261112-lpeqt9_l/receipt.json`.
+Logs use `/tmp/studiocast-modnet-promotion-*-20261112.log` (green backend,
+packaging, and Qt suffixes); initial fail-closed logs are retained.
+
+Root post-integration broad tests and fresh independent critique follow before
+claiming this promotion complete. Existing runtime/native qualification limits
+are unchanged; this phase does not claim newly executed hardware tests.
+
 ## Remaining delivery boundaries
 
-- Await explicit model publication decision; then verify remote bytes before
-  catalog/template promotion and rerun affected model/installer/packaging checks.
+- Complete post-integration broad tests and fresh independent critique of the
+  integrated approved promotion.
 - Collect unavailable hardware, real-camera/visual-quality, and optimized latency
   feedback during deployment; keep fail-closed runtime checks intact.
 - Git push/application release/deployment are separate actions. This task has
   made no new remote Git push, application release, installed-pack change, host
-  package/service/driver/kernel change, or model publication. The preceding
+  package/service/driver/kernel change. The approved four-file model publication
+  above is the only new external mutation. The preceding
   completed scope was pushed to `origin/v0.2.9` at baseline `51b9612`.
