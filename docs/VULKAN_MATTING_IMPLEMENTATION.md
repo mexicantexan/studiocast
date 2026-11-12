@@ -91,8 +91,40 @@ The production smoke checks this refresh as well as actual manager execution.
 Native model-backed acceptance is still pending: the known 1x1 convolution
 already passes changing-output, allocation-reuse, CPU-rejection, low-budget, and
 timeout-quarantine checks, but the full MODNet graph currently fails recording
-at its first InnerProduct layer. This is an active implementation failure, not
-an accepted hardware limitation. Runtime diagnosis and remediation continue.
+at its first InnerProduct layer. This initial failure was subsequently traced
+to resource retention and fixed as recorded below.
+
+Runtime repair `4e7fe14`, integrated as `366103d`, preserves the 256 MiB / 512
+resource caps while reusing released setup workspace and retiring completed
+upload staging. It also enforces replay ABI 2, rejects internal submission/reset,
+propagates command-begin failures, and adopts the exact native provider entry
+point. Required P1000 native tests passed, including six real MODNet golden
+cases (worst maximum error `0.000112742`, worst MAE `7.06813e-7`, all IoU 1),
+changing toy outputs, allocation reuse, CPU-layer and low-budget rejection,
+provider and initial-recording negatives, and timeout quarantine. Retained native
+allocations: 232; complete context peak: 111,266,560 bytes. Evidence:
+`/tmp/studiocast-ncnn-native-v2-final-test-20261111.log`.
+
+Independent interim audit `vulkan_matting_safety_audit` confirmed hidden ncnn
+submission and ignored initial command-begin errors; ABI 2 repairs both with
+native negative tests. It also reproduced an artifact replacement race using
+actual validators and the ncnn CPU loader: different weights loaded under the
+old typed identity. Immutable verified snapshot loading is assigned to the
+runtime agent and remains pending. Model hashes and context checks alone are
+not accepted as closing that race.
+
+The first actual camera-manager run passed real cold diagnostics (all four
+consumers, exact reviewed profile, resident warmup, and no CPU fallback), then
+failed blur setup with `malformed_contract` after successful native preparation.
+The pipeline agent is diagnosing that integration failure; it is not an
+accepted hardware limitation. The branch is not ready for deployment yet.
+
+Root repaired the installer shadow parser's remaining two-effect Vulkan
+allowlist. Exact four-consumer snapshots now require common evidence 1–12 plus
+runtime/artifact evidence 15/16; incomplete evidence remains rejected and
+`recommendation_eligible` remains false. The regression reproduced four rejected
+complete packets before the fix, then passed. All 54 installer backend tests
+passed (21.145 seconds).
 
 Scope extension: the preceding pushed baseline's CI run `43031290469` exposed
 three bounded delivery failures. Root owns the repair: explicitly include

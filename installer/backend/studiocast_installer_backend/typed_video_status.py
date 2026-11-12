@@ -568,10 +568,14 @@ def _selected_capability_is_exact(
         return False
     if selection["lane_id"] != 3:
         return True
-    if effect not in {"mirror", "vignette"}:
-        return False
     required = set(range(1, 13))
-    required.add(13 if effect == "mirror" else 14)
+    if effect in {"virtual_background.blur", "virtual_background.remove",
+                  "virtual_background.replace", "virtual_key_light"}:
+        required.update((15, 16))
+    elif effect in {"mirror", "vignette"}:
+        required.add(13 if effect == "mirror" else 14)
+    else:
+        return False
     satisfied = {
         item["code"]["id"]
         for item in selection["evidence"]

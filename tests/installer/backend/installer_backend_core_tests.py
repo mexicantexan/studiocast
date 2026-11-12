@@ -347,9 +347,14 @@ def typed_vulkan_evidence(effect_id, effect):
         "vulkan_device_local_residency", "vulkan_bounded_allocations",
         "vulkan_no_cpu_layers", "vulkan_no_intermediate_readbacks",
     ], start=1))
-    tokens.append(
-        (13, "open_vulkan_mirror_production_ready") if effect == "mirror"
-        else (14, "open_vulkan_vignette_fixed_center_production_ready"))
+    if effect in {"virtual_background.blur", "virtual_background.remove",
+                  "virtual_background.replace", "virtual_key_light"}:
+        tokens.extend(((15, "vulkan_matting_runtime_ready"),
+                       (16, "vulkan_model_artifacts_valid")))
+    else:
+        tokens.append(
+            (13, "open_vulkan_mirror_production_ready") if effect == "mirror"
+            else (14, "open_vulkan_vignette_fixed_center_production_ready"))
     return [{
         "code": typed_pair(index, token),
         "status": typed_pair(1, "ready"), "reason": typed_pair(0, ""),
@@ -798,6 +803,41 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(
             parsed["effects"]["virtual_background.blur"]["active_provider"],
             "open_video_onnxruntime_cuda")
+
+    def test_typed_vulkan_matting_requires_exact_model_and_runtime_evidence_shadow_only(self):
+        for identifier, name in ((3, "virtual_background.blur"),
+                                 (4, "virtual_background.remove"),
+                                 (5, "virtual_background.replace"),
+                                 (6, "virtual_key_light")):
+            value = typed_multi_island_fixture()
+            value["effects"] = [typed_effect(x["effect"]["id"], x["effect"]["token"])
+                                for x in value["effects"]]
+            selected = next(x for x in value["effects"] if x["effect"]["id"] == identifier)
+            active_typed_effect(selected, 3, "open_vulkan", 141,
+                                "open_vulkan_matting_production_ready", 1, 11, 5,
+                                "vulkan", 5, "open_vulkan_production_kernels")
+            value["capabilities"]["lanes"] = typed_capability_lanes(value["effects"])
+            value["islands"] = [typed_island(1, "final_visual", 1, 101, 11,
+                                           identifier, name, 5, "vulkan", 5,
+                                           "open_vulkan_production_kernels")]
+            value["authority"]["prepared_route_effect_mask"] = 1 << (identifier - 1)
+            value["aggregate"] = {"current_island_count": 1,
+                                  "transfers": value["islands"][0]["telemetry"]["transfers"]}
+            with self.subTest(effect=name, evidence="complete"):
+                parsed = parse_typed_multi_island_video_status({"typed_multi_island_video_status": value})
+                self.assertTrue(parsed["valid"], parsed["reason_codes"])
+                self.assertFalse(parsed["recommendation_eligible"])
+                self.assertEqual("shadow_only", parsed["mode"])
+            for missing in (8, 15, 16):
+                broken = copy.deepcopy(value)
+                effect = next(x for x in broken["effects"] if x["effect"]["id"] == identifier)
+                proof = effect["selected_capability"]["semantic"]
+                proof["evidence"] = [x for x in proof["evidence"] if x["code"]["id"] != missing]
+                broken["capabilities"]["lanes"] = typed_capability_lanes(broken["effects"])
+                with self.subTest(effect=name, missing=missing):
+                    rejected = parse_typed_multi_island_video_status({"typed_multi_island_video_status": broken})
+                    self.assertFalse(rejected["valid"])
+                    self.assertEqual(["typed_status.selected_capability_incomplete"], rejected["reason_codes"])
 
     def test_typed_multi_island_status_rejects_versions_effect_topology_and_staleness(self):
         cases = []
