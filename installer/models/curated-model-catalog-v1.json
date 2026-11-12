@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-11",
+  "catalog_version": "2026-11-12",
   "policy_version": 1,
   "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/main",
   "size_metadata": {
@@ -47,13 +47,15 @@
       "default": true,
       "pack_path": "matting/Good Quality",
       "metadata": [
-        {"source": "resources/model_packs/open_video/matting/Good Quality/model.json", "destination": "model.json", "sha256": "a764a5d6b1cd374687b85826976e7e4b45b8ecb5dde0bd834ed95678a7a26b95"},
-        {"source": "resources/model_packs/open_video/matting/Good Quality/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "54f6ff80725eace433788abc94a32f41e9b10fd7d787fcc1fdb7b46bc39782db"}
+        {"source": "resources/model_packs/open_video/matting/Good Quality/model.json", "destination": "model.json", "sha256": "3b94bc7bac4ae116659bf7b6bac93fe3a4d90448553661de536eb6c428f13bcc"},
+        {"source": "resources/model_packs/open_video/matting/Good Quality/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "77b9ad63b2659c31905d1a820403fea0ba0729c7d0530b6e6c6f8b717fd40f81"}
       ],
       "license": {"spdx": "Apache-2.0", "redistribution": "permitted", "notes": "Upstream repository identifies the model as Apache-2.0."},
-      "provenance": {"project": "MODNet WebNN", "url": "https://huggingface.co/onnx-community/modnet-webnn", "release": "catalog-pinned SHA-256"},
+      "provenance": {"project": "MODNet WebNN", "url": "https://huggingface.co/onnx-community/modnet-webnn", "release": "original ONNX retained; fixed-256 FP32 ncnn conversion via pnnx 20261020; Hugging Face publication f6be359c49ba07163287fe3732dc4a3024b91f60"},
       "artifacts": [
-        {"name": "model.onnx", "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9", "size_bytes": 25888640, "size_status": "known", "source_paths": ["open_video/matting/Good Quality/model.onnx", "matting/Good Quality/model.onnx", "open_cuda/matting/Good Quality/model.onnx"]}
+        {"name": "model.onnx", "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9", "size_bytes": 25888640, "size_status": "known", "source_paths": ["open_video/matting/Good Quality/model.onnx", "matting/Good Quality/model.onnx", "open_cuda/matting/Good Quality/model.onnx"]},
+        {"name": "model.ncnn.param", "sha256": "4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61466c58d1310af8a1bd", "size_bytes": 12113, "size_status": "known", "source_paths": ["open_video/matting/Good Quality/revisions/ncnn-fp32-20261020-38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2/model.ncnn.param"]},
+        {"name": "model.ncnn.bin", "sha256": "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2", "size_bytes": 25844000, "size_status": "known", "source_paths": ["open_video/matting/Good Quality/revisions/ncnn-fp32-20261020-38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2/model.ncnn.bin"]}
       ]
     },
     {
