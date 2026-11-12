@@ -2,6 +2,7 @@
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/production_video_setup_request.h"
 #include "core/vulkan/production_video_backend_setup_source.h"
+#include "core/vulkan/vulkan_device.h"
 
 #include <algorithm>
 #include <atomic>
@@ -226,6 +227,42 @@ int main(int argc, char **argv) {
   if (setenv("XDG_DATA_HOME",
              root.parent_path().parent_path().parent_path().c_str(), 1) != 0)
     return 2;
+  const auto cold = studiocast::vulkan::DiagnoseOpenVulkanDefault();
+  std::cout << "cold_diagnostics=" << cold.ToJson() << '\n';
+  if (cold.default_model_id != options.model_id ||
+      !cold.matting_production_ready || !cold.matting_parity_validated ||
+      cold.matting_cpu_fallback_count != 0 ||
+      !cold.matting_model_contract_validated || !cold.matting_runtime_created ||
+      !cold.matting_graph_loaded || !cold.matting_warmup_complete ||
+      cold.matting_warmup_inference_count != 1 ||
+      !cold.matting_shared_device_imported ||
+      !cold.matting_queue_ownership_explicit ||
+      !cold.matting_synchronous_completion ||
+      !cold.matting_bounded_reusable_allocations ||
+      cold.matting_dynamic_allocation_count != 0 ||
+      cold.matting_cpu_readback_count != 0 || cold.matting_cpu_layers_used ||
+      !cold.input_device_resident || !cold.alpha_device_resident ||
+      !cold.output_device_resident ||
+      cold.device_residency_mode != "device_resident" ||
+      cold.eye_contact_production_ready ||
+      cold.video_noise_removal_production_ready ||
+      cold.auto_frame_production_ready) {
+    std::cerr << "FAIL cold diagnostics did not prove the exact model-backed "
+                 "Vulkan profile\n";
+    return 1;
+  }
+  for (const std::string effect :
+       {"virtual_background.blur", "virtual_background.remove",
+        "virtual_background.replace", "virtual_key_light"}) {
+    if (std::find(cold.available_effects.begin(), cold.available_effects.end(),
+                  effect) == cold.available_effects.end() ||
+        cold.blocked_effects.contains(effect)) {
+      std::cerr
+          << "FAIL cold diagnostics omitted a qualified matting consumer: "
+          << effect << '\n';
+      return 1;
+    }
+  }
   for (auto mode : {video::effects::VirtualBackgroundMode::blur,
                     video::effects::VirtualBackgroundMode::remove,
                     video::effects::VirtualBackgroundMode::replace}) {
