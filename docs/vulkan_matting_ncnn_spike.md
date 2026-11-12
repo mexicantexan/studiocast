@@ -1,13 +1,18 @@
 # Vulkan Matting ncnn Spike
 
-- Status: Experimental design record; not a production capability contract
+- Status: Historical experimental design record; not a production capability contract
 - Applies To: Optional ncnn Vulkan matting spike and fail-closed adapter boundary
 - Audience: Vulkan and Open Video maintainers
-- Last Verified: 2026-07-22
+- Last Verified: 2026-11-11
 
 Milestone 4 evaluates ncnn Vulkan as a candidate inference runtime for a future
 Open Vulkan virtual-background backend. This is a spike only; it does not change
-the production model-pack format or runtime selection.
+the production model-pack format or runtime selection. Production matting now
+has a separate ncnn-owned resident implementation; see
+[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting) for
+its pinned dependency/build procedure and
+[how_to_add_your_own_model.md](how_to_add_your_own_model.md#vulkan-matting-schema-v2)
+for the converted model contract. The spike cannot attest production readiness.
 
 ## Build
 
@@ -38,10 +43,20 @@ Conversion is developer tooling and must not run in the frame loop. The current
 default matting pack is `modnet-webnn-256-fp32`, with manifest-fixed
 `1x3x256x256` input and `1x1x256x256` alpha output.
 
-Preferred pnnx path:
+Historical exploratory pnnx path (not the reviewed production converter;
+use `scripts/models/convert_modnet_ncnn.py` for production candidates). Never
+run conversion in a user-installed pack; copy the inputs to an isolated
+directory first:
 
 ```bash
-cd ~/.local/share/studiocast/models/open_video/matting/Good\ Quality
+mkdir -p /tmp/modnet-spike-conversion
+# Copy the source model.onnx into this isolated directory.
+```
+
+Exploratory command:
+
+```bash
+cd /tmp/modnet-spike-conversion
 pnnx model.onnx inputshape=[1,3,256,256] \
   ncnnparam=model.ncnn.param ncnnbin=model.ncnn.bin fp16=0 optlevel=2
 ```
@@ -92,10 +107,11 @@ The tool reports:
 - alpha MAE, max absolute error, and thresholded mask IoU
 - transfer/residency status
 
-## Current Feasibility Boundary
+## Historical Feasibility Boundary
 
-ncnn can run Vulkan inference with its own `VkMat` tensors, but StudioCast's
-current Vulkan buffers are owned by a separate minimal `VulkanDevice` wrapper.
+At the spike milestone, ncnn could run Vulkan inference with its own `VkMat`
+tensors, while StudioCast's Vulkan buffers belonged to a separate minimal
+`VulkanDevice` wrapper.
 Direct `VulkanTensor` or `VulkanImage` zero-copy interop with ncnn is therefore
 not proven in this milestone.
 
@@ -104,85 +120,19 @@ Vulkan runtime behavior and output quality, but it explicitly reports device
 residency as `no`. A production Open Vulkan backend would need either ncnn-owned
 preprocess/composite kernels or a shared Vulkan device/allocator design.
 
-## Production Build and Model Contract
+## Production boundary
 
-The production integration has a separate, fail-closed build switch. It does
-not promote the CPU-transfer spike:
+The spike uses CPU `ncnn::Mat` input/output and reports residency as `no`.
+It therefore remains diagnostics-only even when the separate production build
+is enabled. Its latency/quality output must never be used as proof of shared
+ownership, bounded completion, resident graph execution, or camera publication.
 
-```bash
-cmake -S . -B build-vulkan-ncnn-production -G Ninja \
-  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
-  -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
-  -Dncnn_DIR=/path/to/vulkan-enabled/ncnn/lib/cmake/ncnn
-```
-
-Enabling `STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING` requires both Open Vulkan and
-ncnn compiled with Vulkan support; a missing dependency is a configure error.
-The option defaults to `OFF`, so Open Vulkan remains runtime-loaded and usable
-for its non-inference kernels without adding an ncnn dependency.
-
-Production artifacts are created offline. A schema-v2 matting manifest opts in
-with an `ncnn_vulkan` object, while the referenced artifacts and their installed
-SHA-256 values remain in the common `files` array:
-
-```json
-{
-  "schema_version": 2,
-  "task": "matting",
-  "input": {
-    "name": "input", "layout": "nchw", "dtype": "float32",
-    "width": 256, "height": 256, "channels": 3
-  },
-  "output": {
-    "name": "alpha", "kind": "alpha", "layout": "nchw",
-    "dtype": "float32", "width": 160, "height": 144, "channels": 1
-  },
-  "files": [
-    {
-      "name": "model.ncnn.param",
-      "kind": "ncnn_param",
-      "role": "vulkan_matting",
-      "sha256": "<64 lowercase or uppercase hex characters>"
-    },
-    {
-      "name": "model.ncnn.bin",
-      "kind": "ncnn_bin",
-      "role": "vulkan_matting",
-      "sha256": "<64 lowercase or uppercase hex characters>"
-    }
-  ],
-  "ncnn_vulkan": {
-    "param_file": "model.ncnn.param",
-    "bin_file": "model.ncnn.bin",
-    "input_blob": "input",
-    "output_blob": "alpha",
-    "converter": {
-      "name": "pnnx",
-      "version": "20250503"
-    },
-    "precision": "fp32"
-  }
-}
-```
-
-`param_file` and `bin_file` must be safe relative paths, must refer to unique
-`files` entries of the matching kind, and must carry valid SHA-256 values.
-Input/output blob names, converter name/version, and precision (`fp32` or
-`fp16`) are mandatory. Precision describes the offline artifacts; both
-variants use StudioCast's float32 resident input/output binding contract.
-Exact NCHW output layout/width/height/channels are mandatory and may differ
-from the input geometry. At one-time production session creation StudioCast
-resolves both paths inside the pack and recomputes both checksums. Missing
-metadata, path escape, missing files, and checksum mismatch all fail closed.
-Manifest parsing and hashing are forbidden in the frame loop.
-
-Current curated packs remain ONNX-only until reviewed ncnn conversions and
-their real checksums are produced. Consequently, this contract alone does not
-make production Vulkan matting available or device-resident.
-
-Current upstream ncnn owns/selects its Vulkan device and does not provide the
-reviewed external-device import needed for StudioCast's already-selected
-`VkPhysicalDevice`/`VkDevice`/`VkQueue` and buffers. The production factory
-therefore remains fail-closed with
-`open_vulkan_matting_adapter_unavailable` even when the build option and ncnn
-dependency are present.
+The production implementation instead adopts an ncnn-owned exact Vulkan
+context and queue before StudioCast allocation, then records and replays the
+GPU-only graph with fixed buffers. It uses the pinned StudioCast replay ABI 2,
+immutable verified artifact snapshots, bounded submission, and no intermediate
+host inference bridge. Plain upstream ncnn cannot satisfy that contract.
+Production runtime and model evidence must come from its own native tests and
+actual manager smoke, with the limits recorded in
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) and
+[MANUAL_TESTING.md](MANUAL_TESTING.md).

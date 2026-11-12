@@ -595,7 +595,7 @@ loader enumeration is not a successful production camera run.
   an explicitly authorized transaction repair. Validation must preserve the
   installed pack and test candidates in isolated HOME/XDG roots.
 
-Final source checkpoint `b204b0a` includes CUDA composition, layered
+The previous CUDA parity checkpoint `b204b0a` includes CUDA composition, layered
 unsubmitted-frame retirement, disabled final-stage timing, and Vulkan shutdown
 context-lifetime repairs. The
 [HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
@@ -627,6 +627,93 @@ and an automatic six-stage resident case; automatic host mirror needs separate
 camera-level evidence. A portable
 skip, a configured workflow, or a kernel-only pass is not completed hardware
 qualification.
+
+## Resident Vulkan matting validation
+
+Build the opt-in patched dependency and production configuration described in
+[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting).
+Use a verified converted MODNet candidate and the original ONNX golden tensors
+from [how_to_add_your_own_model.md](how_to_add_your_own_model.md#vulkan-matting-schema-v2).
+Keep candidates and HOME/XDG state isolated; never repair installed packs as a
+side effect of validation.
+
+Required component test (all three model inputs must be supplied together):
+
+```bash
+STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+STUDIOCAST_NCNN_MATTING_PARAM=/candidate/model.ncnn.param \
+STUDIOCAST_NCNN_MATTING_BIN=/candidate/model.ncnn.bin \
+STUDIOCAST_NCNN_MATTING_GOLDEN_ROOT=/candidate/numerical \
+  ./build-vulkan-matting/studiocast-ncnn-vulkan-matting-runtime-tests
+```
+
+Required actual production-manager test, using a preinstalled read-only isolated
+model tree whose path ends in `studiocast/models/open_video` and a readable
+replacement image:
+
+```bash
+./build-vulkan-matting/studiocast-vulkan-matting-production-smoke --require \
+  --model-root /isolated/data/studiocast/models/open_video \
+  --model-id modnet-webnn-256-fp32 --replace-path /fixtures/replacement.ppm \
+  --frames 3
+```
+
+The manager smoke covers eight cases: blur/remove/replace individually, each
+with key light plus fixed-center vignette and mirror, then key light alone and
+with the same final stages. Generated RGB input is 64x48 and output 32x24;
+completion uses the camera's 100 ms deadline, 1 ms poll interval, and 100-poll
+cap. It checks strict cold diagnostics, exact model identity, successful stages,
+zero host allocations during execution, writer-commit attribution, zero
+fallback, one upload/one final readback, zero intermediate transfers, and zero
+CPU tails. Exit 77 is a skip and cannot count as native qualification. The
+opt-in `vulkan-matting-production` CI job requires explicit preprovisioned
+runner/dependency/model/image inputs and fails on a skip; configuration is not
+evidence that remote GPU CI ran.
+
+- [ ] Verify all four consumer readiness predicates after explicit daemon
+  diagnostics refresh; routine status polling must consume cached facts.
+- [ ] Disable the production build, remove/mismatch an artifact, select a foreign
+  device/provider, or introduce a CPU-only layer. Each affected consumer must
+  remain unavailable without disabling independently valid mirror/vignette.
+- [ ] Confirm a failed writer cannot create active effect/backend attribution.
+- [ ] Reconfigure geometry/effects/model and verify one new prepared island,
+  bounded allocations, graph reuse, shared matte, and exact selected queue.
+- [ ] Inject low budgets, initial recording failure, internal submit/reset,
+  timeout, and device loss. Unsafe completion must quarantine and retain all
+  resources until explicit quiescence proof permits shutdown.
+- [ ] Test artifact replacement between verification and model load; only the
+  immutable verified snapshot may be consumed.
+- [ ] Repeat on each claimed vendor and test forced non-push-descriptor behavior,
+  Khronos validation layers, real portrait images, real camera/V4L2 writers,
+  optional failure/recovery, optimized latency, and native sanitizers.
+
+Available component evidence, 2026-11-11: Quadro P1000 / NVIDIA driver
+535.309.01 passed six real MODNet golden cases, with worst maximum error
+`0.000112742`, worst MAE `7.06813e-7`, and all threshold-mask IoU values 1.
+The test also passed changing-output/reuse, CPU-layer and low-budget rejection,
+provider/initial-recording negatives, and timeout quarantine. Retained native
+allocations were 232 and full context peak was 111,266,560 bytes, within the
+256 MiB / 512-resource reservation. Log:
+`/tmp/studiocast-ncnn-native-v2-final-test-20261111.log`.
+
+The actual production-manager matrix passed at source
+`22c8724d82532e483c269e15c44952926c1e6964` (exit 0, 53.61 seconds), including
+immutable verified snapshot loading and camera-bounded fence waits. Strict cold
+diagnostics passed and all eight cases committed three frames each: 24 writer
+commits, 24 uploads, 24 final readbacks, zero intermediate transfers, CPU tails,
+execution-time host allocations, or fallback frames. Every requested stage
+succeeded. Synchronizations were 7–9 per frame within the 16-operation cap and
+100 ms completion policy. Evidence is `matrix.log` and `run.json` under
+`/tmp/studiocast-vulkan-camera-smoke-20261111-seity1rh/`, including exact binary,
+dependency, and model hashes.
+
+This is generated-input/in-memory-writer evidence. No AMD/Intel GPU or Khronos
+validation layers were available. Forced non-push-descriptor execution, real
+portrait quality, real camera/V4L2 transport, optimized latency, and clean
+full-native-sanitizer qualification remain open deployment feedback items.
+Model publication and signed application release remain separate; consult
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) for the
+exact current integration and validation record.
 
 ## Open Vulkan Adapter Selection
 
