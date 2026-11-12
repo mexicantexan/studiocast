@@ -84,6 +84,14 @@ struct VulkanMattingGraphDescriptor {
 struct VulkanMattingPersistentResources {
   std::size_t input_bytes = 0;
   std::size_t alpha_bytes = 0;
+  std::uintptr_t input_buffer = 0;
+  std::uintptr_t alpha_buffer = 0;
+  std::size_t input_offset = 0;
+  std::size_t alpha_offset = 0;
+  std::size_t alpha_row_stride_bytes = 0;
+  std::size_t alpha_buffer_capacity_bytes = 0;
+  std::size_t allocation_budget_bytes = 256u * 1024u * 1024u;
+  std::size_t allocation_resource_limit = 512;
   bool allow_cpu_layers = false;
   bool require_device_residency = true;
 };
@@ -209,6 +217,10 @@ public:
   virtual ~VulkanMattingRuntime() = default;
 
   virtual VulkanMattingRuntimeResult
+  ConfigureResourceBudget(const VulkanMattingPersistentResources &) {
+    return VulkanMattingRuntimeResult::Success();
+  }
+  virtual VulkanMattingRuntimeResult
   Initialize(const VulkanMattingDeviceContext &device) = 0;
   virtual VulkanMattingRuntimeResult
   LoadGraph(const VulkanMattingGraphDescriptor &graph) = 0;
@@ -219,6 +231,10 @@ public:
   Run(const VulkanMattingBufferBinding &input,
       const VulkanMattingBufferBinding &alpha_output) = 0;
   virtual VulkanMattingRuntimeEvidence Evidence() const = 0;
+  virtual void
+  RefreshExecutionEvidence(VulkanMattingRuntimeEvidence *out) const {
+    *out = Evidence();
+  }
 };
 
 // Owns and enforces the production lifecycle. Prepare() performs runtime
@@ -252,6 +268,7 @@ public:
   VulkanMattingRuntimeFailure latched_failure() const;
   const std::string &latched_error() const;
   VulkanMattingRuntimeEvidence Evidence() const;
+  void RefreshExecutionEvidence(VulkanMattingRuntimeEvidence *out) const;
 
 private:
   bool AcceptResult(const VulkanMattingRuntimeResult &result,
@@ -268,6 +285,7 @@ private:
   bool VerifyExecutionEvidence(const VulkanMattingRuntimeEvidence &evidence,
                                bool warmup, std::string *error_out);
 
+  VulkanMattingRuntimeEvidence execution_evidence_;
   std::unique_ptr<VulkanMattingRuntime> runtime_;
   VulkanMattingDeviceContext device_;
   VulkanMattingGraphDescriptor graph_;

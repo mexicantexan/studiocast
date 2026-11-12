@@ -1,0 +1,496 @@
+diff --git a/src/allocator.cpp b/src/allocator.cpp
+index d488d11..469dc29 100644
+--- a/src/allocator.cpp
++++ b/src/allocator.cpp
+@@ -352,0 +353,4 @@ VkAllocator::VkAllocator(const VulkanDevice* _vkdev)
++    studiocast_allocation_limit = 0;
++    studiocast_allocation_bytes = 0;
++    studiocast_allocation_count = 0;
++    studiocast_unmapped = false;
+@@ -448,0 +453,2 @@ VkDeviceMemory VkAllocator::allocate_memory(size_t size, uint32_t memory_type_in
++    if (studiocast_allocation_limit &&
++        size > studiocast_allocation_limit - studiocast_allocation_bytes) return 0;
+@@ -462,0 +469,2 @@ VkDeviceMemory VkAllocator::allocate_memory(size_t size, uint32_t memory_type_in
++    studiocast_allocation_bytes += size;
++    ++studiocast_allocation_count;
+@@ -781 +789 @@ VkBufferMemory* VkBlobAllocator::fastMalloc(size_t size)
+-        mappable = vkdev->is_mappable(buffer_memory_type_index);
++        mappable = !studiocast_unmapped && vkdev->is_mappable(buffer_memory_type_index);
+@@ -1061 +1069 @@ VkImageMemory* VkBlobAllocator::fastMalloc(int w, int h, int c, size_t elemsize,
+-        mappable = vkdev->is_mappable(image_memory_type_index);
++        mappable = !studiocast_unmapped && vkdev->is_mappable(image_memory_type_index);
+diff --git a/src/allocator.h b/src/allocator.h
+index b2cb06b..a2a3d50 100644
+--- a/src/allocator.h
++++ b/src/allocator.h
+@@ -284,0 +285,4 @@ public:
++    size_t studiocast_allocation_limit;
++    size_t studiocast_allocation_bytes;
++    size_t studiocast_allocation_count;
++    bool studiocast_unmapped;
+diff --git a/src/command.cpp b/src/command.cpp
+index dc6e916..eabe36e 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -16,0 +17,3 @@ public:
++    int init_result;
++    bool studiocast_finalized;
++    bool studiocast_recording_failed;
+@@ -208 +211,3 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
+-    init();
++    studiocast_finalized = false;
++    studiocast_recording_failed = false;
++    init_result = init();
+@@ -326 +331 @@ int VkComputePrivate::begin_command_buffer()
+-    commandBufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    commandBufferBeginInfo.flags = 0;
+@@ -366 +371 @@ void VkCompute::record_upload(const Mat& src, VkMat& dst, const Option& opt)
+-    // NCNN_LOGE("record_upload buffer");
++    // d->studiocast_recording_failed = true; NCNN_LOGE("record_upload buffer");
+@@ -407 +412 @@ void VkCompute::record_upload(const Mat& src, VkMat& dst, const Option& opt)
+-    //     NCNN_LOGE("upload_staging_buffer %p  ->   %p +%d ~%d", src_fp16.data, dst_staging.buffer(), dst_staging.buffer_offset(), dst_staging.buffer_capacity());
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("upload_staging_buffer %p  ->   %p +%d ~%d", src_fp16.data, dst_staging.buffer(), dst_staging.buffer_offset(), dst_staging.buffer_capacity());
+@@ -447 +452 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+-    // NCNN_LOGE("record_download buffer");
++    // d->studiocast_recording_failed = true; NCNN_LOGE("record_download buffer");
+@@ -606 +611 @@ void VkCompute::record_clone(const Mat& src, VkMat& dst, const Option& opt)
+-    //     NCNN_LOGE("record_clone host to buffer");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone host to buffer");
+@@ -636 +641 @@ void VkCompute::record_clone(const Mat& src, VkImageMat& dst, const Option& opt)
+-    //     NCNN_LOGE("record_clone host to image");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone host to image");
+@@ -653 +658 @@ void VkCompute::record_clone(const VkMat& src, Mat& dst, const Option& opt)
+-    //     NCNN_LOGE("record_clone buffer to host");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone buffer to host");
+@@ -730 +735 @@ void VkCompute::record_clone(const VkImageMat& src, Mat& dst, const Option& opt)
+-    //     NCNN_LOGE("record_clone image to host");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone image to host");
+@@ -744 +749 @@ void VkCompute::record_clone(const VkMat& src, VkMat& dst, const Option& opt)
+-    //     NCNN_LOGE("record_clone buffer to buffer");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone buffer to buffer");
+@@ -826 +831 @@ void VkCompute::record_clone(const VkImageMat& src, VkImageMat& dst, const Optio
+-    //     NCNN_LOGE("record_clone image to image");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone image to image");
+@@ -972 +977 @@ void VkCompute::record_clone(const VkMat& src, VkImageMat& dst, const Option& op
+-    //     NCNN_LOGE("record_clone buffer to image");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone buffer to image");
+@@ -1132 +1137 @@ void VkCompute::record_clone(const VkImageMat& src, VkMat& dst, const Option& op
+-    //     NCNN_LOGE("record_clone image to buffer");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_clone image to buffer");
+@@ -1286 +1291 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-    //     NCNN_LOGE("record_pipeline %p", pipeline);
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("record_pipeline %p", pipeline);
+@@ -1297 +1302 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-        NCNN_LOGE("binding_count not match, expect %d but got %d + %d", shader_info.binding_count, buffer_binding_count, image_binding_count);
++        d->studiocast_recording_failed = true; NCNN_LOGE("binding_count not match, expect %d but got %d + %d", shader_info.binding_count, buffer_binding_count, image_binding_count);
+@@ -1302 +1307 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-        NCNN_LOGE("push_constant_count not match, expect %d but got %d", shader_info.push_constant_count, constant_count);
++        d->studiocast_recording_failed = true; NCNN_LOGE("push_constant_count not match, expect %d but got %d", shader_info.push_constant_count, constant_count);
+@@ -1316 +1321 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-            //             NCNN_LOGE("binding #%d buffer = %d %d %d %d @ %lu %d = %p +%ld ~%ld", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.buffer(), binding.buffer_offset(), binding.buffer_capacity());
++            //             d->studiocast_recording_failed = true; NCNN_LOGE("binding #%d buffer = %d %d %d %d @ %lu %d = %p +%ld ~%ld", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.buffer(), binding.buffer_offset(), binding.buffer_capacity());
+@@ -1325 +1330 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-            //             NCNN_LOGE("binding #%d image = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
++            //             d->studiocast_recording_failed = true; NCNN_LOGE("binding #%d image = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
+@@ -1338 +1343 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-            //             NCNN_LOGE("binding #%d sampler = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
++            //             d->studiocast_recording_failed = true; NCNN_LOGE("binding #%d sampler = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
+@@ -1487 +1492 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-                    NCNN_LOGE("vkCreateDescriptorPool failed %d", ret);
++                    d->studiocast_recording_failed = true; NCNN_LOGE("vkCreateDescriptorPool failed %d", ret);
+@@ -1507 +1512 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+-                    NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
++                    d->studiocast_recording_failed = true; NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
+@@ -1759 +1764 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
+-                    NCNN_LOGE("vkCreateDescriptorPool failed %d", ret);
++                    d->studiocast_recording_failed = true; NCNN_LOGE("vkCreateDescriptorPool failed %d", ret);
+@@ -1779 +1784 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
+-                    NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
++                    d->studiocast_recording_failed = true; NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
+@@ -1873,0 +1879,125 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
++bool VkCompute::studiocast_valid() const { return d->init_result == 0 && !d->studiocast_recording_failed; }
++
++int VkCompute::studiocast_finalize(VkCommandBuffer* command_buffer)
++{
++    if (!studiocast_valid() || d->studiocast_finalized || !command_buffer || !d->upload_staging_buffers.empty() ||
++        !d->download_post_buffers.empty() || !d->download_post_mats.empty() ||
++        !d->download_post_mats_fp16.empty()) return -1;
++    for (size_t i = 0; i < d->delayed_records.size(); i++)
++        if (d->delayed_records[i].type == VkComputePrivate::record::TYPE_post_download ||
++            d->delayed_records[i].type == VkComputePrivate::record::TYPE_post_cast_float16_to_float32 ||
++            d->delayed_records[i].type == VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32)
++            return -1;
++
++    d->studiocast_finalized = true;
++    if (!vkdev->info.support_VK_KHR_push_descriptor())
++    {
++        if (d->begin_command_buffer() != 0) return -1;
++
++#if NCNN_BENCHMARK
++        if (d->query_pool)
++            vkCmdResetQueryPool(d->compute_command_buffer, d->query_pool, 0, d->query_count);
++#endif // NCNN_BENCHMARK
++
++        const size_t record_count = d->delayed_records.size();
++
++        // handle delayed records
++        for (size_t i = 0; i < record_count; i++)
++        {
++            const VkComputePrivate::record& r = d->delayed_records[i];
++
++            switch (r.type)
++            {
++            case VkComputePrivate::record::TYPE_copy_buffer:
++            {
++                vkCmdCopyBuffer(r.command_buffer, r.copy_buffer.src, r.copy_buffer.dst, r.copy_buffer.region_count, r.copy_buffer.regions);
++                delete[] r.copy_buffer.regions;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_copy_image:
++            {
++                vkCmdCopyImage(r.command_buffer, r.copy_image.src, r.copy_image.src_layout, r.copy_image.dst, r.copy_image.dst_layout, r.copy_image.region_count, r.copy_image.regions);
++                delete[] r.copy_image.regions;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_copy_buffer_to_image:
++            {
++                vkCmdCopyBufferToImage(r.command_buffer, r.copy_buffer_to_image.src, r.copy_buffer_to_image.dst, r.copy_buffer_to_image.layout, r.copy_buffer_to_image.region_count, r.copy_buffer_to_image.regions);
++                delete[] r.copy_buffer_to_image.regions;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_copy_image_to_buffer:
++            {
++                vkCmdCopyImageToBuffer(r.command_buffer, r.copy_image_to_buffer.src, r.copy_image_to_buffer.layout, r.copy_image_to_buffer.dst, r.copy_image_to_buffer.region_count, r.copy_image_to_buffer.regions);
++                delete[] r.copy_image_to_buffer.regions;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_bind_pipeline:
++            {
++                vkCmdBindPipeline(r.command_buffer, r.bind_pipeline.bind_point, r.bind_pipeline.pipeline);
++#if NCNN_COVERAGE
++                vkdev->bind_shader_coverage(r.command_buffer, r.bind_pipeline.pipeline_layout);
++#endif
++                break;
++            }
++            case VkComputePrivate::record::TYPE_bind_descriptorsets:
++            {
++                vkCmdBindDescriptorSets(r.command_buffer, r.bind_descriptorsets.bind_point, r.bind_descriptorsets.pipeline_layout, 0, r.bind_descriptorsets.descriptorset_count, &d->descriptorsets[r.bind_descriptorsets.descriptorset_offset], 0, 0);
++                break;
++            }
++            case VkComputePrivate::record::TYPE_push_constants:
++            {
++                vkCmdPushConstants(r.command_buffer, r.push_constants.pipeline_layout, r.push_constants.stage_flags, 0, r.push_constants.size, r.push_constants.values);
++                delete[](unsigned char*) r.push_constants.values;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_dispatch:
++            {
++                vkCmdDispatch(r.command_buffer, r.dispatch.group_count_x, r.dispatch.group_count_y, r.dispatch.group_count_z);
++                break;
++            }
++            case VkComputePrivate::record::TYPE_memory_barrers:
++            {
++                vkCmdPipelineBarrier(r.command_buffer, r.memory_barrers.src_stage, r.memory_barrers.dst_stage, 0, r.memory_barrers.barrier_count, r.memory_barrers.barriers, 0, 0, 0, 0);
++                delete[] r.memory_barrers.barriers;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_buffer_barrers:
++            {
++                vkCmdPipelineBarrier(r.command_buffer, r.buffer_barrers.src_stage, r.buffer_barrers.dst_stage, 0, 0, 0, r.buffer_barrers.barrier_count, r.buffer_barrers.barriers, 0, 0);
++                delete[] r.buffer_barrers.barriers;
++                break;
++            }
++            case VkComputePrivate::record::TYPE_image_barrers:
++            {
++                vkCmdPipelineBarrier(r.command_buffer, r.image_barrers.src_stage, r.image_barrers.dst_stage, 0, 0, 0, 0, 0, r.image_barrers.barrier_count, r.image_barrers.barriers);
++                delete[] r.image_barrers.barriers;
++                break;
++            }
++#if NCNN_BENCHMARK
++            case VkComputePrivate::record::TYPE_write_timestamp:
++            {
++                if (d->query_pool)
++                    vkCmdWriteTimestamp(r.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, d->query_pool, r.write_timestamp.query);
++                break;
++            }
++#endif // NCNN_BENCHMARK
++            case VkComputePrivate::record::TYPE_post_download:
++            case VkComputePrivate::record::TYPE_post_cast_float16_to_float32:
++            case VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32:
++            default:
++                break;
++            }
++        }
++    }
++
++    // end command buffer
++    {
++        if (d->end_command_buffer() != 0) return -1;
++    }
++
++    d->delayed_records.clear();
++    *command_buffer = d->compute_command_buffer;
++    return 0;
++}
++
+@@ -1876 +2006 @@ int VkCompute::submit_and_wait()
+-    //     NCNN_LOGE("submit_and_wait");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("submit_and_wait");
+@@ -1988 +2118 @@ int VkCompute::submit_and_wait()
+-        NCNN_LOGE("out of compute queue");
++        d->studiocast_recording_failed = true; NCNN_LOGE("out of compute queue");
+@@ -2008 +2138 @@ int VkCompute::submit_and_wait()
+-            NCNN_LOGE("vkQueueSubmit failed %d", ret);
++            d->studiocast_recording_failed = true; NCNN_LOGE("vkQueueSubmit failed %d", ret);
+@@ -2021 +2151 @@ int VkCompute::submit_and_wait()
+-            NCNN_LOGE("vkWaitForFences failed %d", ret);
++            d->studiocast_recording_failed = true; NCNN_LOGE("vkWaitForFences failed %d", ret);
+@@ -2038 +2168 @@ int VkCompute::submit_and_wait()
+-            // NCNN_LOGE("post_download  %p +%d ~%d  -> %p", src.buffer(), src.buffer_offset(), src.buffer_capacity(), dst.data);
++            // d->studiocast_recording_failed = true; NCNN_LOGE("post_download  %p +%d ~%d  -> %p", src.buffer(), src.buffer_offset(), src.buffer_capacity(), dst.data);
+@@ -2051 +2181 @@ int VkCompute::submit_and_wait()
+-            // NCNN_LOGE("post_cast_float16_to_float32");
++            // d->studiocast_recording_failed = true; NCNN_LOGE("post_cast_float16_to_float32");
+@@ -2064 +2194 @@ int VkCompute::submit_and_wait()
+-            // NCNN_LOGE("post_cast_bfloat16_to_float32");
++            // d->studiocast_recording_failed = true; NCNN_LOGE("post_cast_bfloat16_to_float32");
+@@ -2134 +2264 @@ int VkCompute::reset()
+-            NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
++            d->studiocast_recording_failed = true; NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
+@@ -2142 +2272 @@ int VkCompute::reset()
+-            NCNN_LOGE("vkResetFences failed %d", ret);
++            d->studiocast_recording_failed = true; NCNN_LOGE("vkResetFences failed %d", ret);
+@@ -2181 +2311 @@ int VkCompute::create_query_pool(uint32_t _query_count)
+-        NCNN_LOGE("vkCreateQueryPool failed %d", ret);
++        d->studiocast_recording_failed = true; NCNN_LOGE("vkCreateQueryPool failed %d", ret);
+@@ -2198 +2328 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
+-        NCNN_LOGE("results not large enough");
++        d->studiocast_recording_failed = true; NCNN_LOGE("results not large enough");
+@@ -2206 +2336 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
+-        NCNN_LOGE("vkGetQueryPoolResults failed %d", ret);
++        d->studiocast_recording_failed = true; NCNN_LOGE("vkGetQueryPoolResults failed %d", ret);
+@@ -2355 +2485,3 @@ public:
+-    VkTransferPrivate(const VulkanDevice* _vkdev);
++    VkTransferPrivate(const VulkanDevice* _vkdev, bool _compute_only);
++    int init_result;
++    bool studiocast_finalized;
+@@ -2362,0 +2495 @@ public:
++    bool compute_only;
+@@ -2380,2 +2513,2 @@ public:
+-VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
+-    : vkdev(_vkdev)
++VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev, bool _compute_only)
++    : vkdev(_vkdev), compute_only(_compute_only)
+@@ -2396 +2529,2 @@ VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
+-    init();
++    studiocast_finalized = false;
++    init_result = init();
+@@ -2406 +2540 @@ VkTransferPrivate::~VkTransferPrivate()
+-    if (!vkdev->info.unified_compute_transfer_queue())
++    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2467 +2601 @@ int VkTransferPrivate::init()
+-    if (!vkdev->info.unified_compute_transfer_queue())
++    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2544 +2678 @@ int VkTransferPrivate::begin_command_buffer()
+-        commandBufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        commandBufferBeginInfo.flags = 0;
+@@ -2555 +2689 @@ int VkTransferPrivate::begin_command_buffer()
+-    if (!vkdev->info.unified_compute_transfer_queue())
++    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2561 +2695 @@ int VkTransferPrivate::begin_command_buffer()
+-            commandBufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            commandBufferBeginInfo.flags = 0;
+@@ -2587 +2721 @@ int VkTransferPrivate::end_command_buffer()
+-    if (!vkdev->info.unified_compute_transfer_queue())
++    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2602,2 +2736,2 @@ int VkTransferPrivate::end_command_buffer()
+-VkTransfer::VkTransfer(const VulkanDevice* _vkdev)
+-    : vkdev(_vkdev), d(new VkTransferPrivate(_vkdev))
++VkTransfer::VkTransfer(const VulkanDevice* _vkdev, bool compute_only)
++    : vkdev(_vkdev), d(new VkTransferPrivate(_vkdev, compute_only))
+@@ -2702 +2836 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+-    if (vkdev->info.unified_compute_transfer_queue())
++    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2740 +2874 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+-    if (vkdev->info.unified_compute_transfer_queue())
++    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2811,0 +2946,11 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
++bool VkTransfer::studiocast_valid() const { return d->init_result == 0; }
++
++int VkTransfer::studiocast_finalize(VkCommandBuffer* command_buffer)
++{
++    if (!studiocast_valid() || d->studiocast_finalized || !command_buffer || !d->compute_only) return -1;
++    d->studiocast_finalized = true;
++    if (d->end_command_buffer() != 0) return -1;
++    *command_buffer = d->compute_command_buffer;
++    return 0;
++}
++
+@@ -2828 +2973 @@ int VkTransfer::submit_and_wait()
+-    if (vkdev->info.unified_compute_transfer_queue())
++    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2914 +3059 @@ int VkTransfer::submit_and_wait()
+-    if (vkdev->info.unified_compute_transfer_queue())
++    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
+@@ -2964 +3109 @@ int VkTransfer::reset()
+-    if (!vkdev->info.unified_compute_transfer_queue())
++    if (!(d->compute_only || vkdev->info.unified_compute_transfer_queue()))
+diff --git a/src/command.h b/src/command.h
+index a673823..c06eee3 100644
+--- a/src/command.h
++++ b/src/command.h
+@@ -6,0 +7,3 @@
++#define NCNN_STUDIOCAST_REPLAY_ABI 1
++#define NCNN_STUDIOCAST_UPSTREAM_REVISION "24ea07e87f544a3fbc59980b57885a92c75f2d24"
++
+@@ -66,0 +70,5 @@ public:
++    // StudioCast: finalize without submission; caller owns queue/fence and lifetime.
++    // GPU-only recordings only. Retain this object and every bound allocation.
++    bool studiocast_valid() const;
++    int studiocast_finalize(VkCommandBuffer* command_buffer);
++
+@@ -94 +102 @@ public:
+-    explicit VkTransfer(const VulkanDevice* vkdev);
++    explicit VkTransfer(const VulkanDevice* vkdev, bool compute_only = false);
+@@ -99,0 +108,3 @@ public:
++    bool studiocast_valid() const;
++    int studiocast_finalize(VkCommandBuffer* command_buffer);
++
+diff --git a/src/gpu.cpp b/src/gpu.cpp
+index f03145c..c43a3be 100644
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -50,0 +51 @@ static Mutex g_instance_lock;
++static int g_studiocast_instance_leases = 0;
+@@ -3609,0 +3611,22 @@ VkInstance get_gpu_instance()
++int studiocast_acquire_gpu_instance()
++{
++    for (;;) {
++        if (create_gpu_instance() != 0) return -1;
++        MutexLockGuard lock(g_instance_lock);
++        if (g_instance.created != 0) {
++            ++g_studiocast_instance_leases;
++            return 0;
++        }
++    }
++}
++
++void studiocast_release_gpu_instance()
++{
++    {
++        MutexLockGuard lock(g_instance_lock);
++        if (g_studiocast_instance_leases == 0) return;
++        --g_studiocast_instance_leases;
++    }
++    destroy_gpu_instance();
++}
++
+@@ -3614 +3637 @@ void destroy_gpu_instance()
+-    if (g_instance.created == 0)
++    if (g_instance.created == 0 || g_studiocast_instance_leases != 0)
+@@ -3709,0 +3733,2 @@ public:
++        studiocast_allocation_limit = 1024 * 1024;
++        studiocast_unmapped = true;
+@@ -3744 +3769,2 @@ public:
+-    int create_dummy_buffer_image();
++    int create_dummy_buffer_image(VkCommandBuffer* external = 0);
++    VkDummyCompute* studiocast_dummy_command;
+@@ -3810,0 +3837 @@ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
++    studiocast_dummy_command = 0;
+@@ -3821 +3848 @@ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
+-int VulkanDevicePrivate::create_dummy_buffer_image()
++int VulkanDevicePrivate::create_dummy_buffer_image(VkCommandBuffer* external)
+@@ -3825,0 +3853 @@ int VulkanDevicePrivate::create_dummy_buffer_image()
++    if (dummy_buffer.empty()) return -1;
+@@ -3837 +3865,4 @@ int VulkanDevicePrivate::create_dummy_buffer_image()
+-    VkDummyCompute cmd(vkdev);
++    if (vkdev->info.support_image_storage() && (dummy_image.empty() || dummy_image_readonly.empty())) return -1;
++    VkDummyCompute* retained = new VkDummyCompute(vkdev);
++    VkDummyCompute& cmd = *retained;
++    if (!cmd.studiocast_valid()) { delete retained; return -1; }
+@@ -3851 +3882,7 @@ int VulkanDevicePrivate::create_dummy_buffer_image()
+-    return cmd.submit_and_wait();
++    if (external) {
++        studiocast_dummy_command = retained;
++        return cmd.studiocast_finalize(external);
++    }
++    int result = cmd.submit_and_wait();
++    delete retained;
++    return result;
+@@ -3855,0 +3893,2 @@ void VulkanDevicePrivate::destroy_dummy_buffer_image()
++    delete studiocast_dummy_command;
++    studiocast_dummy_command = 0;
+@@ -4075 +4114 @@ void VulkanDevicePrivate::destroy_utility_operator()
+-VulkanDevice::VulkanDevice(int device_index)
++VulkanDevice::VulkanDevice(int device_index, bool studiocast_defer_dummy)
+@@ -4301 +4340 @@ VulkanDevice::VulkanDevice(int device_index)
+-    int cret = d->create_dummy_buffer_image();
++    int cret = studiocast_defer_dummy ? 0 : d->create_dummy_buffer_image();
+@@ -4312,0 +4352,9 @@ VulkanDevice::VulkanDevice(int device_index)
++size_t VulkanDevice::studiocast_dummy_allocation_bytes() const { return d->dummy_allocator ? d->dummy_allocator->studiocast_allocation_bytes : 0; }
++size_t VulkanDevice::studiocast_dummy_allocation_count() const { return d->dummy_allocator ? d->dummy_allocator->studiocast_allocation_count : 0; }
++
++int VulkanDevice::studiocast_initialize_dummy(VkCommandBuffer* command_buffer)
++{
++    if (!command_buffer || d->dummy_allocator) return -1;
++    return d->create_dummy_buffer_image(command_buffer);
++}
++
+diff --git a/src/gpu.h b/src/gpu.h
+index 0ccf840..2b852cd 100644
+--- a/src/gpu.h
++++ b/src/gpu.h
+@@ -25,0 +26,2 @@ NCNN_EXPORT VkInstance get_gpu_instance();
++NCNN_EXPORT int studiocast_acquire_gpu_instance();
++NCNN_EXPORT void studiocast_release_gpu_instance();
+@@ -448 +450,4 @@ public:
+-    VulkanDevice(int device_index = get_default_gpu_index());
++    VulkanDevice(int device_index = get_default_gpu_index(), bool studiocast_defer_dummy = false);
++    int studiocast_initialize_dummy(VkCommandBuffer* command_buffer);
++    size_t studiocast_dummy_allocation_bytes() const;
++    size_t studiocast_dummy_allocation_count() const;
+diff --git a/src/net.cpp b/src/net.cpp
+index c35c35e..846835f 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -2386 +2386 @@ int Net::load_model(const DataReader& dr)
+-        cmd_upload = new ncnn::VkTransfer(d->vkdev);
++        cmd_upload = opt.studiocast_model_upload ? opt.studiocast_model_upload : new ncnn::VkTransfer(d->vkdev);
+@@ -2389 +2389 @@ int Net::load_model(const DataReader& dr)
+-        if (!d->weight_vkallocator)
++        if (!opt.studiocast_model_upload && !d->weight_vkallocator)
+@@ -2393 +2393 @@ int Net::load_model(const DataReader& dr)
+-        if (!d->weight_staging_vkallocator)
++        if (!opt.studiocast_model_upload && !d->weight_staging_vkallocator)
+@@ -2400,3 +2400,3 @@ int Net::load_model(const DataReader& dr)
+-        opt_upload.blob_vkallocator = d->weight_vkallocator;
+-        opt_upload.workspace_vkallocator = d->weight_vkallocator;
+-        opt_upload.staging_vkallocator = d->weight_staging_vkallocator;
++        opt_upload.blob_vkallocator = opt.studiocast_model_upload ? opt.blob_vkallocator : d->weight_vkallocator;
++        opt_upload.workspace_vkallocator = opt.studiocast_model_upload ? opt.workspace_vkallocator : d->weight_vkallocator;
++        opt_upload.staging_vkallocator = opt.studiocast_model_upload ? opt.staging_vkallocator : d->weight_staging_vkallocator;
+@@ -2461 +2461 @@ int Net::load_model(const DataReader& dr)
+-            if (cmd_upload->pending_upload_total() > 256 * 1024 * 1024)
++            if (!opt.studiocast_model_upload && cmd_upload->pending_upload_total() > 256 * 1024 * 1024)
+@@ -2497 +2497 @@ int Net::load_model(const DataReader& dr)
+-    if (ret == 0 && opt.use_vulkan_compute && cmd_upload)
++    if (ret == 0 && opt.use_vulkan_compute && cmd_upload && !opt.studiocast_model_upload)
+@@ -2502 +2502 @@ int Net::load_model(const DataReader& dr)
+-    if (cmd_upload)
++    if (cmd_upload && !opt.studiocast_model_upload)
+diff --git a/src/option.cpp b/src/option.cpp
+index a6bfba4..9baf784 100644
+--- a/src/option.cpp
++++ b/src/option.cpp
+@@ -24,0 +25 @@ Option::Option()
++    studiocast_model_upload = 0;
+diff --git a/src/option.h b/src/option.h
+index 567ebb3..ebc1109 100644
+--- a/src/option.h
++++ b/src/option.h
+@@ -12,0 +13 @@ class VkAllocator;
++class VkTransfer;
+@@ -55,0 +57,3 @@ public:
++    // StudioCast: externally owned model upload, never submitted by Net.
++    VkTransfer* studiocast_model_upload;
++
