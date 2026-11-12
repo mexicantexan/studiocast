@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/video/production_video_setup_lease.h"
 #include "core/video/video_adapter_factory.h"
 
 #include "core/open_video/model_pack_registry.h"
@@ -23,6 +24,9 @@ struct VulkanVideoExecutionFactoryConfiguration {
   hal::ResourceBudget reservation{};
   int input_width = 0;
   int input_height = 0;
+  // Hermetic injected-constructor seam; production ignores these callbacks.
+  hal::StatusId (*injected_shutdown_probe)(void *) noexcept = nullptr;
+  void *injected_shutdown_context = nullptr;
 };
 
 class VulkanVideoExecutionFactory final : public video::IVideoAdapterFactory {
@@ -47,6 +51,8 @@ public:
   // probing, allocation, or capability discovery occurs in Preflight or
   // Execute.
   [[nodiscard]] hal::StatusId Initialize(hal::ReasonId *reason) noexcept;
+  [[nodiscard]] video::ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept;
   [[nodiscard]] bool initialized() const noexcept;
   [[nodiscard]] hal::StatusId initialization_status() const noexcept;
   [[nodiscard]] hal::ReasonId initialization_reason() const noexcept;

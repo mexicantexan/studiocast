@@ -846,8 +846,42 @@ struct VulkanVideoExecutionFactory::Impl {
     return injected;
   }
 
+  void DiscardFailedProduction() noexcept {
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (!NativeQuiescenceProven()) {
+      status = StatusId::quarantined;
+      reason = ReasonId::synchronization_failed;
+      // Destructor retains this complete failed candidate; no caller may
+      // mistake missing session readiness for permission to release it.
+      return;
+    }
+    production.reset();
+#endif
+  }
+
+  std::uint64_t shutdown_attempts = 0;
+  bool shutdown_complete = false;
+
+  bool NativeQuiescenceProven() const noexcept {
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (production && production->kernels.device()->Initialized()) {
+      const auto health = production->kernels.device()->health_state();
+      return health.healthy() &&
+             health.completed_serial >= health.submitted_serial &&
+             production->kernels.device()->SafeToDestroyResources();
+    }
+#endif
+    return true;
+  }
+
   ~Impl() {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (production && !NativeQuiescenceProven()) {
+      // Completion is unproven. Retain the entire native island for process
+      // lifetime; destroying an uncertain queue's resources is unsafe.
+      (void)production.release();
+      return;
+    }
     if (production) {
       if (production->adapter)
         production->adapter->Shutdown();
@@ -875,6 +909,10 @@ VulkanVideoExecutionFactory::~VulkanVideoExecutionFactory() = default;
 
 StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
   SetReason(reason, ReasonId::none);
+  if (impl_->shutdown_attempts != 0) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
   if (impl_->initialized) {
     SetReason(reason, impl_->reason);
     return impl_->status;
@@ -907,7 +945,7 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     if (!adopted || !impl_->production->kernels.Initialize(&error)) {
       impl_->status = StatusId::unavailable;
       impl_->reason = ReasonId::capability_evidence_incomplete;
-      impl_->production.reset();
+      impl_->DiscardFailedProduction();
     } else {
       static std::atomic<std::uint64_t> next_adapter_id{
           UINT64_C(0x56554c4b00000000)};
@@ -925,7 +963,7 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
                impl_->configuration.input_height, &error))) {
         impl_->reason = ReasonId::capability_evidence_incomplete;
         impl_->status = StatusId::unavailable;
-        impl_->production.reset();
+        impl_->DiscardFailedProduction();
         SetReason(reason, impl_->reason);
         return impl_->status;
       }
@@ -937,7 +975,7 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
         impl_->reason = evidence.blocker == ReasonId::none
                             ? ReasonId::capability_evidence_incomplete
                             : evidence.blocker;
-        impl_->production.reset();
+        impl_->DiscardFailedProduction();
       } else {
         impl_->production->adapter = std::make_unique<VulkanHalResidentAdapter>(
             adapter_id, *impl_->production->executor);
@@ -981,6 +1019,48 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
   }
   SetReason(reason, impl_->reason);
   return impl_->status;
+}
+
+video::ProductionVideoSetupLeaseShutdownResult
+VulkanVideoExecutionFactory::RequestShutdown() noexcept {
+  video::ProductionVideoSetupLeaseShutdownResult result;
+  result.shutdown_requested = true;
+  result.shutdown_attempts = ++impl_->shutdown_attempts;
+  auto proof = StatusId::ready;
+  if (!impl_->shutdown_complete) {
+    if (impl_->injected && impl_->configuration.injected_shutdown_probe)
+      proof = impl_->configuration.injected_shutdown_probe(
+          impl_->configuration.injected_shutdown_context);
+    else if (!impl_->NativeQuiescenceProven()) {
+      proof = StatusId::quarantined;
+    }
+  }
+  if (proof != StatusId::ready) {
+    result.status = StatusId::quarantined;
+    result.reason = ReasonId::synchronization_failed;
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (impl_->production &&
+        impl_->production->kernels.device()->health_state().health ==
+            VulkanContextHealth::device_lost)
+      result.reason = ReasonId::device_lost;
+#endif
+    result.pending = true;
+    return result;
+  }
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  if (impl_->production) {
+    if (impl_->production->adapter)
+      impl_->production->adapter->Shutdown();
+    if (impl_->production->executor)
+      impl_->production->executor->Shutdown();
+  }
+#endif
+  impl_->shutdown_complete = true;
+  result.status = StatusId::stopped;
+  result.reason = ReasonId::shutdown_requested;
+  result.quiescent = true;
+  result.driver_context_release_permitted = true;
+  return result;
 }
 
 bool VulkanVideoExecutionFactory::initialized() const noexcept {
@@ -1049,6 +1129,8 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
     preflight.readiness.available = false;
     return preflight;
   };
+  if (impl_->shutdown_attempts != 0)
+    return fail(StatusId::stopped, ReasonId::shutdown_requested);
   if (!impl_->initialized)
     return fail(impl_->status, impl_->reason);
   if (route != video::VideoExecutionRoute::prepared_resident)
@@ -1173,6 +1255,8 @@ VulkanVideoExecutionFactory::Prepare(
     }
     return std::unique_ptr<video::IVideoExecutionExecutor>{};
   };
+  if (impl_->shutdown_attempts != 0)
+    return fail(StatusId::stopped, ReasonId::shutdown_requested);
   if (!impl_->initialized)
     return fail(impl_->status, impl_->reason);
   if (plan.route != video::VideoExecutionRoute::prepared_resident ||

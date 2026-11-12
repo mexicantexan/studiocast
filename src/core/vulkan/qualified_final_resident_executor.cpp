@@ -737,8 +737,14 @@ void QualifiedFinalResidentExecutor::DestroyPrepared(
     VulkanExecutorPreparedProgram *prepared) noexcept {
   if (!prepared)
     return;
-  if (Slot *slot = Find(prepared->state_id))
+  if (Slot *slot = Find(prepared->state_id)) {
+    if (kernels_ && kernels_->device() &&
+        !kernels_->device()->health_state().healthy()) {
+      slot->quarantined = true;
+      return;
+    }
     Release(slot);
+  }
   *prepared = {};
 }
 

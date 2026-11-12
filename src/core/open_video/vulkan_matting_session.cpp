@@ -415,6 +415,7 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
   impl_->resources.input_buffer = OpaqueHandle(impl_->input_tensor.buffer());
   impl_->resources.alpha_buffer = OpaqueHandle(impl_->fixed_alpha->buffer());
   impl_->resources.alpha_row_stride_bytes = impl_->fixed_alpha->pitch_bytes();
+  impl_->resources.alpha_buffer_capacity_bytes = impl_->fixed_alpha->byte_size();
   impl_->resources.input_bytes = impl_->input_tensor.bytes();
   impl_->resources.alpha_bytes = alpha_size.bytes;
   impl_->resources.allow_cpu_layers = false;
