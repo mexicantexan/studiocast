@@ -229,6 +229,7 @@ int main(int argc, char **argv) {
     return 2;
   const auto cold = studiocast::vulkan::DiagnoseOpenVulkanDefault();
   std::cout << "cold_diagnostics=" << cold.ToJson() << '\n';
+  std::cout.flush();
   if (cold.default_model_id != options.model_id ||
       !cold.matting_production_ready || !cold.matting_parity_validated ||
       cold.matting_cpu_fallback_count != 0 ||
