@@ -124,15 +124,23 @@ int main() {
 #if !defined(NCNN_VULKAN) || NCNN_VULKAN != 1 || !defined(NCNN_STUDIOCAST_REPLAY_ABI) || NCNN_STUDIOCAST_REPLAY_ABI != 1
 #error "Production matting requires pinned StudioCast replay API"
 #endif
+#if NCNN_COVERAGE
+#error "Production replay forbids ncnn coverage teardown waits"
+#endif
 int main() {
   static_assert(std::string_view(NCNN_STUDIOCAST_UPSTREAM_REVISION) == "24ea07e87f544a3fbc59980b57885a92c75f2d24");
+  if (ncnn::studiocast_acquire_gpu_instance() != 0) return 1;
   ncnn::VulkanDevice device(0, true);
   ncnn::VkCompute compute(&device);
   ncnn::VkTransfer transfer(&device, true);
   VkCommandBuffer buffer = VK_NULL_HANDLE;
   ncnn::Option option;
   option.studiocast_model_upload = &transfer;
-  return compute.studiocast_finalize(&buffer) + transfer.studiocast_finalize(&buffer) + device.studiocast_initialize_dummy(&buffer);
+  int result = compute.studiocast_finalize(&buffer) + transfer.studiocast_finalize(&buffer) + device.studiocast_initialize_dummy(&buffer);
+  result += compute.studiocast_valid() && transfer.studiocast_valid() ? 0 : 1;
+  result += static_cast<int>(device.studiocast_dummy_allocation_bytes() + device.studiocast_dummy_allocation_count());
+  ncnn::studiocast_release_gpu_instance();
+  return result;
 }
 ]==] _studiocast_ncnn_replay_link_ok)
     unset(CMAKE_REQUIRED_LIBRARIES)

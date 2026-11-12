@@ -307,9 +307,9 @@ std::unique_ptr<VulkanMattingRuntime>
 CreateUnavailableVulkanMattingRuntime(std::string reason);
 
 // Build/link availability is necessary but intentionally not sufficient. The
-// current ncnn API owns its Vulkan device, so StudioCast keeps this factory
-// unavailable until a reviewed adapter can import the already-selected shared
-// VkPhysicalDevice/VkDevice/VkQueue and buffers without CPU bridges.
+// pinned replay adapter requires StudioCast to adopt the exact ncnn-owned
+// device and leased queue before allocating any resources. Availability never
+// substitutes for validated model, residency, warmup or execution evidence.
 bool ProductionVulkanMattingBuildEnabled();
 bool ProductionVulkanMattingAdapterAvailable();
 std::unique_ptr<VulkanMattingRuntime> CreateProductionVulkanMattingRuntime();

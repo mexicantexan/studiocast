@@ -348,6 +348,22 @@ int main() {
                  lifecycle->Evidence().cpu_readback_count == 0,
              "runtime accounting differs"))
     return 1;
+  {
+    const auto allocation_before = device.allocation_stats();
+    auto limited = resources;
+    limited.allocation_budget_bytes = 1;
+    ov::VulkanMattingRuntimeLifecycle rejected(
+        ov::CreateProductionVulkanMattingRuntime());
+    if (!Check(!rejected.Prepare(Context(device), graph, limited, &error),
+               "undersized reservation was accepted") ||
+        !Check(rejected.latched_failure() ==
+                   ov::VulkanMattingRuntimeFailure::allocation_contract_failed,
+               "undersized reservation classification differs") ||
+        !Check(allocation_before.allocation_count ==
+                   device.allocation_stats().allocation_count,
+               "undersized caller reservation allocated native memory"))
+      return 1;
+  }
   // Unsupported CPU-only graphs must fail before their model is loaded.
   const auto cpu_param = cleanup.path / "cpu.param";
   {

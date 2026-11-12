@@ -29,7 +29,7 @@ index b2cb06b..a2a3d50 100644
 +    size_t studiocast_allocation_count;
 +    bool studiocast_unmapped;
 diff --git a/src/command.cpp b/src/command.cpp
-index dc6e916..eabe36e 100644
+index dc6e916..ec096ff 100644
 --- a/src/command.cpp
 +++ b/src/command.cpp
 @@ -16,0 +17,3 @@ public:
@@ -107,8 +107,23 @@ index dc6e916..eabe36e 100644
 @@ -1779 +1784 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
 -                    NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
 +                    d->studiocast_recording_failed = true; NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
-@@ -1873,0 +1879,125 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
+@@ -1874 +1879,3 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
+-int VkCompute::submit_and_wait()
 +bool VkCompute::studiocast_valid() const { return d->init_result == 0 && !d->studiocast_recording_failed; }
++
++static int studiocast_end_recording(VkComputePrivate* d, const VulkanDevice* vkdev)
+@@ -1876 +1883 @@ int VkCompute::submit_and_wait()
+-    //     NCNN_LOGE("submit_and_wait");
++    //     d->studiocast_recording_failed = true; NCNN_LOGE("submit_and_wait");
+@@ -1880 +1887 @@ int VkCompute::submit_and_wait()
+-        d->begin_command_buffer();
++        if (d->begin_command_buffer() != 0) return -1;
+@@ -1981 +1988 @@ int VkCompute::submit_and_wait()
+-        d->end_command_buffer();
++        if (d->end_command_buffer() != 0) return -1;
+@@ -1983,0 +1991,25 @@ int VkCompute::submit_and_wait()
++    return 0;
++}
 +
 +int VkCompute::studiocast_finalize(VkCommandBuffer* command_buffer)
 +{
@@ -122,199 +137,95 @@ index dc6e916..eabe36e 100644
 +            return -1;
 +
 +    d->studiocast_finalized = true;
-+    if (!vkdev->info.support_VK_KHR_push_descriptor())
-+    {
-+        if (d->begin_command_buffer() != 0) return -1;
-+
-+#if NCNN_BENCHMARK
-+        if (d->query_pool)
-+            vkCmdResetQueryPool(d->compute_command_buffer, d->query_pool, 0, d->query_count);
-+#endif // NCNN_BENCHMARK
-+
-+        const size_t record_count = d->delayed_records.size();
-+
-+        // handle delayed records
-+        for (size_t i = 0; i < record_count; i++)
-+        {
-+            const VkComputePrivate::record& r = d->delayed_records[i];
-+
-+            switch (r.type)
-+            {
-+            case VkComputePrivate::record::TYPE_copy_buffer:
-+            {
-+                vkCmdCopyBuffer(r.command_buffer, r.copy_buffer.src, r.copy_buffer.dst, r.copy_buffer.region_count, r.copy_buffer.regions);
-+                delete[] r.copy_buffer.regions;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_copy_image:
-+            {
-+                vkCmdCopyImage(r.command_buffer, r.copy_image.src, r.copy_image.src_layout, r.copy_image.dst, r.copy_image.dst_layout, r.copy_image.region_count, r.copy_image.regions);
-+                delete[] r.copy_image.regions;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_copy_buffer_to_image:
-+            {
-+                vkCmdCopyBufferToImage(r.command_buffer, r.copy_buffer_to_image.src, r.copy_buffer_to_image.dst, r.copy_buffer_to_image.layout, r.copy_buffer_to_image.region_count, r.copy_buffer_to_image.regions);
-+                delete[] r.copy_buffer_to_image.regions;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_copy_image_to_buffer:
-+            {
-+                vkCmdCopyImageToBuffer(r.command_buffer, r.copy_image_to_buffer.src, r.copy_image_to_buffer.layout, r.copy_image_to_buffer.dst, r.copy_image_to_buffer.region_count, r.copy_image_to_buffer.regions);
-+                delete[] r.copy_image_to_buffer.regions;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_bind_pipeline:
-+            {
-+                vkCmdBindPipeline(r.command_buffer, r.bind_pipeline.bind_point, r.bind_pipeline.pipeline);
-+#if NCNN_COVERAGE
-+                vkdev->bind_shader_coverage(r.command_buffer, r.bind_pipeline.pipeline_layout);
-+#endif
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_bind_descriptorsets:
-+            {
-+                vkCmdBindDescriptorSets(r.command_buffer, r.bind_descriptorsets.bind_point, r.bind_descriptorsets.pipeline_layout, 0, r.bind_descriptorsets.descriptorset_count, &d->descriptorsets[r.bind_descriptorsets.descriptorset_offset], 0, 0);
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_push_constants:
-+            {
-+                vkCmdPushConstants(r.command_buffer, r.push_constants.pipeline_layout, r.push_constants.stage_flags, 0, r.push_constants.size, r.push_constants.values);
-+                delete[](unsigned char*) r.push_constants.values;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_dispatch:
-+            {
-+                vkCmdDispatch(r.command_buffer, r.dispatch.group_count_x, r.dispatch.group_count_y, r.dispatch.group_count_z);
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_memory_barrers:
-+            {
-+                vkCmdPipelineBarrier(r.command_buffer, r.memory_barrers.src_stage, r.memory_barrers.dst_stage, 0, r.memory_barrers.barrier_count, r.memory_barrers.barriers, 0, 0, 0, 0);
-+                delete[] r.memory_barrers.barriers;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_buffer_barrers:
-+            {
-+                vkCmdPipelineBarrier(r.command_buffer, r.buffer_barrers.src_stage, r.buffer_barrers.dst_stage, 0, 0, 0, r.buffer_barrers.barrier_count, r.buffer_barrers.barriers, 0, 0);
-+                delete[] r.buffer_barrers.barriers;
-+                break;
-+            }
-+            case VkComputePrivate::record::TYPE_image_barrers:
-+            {
-+                vkCmdPipelineBarrier(r.command_buffer, r.image_barrers.src_stage, r.image_barrers.dst_stage, 0, 0, 0, 0, 0, r.image_barrers.barrier_count, r.image_barrers.barriers);
-+                delete[] r.image_barrers.barriers;
-+                break;
-+            }
-+#if NCNN_BENCHMARK
-+            case VkComputePrivate::record::TYPE_write_timestamp:
-+            {
-+                if (d->query_pool)
-+                    vkCmdWriteTimestamp(r.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, d->query_pool, r.write_timestamp.query);
-+                break;
-+            }
-+#endif // NCNN_BENCHMARK
-+            case VkComputePrivate::record::TYPE_post_download:
-+            case VkComputePrivate::record::TYPE_post_cast_float16_to_float32:
-+            case VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32:
-+            default:
-+                break;
-+            }
-+        }
-+    }
-+
-+    // end command buffer
-+    {
-+        if (d->end_command_buffer() != 0) return -1;
-+    }
-+
++    if (studiocast_end_recording(d, vkdev) != 0) return -1;
 +    d->delayed_records.clear();
 +    *command_buffer = d->compute_command_buffer;
 +    return 0;
 +}
 +
-@@ -1876 +2006 @@ int VkCompute::submit_and_wait()
--    //     NCNN_LOGE("submit_and_wait");
-+    //     d->studiocast_recording_failed = true; NCNN_LOGE("submit_and_wait");
-@@ -1988 +2118 @@ int VkCompute::submit_and_wait()
++int VkCompute::submit_and_wait()
++{
++    if (studiocast_end_recording(d, vkdev) != 0) return -1;
++
+@@ -1988 +2020 @@ int VkCompute::submit_and_wait()
 -        NCNN_LOGE("out of compute queue");
 +        d->studiocast_recording_failed = true; NCNN_LOGE("out of compute queue");
-@@ -2008 +2138 @@ int VkCompute::submit_and_wait()
+@@ -2008 +2040 @@ int VkCompute::submit_and_wait()
 -            NCNN_LOGE("vkQueueSubmit failed %d", ret);
 +            d->studiocast_recording_failed = true; NCNN_LOGE("vkQueueSubmit failed %d", ret);
-@@ -2021 +2151 @@ int VkCompute::submit_and_wait()
+@@ -2021 +2053 @@ int VkCompute::submit_and_wait()
 -            NCNN_LOGE("vkWaitForFences failed %d", ret);
 +            d->studiocast_recording_failed = true; NCNN_LOGE("vkWaitForFences failed %d", ret);
-@@ -2038 +2168 @@ int VkCompute::submit_and_wait()
+@@ -2038 +2070 @@ int VkCompute::submit_and_wait()
 -            // NCNN_LOGE("post_download  %p +%d ~%d  -> %p", src.buffer(), src.buffer_offset(), src.buffer_capacity(), dst.data);
 +            // d->studiocast_recording_failed = true; NCNN_LOGE("post_download  %p +%d ~%d  -> %p", src.buffer(), src.buffer_offset(), src.buffer_capacity(), dst.data);
-@@ -2051 +2181 @@ int VkCompute::submit_and_wait()
+@@ -2051 +2083 @@ int VkCompute::submit_and_wait()
 -            // NCNN_LOGE("post_cast_float16_to_float32");
 +            // d->studiocast_recording_failed = true; NCNN_LOGE("post_cast_float16_to_float32");
-@@ -2064 +2194 @@ int VkCompute::submit_and_wait()
+@@ -2064 +2096 @@ int VkCompute::submit_and_wait()
 -            // NCNN_LOGE("post_cast_bfloat16_to_float32");
 +            // d->studiocast_recording_failed = true; NCNN_LOGE("post_cast_bfloat16_to_float32");
-@@ -2134 +2264 @@ int VkCompute::reset()
+@@ -2134 +2166 @@ int VkCompute::reset()
 -            NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
 +            d->studiocast_recording_failed = true; NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
-@@ -2142 +2272 @@ int VkCompute::reset()
+@@ -2142 +2174 @@ int VkCompute::reset()
 -            NCNN_LOGE("vkResetFences failed %d", ret);
 +            d->studiocast_recording_failed = true; NCNN_LOGE("vkResetFences failed %d", ret);
-@@ -2181 +2311 @@ int VkCompute::create_query_pool(uint32_t _query_count)
+@@ -2181 +2213 @@ int VkCompute::create_query_pool(uint32_t _query_count)
 -        NCNN_LOGE("vkCreateQueryPool failed %d", ret);
 +        d->studiocast_recording_failed = true; NCNN_LOGE("vkCreateQueryPool failed %d", ret);
-@@ -2198 +2328 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
+@@ -2198 +2230 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
 -        NCNN_LOGE("results not large enough");
 +        d->studiocast_recording_failed = true; NCNN_LOGE("results not large enough");
-@@ -2206 +2336 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
+@@ -2206 +2238 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
 -        NCNN_LOGE("vkGetQueryPoolResults failed %d", ret);
 +        d->studiocast_recording_failed = true; NCNN_LOGE("vkGetQueryPoolResults failed %d", ret);
-@@ -2355 +2485,3 @@ public:
+@@ -2355 +2387,3 @@ public:
 -    VkTransferPrivate(const VulkanDevice* _vkdev);
 +    VkTransferPrivate(const VulkanDevice* _vkdev, bool _compute_only);
 +    int init_result;
 +    bool studiocast_finalized;
-@@ -2362,0 +2495 @@ public:
+@@ -2362,0 +2397 @@ public:
 +    bool compute_only;
-@@ -2380,2 +2513,2 @@ public:
+@@ -2380,2 +2415,2 @@ public:
 -VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
 -    : vkdev(_vkdev)
 +VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev, bool _compute_only)
 +    : vkdev(_vkdev), compute_only(_compute_only)
-@@ -2396 +2529,2 @@ VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
+@@ -2396 +2431,2 @@ VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
 -    init();
 +    studiocast_finalized = false;
 +    init_result = init();
-@@ -2406 +2540 @@ VkTransferPrivate::~VkTransferPrivate()
+@@ -2406 +2442 @@ VkTransferPrivate::~VkTransferPrivate()
 -    if (!vkdev->info.unified_compute_transfer_queue())
 +    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2467 +2601 @@ int VkTransferPrivate::init()
+@@ -2467 +2503 @@ int VkTransferPrivate::init()
 -    if (!vkdev->info.unified_compute_transfer_queue())
 +    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2544 +2678 @@ int VkTransferPrivate::begin_command_buffer()
+@@ -2544 +2580 @@ int VkTransferPrivate::begin_command_buffer()
 -        commandBufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 +        commandBufferBeginInfo.flags = 0;
-@@ -2555 +2689 @@ int VkTransferPrivate::begin_command_buffer()
+@@ -2555 +2591 @@ int VkTransferPrivate::begin_command_buffer()
 -    if (!vkdev->info.unified_compute_transfer_queue())
 +    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2561 +2695 @@ int VkTransferPrivate::begin_command_buffer()
+@@ -2561 +2597 @@ int VkTransferPrivate::begin_command_buffer()
 -            commandBufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 +            commandBufferBeginInfo.flags = 0;
-@@ -2587 +2721 @@ int VkTransferPrivate::end_command_buffer()
+@@ -2587 +2623 @@ int VkTransferPrivate::end_command_buffer()
 -    if (!vkdev->info.unified_compute_transfer_queue())
 +    if (!(compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2602,2 +2736,2 @@ int VkTransferPrivate::end_command_buffer()
+@@ -2602,2 +2638,2 @@ int VkTransferPrivate::end_command_buffer()
 -VkTransfer::VkTransfer(const VulkanDevice* _vkdev)
 -    : vkdev(_vkdev), d(new VkTransferPrivate(_vkdev))
 +VkTransfer::VkTransfer(const VulkanDevice* _vkdev, bool compute_only)
 +    : vkdev(_vkdev), d(new VkTransferPrivate(_vkdev, compute_only))
-@@ -2702 +2836 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+@@ -2702 +2738 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
 -    if (vkdev->info.unified_compute_transfer_queue())
 +    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2740 +2874 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+@@ -2740 +2776 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
 -    if (vkdev->info.unified_compute_transfer_queue())
 +    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2811,0 +2946,11 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+@@ -2811,0 +2848,11 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
 +bool VkTransfer::studiocast_valid() const { return d->init_result == 0; }
 +
 +int VkTransfer::studiocast_finalize(VkCommandBuffer* command_buffer)
@@ -326,13 +237,13 @@ index dc6e916..eabe36e 100644
 +    return 0;
 +}
 +
-@@ -2828 +2973 @@ int VkTransfer::submit_and_wait()
+@@ -2828 +2875 @@ int VkTransfer::submit_and_wait()
 -    if (vkdev->info.unified_compute_transfer_queue())
 +    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2914 +3059 @@ int VkTransfer::submit_and_wait()
+@@ -2914 +2961 @@ int VkTransfer::submit_and_wait()
 -    if (vkdev->info.unified_compute_transfer_queue())
 +    if ((d->compute_only || vkdev->info.unified_compute_transfer_queue()))
-@@ -2964 +3109 @@ int VkTransfer::reset()
+@@ -2964 +3011 @@ int VkTransfer::reset()
 -    if (!vkdev->info.unified_compute_transfer_queue())
 +    if (!(d->compute_only || vkdev->info.unified_compute_transfer_queue()))
 diff --git a/src/command.h b/src/command.h
