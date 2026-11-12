@@ -1274,6 +1274,7 @@ if (BUILD_TESTING)
         add_test(NAME studiocast-installer-packaging-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+                        "CMAKE_COMMAND=${CMAKE_COMMAND}"
                         "${Python3_EXECUTABLE}"
                         "${PROJECT_SOURCE_DIR}/tests/installer/packaging/installer_packaging_tests.py")
         set_tests_properties(studiocast-installer-packaging-tests PROPERTIES

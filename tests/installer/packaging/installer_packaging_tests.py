@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,127 @@ MODEL_PACK_SIZE_ROWS = [
     ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
     ("fastdvdnet_sigma15", 1, 9948304),
 ]
+
+
+class NcnnRuntimeNoticesTests(unittest.TestCase):
+    """Execute the real installer rules with tiny binaries and a local SDK fixture."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="studiocast-ncnn-notices-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.env = os.environ.copy()
+        self.env.update({"HOME": str(self.root / "home"),
+                         "XDG_CONFIG_HOME": str(self.root / "config"),
+                         "XDG_DATA_HOME": str(self.root / "data"),
+                         "XDG_CACHE_HOME": str(self.root / "cache"),
+                         "XDG_STATE_HOME": str(self.root / "state")})
+        self.cmake = (os.environ.get("CMAKE_COMMAND") or
+                      shutil.which("cmake", path=os.defpath) or "cmake")
+        self.prefix = self.root / "sdk"
+        self.notices = self.prefix / "share/licenses/studiocast-ncnn"
+        self.notices.mkdir(parents=True)
+        self.receipt = {
+            "upstream_revision": "24ea07e87f544a3fbc59980b57885a92c75f2d24",
+            "glslang_revision": "5017667d5a5300dff6aab57db1931a495ff9a10c",
+            "replay_abi": 2,
+            "patch_sha256": hashlib.sha256(
+                (ROOT / "cmake/patches/ncnn-studiocast-replay.patch").read_bytes()).hexdigest(),
+        }
+        self.payloads = {
+            "ncnn-LICENSE.txt": b"fixture ncnn license\nall retained terms\n",
+            "glslang-LICENSE.txt": b"fixture glslang license\nall retained terms\n",
+            "dependency.json": (json.dumps(self.receipt, indent=2) + "\n").encode(),
+        }
+        for name, payload in self.payloads.items():
+            (self.notices / name).write_bytes(payload)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        (self.source / "main.cpp").write_text("int main() { return 0; }\n")
+        # Use the production installer file and its Runtime component, avoiding
+        # Qt/SDK compilation and all host installation/device operations.
+        (self.source / "CMakeLists.txt").write_text(f'''\
+cmake_minimum_required(VERSION 3.22)
+project(RuntimeNotices LANGUAGES CXX)
+set(PROJECT_SOURCE_DIR "{ROOT}")
+set(QT_VERSION_MAJOR 6)
+add_library(Qt6::Widgets INTERFACE IMPORTED)
+function(studiocast_set_project_warnings target)
+endfunction()
+function(studiocast_enable_sanitizers target)
+endfunction()
+foreach(name IN ITEMS studiocast studiocast-probe studiocast-maxine studiocast-open
+        studiocast-audio studiocast-video studiocastctl studiocastd)
+  add_executable(${{name}} main.cpp)
+endforeach()
+include("{ROOT}/cmake/Ncnn.cmake")
+include("{ROOT}/installer/CMakeLists.txt")
+''')
+        self.build = self.root / "build"
+
+    def run_cmake(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run([self.cmake, *args], env=self.env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if check:
+            self.assertEqual(0, result.returncode, result.stdout)
+        return result
+
+    def configure(self, enabled: bool = True, **kwargs) -> subprocess.CompletedProcess[str]:
+        return self.run_cmake(
+            "-S", str(self.source), "-B", str(self.build),
+            f"-DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING={'ON' if enabled else 'OFF'}",
+            f"-Dncnn_DIR={self.prefix / 'lib/cmake/ncnn'}", "-DCMAKE_INSTALL_DATADIR=share",
+            **kwargs)
+
+    def install_runtime(self) -> Path:
+        targets = ["studiocast", "studiocast-probe", "studiocast-maxine", "studiocast-open",
+                   "studiocast-audio", "studiocast-video", "studiocastctl", "studiocastd"]
+        self.run_cmake("--build", str(self.build), "--target", *targets)
+        stage = self.root / "stage"
+        self.run_cmake("--install", str(self.build), "--prefix", str(stage), "--component", "Runtime")
+        self.assertTrue((stage / "bin/studiocastd").is_file())
+        self.assertFalse((stage / "share/studiocast/installer").exists())
+        return stage
+
+    def test_production_runtime_stages_exact_licenses_and_receipt(self) -> None:
+        self.configure()
+        stage = self.install_runtime()
+        installed = stage / "share/licenses/studiocast-ncnn"
+        self.assertEqual(set(self.payloads), {p.name for p in installed.iterdir()})
+        for name, payload in self.payloads.items():
+            self.assertEqual(payload, (installed / name).read_bytes())
+
+    def test_disabled_runtime_does_not_require_or_install_optional_notices(self) -> None:
+        shutil.rmtree(self.prefix)
+        self.configure(enabled=False)
+        self.assertFalse((self.install_runtime() / "share/licenses/studiocast-ncnn").exists())
+
+    def test_production_rejects_missing_empty_and_mismatched_prerequisites(self) -> None:
+        for name, payload in self.payloads.items():
+            with self.subTest(missing=name):
+                (self.notices / name).unlink()
+                failed = self.configure(check=False)
+                self.assertNotEqual(0, failed.returncode, failed.stdout)
+                self.assertIn(name, failed.stdout)
+                self.assertIn("Production ncnn Runtime packaging requires", failed.stdout)
+                (self.notices / name).write_bytes(payload)
+            with self.subTest(empty=name):
+                (self.notices / name).write_bytes(b"")
+                failed = self.configure(check=False)
+                self.assertNotEqual(0, failed.returncode, failed.stdout)
+                self.assertIn("requires nonempty", failed.stdout)
+                (self.notices / name).write_bytes(payload)
+        for field in self.receipt:
+            with self.subTest(mismatched=field):
+                bad = dict(self.receipt, **{field: "wrong"})
+                (self.notices / "dependency.json").write_text(json.dumps(bad))
+                failed = self.configure(check=False)
+                self.assertNotEqual(0, failed.returncode, failed.stdout)
+                self.assertRegex(failed.stdout, rf"invalid\s+{field}")
+        (self.notices / "dependency.json").write_text("not json")
+        failed = self.configure(check=False)
+        self.assertNotEqual(0, failed.returncode, failed.stdout)
+        self.assertIn("dependency receipt has invalid", failed.stdout)
 
 
 def catalog_size_summary() -> dict:

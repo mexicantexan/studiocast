@@ -42,6 +42,7 @@ set_target_properties(studiocast-installer PROPERTIES
 # Install step
 # -----------------------------
 include(GNUInstallDirs)
+studiocast_install_ncnn_runtime_notices()
 install(TARGETS studiocast studiocast-probe studiocast-maxine studiocast-open studiocast-audio studiocast-video studiocastctl
         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
         COMPONENT Runtime

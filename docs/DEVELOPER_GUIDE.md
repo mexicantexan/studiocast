@@ -718,6 +718,12 @@ The dependency `--output` must not exist. Alternatively pass
 `-Dncnn_DIR=/tmp/studiocast-ncnn-dependency/prefix/lib/cmake/ncnn` to CMake.
 Use the patch and helper from the same StudioCast checkout; do not reuse a
 prefix produced by an earlier patch just because its upstream commit matches.
+Production configuration also requires the helper's full ncnn/glslang licenses
+and exact dependency receipt under `prefix/share/licenses/studiocast-ncnn`.
+CMake rejects missing or mismatched receipts and stages all three files with
+the `Runtime` install component under `share/licenses/studiocast-ncnn` (or the
+configured data directory). Keep these notices with redistributed binaries.
+Builds with production matting disabled do not require these optional files.
 
 The production owner adopts ncnn's exact logical context and compute queue
 before allocating StudioCast resources. It matches the configured physical
