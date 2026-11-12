@@ -1,7 +1,7 @@
 # Production Vulkan matting implementation
 
-- Status: Runtime implementation/review complete; approved model publication
-  remotely verified; catalog promotion integrated; final validation/review in progress
+- Status: Bounded runtime implementation, approved model publication, catalog
+  promotion, broad verification, and fresh independent critique complete
 - Baseline: `51b96122ab2ccca92af9bed35c86c7fe8e5060a0`, branch `v0.2.9`
 - User decision, 2026-11-11: implement production Vulkan matting and its model
   and validation requirements; validate available hardware and record unavailable
@@ -70,6 +70,7 @@ files; implementation agents used isolated worktrees.
 | `vulkan_matting_docs` / `codex/vulkan-matting-docs-20261111` | `0dc32c4` | `0219ee6` |
 | `vulkan_runtime_notices` / `codex/vulkan-runtime-notices-20261111` | `aeb9266` | `8300939` |
 | `modnet_catalog_promotion` / `codex/modnet-catalog-promotion-20261112` | `3a02d3e` | `eb13d5b` |
+| `modnet_promotion_critique` | Read-only fresh promotion critique; no commit | Approved integrated `3a392b5`; no finding |
 | Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743`, `b346f96`, `763b5ee`, `acad9d0` | Direct focused commits; no parallel writes to shared files |
 | `vulkan_matting_safety_audit` | Read-only interim audit; no commit | Confirmed findings repaired as described below |
 | `vulkan_final_critique` | Read-only first final critique; no commit | One Medium packaging finding, repaired and integrated |
@@ -306,15 +307,26 @@ Root additionally performed an actual immutable public HTTPS transaction using
 the integrated catalog, then an offline transaction whose transport raises if
 called. Both succeeded and all five files matched pinned hashes. Receipt:
 `/tmp/studiocast-modnet-public-transaction-20261112-0gqczid9/receipt.json`.
-The 41-file docs validator, shell syntax, and diff checks passed. Fresh
-independent critique follows broad verification. Existing runtime/native
-qualification limits are unchanged; this phase does not claim new real-model
-hardware qualification.
+The 41-file docs validator, shell syntax, and diff checks passed. Fresh independent critic `modnet_promotion_critique` approved integrated
+`3a392b5ebb2b6938163fb0dd855b4920128eab08` against baseline `6460bcbe`, with
+no confirmed finding. It independently passed transactions 20/20 (0.770 s),
+converter 7/7 (0.315 s), packaging 13/13 (8.134 s), backend 54/54 (22.432 s),
+the integrated offscreen Qt wizard, 41-file docs validation, shell syntax, and
+diff checks. It rehashed all four retained public downloads (25,869,914 bytes),
+verified exact template equality, catalog hash/totals, preserved selection and
+other-pack objects, and performed another real-artifact offline install with
+network access denied. A baseline unmarked pack was rejected with
+`curated_ownership_unverified` and preserved byte-for-byte. Its detached worktree
+remained clean. The critic reviewed the publication receipt and broad/native
+logs without repeating the external enumeration or GPU qualification. Existing
+runtime/native limits remain unchanged; this phase does not claim new real-model
+hardware qualification. Root verified the promotion commit is merged, with no
+accepted implementation stranded on a topic branch. Root-owned documentation
+commits `2d9b31e` and `3a392b5` record publication/contracts and integrated tests;
+the final ledger-only handoff does not change reviewed behavior.
 
 ## Remaining delivery boundaries
 
-- Complete post-integration broad tests and fresh independent critique of the
-  integrated approved promotion.
 - Collect unavailable hardware, real-camera/visual-quality, and optimized latency
   feedback during deployment; keep fail-closed runtime checks intact.
 - Git push/application release/deployment are separate actions. This task has
