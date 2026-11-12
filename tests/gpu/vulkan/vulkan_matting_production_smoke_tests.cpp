@@ -4,14 +4,35 @@
 #include "core/vulkan/production_video_backend_setup_source.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace {
+std::atomic<bool> count_frame_allocations{false};
+std::atomic<std::uint64_t> frame_allocations{0};
+} // namespace
+void *operator new(std::size_t size) {
+  if (count_frame_allocations.load(std::memory_order_relaxed))
+    ++frame_allocations;
+  if (auto *memory = std::malloc(size ? size : 1))
+    return memory;
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 
 namespace {
 namespace hal = studiocast::hal;
@@ -111,7 +132,11 @@ bool Run(const Options &options, video::effects::VirtualBackgroundMode mode,
     binding.ownership = hal::OwnershipModel::borrowed_until_completion;
     binding.lifetime = hal::ResourceLifetime::frame_borrowed;
     binding.capture_sequence = f + 1;
+    frame_allocations.store(0, std::memory_order_relaxed);
+    count_frame_allocations.store(true, std::memory_order_relaxed);
     const auto frame = manager.Execute(binding);
+    count_frame_allocations.store(false, std::memory_order_relaxed);
+    const auto allocations = frame_allocations.load(std::memory_order_relaxed);
     std::cout << "frame=" << f + 1
               << " status=" << static_cast<unsigned>(frame.status)
               << " reason=" << static_cast<unsigned>(frame.reason)
@@ -121,9 +146,10 @@ bool Run(const Options &options, video::effects::VirtualBackgroundMode mode,
               << " intermediate=" << frame.transfers.intermediate_readbacks
               << " tails=" << frame.transfers.cpu_tail_boundaries
               << " sync=" << frame.transfers.synchronizations
+              << " host_allocations=" << allocations
               << " elapsed_ns=" << frame.frame_elapsed_ns << '\n';
-    if (frame.status != hal::StatusId::executed || !frame.output_ready ||
-        frame.stage_count != program.stage_count ||
+    if (allocations != 0 || frame.status != hal::StatusId::executed ||
+        !frame.output_ready || frame.stage_count != program.stage_count ||
         frame.transfers.uploads != 1 || frame.transfers.final_readbacks != 1 ||
         frame.transfers.intermediate_readbacks != 0 ||
         frame.transfers.intermediate_uploads != 0 ||

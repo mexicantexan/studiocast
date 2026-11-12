@@ -14,10 +14,11 @@
 
 namespace studiocast::vulkan {
 
-// Synchronous production executor for the exact qualified Open Vulkan final
-// island: fixed-center vignette followed by final mirror. UtilityKernels and
-// its VulkanDevice must outlive this object; no other adapter may submit work
-// to this executor's prepared resources.
+// Synchronous production executor for one exact Open Vulkan island: optional
+// shared resident matting, background composition and key light, then final
+// resize, fixed-center vignette and mirror. UtilityKernels and its adopted or
+// owned VulkanDevice must outlive this object; other adapters cannot submit
+// work to these prepared resources.
 class QualifiedFinalResidentExecutor final
     : public IQualifiedVulkanResidentExecutor {
 public:

@@ -12,10 +12,9 @@ namespace studiocast::open_vulkan {
 
 // Long-lived matting session for the Open Vulkan backend.
 //
-// This owns Vulkan preprocess buffers and is the production integration point
-// for a device-resident Vulkan inference runtime. The current milestone-4 ncnn
-// spike used CPU Mat input/output, so this session refuses activation rather
-// than hiding CPU matte transfers behind an Open Vulkan backend.
+// Owns persistent Vulkan preprocessing and one recorded GPU-only inference
+// graph on the exact StudioCast context. The optional production runtime uses
+// fixed resident input/alpha bindings; the CPU-Mat spike never participates.
 class OpenVulkanMattingSession {
 public:
   struct Options {
@@ -33,7 +32,7 @@ public:
                            studiocast::open_video::ModelPack pack,
                            Options opts);
   // Runtime injection is a focused no-GPU test seam. Production construction
-  // uses the fail-closed adapter selected by the build.
+  // uses the exact-device adapter selected by the build.
   OpenVulkanMattingSession(studiocast::vulkan::VulkanDevice *device,
                            studiocast::vulkan::kernels::UtilityKernels *kernels,
                            studiocast::open_video::ModelPack pack, Options opts,
