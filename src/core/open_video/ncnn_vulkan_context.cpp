@@ -4,18 +4,12 @@
 #include <mutex>
 namespace {
 struct InstanceOwner {
-  ~InstanceOwner() { ncnn::destroy_gpu_instance(); }
+  ~InstanceOwner() { ncnn::studiocast_release_gpu_instance(); }
 };
 std::shared_ptr<void> AcquireInstance() {
-  static std::mutex mutex;
-  static std::weak_ptr<void> instance;
-  std::lock_guard lock(mutex);
-  auto owner = instance.lock();
-  if (!owner && ncnn::create_gpu_instance() == 0) {
-    owner = std::make_shared<InstanceOwner>();
-    instance = owner;
-  }
-  return owner;
+  if (ncnn::studiocast_acquire_gpu_instance() != 0)
+    return {};
+  return std::make_shared<InstanceOwner>();
 }
 template <class To, class From> To Handle(From value) {
   return reinterpret_cast<To>(value);

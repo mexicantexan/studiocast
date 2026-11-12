@@ -3,6 +3,7 @@
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_context_internal.h"
 #include "core/vulkan/vulkan_image.h"
+#include "core/vulkan/vulkan_tensor.h"
 #include <allocator.h>
 #include <array>
 #include <command.h>
@@ -179,6 +180,14 @@ public:
     program_->budget.resource_cap = resources_.allocation_resource_limit;
     program_->owner =
         std::static_pointer_cast<detail::NcnnVulkanContext>(native);
+    program_->budget.bytes =
+        program_->owner->device->studiocast_dummy_allocation_bytes();
+    program_->budget.resources =
+        program_->owner->device->studiocast_dummy_allocation_count();
+    if (program_->budget.bytes > program_->budget.cap ||
+        program_->budget.resources > program_->budget.resource_cap)
+      return Fail(Failure::allocation_contract_failed,
+                  "Native bootstrap exceeds caller reservation.");
     program_->context =
         std::static_pointer_cast<vk::detail::VulkanContextState>(
             device_->RetainContext());
@@ -202,7 +211,7 @@ public:
     graph_ = graph;
     if (!program_ || graph.input_n != 1 || graph.input_c != 3 ||
         graph.output_n != 1 || graph.output_c != 1 || graph.input_h <= 0 ||
-        graph.input_w <= 0 ||
+        graph.input_w <= 0 || graph.output_h <= 0 || graph.output_w <= 0 ||
         (std::size_t(graph.input_h) * std::size_t(graph.input_w)) % 4 != 0)
       return Fail(Failure::invalid_shape, "ncnn replay requires batch one RGB "
                                           "and aligned NCHW float32 planes.");
@@ -266,15 +275,36 @@ public:
   Result PreparePersistentResources(
       const VulkanMattingPersistentResources &resources) override {
     resources_ = resources;
-    if (!program_ || !resources.input_buffer || !resources.alpha_buffer ||
-        resources.input_offset || resources.alpha_offset ||
-        resources.alpha_row_stride_bytes <
-            std::size_t(graph_.output_w) * sizeof(float) ||
+    vk::VulkanTensorSize input_size, output_size;
+    std::string shape_error;
+    const auto row_bytes = std::size_t(graph_.output_w) * sizeof(float);
+    const auto rows_minus_one = std::size_t(graph_.output_h - 1);
+    const bool stride_safe =
+        resources.alpha_row_stride_bytes >= row_bytes &&
+        (rows_minus_one == 0 ||
+         resources.alpha_row_stride_bytes <=
+             (std::numeric_limits<std::size_t>::max() - row_bytes) /
+                 rows_minus_one);
+    const auto alpha_extent =
+        stride_safe
+            ? rows_minus_one * resources.alpha_row_stride_bytes + row_bytes
+            : 0;
+    if (!program_ ||
+        !vk::CheckedNchwF32Size(1, 3, graph_.input_h, graph_.input_w,
+                                &input_size, &shape_error) ||
+        !vk::CheckedNchwF32Size(1, 1, graph_.output_h, graph_.output_w,
+                                &output_size, &shape_error) ||
+        resources.input_bytes != input_size.bytes ||
+        resources.alpha_bytes != output_size.bytes || !resources.input_buffer ||
+        !resources.alpha_buffer ||
+        resources.input_buffer == resources.alpha_buffer ||
+        resources.input_offset || resources.alpha_offset || !stride_safe ||
+        resources.alpha_buffer_capacity_bytes < alpha_extent ||
         resources.allocation_budget_bytes < program_->budget.bytes ||
         resources.allocation_resource_limit < program_->budget.resources)
       return Fail(Failure::allocation_contract_failed,
-                  "Missing fixed GPU bindings or insufficient native "
-                  "allocation reservation.");
+                  "Invalid fixed GPU binding shape/capacity or insufficient "
+                  "native allocation reservation.");
     program_->budget.cap = std::min(resources.allocation_budget_bytes,
                                     kNcnnVulkanMattingAllocationBudgetBytes);
     program_->budget.resource_cap =
