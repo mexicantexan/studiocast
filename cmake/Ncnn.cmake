@@ -2,6 +2,54 @@ include_guard(GLOBAL)
 
 include(CheckCXXSourceCompiles)
 
+function(studiocast_install_ncnn_runtime_notices)
+  if (NOT STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+    return()
+  endif()
+
+  # The reviewed helper keeps notices beside the selected package, never in a
+  # separately selected SDK whose receipt could describe different linked bytes.
+  if (ncnn_DIR)
+    get_filename_component(_prefix "${ncnn_DIR}/../../.." ABSOLUTE)
+  elseif (NCNN_ROOT AND _studiocast_ncnn_target STREQUAL "studiocast::ncnn")
+    get_filename_component(_prefix "${NCNN_ROOT}" ABSOLUTE)
+  else()
+    message(FATAL_ERROR "Production ncnn Runtime packaging requires the prefix from scripts/build_ncnn_vulkan_dependency.py; set ncnn_DIR or CMAKE_PREFIX_PATH to that prefix.")
+  endif()
+  set(_notices "${_prefix}/share/licenses/studiocast-ncnn")
+  set(_files ncnn-LICENSE.txt glslang-LICENSE.txt dependency.json)
+  foreach (_file IN LISTS _files)
+    if (NOT EXISTS "${_notices}/${_file}" OR IS_DIRECTORY "${_notices}/${_file}")
+      message(FATAL_ERROR "Production ncnn Runtime packaging requires ${_notices}/${_file}. Rebuild the isolated dependency with scripts/build_ncnn_vulkan_dependency.py.")
+    endif()
+    file(SIZE "${_notices}/${_file}" _size)
+    if (_size EQUAL 0)
+      message(FATAL_ERROR "Production ncnn Runtime packaging requires nonempty ${_notices}/${_file}.")
+    endif()
+  endforeach()
+  file(READ "${_notices}/dependency.json" _receipt)
+  file(SHA256 "${PROJECT_SOURCE_DIR}/cmake/patches/ncnn-studiocast-replay.patch" _patch_sha256)
+  set(_upstream_revision "24ea07e87f544a3fbc59980b57885a92c75f2d24")
+  set(_glslang_revision "5017667d5a5300dff6aab57db1931a495ff9a10c")
+  set(_replay_abi 2)
+  foreach (_field IN ITEMS upstream_revision glslang_revision replay_abi patch_sha256)
+    string(JSON _value ERROR_VARIABLE _error GET "${_receipt}" "${_field}")
+    if (_error OR NOT "${_value}" STREQUAL "${_${_field}}")
+      message(FATAL_ERROR "Production ncnn Runtime packaging dependency receipt has invalid ${_field}: ${_notices}/dependency.json. Rebuild with the current scripts/build_ncnn_vulkan_dependency.py.")
+    endif()
+  endforeach()
+
+  # Snapshot the validated inputs so the installed receipt and licenses stay
+  # together even if the SDK prefix is subsequently moved or removed.
+  set(_stage "${CMAKE_CURRENT_BINARY_DIR}/ncnn-runtime-notices")
+  foreach (_file IN LISTS _files)
+    configure_file("${_notices}/${_file}" "${_stage}/${_file}" COPYONLY)
+    install(FILES "${_stage}/${_file}"
+      DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/studiocast-ncnn"
+      COMPONENT Runtime)
+  endforeach()
+endfunction()
+
 function(studiocast_configure_ncnn out_found out_target out_has_vulkan)
   set(_found FALSE)
   set(_target "")
