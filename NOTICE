@@ -4,3 +4,11 @@ Copyright (c) 2026
 This product includes software developed by StudioCast contributors.
 
 This codebase/repo (StudioCast) is not affiliated with NVIDIA. NVIDIA and NVIDIA Broadcast are trademarks of NVIDIA Corporation.
+
+The optional production Vulkan matting build uses Tencent ncnn (BSD-3-Clause)
+at commit 24ea07e87f544a3fbc59980b57885a92c75f2d24 with the StudioCast replay
+patch in cmake/patches/ncnn-studiocast-replay.patch. Its pinned glslang dependency
+retains its upstream license terms. scripts/build_ncnn_vulkan_dependency.py
+preserves both upstream license files and the exact dependency receipt under
+the isolated prefix's share/licenses/studiocast-ncnn directory. Redistributors
+of binaries linked with these optional dependencies must retain those notices.

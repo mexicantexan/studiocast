@@ -73,6 +73,27 @@ native execution remains pending. Root registered both optional source files,
 the opt-in native runtime test, and the hermetic converter suite. Focused
 optional-backend-off factory/adapter/converter CTest passed three of three.
 
+Pipeline integration: `222b025` and `7250f3f` are integrated as `5951f0b`;
+quiescence/capacity repair `9b98cb5` as `9ce89d3`; allocation-counting smoke
+test `5b71597` as `fa0311d`. The neutral registry now requires model/runtime
+evidence for exactly the four matting consumers, and final semantic descriptors
+carry writer geometry. Pending/unsafe Vulkan shutdown retains the complete
+factory and denies release until native quiescence is proven. Root reran the six
+optional-backend-off factory, adapter, migration, status, resolver, and contract
+tests: six passed, zero failed. The integrated production-on Debug build passed.
+
+Root added real session preparation to explicit startup/diagnostics refresh;
+normal status polling still reads the daemon cache. Installer parity attestation
+is limited to the exact converted MODNet artifacts and preprocessing profile,
+plus successful local preparation/warmup and canonical consumer predicates.
+Compatible BYO runtime validity alone does not attest numerical comparison.
+The production smoke checks this refresh as well as actual manager execution.
+Native model-backed acceptance is still pending: the known 1x1 convolution
+already passes changing-output, allocation-reuse, CPU-rejection, low-budget, and
+timeout-quarantine checks, but the full MODNet graph currently fails recording
+at its first InnerProduct layer. This is an active implementation failure, not
+an accepted hardware limitation. Runtime diagnosis and remediation continue.
+
 Scope extension: the preceding pushed baseline's CI run `43031290469` exposed
 three bounded delivery failures. Root owns the repair: explicitly include
 `<algorithm>` in the Open CUDA factory; use ONNX Runtime's stable C API for

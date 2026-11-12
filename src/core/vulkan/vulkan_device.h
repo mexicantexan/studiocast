@@ -361,6 +361,8 @@ struct OpenVulkanDiagnostics {
   bool matting_model_pack_selected = false;
   bool matting_model_contract_validated = false;
   bool matting_production_ready = false;
+  bool matting_parity_validated = false;
+  std::uint64_t matting_cpu_fallback_count = 0;
   std::string matting_reason_code = "open_vulkan_matting_unavailable";
   std::string matting_blocker_code;
   std::string matting_detail;

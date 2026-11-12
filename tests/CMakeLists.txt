@@ -1906,6 +1906,23 @@ if (BUILD_TESTING)
                 unit video gpu vulkan model)
 
         if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+            add_executable(studiocast-vulkan-matting-production-smoke
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_matting_production_smoke_tests.cpp)
+            target_link_libraries(studiocast-vulkan-matting-production-smoke PRIVATE
+                    studiocast_vulkan_backend studiocast_video_backend_composition)
+            target_include_directories(studiocast-vulkan-matting-production-smoke PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+            studiocast_set_project_warnings(studiocast-vulkan-matting-production-smoke)
+            studiocast_enable_sanitizers(studiocast-vulkan-matting-production-smoke)
+            set_target_properties(studiocast-vulkan-matting-production-smoke PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-vulkan-matting-production-smoke
+                    COMMAND studiocast-vulkan-matting-production-smoke)
+            set_tests_properties(studiocast-vulkan-matting-production-smoke PROPERTIES
+                    SKIP_RETURN_CODE 77)
+            studiocast_set_test_labels(studiocast-vulkan-matting-production-smoke
+                    integration video gpu vulkan model)
+
             add_executable(studiocast-ncnn-vulkan-matting-runtime-tests
                     ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/ncnn_vulkan_matting_runtime_tests.cpp)
             target_link_libraries(studiocast-ncnn-vulkan-matting-runtime-tests PRIVATE

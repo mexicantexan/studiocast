@@ -1,15 +1,20 @@
 #include "core/vulkan/kernels/resize_bilinear.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
 
 #include "core/open_video/model_pack_registry.h"
+#include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/vulkan_matting_runtime.h"
+#include "core/open_video/vulkan_matting_session.h"
 #include "core/util/xdg.h"
 #include "core/video/effects/broadcast_effect_contract.h"
 #include "core/video/open_vulkan_auto_frame.h"
@@ -17,6 +22,10 @@
 #include "core/video/open_vulkan_mirror.h"
 #include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/open_vulkan_vignette.h"
+#include "core/video/open_vulkan_virtual_background_blur.h"
+#include "core/video/open_vulkan_virtual_background_remove.h"
+#include "core/video/open_vulkan_virtual_background_replace.h"
+#include "core/video/open_vulkan_virtual_key_light.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
 #include "core/vulkan/kernels/utility_kernels.h"
 
@@ -423,6 +432,7 @@ namespace {
 struct OpenVulkanMattingModelFacts {
   bool selected = false;
   bool contract_validated = false;
+  std::optional<open_video::ModelPack> pack;
 };
 
 OpenVulkanMattingModelFacts
@@ -467,8 +477,10 @@ PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
     }
   }
   facts.selected = !d->default_model_id.empty();
-  // Diagnostics polling never hashes artifacts. Only a live session may
-  // publish cached validation attestation; this cold diagnostic has none.
+  if (facts.selected)
+    facts.pack = reg.Find("matting", d->default_model_id);
+  // Only a prepared session may attest validation. Explicit refresh can prepare
+  // one below; normal status polling reads the daemon's cached snapshot.
   facts.contract_validated = false;
 
   for (const auto &[id, reason] : reg.Problems()) {
@@ -505,7 +517,8 @@ PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
 }
 
 void ApplyOpenVulkanMattingReadiness(
-    OpenVulkanDiagnostics *d, const OpenVulkanMattingModelFacts &model_facts) {
+    OpenVulkanDiagnostics *d, const OpenVulkanMattingModelFacts &model_facts,
+    const open_vulkan::VulkanMattingReadiness *prepared = nullptr) {
   if (!d)
     return;
   studiocast::open_vulkan::VulkanMattingReadinessInput input;
@@ -519,7 +532,8 @@ void ApplyOpenVulkanMattingReadiness(
   input.compute_queue_available = d->compute_queue_available;
   input.context_healthy = d->context_healthy;
   const auto readiness =
-      studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
+      prepared ? *prepared
+               : studiocast::open_vulkan::EvaluateVulkanMattingReadiness(input);
   const auto &runtime = readiness.runtime;
 
   d->matting_build_enabled = input.production_build_enabled;
@@ -596,13 +610,12 @@ void ApplyOpenVulkanPixelEffectReadiness(OpenVulkanDiagnostics *d) {
   if (!d)
     return;
 
-  const auto mirror =
-      studiocast::video::EvaluateOpenVulkanMirrorReadiness(*d);
+  const auto mirror = studiocast::video::EvaluateOpenVulkanMirrorReadiness(*d);
   d->mirror_production_ready = mirror.production_ready;
   d->mirror_readiness_code =
       mirror.production_ready
-          ? std::string(studiocast::video::
-                            kOpenVulkanMirrorProductionReadyReason)
+          ? std::string(
+                studiocast::video::kOpenVulkanMirrorProductionReadyReason)
           : std::string{};
   d->mirror_blocker_code =
       mirror.production_ready ? std::string{} : mirror.shared_reason_code;
@@ -620,8 +633,8 @@ void ApplyOpenVulkanPixelEffectReadiness(OpenVulkanDiagnostics *d) {
           : std::string{};
   d->vignette_blocker_code =
       vignette.production_ready ? std::string{} : vignette.shared_reason_code;
-  d->vignette_parameter_contract = std::string(
-      studiocast::video::kOpenVulkanVignetteParameterContract);
+  d->vignette_parameter_contract =
+      std::string(studiocast::video::kOpenVulkanVignetteParameterContract);
   SetOpenVulkanEffectAvailability(
       d, studiocast::video::effects::contract::kEffectIdVignette,
       vignette.production_ready, d->vignette_blocker_code);
@@ -633,8 +646,8 @@ void ApplyOpenVulkanAutoFrameReleaseReadiness(OpenVulkanDiagnostics *d) {
   d->auto_frame_crop_stage_implemented = true;
   d->auto_frame_production_ready = false;
   d->auto_frame_readiness_code.clear();
-  d->auto_frame_blocker_code = std::string(
-      studiocast::video::kOpenVulkanAutoFrameFaceProviderReason);
+  d->auto_frame_blocker_code =
+      std::string(studiocast::video::kOpenVulkanAutoFrameFaceProviderReason);
   d->auto_frame_cpu_tail = true;
   d->auto_frame_degraded_reason_code =
       std::string(studiocast::video::kOpenVulkanAutoFrameCpuTailReason);
@@ -688,10 +701,9 @@ void ApplyOpenVulkanEyeContactReadiness(OpenVulkanDiagnostics *d) {
 
   const std::string effect_id(
       studiocast::video::effects::contract::kEffectIdEyeContact);
-  d->available_effects.erase(
-      std::remove(d->available_effects.begin(), d->available_effects.end(),
-                  effect_id),
-      d->available_effects.end());
+  d->available_effects.erase(std::remove(d->available_effects.begin(),
+                                         d->available_effects.end(), effect_id),
+                             d->available_effects.end());
   d->blocked_effects[effect_id] = readiness.reason_code;
 }
 
@@ -767,6 +779,104 @@ void ApplyOpenVulkanVideoNoiseRemovalReadiness(OpenVulkanDiagnostics *d) {
   d->blocked_effects[effect_id] = readiness.reason_code;
 }
 
+// This attestation is deliberately limited to the converted artifact/profile
+// covered by the numerical and production-manager tests. BYO runtime validity
+// alone does not claim that an arbitrary model has passed those comparisons.
+bool ReviewedMattingProfile(const open_video::ModelPack &pack) {
+  if (pack.id != "modnet-webnn-256-fp32" || !pack.ncnn_vulkan || !pack.matting)
+    return false;
+  const auto &native = *pack.ncnn_vulkan;
+  const auto &model = *pack.matting;
+  return native.param_sha256 == "4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61"
+                                "466c58d1310af8a1bd" &&
+         native.bin_sha256 == "38871660dda4dd324304eb572f43a43ddc5c876c8dff50db"
+                              "2cf09d29a17e3fa2" &&
+         native.precision == "fp32" && model.input.width == 256 &&
+         model.input.height == 256 && model.output.width == 256 &&
+         model.output.height == 256 && model.preprocess.color == "rgb" &&
+         model.preprocess.range == "0..1" &&
+         model.preprocess.mean == std::array<double, 3>{0.5, 0.5, 0.5} &&
+         model.preprocess.std == std::array<double, 3>{0.5, 0.5, 0.5};
+}
+
+// Called only during explicit startup/diagnostics refresh. GET_STATUS consumes
+// the daemon cache and never performs this hashing, preparation or inference.
+bool PrepareMattingDiagnostics(OpenVulkanDiagnostics *d,
+                               OpenVulkanMattingModelFacts *facts,
+                               open_vulkan::VulkanMattingReadiness *readiness) {
+  if (!facts->pack || !open_vulkan::ProductionVulkanMattingBuildEnabled() ||
+      !open_vulkan::ProductionVulkanMattingAdapterAvailable())
+    return false;
+  try {
+    std::string error;
+    if (!open_video::ValidateProductionNcnnVulkanMattingPack(*facts->pack,
+                                                             &error)) {
+      readiness->blocker_code =
+          open_vulkan::kOpenVulkanMattingModelInvalidReason;
+      readiness->detail = error;
+      return true;
+    }
+    facts->contract_validated = true;
+    kernels::UtilityKernels utility;
+    if (!open_vulkan::InitializeProductionVulkanMattingDevice(utility.device(),
+                                                              &error) ||
+        !utility.Initialize(&error)) {
+      readiness->blocker_code =
+          open_vulkan::kOpenVulkanMattingAdapterUnavailableReason;
+      readiness->detail = error;
+      return true;
+    }
+    const auto &shape = facts->pack->matting->output;
+    VulkanImage alpha;
+    if (!alpha.Allocate(utility.device(), shape.width, shape.height,
+                        VulkanPixelFormat::f32_1, false, &error)) {
+      readiness->blocker_code = open_vulkan::kOpenVulkanMattingAllocationReason;
+      readiness->detail = error;
+      return true;
+    }
+    open_vulkan::OpenVulkanMattingSession session(utility.device(), &utility,
+                                                  *facts->pack);
+    if (!session.BindAlphaOutputForSetup(&alpha, &error) ||
+        !session.EnsureInitialized(4, 4, &error) || !session.Warmup(&error)) {
+      *readiness = session.Readiness();
+      if (!error.empty())
+        readiness->detail = error;
+      return true;
+    }
+    *readiness = session.Readiness();
+    auto prepared = utility.Diagnostics();
+    prepared.ok = true;
+    prepared.shader_pipeline_created = true;
+    prepared.installed_models = std::move(d->installed_models);
+    prepared.models = std::move(d->models);
+    prepared.default_model_id = std::move(d->default_model_id);
+    prepared.missing_models = std::move(d->missing_models);
+    prepared.install_hints = std::move(d->install_hints);
+    prepared.warnings = std::move(d->warnings);
+    prepared.matting_parity_validated =
+        ReviewedMattingProfile(*facts->pack) &&
+        video::EvaluateOpenVulkanVirtualBackgroundBlurReadiness(prepared,
+                                                                *readiness)
+            .production_ready &&
+        video::EvaluateOpenVulkanVirtualBackgroundRemoveReadiness(prepared,
+                                                                  *readiness)
+            .production_ready &&
+        video::EvaluateOpenVulkanVirtualBackgroundReplaceReadiness(prepared,
+                                                                   *readiness)
+            .production_ready &&
+        video::EvaluateOpenVulkanVirtualKeyLightReadiness(prepared, *readiness)
+            .production_ready;
+    *d = std::move(prepared);
+    return true;
+  } catch (const std::exception &error) {
+    readiness->production_ready = false;
+    readiness->blocker_code =
+        open_vulkan::kOpenVulkanMattingRuntimeFailureReason;
+    readiness->detail = error.what();
+    return true;
+  }
+}
+
 } // namespace
 
 OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
@@ -814,7 +924,7 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   OpenVulkanDiagnostics d = resize.Diagnostics();
   d.ok = true;
   d.shader_pipeline_created = true;
-  const auto model_facts = PopulateOpenVulkanModelDiagnostics(&d);
+  auto model_facts = PopulateOpenVulkanModelDiagnostics(&d);
   d.matting_runtime = "none";
   d.device_residency_mode = "unavailable";
   d.matting_runtime_created = false;
@@ -822,17 +932,24 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   d.input_device_resident = false;
   d.alpha_device_resident = false;
   d.output_device_resident = false;
-  ApplyOpenVulkanMattingReadiness(&d, model_facts);
-  d.blocked_reason = d.matting_reason_code;
-  d.degraded_reason = "[" + d.matting_reason_code + "]";
-  if (!d.matting_blocker_code.empty())
-    d.degraded_reason += " [" + d.matting_blocker_code + "]";
-  if (!d.matting_detail.empty())
-    d.degraded_reason += " " + d.matting_detail;
-  d.warnings.push_back(
-      "The milestone-4 ncnn Vulkan spike used CPU Mat input/output; it is not "
-      "used for production Open Vulkan virtual background.");
-  BlockOpenVulkanVirtualBackground(&d, d.matting_reason_code.c_str());
+  open_vulkan::VulkanMattingReadiness prepared;
+  const bool attempted = PrepareMattingDiagnostics(&d, &model_facts, &prepared);
+  ApplyOpenVulkanMattingReadiness(&d, model_facts,
+                                  attempted ? &prepared : nullptr);
+  if (d.matting_production_ready) {
+    for (const auto effect :
+         {"virtual_background.blur", "virtual_background.remove",
+          "virtual_background.replace", "virtual_key_light"})
+      SetOpenVulkanEffectAvailability(&d, effect, true, "");
+  } else {
+    d.blocked_reason = d.matting_reason_code;
+    d.degraded_reason = "[" + d.matting_reason_code + "]";
+    if (!d.matting_blocker_code.empty())
+      d.degraded_reason += " [" + d.matting_blocker_code + "]";
+    if (!d.matting_detail.empty())
+      d.degraded_reason += " " + d.matting_detail;
+    BlockOpenVulkanVirtualBackground(&d, d.matting_reason_code.c_str());
+  }
   ApplyOpenVulkanPixelEffectReadiness(&d);
   ApplyOpenVulkanAutoFrameReleaseReadiness(&d);
   ApplyOpenVulkanEyeContactReadiness(&d);
