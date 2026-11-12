@@ -3,7 +3,7 @@
 - Status: Active cross-subsystem capability contract
 - Applies To: StudioCast v0.2.9 installer recommendation and runtime evidence
 - Audience: Installer, runtime, packaging, and test maintainers
-- Last Verified: 2026-07-22
+- Last Verified: 2026-11-11
 
 This document is the per-effect installer policy input for StudioCast `v0.2.9`.
 It describes the canonical live pipeline after the Vulkan production program,
@@ -28,20 +28,23 @@ The status vocabulary is:
 | Canonical effect ID | Vulkan implementation status | Live evidence and limitation | Selectable production CPU fallback | Installer readiness/blocker codes |
 | --- | --- | --- | --- | --- |
 | `mirror` | production usable | The canonical final visual transform uses the shared production Vulkan context. One bounded mapped upload staging buffer feeds a non-mapped `DEVICE_LOCAL` source; resize scratch and mirror output are non-mapped `DEVICE_LOCAL`; one distinct mapped staging buffer is used only for the final writer-boundary readback. Real-device parity/live-pipeline tests assert the allocation properties, one upload, zero intermediate readbacks/CPU fallback, one final readback, synchronization, ordering, and reuse. Recommendation still requires exact per-effect readiness plus non-CPU device, compute queue, healthy context, and utility-kernel evidence. | none | ready: `open_vulkan_mirror_production_ready`; otherwise the exact common Vulkan blocker |
-| `virtual_background.blur` | experimental | A canonical resident blur/composite stage exists. Production remains fail-closed because the distributed packs are ONNX-only and no reviewed exact-device ncnn Vulkan adapter/runtime is available. Synthetic matting seams are test evidence only. | none; the CPU class is an unwired center-focus placeholder, not semantic matting | `open_vulkan_matting_unavailable`, with the exact nested adapter/artifact/runtime blocker |
-| `virtual_background.remove` | experimental | A canonical resident solid composite exists, behind the same production matting contract as blur. | none; the CPU class is an unwired center-focus placeholder | `open_vulkan_matting_unavailable`, with the exact nested blocker |
-| `virtual_background.replace` | experimental | A canonical resident replacement composite and bounded setup-time image upload lifecycle exist. It remains behind production matting readiness and validates the replacement image separately. | none | `open_vulkan_matting_unavailable`, with the exact nested blocker |
+| `virtual_background.blur` | production usable (opt-in matting) | The prepared camera manager runs resident MODNet inference, alpha resize/feather, and background blur/composite. Requires the production matting build, converted reviewed profile, and actual exact-device warmup/readiness. | none | ready: `open_vulkan_matting_production_ready`; otherwise `open_vulkan_matting_unavailable` with the exact nested blocker |
+| `virtual_background.remove` | production usable (opt-in matting) | The prepared resident solid composite uses the same current-frame matte and exact runtime contract as blur. | none | ready: `open_vulkan_matting_production_ready`; otherwise `open_vulkan_matting_unavailable` with the exact nested blocker |
+| `virtual_background.replace` | production usable (opt-in matting) | The prepared replacement composite decodes/uploads/resizes its image only at setup, validates that asset separately, and consumes the same resident matte. | none | ready: `open_vulkan_matting_production_ready`; otherwise `open_vulkan_matting_unavailable` with the exact nested blocker |
 | `auto_frame` | usable with degraded behavior; unavailable on the analyzed machine | The crop/resize stage is Vulkan, but tracking and crop-plan smoothing are explicit CPU tails. The shipped YuNet tracker/artifact is not production-ready on the analyzed machine, so cold daemon evidence is fail-closed even though the crop stage exists. A future valid CPU-only tracker would remain degraded, not Vulkan-native. | none; its CPU tracking is an internal tail, not a selectable CPU engine | unavailable: `vulkan_auto_frame_yunet_unavailable`; a valid degraded path reports `vulkan_effect_cpu_tail` |
 | `eye_contact` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but there is no callable Vulkan live stage, exact-device inference provider/adapter, validated Vulkan artifact contract, resident analysis/tensor path, or production gaze/look-away contract. | none | `open_vulkan_eye_contact_unavailable`, nested `open_vulkan_eye_contact_runtime_unavailable` |
 | `video_noise_removal` | diagnostics-only / stub-unavailable | Exact per-effect diagnostics exist, but FastDVDnet currently uses CUDA/CPU providers, host temporal history, CPU preprocessing/postprocessing, and ONNX-only artifacts. There is no callable Vulkan stage or bounded resident temporal-history contract. | none | `open_vulkan_video_noise_removal_unavailable`, nested `open_vulkan_video_noise_removal_runtime_unavailable` |
-| `virtual_key_light` | experimental | The canonical relight stage is resident, but production readiness requires the same exact same-frame, exact-device production matte evidence as the virtual-background modes. | none; CPU work in other backends is not a selectable CPU engine | `open_vulkan_matting_unavailable`, with the exact nested blocker |
+| `virtual_key_light` | production usable (opt-in matting) | The prepared relight stage reuses the same current-frame resident matte when combined with a background mode. Independent key light runs one resident inference. | none | ready: `open_vulkan_matting_production_ready`; otherwise `open_vulkan_matting_unavailable` with the exact nested blocker |
 | `vignette` | production usable (fixed center only) | The canonical final Vulkan stage matches the CUDA-reference fixed-center parameter contract. A bounded setup-only staging allocation uploads the generated factor plane into a persistent non-mapped `DEVICE_LOCAL` mask; source, resize scratch, vignette output, and optional following mirror output are also non-mapped `DEVICE_LOCAL`. Only the initial upload transport and single final readback transport are mapped. `center_on_tracked_face` is not supported by this Vulkan implementation; when that semantic becomes observable with retained Auto Frame, only vignette is removed. | none | ready: `open_vulkan_vignette_fixed_center_production_ready`; tracked-center: `vulkan_vignette_tracked_center_not_supported`; otherwise the exact common Vulkan blocker |
 
-Mirror and fixed-center vignette are the only canonical effects currently
-eligible for a Vulkan recommendation, and only when their exact daemon
-`production_ready` facts and all common runtime facts are true. The analyzed
-machine's cold diagnostics do not make Auto Frame, matting consumers, eye
-contact, or video noise removal production-ready.
+Mirror and fixed-center vignette require their exact daemon readiness facts.
+The four matting consumers additionally require the opt-in production matting
+build and reviewed converted MODNet profile, successfully prepared and warmed on
+the analyzed machine. Every recommendation still requires exact per-effect
+`production_ready` and common runtime facts. Missing prerequisites remain
+blocked; no Auto Frame, eye-contact, or video-denoise capability is promoted.
+The active curated catalog remains ONNX-only for MODNet pending separately
+approved publication; local converted packs can satisfy the explicit contract.
 
 ## Evidence layers and fail-closed facts
 
@@ -123,12 +126,31 @@ StudioCast physical/logical device and compute queue, no CPU layers, warmed
 runtime/graph, device-resident input/alpha/output, synchronous ownership, and
 bounded reusable allocations.
 
-The curated matting packs remain ONNX-only. Upstream ncnn does not expose the
-reviewed external-device import needed by StudioCast's selected device, queue,
-and buffers. The milestone spike uses CPU `ncnn::Mat` input/output and is
-diagnostics-only; it cannot satisfy production residency. Consequently the
-three virtual-background modes and virtual key light remain experimental and
-fail closed.
+The production owner adopts an ncnn-owned logical device and compute queue
+before allocating StudioCast resources. It matches configured physical-device
+intent and retains the same provider entry point, ownership domain, and native
+lifetime through every child. Pinned replay ABI 2 records inference once,
+forbids internal unbounded submission/reset, and uses StudioCast's finite fence
+waits. Caller deadlines and the existing 16-synchronization facade cap remain
+enforced; the native arena stays within 256 MiB / 512 resources. Model loading
+consumes bounded, sealed, checksum-verified snapshots, so path replacement or
+in-place mutation cannot change the bytes attached to the prepared identity.
+
+Explicit diagnostics refresh prepares and warms a real session; ordinary status
+polling reads the daemon cache. `matting_parity_validated` is limited to the
+reviewed exact MODNet parameter/bin hashes, blob names, geometry, and RGB
+normalization profile, plus consumer readiness. A compatible BYO graph does not
+inherit that numerical attestation. The historical CPU `ncnn::Mat` spike remains
+diagnostics-only and is not the production adapter.
+
+P1000/535.309.01 evidence covers six numerical model cases and eight actual
+manager cases with three frames each: one upload/one final readback, no
+intermediate transfers, CPU tails, execution-time host allocations, or fallback.
+It does not qualify AMD/Intel, forced non-push-descriptor execution, Khronos
+validation cleanliness, real-camera/V4L2 transport, portrait quality, optimized
+latency, or clean full-native sanitizers. See
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) for exact
+source/model/dependency evidence and the separate publication decision.
 
 ## Recommendation and CPU fallback
 

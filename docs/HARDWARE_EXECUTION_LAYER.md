@@ -171,15 +171,21 @@ do not by themselves satisfy the family gate in
 
 ### Evidence and remaining gates
 
+The table below records the preceding CUDA/final-stage delivery checkpoint.
+Vulkan matting was added subsequently at runtime source `22c8724`; its current
+implementation, model candidate, eight-case native matrix, and qualification
+limits are recorded in
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
+
 | Evidence layer | Recorded result | Qualification boundary / remaining gate |
 | --- | --- | --- |
-| Local source checkpoint | `b204b0aff69f7872a6687ab3470b4e513b48fb14`: canonical CUDA composition, exact dependency binding, strict selection, reset invalidation, six-axis reservation, failed-frame fences, and exact unsubmitted-binding retirement | This is the tested source identity; subsequent documentation commits do not change runtime source. Family and release gates remain separate |
+| Local source checkpoint | `b204b0aff69f7872a6687ab3470b4e513b48fb14`: canonical CUDA composition, exact dependency binding, strict selection, reset invalidation, six-axis reservation, failed-frame fences, and exact unsubmitted-binding retirement | Historical source identity for this table. Subsequent Vulkan matting work has separate source/evidence below; family and release gates remain separate |
 | CUDA timing and lifecycle repair | `9e41f5c` / `2e70c1b` preserve final-stage timing order and zero disabled/unrun durations; actual executor fixture covers all four final-stage masks, next frame, required failure, and optional cooldown/retry | Hermetic native-body evidence is distinct from the required hardware matrix |
 | Vulkan shutdown repair | `f64a00d` / `2623b88` retain the context until its submission guard unlocks; two-case lifecycle fixture exposes the old unique-owner failure, preserves retained-owner behavior, and passes against the fix | Native initialization/shutdown ASan reproducer proved the prior use-after-free; no driver/provider change was made |
 | Native CUDA matrix | All sixteen required cases passed at clean `b204b0a` (command exit 0), with three commits each; Debug camera policy 100 ms / 1 ms / 100 polls, 64x48 → 32x24, fifteen strict cases plus automatic six-stage resident composition without mirror | Generated input has no detected face; in-memory writer only. No real camera/V4L2, real-face correction, quality, optimized latency, AMD, or Intel qualification |
 | Final matrix accounting | 48 committed frames, 48 uploads, 48 final RGB readbacks, 188 metadata readbacks, 71 synchronizations, 83 CPU-tail boundaries, zero fallback. Strict seven-stage and automatic six-stage cases each report three uploads/final RGB/commits, 39 metadata readbacks, nine synchronizations, twelve tails | Exact source, inputs, model identities, and per-case logs are retained with the ledger; metadata and CPU tracking/planning remain measured boundaries |
 | Model identity | Corrected FastDVDnet, current 640x640 YuNet metadata, dlib, and real FP32 left/right eye models in an isolated root; exact identities recorded with final hardware evidence | Eye models and dependencies are prepared, but no-face input does not demonstrate gaze correction; installed packs remain untouched |
-| Native Vulkan and probe | Final `b204b0a` required Vulkan final integration and combined probe exited 0; the corrected topic kernel/final/lifetime selection passed three of three and required probe five of five | Only mirror/fixed-center vignette retain Vulkan production eligibility; no other effect/vendor promotion |
+| Native Vulkan and probe | Final `b204b0a` required Vulkan final integration and combined probe exited 0; the corrected topic kernel/final/lifetime selection passed three of three and required probe five of five | At that checkpoint only mirror/fixed-center vignette were eligible. Later opt-in matting evidence is recorded separately; no vendor-family qualification is inferred |
 | Integrated regression and critique | Both final Debug builds passed; enabled CTest 87 total / 81 executed / six skips / zero failures (108.12 s); disabled 80 / 75 / five / zero (95.90 s). Disabled probe also exited 0. Fresh independent critique approved runtime source `b204b0a` and docs `81a8989` / `e619d93` with no unresolved Blocker/Critical/High; six exporter tests, four workflow tests, and the lifetime binary also passed independently | Approval is bounded to local implementation and the recorded evidence. Explicit opt-in skips are not native qualification; publication and release gates remain separate |
 | Sanitizer diagnostic | Full ASan hermetic lifecycle fixture passed with leak checks. Native helper no longer reports the use-after-free, but exits 1 with LeakSanitizer reporting 12,080 bytes in 81 allocations in unloaded/unknown modules and a child-symbolizer `LD_PRELOAD` issue | No clean full-native-sanitizer claim and no source/driver attribution for these remaining diagnostics without causal evidence |
 | Required hardware CI | `d994679` enforces sixteen CUDA topologies with dlib, exact preinstalled model IDs, and a replacement image, plus required per-vendor Vulkan final execution | Local command execution is distinct from remote CI execution; automatic host mirror still needs camera-level evidence |
@@ -216,7 +222,7 @@ the prior valid plan.
 | --- | --- | --- |
 | CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
 | Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
-| Open Vulkan final | Explicit strict Vulkan; only production-qualified fixed-center vignette and/or mirror; tight RGB24 transport; zero CPU tails | Matting, tracked-center vignette, Auto Frame, eye contact, denoise, key light, and background modes remain blocked or non-production exactly as documented |
+| Open Vulkan resident | Explicit strict Vulkan; fixed-center vignette/mirror, plus opt-in reviewed MODNet background blur/remove/replace and key light; tight RGB24 transport and final resize; zero CPU tails | Matting needs the patched replay runtime, verified converted model and real warmup. Tracked-center vignette, Auto Frame, eye contact and denoise remain blocked or non-production; unavailable vendor qualification is not inferred |
 | Open CUDA resident | Strict CUDA and automatic CUDA selection use exact model/provider evidence; canonical effect composition and geometry are integrated | Bounded generated-input/in-memory-writer evidence is recorded above; final integrated evidence and critique are recorded above; family/release gates remain required |
 | Open Video compatibility | Native-to-host denoise/Eye Contact fallback is setup-only under unconstrained automatic selection, after permitted availability failure and proven safe cleanup | Strict CUDA or incompatible provider intent, mixed CUDA semantics, pending cleanup, and quarantine never take this fallback; explicit typed CPU compatibility remains separate and is not CUDA attribution |
 
@@ -256,13 +262,19 @@ explicit lease retry and retains the complete execution island while release is
 pending; immediate owners such as the current Maxine bootstrap return an
 already-complete result.
 
-The Vulkan adapter may advertise product capability only for mirror and
-fixed-center vignette, with the exact evidence described in
-[INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md). Vulkan
-matting, tracked-center vignette, Auto Frame, eye contact, video denoise,
-virtual key light, and virtual-background modes retain their existing
-production, degraded, experimental, diagnostics-only, or blocked states.
-Creating a generic Vulkan adapter does not promote them.
+The Vulkan adapter advertises mirror/fixed-center vignette from their exact
+evidence and the four matting consumers only after real reviewed model/runtime
+preparation. Matting adopts one ncnn-owned context/provider/queue before native
+resources, loads sealed verified file snapshots, records a reusable GPU-only
+graph, and shares its current-frame matte across composition and key light.
+Internal ncnn submission/reset is denied; StudioCast enforces finite waits,
+allocation caps and quarantine. The user's unavailable-hardware decision permits
+deployment feedback without claiming AMD/Intel qualification. Exact predicates
+and remaining limits are in
+[INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md) and
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
+Tracked-center vignette, Auto Frame, eye contact and video denoise retain their
+previous limitations. Creating a generic adapter alone promotes no capability.
 
 `production_video_setup_request.*` owns the shared
 `BuildProductionVideoBackendSetupRequest` builder used by the camera pipeline

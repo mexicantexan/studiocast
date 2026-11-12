@@ -27,12 +27,12 @@ struct CapabilityRow {
 constexpr std::array<CapabilityRow, 9> kExpectedCapabilities{{
     {kEffectIdMirror, "production usable",
      "open_vulkan_mirror_production_ready"},
-    {kEffectIdVirtualBackgroundBlur, "experimental",
-     "open_vulkan_matting_unavailable"},
-    {kEffectIdVirtualBackgroundRemove, "experimental",
-     "open_vulkan_matting_unavailable"},
-    {kEffectIdVirtualBackgroundReplace, "experimental",
-     "open_vulkan_matting_unavailable"},
+    {kEffectIdVirtualBackgroundBlur, "production usable (opt-in matting)",
+     "open_vulkan_matting_production_ready"},
+    {kEffectIdVirtualBackgroundRemove, "production usable (opt-in matting)",
+     "open_vulkan_matting_production_ready"},
+    {kEffectIdVirtualBackgroundReplace, "production usable (opt-in matting)",
+     "open_vulkan_matting_production_ready"},
     {kEffectIdAutoFrame,
      "usable with degraded behavior; unavailable on the analyzed machine",
      "vulkan_auto_frame_yunet_unavailable"},
@@ -40,8 +40,8 @@ constexpr std::array<CapabilityRow, 9> kExpectedCapabilities{{
      "open_vulkan_eye_contact_unavailable"},
     {kEffectIdVideoNoiseRemoval, "diagnostics-only / stub-unavailable",
      "open_vulkan_video_noise_removal_unavailable"},
-    {kEffectIdVirtualKeyLight, "experimental",
-     "open_vulkan_matting_unavailable"},
+    {kEffectIdVirtualKeyLight, "production usable (opt-in matting)",
+     "open_vulkan_matting_production_ready"},
     {kEffectIdVignette, "production usable (fixed center only)",
      "open_vulkan_vignette_fixed_center_production_ready"},
 }};
@@ -85,9 +85,8 @@ bool TestAuditCoversCanonicalEffects() {
   ok &= Require(ids.size() == kExpectedCapabilities.size(),
                 "capability matrix must cover exactly nine effects");
   ok &= Require(
-      Contains(audit,
-               "Mirror and fixed-center vignette are the only canonical "
-               "effects currently") &&
+      Contains(audit, "The four matting consumers additionally require") &&
+          Contains(audit, "matting_parity_validated") &&
           Contains(audit, "`effect.<id>.cpu.no_selectable_production_path`") &&
           Contains(audit, "`available_effects` is useful live-stage evidence "
                           "but is never sufficient"),
@@ -158,16 +157,24 @@ bool TestStaticHalPreservesTheExactProductionSet() {
           Contains(source, "caller.intent.requested_provider != kProvider") &&
           Contains(source, "semantic != hal::SemanticEffectId::mirror") &&
           Contains(source, "semantic != hal::SemanticEffectId::vignette") &&
+          Contains(source, "ValidateProductionNcnnVulkanMattingPack") &&
+          Contains(source, "snapshot.artifacts") &&
           Contains(source, "ExactTerminalBackendResolvedOutputTail") &&
           Contains(source, "result.plan.cpu_tail_count = 0"),
-      "Vulkan setup source must bind strict selection, two effects, and zero "
-      "CPU tails");
+      "Vulkan setup must bind strict selection, verified model artifacts and "
+      "zero CPU tails");
   ok &= Require(
       Contains(factory, "semantic_capabilities[0] = ProductionCapability") &&
           Contains(factory, "SemanticEffectId::vignette") &&
           Contains(factory, "semantic_capabilities[1] = ProductionCapability") &&
           Contains(factory, "SemanticEffectId::mirror") &&
           Contains(factory, "semantic_capability_count = 2") &&
+          Contains(factory, "matting_production_ready") &&
+          Contains(factory, "vulkan_model_artifacts_valid") &&
+          Contains(factory, "SemanticEffectId::virtual_background_blur") &&
+          Contains(factory, "SemanticEffectId::virtual_background_remove") &&
+          Contains(factory, "SemanticEffectId::virtual_background_replace") &&
+          Contains(factory, "SemanticEffectId::virtual_key_light") &&
           Contains(factory, "vulkan_exact_device_shared") &&
           Contains(factory, "vulkan_no_intermediate_readbacks"),
       "Vulkan factory capability set or evidence changed");
@@ -193,6 +200,9 @@ bool TestBlockedAndExperimentalEvidenceRemainsFailClosed() {
       root / "src/core/video/open_vulkan_video_noise_removal.h");
   const std::string spike =
       ReadFile(root / "docs/vulkan_matting_ncnn_spike.md");
+  const std::string native = ReadFile(
+      root / "src/core/open_video/ncnn_vulkan_matting_runtime.cpp");
+  const std::string dependency = ReadFile(root / "cmake/Ncnn.cmake");
   bool ok = Require(!diagnostics.empty() && !device.empty() && !eye.empty() &&
                         !denoise.empty() && !spike.empty(),
                     "Vulkan fail-closed evidence sources are missing");
@@ -216,9 +226,12 @@ bool TestBlockedAndExperimentalEvidenceRemainsFailClosed() {
       "diagnostics-only effects must not gain a callable or CPU fallback path");
   ok &= Require(
       Contains(spike, "not a production capability contract") &&
-          Contains(spike, "therefore remains fail-closed") &&
-          Contains(spike, "reviewed external-device import needed"),
-      "ncnn Vulkan matting must retain the exact-device fail-closed boundary");
+          Contains(native, "OpenVerifiedModelFileSnapshot") &&
+          Contains(native, "net.load_param(parameters.get())") &&
+          Contains(native, "net.load_model(weights.get())") &&
+          Contains(dependency, "NCNN_STUDIOCAST_REPLAY_ABI != 2"),
+      "production matting needs verified snapshots and the bounded replay ABI; "
+      "the historical spike cannot attest readiness");
   return ok;
 }
 
