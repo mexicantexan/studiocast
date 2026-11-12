@@ -295,9 +295,21 @@ transactions succeeded with all five pack files exact; receipt:
 Logs use `/tmp/studiocast-modnet-promotion-*-20261112.log` (green backend,
 packaging, and Qt suffixes); initial fail-closed logs are retained.
 
-Root post-integration broad tests and fresh independent critique follow before
-claiming this promotion complete. Existing runtime/native qualification limits
-are unchanged; this phase does not claim newly executed hardware tests.
+Root post-integration production and disabled builds passed. Production CTest
+passed 88 registered / 82 executed / six expected skips / zero failures
+(32.56 s); disabled CTest passed 81 / 76 / five / zero (32.32 s), using temporary
+HOME/XDG roots. The all-optional CUDA/Vulkan/audio/dlib build also passed;
+its CTest passed 88 registered / 82 executed / six expected skips / zero failures
+(23.65 s). All three configurations are green before fresh final review. Logs:
+`/tmp/studiocast-modnet-final-{production,disabled,all-enabled}-{build,ctest}-20261112.log`.
+Root additionally performed an actual immutable public HTTPS transaction using
+the integrated catalog, then an offline transaction whose transport raises if
+called. Both succeeded and all five files matched pinned hashes. Receipt:
+`/tmp/studiocast-modnet-public-transaction-20261112-0gqczid9/receipt.json`.
+The 41-file docs validator, shell syntax, and diff checks passed. Fresh
+independent critique follows broad verification. Existing runtime/native
+qualification limits are unchanged; this phase does not claim new real-model
+hardware qualification.
 
 ## Remaining delivery boundaries
 
