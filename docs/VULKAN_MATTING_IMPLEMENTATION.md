@@ -1,7 +1,7 @@
 # Production Vulkan matting implementation
 
 - Status: Local implementation and native matrix complete; broad verification complete;
-  final critique remediation in progress; model publication/catalog pending approval
+  post-remediation final critique pending; model publication/catalog pending approval
 - Baseline: `51b96122ab2ccca92af9bed35c86c7fe8e5060a0`, branch `v0.2.9`
 - User decision, 2026-11-11: implement production Vulkan matting and its model
   and validation requirements; validate available hardware and record unavailable
@@ -66,7 +66,8 @@ files; implementation agents used isolated worktrees.
 | `vulkan_pipeline_design` / `codex/vulkan-matting-pipeline-20261111` | `222b025`, `7250f3f`, `9b98cb5`, `5b71597`, `6209a26`, `58612f0`, `8eb16cf`, `a90a2d9` | `5951f0b`, `9ce89d3`, `fa0311d`, `db6937a`, `342136d`, `ab5d09b`, `22c8724` |
 | `vulkan_model_design` / `codex/modnet-ncnn-conversion-20261111` | `ac93711` | `46f743f` |
 | `vulkan_matting_docs` / `codex/vulkan-matting-docs-20261111` | `0dc32c4` | `0219ee6` |
-| Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743` | Direct focused commits; no parallel writes to shared files |
+| `vulkan_runtime_notices` / `codex/vulkan-runtime-notices-20261111` | `aeb9266` | `8300939` |
+| Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743`, `b346f96`, `763b5ee` | Direct focused commits; no parallel writes to shared files |
 | `vulkan_matting_safety_audit` | Read-only interim audit; no commit | Confirmed findings repaired as described below |
 
 The four consumers now execute through the real neutral production manager,
@@ -213,8 +214,24 @@ capability/model/status binaries. It found one valid Medium gap: ncnn-enabled
 Runtime install omitted the full ncnn/glslang notices and dependency receipt,
 which existed only in the isolated SDK prefix. The Qt-only Installer AppImage
 does not link ncnn. Root accepted and delegated the repair to
-`vulkan_runtime_notices` on `codex/vulkan-runtime-notices-20261111`; a fresh
-post-remediation independent critique will follow integration and revalidation.
+`vulkan_runtime_notices` on `codex/vulkan-runtime-notices-20261111`. Focused
+commit `aeb9266`, integrated as `8300939`, now requires nonempty full notices and
+an exact upstream/glslang/replay/current-patch receipt from the selected SDK
+prefix, snapshots all three inputs, and installs them in Runtime. The OFF
+configuration needs no optional files. Twelve packaging tests pass, including
+actual component staging and missing/empty/malformed/identity rejection. The
+real production Runtime (actual binaries) installed into temporary prefix
+`/tmp/studiocast-actual-runtime-stage-20261111-qvlszbr_`; all three installed
+files exactly match the selected helper prefix (ncnn 6,427 bytes, glslang
+54,615 bytes, receipt 241 bytes). Receipt and hashes:
+`/tmp/studiocast-vulkan-matting-post-notices-runtime-receipt-20261111.json`.
+Post-integration builds passed. Production CTest passed 88 total / 82 executed /
+six expected skips / zero failures (27.83 s); disabled CTest passed 81 total /
+76 executed / five expected skips / zero failures (29.48 s), under temporary
+HOME/XDG roots. Both include all 12 packaging tests. Logs:
+`/tmp/studiocast-vulkan-matting-post-notices-{production,disabled}-ctest-20261111.log`.
+The 41-file docs validator and diff check passed. A fresh post-remediation
+independent critique follows this revalidation.
 
 ## Remaining delivery boundaries
 
