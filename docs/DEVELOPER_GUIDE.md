@@ -206,9 +206,9 @@ when the full dependency bundle is skipped.
 
 Installer review text must state that Open Vulkan is optional and runtime-loaded
 and still requires a working GPU driver/ICD. It must not equate loader/device
-availability with production inference parity: production Vulkan
-virtual-background matting remains blocked until a device-resident Vulkan
-inference runtime is implemented.
+availability with production inference parity. Vulkan matting additionally
+requires the opt-in pinned inference build, converted model artifacts, and
+exact per-effect runtime evidence described below.
 
 The installer backend supports Ubuntu 22.04/Jammy, Ubuntu 24.04/Noble, and Linux
 Mint when `/etc/os-release` exposes a reliable Ubuntu base. Mint
@@ -592,10 +592,11 @@ Open Vulkan is optional and runtime-loaded. Build with
 install loader/diagnostic packages with `./scripts/setup.sh --vulkan-runtime`
 and Mesa Intel/AMD ICD packages with `--mesa-vulkan`; these packages do not
 promise hardware support. Runtime/device availability also does not imply
-production Vulkan virtual-background matting readiness: until a
-device-resident Vulkan matting runtime is available, daemon status must report
-Open Vulkan virtual background as blocked/degraded instead of silently running
-CUDA.
+production Vulkan virtual-background matting readiness. The optional resident
+ncnn integration below must prepare and warm the exact model on the selected
+device before the daemon can report its four matting consumers ready. Missing
+build, model, or runtime evidence remains blocked instead of silently running
+CUDA or CPU inference.
 
 Production Vulkan expansion follows CUDA parity in bounded, independently
 reviewed phases. Each phase needs an adapter with exact resource and execution-
@@ -603,8 +604,10 @@ domain ownership, models that satisfy the documented conversion and checksum
 contract where inference is involved, and real-hardware evidence for the
 claimed device families. These are qualification requirements, not promises
 that the remaining Vulkan effects are available. In particular, Vulkan
-matting stays blocked until reviewed shared-device GPU-only inference and
-converted, checksummed model artifacts satisfy the resident-runtime contract.
+matting requires reviewed shared-device GPU-only inference and converted,
+checksummed model artifacts satisfying the resident-runtime contract. The
+implementation is opt-in; its available-hardware evidence does not qualify
+unavailable device families or the remaining Vulkan model effects.
 
 Keep implementation, production routing, hardware qualification, and release
 publication as separate evidence. Local canonical CUDA composition is integrated
@@ -619,9 +622,11 @@ axes are checked before native acquisition. Failed submitted frames freeze
 normal work and require a bound retirement fence; device loss is not release
 proof. Exact unsubmitted-binding retirement is integrated at `7810477`.
 Disabled final-stage timing is fixed at `2e70c1b`; Vulkan shutdown now retains
-its context until the submission guard unlocks (`2623b88`). Final source is
-`b204b0a`; current test/review results and sanitizer limits are recorded in the
-HAL evidence table.
+its context until the submission guard unlocks (`2623b88`). The previous CUDA
+parity source checkpoint is `b204b0a`; its test/review results and sanitizer
+limits are recorded in the HAL evidence table. The subsequent Vulkan matting
+work and validation are tracked in
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
 
 A failed temporal reset must invalidate stale output attribution and prevent
 execution/publication until a valid program is prepared. Preserve this gate for
@@ -683,6 +688,62 @@ relying on a changed adapter for a running pipeline.
 
 Canonical video effects are persisted under `video.effects.json` in the daemon
 config.
+
+## Building resident Vulkan matting
+
+`STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING` defaults to `OFF`. Enabling it
+requires `STUDIOCAST_ENABLE_OPEN_VULKAN=ON` and the reviewed ncnn replay ABI 2.
+A plain upstream ncnn package, even with Vulkan enabled, is rejected at configure
+time. The separate `STUDIOCAST_ENABLE_NCNN_SPIKE` option is not required.
+
+Provide an existing exact ncnn checkout at
+`24ea07e87f544a3fbc59980b57885a92c75f2d24`, with its glslang submodule at
+`5017667d5a5300dff6aab57db1931a495ff9a10c`. The helper exports committed
+sources, applies `cmake/patches/ncnn-studiocast-replay.patch`, builds and installs
+only beneath a new output directory, and writes a dependency receipt and
+licenses. It performs no network or system package installation:
+
+```bash
+python3 scripts/build_ncnn_vulkan_dependency.py \
+  --source /path/to/exact/ncnn-checkout \
+  --output /tmp/studiocast-ncnn-dependency --jobs 4
+cmake -S . -B build-vulkan-matting -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+  -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+  -DCMAKE_PREFIX_PATH=/tmp/studiocast-ncnn-dependency/prefix
+cmake --build build-vulkan-matting
+```
+
+The dependency `--output` must not exist. Alternatively pass
+`-Dncnn_DIR=/tmp/studiocast-ncnn-dependency/prefix/lib/cmake/ncnn` to CMake.
+Use the patch and helper from the same StudioCast checkout; do not reuse a
+prefix produced by an earlier patch just because its upstream commit matches.
+
+The production owner adopts ncnn's exact logical context and compute queue
+before allocating StudioCast resources. It matches the configured physical
+device and uses the same Vulkan provider entry point, allocator ownership, and
+submission protocol throughout. Preparation loads immutable verified artifact
+snapshots, rejects CPU layers and host tensor bridges, allocates fixed resident
+buffers, records inference once, and warms it up. Frames replay the graph under
+StudioCast's bounded submission/completion protocol; the complete context is
+bounded to 256 MiB and 512 resources. Failed or unproven completion retains the
+whole island until quiescence is proven.
+
+The four consumers are background blur, remove, replace, and virtual key light.
+They share one same-frame matte and can compose with resident mirror,
+fixed-center vignette, and final resize through
+`ProductionVideoBackendManager`. The intended transfer shape is one upload,
+zero intermediate readbacks or CPU tails, and one final writer-boundary
+readback. Vulkan Eye Contact, video denoise, Auto Frame tracking, and
+tracked-center vignette remain unavailable. Selected/readiness state is not
+active state: the writer must successfully commit the output first.
+
+Model conversion, schema, exact artifact identities, and isolated validation
+are documented in [how_to_add_your_own_model.md](how_to_add_your_own_model.md).
+For required native commands and remaining hardware/quality gates, use
+[MANUAL_TESTING.md](MANUAL_TESTING.md). The original
+[vulkan_matting_ncnn_spike.md](vulkan_matting_ncnn_spike.md) remains a historical
+CPU-transfer experiment, separate from this resident implementation.
 
 ## Model installation and validation
 
