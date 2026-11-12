@@ -53,6 +53,19 @@ validation evidence will be recorded as each component is accepted.
 
 ## Validation and remaining work
 
+Scope extension: the preceding pushed baseline's CI run `43031290469` exposed
+three bounded delivery failures. Root owns the repair: explicitly include
+`<algorithm>` in the Open CUDA factory; use ONNX Runtime's stable C API for
+free-dimension overrides so the pinned 1.17.3 headers compile; and stage the
+installer's imported `typed_video_status.py` module. Packaging fixtures now use
+the CMake-selected module list so missing install entries affect real imports.
+The original logs are retained at
+`/tmp/studiocast-vulkan-task-pr-ci-failures-20261111.log`.
+The repaired translation unit compiled against the actual upstream ORT 1.17.3
+headers (syntax check exit 0), the optional-backend-off Open Video target built,
+all nine packaging tests passed, shell syntax passed, and the 41-file docs
+validator passed. Broad integrated verification remains pending.
+
 Pending: runtime, model, and pipeline implementation; focused tests; integrated
 optional-backend-off/on builds and CTest; available P1000 native model-backed
 tests; model-source publication decision; documentation reconciliation; and fresh

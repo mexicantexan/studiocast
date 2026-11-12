@@ -1122,8 +1122,8 @@ CreateOrtSessionForPlan(void *context, internal::OrtSessionCreateAttempt,
     so.SetInterOpNumThreads(1);
     so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
     for (const auto &dimension : session_opts.free_dimension_overrides) {
-      so.AddFreeDimensionOverrideByName(dimension.name.c_str(),
-                                        dimension.extent);
+      Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+          so, dimension.name.c_str(), dimension.extent));
     }
     if (session_opts.provider_policy ==
         OrtProviderPolicy::strict_cuda_only) {

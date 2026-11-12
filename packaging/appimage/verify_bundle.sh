@@ -170,7 +170,7 @@ verify_staged_metadata() {
     "${appdir}/usr/share/studiocast/installer/studiocast-installer-backend" \
     --help
   local backend_module
-  for backend_module in __init__.py cli.py contracts.py executor.py facts.py manifest.py packaged.py plan.py recommendation.py; do
+  for backend_module in __init__.py cli.py contracts.py executor.py facts.py manifest.py packaged.py plan.py recommendation.py typed_video_status.py; do
     require_file "${appdir}/usr/share/studiocast/installer/studiocast_installer_backend/${backend_module}"
   done
   require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"

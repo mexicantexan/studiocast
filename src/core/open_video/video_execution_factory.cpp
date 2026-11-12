@@ -2,6 +2,7 @@
 #include "core/open_video/open_cuda_selection_policy.h"
 #include "core/video/production_video_backend_manager.h"
 
+#include <algorithm>
 #include <limits>
 #include <new>
 #include <utility>

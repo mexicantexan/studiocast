@@ -72,6 +72,7 @@ install(FILES
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/packaged.py
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/plan.py
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/recommendation.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/typed_video_status.py
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/studiocast_installer_backend"
         COMPONENT Installer
 )

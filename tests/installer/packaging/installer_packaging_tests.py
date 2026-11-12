@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 BACKEND_PACKAGE = ROOT / "installer/backend/studiocast_installer_backend"
 BACKEND_MODULES = (
     "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
-    "manifest.py", "packaged.py", "plan.py", "recommendation.py",
+    "manifest.py", "packaged.py", "plan.py", "recommendation.py", "typed_video_status.py",
 )
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
@@ -102,11 +103,13 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.backend_path = installer / "studiocast-installer-backend"
         shutil.copy2(BACKEND, self.backend_path)
         self.backend_path.chmod(0o755)
-        shutil.copytree(
-            BACKEND_PACKAGE,
-            installer / BACKEND_PACKAGE.name,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-        )
+        # Stage the CMake-selected modules rather than the whole source package,
+        # so a missing install entry fails the packaged backend's real imports.
+        backend_package = installer / BACKEND_PACKAGE.name
+        backend_package.mkdir()
+        install_rules = (ROOT / "installer/CMakeLists.txt").read_text(encoding="utf-8")
+        for module in re.findall(r"installer/backend/studiocast_installer_backend/([\w]+\.py)", install_rules):
+            shutil.copy2(BACKEND_PACKAGE / module, backend_package / module)
         shutil.copytree(ROOT / "installer/release", installer / "release",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copytree(ROOT / "installer/models", installer / "models",
