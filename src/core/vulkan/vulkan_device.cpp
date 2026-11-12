@@ -957,6 +957,9 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << BoolJson(matting_model_contract_validated) << ",";
   oss << "\"matting_production_ready\":" << BoolJson(matting_production_ready)
       << ",";
+  oss << "\"matting_parity_validated\":" << BoolJson(matting_parity_validated)
+      << ",";
+  oss << "\"matting_cpu_fallback_count\":" << matting_cpu_fallback_count << ",";
   oss << "\"matting_reason_code\":\"" << JsonEscape(matting_reason_code)
       << "\",";
   oss << "\"matting_blocker_code\":\"" << JsonEscape(matting_blocker_code)

@@ -659,7 +659,7 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_vulkan_backend_optional_sources})
     math(EXPR _studiocast_expected_source_count
-            "${_studiocast_expected_source_count} + 17")
+            "${_studiocast_expected_source_count} + 19")
 endif ()
 if (PULSE_SIMPLE_FOUND)
     list(APPEND _studiocast_expected_sources
