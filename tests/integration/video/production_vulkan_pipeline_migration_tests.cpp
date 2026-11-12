@@ -86,6 +86,9 @@ void TestVulkanSetupSourceOwnsExactSelectionAndTailBinding() {
             source.find("ProductionVideoSetupLease::Acquire") !=
                 std::string::npos,
         "Vulkan setup source must bind a typed domain and owned lease");
+  Check(source.find("snapshot.artifacts[snapshot.artifact_count++]") != std::string::npos &&
+            source.find("stage.intent.semantic, kProvider, stage.model") != std::string::npos,
+        "model-backed Vulkan setup must bind each exact semantic artifact into its lease");
 }
 
 void TestVulkanAdapterClaimsOnlyQualifiedOperations() {
