@@ -564,6 +564,8 @@ bool TestMattingFinalGeometryContract() {
   stage.parameters[2].id = video::CanonicalVideoParameterId::greenscreen_mode;
   stage.parameters[2].kind =
       video::CanonicalVideoParameterKind::unsigned_integer;
+  stage.parameters[2].unsigned_value =
+      3; // Maxine-only mode is opaque to Vulkan.
   stage.parameters[3].id =
       video::CanonicalVideoParameterId::greenscreen_temporal;
   stage.parameters[3].kind = video::CanonicalVideoParameterKind::boolean;
@@ -581,8 +583,8 @@ bool TestMattingFinalGeometryContract() {
       status == hal::StatusId::ready &&
           snapshot.plan.prepared_program.stages[0].output.image.width == 2 &&
           snapshot.plan.prepared_program.stages[0].output.image.height == 1,
-      "standalone matting consumer must bind its final resident resize to "
-      "writer geometry");
+      "standalone matting must bind writer geometry while leaving Maxine-only "
+      "knobs opaque");
 }
 
 bool TestShutdownRetainsUnprovenNativeOwner() {
