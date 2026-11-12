@@ -1,7 +1,7 @@
 # Production Vulkan matting implementation
 
-- Status: Local implementation and native matrix complete; broad verification complete;
-  post-remediation final critique pending; model publication/catalog pending approval
+- Status: Local implementation, native matrix, broad verification, and fresh final
+  critique complete; model publication/catalog pending explicit approval
 - Baseline: `51b96122ab2ccca92af9bed35c86c7fe8e5060a0`, branch `v0.2.9`
 - User decision, 2026-11-11: implement production Vulkan matting and its model
   and validation requirements; validate available hardware and record unavailable
@@ -67,8 +67,10 @@ files; implementation agents used isolated worktrees.
 | `vulkan_model_design` / `codex/modnet-ncnn-conversion-20261111` | `ac93711` | `46f743f` |
 | `vulkan_matting_docs` / `codex/vulkan-matting-docs-20261111` | `0dc32c4` | `0219ee6` |
 | `vulkan_runtime_notices` / `codex/vulkan-runtime-notices-20261111` | `aeb9266` | `8300939` |
-| Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743`, `b346f96`, `763b5ee` | Direct focused commits; no parallel writes to shared files |
+| Root / integration branch | `c77f93f`, `5ee1586`, `8860c73`, `27d5623`, `2e1d6f8`, `b5bc89d`, `13846de`, `cd3c743`, `b346f96`, `763b5ee`, `acad9d0` | Direct focused commits; no parallel writes to shared files |
 | `vulkan_matting_safety_audit` | Read-only interim audit; no commit | Confirmed findings repaired as described below |
+| `vulkan_final_critique` | Read-only first final critique; no commit | One Medium packaging finding, repaired and integrated |
+| `vulkan_post_remediation_critique` | Read-only fresh final critique; no commit | Approved integrated `acad9d0`; no unresolved finding |
 
 The four consumers now execute through the real neutral production manager,
 setup leases, and prepared Vulkan island. The exact selected physical GPU and
@@ -230,12 +232,26 @@ six expected skips / zero failures (27.83 s); disabled CTest passed 81 total /
 76 executed / five expected skips / zero failures (29.48 s), under temporary
 HOME/XDG roots. Both include all 12 packaging tests. Logs:
 `/tmp/studiocast-vulkan-matting-post-notices-{production,disabled}-ctest-20261111.log`.
-The 41-file docs validator and diff check passed. A fresh post-remediation
-independent critique follows this revalidation.
+The 41-file docs validator and diff check passed.
+
+Fresh critic `vulkan_post_remediation_critique` approved integrated
+`acad9d0b1a82acf8228d05d76396070068c2c740`, with no unresolved
+Blocker/Critical/High or other confirmed unmet requirement in the bounded local
+implementation. It independently passed packaging 12/12 (7.390 s), converter
+7/7 (0.278 s), workflow 5/5 (0.343 s), six production lifecycle/adapter/lifetime/
+model/status/capability binaries, and the disabled factory binary. A separate
+Runtime fixture install after deleting its SDK prefix preserved all three exact
+configure-time snapshots. It independently compared the actual staged production
+notices/receipt to the real selected SDK; all three matched. Its diff check
+passed and audit worktree stayed clean. It reviewed the broad/native logs but
+did not rerun GPU tests or claim unavailable qualification. Root verified that
+all 16 accepted implementation commits are ancestors of integration HEAD.
+Final handoff is on `v0.2.9`; subsequent ledger-only changes do not change the
+reviewed runtime or packaging behavior. No accepted implementation remains on
+an unmerged topic branch.
 
 ## Remaining delivery boundaries
 
-- Complete fresh final critique and record its exact result here.
 - Await explicit model publication decision; then verify remote bytes before
   catalog/template promotion and rerun affected model/installer/packaging checks.
 - Collect unavailable hardware, real-camera/visual-quality, and optimized latency
