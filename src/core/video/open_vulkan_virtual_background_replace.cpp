@@ -287,6 +287,7 @@ bool OpenVulkanVirtualBackgroundReplace::EnsureInitialized(
     asset_valid_ = false;
     initialized_ = false;
   }
+  setup_diagnostics_ = kernels->Diagnostics();
   kernels_ = kernels;
   context_identity_ = identity;
   width_ = width;
@@ -363,6 +364,7 @@ bool OpenVulkanVirtualBackgroundReplace::Apply(
     return fail("counter output is null");
   if (!initialized_ || !asset_valid_ || !kernels_ || !kernels_->device())
     return fail("wrapper or replacement asset is not initialized");
+  if (!kernels_->device()->health_state().healthy()) return fail("shared Vulkan context is unhealthy");
   if (kernels_->device()->context_identity() != context_identity_) {
     return fail("[vulkan_context_generation_changed] shared Vulkan context "
                 "generation changed");
@@ -376,7 +378,7 @@ bool OpenVulkanVirtualBackgroundReplace::Apply(
   const auto &runtime = matting.runtime;
   const auto current_readiness =
       EvaluateOpenVulkanVirtualBackgroundReplaceReadiness(
-          kernels_->Diagnostics(), matting);
+          setup_diagnostics_, matting);
   if (!current_readiness.production_ready) {
     return fail(StableFailure(current_readiness.reason_code,
                               current_readiness.detail, {}));

@@ -25,26 +25,28 @@ public:
     int warmup_runs = 1;
   };
 
-  OpenVulkanMattingSession(
-      studiocast::vulkan::VulkanDevice *device,
-      studiocast::vulkan::kernels::UtilityKernels *kernels,
-      studiocast::open_video::ModelPack pack);
-  OpenVulkanMattingSession(
-      studiocast::vulkan::VulkanDevice *device,
-      studiocast::vulkan::kernels::UtilityKernels *kernels,
-      studiocast::open_video::ModelPack pack, Options opts);
+  OpenVulkanMattingSession(studiocast::vulkan::VulkanDevice *device,
+                           studiocast::vulkan::kernels::UtilityKernels *kernels,
+                           studiocast::open_video::ModelPack pack);
+  OpenVulkanMattingSession(studiocast::vulkan::VulkanDevice *device,
+                           studiocast::vulkan::kernels::UtilityKernels *kernels,
+                           studiocast::open_video::ModelPack pack,
+                           Options opts);
   // Runtime injection is a focused no-GPU test seam. Production construction
   // uses the fail-closed adapter selected by the build.
-  OpenVulkanMattingSession(
-      studiocast::vulkan::VulkanDevice *device,
-      studiocast::vulkan::kernels::UtilityKernels *kernels,
-      studiocast::open_video::ModelPack pack, Options opts,
-      std::unique_ptr<VulkanMattingRuntime> runtime);
+  OpenVulkanMattingSession(studiocast::vulkan::VulkanDevice *device,
+                           studiocast::vulkan::kernels::UtilityKernels *kernels,
+                           studiocast::open_video::ModelPack pack, Options opts,
+                           std::unique_ptr<VulkanMattingRuntime> runtime);
   ~OpenVulkanMattingSession();
 
   OpenVulkanMattingSession(const OpenVulkanMattingSession &) = delete;
   OpenVulkanMattingSession &
   operator=(const OpenVulkanMattingSession &) = delete;
+
+  bool BindAlphaOutputForSetup(const studiocast::vulkan::VulkanImage *alpha,
+                               std::string *error_out);
+  void UpdateCachedReadiness(VulkanMattingReadiness *readiness) const;
 
   bool EnsureInitialized(int frame_w, int frame_h, std::string *error_out);
   bool Warmup(std::string *error_out);

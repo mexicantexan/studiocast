@@ -585,6 +585,27 @@ bool TestStructuralCorruption() {
           CapabilityValidationCode::vulkan_matrix_inconsistent,
       "Vulkan production success must include all common and per-effect "
       "typed evidence");
+  for (const auto effect : {SemanticEffectId::virtual_background_blur,
+                            SemanticEffectId::virtual_background_remove,
+                            SemanticEffectId::virtual_background_replace,
+                            SemanticEffectId::virtual_key_light}) {
+    snapshot=CurrentCapabilities();
+    Promote(&snapshot,effect,ProductCapabilityLaneId::open_vulkan,BackendId::vulkan,
+            SemanticEffectProviderId::open_vulkan_production_kernels,
+            Code::open_vulkan_matting_production_ready);
+    auto *matting=Lane(&snapshot,effect,ProductCapabilityLaneId::open_vulkan);
+    ok &= Expect(studiocast::video::ValidateProductCapabilitySnapshot(snapshot).code==CapabilityValidationCode::vulkan_matrix_inconsistent,
+                 "pixel-effect readiness cannot qualify a model-backed Vulkan consumer");
+    --matting->semantic.evidence_count;
+    for (const auto code : {studiocast::hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready,
+                            studiocast::hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid})
+      matting->semantic.evidence[matting->semantic.evidence_count++]={code,StatusId::ready,ReasonId::none,effect,BackendId::vulkan,true};
+    ok &= Expect(studiocast::video::ValidateProductCapabilitySnapshot(snapshot).code==CapabilityValidationCode::valid,
+                 "exact resident model and runtime evidence should qualify only the named consumer");
+    --matting->semantic.evidence_count;
+    ok &= Expect(studiocast::video::ValidateProductCapabilitySnapshot(snapshot).code==CapabilityValidationCode::vulkan_matrix_inconsistent,
+                 "a missing model-artifact attestation must fail closed");
+  }
   return ok;
 }
 

@@ -134,6 +134,7 @@ private:
   bool source_valid_ = false;
   bool asset_valid_ = false;
   bool initialized_ = false;
+  studiocast::vulkan::OpenVulkanDiagnostics setup_diagnostics_{};
 };
 
 } // namespace studiocast::video

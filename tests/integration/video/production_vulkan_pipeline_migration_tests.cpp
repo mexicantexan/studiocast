@@ -75,7 +75,7 @@ void TestVulkanSetupSourceOwnsExactSelectionAndTailBinding() {
             std::string::npos &&
             source.find("semantic != hal::SemanticEffectId::vignette") !=
                 std::string::npos,
-        "Vulkan setup source must admit only mirror and vignette");
+        "Vulkan setup source must explicitly gate native final semantics");
   Check(source.find("ExactTerminalBackendResolvedOutputTail") !=
             std::string::npos &&
             source.find("result.plan.cpu_tail_count = 0") !=
@@ -102,7 +102,10 @@ void TestVulkanAdapterClaimsOnlyQualifiedOperations() {
             factory.find("SemanticEffectId::mirror") != std::string::npos &&
             factory.find("semantic_capability_count = 2") !=
                 std::string::npos,
-        "Vulkan factory capability set must remain exactly two effects");
+        "Vulkan factory must retain the two independent final capabilities");
+  Check(factory.find("if (evidence.matting_production_ready)") != std::string::npos &&
+            factory.find("vulkan_matting_runtime_ready") != std::string::npos,
+        "matting registrations must require production runtime readiness");
   Check(adapter.find("program.cpu_tail_count != 0") != std::string::npos &&
             adapter.find("ReasonId::cpu_tail_required") !=
                 std::string::npos &&

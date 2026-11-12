@@ -522,6 +522,12 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
         return CapabilityCode::
             open_vulkan_vignette_fixed_center_production_ready;
       }
+      if (effect == hal::SemanticEffectId::virtual_background_blur ||
+          effect == hal::SemanticEffectId::virtual_background_remove ||
+          effect == hal::SemanticEffectId::virtual_background_replace ||
+          effect == hal::SemanticEffectId::virtual_key_light) {
+        return CapabilityCode::open_vulkan_matting_production_ready;
+      }
       return CapabilityCode::none;
     case Lane::cpu:
     case Lane::invalid:
@@ -550,9 +556,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
     return hal::SemanticEffectProviderId::invalid;
   };
   const auto desired_backend = [&](hal::SemanticEffectId effect) {
-    if ((effect == hal::SemanticEffectId::mirror ||
-         effect == hal::SemanticEffectId::vignette) &&
-        input.compute_backend == ComputeBackendPreference::vulkan) {
+    if (input.compute_backend == ComputeBackendPreference::vulkan) {
       return hal::BackendId::vulkan;
     }
     if (input.effects->engine == effects::EffectsEnginePreference::open_cuda)

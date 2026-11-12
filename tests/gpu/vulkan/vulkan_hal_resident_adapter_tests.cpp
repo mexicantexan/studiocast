@@ -563,11 +563,12 @@ bool TestCapabilityAndSemanticGates() {
                   "unsupported-semantic options should bind");
     ReasonId reason = ReasonId::none;
     ReadinessSnapshot readiness;
-    ok &= Require(session.Configure(program, adapter, &readiness, &reason) ==
-                          StatusId::blocked &&
-                      reason == ReasonId::semantic_effect_unsupported &&
-                      executor.prepare_calls == 0,
-                  "Vulkan matting semantics must remain fail-closed");
+    ok &= Require(
+        session.Configure(program, adapter, &readiness, &reason) ==
+                StatusId::blocked &&
+            reason == ReasonId::malformed_descriptor &&
+            executor.prepare_calls == 0,
+        "Vulkan matting without an artifact identity must remain fail-closed");
   }
   {
     FakeQualifiedExecutor executor;
@@ -625,6 +626,51 @@ bool TestCapabilityAndSemanticGates() {
                       executor.prepare_calls == 0,
                   "cross-adapter Vulkan residency must fail closed");
   }
+  return ok;
+}
+
+bool TestMattingRequiresExactRuntimeAndModel() {
+  FakeQualifiedExecutor executor;
+  VulkanHalResidentAdapter adapter(kAdapterId, executor);
+  PreparedProgramSession session;
+  auto program = Program(209, true, false);
+  program.stages[0].semantic = SemanticEffectId::virtual_background_remove;
+  program.stages[0].model.artifact_generation = 1;
+  program.stages[0].model.model_id_hash[0] = 1;
+  program.stages[0].model.artifact_set_hash[0] = 2;
+  auto options = Options(program, false, false);
+  options.background = SemanticEffectId::virtual_background_remove;
+  ReasonId reason = ReasonId::none;
+  ReadinessSnapshot readiness;
+  bool ok =
+      Require(adapter.SetProgramOptions(options) &&
+                  session.Configure(program, adapter, &readiness, &reason) ==
+                      StatusId::blocked &&
+                  reason == ReasonId::capability_evidence_incomplete &&
+                  executor.prepare_calls == 0,
+              "model identity cannot replace production runtime evidence");
+  executor.evidence.matting_production_ready = true;
+  ok &= Require(
+      adapter.SetProgramOptions(options) &&
+          session.Configure(program, adapter, &readiness, &reason) ==
+              StatusId::ready &&
+          executor.prepare_calls == 1,
+      "exact matting runtime and model evidence should prepare the consumer");
+  std::array<std::uint8_t, kFrameBytes> input{}, output{};
+  ResourceHandle resource;
+  ok &= Require(adapter.BindFrame(program.program_id, 1, Binding(input, output),
+                                  &resource, &reason) == StatusId::ready,
+                "matting consumer frame should bind");
+  const auto result = session.Execute(Request(program, resource, 1));
+  ok &=
+      Require(result.status == StatusId::executed && result.stage_count == 1 &&
+                  result.stages[0].semantic ==
+                      SemanticEffectId::virtual_background_remove &&
+                  result.stages[0].status == StageExecutionStatus::succeeded &&
+                  session.CommitOutput({result.completion, true}, &reason) ==
+                      StatusId::ready,
+              "matting attribution must follow successful resident execution "
+              "and writer commit");
   return ok;
 }
 
@@ -1344,6 +1390,7 @@ int main() {
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestMetadataAllowancesFailBeforeNativePrepare();
   ok &= TestCapabilityAndSemanticGates();
+  ok &= TestMattingRequiresExactRuntimeAndModel();
   ok &= TestOptionalAndRequiredFailure();
   ok &= TestNeutralBindingAdversarialValidation();
   ok &= TestDisabledStageMaskExecution();

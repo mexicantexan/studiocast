@@ -303,6 +303,7 @@ Capability(hal::SemanticEffectId semantic,
   capability.production_eligible = true;
   capability.exact_evidence = true;
   constexpr hal::CapabilityEvidenceCode common[]{
+      hal::CapabilityEvidenceCode::vulkan_physical_device_available,
       hal::CapabilityEvidenceCode::vulkan_build_enabled,
       hal::CapabilityEvidenceCode::vulkan_loader_available,
       hal::CapabilityEvidenceCode::vulkan_non_cpu_device,
@@ -420,7 +421,12 @@ struct Fixture {
   video::VideoExecutionCoordinator coordinator;
 
   Fixture()
-      : factory(Registration(&adapter), {kFactoryId, 300}),
+      : factory(Registration(&adapter),
+                [] {
+                  vulkan::VulkanVideoExecutionFactoryConfiguration c;
+                  c.factory_id = kFactoryId;
+                  return c;
+                }()),
         coordinator(registry) {}
 
   bool Initialize() {
@@ -515,6 +521,14 @@ bool TestUnsupportedAndForeignPreflight() {
   auto request = Request();
 
   request.intent.stages[0].parameters[1].boolean_value = true;
+  auto fixed = fixture.factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  if (!Require(fixed.status == hal::StatusId::ready,
+               "tracked-center preference without a retained tracker must "
+               "preserve fixed-center behavior"))
+    return false;
+  request.intent.stages[0].intent.requires_tracked_vignette_center = true;
   auto preflight = fixture.factory.Preflight(
       request, frozen.plan.resolution, frozen.plan.domain_plan,
       video::VideoExecutionRoute::prepared_resident);
@@ -530,12 +544,17 @@ bool TestUnsupportedAndForeignPreflight() {
       request, frozen.plan.resolution, frozen.plan.domain_plan,
       video::VideoExecutionRoute::prepared_resident);
   ok &= Require(preflight.status == hal::StatusId::blocked &&
-                    preflight.reason ==
-                        hal::ReasonId::semantic_effect_unsupported,
-                "Vulkan matting semantics must remain fail-closed");
+                    preflight.reason == hal::ReasonId::malformed_contract,
+                "Vulkan matting without a bound model must remain fail-closed");
 
   vulkan::VulkanVideoExecutionFactory invalid_sync_factory(
-      Registration(&fixture.adapter), {kFactoryId + 10, 300, 0, 0});
+      Registration(&fixture.adapter), [] {
+        vulkan::VulkanVideoExecutionFactoryConfiguration c;
+        c.factory_id = kFactoryId + 10;
+        c.minimum_synchronizations_per_frame = 0;
+        c.maximum_synchronizations_per_frame = 0;
+        return c;
+      }());
   hal::ReasonId invalid_reason = hal::ReasonId::none;
   ok &= Require(invalid_sync_factory.Initialize(&invalid_reason) ==
                     hal::StatusId::ready,
@@ -841,8 +860,7 @@ int TestProductionSetupSourceIfAvailable() {
   request.effects.mirror = true;
   request.plan = Request();
   request.plan.invalidation_key.execution_domain_hash = 0;
-  request.plan.cpu_tails[0].id =
-      hal::CpuTailId::backend_resolved_output;
+  request.plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
   request.plan.cpu_tails[0].after_stage_id = 9;
   request.plan.cpu_tails[0].required = true;
   request.plan.cpu_tails[0].placement =
@@ -868,10 +886,10 @@ int TestProductionSetupSourceIfAvailable() {
                           .execution_domain.logical_context_generation,
               "production setup source must bind an exact live Vulkan lease");
   const auto shutdown = result.lease.Shutdown();
-  ok &= Require(shutdown.status == hal::StatusId::stopped &&
-                    shutdown.quiescent &&
-                    shutdown.driver_context_release_permitted,
-                "production Vulkan setup lease must shut down synchronously");
+  ok &=
+      Require(shutdown.status == hal::StatusId::stopped && shutdown.quiescent &&
+                  shutdown.driver_context_release_permitted,
+              "production Vulkan setup lease must shut down synchronously");
   return ok ? 0 : 1;
 }
 #endif

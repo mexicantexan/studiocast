@@ -98,6 +98,7 @@ private:
   int width_ = 0;
   int height_ = 0;
   bool initialized_ = false;
+  studiocast::vulkan::OpenVulkanDiagnostics setup_diagnostics_{};
 };
 
 } // namespace studiocast::video
