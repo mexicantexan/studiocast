@@ -530,6 +530,8 @@ bool TestMattingFinalGeometryContract() {
       capability;
   vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
   configuration.factory_id = kFactoryId;
+  configuration.maximum_synchronizations_per_frame =
+      video::kMaxPerFrameSynchronizationsV1;
   configuration.matting_pack = std::make_shared<open_video::ModelPack>();
   configuration.matting_identity.artifact_generation = 1;
   configuration.matting_identity.model_id_hash[0] = 3;
@@ -653,10 +655,34 @@ bool TestShutdownRetainsUnprovenNativeOwner() {
   return ok;
 }
 
+bool TestFiniteFenceTimeoutContract() {
+  FakeVulkanAdapter adapter;
+  for (const auto timeout : {UINT64_C(0), UINT64_MAX}) {
+    vulkan::VulkanVideoExecutionFactoryConfiguration config;
+    config.execution_fence_timeout_ns = timeout;
+    vulkan::VulkanVideoExecutionFactory factory(Registration(&adapter), config);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!Require(factory.Initialize(&reason) == hal::StatusId::blocked &&
+                     reason == hal::ReasonId::malformed_contract &&
+                     adapter.prepare_calls == 0,
+                 "zero or infinite fence deadlines must fail before native "
+                 "acquisition"))
+      return false;
+  }
+  vulkan::VulkanVideoExecutionFactoryConfiguration config;
+  config.execution_fence_timeout_ns = UINT64_C(100000000);
+  vulkan::VulkanVideoExecutionFactory factory(Registration(&adapter), config);
+  hal::ReasonId reason = hal::ReasonId::none;
+  return Require(
+      factory.Initialize(&reason) == hal::StatusId::ready,
+      "the finite camera 100 ms deadline must preserve valid preparation");
+}
+
 bool TestMalformedSourceStageCount() {
   auto source = vulkan::CreateProductionVideoBackendSetupSource();
   video::ProductionVideoResidentSetup request;
   request.plan = Request();
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
   request.plan.intent.stage_count = request.plan.intent.stages.size() + 1;
   const auto result = source->AcquireResidentSetup(request);
   return Require(result.status == hal::StatusId::blocked &&
@@ -1014,6 +1040,7 @@ int TestProductionSetupSourceIfAvailable() {
   request.effects.vignette.center_on_tracked_face = false;
   request.effects.mirror = true;
   request.plan = Request();
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
   request.plan.invalidation_key.execution_domain_hash = 0;
   request.plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
   request.plan.cpu_tails[0].after_stage_id = 9;
@@ -1056,6 +1083,7 @@ int main() {
   ok &= TestExactFactoryAndCommit();
   ok &= TestMattingFinalGeometryContract();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
+  ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();

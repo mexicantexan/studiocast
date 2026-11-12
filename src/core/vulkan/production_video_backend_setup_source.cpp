@@ -118,6 +118,9 @@ public:
                        hal::ReasonId::semantic_effect_unsupported);
       }
     }
+    if (request.wait.timeout_nanoseconds == 0 ||
+        request.wait.timeout_nanoseconds == UINT64_MAX)
+      return Failure(hal::StatusId::blocked, hal::ReasonId::malformed_contract);
     if (caller.cpu_tail_count != 0 &&
         !ExactTerminalBackendResolvedOutputTail(caller)) {
       return Failure(hal::StatusId::blocked, hal::ReasonId::cpu_tail_required);
@@ -126,6 +129,8 @@ public:
     try {
       VulkanVideoExecutionFactoryConfiguration configuration;
       configuration.reservation = caller.budget;
+      configuration.execution_fence_timeout_ns =
+          request.wait.timeout_nanoseconds;
       configuration.input_width = static_cast<int>(caller.host_input.width);
       configuration.input_height = static_cast<int>(caller.host_input.height);
       configuration.effects =
@@ -216,7 +221,8 @@ public:
             identity.identity.registry_generation;
         configuration.matting_pack =
             std::make_shared<const open_video::ModelPack>(std::move(*selected));
-        configuration.maximum_synchronizations_per_frame = 32;
+        configuration.maximum_synchronizations_per_frame =
+            video::kMaxPerFrameSynchronizationsV1;
         configuration.minimum_synchronizations_per_frame = 2;
       }
       auto factory =

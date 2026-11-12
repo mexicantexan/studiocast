@@ -918,7 +918,9 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     SetReason(reason, impl_->reason);
     return impl_->status;
   }
-  if (impl_->configuration.factory_id == 0) {
+  if (impl_->configuration.factory_id == 0 ||
+      impl_->configuration.execution_fence_timeout_ns == 0 ||
+      impl_->configuration.execution_fence_timeout_ns == UINT64_MAX) {
     impl_->status = StatusId::blocked;
     impl_->reason = ReasonId::malformed_contract;
   } else if (impl_->injected) {
@@ -940,10 +942,19 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     }
     impl_->production = std::make_unique<Impl::Production>();
     std::string error;
-    const bool adopted = !impl_->configuration.matting_pack ||
-                         open_vulkan::InitializeProductionVulkanMattingDevice(
-                             impl_->production->kernels.device(), &error);
-    if (!adopted || !impl_->production->kernels.Initialize(&error)) {
+    VulkanDeviceConfig device_config;
+    device_config.fence_timeout_ns =
+        impl_->configuration.execution_fence_timeout_ns;
+    VulkanDeviceSelection selection;
+    const bool selected = VulkanDevice::ResolveSelection(&selection, &error);
+    const bool device_ready =
+        selected && (impl_->configuration.matting_pack
+                         ? open_vulkan::InitializeProductionVulkanMattingDevice(
+                               impl_->production->kernels.device(), selection,
+                               device_config, &error)
+                         : impl_->production->kernels.device()->Initialize(
+                               selection, device_config, &error));
+    if (!device_ready || !impl_->production->kernels.Initialize(&error)) {
       impl_->status = StatusId::unavailable;
       impl_->reason = ReasonId::capability_evidence_incomplete;
       impl_->DiscardFailedProduction();

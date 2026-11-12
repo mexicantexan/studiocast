@@ -89,6 +89,8 @@ void TestVulkanSetupSourceOwnsExactSelectionAndTailBinding() {
   Check(source.find("snapshot.artifacts[snapshot.artifact_count++]") != std::string::npos &&
             source.find("stage.intent.semantic, kProvider, stage.model") != std::string::npos,
         "model-backed Vulkan setup must bind each exact semantic artifact into its lease");
+  Check(source.find("video::kMaxPerFrameSynchronizationsV1") != std::string::npos,
+        "matting setup must preserve the facade synchronization ceiling");
 }
 
 void TestVulkanAdapterClaimsOnlyQualifiedOperations() {

@@ -18,6 +18,8 @@ struct VulkanVideoExecutionFactoryConfiguration {
   std::uint32_t selection_priority = 300;
   std::uint64_t minimum_synchronizations_per_frame = 2;
   std::uint64_t maximum_synchronizations_per_frame = 3;
+  // Maximum native wait per submission, fixed before device acquisition.
+  std::uint64_t execution_fence_timeout_ns = UINT64_C(100000000);
   std::shared_ptr<const open_video::ModelPack> matting_pack;
   std::shared_ptr<const video::effects::BroadcastCameraEffects> effects;
   hal::ModelArtifactIdentity matting_identity{};
