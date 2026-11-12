@@ -1,3 +1,4 @@
+#include "core/open_video/model_pack_registry.h"
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_context_internal.h"
 #include "core/open_video/vulkan_matting_runtime.h"
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <net.h>
 #include <unistd.h>
 #include <vector>
 namespace {
@@ -174,6 +176,78 @@ bool ReplayGuards(vk::VulkanDevice &device) {
                "replay guard submitted work");
 }
 
+bool NcnnVerifiedFileSnapshots() {
+  char pattern[] = "/tmp/studiocast-ncnn-file-snapshot-XXXXXX";
+  const char *root = mkdtemp(pattern);
+  if (!root)
+    return false;
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+    }
+  } cleanup{root};
+  const auto param = cleanup.path / "model.param",
+             bin = cleanup.path / "model.bin";
+  {
+    std::ofstream file(param);
+    file << "7767517\n2 2\nInput input 0 1 rgb\nConvolution matte 1 1 rgb "
+            "alpha 0=1 1=1 5=0 6=3\n";
+  }
+  {
+    std::ofstream file(bin, std::ios::binary);
+    const std::uint32_t tag = 0;
+    const float weights[3] = {1, 0, 0};
+    file.write(reinterpret_cast<const char *>(&tag), sizeof(tag));
+    file.write(reinterpret_cast<const char *>(weights), sizeof(weights));
+  }
+  std::string param_hash, bin_hash, error;
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          param, &param_hash, &error) ||
+      !studiocast::model_integrity_internal::ComputeSha256File(bin, &bin_hash,
+                                                               &error))
+    return false;
+  auto parameters = studiocast::open_video::OpenVerifiedModelFileSnapshot(
+      param, param_hash, 1024, &error);
+  auto weights = studiocast::open_video::OpenVerifiedModelFileSnapshot(
+      bin, bin_hash, 1024, &error);
+  if (!Check(parameters && weights, "verified ncnn FILE snapshots: " + error))
+    return false;
+  // The actual SDK must consume the verified streams even after both original
+  // files are replaced with bytes that cannot represent this network.
+  {
+    std::ofstream file(param, std::ios::trunc);
+    file << "invalid replacement graph";
+  }
+  {
+    std::ofstream file(bin, std::ios::trunc);
+    file << "invalid replacement weights";
+  }
+  ncnn::Net net;
+  net.opt.use_vulkan_compute = false;
+  net.opt.num_threads = 1;
+  if (!Check(net.load_param(parameters.get()) == 0 &&
+                 net.load_model(weights.get()) == 0,
+             "ncnn reopened replaced artifacts instead of consuming verified "
+             "FILE streams"))
+    return false;
+  ncnn::Mat input(4, 4, 3);
+  input.fill(0.25f);
+  auto extractor = net.create_extractor();
+  ncnn::Mat output;
+  if (!Check(extractor.input("rgb", input) == 0 &&
+                 extractor.extract("alpha", output) == 0,
+             "ncnn verified snapshot inference failed"))
+    return false;
+  for (int i = 0; i < 16; ++i)
+    if (!Check(std::fabs(static_cast<float *>(output.data)[i] - 0.25f) < 1e-6f,
+               "replaced source changed verified ncnn model behavior"))
+      return false;
+  std::cout << "ncnn verified FILE snapshots survive source replacement.\n";
+  return true;
+}
+
 bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
   const char *param = std::getenv("STUDIOCAST_NCNN_MATTING_PARAM");
   const char *bin = std::getenv("STUDIOCAST_NCNN_MATTING_BIN");
@@ -204,8 +278,11 @@ bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
   ov::VulkanMattingGraphDescriptor graph;
   graph.param_path = param;
   graph.bin_path = bin;
-  graph.param_sha256 = std::string(64, 'a');
-  graph.bin_sha256 = std::string(64, 'b');
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          graph.param_path, &graph.param_sha256, error) ||
+      !studiocast::model_integrity_internal::ComputeSha256File(
+          graph.bin_path, &graph.bin_sha256, error))
+    return false;
   graph.input_blob = "input";
   graph.output_blob = "output";
   graph.converter_name = "onnx2ncnn";
@@ -306,6 +383,11 @@ bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
 
 } // namespace
 int main() {
+  if (!NcnnVerifiedFileSnapshots())
+    return 1;
+  if (std::getenv("STUDIOCAST_TEST_NCNN_SNAPSHOTS_ONLY") &&
+      !std::getenv("STUDIOCAST_REQUIRE_VULKAN_RUNTIME"))
+    return 0;
   std::string error;
   vk::VulkanDevice device;
   if (!ov::InitializeProductionVulkanMattingDevice(&device, &error)) {
@@ -344,8 +426,11 @@ int main() {
   ov::VulkanMattingGraphDescriptor graph;
   graph.param_path = param;
   graph.bin_path = bin;
-  graph.param_sha256 = std::string(64, 'a');
-  graph.bin_sha256 = std::string(64, 'b');
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          graph.param_path, &graph.param_sha256, &error) ||
+      !studiocast::model_integrity_internal::ComputeSha256File(
+          graph.bin_path, &graph.bin_sha256, &error))
+    return 1;
   graph.input_blob = "rgb";
   graph.output_blob = "alpha";
   graph.converter_name = "test";
@@ -425,7 +510,7 @@ int main() {
       for (int x = 0; x < 4; ++x) {
         const auto *row = reinterpret_cast<const float *>(
             static_cast<const char *>(readback.mapped()) +
-            y * alpha.pitch_bytes());
+            static_cast<std::size_t>(y) * alpha.pitch_bytes());
         if (!Check(std::fabs(row[x] - value) < 1e-5f,
                    "ncnn resident output differs from known 1x1 convolution"))
           return 1;
@@ -465,6 +550,9 @@ int main() {
              "CPU rejection initialization"))
     return 1;
   graph.param_path = cpu_param;
+  if (!studiocast::model_integrity_internal::ComputeSha256File(
+          cpu_param, &graph.param_sha256, &error))
+    return 1;
   if (!Check(cpu->LoadGraph(graph).failure ==
                  ov::VulkanMattingRuntimeFailure::cpu_layer_rejected,
              "CPU-only layer was accepted"))

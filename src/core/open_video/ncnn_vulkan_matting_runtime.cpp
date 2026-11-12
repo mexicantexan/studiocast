@@ -1,5 +1,6 @@
 #include "core/open_video/vulkan_matting_runtime.h"
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+#include "core/open_video/model_pack_registry.h"
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_context_internal.h"
 #include "core/vulkan/vulkan_image.h"
@@ -243,6 +244,20 @@ public:
         (std::size_t(graph.input_h) * std::size_t(graph.input_w)) % 4 != 0)
       return Fail(Failure::invalid_shape, "ncnn replay requires batch one RGB "
                                           "and aligned NCHW float32 planes.");
+    // Bind the graph identity to the bytes actually consumed by ncnn. Paths
+    // may change after registry validation; the sealed FILE streams cannot.
+    std::string snapshot_error;
+    auto parameters = open_video::OpenVerifiedModelFileSnapshot(
+        graph.param_path, graph.param_sha256, 1024u * 1024u, &snapshot_error);
+    if (!parameters)
+      return Fail(Failure::invalid_graph,
+                  "ncnn parameter snapshot: " + snapshot_error);
+    auto weights = open_video::OpenVerifiedModelFileSnapshot(
+        graph.bin_path, graph.bin_sha256, resources_.allocation_budget_bytes,
+        &snapshot_error);
+    if (!weights)
+      return Fail(Failure::invalid_graph,
+                  "ncnn weight snapshot: " + snapshot_error);
     program_->net = std::make_unique<ncnn::Net>();
     auto &net = *program_->net;
     net.set_vulkan_device(program_->owner->device.get());
@@ -258,9 +273,10 @@ public:
     opt.use_tensor_storage = false;
     opt.use_weights_in_host_memory = false;
     opt.use_local_pool_allocator = false;
+    opt.use_mapped_model_loading = false;
     opt.blob_vkallocator = opt.workspace_vkallocator = program_->resident.get();
     opt.staging_vkallocator = program_->staging.get();
-    if (net.load_param(graph.param_path.c_str()) != 0)
+    if (net.load_param(parameters.get()) != 0)
       return Fail(Failure::invalid_graph, "ncnn parameter load failed.");
     for (const auto *layer : net.layers()) {
       if (layer && layer->typeindex == ncnn::LayerType::MultiHeadAttention)
@@ -281,8 +297,7 @@ public:
       return Fail(Failure::out_of_memory,
                   "ncnn upload command infrastructure failed.");
     opt.studiocast_model_upload = program_->upload.get();
-    if (net.load_model(graph.bin_path.c_str()) != 0 ||
-        program_->budget.rejected)
+    if (net.load_model(weights.get()) != 0 || program_->budget.rejected)
       return Fail(program_->budget.rejected
                       ? Failure::allocation_contract_failed
                       : Failure::invalid_graph,

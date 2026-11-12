@@ -5,6 +5,12 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cerrno>
+#include <fcntl.h>
+#include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -222,6 +228,107 @@ std::array<std::uint8_t, 32> ComputeSha256Bytes(const std::uint8_t *data,
 } // namespace studiocast::model_integrity_internal
 
 namespace studiocast::open_video {
+VerifiedModelFileSnapshot
+OpenVerifiedModelFileSnapshot(const fs::path &path,
+                              const std::string &expected_sha256,
+                              std::size_t maximum_bytes, std::string *error) {
+  if (error)
+    error->clear();
+  const auto fail = [error](const char *message) -> VerifiedModelFileSnapshot {
+    if (error)
+      *error = message;
+    return {};
+  };
+  if (!maximum_bytes ||
+      maximum_bytes >
+          static_cast<std::uintmax_t>(std::numeric_limits<off_t>::max()) ||
+      !model_integrity_internal::IsSha256Hex(expected_sha256) ||
+      path.native().find('\0') != std::string::npos)
+    return fail("invalid model snapshot digest, path or size reservation");
+  struct Descriptor {
+    int fd = -1;
+    ~Descriptor() {
+      if (fd >= 0)
+        close(fd);
+    }
+  } source{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
+  if (source.fd < 0)
+    return fail(
+        "model snapshot source open failed (symlinks are not permitted)");
+  struct stat metadata {};
+  if (fstat(source.fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+      metadata.st_size < 0 ||
+      static_cast<std::uintmax_t>(metadata.st_size) > maximum_bytes)
+    return fail("model snapshot source is not a regular file within the size "
+                "reservation");
+  Descriptor snapshot{memfd_create("studiocast-verified-model",
+                                   MFD_CLOEXEC | MFD_ALLOW_SEALING)};
+  if (snapshot.fd < 0)
+    return fail("sealed anonymous model snapshots are unavailable");
+  std::array<std::uint8_t, 64 * 1024> buffer{};
+  std::size_t total = 0;
+  for (;;) {
+    const std::size_t request =
+        std::min(buffer.size(), maximum_bytes - total + 1);
+    const ssize_t count = read(source.fd, buffer.data(), request);
+    if (count < 0) {
+      if (errno == EINTR)
+        continue;
+      return fail("model snapshot source read failed");
+    }
+    if (count == 0)
+      break;
+    const auto bytes = static_cast<std::size_t>(count);
+    if (bytes > maximum_bytes - total)
+      return fail("model snapshot grew beyond the size reservation");
+    std::size_t written = 0;
+    while (written < bytes) {
+      const ssize_t n =
+          write(snapshot.fd, buffer.data() + written, bytes - written);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return fail("model snapshot write failed");
+      written += static_cast<std::size_t>(n);
+    }
+    total += bytes;
+  }
+  if (fcntl(snapshot.fd, F_ADD_SEALS,
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0 ||
+      lseek(snapshot.fd, 0, SEEK_SET) != 0)
+    return fail("model snapshot sealing or rewind failed");
+  struct stat sealed_metadata {};
+  if (fstat(snapshot.fd, &sealed_metadata) != 0 ||
+      sealed_metadata.st_size < 0 ||
+      static_cast<std::uintmax_t>(sealed_metadata.st_size) != total)
+    return fail("model snapshot size changed before sealing");
+  // Hash the already sealed bytes that the loader will consume, rather than
+  // trusting either the original path or the mutable copy buffer.
+  model_integrity_internal::Sha256 sha;
+  for (;;) {
+    const ssize_t count = read(snapshot.fd, buffer.data(), buffer.size());
+    if (count < 0) {
+      if (errno == EINTR)
+        continue;
+      return fail("sealed model snapshot read failed");
+    }
+    if (count == 0)
+      break;
+    sha.Update(buffer.data(), static_cast<std::size_t>(count));
+  }
+  if (model_integrity_internal::HashToHex(sha.Final()) !=
+      model_integrity_internal::NormalizeSha256Hex(expected_sha256))
+    return fail("model snapshot checksum_mismatch: source bytes changed or "
+                "differ from the declared identity");
+  if (lseek(snapshot.fd, 0, SEEK_SET) != 0)
+    return fail("verified model snapshot rewind failed");
+  std::FILE *stream = fdopen(snapshot.fd, "rb");
+  if (!stream)
+    return fail("model snapshot FILE stream creation failed");
+  snapshot.fd = -1;
+  return VerifiedModelFileSnapshot(stream);
+}
+
 namespace {
 
 std::atomic<std::uint64_t> g_registry_generation{1};

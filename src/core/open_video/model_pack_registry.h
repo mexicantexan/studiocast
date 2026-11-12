@@ -2,13 +2,38 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <memory>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
+namespace studiocast::model_integrity_internal {
+bool ComputeSha256File(const std::filesystem::path &path, std::string *out,
+                       std::string *error);
+}
+
 namespace studiocast::open_video {
+
+struct ModelSnapshotFileCloser {
+  void operator()(std::FILE *file) const noexcept {
+    if (file)
+      std::fclose(file);
+  }
+};
+using VerifiedModelFileSnapshot =
+    std::unique_ptr<std::FILE, ModelSnapshotFileCloser>;
+
+// Setup only. Returns a sealed anonymous FILE* containing exactly the declared
+// digest, bounded before allocation and independent of subsequent path/inode
+// changes. The consumer must load from this stream, never reopen the path.
+VerifiedModelFileSnapshot
+OpenVerifiedModelFileSnapshot(const std::filesystem::path &path,
+                              const std::string &expected_sha256,
+                              std::size_t maximum_bytes, std::string *error);
 
 struct ModelFile {
   // Original relative filename as declared in model.json.
