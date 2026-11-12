@@ -26,7 +26,8 @@ public:
 
   bool Allocate(VulkanDevice *device, VkDeviceSize size, VkFlags usage,
                 VkFlags required_memory_flags, VkFlags preferred_memory_flags,
-                bool map_memory, std::string *error_out);
+                bool map_memory, std::string *error_out,
+                VkDeviceSize allocation_limit = 0);
   void Free() noexcept;
 
   bool Valid() const;
@@ -39,7 +40,9 @@ public:
   }
   VkBuffer buffer() const { return buffer_; }
   VkDeviceMemory memory() const { return memory_; }
+  std::uint32_t memory_type_index() const { return memory_type_index_; }
   VkDeviceSize size() const { return size_; }
+  VkDeviceSize allocation_size() const { return allocation_size_; }
   void *mapped() const { return mapped_; }
   bool device_local() const {
     return (memory_property_flags_ & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
@@ -61,6 +64,7 @@ private:
   VkDeviceSize allocation_size_ = 0;
   void *mapped_ = nullptr;
   VkFlags memory_property_flags_ = 0;
+  std::uint32_t memory_type_index_ = 0;
 };
 
 class VulkanImage {

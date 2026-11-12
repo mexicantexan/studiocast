@@ -130,6 +130,8 @@ public:
                            bool submission_failure, std::string *error_out);
   void MarkShutdown() noexcept;
 
+  std::shared_ptr<void> native_owner;
+  std::string native_owner_kind;
   std::shared_ptr<VulkanLoader> loader;
   VulkanContextIdentity identity;
   VkInstance instance = nullptr;
@@ -286,15 +288,13 @@ struct OpenVulkanDiagnostics {
   bool auto_frame_crop_stage_implemented = false;
   bool auto_frame_production_ready = false;
   std::string auto_frame_readiness_code;
-  std::string auto_frame_blocker_code =
-      "vulkan_auto_frame_yunet_unavailable";
+  std::string auto_frame_blocker_code = "vulkan_auto_frame_yunet_unavailable";
   bool auto_frame_cpu_tail = false;
   std::string auto_frame_degraded_reason_code = "vulkan_effect_cpu_tail";
   bool auto_frame_selectable_cpu_fallback = false;
 
   bool eye_contact_production_ready = false;
-  std::string eye_contact_reason_code =
-      "open_vulkan_eye_contact_unavailable";
+  std::string eye_contact_reason_code = "open_vulkan_eye_contact_unavailable";
   std::string eye_contact_blocker_code =
       "open_vulkan_eye_contact_runtime_unavailable";
   std::string eye_contact_detail;
@@ -389,6 +389,17 @@ struct OpenVulkanDiagnostics {
   std::string ToJson() const;
 };
 
+// Trusted in-tree adoption only: the owner retains both instance and device.
+struct VulkanDeviceAdoption {
+  VkInstance instance = nullptr;
+  VkPhysicalDevice physical_device = nullptr;
+  VkDevice device = nullptr;
+  VkQueue queue = nullptr;
+  std::uint32_t queue_family_index = 0;
+  std::shared_ptr<void> owner;
+  std::string owner_kind;
+};
+
 class VulkanDevice {
 public:
   VulkanDevice();
@@ -396,7 +407,18 @@ public:
   VulkanDevice &operator=(const VulkanDevice &) = delete;
   ~VulkanDevice();
 
+  static bool ChooseAdoptionPhysicalDevice(
+      VkInstance instance, const VulkanDeviceSelection &selection,
+      std::shared_ptr<void> owner, VkPhysicalDevice *physical_device,
+      std::string *error_out);
+  static bool ResolveSelection(VulkanDeviceSelection *selection,
+                               std::string *error_out);
   bool Initialize(std::string *error_out);
+  bool InitializeAdopted(const VulkanDeviceSelection &selection,
+                         const VulkanDeviceConfig &config,
+                         VulkanDeviceAdoption adoption, std::string *error_out);
+  std::shared_ptr<void> NativeOwner(std::string_view kind) const;
+  std::shared_ptr<void> RetainContext() const { return context_; }
   bool Initialize(const VulkanDeviceSelection &selection,
                   std::string *error_out);
   bool Initialize(const VulkanDeviceSelection &selection,
@@ -430,6 +452,8 @@ public:
                       std::string *error_out) const;
 
   bool SubmitAndWait(VkCommandBuffer command_buffer, std::string *error_out);
+  bool SubmitAndWait(const VkCommandBuffer *command_buffers,
+                     std::uint32_t count, std::string *error_out);
   bool CheckDriverResult(VkResult result, std::string_view operation,
                          bool poison_on_failure, std::string *error_out) const;
   bool RecordBufferBarrier(VkCommandBuffer command_buffer, VkBuffer buffer,
@@ -464,6 +488,7 @@ private:
     return context_;
   }
 
+  std::shared_ptr<void> adopted_owner_;
   std::shared_ptr<VulkanLoader> loader_;
   std::shared_ptr<detail::VulkanContextState> context_;
   VulkanDeviceSelection selection_;
