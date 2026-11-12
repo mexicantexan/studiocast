@@ -1,0 +1,14 @@
+{
+  "onnx_sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",
+  "onnx_size_bytes": 25888640,
+  "onnx_upstream_revision": "f67d848345da34a2598d45ccb39bf657715ea937",
+  "pnnx_version": "20261020",
+  "pnnx_sha256": "4db234cb90a27dc15e04e0d0edf5706c7a488ab8e6235cf8c146c6ec80fd9355",
+  "pnnx_wheel_url": "https://files.pythonhosted.org/packages/5c/b7/9665ea73f6503fea4f30abbd3eebcea1c8500095496167761a15482354bc/pnnx-20261020-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+  "pnnx_wheel_sha256": "d50d921e5897293d616444191c1a2dc5366423c81bdb4bd22a985fe8071cf17c",
+  "ncnn_commit": "24ea07e87f544a3fbc59980b57885a92c75f2d24",
+  "reference_cmake_options": ["-DNCNN_VULKAN=OFF", "-DNCNN_RUNTIME_CPU=OFF", "-DNCNN_AVX=ON", "-DNCNN_AVX2=ON", "-DNCNN_FMA=ON", "-DNCNN_AVXVNNI=ON", "-DNCNN_AVX512=OFF", "-DNCNN_INT8=OFF", "-DNCNN_BF16=OFF", "-DNCNN_OPENMP=OFF"],
+  "license_url": "https://raw.githubusercontent.com/ZHKKKe/MODNet/28165a451e4610c9d77cfdf925a94610bb2810fb/LICENSE",
+  "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "python_versions": {"numpy": "2.1.3", "onnx": "1.16.0", "onnxruntime": "1.23.2"}
+}
