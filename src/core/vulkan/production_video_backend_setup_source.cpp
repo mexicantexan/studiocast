@@ -54,6 +54,14 @@ public:
       std::unique_ptr<VulkanVideoExecutionFactory> factory) noexcept
       : factory_(std::move(factory)) {}
 
+  ~VulkanSetupLeaseOwner() override {
+    if (shutdown_.pending) {
+      // The setup lease already made its final bounded attempt. Retain the
+      // complete factory, adapter, graph, context, queue, and buffers.
+      (void)factory_.release();
+    }
+  }
+
   hal::IResidentAdapter *resident_adapter() const noexcept override {
     return factory_ ? factory_->adapter_registration().resident_adapter
                     : nullptr;
@@ -63,15 +71,17 @@ public:
     return factory_.get();
   }
 
-  void Shutdown() noexcept override {
-    // V1 execution is synchronous. The composition destroys its coordinator
-    // and prepared program before asking the lease to shut down, so no work is
-    // in flight here. Factory destruction remains ordered after this callback
-    // and releases the Vulkan adapter, queue, kernels, and device context.
+  void Shutdown() noexcept override { (void)RequestShutdown(); }
+
+  video::ProductionVideoSetupLeaseShutdownResult
+  RequestShutdown() noexcept override {
+    shutdown_ = factory_->RequestShutdown();
+    return shutdown_;
   }
 
 private:
   std::unique_ptr<VulkanVideoExecutionFactory> factory_;
+  video::ProductionVideoSetupLeaseShutdownResult shutdown_{};
 };
 
 class ProductionSetupSource final
@@ -131,7 +141,7 @@ public:
             static_cast<std::uint64_t>(caller.host_output.width) *
             caller.host_output.height;
         if (pixels > (UINT64_MAX - native_bytes) / 64 ||
-            output_pixels > (UINT64_MAX-native_bytes-pixels*64)/16 ||
+            output_pixels > (UINT64_MAX - native_bytes - pixels * 64) / 16 ||
             caller.budget.persistent_bytes <
                 native_bytes + pixels * 64 + output_pixels * 16 ||
             caller.budget.scratch_bytes < pixels * 32 + output_pixels * 4 ||
@@ -323,6 +333,14 @@ public:
 };
 
 } // namespace
+
+std::unique_ptr<video::IProductionVideoSetupLeaseOwner>
+CreateProductionVulkanSetupLeaseOwner(
+    std::unique_ptr<VulkanVideoExecutionFactory> factory) {
+  if (!factory)
+    return nullptr;
+  return std::make_unique<VulkanSetupLeaseOwner>(std::move(factory));
+}
 
 std::unique_ptr<video::IProductionVideoBackendSetupSource>
 CreateProductionVideoBackendSetupSource() noexcept {

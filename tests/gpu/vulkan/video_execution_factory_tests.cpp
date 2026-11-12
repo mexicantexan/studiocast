@@ -585,6 +585,72 @@ bool TestMattingFinalGeometryContract() {
       "writer geometry");
 }
 
+bool TestShutdownRetainsUnprovenNativeOwner() {
+  FakeVulkanAdapter adapter;
+  bool safe = false;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &safe;
+  configuration.injected_shutdown_probe = [](void *context) noexcept {
+    return *static_cast<bool *>(context) ? hal::StatusId::ready
+                                         : hal::StatusId::quarantined;
+  };
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  std::weak_ptr<const video::effects::BroadcastCameraEffects> lifetime =
+      configuration.effects;
+  auto factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  configuration.effects.reset();
+  auto owner =
+      vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto first = owner->RequestShutdown();
+  bool ok =
+      Require(first.status == hal::StatusId::quarantined &&
+                  first.reason == hal::ReasonId::synchronization_failed &&
+                  first.shutdown_requested && first.pending &&
+                  !first.quiescent && !first.driver_context_release_permitted,
+              "unproven Vulkan completion must report quarantine and retain "
+              "the native owner");
+  safe = true;
+  const auto retry = owner->RequestShutdown();
+  ok &= Require(
+      retry.status == hal::StatusId::stopped &&
+          retry.reason == hal::ReasonId::shutdown_requested &&
+          retry.shutdown_attempts == 2 && !retry.pending && retry.quiescent &&
+          retry.driver_context_release_permitted,
+      "only a subsequent positive quiescence proof may permit owner release");
+  owner.reset();
+  ok &= Require(lifetime.expired(),
+                "proved shutdown must release factory ownership");
+  // Retention is observed before this fixture explicitly supplies proof and
+  // destroys its fake owner, keeping sanitizer runs free of intentional leaks.
+  auto retained_safe = std::make_shared<bool>(false);
+  configuration.injected_shutdown_context = retained_safe.get();
+  configuration.effects =
+      std::shared_ptr<const video::effects::BroadcastCameraEffects>(
+          new video::effects::BroadcastCameraEffects,
+          [retained_safe](const auto *effects) { delete effects; });
+  lifetime = configuration.effects;
+  factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  auto *retained_factory = factory.get();
+  owner = vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  configuration.effects.reset();
+  const auto pending = owner->RequestShutdown();
+  owner.reset();
+  ok &= Require(pending.pending && !lifetime.expired(),
+                "destruction without proof must retain the complete factory "
+                "rather than release its native island");
+  *retained_safe = true;
+  ok &= Require(
+      retained_factory->RequestShutdown().driver_context_release_permitted,
+      "fixture cleanup also requires positive proof");
+  delete retained_factory;
+  ok &= Require(lifetime.expired(),
+                "proved fixture cleanup must release the retained factory");
+  return ok;
+}
+
 bool TestUnsupportedAndForeignPreflight() {
   Fixture fixture;
   if (!fixture.Initialize() || !fixture.Prepare(Request()))
@@ -972,6 +1038,7 @@ int main() {
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
   ok &= TestMattingFinalGeometryContract();
+  ok &= TestShutdownRetainsUnprovenNativeOwner();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();
