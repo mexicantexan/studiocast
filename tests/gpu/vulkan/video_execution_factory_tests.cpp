@@ -1020,6 +1020,88 @@ bool TestMissingSelectedPackNeedsNoNativeContext() {
   return ok;
 }
 
+bool TestCompiledOffInferenceKeepsUtilitySurvivors() {
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN && \
+    (!defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) ||                        \
+     !STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+  const auto *required =
+      std::getenv("STUDIOCAST_REQUIRE_VULKAN_SDK_OFF_ISOLATION");
+  if (!required || std::string(required) != "1")
+    return true;
+  const auto registry = open_video::ModelPackRegistry::ScanDefault();
+  const auto selected = registry.Find(
+      "video_denoise", registry.DefaultModelIdForTask("video_denoise"));
+  if (!Require(
+          selected && !selected->ncnn_vulkan_networks.empty(),
+          "SDK-off isolation requires an existing converted model fixture"))
+    return false;
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.plan.intent.stages[2] = request.plan.intent.stages[1];
+  request.plan.intent.stages[1] = request.plan.intent.stages[0];
+  auto &model = request.plan.intent.stages[0];
+  model = {};
+  model.intent.stage_id = 1;
+  model.intent.semantic = hal::SemanticEffectId::video_noise_removal;
+  model.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  model.parameters[0].id = video::CanonicalVideoParameterId::strength;
+  model.parameters[0].kind = video::CanonicalVideoParameterKind::signed_integer;
+  model.parameters[0].signed_value = 70;
+  model.parameter_count = 1;
+  request.plan.intent.stage_count = 3;
+  request.plan.temporal.temporal = true;
+  request.plan.temporal.history_frames = 5;
+  request.plan.invalidation_key.execution_domain_hash = 0;
+  request.effects.video_noise_removal.enabled = true;
+  request.effects.video_noise_removal.model_id = selected->id;
+  request.effects.vignette.enabled = request.effects.mirror = true;
+  request.effects.vignette.intensity = 61;
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  auto acquired = source->AcquireResidentSetup(request);
+  if (!Require(
+          acquired.status == hal::StatusId::degraded && acquired.lease.live(),
+          "compiled-off inference disabled unrelated fixed vignette/mirror"))
+    return false;
+  hal::StaticAdapterRegistry adapters;
+  video::VideoExecutionCoordinator coordinator(adapters);
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto snapshot = acquired.lease.snapshot();
+  if (!Require(adapters.Register(snapshot.adapter, &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(snapshot.factory, &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.Prepare(acquired.plan, nullptr, &reason) ==
+                       hal::StatusId::degraded,
+               "SDK-off utility survivors could not prepare"))
+    return false;
+  std::uint8_t input[kBytes]{}, output[kBytes]{};
+  const auto frame = coordinator.Execute(Binding(input, output, 1));
+  bool ok =
+      Require(frame.output_ready && frame.stage_count == 2 &&
+                  frame.transfers.uploads == 1 &&
+                  frame.transfers.final_readbacks == 1 &&
+                  frame.transfers.intermediate_readbacks == 0 &&
+                  coordinator.CommitOutput(frame.completion, true, &reason) ==
+                      hal::StatusId::ready,
+              "SDK-off utility survivors did not execute and commit");
+  coordinator.Shutdown();
+  const auto shutdown = acquired.lease.Shutdown();
+  ok &= Require(shutdown.quiescent && shutdown.driver_context_release_permitted,
+                "SDK-off utility owner did not shut down safely");
+  model.intent.required = true;
+  const auto blocked = source->AcquireResidentSetup(request);
+  ok &= Require(
+      blocked.status == hal::StatusId::unavailable &&
+          blocked.reason == hal::ReasonId::required_stage_failed &&
+          !blocked.lease.live(),
+      "required compiled-off inference must fail before native acquisition");
+  return ok;
+#else
+  return true;
+#endif
+}
+
 bool TestUnsupportedAndForeignPreflight() {
   Fixture fixture;
   if (!fixture.Initialize() || !fixture.Prepare(Request()))
@@ -1418,6 +1500,7 @@ int main() {
   ok &= TestMalformedSourceStageCount();
   ok &= TestUnavailableOptionalStageIsolation();
   ok &= TestMissingSelectedPackNeedsNoNativeContext();
+  ok &= TestCompiledOffInferenceKeepsUtilitySurvivors();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();

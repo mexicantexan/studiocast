@@ -214,8 +214,6 @@ public:
           std::make_shared<const video::effects::BroadcastCameraEffects>(
               request.effects);
       std::optional<open_video::ModelPackRegistry> selected_registry;
-      if (needs_matting || needs_denoise || needs_face)
-        selected_registry = open_video::ModelPackRegistry::ScanDefault();
       auto runtime_effects = request.effects;
       const auto unavailable = [&](hal::SemanticEffectId semantic) {
         for (std::size_t i = 0; i < caller.intent.stage_count; ++i)
@@ -255,6 +253,19 @@ public:
               hal::SemanticEffectId::virtual_key_light})
           unavailable(semantic);
       };
+#if !defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) ||                         \
+    !STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+      // A missing compiled inference provider is a per-effect prerequisite,
+      // not a Vulkan device failure. Do not scan/hash models or apply their
+      // graph reservations when this build cannot execute them.
+      unavailable_matting();
+      unavailable(hal::SemanticEffectId::video_noise_removal);
+      unavailable(hal::SemanticEffectId::eye_contact);
+      unavailable(hal::SemanticEffectId::auto_frame);
+      needs_matting = needs_denoise = needs_eye = needs_face = false;
+#endif
+      if (needs_matting || needs_denoise || needs_face)
+        selected_registry = open_video::ModelPackRegistry::ScanDefault();
       if (needs_matting) {
         // Native graph resources are reserved before context/session
         // acquisition.

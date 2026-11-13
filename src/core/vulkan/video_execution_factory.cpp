@@ -1227,19 +1227,6 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     impl_->status = impl_->initialized ? StatusId::ready : StatusId::blocked;
   } else {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
-    const bool expanded_models = impl_->configuration.denoise_pack ||
-                                 impl_->configuration.face_pack ||
-                                 impl_->configuration.eye_pack;
-    const auto &configuration = impl_->configuration;
-    const bool prepared_batch =
-        expanded_models || configuration.matting_pack ||
-        (configuration.effects && configuration.input_width > 0 &&
-         configuration.input_height > 0 && configuration.output_width > 0 &&
-         configuration.output_height > 0 &&
-         // Preserve the older small utility-only reservations. The camera's
-         // aggregate reservation can prepare all 64 immutable dispatch slots.
-         configuration.reservation.resource_count >= 128 &&
-         configuration.reservation.in_flight_slots == 1);
     const auto block_eye = [&]() {
       impl_->configuration.unavailable_semantic_mask |=
           SemanticBit(SemanticEffectId::eye_contact);
@@ -1263,6 +1250,10 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     if (impl_->configuration.eye_pack)
       block_eye();
 #endif
+    bool expanded_models = impl_->configuration.denoise_pack ||
+                           impl_->configuration.face_pack ||
+                           impl_->configuration.eye_pack;
+    const auto &configuration = impl_->configuration;
     if (impl_->configuration.matting_pack &&
         (impl_->configuration.input_width <= 0 ||
          impl_->configuration.input_height <= 0 ||
@@ -1311,15 +1302,30 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
       // The adopted-context helper checks the selected physical feature before
       // constructing its logical device. Isolate only the affected effect.
       block_eye();
-      device_ready = open_vulkan::InitializeProductionVulkanMattingDevice(
-          impl_->production->kernels.device(), selection, device_config, &error,
-          false);
+      expanded_models = impl_->configuration.denoise_pack ||
+                        impl_->configuration.face_pack ||
+                        impl_->configuration.eye_pack;
+      device_ready = (impl_->configuration.matting_pack || expanded_models)
+                         ? open_vulkan::InitializeProductionVulkanMattingDevice(
+                               impl_->production->kernels.device(), selection,
+                               device_config, &error, false)
+                         : impl_->production->kernels.device()->Initialize(
+                               selection, device_config, &error);
     }
     if (!device_ready || !impl_->production->kernels.Initialize(&error)) {
       impl_->status = StatusId::unavailable;
       impl_->reason = ReasonId::capability_evidence_incomplete;
       impl_->DiscardFailedProduction();
     } else {
+      const bool prepared_batch =
+          expanded_models || configuration.matting_pack ||
+          (configuration.effects && configuration.input_width > 0 &&
+           configuration.input_height > 0 && configuration.output_width > 0 &&
+           configuration.output_height > 0 &&
+           // Preserve the older small utility-only reservations. The camera's
+           // aggregate reservation can prepare all 64 immutable dispatch slots.
+           configuration.reservation.resource_count >= 128 &&
+           configuration.reservation.in_flight_slots == 1);
       static std::atomic<std::uint64_t> next_adapter_id{
           UINT64_C(0x56554c4b00000000)};
       auto adapter_id = next_adapter_id.fetch_add(1, std::memory_order_relaxed);
