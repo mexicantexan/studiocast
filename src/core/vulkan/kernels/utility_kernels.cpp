@@ -11,6 +11,11 @@ namespace studiocast::vulkan::kernels {
 
 namespace {
 
+struct DeferredRecordingScope {
+  UtilityKernels *owner;
+  ~DeferredRecordingScope() { owner->DiscardUnsubmittedOperation(); }
+};
+
 constexpr std::uint32_t kBlockX = 16;
 constexpr std::uint32_t kBlockY = 16;
 
@@ -206,6 +211,9 @@ bool UtilityKernels::Initialize(std::string *error_out) {
 
 void UtilityKernels::Shutdown() noexcept {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (deferred_batch_ &&
+      deferred_batch_->state() == ResidentCommandBatchState::unsafe_pending)
+    return; // The execution owner must retain this complete object.
   const bool have_device = device_.Initialized();
   const bool destroy_children = have_device && device_.SafeToDestroyResources();
   const auto &vf = device_.f();
@@ -529,6 +537,7 @@ bool UtilityKernels::BeginDeferredFrame(ResidentCommandBatch &batch,
     error_out->clear();
   if (!initialized_ || !deferred_capacity_ || deferred_batch_ ||
       batch.state() != ResidentCommandBatchState::recording ||
+      batch.Mark().batch_id == 0 ||
       batch.context_identity() != device_.context_identity() ||
       std::any_of(deferred_slots_.begin(), deferred_slots_.end(),
                   [](const auto &slot) { return slot.pending; })) {
@@ -552,11 +561,19 @@ void UtilityKernels::EndDeferredFrame() noexcept {
   active_deferred_slot_ = nullptr;
 }
 
+void UtilityKernels::DiscardUnsubmittedOperation() noexcept {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (deferred_batch_ && deferred_batch_->Mark().batch_id != 0 &&
+      active_deferred_slot_ && !active_deferred_slot_->pending)
+    active_deferred_slot_ = nullptr;
+}
+
 bool UtilityKernels::AcquireDeferredSlot(std::string *error_out) {
   if (!deferred_batch_)
     return true;
   if (active_deferred_slot_ || deferred_cursor_ >= deferred_capacity_ ||
       deferred_batch_->state() != ResidentCommandBatchState::recording ||
+      deferred_batch_->Mark().batch_id == 0 ||
       deferred_slots_[deferred_cursor_].pending) {
     if (error_out)
       *error_out = "Deferred utility command/parameter slot unavailable.";
@@ -587,11 +604,15 @@ bool UtilityKernels::BindBuffers(VkBuffer u8_src0, VkBuffer u8_src1,
                                  std::string *error_out) {
   if (!AcquireDeferredSlot(error_out))
     return false;
-  if (active_deferred_slot_)
-    return BindBuffersForSet(active_deferred_slot_->descriptors,
-                             active_deferred_slot_->params.buffer(),
-                             &active_deferred_slot_->bound, u8_src0, u8_src1,
-                             f32_src0, u8_out, f32_out, scratch, error_out);
+  if (active_deferred_slot_) {
+    const bool bound = BindBuffersForSet(
+        active_deferred_slot_->descriptors,
+        active_deferred_slot_->params.buffer(), &active_deferred_slot_->bound,
+        u8_src0, u8_src1, f32_src0, u8_out, f32_out, scratch, error_out);
+    if (!bound)
+      DiscardUnsubmittedOperation();
+    return bound;
+  }
   return BindBuffersForSet(descriptor_set_, params_.buffer(), &bound_buffers_,
                            u8_src0, u8_src1, f32_src0, u8_out, f32_out, scratch,
                            error_out);
@@ -608,6 +629,7 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
                                      std::uint32_t dispatch_w,
                                      std::uint32_t dispatch_h,
                                      std::string *error_out) {
+  const DeferredRecordingScope recording_scope{this};
   if (!initialized_) {
     if (error_out)
       *error_out = init_error_.empty()
@@ -1124,6 +1146,7 @@ bool UtilityKernels::UploadU8x3ToDeviceLocal(const std::uint8_t *src,
                                              const VulkanImage &device_dst,
                                              std::string *error_out) {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  const DeferredRecordingScope recording_scope{this};
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(upload_staging,
@@ -1296,6 +1319,7 @@ bool UtilityKernels::ReadbackU8x3(const VulkanImage &src,
                                   std::uint8_t *dst, std::size_t dst_stride,
                                   std::string *error_out) {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  const DeferredRecordingScope recording_scope{this};
   if (error_out)
     error_out->clear();
   if (!initialized_) {

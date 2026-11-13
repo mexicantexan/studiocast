@@ -37,6 +37,9 @@ struct UtilityKernelsTestAccess {
                                error) &&
            kernels.SubmitRecorded(error);
   }
+  static void RejectFirstBinding(UtilityKernels &kernels) {
+    kernels.deferred_slots_[0].descriptors = nullptr;
+  }
 };
 } // namespace studiocast::vulkan::kernels
 
@@ -180,9 +183,18 @@ bool CheckDeferredSlots() {
   ResidentCommandBatch batch;
   std::string error;
   bool ok = Require(batch.Initialize(device, 2, &error) &&
-                        batch.BeginFrame(1, &error) &&
-                        utility.BeginDeferredFrame(batch, &error),
+                        batch.BeginFrame(1, &error),
                     "begin deferred utility slots");
+  bool foreign_begin = true;
+  std::thread foreign([&] {
+    std::string own_error;
+    foreign_begin = utility.BeginDeferredFrame(batch, &own_error);
+  });
+  foreign.join();
+  ok &= Require(!foreign_begin && !utility.deferred_frame_active(),
+                "foreign recording thread cannot attach or mutate slots");
+  ok &= Require(utility.BeginDeferredFrame(batch, &error),
+                "attach recording owner");
   const auto prior_submissions = submissions;
   ok &= Require(kernels::UtilityKernelsTestAccess::Queue(utility, &error) &&
                     kernels::UtilityKernelsTestAccess::Queue(utility, &error),
@@ -208,6 +220,28 @@ bool CheckDeferredSlots() {
   utility.EndDeferredFrame();
   ok &= Require(!utility.deferred_frame_active(),
                 "unsubmitted abort retires slots");
+  ok &= Require(batch.BeginFrame(3, &error) &&
+                    utility.BeginDeferredFrame(batch, &error),
+                "begin pre-submit failure fixture");
+  kernels::UtilityKernelsTestAccess::RejectFirstBinding(utility);
+  ok &= Require(!kernels::UtilityKernelsTestAccess::Queue(utility, &error) &&
+                    batch.command_count() == 0,
+                "binding failure queues no GPU work");
+  ok &= Require(kernels::UtilityKernelsTestAccess::Queue(utility, &error) &&
+                    batch.command_count() == 1,
+                "unrelated later stage survives unsubmitted binding failure");
+  device->InjectNextSubmissionResultForTesting(
+      VulkanSubmissionPhase::wait_for_fence, VK_TIMEOUT);
+  ok &= Require(!batch.Complete(&error), "deferred utility timeout");
+  utility.EndDeferredFrame();
+  utility.Shutdown();
+  ok &= Require(utility.deferred_frame_active() && utility.Initialized(),
+                "unsafe completion retains utility callback owners and slots");
+  context->health.health = VulkanContextHealth::fatal_submission_error;
+  context->health.completed_serial = context->health.submitted_serial;
+  ok &= Require(batch.RetireAfterQuiescence(&error),
+                "retire unsafe utility slots");
+  utility.EndDeferredFrame();
   return ok;
 }
 } // namespace

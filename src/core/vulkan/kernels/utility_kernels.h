@@ -86,6 +86,9 @@ public:
   bool BeginDeferredFrame(ResidentCommandBatch &batch, std::string *error_out);
   // A still-recording or unsafe batch remains attached and denies reuse.
   void EndDeferredFrame() noexcept;
+  // Discards only the current never-appended operation. Its slot remains
+  // consumed; queued bindings and callbacks are never changed.
+  void DiscardUnsubmittedOperation() noexcept;
   bool deferred_frame_active() const noexcept {
     return deferred_batch_ != nullptr;
   }
