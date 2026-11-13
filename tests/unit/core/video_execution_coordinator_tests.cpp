@@ -1038,6 +1038,120 @@ bool TestQuarantineCauseAndFailedExecutionActivity() {
   return ok;
 }
 
+bool TestFailedResetRequiresNewPreparedProgram() {
+  bool ok = true;
+  for (const auto reset_status :
+       {hal::StatusId::ready, hal::StatusId::failed, hal::StatusId::stale,
+        hal::StatusId::blocked, hal::StatusId::degraded}) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    const auto provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    if (!RegisterCapability(&registry, &resident, domain, provider))
+      return false;
+    FakeFactory factory(domain, provider);
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(1,
+                                video::VideoExecutionRoute::prepared_resident,
+                                domain, provider, &factory),
+            &reason) != hal::StatusId::ready ||
+        !Configure(&coordinator, Request()))
+      return false;
+    std::uint8_t input[24]{}, output[24]{};
+    const auto first = coordinator.Execute(Binding(input, output, 1));
+    if (!Require(coordinator.CommitOutput(first.completion, true, &reason) ==
+                     hal::StatusId::ready,
+                 "reset recovery fixture must publish an initial frame"))
+      return false;
+    const auto history = coordinator.Snapshot();
+    factory.latest_executor->reset_status = reset_status;
+    ok &= Require(coordinator.ResetTemporal(
+                      hal::ReasonId::temporal_discontinuity) == reset_status &&
+                      factory.latest_executor->reset_calls == 1,
+                  "coordinator must preserve the original reset result");
+    const auto reset = coordinator.Snapshot();
+    if (reset_status == hal::StatusId::ready) {
+      ok &= Require(reset.prepared && reset.readiness.available &&
+                        reset.telemetry.temporal_resets == 1,
+                    "successful reset must preserve execution eligibility");
+    } else {
+      ok &= Require(
+          !reset.prepared && !reset.quarantined &&
+              reset.readiness.status == hal::StatusId::stale &&
+              reset.readiness.reason ==
+                  hal::ReasonId::reconfiguration_required &&
+              !reset.readiness.available && reset.readiness.rebuild_requested &&
+              !reset.latest_committed_frame.valid &&
+              reset.telemetry.active_backend == hal::BackendId::invalid &&
+              reset.telemetry.active_provider ==
+                  hal::SemanticEffectProviderId::invalid &&
+              reset.telemetry.runtime_status == reset_status &&
+              reset.telemetry.runtime_reason ==
+                  hal::ReasonId::reconfiguration_required &&
+              reset.plan.plan_id == history.plan.plan_id &&
+              reset.readiness.execution_domain ==
+                  history.readiness.execution_domain &&
+              reset.telemetry.committed_output_frames == 1 &&
+              reset.telemetry.active_backend_frames == 1 &&
+              reset.telemetry.committed_stage_successes ==
+                  history.telemetry.committed_stage_successes &&
+              reset.telemetry.transfers.uploads ==
+                  history.telemetry.transfers.uploads &&
+              reset.telemetry.temporal_resets == 0,
+          "failed reset must close readiness while retaining selected history");
+      const auto rejected = coordinator.Execute(Binding(input, output, 2));
+      ok &= Require(
+          rejected.status == hal::StatusId::stale &&
+              rejected.reason == hal::ReasonId::reconfiguration_required &&
+              !rejected.output_ready && !coordinator.Snapshot().frame_pending &&
+              factory.latest_executor->execute_calls == 1 &&
+              coordinator.CommitOutput(first.completion, true, &reason) ==
+                  hal::StatusId::failed &&
+              reason == hal::ReasonId::output_not_committed &&
+              factory.latest_executor->commit_calls == 1,
+          "failed reset must prevent executor calls and publication");
+      factory.latest_executor->reset_status = hal::StatusId::ready;
+      ok &= Require(
+          coordinator.ResetTemporal(hal::ReasonId::temporal_discontinuity) ==
+                  hal::StatusId::stale &&
+              factory.latest_executor->reset_calls == 1,
+          "a second reset must not reopen unproven temporal history");
+      auto malformed = Request();
+      malformed.plan_id = 0;
+      video::VideoExecutionPrepareEvidence evidence;
+      ok &= Require(
+          coordinator.Prepare(malformed, &evidence, &reason) ==
+                  hal::StatusId::blocked &&
+              coordinator.Execute(Binding(input, output, 2)).reason ==
+                  hal::ReasonId::reconfiguration_required &&
+              factory.latest_executor->execute_calls == 1 &&
+              coordinator.Snapshot().telemetry.committed_output_frames == 1,
+          "rejected preparation must leave failed reset closed");
+      if (!Configure(&coordinator, Request()))
+        return false;
+    }
+    const auto recovered = coordinator.Execute(Binding(input, output, 2));
+    ok &= Require(
+        recovered.output_ready &&
+            coordinator.CommitOutput(recovered.completion, true, &reason) ==
+                hal::StatusId::ready &&
+            coordinator.Snapshot().prepared &&
+            coordinator.Snapshot().readiness.available &&
+            !coordinator.Snapshot().readiness.rebuild_requested &&
+            coordinator.Snapshot().latest_committed_frame.capture_sequence ==
+                2 &&
+            coordinator.Snapshot()
+                    .latest_committed_frame.output_commit_sequence == 2 &&
+            coordinator.Snapshot().telemetry.committed_output_frames == 2,
+        "valid new preparation must restore exact publication after failed "
+        "reset");
+  }
+  return ok;
+}
+
 bool TestInvalidationStaleGenerationAndOldPlanRetention() {
   const auto domain = Domain();
   DummyResident resident(domain);
@@ -1875,6 +1989,7 @@ int main() {
   ok &= TestExecuteCommitAndWriterFailure();
   ok &= TestFailedPublicationClearsOnlyCurrentActivity();
   ok &= TestQuarantineCauseAndFailedExecutionActivity();
+  ok &= TestFailedResetRequiresNewPreparedProgram();
   ok &= TestInvalidationStaleGenerationAndOldPlanRetention();
   ok &= TestWrongDomainAndStaleCompletion();
   ok &= TestOptionalFailOpenPreservesOutput();

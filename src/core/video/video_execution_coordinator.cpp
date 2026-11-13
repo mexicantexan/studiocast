@@ -823,9 +823,13 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
   }
   if (!prepared_ || quarantined_) {
     frame.status =
-        quarantined_ ? hal::StatusId::quarantined : hal::StatusId::blocked;
-    frame.reason =
-        quarantined_ ? quarantine_reason_ : hal::ReasonId::stale_program;
+        quarantined_ ? hal::StatusId::quarantined
+                     : (readiness_.rebuild_requested ? hal::StatusId::stale
+                                                     : hal::StatusId::blocked);
+    frame.reason = quarantined_ ? quarantine_reason_
+                                : (readiness_.rebuild_requested
+                                       ? hal::ReasonId::reconfiguration_required
+                                       : hal::ReasonId::stale_program);
     return frame;
   }
   if (passthrough_) {
@@ -1089,6 +1093,16 @@ VideoExecutionCoordinator::ResetTemporal(hal::ReasonId reason) noexcept {
     Quarantine(failure);
   } else {
     ClearCurrentActivity();
+    // A failed reset leaves temporal history unproven until Prepare succeeds.
+    prepared_ = false;
+    readiness_.status = hal::StatusId::stale;
+    readiness_.reason = hal::ReasonId::reconfiguration_required;
+    readiness_.available = readiness_.degraded = false;
+    readiness_.rebuild_requested = true;
+    telemetry_.runtime_status = status;
+    telemetry_.runtime_reason = hal::ReasonId::reconfiguration_required;
+    ++telemetry_.rebuild_requests;
+    executor_->Invalidate(hal::ReasonId::reconfiguration_required);
   }
   return status;
 }
