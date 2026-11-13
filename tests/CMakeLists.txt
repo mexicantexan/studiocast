@@ -1268,6 +1268,20 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-modnet-ncnn-conversion-tests
                 unit installer model)
 
+        add_test(NAME studiocast-video-ncnn-conversion-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/installer/models/video_ncnn_conversion_tests.py")
+        studiocast_set_test_labels(studiocast-video-ncnn-conversion-tests
+                unit installer model)
+
+        add_test(NAME studiocast-vulkan-dependency-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "PYTHONDONTWRITEBYTECODE=1"
+                        "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/installer/backend/vulkan_dependency_tests.py")
+        studiocast_set_test_labels(studiocast-vulkan-dependency-tests
+                unit installer gpu vulkan)
+
         add_test(NAME studiocast-vulkan-model-evidence-tests
                 COMMAND "${CMAKE_COMMAND}" -E env
                         "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
@@ -1436,6 +1450,8 @@ if (BUILD_TESTING)
     # definitions. Matrix-aware contract tests still need the configured build
     # state to select the matching fail-closed expectations.
     target_compile_definitions(studiocast-video-tests PRIVATE
+            STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=$<BOOL:${STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING}>
+            STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>
             STUDIOCAST_ENABLE_OPEN_VULKAN=$<BOOL:${STUDIOCAST_ENABLE_OPEN_VULKAN}>
     )
 
@@ -1822,6 +1838,28 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-vulkan-resident-command-batch-tests
                 unit video gpu vulkan)
 
+        if (_studiocast_have_dlib)
+            add_executable(studiocast-vulkan-dlib-predictor-data-tests
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_dlib_predictor_data_tests.cpp)
+            target_link_libraries(studiocast-vulkan-dlib-predictor-data-tests PRIVATE
+                    studiocast_vulkan_backend)
+            if (TARGET dlib::dlib)
+                target_link_libraries(studiocast-vulkan-dlib-predictor-data-tests PRIVATE dlib::dlib)
+            elseif (TARGET dlib)
+                target_link_libraries(studiocast-vulkan-dlib-predictor-data-tests PRIVATE dlib)
+            endif()
+            target_include_directories(studiocast-vulkan-dlib-predictor-data-tests PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src")
+            studiocast_set_project_warnings(studiocast-vulkan-dlib-predictor-data-tests)
+            studiocast_enable_sanitizers(studiocast-vulkan-dlib-predictor-data-tests)
+            set_target_properties(studiocast-vulkan-dlib-predictor-data-tests PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-vulkan-dlib-predictor-data-tests
+                    COMMAND studiocast-vulkan-dlib-predictor-data-tests)
+            studiocast_set_test_labels(studiocast-vulkan-dlib-predictor-data-tests
+                    unit video model vulkan)
+        endif()
+
         add_executable(studiocast-vulkan-device-lifetime-tests
                 ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_device_lifetime_tests.cpp)
         target_link_libraries(studiocast-vulkan-device-lifetime-tests PRIVATE
@@ -1946,6 +1984,38 @@ if (BUILD_TESTING)
                 unit video gpu vulkan model)
 
         if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+            add_executable(studiocast-vulkan-model-diagnostics-tests
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_model_diagnostics_tests.cpp)
+            target_link_libraries(studiocast-vulkan-model-diagnostics-tests PRIVATE
+                    studiocast_vulkan_backend)
+            target_include_directories(studiocast-vulkan-model-diagnostics-tests PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src")
+            studiocast_set_project_warnings(studiocast-vulkan-model-diagnostics-tests)
+            studiocast_enable_sanitizers(studiocast-vulkan-model-diagnostics-tests)
+            set_target_properties(studiocast-vulkan-model-diagnostics-tests PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-vulkan-model-diagnostics-tests
+                    COMMAND studiocast-vulkan-model-diagnostics-tests)
+            set_tests_properties(studiocast-vulkan-model-diagnostics-tests PROPERTIES SKIP_RETURN_CODE 77)
+            studiocast_set_test_labels(studiocast-vulkan-model-diagnostics-tests
+                    integration video gpu vulkan model)
+
+            add_executable(studiocast-vulkan-effects-production-smoke
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_effects_production_smoke_tests.cpp)
+            target_link_libraries(studiocast-vulkan-effects-production-smoke PRIVATE
+                    studiocast_vulkan_backend studiocast_video_backend_composition studiocast_video_io)
+            target_include_directories(studiocast-vulkan-effects-production-smoke PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+            studiocast_set_project_warnings(studiocast-vulkan-effects-production-smoke)
+            studiocast_enable_sanitizers(studiocast-vulkan-effects-production-smoke)
+            set_target_properties(studiocast-vulkan-effects-production-smoke PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-vulkan-effects-production-smoke
+                    COMMAND studiocast-vulkan-effects-production-smoke)
+            set_tests_properties(studiocast-vulkan-effects-production-smoke PROPERTIES SKIP_RETURN_CODE 77)
+            studiocast_set_test_labels(studiocast-vulkan-effects-production-smoke
+                    integration video gpu vulkan model)
+
             add_executable(studiocast-vulkan-matting-production-smoke
                     ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_matting_production_smoke_tests.cpp)
             target_link_libraries(studiocast-vulkan-matting-production-smoke PRIVATE
@@ -1961,6 +2031,46 @@ if (BUILD_TESTING)
             set_tests_properties(studiocast-vulkan-matting-production-smoke PROPERTIES
                     SKIP_RETURN_CODE 77)
             studiocast_set_test_labels(studiocast-vulkan-matting-production-smoke
+                    integration video gpu vulkan model)
+
+            if (_studiocast_have_dlib)
+                add_executable(studiocast-vulkan-tracking-kernel-tests
+                        ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_tracking_kernel_tests.cpp)
+                target_link_libraries(studiocast-vulkan-tracking-kernel-tests PRIVATE
+                        studiocast_vulkan_backend studiocast_open_video_backend)
+                if (TARGET dlib::dlib)
+                    target_link_libraries(studiocast-vulkan-tracking-kernel-tests PRIVATE dlib::dlib)
+                elseif (TARGET dlib)
+                    target_link_libraries(studiocast-vulkan-tracking-kernel-tests PRIVATE dlib)
+                endif()
+                target_include_directories(studiocast-vulkan-tracking-kernel-tests PRIVATE
+                        "${PROJECT_SOURCE_DIR}/src")
+                studiocast_set_project_warnings(studiocast-vulkan-tracking-kernel-tests)
+                studiocast_enable_sanitizers(studiocast-vulkan-tracking-kernel-tests)
+                set_target_properties(studiocast-vulkan-tracking-kernel-tests PROPERTIES
+                        AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+                add_test(NAME studiocast-vulkan-tracking-kernel-tests
+                        COMMAND studiocast-vulkan-tracking-kernel-tests)
+                set_tests_properties(studiocast-vulkan-tracking-kernel-tests PROPERTIES SKIP_RETURN_CODE 77)
+                studiocast_set_test_labels(studiocast-vulkan-tracking-kernel-tests
+                        integration video gpu vulkan model)
+            endif()
+
+            add_executable(studiocast-ncnn-vulkan-inference-tests
+                    ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/ncnn_vulkan_inference_tests.cpp)
+            target_link_libraries(studiocast-ncnn-vulkan-inference-tests PRIVATE
+                    studiocast_vulkan_backend "${_studiocast_ncnn_target}")
+            target_include_directories(studiocast-ncnn-vulkan-inference-tests PRIVATE
+                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+            studiocast_set_project_warnings(studiocast-ncnn-vulkan-inference-tests)
+            studiocast_enable_sanitizers(studiocast-ncnn-vulkan-inference-tests)
+            set_target_properties(studiocast-ncnn-vulkan-inference-tests PROPERTIES
+                    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME studiocast-ncnn-vulkan-inference-tests
+                    COMMAND studiocast-ncnn-vulkan-inference-tests)
+            set_tests_properties(studiocast-ncnn-vulkan-inference-tests PROPERTIES
+                    SKIP_RETURN_CODE 77)
+            studiocast_set_test_labels(studiocast-ncnn-vulkan-inference-tests
                     integration video gpu vulkan model)
 
             add_executable(studiocast-ncnn-vulkan-matting-runtime-tests

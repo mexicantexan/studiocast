@@ -57,18 +57,24 @@ int main() {
       Make(SemanticEffectId::vignette,
            {Code::open_vulkan_vignette_fixed_center_production_ready}),
       Make(SemanticEffectId::virtual_background_blur,
-           {Code::vulkan_model_artifacts_valid, Code::vulkan_matting_runtime_ready}),
+           {Code::vulkan_model_artifacts_valid,
+            Code::vulkan_matting_runtime_ready}),
       Make(SemanticEffectId::virtual_background_remove,
-           {Code::vulkan_model_artifacts_valid, Code::vulkan_matting_runtime_ready}),
+           {Code::vulkan_model_artifacts_valid,
+            Code::vulkan_matting_runtime_ready}),
       Make(SemanticEffectId::virtual_background_replace,
-           {Code::vulkan_model_artifacts_valid, Code::vulkan_matting_runtime_ready}),
+           {Code::vulkan_model_artifacts_valid,
+            Code::vulkan_matting_runtime_ready}),
       Make(SemanticEffectId::virtual_key_light,
-           {Code::vulkan_model_artifacts_valid, Code::vulkan_matting_runtime_ready}),
+           {Code::vulkan_model_artifacts_valid,
+            Code::vulkan_matting_runtime_ready}),
       Make(SemanticEffectId::video_noise_removal,
-           {Code::vulkan_model_artifacts_valid, Code::vulkan_denoise_runtime_ready}),
+           {Code::vulkan_model_artifacts_valid,
+            Code::vulkan_denoise_runtime_ready}),
       Make(SemanticEffectId::eye_contact,
            {Code::vulkan_model_artifacts_valid, Code::vulkan_face_runtime_ready,
-            Code::vulkan_eye_runtime_ready, Code::vulkan_landmarks_runtime_ready,
+            Code::vulkan_eye_runtime_ready,
+            Code::vulkan_landmarks_runtime_ready,
             Code::vulkan_shader_float64_enabled}),
       Make(SemanticEffectId::auto_frame,
            {Code::vulkan_model_artifacts_valid, Code::vulkan_face_runtime_ready,
@@ -76,23 +82,31 @@ int main() {
       Make(SemanticEffectId::vignette,
            {Code::vulkan_model_artifacts_valid, Code::vulkan_face_runtime_ready,
             Code::vulkan_tracking_gpu_ready,
-            Code::vulkan_tracked_vignette_center_supported}, true),
+            Code::vulkan_tracked_vignette_center_supported},
+           true),
   };
   for (const auto &capability : cases) {
     if (!Check(capability)) {
-      std::cerr << "Incomplete/foreign evidence admitted or complete effect rejected\n";
+      std::cerr << "Incomplete/foreign evidence admitted or complete effect "
+                   "rejected\n";
       return 1;
     }
   }
-  for (const auto semantic : {SemanticEffectId::video_noise_removal,
-                             SemanticEffectId::eye_contact,
-                             SemanticEffectId::auto_frame}) {
-    const auto impostor = Make(semantic,
-        {Code::vulkan_model_artifacts_valid, Code::vulkan_matting_runtime_ready});
+  for (const auto semantic :
+       {SemanticEffectId::video_noise_removal, SemanticEffectId::eye_contact,
+        SemanticEffectId::auto_frame}) {
+    const auto impostor = Make(semantic, {Code::vulkan_model_artifacts_valid,
+                                          Code::vulkan_matting_runtime_ready});
     if (HasVulkanProductionModelEvidence(impostor)) {
       std::cerr << "Matting-only proof qualified another model effect\n";
       return 1;
     }
+  }
+  auto misplaced = cases.front();
+  misplaced.supports_tracked_vignette_center = true;
+  if (HasVulkanProductionEvidence(misplaced)) {
+    std::cerr << "Tracked-center claim admitted for non-vignette semantic\n";
+    return 1;
   }
   return 0;
 }

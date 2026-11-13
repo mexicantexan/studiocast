@@ -182,6 +182,11 @@ set(_studiocast_vulkan_backend_sources
 
 set(_studiocast_vulkan_backend_optional_sources
         ${PROJECT_SOURCE_DIR}/src/core/open_video/ncnn_vulkan_context.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/ncnn_vulkan_inference.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/dlib_shape_predictor_data.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_vulkan_tracking.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/open_video/prepared_vulkan_fastdvdnet.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/vulkan/kernels/tracking_kernels.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/ncnn_vulkan_matting_runtime.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_runtime.cpp
         ${PROJECT_SOURCE_DIR}/src/core/open_video/vulkan_matting_session.cpp
@@ -503,11 +508,16 @@ if (STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
             PRIVATE "${_studiocast_ncnn_target}")
 endif()
 
+target_compile_definitions(studiocast_vulkan_backend PRIVATE
+        STUDIOCAST_HAVE_DLIB=$<BOOL:${_studiocast_have_dlib}>)
+
 if (_studiocast_have_dlib)
     if (TARGET dlib::dlib)
         target_link_libraries(studiocast_open_video_backend PRIVATE dlib::dlib)
+        target_link_libraries(studiocast_vulkan_backend PRIVATE dlib::dlib)
     elseif (TARGET dlib)
         target_link_libraries(studiocast_open_video_backend PRIVATE dlib)
+        target_link_libraries(studiocast_vulkan_backend PRIVATE dlib)
     else()
         message(WARNING
                 "dlib found but no CMake target was provided; linking may fail.")
@@ -660,7 +670,7 @@ if (STUDIOCAST_ENABLE_OPEN_VULKAN)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_vulkan_backend_optional_sources})
     math(EXPR _studiocast_expected_source_count
-            "${_studiocast_expected_source_count} + 20")
+            "${_studiocast_expected_source_count} + 25")
 endif ()
 if (PULSE_SIMPLE_FOUND)
     list(APPEND _studiocast_expected_sources

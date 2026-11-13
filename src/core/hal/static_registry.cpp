@@ -113,7 +113,9 @@ bool ValidateSemanticCapability(
 bool HasVulkanProductionModelEvidence(
     const SemanticCapabilityEvidence &capability) noexcept {
   if (capability.evidence_count > capability.evidence.size() ||
-      !IsVulkanProductionSemantic(capability.semantic))
+      !IsVulkanProductionSemantic(capability.semantic) ||
+      (capability.supports_tracked_vignette_center &&
+       capability.semantic != SemanticEffectId::vignette))
     return false;
   const auto has = [&](CapabilityEvidenceCode code) {
     for (std::size_t i = 0; i < capability.evidence_count; ++i) {

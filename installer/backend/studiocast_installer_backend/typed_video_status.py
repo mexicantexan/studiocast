@@ -458,7 +458,9 @@ def _capability_selection(value: Any, effect: str, code: str) -> dict[str, Any]:
     live_stage = _boolean(semantic.get("live_stage"), code)
     production_eligible = _boolean(semantic.get("production_eligible"), code)
     exact_evidence = _boolean(semantic.get("exact_evidence"), code)
-    _boolean(semantic.get("supports_tracked_vignette_center"), code)
+    tracked_center = _boolean(semantic.get("supports_tracked_vignette_center"), code)
+    if tracked_center and effect != "vignette":
+        _fail(code)
     evidence = _semantic_evidence(semantic.get("evidence"), code)
     if lane_id == 0:
         if (capability["id"] != 0 or nested["id"] != 0 or
@@ -476,6 +478,7 @@ def _capability_selection(value: Any, effect: str, code: str) -> dict[str, Any]:
         "cpu_tail_id": cpu_tail_id, "live_stage": live_stage,
         "production_eligible": production_eligible,
         "exact_evidence": exact_evidence, "evidence": evidence,
+        "supports_tracked_vignette_center": tracked_center,
     }
 
 
@@ -526,7 +529,9 @@ def _capability_matrix(
         if cpu_tail_id is None:
             _fail(code)
         _uint(semantic.get("cpu_tail_scratch_bytes"), code)
-        _boolean(semantic.get("supports_tracked_vignette_center"), code)
+        tracked_center = _boolean(semantic.get("supports_tracked_vignette_center"), code)
+        if tracked_center and effect != "vignette":
+            _fail(code)
         evidence = _semantic_evidence(
             semantic.get("evidence"), code, matrix_shape=True)
         key = (effect, lane_id)
@@ -542,6 +547,7 @@ def _capability_matrix(
             "live_stage": live_stage,
             "production_eligible": production_eligible,
             "exact_evidence": exact_evidence, "evidence": evidence,
+            "supports_tracked_vignette_center": tracked_center,
             "selectable": selectable, "disposition": disposition,
         }
     expected = {
@@ -562,6 +568,7 @@ def _capability_matches(
         "lane_id", "code", "nested_code", "provider_id", "status_id",
         "reason_id", "effect_id", "cpu_tail_id", "live_stage",
         "production_eligible", "exact_evidence", "evidence",
+        "supports_tracked_vignette_center",
     ))
 
 
@@ -576,6 +583,9 @@ def _selected_capability_is_exact(
         return False
     if selection["lane_id"] != 3:
         return True
+    if effect == "vignette" and ((selection["code"]["id"] == 147) !=
+                                 selection["supports_tracked_vignette_center"]):
+        return False
     required = set(range(1, 13))
     if effect in {"virtual_background.blur", "virtual_background.remove",
                   "virtual_background.replace", "virtual_key_light"}:

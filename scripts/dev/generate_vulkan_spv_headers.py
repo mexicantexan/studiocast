@@ -35,6 +35,34 @@ SHADERS = (
         size_name="kUtilityKernelsSpirvSizeBytes",
         hash_name="kUtilityKernelsShaderSourceSha256",
     ),
+    ShaderHeader(
+        source="src/core/vulkan/kernels/shaders/tracking.comp",
+        header="src/core/vulkan/kernels/shaders/tracking_spv.h",
+        array_name="kTrackingSpirv",
+        size_name="kTrackingSpirvSizeBytes",
+        hash_name="kTrackingShaderSourceSha256",
+    ),
+    ShaderHeader(
+        source="src/core/vulkan/kernels/shaders/dlib_predictor.comp",
+        header="src/core/vulkan/kernels/shaders/dlib_predictor_spv.h",
+        array_name="kDlibPredictorSpirv",
+        size_name="kDlibPredictorSpirvSizeBytes",
+        hash_name="kDlibPredictorShaderSourceSha256",
+    ),
+    ShaderHeader(
+        source="src/core/vulkan/kernels/shaders/eye_contact.comp",
+        header="src/core/vulkan/kernels/shaders/eye_contact_spv.h",
+        array_name="kEyeContactSpirv",
+        size_name="kEyeContactSpirvSizeBytes",
+        hash_name="kEyeContactShaderSourceSha256",
+    ),
+    ShaderHeader(
+        source="src/core/vulkan/kernels/shaders/fastdvdnet.comp",
+        header="src/core/vulkan/kernels/shaders/fastdvdnet_spv.h",
+        array_name="kFastDvdnetSpirv",
+        size_name="kFastDvdnetSpirvSizeBytes",
+        hash_name="kFastDvdnetShaderSourceSha256",
+    ),
 )
 
 
@@ -103,11 +131,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", default=".")
     parser.add_argument("--glslang-validator", required=True)
+    parser.add_argument("--shader", action="append",
+                        choices=[Path(s.source).stem for s in SHADERS],
+                        help="Regenerate only these shaders (repeatable).")
     args = parser.parse_args()
 
     root = Path(args.source_root).resolve()
     glslang = Path(args.glslang_validator).resolve()
     for shader in SHADERS:
+        if args.shader and Path(shader.source).stem not in args.shader:
+            continue
         spv = compile_shader(glslang, root, shader)
         write_header(root, shader, spv)
         print(f"generated {shader.header}")

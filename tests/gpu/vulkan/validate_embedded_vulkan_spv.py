@@ -45,6 +45,38 @@ SHADERS = (
         size_name="kUtilityKernelsSpirvSizeBytes",
         hash_name="kUtilityKernelsShaderSourceSha256",
     ),
+    ShaderHeader(
+        name="tracking",
+        source="src/core/vulkan/kernels/shaders/tracking.comp",
+        header="src/core/vulkan/kernels/shaders/tracking_spv.h",
+        array_name="kTrackingSpirv",
+        size_name="kTrackingSpirvSizeBytes",
+        hash_name="kTrackingShaderSourceSha256",
+    ),
+    ShaderHeader(
+        name="dlib_predictor",
+        source="src/core/vulkan/kernels/shaders/dlib_predictor.comp",
+        header="src/core/vulkan/kernels/shaders/dlib_predictor_spv.h",
+        array_name="kDlibPredictorSpirv",
+        size_name="kDlibPredictorSpirvSizeBytes",
+        hash_name="kDlibPredictorShaderSourceSha256",
+    ),
+    ShaderHeader(
+        name="eye_contact",
+        source="src/core/vulkan/kernels/shaders/eye_contact.comp",
+        header="src/core/vulkan/kernels/shaders/eye_contact_spv.h",
+        array_name="kEyeContactSpirv",
+        size_name="kEyeContactSpirvSizeBytes",
+        hash_name="kEyeContactShaderSourceSha256",
+    ),
+    ShaderHeader(
+        name="fastdvdnet",
+        source="src/core/vulkan/kernels/shaders/fastdvdnet.comp",
+        header="src/core/vulkan/kernels/shaders/fastdvdnet_spv.h",
+        array_name="kFastDvdnetSpirv",
+        size_name="kFastDvdnetSpirvSizeBytes",
+        hash_name="kFastDvdnetShaderSourceSha256",
+    ),
 )
 
 
@@ -86,9 +118,11 @@ def words_to_bytes(words: list[int]) -> bytes:
     return b"".join(word.to_bytes(4, byteorder="little") for word in words)
 
 
-def validate(root: Path, glslang: Path | None) -> int:
+def validate(root: Path, glslang: Path | None, selected: list[str] | None = None) -> int:
     failures = 0
     for shader in SHADERS:
+        if selected and shader.name not in selected:
+            continue
         source_path = root / shader.source
         header_path = root / shader.header
         if not source_path.is_file():
@@ -138,10 +172,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", default=".")
     parser.add_argument("--glslang-validator")
+    parser.add_argument("--shader", action="append", choices=[s.name for s in SHADERS],
+                        help="Validate only these shaders (repeatable); compiler versions may differ.")
     args = parser.parse_args()
 
     glslang = Path(args.glslang_validator).resolve() if args.glslang_validator else None
-    return 1 if validate(Path(args.source_root).resolve(), glslang) else 0
+    return 1 if validate(Path(args.source_root).resolve(), glslang, args.shader) else 0
 
 
 if __name__ == "__main__":

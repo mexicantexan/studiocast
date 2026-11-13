@@ -64,6 +64,20 @@ class VulkanModelEvidenceTests(unittest.TestCase):
                     self.assertFalse(rejected["valid"])
                     self.assertEqual(["typed_status.selected_capability_incomplete"], rejected["reason_codes"])
 
+    def test_tracked_flag_cannot_disagree_with_semantic_or_success_code(self):
+        cases = ((8, "vignette", 147,
+                  "open_vulkan_vignette_tracked_center_production_ready", (19, 51, 54)),
+                 (1, "video_noise_removal", 143,
+                  "open_vulkan_video_noise_removal_production_ready", (50,)))
+        for identifier, name, code, token, proofs in cases:
+            packet = self.packet(identifier, name, code, token, proofs)
+            effect = next(x for x in packet["effects"] if x["effect"]["id"] == identifier)
+            semantic = effect["selected_capability"]["semantic"]
+            semantic["supports_tracked_vignette_center"] = not semantic["supports_tracked_vignette_center"]
+            packet["capabilities"]["lanes"] = typed_capability_lanes(packet["effects"])
+            rejected = parse_typed_multi_island_video_status({"typed_multi_island_video_status": packet})
+            self.assertFalse(rejected["valid"], name)
+
 
 if __name__ == "__main__":
     unittest.main()
