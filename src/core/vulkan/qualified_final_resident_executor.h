@@ -70,6 +70,7 @@ private:
   struct Slot {
     bool occupied = false;
     bool quarantined = false;
+    hal::ReasonId quarantine_reason = hal::ReasonId::none;
     std::uint64_t state_id = 0;
     std::uint64_t program_id = 0;
     std::uint64_t canonical_plan_hash = 0;

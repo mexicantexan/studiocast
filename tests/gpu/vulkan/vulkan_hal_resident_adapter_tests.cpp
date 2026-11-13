@@ -291,6 +291,11 @@ public:
       result.device_lost = true;
       return result;
     }
+    if (report_timeout) {
+      result.status = StatusId::quarantined;
+      result.reason = ReasonId::synchronization_failed;
+      return result;
+    }
     if (write_output) {
       std::memcpy(
           binding.output, binding.input,
@@ -325,6 +330,7 @@ public:
   ReasonId stage_failure_reason = ReasonId::optional_stage_failed_open;
   bool hidden_intermediate_crossing = false;
   bool report_device_loss = false;
+  bool report_timeout = false;
   bool write_output = true;
   bool shutdown = false;
   std::uint64_t prepare_calls = 0;
@@ -451,6 +457,54 @@ bool TestResetAndExactUnsubmittedRetirement() {
                     executor.execute_calls == 0,
                 "failed reset blocks subsequent native execution");
   adapter.DestroyPrepared(&handle);
+  return ok;
+}
+
+bool TestQuarantinePreservesTimeoutVersusDeviceLoss() {
+  bool ok = true;
+  for (const auto failure :
+       {ReasonId::synchronization_failed, ReasonId::device_lost}) {
+    FakeQualifiedExecutor executor;
+    executor.report_timeout = failure == ReasonId::synchronization_failed;
+    executor.report_device_loss = failure == ReasonId::device_lost;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    const auto program = Program(910);
+    studiocast::hal::PreparedProgramHandle handle;
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &= Require(adapter.SetProgramOptions(Options(program)) &&
+                      adapter.Prepare(program, &handle, &readiness, &reason) ==
+                          StatusId::ready,
+                  "quarantine-reason fixture must prepare");
+    std::array<std::uint8_t, kFrameBytes> input{}, output{};
+    HostFrameTokens tokens;
+    ok &= Require(
+        adapter.BindHostFrame(handle, CommonBinding(program, input, output, 1),
+                              &tokens, &reason) == StatusId::ready,
+        "quarantine-reason frame must bind");
+    const auto failed =
+        adapter.Execute(handle, Request(program, tokens.input, 1));
+    const auto retry =
+        adapter.Execute(handle, Request(program, tokens.input, 2));
+    HostFrameOutputResolution resolution;
+    ok &= Require(
+        failed.status == StatusId::quarantined && failed.reason == failure &&
+            !failed.output_valid && retry.status == StatusId::quarantined &&
+            retry.reason == failure && executor.execute_calls == 1 &&
+            adapter.BindHostFrame(handle,
+                                  CommonBinding(program, input, output, 2),
+                                  &tokens, &reason) == StatusId::quarantined &&
+            reason == failure &&
+            adapter.ResolveHostFrameOutput(handle, {}, {}, &resolution,
+                                           &reason) == StatusId::quarantined &&
+            reason == failure &&
+            adapter.DiscardUnsubmittedHostFrame(handle, tokens, 1, &reason) ==
+                StatusId::quarantined &&
+            reason == failure,
+        "timeout quarantine must retain synchronization failure; "
+        "real device loss must retain device-lost evidence");
+    adapter.DestroyPrepared(&handle);
+  }
   return ok;
 }
 
@@ -1450,6 +1504,7 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
 int main() {
   bool ok = true;
   ok &= TestResetAndExactUnsubmittedRetirement();
+  ok &= TestQuarantinePreservesTimeoutVersusDeviceLoss();
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestMetadataAllowancesFailBeforeNativePrepare();
   ok &= TestCapabilityAndSemanticGates();

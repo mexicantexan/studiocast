@@ -200,6 +200,7 @@ private:
   struct PreparedSlot {
     bool occupied = false;
     bool quarantined = false;
+    hal::ReasonId quarantine_reason = hal::ReasonId::none;
     bool binding_armed = false;
     bool neutral_binding = false;
     bool executing = false;

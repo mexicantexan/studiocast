@@ -625,7 +625,7 @@ StatusId VulkanHalResidentAdapter::ArmHostFrame(
     return StatusId::blocked;
   }
   if (slot->quarantined) {
-    SetReason(reason, ReasonId::device_lost);
+    SetReason(reason, slot->quarantine_reason);
     return StatusId::quarantined;
   }
   if (slot->executing || slot->binding_armed) {
@@ -762,7 +762,7 @@ VulkanHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   if (!slot)
     return Failed(StatusId::stale, ReasonId::stale_program);
   if (slot->quarantined)
-    return Failed(StatusId::quarantined, ReasonId::device_lost);
+    return Failed(StatusId::quarantined, slot->quarantine_reason);
   if (!slot->binding_armed)
     return Failed(StatusId::blocked, ReasonId::invalid_resource);
   const auto reject_bound_frame = [slot](StatusId status,
@@ -854,11 +854,18 @@ VulkanHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
   result.transfers = executor_result.transfers;
   result.transfers.cpu_tail_boundaries += slot->program.cpu_tail_count;
   result.frame_elapsed_ns = executor_result.frame_elapsed_ns;
-  if (executor_result.device_lost ||
+  if (executor_result.status == StatusId::quarantined ||
+      executor_result.device_lost ||
       executor_result.reason == ReasonId::device_lost) {
     slot->quarantined = true;
     result.status = StatusId::quarantined;
-    result.reason = ReasonId::device_lost;
+    result.reason = executor_result.device_lost ||
+                            executor_result.reason == ReasonId::device_lost
+                        ? ReasonId::device_lost
+                        : (executor_result.reason == ReasonId::none
+                               ? ReasonId::synchronization_failed
+                               : executor_result.reason);
+    slot->quarantine_reason = result.reason;
     return result;
   }
   if (executor_result.stage_count != execution_program.stage_count ||
@@ -981,7 +988,7 @@ StatusId VulkanHalResidentAdapter::ResolveHostFrameOutput(
     return StatusId::stale;
   }
   if (slot->quarantined) {
-    SetReason(reason, ReasonId::device_lost);
+    SetReason(reason, slot->quarantine_reason);
     return StatusId::quarantined;
   }
   if (!resolution || !slot->output_ready) {
@@ -1047,8 +1054,12 @@ StatusId VulkanHalResidentAdapter::ResetTemporalState(
       executor_->ResetTemporalState(slot->executor_program, reason);
   slot->output_ready = false;
   slot->completed_token = {};
-  if (status != StatusId::ready && status != StatusId::degraded)
+  if (status != StatusId::ready && status != StatusId::degraded) {
     slot->quarantined = true;
+    slot->quarantine_reason = reason == ReasonId::device_lost
+                                  ? reason
+                                  : ReasonId::synchronization_failed;
+  }
   return status;
 }
 
@@ -1067,7 +1078,7 @@ StatusId VulkanHalResidentAdapter::DiscardUnsubmittedHostFrame(
     return StatusId::stale;
   }
   if (slot->quarantined) {
-    SetReason(reason, ReasonId::device_lost);
+    SetReason(reason, slot->quarantine_reason);
     return StatusId::quarantined;
   }
   if (!sequence || !slot->neutral_binding || !slot->binding_armed ||

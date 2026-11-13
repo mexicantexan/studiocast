@@ -138,6 +138,7 @@ enum class ExecuteMode {
   optional_fail_open,
   transfer_mismatch,
   device_loss,
+  synchronization_quarantine,
 };
 
 class FakeVulkanAdapter final : public hal::IResidentAdapter {
@@ -201,9 +202,12 @@ public:
           const hal::ExecuteRequest &request) noexcept override {
     ++execute_calls;
     hal::ExecuteResult result;
-    if (mode == ExecuteMode::device_loss) {
+    if (mode == ExecuteMode::device_loss ||
+        mode == ExecuteMode::synchronization_quarantine) {
       result.status = hal::StatusId::quarantined;
-      result.reason = hal::ReasonId::device_lost;
+      result.reason = mode == ExecuteMode::device_loss
+                          ? hal::ReasonId::device_lost
+                          : hal::ReasonId::synchronization_failed;
       return result;
     }
     std::memcpy(binding_.output_planes[0].write_data,
@@ -510,6 +514,38 @@ bool TestExactFactoryAndCommit() {
                         hal::BackendId::vulkan &&
                     committed.telemetry.committed_output_frames == 1,
                 "active Vulkan attribution must occur only after commit");
+  return ok;
+}
+
+bool TestFactoryRetainsExactQuarantineReason() {
+  bool ok = true;
+  for (const auto reason :
+       {hal::ReasonId::synchronization_failed, hal::ReasonId::device_lost}) {
+    Fixture fixture;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    video::VideoAdapterPrepareEvidence evidence;
+    auto executor =
+        fixture.factory.Prepare(fixture.coordinator.Snapshot().plan, &evidence);
+    if (!Require(executor != nullptr, "quarantine wrapper must prepare"))
+      return false;
+    fixture.adapter.mode = reason == hal::ReasonId::device_lost
+                               ? ExecuteMode::device_loss
+                               : ExecuteMode::synchronization_quarantine;
+    std::uint8_t input[kBytes]{}, output[kBytes]{};
+    const auto failed = executor->Execute(Binding(input, output, 1));
+    const auto retry = executor->Execute(Binding(input, output, 2));
+    const auto snapshot = executor->Snapshot();
+    ok &= Require(failed.status == hal::StatusId::quarantined &&
+                      failed.reason == reason && !failed.output_ready &&
+                      retry.status == hal::StatusId::quarantined &&
+                      retry.reason == reason &&
+                      snapshot.readiness.status == hal::StatusId::quarantined &&
+                      snapshot.readiness.reason == reason &&
+                      fixture.adapter.execute_calls == 1,
+                  "factory retries and diagnostics must preserve timeout "
+                  "versus real device loss");
+  }
   return ok;
 }
 
@@ -1373,6 +1409,7 @@ int TestProductionSetupSourceIfAvailable() {
 int main() {
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
+  ok &= TestFactoryRetainsExactQuarantineReason();
   ok &= TestMattingFinalGeometryContract();
   ok &= TestAllModelProgramContract();
   ok &= TestFactoryRejectsIncompleteAndDuplicateModelProofs();

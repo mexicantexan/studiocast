@@ -180,8 +180,7 @@ struct QualifiedFinalResidentExecutor::ModelEffects {
       b.c = 1;
     }
     b.row_stride_bytes = static_cast<std::size_t>(b.w) * sizeof(float);
-    b.plane_stride_bytes =
-        b.row_stride_bytes * static_cast<std::size_t>(b.h);
+    b.plane_stride_bytes = b.row_stride_bytes * static_cast<std::size_t>(b.h);
     return b;
   }
   bool PrepareGraph(open_vulkan::NcnnVulkanInference &runtime,
@@ -434,17 +433,17 @@ bool QualifiedFinalResidentExecutor::InitializeModels(
     // Record every enabled immutable phase against canonical fixed images at
     // setup. Abort proves no phase was executed; live calls only append them.
     initialization_failed_semantic_ = SemanticEffectId::auto_frame;
-    bool recorded = m.batch.BeginFrame(1, error) &&
-                    m.tracking.AppendReset(m.batch, error) &&
-                    m.tracking.AppendFacePreprocess(m.batch, m.face_input,
-                                                    error) &&
-                    m.tracking.AppendFaceDecode(m.batch, error);
+    bool recorded =
+        m.batch.BeginFrame(1, error) &&
+        m.tracking.AppendReset(m.batch, error) &&
+        m.tracking.AppendFacePreprocess(m.batch, m.face_input, error) &&
+        m.tracking.AppendFaceDecode(m.batch, error);
     if (recorded && eye) {
       initialization_failed_semantic_ = SemanticEffectId::eye_contact;
       recorded = m.tracking.AppendLandmarks(m.batch, m.face_input, error) &&
                  m.tracking.AppendEyeInputs(m.batch, m.face_input, error) &&
-                 m.tracking.AppendEyeTailAndComposite(
-                     m.batch, m.face_input, m.eye_output, error);
+                 m.tracking.AppendEyeTailAndComposite(m.batch, m.face_input,
+                                                      m.eye_output, error);
     }
     if (recorded && setup.auto_frame) {
       initialization_failed_semantic_ = SemanticEffectId::auto_frame;
@@ -454,8 +453,8 @@ bool QualifiedFinalResidentExecutor::InitializeModels(
     }
     if (recorded && tracked) {
       initialization_failed_semantic_ = SemanticEffectId::vignette;
-      recorded = m.tracking.AppendVignette(
-          m.batch, m.vignette_input, m.vignette_output, error);
+      recorded = m.tracking.AppendVignette(m.batch, m.vignette_input,
+                                           m.vignette_output, error);
     }
     if (!recorded) {
       m.batch.AbortUnsubmitted();
@@ -871,8 +870,8 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
   }
   if (slot->quarantined) {
     result.status = StatusId::quarantined;
-    result.reason = ReasonId::device_lost;
-    result.device_lost = true;
+    result.reason = slot->quarantine_reason;
+    result.device_lost = result.reason == ReasonId::device_lost;
     return finish();
   }
   const std::size_t minimum_input_row =
@@ -935,12 +934,15 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
           binding.input, binding.input_row_stride_bytes, slot->upload_staging,
           slot->source, nullptr)) {
     const auto failed_health = kernels_->device()->health_state();
-    result.device_lost = failed_health.health != VulkanContextHealth::healthy;
-    slot->quarantined = result.device_lost;
+    result.device_lost =
+        failed_health.health == VulkanContextHealth::device_lost;
+    slot->quarantined = !failed_health.healthy();
     result.status =
-        result.device_lost ? StatusId::quarantined : StatusId::failed;
+        slot->quarantined ? StatusId::quarantined : StatusId::failed;
     result.reason = result.device_lost ? ReasonId::device_lost
                                        : ReasonId::synchronization_failed;
+    if (slot->quarantined)
+      slot->quarantine_reason = result.reason;
     return finish();
   }
   result.transfers.uploads = 1;
@@ -1104,12 +1106,16 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
                               binding.output, binding.output_row_stride_bytes,
                               nullptr)) {
     const auto failed_health = kernels_->device()->health_state();
-    result.device_lost = failed_health.health != VulkanContextHealth::healthy;
-    slot->quarantined = result.device_lost;
+    result.device_lost =
+        failed_health.health == VulkanContextHealth::device_lost;
+    slot->quarantined = !failed_health.healthy();
     result.status =
-        result.device_lost ? StatusId::quarantined : StatusId::failed;
-    result.reason = result.device_lost ? ReasonId::device_lost
-                                       : ReasonId::output_write_failed;
+        slot->quarantined ? StatusId::quarantined : StatusId::failed;
+    result.reason = result.device_lost  ? ReasonId::device_lost
+                    : slot->quarantined ? ReasonId::synchronization_failed
+                                        : ReasonId::output_write_failed;
+    if (slot->quarantined)
+      slot->quarantine_reason = result.reason;
     result.transfers.synchronizations =
         kernels_->synchronous_submission_count() - submissions_before +
         matting_readiness_.runtime.completion_count -
@@ -1145,9 +1151,12 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::ExecuteExpanded(
     if (m.batch.state() == ResidentCommandBatchState::unsafe_pending ||
         !kernels_->device()->health_state().healthy()) {
       slot->quarantined = true;
-      result.device_lost = true;
+      result.device_lost = kernels_->device()->health_state().health ==
+                           VulkanContextHealth::device_lost;
       result.status = StatusId::quarantined;
-      result.reason = ReasonId::synchronization_failed;
+      result.reason = result.device_lost ? ReasonId::device_lost
+                                         : ReasonId::synchronization_failed;
+      slot->quarantine_reason = result.reason;
     }
     result.frame_elapsed_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1434,6 +1443,7 @@ void QualifiedFinalResidentExecutor::Release(Slot *slot) noexcept {
   slot->upload_staging.Free();
   slot->occupied = false;
   slot->quarantined = false;
+  slot->quarantine_reason = ReasonId::none;
   slot->state_id = 0;
   slot->program_id = 0;
   slot->canonical_plan_hash = 0;
@@ -1455,6 +1465,10 @@ void QualifiedFinalResidentExecutor::DestroyPrepared(
     if (kernels_ && kernels_->device() &&
         !kernels_->device()->health_state().healthy()) {
       slot->quarantined = true;
+      slot->quarantine_reason = kernels_->device()->health_state().health ==
+                                        VulkanContextHealth::device_lost
+                                    ? ReasonId::device_lost
+                                    : ReasonId::synchronization_failed;
       return;
     }
     Release(slot);
@@ -1481,7 +1495,8 @@ void QualifiedFinalResidentExecutor::Shutdown() noexcept {
   shutdown_ = true;
 }
 
-bool QualifiedFinalResidentExecutor::RetireFailedFrameAfterQuiescence() noexcept {
+bool QualifiedFinalResidentExecutor::
+    RetireFailedFrameAfterQuiescence() noexcept {
   if (model_effects_) {
     auto &batch = model_effects_->batch;
     if (batch.state() == ResidentCommandBatchState::recording)

@@ -923,6 +923,7 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
   const auto request = Request(test);
   const auto failed = manager.Execute(Binding(request, input, &output, 1));
   if (!Require(failed.status == hal::StatusId::quarantined &&
+                   failed.reason == hal::ReasonId::synchronization_failed &&
                    !failed.output_ready &&
                    !manager.Snapshot().resident.latest_committed_frame.valid &&
                    manager.Snapshot().resident.telemetry.active_backend_frames == 0 &&
@@ -950,6 +951,7 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
   const auto retry = manager.Execute(Binding(request, input, &output, 2));
   if (!Require(retry.status != hal::StatusId::executed &&
                    retry.status != hal::StatusId::degraded &&
+                   retry.reason == hal::ReasonId::synchronization_failed &&
                    !retry.output_ready && Collect(*observed, &after) &&
                    no_success(),
                "a poisoned context accepted another frame"))

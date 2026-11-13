@@ -841,7 +841,7 @@ public:
     ReasonId reason = ReasonId::none;
     hal::ReadinessSnapshot readiness;
     auto status = session_.Configure(plan_.prepared_program, adapter_,
-                                           &readiness, &reason);
+                                     &readiness, &reason);
     if (evidence) {
       evidence->status = status;
       evidence->reason = reason;
@@ -892,7 +892,7 @@ public:
     if (!prepared_) {
       frame.status = quarantined_ ? StatusId::quarantined : StatusId::stale;
       frame.reason =
-          quarantined_ ? ReasonId::device_lost : ReasonId::stale_program;
+          quarantined_ ? quarantine_reason_ : ReasonId::stale_program;
       return frame;
     }
     hal::HostFrameTokens tokens;
@@ -919,6 +919,9 @@ public:
     if (executed.reason == ReasonId::device_lost ||
         executed.status == StatusId::quarantined) {
       quarantined_ = true;
+      quarantine_reason_ = executed.reason == ReasonId::none
+                               ? ReasonId::synchronization_failed
+                               : executed.reason;
       prepared_ = false;
       return frame;
     }
@@ -961,7 +964,10 @@ public:
     session_.Invalidate(reason);
     prepared_ = false;
     pending_ = false;
-    quarantined_ = reason == ReasonId::device_lost;
+    quarantined_ = quarantined_ || reason == ReasonId::device_lost;
+    if (quarantined_ && quarantine_reason_ == ReasonId::none)
+      quarantine_reason_ =
+          reason == ReasonId::none ? ReasonId::synchronization_failed : reason;
   }
 
   StatusId ResetTemporal(ReasonId reason) noexcept override {
@@ -974,6 +980,12 @@ public:
       prepared_ = false;
       pending_ = false;
       quarantined_ = status == StatusId::quarantined;
+      if (quarantined_ && quarantine_reason_ == ReasonId::none) {
+        const auto failure = session_.readiness().reason;
+        quarantine_reason_ = failure == ReasonId::device_lost
+                                 ? failure
+                                 : ReasonId::synchronization_failed;
+      }
     }
     return status;
   }
@@ -999,9 +1011,9 @@ public:
           stopped_ ? StatusId::stopped
                    : (quarantined_ ? StatusId::quarantined : StatusId::stale);
       snapshot.readiness.reason =
-          stopped_ ? ReasonId::shutdown_requested
-                   : (quarantined_ ? ReasonId::device_lost
-                                   : ReasonId::stale_program);
+          stopped_
+              ? ReasonId::shutdown_requested
+              : (quarantined_ ? quarantine_reason_ : ReasonId::stale_program);
       snapshot.readiness.available = false;
     }
     snapshot.telemetry = session_.telemetry();
@@ -1025,6 +1037,7 @@ private:
   bool prepared_ = false;
   bool pending_ = false;
   bool quarantined_ = false;
+  ReasonId quarantine_reason_ = ReasonId::none;
   bool stopped_ = false;
 };
 
@@ -1077,7 +1090,10 @@ struct VulkanVideoExecutionFactory::Impl {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     if (!NativeQuiescenceProven()) {
       status = StatusId::quarantined;
-      reason = ReasonId::synchronization_failed;
+      reason = production && production->kernels.device()->health_state().health ==
+                                 VulkanContextHealth::device_lost
+                   ? ReasonId::device_lost
+                   : ReasonId::synchronization_failed;
       // Destructor retains this complete failed candidate; no caller may
       // mistake missing session readiness for permission to release it.
       return;
@@ -1669,8 +1685,10 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
                     : StatusId::blocked,
                 validation_reason);
   }
-  preflight.status = frozen_resolution.degraded ? StatusId::degraded : StatusId::ready;
-  preflight.reason = frozen_resolution.degraded ? frozen_resolution.reason : ReasonId::none;
+  preflight.status =
+      frozen_resolution.degraded ? StatusId::degraded : StatusId::ready;
+  preflight.reason =
+      frozen_resolution.degraded ? frozen_resolution.reason : ReasonId::none;
   preflight.readiness.status = preflight.status;
   preflight.readiness.reason = preflight.reason;
   preflight.readiness.degraded = frozen_resolution.degraded;
