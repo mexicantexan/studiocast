@@ -26,6 +26,7 @@ struct ResidentCommandTicket {
   std::uint64_t epoch = 0;
   std::uint64_t capture_sequence = 0;
   std::uint64_t owner_generation = 0;
+  // Monotonic within an epoch; rollback never reuses an issued ticket index.
   std::uint32_t participant_index = 0;
   friend bool operator==(const ResidentCommandTicket &,
                          const ResidentCommandTicket &) = default;
