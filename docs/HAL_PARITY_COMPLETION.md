@@ -30,6 +30,13 @@ name its effects, adapter and execution-domain contract, models and artifacts,
 hardware matrix, transfer budget, failure behavior, and rollback boundary.
 Passing one phase does not promote other Vulkan effects.
 
+The user expanded the current implementation scope to complete the remaining
+Vulkan model effects together. FastDVDnet denoise, YuNet Auto Frame, dlib/FLX
+Eye Contact and tracked vignette now join the resident matting/utility program.
+Their independent evidence and combined validation are tracked in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md). The per-effect
+qualification gates below continue to apply to this combined scope.
+
 Vulkan matting activation requires all of the following, reviewed together:
 
 - shared-device GPU-only inference using StudioCast's selected physical and
@@ -46,7 +53,8 @@ P1000 execution results; see
 [VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
 Unavailable AMD/Intel hardware remains explicitly unqualified for deployment
 feedback under the user's 2026-11-11 decision. This does not waive runtime,
-integrity, ownership, or transfer gates, or promote other Vulkan model effects.
+integrity, ownership, or transfer gates. The expanded effects require their own
+exact proofs rather than inheriting qualification from MODNet.
 
 ## Family parity gate
 

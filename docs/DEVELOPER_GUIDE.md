@@ -598,16 +598,17 @@ device before the daemon can report its four matting consumers ready. Missing
 build, model, or runtime evidence remains blocked instead of silently running
 CUDA or CPU inference.
 
-Production Vulkan expansion follows CUDA parity in bounded, independently
-reviewed phases. Each phase needs an adapter with exact resource and execution-
-domain ownership, models that satisfy the documented conversion and checksum
-contract where inference is involved, and real-hardware evidence for the
-claimed device families. These are qualification requirements, not promises
-that the remaining Vulkan effects are available. In particular, Vulkan
-matting requires reviewed shared-device GPU-only inference and converted,
-checksummed model artifacts satisfying the resident-runtime contract. The
-implementation is opt-in; its available-hardware evidence does not qualify
-unavailable device families or the remaining Vulkan model effects.
+The expanded production Vulkan program implements FastDVDnet denoise, YuNet
+Auto Frame, dlib/FLX Eye Contact and tracked vignette alongside matting,
+background composition, key light, resize and mirror. These effects share one
+prepared execution domain and retain GPU intermediates through the final
+readback. Each selected effect still needs its own model, warmup, ownership,
+resource and numerical qualification evidence; matting readiness alone cannot
+promote another effect. The model-backed implementation requires the pinned
+ncnn replay SDK and compatible checksummed artifacts. Available-hardware
+results, pending artifact publication and geometry limits are recorded in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md); they do not
+qualify unavailable device families.
 
 Keep implementation, production routing, hardware qualification, and release
 publication as separate evidence. Local canonical CUDA composition is integrated
