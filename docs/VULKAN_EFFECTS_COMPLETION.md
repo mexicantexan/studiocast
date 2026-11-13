@@ -206,3 +206,76 @@ includes selection, hashing, shader/graph preparation and predictor parsing; it
 is not an inference latency claim. Combined/FHD profiles, production execution,
 face-positive proof, Release diagnostic-refresh timing and final budgets remain
 under investigation before qualification.
+
+## Integrated branches and follow-up verification
+
+| Topic | Accepted source / integrated commit |
+| --- | --- |
+| Generic inference/conversion | `codex/vulkan-all-runtime-20261112`, tip `05df764`, merged `e2e8c1a` |
+| Resident tracking/eye kernels | `codex/vulkan-all-tracking-20261112`, tip `2a6ca5b`, merged `0842bae` |
+| Readiness wrappers | `codex/vulkan-model-readiness-20261112`, `686a587` → `f0ee829` |
+| Model/shared-inference docs | `codex/vulkan-model-docs-20261112`, `df66ac3` → `f7a2835` |
+| Production integration/isolation | `codex/vulkan-all-pipeline-20261112`, `f06d6ff` → `eebff48`; rank-one/warmup changes `edc8c76` → `cf14d37` |
+| SDK installer | `codex/vulkan-installer-runtime-20261112`, `54decff` → `353ae41`; smoke `c0af1de` → `efdd822` |
+| Legacy status/recommendation | `codex/vulkan-legacy-projection-20261112`, `9263541` → `b769b55` |
+| Opt-in full-model CI | `codex/vulkan-models-hardware-ci-20261112`, `9e31f3e` → `e869a81` |
+
+The initial Auto Frame proof correction misread the base runtime code: it already
+emitted tracking54, so the additive record must remain face51. `cf8ec26` corrects
+the introduced duplicate54 and restores exact51+54. The complete seven-stage
+factory test is integrated at `885cf97`. `1a0890a` then validates every raw factory
+capability with the shared full-proof predicate and static registry before
+publishing readiness; missing51/54/53/55 and duplicate-proof negatives pass. This
+prevents invalid raw readiness from reaching a later lease rejection.
+
+Cold diagnostics initially under-reserved the forest setup upload at1MiB.
+`892158d` reserves64MiB for the exact roughly63.7MiB flattened forest; the whole
+small startup profile is explicitly833MiB with2,048resources, not a per-model
+multiplier. Actual optimized cold diagnostics then passed all9effects on the
+same prepared owner in23.51s, within the existing35s installed refresh timeout.
+The native log is
+`/tmp/studiocast-vulkan-all-pipeline-release-cold-diagnostics-20261112.log`.
+
+The real full seven-stage64x64 preparation passed at375,072,288 retained bytes /
+802 native allocations, with815 setup high-water allocations and8.59s Release
+setup. All six caller axes remain unchanged; the general manager's existing
+maximum caller reservation is8GiBpersistent+4GiBscratch+1GiBupload+1GiBreadback,
+1,024resources and one in-flight frame. The actual context clamps the aggregate
+to the selected physical memory limit and charges every pool/buffer. This is an
+explicit aggregate upper limit, not a claim that each effect consumes its own
+256MiB or that FHD preparation/execution is qualified.
+
+The full batch first hit the100ms fence and exited139 during unsafe teardown.
+A debugger rerun completed four batches in approximately90.9/88.9/48.4/48.0ms
+with one upload/final readback/synchronization, no CPU tails and zero C++ Execute
+allocations. The timeout/crash is still under diagnosis; these four observations
+do not establish latency percentiles or waive the100ms limit. Independent
+lifetime inspection found complete island retention but a genuine missing
+production bridge to recheck a poisoned context's exact pending fence during
+shutdown. A bounded late-retirement API and scoped crash reproduction are in
+progress; successful late retirement must never promote a failed frame.
+
+The native matrix also exposed a valid neutral-runtime scope extension:
+a successful publication followed by a failed writer retained stale active
+attribution in PreparedProgramSession and VideoExecutionCoordinator. A separate
+isolated remediation owns only those two implementations and their existing
+focused tests. It must preserve selected/readiness state and historical counters,
+clear current activity only after a validated failed publication, reject forged
+completions and recover on the next successful writer. The native assertion is
+retained unchanged.
+
+Before these latest remediation changes, broad loader-denied suites passed:
+production ncnn100tests (88executed/12native opt-ins skipped), all-optional94
+(88/6skipped), both49.47s. Disabled85tests had only the disk-dependent fake-build
+backend test fail; its two fixtures were corrected to use declared fixture free
+space and the affected backend test passed afterward. No assertion or disk gate
+was weakened. Fresh final-head suites remain required after remediation.
+
+Independent model/publication audit found no Critical/High asset/license blocker:
+all14file hashes, four complete finite FP32 graphs, original ONNX and prefix
+checks,45denoise/60face-head/15-per-eye numerical cases and30exact-tail cases,
+full upstream license receipts, local/offline transactions and unmarked-user-pack
+preservation passed. Promotion restores all10original catalog artifact objects
+(including public ONNX source candidates) and adds only the8new artifacts. The
+exact14file publication approval remains pending; no new artifact was published
+or active catalog promoted.
