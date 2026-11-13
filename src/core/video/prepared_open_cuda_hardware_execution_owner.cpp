@@ -22,6 +22,13 @@ constexpr std::uint64_t kMaxScratchBytes = UINT64_C(1) << 30;
 constexpr std::uint64_t kMaxBoundaryBytes = UINT64_C(1) << 30;
 constexpr std::uint32_t kMaxResources = 256;
 
+hal::ReasonId
+QuarantineCause(const hal::PreparedProgramSession &session) noexcept {
+  const auto reason = session.readiness().reason;
+  return reason == hal::ReasonId::none ? hal::ReasonId::synchronization_failed
+                                       : reason;
+}
+
 std::uint64_t NextAdapterInstanceId() noexcept {
   static std::atomic<std::uint64_t> next{UINT64_C(0x4f430000)};
   std::uint64_t result = next.fetch_add(1, std::memory_order_relaxed);
@@ -509,8 +516,9 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
     result.status =
         owner.shutdown.shutdown_requested
             ? owner.shutdown.hal_status
-            : (owner.bootstrap_domain_ready ? hal::StatusId::ready
-                                            : hal::StatusId::blocked);
+            : (owner.quarantined              ? hal::StatusId::quarantined
+               : owner.bootstrap_domain_ready ? hal::StatusId::ready
+                                              : hal::StatusId::blocked);
     result.reason = owner.shutdown.shutdown_requested
                         ? owner.shutdown.reason
                         : (owner.device_lost ? hal::ReasonId::device_lost
@@ -569,6 +577,11 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
     snapshot.quarantined = false;
     snapshot.stopped = false;
     const auto *session = Session();
+    const auto quarantine_reason =
+        session && session->quarantined()
+            ? QuarantineCause(*session)
+            : (device_lost_latched ? hal::ReasonId::device_lost
+                                   : hal::ReasonId::synchronization_failed);
     if (session) {
       snapshot.readiness = session->readiness();
       snapshot.telemetry = session->telemetry();
@@ -582,7 +595,8 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
       } else {
         snapshot.active_program = {};
         snapshot.execution_domain = {};
-        snapshot.readiness = {};
+        if (!snapshot.quarantined || snapshot.stopped)
+          snapshot.readiness = {};
         snapshot.latest_committed_frame = {};
         snapshot.telemetry.active_backend = hal::BackendId::invalid;
         snapshot.telemetry.active_provider =
@@ -593,9 +607,10 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
                                       ? hal::StatusId::quarantined
                                       : hal::StatusId::stale);
         snapshot.telemetry.runtime_reason =
-            terminal_reason != hal::ReasonId::none
-                ? terminal_reason
-                : (session->stopped() ? hal::ReasonId::shutdown_requested
+            session->stopped() ? hal::ReasonId::shutdown_requested
+                               : (snapshot.quarantined ? quarantine_reason
+                                  : terminal_reason != hal::ReasonId::none
+                                      ? terminal_reason
                                       : hal::ReasonId::stale_program);
       }
     } else {
@@ -619,11 +634,11 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
     if (injected) {
       snapshot.production.status =
           snapshot.stopped ? hal::StatusId::stopped
-                           : (snapshot.prepared ? hal::StatusId::ready
-                                                : hal::StatusId::blocked);
-      snapshot.production.reason = snapshot.quarantined
-                                       ? hal::ReasonId::device_lost
-                                       : hal::ReasonId::none;
+                           : (snapshot.quarantined ? hal::StatusId::quarantined
+                              : snapshot.prepared  ? hal::StatusId::ready
+                                                   : hal::StatusId::blocked);
+      snapshot.production.reason =
+          snapshot.quarantined ? quarantine_reason : hal::ReasonId::none;
       snapshot.production.bootstrap_domain_ready = !snapshot.stopped;
       snapshot.production.prepared_capability_committed = snapshot.prepared;
       snapshot.production.quarantined = snapshot.quarantined;
@@ -656,6 +671,10 @@ struct PreparedOpenCudaHardwareExecutionOwner::Impl {
     if (device_lost_latched &&
         snapshot.production.reason == hal::ReasonId::none) {
       snapshot.production.reason = hal::ReasonId::device_lost;
+    }
+    if (snapshot.production.quarantined &&
+        snapshot.production.reason == hal::ReasonId::none) {
+      snapshot.production.reason = quarantine_reason;
     }
     snapshot.shutdown_pending =
         snapshot.production.shutdown_pending || pending_cleanup != nullptr;
@@ -958,7 +977,7 @@ PreparedOpenCudaHardwareExecutionOwner::ExecuteHostFrame(
                        ? hal::StatusId::quarantined
                        : hal::StatusId::stale;
     frame.reason = session && session->quarantined()
-                       ? hal::ReasonId::device_lost
+                       ? QuarantineCause(*session)
                        : hal::ReasonId::stale_program;
     return frame;
   }

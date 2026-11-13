@@ -279,8 +279,11 @@ public:
 
   hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &,
                                    hal::ReasonId) noexcept override {
-    return hal::StatusId::ready;
+    ++reset_calls;
+    return reset_status;
   }
+  hal::StatusId reset_status = hal::StatusId::ready;
+  std::uint64_t reset_calls = 0;
 
   void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override {
     ++destroy_calls;
@@ -324,7 +327,16 @@ struct CandidateOwner {
                  std::uint64_t synchronizations)
       : adapter(domain, mode, synchronizations) {}
   FakeOpenCudaResident adapter;
+  hal::StatusId observed_status = hal::StatusId::invalid;
+  hal::ReasonId observed_reason = hal::ReasonId::none;
 };
+
+void ObserveRuntime(void *opaque, hal::StatusId status,
+                    hal::ReasonId reason) noexcept {
+  auto *owner = static_cast<CandidateOwner *>(opaque);
+  owner->observed_status = status;
+  owner->observed_reason = reason;
+}
 
 struct SetupContext {
   hal::ExecutionDomainId domain = Domain();
@@ -389,6 +401,7 @@ PrepareCandidate(void *opaque, const video::FrozenVideoExecutionPlan &plan,
   g_destroy_context = context;
   candidate->owner = owner;
   candidate->destroy_owner = DestroyCandidate;
+  candidate->observe_runtime_owner = ObserveRuntime;
   auto registration_domain = context->domain;
   if (context->foreign_domain)
     ++registration_domain.adapter_instance_id;
@@ -935,6 +948,125 @@ bool OptionalFailureDeviceLossAndRollback() {
   return true;
 }
 
+bool QuarantineProjectionPreservesSessionCause() {
+  for (const bool actual_loss : {false, true}) {
+    auto request = Request();
+    SetupContext context;
+    context.mode =
+        actual_loss ? ExecuteMode::device_loss : ExecuteMode::success;
+    FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                          1);
+    auto registration = Registration(&registry_adapter, context.domain,
+                                     request.intent.stages[0].intent.semantic);
+    open_cuda::OpenCudaVideoExecutionFactory factory(
+        FactoryConfig(&context, request));
+    video::FrozenVideoExecutionPlan plan;
+    video::VideoAdapterFactoryPreflight preflight;
+    REQUIRE(BuildFrozen(request, registration, &factory, &plan, &preflight));
+    video::VideoAdapterPrepareEvidence evidence;
+    auto executor = factory.Prepare(plan, &evidence);
+    REQUIRE(executor != nullptr);
+    std::array<std::uint8_t, 24> input{}, output{};
+    const auto first = executor->Execute(Binding(&input, &output, 1));
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!actual_loss) {
+      REQUIRE(first.output_ready);
+      auto forged = first.completion;
+      forged.complete = false;
+      REQUIRE(executor->CommitOutput(forged, false, &reason) ==
+              hal::StatusId::failed);
+      REQUIRE(reason == hal::ReasonId::output_not_committed);
+      REQUIRE(executor->CommitOutput(first.completion, true, &reason) ==
+              hal::StatusId::ready);
+      context.latest_owner->adapter.reset_status = hal::StatusId::quarantined;
+      REQUIRE(executor->ResetTemporal(hal::ReasonId::device_lost) ==
+              hal::StatusId::quarantined);
+    } else {
+      REQUIRE(first.status == hal::StatusId::quarantined);
+    }
+    const auto expected = actual_loss ? hal::ReasonId::device_lost
+                                      : hal::ReasonId::synchronization_failed;
+    REQUIRE(context.latest_owner->observed_status ==
+            hal::StatusId::quarantined);
+    REQUIRE(context.latest_owner->observed_reason == expected);
+    const auto quarantined = executor->Snapshot();
+    REQUIRE(quarantined.status == hal::StatusId::quarantined);
+    REQUIRE(quarantined.reason == expected);
+    REQUIRE(quarantined.readiness.reason == expected);
+    REQUIRE(!quarantined.readiness.available);
+    REQUIRE(quarantined.telemetry.device_losses == (actual_loss ? 1u : 0u));
+    REQUIRE(!quarantined.latest_committed_frame.valid);
+    executor->Invalidate(hal::ReasonId::reconfiguration_required);
+    const auto calls = context.latest_owner->adapter.execute_calls;
+    const auto resets = context.latest_owner->adapter.reset_calls;
+    const auto retry = executor->Execute(Binding(&input, &output, 2));
+    REQUIRE(retry.status == hal::StatusId::quarantined &&
+            retry.reason == expected);
+    REQUIRE(executor->Snapshot().reason == expected);
+    REQUIRE(executor->ResetTemporal(hal::ReasonId::temporal_discontinuity) ==
+            hal::StatusId::quarantined);
+    REQUIRE(context.latest_owner->observed_reason == expected);
+    REQUIRE(context.latest_owner->adapter.execute_calls == calls);
+    REQUIRE(context.latest_owner->adapter.reset_calls == resets);
+    executor.reset();
+    context.mode = ExecuteMode::success;
+    executor = factory.Prepare(plan, &evidence);
+    REQUIRE(executor != nullptr);
+    const auto recovered = executor->Execute(Binding(&input, &output, 3));
+    REQUIRE(recovered.output_ready);
+    REQUIRE(executor->CommitOutput(recovered.completion, true, &reason) ==
+            hal::StatusId::ready);
+    REQUIRE(executor->Snapshot().latest_committed_frame.capture_sequence == 3);
+  }
+  return true;
+}
+
+bool CoordinatorResetUsesActualFactoryQuarantineCause() {
+  auto request = Request();
+  SetupContext context;
+  FakeOpenCudaResident registry_adapter(context.domain, ExecuteMode::success,
+                                        1);
+  const auto registration =
+      Registration(&registry_adapter, context.domain,
+                   request.intent.stages[0].intent.semantic);
+  hal::StaticAdapterRegistry registry;
+  hal::ReasonId reason = hal::ReasonId::none;
+  REQUIRE(registry.Register(registration, &reason) == hal::StatusId::ready);
+  open_cuda::OpenCudaVideoExecutionFactory factory(
+      FactoryConfig(&context, request));
+  video::VideoExecutionCoordinator coordinator(registry);
+  REQUIRE(coordinator.RegisterFactory(factory.Registration(), &reason) ==
+          hal::StatusId::ready);
+  video::VideoExecutionPrepareEvidence prepare;
+  REQUIRE(coordinator.Prepare(request, &prepare, &reason) ==
+          hal::StatusId::ready);
+  std::array<std::uint8_t, 24> input{}, output{};
+  const auto first = coordinator.Execute(Binding(&input, &output, 1));
+  REQUIRE(coordinator.CommitOutput(first.completion, true, &reason) ==
+          hal::StatusId::ready);
+  context.latest_owner->adapter.reset_status = hal::StatusId::quarantined;
+  REQUIRE(coordinator.ResetTemporal(hal::ReasonId::device_lost) ==
+          hal::StatusId::quarantined);
+  REQUIRE(coordinator.Snapshot().readiness.reason ==
+          hal::ReasonId::synchronization_failed);
+  REQUIRE(coordinator.Snapshot().telemetry.runtime_reason ==
+          hal::ReasonId::synchronization_failed);
+  REQUIRE(coordinator.Snapshot().telemetry.device_losses == 0);
+  REQUIRE(coordinator.Snapshot().telemetry.committed_output_frames == 1);
+  REQUIRE(!coordinator.Snapshot().latest_committed_frame.valid);
+  REQUIRE(coordinator.Execute(Binding(&input, &output, 2)).reason ==
+          hal::ReasonId::synchronization_failed);
+  REQUIRE(coordinator.Prepare(request, &prepare, &reason) ==
+          hal::StatusId::ready);
+  const auto recovered = coordinator.Execute(Binding(&input, &output, 3));
+  REQUIRE(recovered.output_ready);
+  REQUIRE(coordinator.CommitOutput(recovered.completion, true, &reason) ==
+          hal::StatusId::ready);
+  REQUIRE(coordinator.Snapshot().latest_committed_frame.capture_sequence == 3);
+  REQUIRE(coordinator.Snapshot().telemetry.committed_output_frames == 2);
+  return true;
+}
+
 bool CoordinatorStrictSelectionAndStopAwareShutdown() {
   auto request = Request(hal::SemanticEffectId::virtual_background_remove);
   SetupContext context;
@@ -1017,6 +1149,8 @@ int main() {
       !ExactPreflightAndMalformedRejection() ||
       !ExecuteTransferCommitAndAllocationContract() ||
       !OptionalFailureDeviceLossAndRollback() ||
+      !QuarantineProjectionPreservesSessionCause() ||
+      !CoordinatorResetUsesActualFactoryQuarantineCause() ||
       !CoordinatorStrictSelectionAndStopAwareShutdown()) {
     return EXIT_FAILURE;
   }

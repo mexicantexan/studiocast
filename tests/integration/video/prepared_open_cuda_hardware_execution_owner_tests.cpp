@@ -292,6 +292,12 @@ public:
       ++result.output.lifetime_generation;
       break;
     }
+    if (failure_status != hal::StatusId::invalid) {
+      result.status = failure_status;
+      result.reason = failure_reason;
+      result.output_valid = false;
+      result.completion = {};
+    }
     return result;
   }
 
@@ -325,6 +331,8 @@ public:
   bool substitute_provider = false;
   bool substitute_backend = false;
   ExecuteMode mode = ExecuteMode::success;
+  hal::StatusId failure_status = hal::StatusId::invalid;
+  hal::ReasonId failure_reason = hal::ReasonId::none;
   std::uint64_t prepare_calls = 0;
   std::uint64_t bind_calls = 0;
   std::uint64_t execute_calls = 0;
@@ -551,13 +559,29 @@ bool ExecuteCommitFailuresAndAllocationFreeFramePath() {
   CHECK(owner.Snapshot().latest_committed_frame.valid);
   CHECK(owner.Snapshot().telemetry.active_backend_frames == 1);
 
+  const auto before_failed_write = owner.Snapshot();
   frames.input.fill(0x54);
   frame = owner.ExecuteHostFrame(frames.input.data(), frames.input.size(),
                                  16 * 3, frames.output.data(),
                                  frames.output.size(), 16 * 3, 2);
   CHECK(owner.CommitOutput(frame.completion, false, nullptr) ==
         hal::StatusId::failed);
-  CHECK(owner.Snapshot().latest_committed_frame.capture_sequence == 1);
+  CHECK(!owner.Snapshot().latest_committed_frame.valid);
+  CHECK(owner.Snapshot().telemetry.active_backend == hal::BackendId::invalid);
+  CHECK(owner.Snapshot().telemetry.active_provider ==
+        hal::SemanticEffectProviderId::invalid);
+  CHECK(owner.Snapshot().telemetry.committed_output_frames == 1);
+  CHECK(owner.Snapshot().telemetry.active_backend_frames == 1);
+  CHECK(owner.Snapshot().prepared &&
+        owner.Snapshot().active_program.program_id != 0);
+  CHECK(owner.Snapshot().active_program.program_id ==
+        before_failed_write.active_program.program_id);
+  CHECK(owner.Snapshot().readiness.status ==
+        before_failed_write.readiness.status);
+  CHECK(owner.Snapshot().readiness.available ==
+        before_failed_write.readiness.available);
+  CHECK(owner.Snapshot().telemetry.selected_backend ==
+        before_failed_write.telemetry.selected_backend);
 
   adapter.mode = FakeCudaAdapter::ExecuteMode::optional_fail_open;
   frames.input.fill(0x65);
@@ -570,6 +594,8 @@ bool ExecuteCommitFailuresAndAllocationFreeFramePath() {
   CHECK(frames.output == frames.input);
   CHECK(owner.CommitOutput(frame.completion, true, &reason) ==
         hal::StatusId::ready);
+  CHECK(owner.Snapshot().latest_committed_frame.capture_sequence == 3);
+  CHECK(owner.Snapshot().latest_committed_frame.output_commit_sequence == 2);
   CHECK(owner.Snapshot().latest_committed_frame.stages[0].status ==
         hal::StageExecutionStatus::optional_failed_open);
   CHECK(owner.Snapshot().telemetry.active_backend_frames == 1);
@@ -700,6 +726,76 @@ bool RollbackPendingReconfigurationAndResourceValidation() {
   return true;
 }
 
+bool QuarantineProjectionPreservesInjectedSessionCause() {
+  for (const auto cause : {hal::ReasonId::synchronization_failed,
+                           hal::ReasonId::device_lost, hal::ReasonId::none}) {
+    FakeCudaAdapter adapter;
+    video::PreparedOpenCudaHardwareExecutionOwner owner(Registration(&adapter));
+    CHECK(owner.Configure(Request()).route ==
+          video::PreparedOpenCudaHardwareRoute::hal_live);
+    Frames frames;
+    const auto first = owner.ExecuteHostFrame(
+        frames.input.data(), frames.input.size(), 16 * 3, frames.output.data(),
+        frames.output.size(), 16 * 3, 1);
+    hal::ReasonId reason = hal::ReasonId::none;
+    CHECK(first.output_ready);
+    auto forged = first.completion;
+    forged.complete = false;
+    CHECK(owner.CommitOutput(forged, false, &reason) == hal::StatusId::failed);
+    CHECK(reason == hal::ReasonId::output_not_committed);
+    CHECK(owner.CommitOutput(first.completion, true, &reason) ==
+          hal::StatusId::ready);
+    adapter.failure_status = hal::StatusId::quarantined;
+    adapter.failure_reason = cause;
+    const auto failed = owner.ExecuteHostFrame(
+        frames.input.data(), frames.input.size(), 16 * 3, frames.output.data(),
+        frames.output.size(), 16 * 3, 2);
+    const auto expected = cause == hal::ReasonId::none
+                              ? hal::ReasonId::synchronization_failed
+                              : cause;
+    CHECK(failed.status == hal::StatusId::quarantined &&
+          failed.reason == expected);
+    auto snapshot = owner.Snapshot();
+    CHECK(snapshot.quarantined && snapshot.readiness.reason == expected);
+    CHECK(snapshot.production.quarantined &&
+          snapshot.production.reason == expected);
+    CHECK(snapshot.production.status == hal::StatusId::quarantined);
+    CHECK(snapshot.production.device_lost ==
+          (cause == hal::ReasonId::device_lost));
+    CHECK(snapshot.telemetry.device_losses ==
+          (cause == hal::ReasonId::device_lost ? 1u : 0u));
+    CHECK(snapshot.telemetry.committed_output_frames == 1 &&
+          !snapshot.latest_committed_frame.valid);
+    owner.Invalidate(hal::ReasonId::reconfiguration_required);
+    snapshot = owner.Snapshot();
+    CHECK(snapshot.quarantined && snapshot.readiness.reason == expected);
+    CHECK(snapshot.telemetry.runtime_reason == expected);
+    CHECK(snapshot.production.reason == expected);
+    CHECK(snapshot.production.device_lost ==
+          (cause == hal::ReasonId::device_lost));
+    const auto calls = adapter.execute_calls;
+    const auto retry = owner.ExecuteHostFrame(
+        frames.input.data(), frames.input.size(), 16 * 3, frames.output.data(),
+        frames.output.size(), 16 * 3, 3);
+    CHECK(retry.status == hal::StatusId::quarantined &&
+          retry.reason == expected);
+    CHECK(adapter.execute_calls == calls);
+    FakeCudaAdapter replacement_adapter;
+    video::PreparedOpenCudaHardwareExecutionOwner replacement(
+        Registration(&replacement_adapter));
+    CHECK(replacement.Configure(Request()).route ==
+          video::PreparedOpenCudaHardwareRoute::hal_live);
+    const auto recovered = replacement.ExecuteHostFrame(
+        frames.input.data(), frames.input.size(), 16 * 3, frames.output.data(),
+        frames.output.size(), 16 * 3, 3);
+    CHECK(recovered.output_ready);
+    CHECK(replacement.CommitOutput(recovered.completion, true, &reason) ==
+          hal::StatusId::ready);
+    CHECK(replacement.Snapshot().latest_committed_frame.capture_sequence == 3);
+  }
+  return true;
+}
+
 bool RequiredFailureDeviceLossAndShutdownFailClosed() {
   FakeCudaAdapter required_adapter;
   video::PreparedOpenCudaHardwareExecutionOwner required_owner(
@@ -774,6 +870,7 @@ int main() {
       !ExactPreparedProgramAndStrictSubstitution() ||
       !ExecuteCommitFailuresAndAllocationFreeFramePath() ||
       !RollbackPendingReconfigurationAndResourceValidation() ||
+      !QuarantineProjectionPreservesInjectedSessionCause() ||
       !RequiredFailureDeviceLossAndShutdownFailClosed()) {
     return EXIT_FAILURE;
   }

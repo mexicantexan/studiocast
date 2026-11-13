@@ -21,6 +21,13 @@ void SetReason(hal::ReasonId *reason, hal::ReasonId value) noexcept {
     *reason = value;
 }
 
+hal::ReasonId
+QuarantineCause(const hal::PreparedProgramSession &session) noexcept {
+  const auto reason = session.readiness().reason;
+  return reason == hal::ReasonId::none ? hal::ReasonId::synchronization_failed
+                                       : reason;
+}
+
 bool IsSetupSuccess(hal::StatusId status) noexcept {
   return status == hal::StatusId::ready || status == hal::StatusId::degraded;
 }
@@ -826,7 +833,7 @@ public:
                          ? hal::StatusId::quarantined
                          : hal::StatusId::stale;
       frame.reason = session_ && session_->quarantined()
-                         ? hal::ReasonId::device_lost
+                         ? QuarantineCause(*session_)
                          : hal::ReasonId::stale_program;
       return frame;
     }
@@ -897,7 +904,7 @@ public:
     if (candidate_.owner && candidate_.observe_runtime_owner)
       candidate_.observe_runtime_owner(candidate_.owner, status,
                                        status == hal::StatusId::quarantined
-                                           ? hal::ReasonId::device_lost
+                                           ? QuarantineCause(*session_)
                                            : reason);
     return status;
   }
@@ -933,7 +940,7 @@ public:
                                                      : hal::StatusId::stale));
     snapshot.reason = snapshot.stopped ? hal::ReasonId::shutdown_requested
                                        : (session_->quarantined()
-                                              ? hal::ReasonId::device_lost
+                                              ? QuarantineCause(*session_)
                                               : snapshot.readiness.reason);
     return snapshot;
   }
