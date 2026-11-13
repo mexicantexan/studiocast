@@ -12,6 +12,18 @@ void SetReason(hal::ReasonId *reason, hal::ReasonId value) noexcept {
     *reason = value;
 }
 
+hal::ReasonId
+QuarantineCause(const hal::ReadinessSnapshot &readiness,
+                const hal::ExecutionTelemetry &telemetry) noexcept {
+  if (readiness.status == hal::StatusId::quarantined &&
+      readiness.reason != hal::ReasonId::none)
+    return readiness.reason;
+  if (telemetry.runtime_status == hal::StatusId::quarantined &&
+      telemetry.runtime_reason != hal::ReasonId::none)
+    return telemetry.runtime_reason;
+  return hal::ReasonId::synchronization_failed;
+}
+
 bool IsSetupSuccess(hal::StatusId status) noexcept {
   return status == hal::StatusId::ready || status == hal::StatusId::degraded;
 }
@@ -1289,7 +1301,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
 
 VideoExecutionFrameResult ProductionVideoBackendManager::Execute(
     const hal::HostFrameBinding &binding) noexcept {
-  if (compatibility_executor_) {
+  if (compatibility_executor_ && snapshot_.setup_complete) {
     auto result = compatibility_executor_->Execute(binding);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
     snapshot_.frame_pending = result.status == hal::StatusId::executed ||
@@ -1325,7 +1337,7 @@ VideoExecutionFrameResult ProductionVideoBackendManager::Execute(
 hal::StatusId ProductionVideoBackendManager::CommitOutput(
     const hal::CompletionToken &completion, bool output_write_succeeded,
     hal::ReasonId *reason) noexcept {
-  if (compatibility_executor_) {
+  if (compatibility_executor_ && snapshot_.setup_complete) {
     const auto status = compatibility_executor_->CommitOutput(
         completion, output_write_succeeded, reason);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
@@ -1373,22 +1385,28 @@ void ProductionVideoBackendManager::Invalidate(hal::ReasonId reason) noexcept {
 
 hal::StatusId
 ProductionVideoBackendManager::ResetTemporal(hal::ReasonId reason) noexcept {
-  if (compatibility_executor_) {
+  if (compatibility_executor_ && snapshot_.setup_complete) {
+    const auto previous = snapshot_.compatibility;
     const auto status = compatibility_executor_->ResetTemporal(reason);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
     if (status == hal::StatusId::ready ||
         status == hal::StatusId::passthrough) {
       return status;
     }
-    const auto invalidate_reason =
-        status == hal::StatusId::quarantined ||
-                snapshot_.compatibility.readiness.reason ==
-                    hal::ReasonId::device_lost ||
-                reason == hal::ReasonId::device_lost
-            ? hal::ReasonId::device_lost
-            : (reason == hal::ReasonId::temporal_discontinuity
-                   ? hal::ReasonId::temporal_discontinuity
-                   : hal::ReasonId::reconfiguration_required);
+    auto invalidate_reason = reason == hal::ReasonId::temporal_discontinuity
+                                 ? reason
+                                 : hal::ReasonId::reconfiguration_required;
+    if (status == hal::StatusId::quarantined) {
+      const auto &current = snapshot_.compatibility;
+      const bool exact = current.plan_id == previous.plan_id &&
+                         current.execution_domain == previous.execution_domain;
+      invalidate_reason =
+          !exact ? hal::ReasonId::synchronization_failed
+          : (current.status == hal::StatusId::quarantined &&
+             current.reason != hal::ReasonId::none)
+              ? current.reason
+              : QuarantineCause(current.readiness, current.telemetry);
+    }
     Invalidate(invalidate_reason);
     return status;
   }
@@ -1402,13 +1420,11 @@ ProductionVideoBackendManager::ResetTemporal(hal::ReasonId reason) noexcept {
   if (status == hal::StatusId::ready || status == hal::StatusId::passthrough)
     return status;
   const auto invalidate_reason =
-      status == hal::StatusId::quarantined ||
-              snapshot_.resident.readiness.reason ==
-                  hal::ReasonId::device_lost ||
-              reason == hal::ReasonId::device_lost
-          ? hal::ReasonId::device_lost
+      status == hal::StatusId::quarantined
+          ? QuarantineCause(snapshot_.resident.readiness,
+                            snapshot_.resident.telemetry)
           : (reason == hal::ReasonId::temporal_discontinuity
-                 ? hal::ReasonId::temporal_discontinuity
+                 ? reason
                  : hal::ReasonId::reconfiguration_required);
   Invalidate(invalidate_reason);
   return status;

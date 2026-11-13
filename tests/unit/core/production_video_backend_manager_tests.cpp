@@ -193,6 +193,9 @@ struct Counters {
   std::uint64_t owner_destructor_calls = 0;
   std::uint64_t pending_shutdown_attempts = 0;
   hal::StatusId reset_status = hal::StatusId::ready;
+  hal::ReasonId reset_reason = hal::ReasonId::none;
+  std::uint64_t reset_calls = 0;
+  bool reset_snapshot_exact = true;
 };
 
 class FakeResidentAdapter final : public hal::IResidentAdapter {
@@ -289,6 +292,15 @@ public:
     snapshot_.prepared = false;
   }
   hal::StatusId ResetTemporal(hal::ReasonId) noexcept override {
+    ++counters_->reset_calls;
+    if (counters_->reset_status == hal::StatusId::quarantined) {
+      snapshot_.status = snapshot_.readiness.status =
+          hal::StatusId::quarantined;
+      snapshot_.reason = snapshot_.readiness.reason = counters_->reset_reason;
+      snapshot_.readiness.available = false;
+      if (!counters_->reset_snapshot_exact)
+        ++snapshot_.plan_id;
+    }
     return counters_->reset_status;
   }
   void Shutdown() noexcept override { snapshot_.stopped = true; }
@@ -1268,12 +1280,104 @@ bool TestFailedTemporalResetRequiresSetupReprepare() {
                         hal::StatusId::ready,
                 "setup thread must be able to reprepare invalidated manager");
   counters.reset_status = hal::StatusId::quarantined;
+  counters.reset_reason = hal::ReasonId::device_lost;
   ok &= Require(manager.ResetTemporal(hal::ReasonId::device_lost) ==
                         hal::StatusId::quarantined &&
                     manager.Snapshot().reason ==
                         hal::ReasonId::device_lost &&
                     manager.Snapshot().resident.quarantined,
                 "device-loss reset failure must retain quarantine reason");
+  return ok;
+}
+
+bool TestResetQuarantinePreservesActualOuterCause() {
+  bool ok = true;
+  for (const bool compatibility : {false, true}) {
+    for (const auto cause : {hal::ReasonId::synchronization_failed,
+                             hal::ReasonId::device_lost, hal::ReasonId::none}) {
+      for (const bool exact : {true, false}) {
+        Counters counters;
+        auto source = std::make_unique<FakeSetupSource>(&counters);
+        if (compatibility)
+          source->mode = SourceMode::single_domain_compatibility;
+        video::ProductionVideoBackendManager manager(std::move(source));
+        const auto request = ResidentRequest();
+        video::ProductionVideoBackendSetupEvidence evidence;
+        hal::ReasonId reason = hal::ReasonId::none;
+        if (!Require(manager.Setup(request, &evidence, &reason) ==
+                         hal::StatusId::ready,
+                     "outer reset fixture must prepare"))
+          return false;
+        std::array<std::byte, kFrameBytes> input{}, output{};
+        const auto first = manager.Execute(Binding(&input, &output, 1));
+        if (!Require(first.output_ready &&
+                         manager.CommitOutput(first.completion, true,
+                                              &reason) == hal::StatusId::ready,
+                     "outer reset fixture must publish before failure"))
+          return false;
+        counters.reset_status = hal::StatusId::quarantined;
+        counters.reset_reason = cause;
+        counters.reset_snapshot_exact = exact;
+        const auto expected = exact && cause != hal::ReasonId::none
+                                  ? cause
+                                  : hal::ReasonId::synchronization_failed;
+        ok &= Require(manager.ResetTemporal(hal::ReasonId::device_lost) ==
+                          hal::StatusId::quarantined,
+                      "outer reset must preserve quarantine status");
+        const auto failed = manager.Snapshot();
+        ok &= Require(
+            failed.state ==
+                    video::ProductionVideoBackendManagerState::invalidated &&
+                failed.reason == expected &&
+                failed.readiness.reason == expected && !failed.setup_complete &&
+                !failed.resident_prepared && !failed.frame_pending,
+            "outer reset cause must come from exact actual proof, not reset "
+            "trigger");
+        if (!compatibility) {
+          ok &= Require(
+              failed.resident.quarantined &&
+                  failed.resident.readiness.reason == expected &&
+                  failed.resident.telemetry.runtime_reason == expected &&
+                  failed.resident.telemetry.device_losses ==
+                      (expected == hal::ReasonId::device_lost ? 1u : 0u) &&
+                  failed.resident.telemetry.committed_output_frames == 1 &&
+                  !failed.resident.latest_committed_frame.valid,
+              "outer projection must retain exact inner quarantine/history");
+        }
+        const auto executes = counters.execute_calls;
+        const auto commits = counters.commit_calls;
+        const auto resets = counters.reset_calls;
+        counters.reset_status = hal::StatusId::ready;
+        const auto retry = manager.Execute(Binding(&input, &output, 2));
+        ok &= Require(
+            retry.status == hal::StatusId::stale && !retry.output_ready &&
+                manager.CommitOutput(first.completion, true, &reason) ==
+                    hal::StatusId::blocked &&
+                manager.ResetTemporal(hal::ReasonId::temporal_discontinuity) ==
+                    hal::StatusId::stale &&
+                counters.execute_calls == executes &&
+                counters.commit_calls == commits &&
+                counters.reset_calls == resets &&
+                manager.Snapshot().reason == expected &&
+                manager.Snapshot().readiness.reason == expected,
+            "outer rejected retries must preserve first cause without native "
+            "work");
+        counters.reset_snapshot_exact = true;
+        if (!Require(manager.Setup(request, &evidence, &reason) ==
+                         hal::StatusId::ready,
+                     "new setup must recover invalidated outer manager"))
+          return false;
+        const auto recovered = manager.Execute(Binding(&input, &output, 3));
+        ok &=
+            Require(recovered.output_ready &&
+                        manager.CommitOutput(recovered.completion, true,
+                                             &reason) == hal::StatusId::ready &&
+                        manager.Snapshot().setup_complete &&
+                        manager.Snapshot().readiness.available,
+                    "fresh valid setup must restore outer publication");
+      }
+    }
+  }
   return ok;
 }
 
@@ -1347,6 +1451,7 @@ int main() {
   ok &= TestInvalidationAndRetryableShutdownAreTyped();
   ok &= TestSingleDomainCompatibilityTopologyIsExact();
   ok &= TestFailedTemporalResetRequiresSetupReprepare();
+  ok &= TestResetQuarantinePreservesActualOuterCause();
   if (!ok)
     return 1;
   std::cout << "Production video backend manager tests passed\n";
