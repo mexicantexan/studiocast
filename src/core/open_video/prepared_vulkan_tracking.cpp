@@ -163,7 +163,10 @@ struct PreparedVulkanTracking::Impl {
     if (!Frame(batch, error))
       return false;
     auto &phase = phases[which];
-    if (phase.pending || phase.last_sequence == batch.capture_sequence())
+    const auto mark = batch.Mark();
+    if (phase.pending || (phase.last_sequence == batch.capture_sequence() &&
+                          phase.ticket.batch_id == mark.batch_id &&
+                          phase.ticket.epoch == mark.epoch))
       return Fail(error,
                   "duplicate resident tracking phase in capture sequence");
     if (phase.command) {
@@ -221,7 +224,10 @@ bool PreparedVulkanTracking::Prepare(const PreparedVulkanTrackingSetup &s,
       !s.reservation.persistent_bytes || !s.reservation.scratch_bytes ||
       !s.reservation.upload_staging_bytes || !Shutdown(error))
     return Fail(error, "invalid or under-reserved resident tracking setup");
-  const bool eye = s.eye_contact && s.eye_strength > 0;
+  // Zero strength is a live-plan omission. Setup still validates/warms the
+  // selected graph and records exact bindings so canonical model failures and
+  // uniform readiness remain observable without changing the saved strength.
+  const bool eye = s.eye_contact;
   if ((eye || s.auto_frame) && !s.face_analysis)
     return Fail(
         error, "tracking consumers require their exact resident face producer");
