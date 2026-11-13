@@ -185,10 +185,11 @@ are:
 
 A compatible BYO pack can satisfy runtime validation without inheriting the
 curated profile's numerical-parity attestation or installer recommendation.
-Vulkan support here covers background blur/remove/replace and virtual key
-light. It does not enable Vulkan Auto Frame tracking, Eye Contact, or denoise.
-Model-free mirror, fixed-center vignette, and resize can share the resident
-island. See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting)
+The singular `ncnn_vulkan` contract covers matting for background modes and
+virtual key light. It remains unchanged; the separate multi-network contract
+below describes denoise, face detection, and Eye Contact. Manifest acceptance
+alone does not prove that an effect is production-ready. See
+[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting)
 for the required patched ncnn dependency and build switch.
 
 ### Reproduce the MODNet conversion offline
@@ -255,6 +256,96 @@ unpublished URLs or alter installed user packs for validation. See
 and ownership-safe transaction state, and
 [MANUAL_TESTING.md](MANUAL_TESTING.md#resident-vulkan-matting-validation) for
 available native evidence and remaining deployment checks.
+
+## Vulkan non-matting schema v2
+
+The additive `ncnn_vulkan_networks[]` field describes FP32 ncnn graphs for
+non-matting tasks. It preserves the original ONNX files, ONNX tensor metadata,
+pack IDs, dependencies, and default selections. Open CUDA continues to use the
+ONNX artifacts and ignores this Vulkan extension. Do not replace MODNet's
+singular `ncnn_vulkan` field with this array.
+
+Each entry contains `role`, `profile`, `param_file`, `bin_file`,
+`source_onnx_sha256`, `converter` (`name: "pnnx"`, nonempty `version`),
+`precision: "fp32"`, and ordered `inputs[]` / `outputs[]`. A tensor contains
+`blob`, `dims`, `w`, `h`, and `c`; only FastDVDnet uses `dynamic_hw: true`.
+For example, its complete graph entry is:
+
+```json
+{
+  "role": "main",
+  "profile": "fastdvdnet_rgb_v1",
+  "param_file": "model.ncnn.param",
+  "bin_file": "model.ncnn.bin",
+  "source_onnx_sha256": "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac",
+  "converter": {"name": "pnnx", "version": "20261020"},
+  "precision": "fp32",
+  "inputs": [
+    {"blob": "noisy", "dims": 3, "w": 0, "h": 0, "c": 15, "dynamic_hw": true},
+    {"blob": "noise_map", "dims": 3, "w": 0, "h": 0, "c": 1, "dynamic_hw": true}
+  ],
+  "outputs": [
+    {"blob": "denoised", "dims": 3, "w": 0, "h": 0, "c": 3, "dynamic_hw": true}
+  ]
+}
+```
+
+Insert it into `ncnn_vulkan_networks` in a complete schema-v2 manifest. The
+named parameter and binary files must also be unique `files[]` entries, with
+kind `ncnn_param` / `ncnn_bin`, role `vulkan_main` (or `vulkan_left` /
+`vulkan_right`), and valid SHA-256 values. The graph's source digest must equal
+the digest declared by exactly one original `files[]` ONNX entry with the same
+role (`main`, `left`, or `right`). Safe pack-relative paths and sealed verified
+artifact snapshots remain mandatory.
+
+The accepted profiles are exact contracts, not arbitrary graph signatures:
+
+| Task / profile / graph roles | Ordered inputs | Ordered outputs |
+| --- | --- | --- |
+| `video_denoise` / `fastdvdnet_rgb_v1` / `main` | `noisy`: rank 3 `(0,0,15)`; `noise_map`: rank 3 `(0,0,1)` | `denoised`: rank 3 `(0,0,3)` |
+| `face_detection` / `yunet_640_v1` / `main` | `input`: rank 3 `(640,640,3)` | `cls_8`, `cls_16`, `cls_32`, then `obj_*`, `bbox_*`, `kps_*`; rank 2 as described below |
+| `eye_contact` / `flx_prefix_v1` / both `left` and `right` | `eye_rgb:0`: rank 3 `(64,48,3)`; `anchors:0`: rank 3 `(64,48,12)`; `angles:0`: rank 1 `(2,1,1)` | `flow`, then `lcm`: each rank 3 `(64,48,2)` |
+
+Tuples are native ncnn `(w,h,c)`, with batch one implicit, rather than ONNX
+NCHW dimension lists. YuNet's twelve outputs have `c=1`, `w=1` for `cls` and
+`obj`, `w=4` for `bbox`, or `w=10` for `kps`. Their `h` is respectively 6400,
+1600, or 400 for strides 8, 16, or 32. Only FastDVDnet permits dynamic H/W:
+the zero manifest extents are resolved during setup, with edge padding to
+multiples of four and cropping after inference. Other tensor ranks/extents,
+INT8/FP16 variants, and arbitrary dynamic axes are not accepted by these profiles.
+
+Rank and strides are distinct. Manifest tensors declare logical shape; prepared
+runtime bindings additionally declare the exact Vulkan resource, byte offset,
+capacity, row stride, and plane stride. External tensors contain plain FP32.
+The runtime handles ncnn packing and `cstep` on GPU; callers must not assume
+internal VkMat planes are tightly packed. At most three inputs and twelve
+outputs are supported, and setup validates all shapes, strides, capacities,
+artifact identity, exact device/provider, and resource limits before execution.
+
+FLX uses the **Better Quality FP32** pack `gaze_correction_cam_flx_v0_1_1`,
+not the different Good Quality FP16 model. Its original ONNX output remains
+corrected RGB; the two-output ncnn prefix requires the exact resident Vulkan
+sampler/lighting/composite tail. A flow-only replacement or ordinary bilinear
+sampler does not satisfy that contract. See the
+[offline conversion procedure](open_source_video_model_conversion_to_onnx.md#4-offline-fp32-ncnn-candidates-for-vulkan).
+
+The dlib dependency is still `dlib_68_ibug_300w`, not an ncnn graph. A BYO
+predictor without a declared checksum remains an unchecked user selection;
+setup computes its SHA-256 and seals the exact bytes used by the bounded forest
+loader. A declared checksum is verified. Computing a digest does not establish
+upstream provenance, license permission, or curated parity. The resident GPU
+predictor requires enabled FP64 on the same adopted Vulkan device and analyzes
+the current resident image; it does not substitute the original CPU capture.
+
+Missing dependencies, unsupported graphs/features, failed warmup, or mismatched
+context/artifacts remain actionable availability failures. A compatible BYO
+pack does not inherit curated parity, recommendation, or release readiness.
+The converter produces an isolated **unpublished candidate** with eight added
+ncnn artifacts; it does not change the active catalog or installed user packs.
+Existing IDs/defaults and installer ownership rules remain unchanged. See
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md) for integration and
+qualification gates, and [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md)
+for approved catalog state.
 
 ## Licensing
 
