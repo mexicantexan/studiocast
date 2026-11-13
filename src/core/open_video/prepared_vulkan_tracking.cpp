@@ -127,6 +127,7 @@ struct PreparedVulkanTracking::Impl {
       auto *p = static_cast<std::uint32_t *>(frame_parameters.mapped());
       p[0] = static_cast<std::uint32_t>(batch.capture_sequence());
       p[1] = static_cast<std::uint32_t>(batch.capture_sequence() >> 32);
+      p[2] = 1;
       if (!frame_parameters.Flush(error))
         return false;
       parameter_sequence = batch.capture_sequence();
@@ -329,7 +330,8 @@ bool PreparedVulkanTracking::Prepare(const PreparedVulkanTrackingSetup &s,
     add(data.rectangle_basis_pseudoinverse, 14);
     p.predictor_parameters[15] = data.maximum_features;
     if (!allocate(p.forest, forest_words.size() * 4, false) ||
-        !allocate(p.predictor_scratch, (136 + data.maximum_features) * 4,
+        !allocate(p.predictor_scratch,
+                  (136 + data.maximum_features + data.maximum_trees) * 4,
                   true) ||
         !tensor(p.points, 1, 1, 136))
       return false;
@@ -598,7 +600,7 @@ bool PreparedVulkanTracking::AppendEyeTailAndComposite(
 bool PreparedVulkanTracking::AppendAutoFrame(
     vulkan::ResidentCommandBatch &batch, const vulkan::VulkanImage &image,
     const vulkan::VulkanImage *alpha, const vulkan::VulkanImage &output,
-    std::string *error) {
+    std::string *error, bool current_matte_available) {
   auto &p = *impl_;
   bool cached = false;
   if (!p.setup.auto_frame ||
@@ -612,6 +614,12 @@ bool PreparedVulkanTracking::AppendAutoFrame(
                 alpha->width() > p.setup.frame_width ||
                 alpha->height() > p.setup.frame_height))
     return Fail(error, "invalid resident Auto Frame matte");
+  if (!p.Frame(batch, error))
+    return false;
+  static_cast<std::uint32_t *>(p.frame_parameters.mapped())[2] =
+      current_matte_available ? 1u : 0u;
+  if (!p.frame_parameters.Flush(error))
+    return false;
   if (!p.Replay(auto_frame, batch,
                 {Bind(image), Bind(output),
                  alpha ? Bind(*alpha) : TrackingBufferBinding{}},
