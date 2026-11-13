@@ -842,3 +842,75 @@ Expected:
   Open CUDA installed, and Maxine installed.
 - Long-running stability and thermal/performance behavior need a separate soak
   plan.
+
+## Complete resident Vulkan model effects
+
+Build the production ncnn runtime above with `STUDIOCAST_ENABLE_DLIB=ON` and
+usable dlib development files. Use a separate verified model tree containing
+MODNet, FastDVDnet sigma15, YuNet FP32, the 68-point dlib predictor and FLX FP32.
+The added ncnn artifacts must be published/verified or supplied as explicit
+isolated converted candidates; an ONNX-only installed pack cannot qualify the
+Vulkan model stage. Model publication and qualification evidence are tracked in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
+
+The complete actual-manager matrix is opt-in and requires a local face fixture:
+
+```bash
+./build-vulkan-matting/studiocast-vulkan-effects-production-smoke --require \
+  --model-root /isolated/data/studiocast/models/open_video \
+  --model-id modnet-webnn-256-fp32 \
+  --face-model-id yunet_opencv_zoo_2023mar_fp32 \
+  --eye-model-id gaze_correction_cam_flx_v0_1_1 \
+  --denoise-model-id fastdvdnet_sigma15 \
+  --replace-path /fixtures/replacement.ppm \
+  --face-path /local/dlib-example-faces/2008_002506.jpg --frames 3
+```
+
+The face fixture is an opt-in local dlib example with SHA-256
+`ede6804edf0ec005144ffe7f0f2b56bd2aa1d21beee79d29f72cb16ead19a447`.
+Its individual redistribution rights have not been established; the repository
+and workflow do not distribute or download it. Provision that exact fixture
+separately. The test checks the selected bytes before decoding it and requires
+Eye100 final output to differ from an otherwise identical Eye0 control. A
+no-face dispatch alone is not face-positive eye correction evidence.
+
+The matrix exercises individual effects, all three backgrounds and combined
+seven-stage chains, odd geometry, no-face and face cases, strength zero,
+sequence gaps/explicit temporal reset, successful/failed writer commits,
+optional/required missing models and all six budget axes. It asserts one upload,
+one final readback, one final synchronization, zero intermediate/model/metadata
+readbacks, zero CPU tails, no C++ Execute allocations and stable native allocation
+counts. Actual inference deltas prove compatible face/matte sharing rather than
+assuming it from stage readiness.
+
+Use `--case denoise`, `--case eye_face`, `--case all_blur`, `--case isolation`
+or `--case budgets` to isolate failures. Use `--prepare-only --case all_blur
+--input 1920x1080 --output 1280x720` to qualify aggregate preparation at a target
+geometry separately from execution. A successful prepare-only run does not
+establish frame latency, output correctness or writer publication. A rejected
+reservation or timed-out native submission is a failure, not a skip or successful
+optional-effect qualification.
+
+The cached production diagnostics have their own required smoke. Set isolated
+HOME/config/cache/state roots and point XDG_DATA_HOME at the parent of the
+`studiocast` model-data directory:
+
+```bash
+STUDIOCAST_REQUIRE_VULKAN_MODEL_DIAGNOSTICS=1 \
+XDG_DATA_HOME=/isolated/data \
+  ./build-vulkan-matting/studiocast-vulkan-model-diagnostics-tests
+```
+
+This prepares the actual owner, verifies exact reviewed artifact/profile
+attestations and independent readiness for all nine effects. Ordinary status
+polling must only read cached results. Measure Release setup/refresh timing
+separately from Debug hashing, and preserve the installed CLI's bounded refresh
+contract. Per-frame model hashes, scans or graph preparation remain forbidden.
+
+A separate manually selected `vulkan-model-effects-production` CI job runs the
+required cold diagnostics and complete matrix on a preprovisioned vendor runner;
+it requires the full-model flag, pinned SDK, model root, replacement image and
+local face fixture. It performs no installation/download and treats exit 77 as
+failure. Record exact HEAD, model/dependency hashes, device/driver, live and
+high-water memory/resources, transfer/inference counts and full-frame timing.
+Required command configuration alone does not establish hosted GPU execution.
