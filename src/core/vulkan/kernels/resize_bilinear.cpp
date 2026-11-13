@@ -829,7 +829,8 @@ bool PrepareMattingDiagnostics(OpenVulkanDiagnostics *d,
     // This is a diagnostic bound, not a camera-resolution memory guarantee.
     configuration.reservation.persistent_bytes = UINT64_C(512) << 20;
     configuration.reservation.scratch_bytes = UINT64_C(256) << 20;
-    configuration.reservation.upload_staging_bytes = UINT64_C(1) << 20;
+    // The flattened 68-point forest is uploaded once (about 63.7 MiB).
+    configuration.reservation.upload_staging_bytes = UINT64_C(64) << 20;
     configuration.reservation.readback_staging_bytes = UINT64_C(1) << 20;
     configuration.reservation.resource_count = 2048;
     configuration.reservation.in_flight_slots = 1;
