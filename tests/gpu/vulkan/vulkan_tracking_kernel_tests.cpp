@@ -819,7 +819,8 @@ void EyeCompositeOracle(Runner &r) {
 }
 } // namespace
 int main() {
-  if (!std::getenv("STUDIOCAST_REQUIRE_VULKAN_TRACKING")) {
+  const auto *required = std::getenv("STUDIOCAST_REQUIRE_VULKAN_TRACKING");
+  if (!required || std::strcmp(required, "1") != 0) {
     std::cout << "SKIP: opt-in resident tracking kernels\n";
     return 77;
   }
@@ -827,7 +828,9 @@ int main() {
     const auto *root = std::getenv("STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Need(root, "set STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Runner runner;
-    if (std::getenv("STUDIOCAST_VULKAN_TRACKING_ONLY_CROP")) {
+    const auto *diagnostic_subset =
+        std::getenv("STUDIOCAST_VULKAN_TRACKING_ONLY_CROP");
+    if (diagnostic_subset && std::strcmp(diagnostic_subset, "1") == 0) {
       CropAndVignetteOracle(runner);
       MatteCadenceOracle(runner);
       EyeCompositeOracle(runner);
@@ -840,9 +843,11 @@ int main() {
     CropAndVignetteOracle(runner);
     MatteCadenceOracle(runner);
     EyeCompositeOracle(runner);
-    if (const auto *fixtures =
-            std::getenv("STUDIOCAST_VULKAN_MODEL_CANDIDATE_ROOT"))
-      FlxTailOracle(runner, fixtures);
+    const auto *fixtures =
+        std::getenv("STUDIOCAST_VULKAN_MODEL_CANDIDATE_ROOT");
+    Need(fixtures, "required full oracle needs "
+                   "STUDIOCAST_VULKAN_MODEL_CANDIDATE_ROOT numerical fixtures");
+    FlxTailOracle(runner, fixtures);
     Need(runner.kernels.Shutdown(&runner.error), runner.error);
     std::cout << "PASS native tracking kernel oracle;maximum_execute_ms="
               << runner.maximum_execute_ms << "\n";

@@ -30,7 +30,8 @@ struct Fixture {
   }
   ~Fixture() { std::filesystem::remove_all(root); }
 };
-ModelPack Pack(const std::filesystem::path &root) {
+ModelPack Pack(const std::filesystem::path &root,
+               bool declared_checksum = true) {
   const auto dir = root / "face_landmarks" / "tiny";
   std::string hash, error;
   Require(studiocast::model_integrity_internal::ComputeSha256File(
@@ -40,7 +41,7 @@ ModelPack Pack(const std::filesystem::path &root) {
       << "Synthetic test data created by this test.\n";
   std::ofstream(dir / "model.json")
       << R"({"schema_version":2,"id":"tiny-dlib68","display_name":"tiny","task":"face_landmarks","files":[{"name":"model.dat","kind":"dlib_shape_predictor","role":"main","sha256":")"
-      << hash
+      << (declared_checksum ? hash : std::string())
       << R"("}],"dlib":{"predictor_kind":"shape_predictor_68_face_landmarks","num_landmarks":68}})";
   auto registry = ModelPackRegistry::Scan(root);
   const auto found = registry.Find("face_landmarks", "tiny-dlib68");
@@ -202,6 +203,20 @@ int main() {
     Require(!LoadDlibPredictorData(pack, validation.identity, 1u << 20, &data,
                                    &error),
             "trailing wire data accepted");
+    dlib::serialize((dir / "model.dat").string()) << predictor;
+    pack = Pack(fixture.root, false);
+    Require(pack.files[0].sha256.empty(),
+            "BYO checksum fixture is not unchecked");
+    validation = ValidateModelArtifactIdentity(pack, pack.files[0]);
+    Require(validation.ok(), validation.detail);
+    Require(LoadDlibPredictorData(pack, validation.identity, 1u << 20, &data,
+                                  &error),
+            error);
+    Compare(data, predictor);
+    std::ofstream(dir / "model.dat", std::ios::app) << "changed-unchecked";
+    Require(!LoadDlibPredictorData(pack, validation.identity, 1u << 20, &data,
+                                   &error),
+            "unchecked BYO mutation bypassed the selected artifact identity");
     if (const char *root = std::getenv("STUDIOCAST_DLIB_ORACLE_MODELS_ROOT")) {
       const auto registry = ModelPackRegistry::Scan(root);
       const auto real = registry.Find("face_landmarks", "dlib_68_ibug_300w");

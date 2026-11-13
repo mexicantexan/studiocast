@@ -92,12 +92,23 @@ bool LoadDlibPredictorData(const ModelPack &pack,
         file = &candidate;
       }
     }
-    if (!file || file->sha256.size() != 64)
-      throw std::runtime_error("missing checksum-pinned dlib predictor");
+    if (!file)
+      throw std::runtime_error("missing dlib predictor artifact");
     const auto validation = ValidateModelArtifactIdentity(pack, *file);
     if (!validation.ok() || !(validation.identity == artifact))
       throw std::runtime_error("selected dlib predictor identity mismatch");
-    auto snapshot = OpenVerifiedModelFileSnapshot(file->path, file->sha256,
+    // Missing BYO manifest checksums remain policy-compatible. Selection still
+    // computes an exact artifact identity; seal the consumed bytes against that
+    // digest, including when the manifest intentionally reports "unchecked".
+    constexpr char hex[] = "0123456789abcdef";
+    std::string selected_digest(64, '0');
+    for (std::size_t i = 0; i < validation.identity.artifact_sha256.size();
+         ++i) {
+      const auto byte = validation.identity.artifact_sha256[i];
+      selected_digest[i * 2] = hex[byte >> 4];
+      selected_digest[i * 2 + 1] = hex[byte & 15];
+    }
+    auto snapshot = OpenVerifiedModelFileSnapshot(file->path, selected_digest,
                                                   maximum_bytes, error);
     if (!snapshot)
       return false;
