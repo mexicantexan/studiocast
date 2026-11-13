@@ -409,3 +409,49 @@ this extension. A separate SDK-off optional-model isolation check and final
 combined/native/cold diagnostics matrix are still in progress. Seven integrated
 Vulkan hermetic suites passed at `5e6b699`; fresh final runtime critique and
 final-head broad suites remain required after the pending fixes.
+
+## Compatibility transport scope extension
+
+Later fresh review of the shared publication boundary found two concrete High
+issues in the retained host compatibility executor. Its successful output exposed
+only a read pointer while the actual camera consumer required a writable output
+view, so processed effects were discarded. It also allocated/copied using writer
+geometry while validating only capture-sized input and preparing models for
+capture geometry. A guarded 24-byte input with a 48-byte requested output
+reproduced an overread in a hermetic child process. These are valid existing-route
+preservation and memory-safety requirements, not hardware qualification waivers.
+
+The bounded repair is assigned to the existing compatibility owner. Keep effects
+at validated capture geometry, then reuse the existing prepared CPU bilinear
+resize for the final writer geometry/stride. Return stable owned read/write
+aliases until exact publication; retain all prior lifecycle, pending-token and
+historical-counter guarantees. Model/runtime algorithms, camera processing and
+Vulkan residency are unchanged by this seam. Frame buffers and resize lookup
+scratch must fit explicit caller reservations and be prepared outside execution.
+Required verification includes actual camera acceptance, guarded up/down scaling,
+odd and padded geometry, malformed descriptors, allocation-denied execution and
+the existing publication/reset suites. This High remediation and its fresh
+independent critique remain blocking until integrated and verified.
+
+The source baseline for the completed available Vulkan matrix was `7c20594`.
+It passed 26 case assertions and 106 successful frames, all with one upload,
+one final readback and one synchronization, zero intermediate transfers/CPU tails
+and zero execution-time C++ allocations. Two original cases failed and remain
+unqualified: combined odd replacement exceeded its first-frame fence at 104.93 ms;
+full-face 320×240 setup omitted denoise after its warmup timed out. A single scoped
+debugger control identified `video_noise_removal` and the exact `VK_TIMEOUT` without
+replacing that failed qualification. Two other full-face modes were not run and
+remain unqualified. Normal cold diagnostics passed in 10.71 s, and missing-landmarks
+diagnostics passed in 4.36 s with Eye Contact isolated and the other eight effects
+ready. The SDK-off native survivor test and explicit wrong-build negative passed.
+
+A subsequent Release rebuild had exact tracked-tree equality with root `e10e5b3`
+(`0bc7e4d38a11befbd567fb86d5c4c265743111b7`). Its requested final-head Eye Contact
+320×240 plus zero-strength control passed ten frames and changed 648 final RGB
+bytes. The combined blur control instead hit its first-frame fence at 103.06 ms
+and exited 1 normally, without a retry. This confirms that combined cold-start
+deadline qualification is incomplete on this P1000 even at small geometry; passing
+component/combination cases do not erase the failed observations. The existing
+100 ms fence and 16-synchronization cap are unchanged. Exact commands, executable
+SHA-256, metrics and all pass/fail/skip logs are recorded in
+`/tmp/studiocast-vulkan-all-pipeline-final-handoff-20261113.txt`.
