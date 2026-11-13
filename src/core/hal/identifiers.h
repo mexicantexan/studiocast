@@ -162,6 +162,12 @@ enum class CapabilityEvidenceCode : std::uint32_t {
   open_vulkan_eye_contact_unavailable = 47,
   open_vulkan_video_noise_removal_unavailable = 48,
   vulkan_effect_cpu_tail = 49,
+  vulkan_denoise_runtime_ready = 50,
+  vulkan_face_runtime_ready = 51,
+  vulkan_eye_runtime_ready = 52,
+  vulkan_landmarks_runtime_ready = 53,
+  vulkan_tracking_gpu_ready = 54,
+  vulkan_shader_float64_enabled = 55,
 };
 
 [[nodiscard]] constexpr std::string_view
