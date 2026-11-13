@@ -481,6 +481,50 @@ bool TestPassthroughAndShadow() {
                   runtime.telemetry().active_backend == hal::BackendId::invalid,
               "passthrough commit attribution was incorrect");
 
+  const auto readiness = runtime.readiness();
+  const auto prepared = runtime.prepared();
+  const auto second =
+      runtime.ExecuteHostFrame(Binding(2, &frame, &unused, true));
+  auto forged = second.completion;
+  forged.complete = false;
+  ok &= Require(
+      second.output_ready &&
+          runtime.CommitOutput(forged, false, &reason) ==
+              hal::StatusId::failed &&
+          reason == hal::ReasonId::output_not_committed &&
+          runtime.frame_pending() && runtime.latest_committed_frame().valid &&
+          runtime.latest_committed_frame().capture_sequence == 1,
+      "forged passthrough completion must preserve pending publication");
+  ok &= Require(
+      runtime.CommitOutput(second.completion, false, &reason) ==
+              hal::StatusId::failed &&
+          reason == hal::ReasonId::output_write_failed &&
+          !runtime.frame_pending() && !runtime.latest_committed_frame().valid &&
+          runtime.telemetry().committed_output_frames == 1 &&
+          runtime.telemetry().active_backend_frames == 0 &&
+          runtime.telemetry().active_backend == hal::BackendId::invalid &&
+          runtime.telemetry().active_provider ==
+              hal::SemanticEffectProviderId::invalid &&
+          runtime.passthrough() && runtime.prepared() == prepared &&
+          runtime.readiness().status == readiness.status &&
+          runtime.readiness().available == readiness.available,
+      "failed passthrough publication must clear only current identity");
+  const auto third =
+      runtime.ExecuteHostFrame(Binding(3, &frame, &unused, true));
+  ok &= Require(
+      third.output_ready &&
+          runtime.CommitOutput(third.completion, true, &reason) ==
+              hal::StatusId::ready &&
+          runtime.latest_committed_frame().valid &&
+          runtime.latest_committed_frame().capture_sequence == 3 &&
+          runtime.latest_committed_frame().output_commit_sequence == 2 &&
+          runtime.latest_committed_frame().stage_count == 0 &&
+          runtime.telemetry().active_backend_frames == 0 &&
+          runtime.telemetry().transfers.uploads == 0 &&
+          runtime.telemetry().transfers.final_readbacks == 0 &&
+          adapter.prepare_calls == 0 && adapter.bind_calls == 0,
+      "passthrough recovery must publish current identity without hardware");
+
   auto shadow = Setup();
   shadow.mode = video::HardwareExecutionSetupMode::shadow_only;
   shadow.legacy_path_retained_for_setup_rollback = true;
@@ -538,6 +582,99 @@ bool TestLiveExecutionCommitFailureAndOptionalFailOpen() {
                         hal::StageExecutionStatus::optional_failed_open &&
                     runtime.telemetry().active_backend == hal::BackendId::cuda,
                 "successful writer did not commit exact activity");
+  return ok;
+}
+
+bool TestFailedPublicationClearsOnlyCurrentActivity() {
+  FakeAdapter adapter;
+  hal::StaticAdapterRegistry registry;
+  if (!Register(&registry, &adapter, true, true))
+    return false;
+  video::HardwareExecutionRuntime runtime(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(runtime.Configure(Setup(), &reason) == hal::StatusId::ready,
+               "publication regression setup failed"))
+    return false;
+  const auto readiness = runtime.readiness();
+  const auto selection = runtime.active_resolution();
+  alignas(8) std::array<std::byte, 24> input{};
+  alignas(8) std::array<std::byte, 24> output{};
+  const auto first = runtime.ExecuteHostFrame(Binding(1, &input, &output));
+  if (!Require(first.output_ready &&
+                   runtime.CommitOutput(first.completion, true, &reason) ==
+                       hal::StatusId::ready &&
+                   runtime.latest_committed_frame().valid &&
+                   runtime.telemetry().active_backend == hal::BackendId::cuda,
+               "first publication must establish active attribution"))
+    return false;
+  const auto committed = runtime.latest_committed_frame();
+  const auto second = runtime.ExecuteHostFrame(Binding(2, &input, &output));
+  if (!Require(second.output_ready, "second frame must be valid and pending"))
+    return false;
+  const auto history = runtime.telemetry();
+  bool ok = true;
+  std::array<hal::CompletionToken, 3> forged{
+      first.completion, second.completion, second.completion};
+  ++forged[1].capture_sequence;
+  forged[2].complete = false;
+  for (const auto &completion : forged) {
+    ok &= Require(
+        runtime.CommitOutput(completion, false, &reason) ==
+                hal::StatusId::failed &&
+            reason == hal::ReasonId::output_not_committed &&
+            runtime.frame_pending() && runtime.latest_committed_frame().valid &&
+            runtime.latest_committed_frame().capture_sequence == 1 &&
+            runtime.telemetry().active_backend == hal::BackendId::cuda,
+        "forged completion must not clear legitimate activity");
+  }
+  ok &= Require(
+      runtime.CommitOutput(second.completion, false, &reason) ==
+              hal::StatusId::failed &&
+          reason == hal::ReasonId::output_write_failed &&
+          !runtime.frame_pending() && !runtime.latest_committed_frame().valid &&
+          runtime.telemetry().active_backend == hal::BackendId::invalid &&
+          runtime.telemetry().active_provider ==
+              hal::SemanticEffectProviderId::invalid,
+      "failed publication must clear prior active attribution");
+  ok &= Require(
+      runtime.prepared() &&
+          runtime.readiness().available == readiness.available &&
+          runtime.readiness().status == readiness.status &&
+          runtime.readiness().ready_stage_mask == readiness.ready_stage_mask &&
+          runtime.readiness().execution_domain == readiness.execution_domain &&
+          runtime.active_resolution().selected_backend ==
+              selection.selected_backend &&
+          runtime.telemetry().selected_backend == history.selected_backend,
+      "failed publication must preserve preparation and selection");
+  ok &= Require(
+      runtime.telemetry().committed_output_frames ==
+              history.committed_output_frames &&
+          runtime.telemetry().active_backend_frames ==
+              history.active_backend_frames &&
+          runtime.telemetry().fallback_frames == history.fallback_frames &&
+          runtime.telemetry().committed_stage_successes ==
+              history.committed_stage_successes &&
+          runtime.telemetry().execution_successes ==
+              history.execution_successes &&
+          runtime.telemetry().transfers.uploads == history.transfers.uploads &&
+          runtime.telemetry().transfers.final_readbacks ==
+              history.transfers.final_readbacks,
+      "failed publication must preserve cumulative history");
+  const auto third = runtime.ExecuteHostFrame(Binding(3, &input, &output));
+  ok &= Require(
+      third.output_ready &&
+          runtime.CommitOutput(third.completion, true, &reason) ==
+              hal::StatusId::ready &&
+          runtime.latest_committed_frame().valid &&
+          runtime.latest_committed_frame().capture_sequence == 3 &&
+          runtime.latest_committed_frame().program_id == committed.program_id &&
+          runtime.latest_committed_frame().output_commit_sequence == 2 &&
+          runtime.latest_committed_frame().stage_count == 2 &&
+          runtime.latest_committed_frame().stages[0].status ==
+              hal::StageExecutionStatus::succeeded &&
+          runtime.telemetry().active_backend == hal::BackendId::cuda &&
+          runtime.telemetry().active_backend_frames == 2,
+      "next successful publication must recover exact activity");
   return ok;
 }
 
@@ -767,6 +904,7 @@ int main() {
   bool ok = true;
   ok &= TestPassthroughAndShadow();
   ok &= TestLiveExecutionCommitFailureAndOptionalFailOpen();
+  ok &= TestFailedPublicationClearsOnlyCurrentActivity();
   ok &= TestStrictCrossAdapterAndExactProgramRejection();
   ok &= TestMalformedResourcesExhaustionAndStaleCompletion();
   ok &= TestReconfigureTemporalDeviceLossShutdownAndNoAllocation();

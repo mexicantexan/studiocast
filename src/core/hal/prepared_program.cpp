@@ -1097,13 +1097,18 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
         commit.completion.adapter_instance_id ==
             pending_completion_.adapter_instance_id &&
         commit.completion.capture_sequence ==
-            pending_completion_.capture_sequence)) {
+            pending_completion_.capture_sequence &&
+        commit.completion.complete == pending_completion_.complete)) {
     SetReason(reason, ReasonId::output_not_committed);
     return StatusId::failed;
   }
 
   completion_pending_ = false;
   host_binding_pending_ = false;
+  // A validated publication attempt replaces current activity, even on failure.
+  latest_committed_frame_ = {};
+  telemetry_.active_backend = BackendId::invalid;
+  telemetry_.active_provider = SemanticEffectProviderId::invalid;
   if (!commit.output_write_succeeded) {
     SetReason(reason, ReasonId::output_write_failed);
     pending_stage_count_ = 0;

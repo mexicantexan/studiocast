@@ -343,7 +343,7 @@ public:
                              bool output_write_succeeded,
                              hal::ReasonId *reason) noexcept override {
     ++commit_calls;
-    if (!output_write_succeeded) {
+    if (!output_write_succeeded || reject_commit) {
       if (reason)
         *reason = hal::ReasonId::output_write_failed;
       return hal::StatusId::failed;
@@ -368,6 +368,7 @@ public:
     return snapshot_;
   }
 
+  bool reject_commit = false;
   std::uint64_t execute_calls = 0;
   std::uint64_t commit_calls = 0;
   std::uint64_t invalidate_calls = 0;
@@ -779,6 +780,121 @@ bool TestExecuteCommitAndWriterFailure() {
          Require(snapshot.telemetry.transfers.uploads == 2 &&
                      snapshot.telemetry.transfers.final_readbacks == 2,
                  "transfer telemetry must include both executions");
+}
+
+bool TestFailedPublicationClearsOnlyCurrentActivity() {
+  bool ok = true;
+  // Both writer failure and executor rejection consume a valid completion.
+  for (const bool executor_rejects : {false, true}) {
+    const auto domain = Domain();
+    DummyResident resident(domain);
+    hal::StaticAdapterRegistry registry;
+    const auto provider =
+        hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+    if (!RegisterCapability(&registry, &resident, domain, provider))
+      return false;
+    FakeFactory factory(domain, provider);
+    video::VideoExecutionCoordinator coordinator(registry);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (coordinator.RegisterFactory(
+            FactoryRegistration(1,
+                                video::VideoExecutionRoute::prepared_resident,
+                                domain, provider, &factory),
+            &reason) != hal::StatusId::ready ||
+        !Configure(&coordinator, Request()))
+      return false;
+    std::uint8_t input[24]{};
+    std::uint8_t output[24]{};
+    const auto first = coordinator.Execute(Binding(input, output, 1));
+    if (!Require(first.output_ready &&
+                     coordinator.CommitOutput(first.completion, true,
+                                              &reason) == hal::StatusId::ready,
+                 "first publication must establish activity"))
+      return false;
+    const auto prepared = coordinator.Snapshot();
+    const auto second = coordinator.Execute(Binding(input, output, 2));
+    if (!Require(second.output_ready, "second frame must be valid and pending"))
+      return false;
+    const auto history = coordinator.Snapshot().telemetry;
+    std::array<hal::CompletionToken, 3> forged{
+        first.completion, second.completion, second.completion};
+    ++forged[1].capture_sequence;
+    forged[2].complete = false;
+    for (const auto &completion : forged) {
+      const auto calls = factory.latest_executor->commit_calls;
+      ok &= Require(
+          coordinator.CommitOutput(completion, false, &reason) ==
+                  hal::StatusId::failed &&
+              reason == hal::ReasonId::output_not_committed &&
+              coordinator.Snapshot().frame_pending &&
+              coordinator.Snapshot().latest_committed_frame.valid &&
+              coordinator.Snapshot().latest_committed_frame.capture_sequence ==
+                  1 &&
+              coordinator.Snapshot().telemetry.active_backend ==
+                  hal::BackendId::cuda &&
+              factory.latest_executor->commit_calls == calls,
+          "forged completion must preserve current activity and pending frame");
+    }
+    factory.latest_executor->reject_commit = executor_rejects;
+    ok &= Require(coordinator.CommitOutput(second.completion, executor_rejects,
+                                           &reason) == hal::StatusId::failed &&
+                      reason == hal::ReasonId::output_write_failed,
+                  "valid failed publication must report failure");
+    const auto failed = coordinator.Snapshot();
+    ok &= Require(
+        !failed.frame_pending && !failed.latest_committed_frame.valid &&
+            failed.telemetry.active_backend == hal::BackendId::invalid &&
+            failed.telemetry.active_provider ==
+                hal::SemanticEffectProviderId::invalid,
+        "failed publication must clear prior active attribution");
+    ok &= Require(
+        failed.prepared && !failed.quarantined &&
+            failed.plan.plan_id == prepared.plan.plan_id &&
+            failed.plan.invalidation_key == prepared.plan.invalidation_key &&
+            failed.readiness.available == prepared.readiness.available &&
+            failed.readiness.status == prepared.readiness.status &&
+            failed.readiness.ready_stage_mask ==
+                prepared.readiness.ready_stage_mask &&
+            failed.readiness.execution_domain ==
+                prepared.readiness.execution_domain &&
+            failed.telemetry.selected_backend == history.selected_backend,
+        "failed publication must preserve prepared selection/readiness");
+    ok &= Require(
+        failed.telemetry.committed_output_frames ==
+                history.committed_output_frames &&
+            failed.telemetry.active_backend_frames ==
+                history.active_backend_frames &&
+            failed.telemetry.fallback_frames == history.fallback_frames &&
+            failed.telemetry.committed_stage_successes ==
+                history.committed_stage_successes &&
+            failed.telemetry.execution_successes ==
+                history.execution_successes &&
+            failed.telemetry.transfers.uploads == history.transfers.uploads &&
+            failed.telemetry.transfers.final_readbacks ==
+                history.transfers.final_readbacks,
+        "failed publication must preserve cumulative history");
+    factory.latest_executor->reject_commit = false;
+    const auto third = coordinator.Execute(Binding(input, output, 3));
+    ok &= Require(third.output_ready &&
+                      coordinator.CommitOutput(third.completion, true,
+                                               &reason) == hal::StatusId::ready,
+                  "next frame must recover after failed publication");
+    const auto recovered = coordinator.Snapshot();
+    ok &= Require(
+        recovered.latest_committed_frame.valid &&
+            recovered.latest_committed_frame.capture_sequence == 3 &&
+            recovered.latest_committed_frame.program_id ==
+                prepared.plan.plan_id &&
+            recovered.latest_committed_frame.output_commit_sequence == 2 &&
+            recovered.latest_committed_frame.stage_count == 1 &&
+            recovered.latest_committed_frame.stages[0].status ==
+                hal::StageExecutionStatus::succeeded &&
+            recovered.telemetry.active_backend == hal::BackendId::cuda &&
+            recovered.telemetry.active_provider == provider &&
+            recovered.telemetry.active_backend_frames == 2,
+        "successful recovery must publish only the exact new activity");
+  }
+  return ok;
 }
 
 bool TestInvalidationStaleGenerationAndOldPlanRetention() {
@@ -1616,6 +1732,7 @@ int main() {
   ok &= TestStrictMismatch();
   ok &= TestStrictProviderMismatch();
   ok &= TestExecuteCommitAndWriterFailure();
+  ok &= TestFailedPublicationClearsOnlyCurrentActivity();
   ok &= TestInvalidationStaleGenerationAndOldPlanRetention();
   ok &= TestWrongDomainAndStaleCompletion();
   ok &= TestOptionalFailOpenPreservesOutput();

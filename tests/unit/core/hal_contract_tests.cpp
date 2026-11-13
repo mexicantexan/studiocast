@@ -849,6 +849,53 @@ bool TestOptionalFailureAndOutputCommitAttribution() {
   return ok;
 }
 
+bool TestForgedCompletionPreservesPendingPublication() {
+  FakeAdapter adapter;
+  PreparedProgramSession session;
+  const auto program = Program();
+  if (!Configure(&session, &adapter, program))
+    return false;
+  ReasonId reason = ReasonId::none;
+  const auto first = session.Execute(Request(program, 1));
+  if (!Require(first.output_valid &&
+                   session.CommitOutput({first.completion, true}, &reason) ==
+                       StatusId::ready,
+               "first direct publication must succeed"))
+    return false;
+  const auto second = session.Execute(Request(program, 2));
+  if (!Require(second.output_valid, "second direct frame must be pending"))
+    return false;
+  std::array<CompletionToken, 6> forged{first.completion,  second.completion,
+                                        second.completion, second.completion,
+                                        second.completion, second.completion};
+  ++forged[1].token_id;
+  ++forged[2].program_id;
+  ++forged[3].adapter_instance_id;
+  ++forged[4].capture_sequence;
+  forged[5].complete = false;
+  bool ok = true;
+  for (const auto &completion : forged) {
+    ok &= Require(
+        session.CommitOutput({completion, false}, &reason) ==
+                StatusId::failed &&
+            reason == ReasonId::output_not_committed &&
+            session.latest_committed_frame().valid &&
+            session.latest_committed_frame().capture_sequence == 1 &&
+            session.telemetry().active_backend == BackendId::cuda &&
+            session.telemetry().committed_output_frames == 1,
+        "every forged completion field must preserve valid publication state");
+  }
+  ok &= Require(
+      session.CommitOutput({second.completion, true}, &reason) ==
+              StatusId::ready &&
+          session.latest_committed_frame().valid &&
+          session.latest_committed_frame().capture_sequence == 2 &&
+          session.latest_committed_frame().output_commit_sequence == 2 &&
+          session.telemetry().active_backend_frames == 2,
+      "forged completions must leave the exact valid completion usable");
+  return ok;
+}
+
 bool TestExplicitFallbackReadinessAndCommittedAttribution() {
   bool ok = true;
   auto program = Program();
@@ -1716,6 +1763,7 @@ int main() {
   ok &= TestExecutionValidationAndNoAllocation();
   ok &= TestNeutralHostBindingAndTransportZeros();
   ok &= TestOptionalFailureAndOutputCommitAttribution();
+  ok &= TestForgedCompletionPreservesPendingPublication();
   ok &= TestExplicitFallbackReadinessAndCommittedAttribution();
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestCircuitBreakerActionsAndRetryTransitions();

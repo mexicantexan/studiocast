@@ -366,6 +366,7 @@ bool TestExecutionCommitAndTelemetry() {
                 "legacy compatibility telemetry projection was not exact");
   ok &= Require(input == output, "resolved output did not reach writer buffer");
 
+  const auto prepared = snapshot;
   frame = owner.ExecuteHostFrame(input.data(), input.size(), 12, output.data(),
                                  output.size(), 12, 2);
   ok &= Require(owner.CommitOutput(frame.completion, false, &reason) ==
@@ -373,9 +374,24 @@ bool TestExecutionCommitAndTelemetry() {
                     reason == hal::ReasonId::output_write_failed,
                 "failed writer was not recorded as uncommitted");
   snapshot = owner.Snapshot();
-  ok &= Require(snapshot.telemetry.committed_output_frames == 1 &&
-                    snapshot.latest_committed_frame.capture_sequence == 1,
-                "unwritten execution changed committed attribution");
+  ok &= Require(
+      snapshot.telemetry.committed_output_frames == 1 &&
+          snapshot.telemetry.active_backend_frames == 1 &&
+          !snapshot.latest_committed_frame.valid &&
+          snapshot.telemetry.active_backend == hal::BackendId::invalid &&
+          snapshot.telemetry.active_provider ==
+              hal::SemanticEffectProviderId::invalid &&
+          snapshot.prepared && snapshot.active_program.valid &&
+          snapshot.active_program.program_id ==
+              prepared.active_program.program_id &&
+          snapshot.readiness.available == prepared.readiness.available &&
+          snapshot.readiness.status == prepared.readiness.status &&
+          snapshot.readiness.execution_domain ==
+              prepared.readiness.execution_domain &&
+          snapshot.telemetry.selected_backend ==
+              prepared.telemetry.selected_backend,
+      "failed publication must clear current activity and preserve prepared "
+      "history");
   return ok;
 }
 

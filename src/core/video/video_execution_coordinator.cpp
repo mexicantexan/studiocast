@@ -958,6 +958,10 @@ VideoExecutionCoordinator::CommitOutput(const hal::CompletionToken &completion,
     SetReason(reason, hal::ReasonId::output_not_committed);
     return hal::StatusId::failed;
   }
+  // Only an exact pending completion may replace the current activity.
+  committed_ = {};
+  telemetry_.active_backend = hal::BackendId::invalid;
+  telemetry_.active_provider = hal::SemanticEffectProviderId::invalid;
   hal::ReasonId commit_reason = hal::ReasonId::none;
   hal::StatusId status = hal::StatusId::ready;
   if (!passthrough_) {
@@ -973,7 +977,6 @@ VideoExecutionCoordinator::CommitOutput(const hal::CompletionToken &completion,
   }
   if (status == hal::StatusId::ready && output_write_succeeded) {
     ++telemetry_.committed_output_frames;
-    committed_ = {};
     committed_.valid = true;
     committed_.program_id = plan_.plan_id;
     committed_.invalidation_key = plan_.invalidation_key;

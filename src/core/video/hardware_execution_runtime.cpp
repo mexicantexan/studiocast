@@ -393,12 +393,12 @@ HardwareExecutionRuntime::CommitOutput(const hal::CompletionToken &completion,
   if (passthrough_) {
     frame_pending_ = false;
     pending_completion_ = {};
+    local_committed_frame_ = {};
     if (!output_write_succeeded) {
       SetReason(reason, hal::ReasonId::output_write_failed);
       return hal::StatusId::failed;
     }
     ++local_telemetry_.committed_output_frames;
-    local_committed_frame_ = {};
     local_committed_frame_.valid = true;
     local_committed_frame_.capture_sequence = completion.capture_sequence;
     local_committed_frame_.output_commit_sequence =
