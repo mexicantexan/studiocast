@@ -92,6 +92,9 @@ public:
                       const vulkan::VulkanImage &,
                       const vulkan::VulkanImage &output, std::string *error);
   bool AppendReset(vulkan::ResidentCommandBatch &, std::string *error);
+  // Candidate setup/warmup establishes every enabled phase's fixed image
+  // binding. Once sealed, live calls may only replay those exact bindings.
+  bool SealBindingsForExecution(std::string *error);
 
   bool Shutdown(std::string *error) noexcept;
   bool ready() const noexcept;
