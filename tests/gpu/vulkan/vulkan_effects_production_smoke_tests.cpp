@@ -266,6 +266,12 @@ std::vector<Case> Matrix(const Options &options) {
     cases.push_back(std::move(test));
   };
   auto effects = Base(options);
+  effects.mirror = true;
+  add("mirror", effects);
+  effects = Base(options);
+  effects.vignette.enabled = true;
+  add("vignette", effects);
+  effects = Base(options);
   effects.video_noise_removal.enabled = true;
   add("denoise", effects);
   effects.video_noise_removal.strength = 0;

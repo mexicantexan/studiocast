@@ -1090,10 +1090,11 @@ struct VulkanVideoExecutionFactory::Impl {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     if (!NativeQuiescenceProven()) {
       status = StatusId::quarantined;
-      reason = production && production->kernels.device()->health_state().health ==
-                                 VulkanContextHealth::device_lost
-                   ? ReasonId::device_lost
-                   : ReasonId::synchronization_failed;
+      reason =
+          production && production->kernels.device()->health_state().health ==
+                            VulkanContextHealth::device_lost
+              ? ReasonId::device_lost
+              : ReasonId::synchronization_failed;
       // Destructor retains this complete failed candidate; no caller may
       // mistake missing session readiness for permission to release it.
       return;
@@ -1229,6 +1230,16 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     const bool expanded_models = impl_->configuration.denoise_pack ||
                                  impl_->configuration.face_pack ||
                                  impl_->configuration.eye_pack;
+    const auto &configuration = impl_->configuration;
+    const bool prepared_batch =
+        expanded_models || configuration.matting_pack ||
+        (configuration.effects && configuration.input_width > 0 &&
+         configuration.input_height > 0 && configuration.output_width > 0 &&
+         configuration.output_height > 0 &&
+         // Preserve the older small utility-only reservations. The camera's
+         // aggregate reservation can prepare all 64 immutable dispatch slots.
+         configuration.reservation.resource_count >= 128 &&
+         configuration.reservation.in_flight_slots == 1);
     const auto block_eye = [&]() {
       impl_->configuration.unavailable_semantic_mask |=
           SemanticBit(SemanticEffectId::eye_contact);
@@ -1330,8 +1341,8 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
         SetReason(reason, impl_->reason);
         return impl_->status;
       }
-      if (expanded_models && !impl_->production->executor->InitializeModels(
-                                 impl_->configuration, &error)) {
+      if (prepared_batch && !impl_->production->executor->InitializeModels(
+                                impl_->configuration, &error)) {
         impl_->reason = ReasonId::capability_evidence_incomplete;
         impl_->failed_semantic =
             impl_->production->executor->InitializationFailedSemantic();
@@ -1340,6 +1351,11 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
         SetReason(reason, impl_->reason);
         return impl_->status;
       }
+      if (prepared_batch &&
+          impl_->configuration.minimum_synchronizations_per_frame > 0 &&
+          impl_->configuration.minimum_synchronizations_per_frame <=
+              impl_->configuration.maximum_synchronizations_per_frame)
+        impl_->configuration.minimum_synchronizations_per_frame = 1;
       const auto evidence = impl_->production->executor->CapabilityEvidence();
       if (evidence.blocker != ReasonId::none ||
           !evidence.mirror_production_ready ||

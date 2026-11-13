@@ -202,6 +202,7 @@ public:
 
     try {
       VulkanVideoExecutionFactoryConfiguration configuration;
+      configuration.minimum_synchronizations_per_frame = 1;
       configuration.reservation = caller.budget;
       configuration.execution_fence_timeout_ns =
           request.wait.timeout_nanoseconds;
