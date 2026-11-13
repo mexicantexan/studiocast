@@ -118,12 +118,11 @@ bool InitializeProductionVulkanMattingDevice(
   const auto context =
       std::static_pointer_cast<vulkan::detail::VulkanContextState>(
           device->RetainContext());
-  if (!context->ReserveAllocation(
-          owner->device->studiocast_dummy_allocation_bytes(), error_out,
-          owner->device->studiocast_dummy_allocation_count()))
-    return false;
   VkCommandBuffer dummy = VK_NULL_HANDLE;
   if (owner->device->studiocast_initialize_dummy(&dummy) != 0 ||
+      !context->ReserveAllocation(
+          owner->device->studiocast_dummy_allocation_bytes(), error_out,
+          owner->device->studiocast_dummy_allocation_count()) ||
       !device->SubmitAndWait(Handle<vulkan::VkCommandBuffer>(dummy), error_out))
     return false;
   const auto buffer = owner->device->get_dummy_buffer();
