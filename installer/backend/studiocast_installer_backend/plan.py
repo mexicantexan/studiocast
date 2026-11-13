@@ -51,6 +51,8 @@ from .packaged import (
     validated_catalog_size_summary,
 )
 
+from .vulkan_dependency import dependency_inputs, dependency_downloads
+
 def operation(op_id: str, kind: str, depends: list[str], inputs: dict[str, Any],
               category: str, privilege: str = "user", failure: str = "abort_rollback",
               source_paths: list[str] | None = None, target_paths: list[str] | None = None) -> dict[str, Any]:
@@ -175,6 +177,7 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     current = r["data"] / "current"
     ops: list[dict[str, Any]] = [operation("preflight.validate", "preflight", [], {}, "validation", "none")]
     last = "preflight.validate"
+    sdk_inputs: dict[str, Any] | None = None
     plan_specific_warnings: list[dict[str, Any]] = []
     preservation = {"preserve_settings": bool(desired.get("preserve_settings", True)), "snapshot_path": None}
 
@@ -292,12 +295,16 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             ops.append(operation("source.archive.extract", "source_extract", [last], {"archive": source_path, "destination": str(extract_to)}, "downloads", source_paths=[source_path], target_paths=[str(extract_to)]))
             last = "source.archive.extract"
         packages: list[str] = []
+        sdk_missing = (facts.get("toolchain", {}).get("missing_vulkan_sdk_dependencies", [])
+                       if desired["features"]["open_vulkan"] else [])
         missing_build_packages = [{"cmake": "cmake", "ninja": "ninja-build", "c++": "build-essential",
                                    "pkg-config": "pkg-config"}[name]
                                   for name in facts.get("toolchain", {}).get("missing_build_dependencies", [])
                                   if name in {"cmake", "ninja", "c++", "pkg-config"}]
         if desired.get("manage_dependencies"):
             packages += missing_build_packages
+            packages += [{"git": "git", "dlib": "libdlib-dev"}[name]
+                         for name in sdk_missing if name in {"git", "dlib"}]
         if desired.get("vulkan_runtime"):
             packages += ["libvulkan1", "vulkan-tools"]
         if desired.get("mesa_packages"):
@@ -309,12 +316,20 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
             ops.append(operation("dependencies.packages.ensure", "trusted_helper", [last],
                                  {"operation_type": "packages.ensure.v1", "packages": packages},
                                  "system_changes", "trusted_helper")); last = "dependencies.packages.ensure"
+        if desired["features"]["open_vulkan"]:
+            sdk_inputs = dependency_inputs(release_offline)
+            ops.append(operation("vulkan.sdk.provision", "vulkan_sdk_provision", [last], sdk_inputs,
+                                 "downloads", target_paths=[sdk_inputs["destination"]]))
+            last = "vulkan.sdk.provision"
         ops.append(operation("build.cache.prepare", "build_cache_prepare", [last], {"fresh": bool(getattr(args, "fresh_build", False))}, "application_files", target_paths=[str(build_cache)])); last = "build.cache.prepare"
         cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA": bool(desired["features"]["open_cuda"]),
                  "STUDIOCAST_ENABLE_OPEN_AUDIO": bool(desired["features"]["open_audio"]),
-                 "STUDIOCAST_ENABLE_OPEN_VULKAN": bool(desired["features"]["open_vulkan"])}
+                 "STUDIOCAST_ENABLE_OPEN_VULKAN": bool(desired["features"]["open_vulkan"]),
+                 "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING": bool(desired["features"]["open_vulkan"]),
+                 "STUDIOCAST_ENABLE_DLIB": bool(desired["features"]["open_cuda"] or desired["features"]["open_vulkan"])}
         ops.append(operation("build.configure", "build_configure", [last], {"source_kind": source_kind, "source_path": source_path,
-            "build_path": str(build_cache), "build_type": desired["build_type"], "cmake": cmake}, "application_files", source_paths=[source_path], target_paths=[str(build_cache)])); last = "build.configure"
+            "build_path": str(build_cache), "build_type": desired["build_type"], "cmake": cmake,
+            "ncnn_prefix": sdk_inputs["prefix"] if sdk_inputs else None}, "application_files", source_paths=[source_path], target_paths=[str(build_cache)])); last = "build.configure"
         ops.append(operation("build.compile", "build_compile", [last], {"build_path": str(build_cache), "targets": list(BINARIES)}, "application_files")); last = "build.compile"
         ops.append(operation("payload.stage", "payload_stage", [last], {"version": target, "build_path": str(build_cache)}, "application_files", target_paths=[str(staging)])); last = "payload.stage"
         ops.append(operation("payload.validate", "payload_validate", [last], {"required_binaries": list(BINARIES)}, "validation", "none")); last = "payload.validate"
@@ -381,6 +396,12 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
     if missing_build and not desired.get("manage_dependencies"):
         blockers.append({"code": "toolchain.build_dependencies_missing", "applies_to": "system_changes",
                          "missing": list(missing_build)})
+    if (sdk_inputs and "missing_vulkan_sdk_dependencies" not in facts.get("toolchain", {})):
+        blockers.append({"code": "vulkan_sdk.toolchain_evidence_missing", "applies_to": "system_changes"})
+    if (sdk_inputs and facts.get("toolchain", {}).get("missing_vulkan_sdk_dependencies") and
+            not desired.get("manage_dependencies")):
+        blockers.append({"code": "vulkan_sdk.build_dependencies_missing", "applies_to": "system_changes",
+                         "missing": facts["toolchain"]["missing_vulkan_sdk_dependencies"]})
     camera = desired.get("virtual_camera", {})
     if (camera.get("desired") is True and not camera.get("load", True) and
             (not facts.get("v4l2", {}).get("module_loaded") or
@@ -485,7 +506,11 @@ def create_plan(args: argparse.Namespace, facts: dict[str, Any], rec: dict[str, 
          "required_for_core": False}
         for pack_id in ([] if intent == "uninstall" else desired.get("model_pack_ids", []))
         for artifact in model_packs[pack_id]["artifacts"]]
+    if sdk_inputs:
+        downloads += dependency_downloads(sdk_inputs)
     base_required = sum(facts.get("paths", {}).get("required_bytes", {}).values())
+    if sdk_inputs:
+        base_required += sdk_inputs["lock"]["build_reserve_bytes"]
     download_bytes = sum(item["size"] for item in downloads if type(item.get("size")) is int)
     required_bytes = base_required + download_bytes
     free_bytes = facts.get("paths", {}).get("free_bytes", 0)

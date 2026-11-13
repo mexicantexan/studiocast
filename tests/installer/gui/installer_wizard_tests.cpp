@@ -133,12 +133,12 @@ QStringList DefaultPacks() {
 }
 
 QJsonObject Plan(const QString &intent = QStringLiteral("install"),
-                 bool blocked = false) {
+                 bool blocked = false, bool vulkanSdk = false) {
   QJsonArray packs;
   for (const QString &pack : DefaultPacks())
     packs.append(pack);
-  const QList<qint64> sizes = {832775, 2033628, 25888640, 12113, 25844000, 232589,
-                               99693937, 1062936, 1062994, 9948304};
+  const QList<qint64> sizes = {832775, 2033628,  25888640, 12113,   25844000,
+                               232589, 99693937, 1062936,  1062994, 9948304};
   const QStringList artifacts = {
       QStringLiteral("fastenhancer_s_vd_v1:model.onnx"),
       QStringLiteral("fastenhancer_m_vd_v1:model.onnx"),
@@ -159,42 +159,72 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
         {QStringLiteral("size"), sizes.at(index)}});
   }
   const qint64 modelBytes = 166611916;
-  return {{QStringLiteral("schema_version"), 1},
-          {QStringLiteral("plan_version"), QStringLiteral("installer-plan/v1")},
-          {QStringLiteral("policy_version"),
-           QStringLiteral("studiocast-installer-policy/1")},
-          {QStringLiteral("plan_id"), QStringLiteral("plan-1")},
-          {QStringLiteral("created_at"), QStringLiteral("2098-01-01T00:00:00Z")},
-          {QStringLiteral("expires_at"), QStringLiteral("2099-01-01T00:00:00Z")},
-          {QStringLiteral("intent"), intent},
-          {QStringLiteral("route"), QStringLiteral("recommended")},
-          {QStringLiteral("desired_state"),
-           QJsonObject{{QStringLiteral("build_type"), QStringLiteral("Release")},
-                       {QStringLiteral("virtual_camera"),
-                        QJsonObject{{QStringLiteral("desired"), true},
-                                    {QStringLiteral("required_for_success"), true}}},
-                       {QStringLiteral("model_pack_ids"), packs}}},
-          {QStringLiteral("downloads"), downloads},
-          {QStringLiteral("disk"),
-           QJsonObject{{QStringLiteral("free_bytes"), 20000000000LL},
-                       {QStringLiteral("base_required_bytes"), 3},
-                       {QStringLiteral("download_bytes"), modelBytes},
-                       {QStringLiteral("required_bytes"), modelBytes + 3}}},
-          {QStringLiteral("operations"),
-           QJsonArray{QJsonObject{{QStringLiteral("id"),
-                                  QStringLiteral("preflight.validate")},
-                                 {QStringLiteral("privilege"),
-                                  QStringLiteral("none")},
-                                 {QStringLiteral("review"),
-                                  QJsonObject{{QStringLiteral("category"),
-                                               QStringLiteral("validation")}}}}}},
-          {QStringLiteral("blockers"),
-           blocked ? QJsonArray{QJsonObject{{QStringLiteral("code"),
-                                            QStringLiteral("fixture.blocker")}}}
-                   : QJsonArray{}},
-          {QStringLiteral("warnings"), QJsonArray{}},
-          {QStringLiteral("plan_digest"), QStringLiteral("sha256:reviewed")},
-          {QStringLiteral("approval_token"), QStringLiteral("secret-token")}};
+  QJsonArray operations{QJsonObject{
+      {QStringLiteral("id"), QStringLiteral("preflight.validate")},
+      {QStringLiteral("privilege"), QStringLiteral("none")},
+      {QStringLiteral("review"), QJsonObject{{QStringLiteral("category"),
+                                              QStringLiteral("validation")}}}}};
+  if (vulkanSdk) {
+    const QStringList names = {QStringLiteral("ncnn"),
+                               QStringLiteral("glslang")};
+    const QList<qint64> sdkSizes = {15108296, 4775739};
+    for (qsizetype index = 0; index < names.size(); ++index) {
+      downloads.append(QJsonObject{
+          {QStringLiteral("artifact_id"),
+           QStringLiteral("vulkan-sdk:") + names.at(index)},
+          {QStringLiteral("dependency"), QStringLiteral("ncnn-vulkan")},
+          {QStringLiteral("filename"),
+           names.at(index) + QStringLiteral("-pinned.tar.gz")},
+          {QStringLiteral("url"),
+           QStringLiteral("https://fixture.invalid/") + names.at(index)},
+          {QStringLiteral("sha256"),
+           QStringLiteral("sha256:sdk-source-identity")},
+          {QStringLiteral("license"),
+           QJsonObject{{QStringLiteral("id"), QStringLiteral("BSD-3-Clause")}}},
+          {QStringLiteral("size"), sdkSizes.at(index)}});
+    }
+    operations.append(QJsonObject{
+        {QStringLiteral("id"), QStringLiteral("vulkan.sdk.provision")},
+        {QStringLiteral("kind"), QStringLiteral("vulkan_sdk_provision")},
+        {QStringLiteral("inputs"),
+         QJsonObject{{QStringLiteral("lock"),
+                      QJsonObject{{QStringLiteral("build_reserve_bytes"),
+                                   2000000000LL}}}}}});
+  }
+  const qint64 downloadBytes = modelBytes + (vulkanSdk ? 19884035 : 0);
+  const qint64 baseBytes = 3 + (vulkanSdk ? 2000000000LL : 0);
+  return {
+      {QStringLiteral("schema_version"), 1},
+      {QStringLiteral("plan_version"), QStringLiteral("installer-plan/v1")},
+      {QStringLiteral("policy_version"),
+       QStringLiteral("studiocast-installer-policy/1")},
+      {QStringLiteral("plan_id"), QStringLiteral("plan-1")},
+      {QStringLiteral("created_at"), QStringLiteral("2098-01-01T00:00:00Z")},
+      {QStringLiteral("expires_at"), QStringLiteral("2099-01-01T00:00:00Z")},
+      {QStringLiteral("intent"), intent},
+      {QStringLiteral("route"), QStringLiteral("recommended")},
+      {QStringLiteral("desired_state"),
+       QJsonObject{
+           {QStringLiteral("build_type"), QStringLiteral("Release")},
+           {QStringLiteral("virtual_camera"),
+            QJsonObject{{QStringLiteral("desired"), true},
+                        {QStringLiteral("required_for_success"), true}}},
+           {QStringLiteral("model_pack_ids"), packs}}},
+      {QStringLiteral("downloads"), downloads},
+      {QStringLiteral("disk"),
+       QJsonObject{
+           {QStringLiteral("free_bytes"), 20000000000LL},
+           {QStringLiteral("base_required_bytes"), baseBytes},
+           {QStringLiteral("download_bytes"), downloadBytes},
+           {QStringLiteral("required_bytes"), downloadBytes + baseBytes}}},
+      {QStringLiteral("operations"), operations},
+      {QStringLiteral("blockers"),
+       blocked ? QJsonArray{QJsonObject{{QStringLiteral("code"),
+                                         QStringLiteral("fixture.blocker")}}}
+               : QJsonArray{}},
+      {QStringLiteral("warnings"), QJsonArray{}},
+      {QStringLiteral("plan_digest"), QStringLiteral("sha256:reviewed")},
+      {QStringLiteral("approval_token"), QStringLiteral("secret-token")}};
 }
 
 QJsonObject Result(const QString &state, bool coreCommitted) {
@@ -765,9 +795,11 @@ bool TestUnsupportedOfflineAndPriorReuse(FakeBackend &backend) {
 
 bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
   backend.setScenario(BaseFacts(),
-                      Status(QStringLiteral("absent"), QStringLiteral("recommended"),
+                      Status(QStringLiteral("absent"),
+                             QStringLiteral("recommended"),
                              QStringLiteral("install")),
-                      Plan(), Result(QStringLiteral("committed"), true), 0);
+                      Plan(QStringLiteral("install"), false, true),
+                      Result(QStringLiteral("committed"), true), 0);
   studiocast::installer::InstallerWizard wizard;
   wizard.setReleaseArchive(backend.archive());
   wizard.setUseReleaseArchive(true);
@@ -792,25 +824,43 @@ bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
                   !planFile.permissions().testFlag(QFileDevice::ReadOther),
               "reviewed plan should be persisted privately") && ok;
   const auto *reviewText = review->findChild<QPlainTextEdit *>();
-  ok = Expect(reviewText && reviewText->toPlainText().contains(
-                                  QStringLiteral("Models/downloads (7 pack IDs)")) &&
+  ok = Expect(reviewText &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("10 verified artifact files, 166611916 model bytes")) &&
+                      QStringLiteral("Models/downloads (7 pack IDs)")) &&
+                  reviewText->toPlainText().contains(QStringLiteral(
+                      "10 verified artifact files, 166611916 model bytes")) &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_face_landmarks.dat: 99693937 bytes")) &&
+                      QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_"
+                                     "face_landmarks.dat: 99693937 bytes")) &&
+                  reviewText->toPlainText().contains(QStringLiteral(
+                      "disk required/free: 2186495954/20000000000 bytes")) &&
                   reviewText->toPlainText().contains(
-                      QStringLiteral("disk required/free: 166611919/20000000000 bytes")),
-              "review should derive exact pack, artifact, size, and disk totals from the plan") && ok;
+                      QStringLiteral("Vulkan runtime dependencies (2 source "
+                                     "archives): 19884035 download bytes")) &&
+                  reviewText->toPlainText().contains(QStringLiteral(
+                      "User-local SDK build reserve: 2000000000 bytes")) &&
+                  reviewText->toPlainText().contains(
+                      QStringLiteral("https://fixture.invalid/ncnn")) &&
+                  reviewText->toPlainText().contains(
+                      QStringLiteral("sha256:sdk-source-identity")) &&
+                  reviewText->toPlainText().contains(
+                      QStringLiteral("License: BSD-3-Clause")),
+              "review should derive exact pack, artifact, size, and disk "
+              "totals from the plan") &&
+       ok;
 
   auto *progress = dynamic_cast<studiocast::installer::ProgressPage *>(
       wizard.page(studiocast::installer::PageProgress));
   progress->initializePage();
-  ok = Expect(WaitForProgress(progress), "fake exact-plan execution should finish") && ok;
+  ok = Expect(WaitForProgress(progress),
+              "fake exact-plan execution should finish") &&
+       ok;
   const QString executed = backend.arguments();
   ok = Expect(executed.startsWith(QStringLiteral("execute-plan\n--plan\n")) &&
                   !executed.contains(QStringLiteral("--source-dir")) &&
                   !executed.contains(QStringLiteral("--v4l2loopback")),
-              "executor args must not reconstruct reviewed selection flags") && ok;
+              "executor args must not reconstruct reviewed selection flags") &&
+       ok;
   ok = Expect(backend.planArguments().contains(
                   QStringLiteral("--release-receipt")) &&
                   !backend.planArguments().contains(

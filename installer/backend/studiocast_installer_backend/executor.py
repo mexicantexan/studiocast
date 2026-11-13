@@ -59,6 +59,8 @@ from .manifest import manifest_state, migrate_v1
 from .packaged import load_model_catalog, release_keys, release_module
 from .plan import pending_path, plan_digest
 
+from . import vulkan_dependency
+
 class Executor:
     def __init__(self, plan: dict[str, Any], dry_run: bool = False):
         self.plan, self.dry_run, self.r = plan, dry_run, roots()
@@ -226,6 +228,8 @@ class Executor:
                 if dst.exists(): safe_remove(dst, [self.r["config"].parent])
                 shutil.copytree(src, dst, symlinks=True)
         elif kind == "release_acquire": self.acquire_release(inputs)
+        elif kind == "vulkan_sdk_provision":
+            vulkan_dependency.provision(inputs, self.run_process, self.dry_run)
         elif kind == "source_extract": self.extract_source(Path(inputs["archive"]), Path(inputs["destination"]))
         elif kind == "build_cache_prepare":
             path = Path(self.plan["paths"]["build_cache"]); validate_mutation_path(path, [self.r["cache"]])
@@ -237,7 +241,14 @@ class Executor:
             cmake = inputs["cmake"]
             argv = ["cmake", "-S", str(source), "-B", inputs["build_path"], "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={inputs['build_type']}"]
             argv += [f"-D{name}={'ON' if bool(value) else 'OFF'}" for name, value in sorted(cmake.items())]
+            if inputs["ncnn_prefix"] is not None:
+                sdk = next(op["inputs"] for op in self.plan["operations"] if op["kind"] == "vulkan_sdk_provision")
+                if not self.dry_run:
+                    vulkan_dependency.verify_prefix(Path(sdk["destination"]), sdk)
+                argv.append(f"-Dncnn_DIR={inputs['ncnn_prefix']}/lib/cmake/ncnn")
             self.run_process(argv)
+            if inputs["ncnn_prefix"] is not None and not self.dry_run:
+                vulkan_dependency.verify_dlib_configuration(Path(inputs["build_path"]))
         elif kind == "build_compile": self.run_process(["cmake", "--build", inputs["build_path"], "--target", *inputs["targets"]])
         elif kind == "payload_stage": self.stage_payload(Path(inputs["build_path"]))
         elif kind == "payload_validate": self.validate_staging(inputs["required_binaries"])
@@ -696,7 +707,10 @@ class Executor:
                 "model_source": self.plan["desired_state"].get("model_source"),
                 "model_offline": self.plan["desired_state"].get("model_offline", False),
                 "preserve_settings": self.plan["preservation"]["preserve_settings"]},
-            "effective_build_configuration": {"cmake": next((op["inputs"]["cmake"] for op in self.plan["operations"] if op["id"] == "build.configure"), {})},
+            "effective_build_configuration": {"cmake": next((op["inputs"]["cmake"] for op in self.plan["operations"] if op["id"] == "build.configure"),
+                (self.manifest_before or {}).get("effective_build_configuration", {}).get("cmake", {})),
+                "ncnn_prefix": next((op["inputs"].get("ncnn_prefix") for op in self.plan["operations"] if op["kind"] == "build_configure"),
+                (self.manifest_before or {}).get("effective_build_configuration", {}).get("ncnn_prefix"))},
             "service": {"desired": self.plan["desired_state"]["service"]["desired"],
                 "actual": self.service_actual, "unit_path": str(unit_path), "unit_sha256": unit_hash},
             "v4l": {"desired": self.plan["desired_state"]["virtual_camera"].get("desired"),
@@ -774,11 +788,25 @@ def validate_operation_contract(plan: dict[str, Any], op: dict[str, Any]) -> Non
             raise BackendError("plan.operation_schema", "Curated model transaction contract is invalid")
         validate_mutation_path(Path(inputs["destination_root"]),
                                [roots()["data"] / "models"], allow_root=True)
+    elif kind == "vulkan_sdk_provision":
+        vulkan_dependency.validate_inputs(inputs)
     elif kind == "build_configure":
+        if set(inputs) != {"source_kind", "source_path", "build_path", "build_type", "cmake", "ncnn_prefix"}:
+            raise BackendError("plan.operation_schema", "Configure inputs must match the bounded schema")
+        if inputs.get("build_type") not in {"Debug", "Release", "RelWithDebInfo", "MinSizeRel"}:
+            raise BackendError("plan.operation_schema", "Configure build type is invalid")
         expected_cmake = {"STUDIOCAST_ENABLE_OPEN_CUDA", "STUDIOCAST_ENABLE_OPEN_AUDIO",
-                          "STUDIOCAST_ENABLE_OPEN_VULKAN"}
+                          "STUDIOCAST_ENABLE_OPEN_VULKAN", "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING",
+                          "STUDIOCAST_ENABLE_DLIB"}
         if set(inputs.get("cmake", {})) != expected_cmake or any(type(value) is not bool for value in inputs["cmake"].values()):
             raise BackendError("plan.operation_schema", "CMake feature flags must be explicit booleans")
+        enabled = plan.get("desired_state", {}).get("features", {}).get("open_vulkan") is True
+        dlib_enabled = enabled or plan.get("desired_state", {}).get("features", {}).get("open_cuda") is True
+        if (inputs["cmake"]["STUDIOCAST_ENABLE_DLIB"] != dlib_enabled or
+                inputs["cmake"]["STUDIOCAST_ENABLE_OPEN_VULKAN"] != enabled or
+                inputs["cmake"]["STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING"] != enabled or
+                (not enabled and inputs["ncnn_prefix"] is not None)):
+            raise BackendError("vulkan_sdk.plan_changed", "Vulkan build flags differ from desired features")
         if inputs.get("build_path") != plan.get("paths", {}).get("build_cache"):
             raise BackendError("plan.path_binding", "Configure build path differs from reviewed path")
     elif kind == "build_compile":
@@ -953,5 +981,6 @@ def validate_plan(plan: dict[str, Any], supplied_digest: str, token: str, facts:
         validate_operation_contract(plan, op)
         known.add(op_id)
     validate_model_plan_contract(plan)
+    vulkan_dependency.validate_plan(plan)
     pending["used"] = True
     atomic_write(pending_path(plan["plan_id"]), pending)

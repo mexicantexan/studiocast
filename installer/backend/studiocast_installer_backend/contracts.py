@@ -57,7 +57,7 @@ DEFAULT_MODEL_PACKS = (
 DEFAULT_MODEL_ARTIFACT_COUNT = 10
 ALLOWED_OPERATION_KINDS = {
     "preflight", "settings_snapshot", "release_acquire", "source_extract", "build_cache_prepare",
-    "build_configure", "build_compile", "payload_stage", "payload_validate",
+    "vulkan_sdk_provision", "build_configure", "build_compile", "payload_stage", "payload_validate",
     "trusted_helper", "payload_activate", "links_reconcile", "service_unit_reconcile",
     "service_state_reconcile", "model_transaction",
     "settings_restore", "cleanup", "manifest_commit", "uninstall_tombstone",
