@@ -7,6 +7,11 @@ CurrentOpenVulkanVideoNoiseRemovalFacts() {
   OpenVulkanVideoNoiseRemovalCapabilityFacts facts;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
   facts.backend_compiled = true;
+#if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  facts.live_stage_implemented = true;
+  facts.production_adapter_available = true;
+  facts.vulkan_inference_provider_available = true;
+#endif
 #endif
   return facts;
 }
@@ -35,7 +40,9 @@ EvaluateOpenVulkanVideoNoiseRemovalReadiness(
       facts.dispatch_count > 0 && facts.cpu_readback_count == 0 &&
       facts.cpu_fallback_count == 0;
 
-  if (!readiness.production_ready) {
+  if (readiness.production_ready) {
+    readiness.reason_code = kOpenVulkanVideoNoiseRemovalProductionReadyReason;
+  } else {
     readiness.reason_code = kOpenVulkanVideoNoiseRemovalUnavailableReason;
     readiness.blocker_code =
         kOpenVulkanVideoNoiseRemovalRuntimeUnavailableReason;

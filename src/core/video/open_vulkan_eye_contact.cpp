@@ -6,6 +6,13 @@ OpenVulkanEyeContactCapabilityFacts CurrentOpenVulkanEyeContactFacts() {
   OpenVulkanEyeContactCapabilityFacts facts;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
   facts.backend_compiled = true;
+#if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  facts.vulkan_inference_provider_available = true;
+#if STUDIOCAST_HAVE_DLIB
+  facts.live_stage_implemented = true;
+  facts.production_adapter_available = true;
+#endif
+#endif
 #endif
   return facts;
 }
@@ -28,7 +35,9 @@ OpenVulkanEyeContactReadiness EvaluateOpenVulkanEyeContactReadiness(
       facts.dispatch_count > 0 && facts.cpu_readback_count == 0 &&
       facts.cpu_fallback_count == 0;
 
-  if (!readiness.production_ready) {
+  if (readiness.production_ready) {
+    readiness.reason_code = kOpenVulkanEyeContactProductionReadyReason;
+  } else {
     readiness.reason_code = kOpenVulkanEyeContactUnavailableReason;
     readiness.blocker_code = kOpenVulkanEyeContactRuntimeUnavailableReason;
     readiness.detail = kOpenVulkanEyeContactUnavailableDetail;

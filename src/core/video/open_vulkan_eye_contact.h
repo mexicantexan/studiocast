@@ -8,19 +8,24 @@ namespace studiocast::video {
 
 inline constexpr std::string_view kOpenVulkanEyeContactUnavailableReason =
     "open_vulkan_eye_contact_unavailable";
+inline constexpr std::string_view kOpenVulkanEyeContactProductionReadyReason =
+    "open_vulkan_eye_contact_production_ready";
 inline constexpr std::string_view
     kOpenVulkanEyeContactRuntimeUnavailableReason =
         "open_vulkan_eye_contact_runtime_unavailable";
 inline constexpr std::string_view kOpenVulkanEyeContactUnavailableDetail =
-    "no production eye-contact runtime can import StudioCast's exact Vulkan "
-    "device, compute queue, and resident buffers; the current ONNX/dlib path "
-    "uses CPU analysis, CPU tensors, and CPU postprocess, and its manifests "
-    "do not declare a complete Vulkan artifact, gaze, or look-away contract";
+    "Open Vulkan eye contact needs the ncnn/dlib build and validated YuNet, "
+    "68-point landmark and FP32 FLX packs prepared and warmed on the selected "
+    "Vulkan device/queue. "
+    "Check converted artifacts, enabled FP64, resident analysis/tensors and "
+    "bounded synchronization; model, context or parity evidence is missing "
+    "or invalid.";
 
 // Product evidence is deliberately split into independent facts. A compiled
 // Vulkan backend or a healthy utility context must never imply that eye
-// contact has a callable live implementation, compatible inference provider,
-// reviewed model contract, or selectable CPU fallback.
+// contact has a prepared compatible inference provider, reviewed model
+// contract, or selectable CPU fallback. Compile-time implementation facts do
+// not supply any of the selected-device/model/warmup/parity evidence below.
 struct OpenVulkanEyeContactCapabilityFacts {
   bool backend_compiled = false;
   bool live_stage_implemented = false;
@@ -41,9 +46,9 @@ struct OpenVulkanEyeContactCapabilityFacts {
   bool parity_validated = false;
   bool selectable_cpu_fallback = false;
 
-  // These remain zero while the effect is diagnostics-only. They are explicit
-  // so status can prove that the unavailable stage did not dispatch, read
-  // back an intermediate, or silently execute a CPU replacement.
+  // Compile-time facts leave these zero. Only completed prepared execution
+  // supplies dispatch evidence; intermediate readback or CPU replacement
+  // always prevents production readiness.
   std::uint64_t dispatch_count = 0;
   std::uint64_t cpu_readback_count = 0;
   std::uint64_t cpu_fallback_count = 0;
@@ -57,9 +62,8 @@ struct OpenVulkanEyeContactReadiness {
   OpenVulkanEyeContactCapabilityFacts facts;
 };
 
-// Returns the facts for the shipped implementation. This is diagnostics-only:
-// there is intentionally no callable Apply method until a reviewed resident
-// runtime, model schema, and parity contract exist.
+// Compile-time implementation facts only. The prepared owner supplies exact
+// device/model/residency/completion and parity evidence after real warmup.
 OpenVulkanEyeContactCapabilityFacts CurrentOpenVulkanEyeContactFacts();
 
 OpenVulkanEyeContactReadiness EvaluateOpenVulkanEyeContactReadiness(

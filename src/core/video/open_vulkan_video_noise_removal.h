@@ -10,22 +10,26 @@ inline constexpr std::string_view
     kOpenVulkanVideoNoiseRemovalUnavailableReason =
         "open_vulkan_video_noise_removal_unavailable";
 inline constexpr std::string_view
+    kOpenVulkanVideoNoiseRemovalProductionReadyReason =
+        "open_vulkan_video_noise_removal_production_ready";
+inline constexpr std::string_view
     kOpenVulkanVideoNoiseRemovalRuntimeUnavailableReason =
         "open_vulkan_video_noise_removal_runtime_unavailable";
 inline constexpr std::string_view
     kOpenVulkanVideoNoiseRemovalUnavailableDetail =
-        "no production video-denoise runtime can import StudioCast's exact "
-        "Vulkan device, compute queue, and resident buffers; the current "
-        "FastDVDnet ONNX path supports only CUDA/CPU providers with host "
-        "temporal history and CPU preprocessing/postprocessing, while the "
-        "available model packs declare ONNX-only artifacts";
+        "Open Vulkan video noise removal needs the production ncnn build, "
+        "a validated converted FastDVDnet pack and a warmed resident "
+        "five-frame program on the "
+        "selected Vulkan device/queue. Check model artifacts, temporal resets, "
+        "bounded resources and synchronization; model, context or parity "
+        "evidence is missing or invalid.";
 
 // Product evidence is deliberately split into independent facts. A compiled
 // Vulkan backend or healthy utility context must never imply a callable live
 // denoiser, compatible inference provider, reviewed artifact, or resident
 // temporal implementation.
 //
-// The future production contract consumes and produces the canonical resident
+// The prepared production contract consumes and produces the canonical resident
 // RGB frame at unchanged geometry. FastDVDnet parity requires a causal
 // five-slot NCHW float32 window: three distinct stored frames (t-2, t-1, t)
 // followed by two repeated current-frame slots. Input/output tensors,
@@ -62,9 +66,9 @@ struct OpenVulkanVideoNoiseRemovalCapabilityFacts {
   bool parity_validated = false;
   bool selectable_cpu_fallback = false;
 
-  // These stay zero while this effect is diagnostics-only. They prove that
-  // fail-closed planning did not dispatch, mutate history, read back an
-  // intermediate, or silently execute a CPU replacement.
+  // Compile-time facts leave these zero. Only completed prepared execution
+  // supplies dispatch/reset evidence; intermediate readback or CPU replacement
+  // always prevents production readiness.
   std::uint64_t dispatch_count = 0;
   std::uint64_t temporal_history_reset_count = 0;
   std::uint64_t cpu_readback_count = 0;
@@ -79,9 +83,8 @@ struct OpenVulkanVideoNoiseRemovalReadiness {
   OpenVulkanVideoNoiseRemovalCapabilityFacts facts;
 };
 
-// Returns the facts for the shipped implementation. This is diagnostics-only:
-// there is intentionally no callable Apply method until the resident runtime,
-// model/artifact schema, temporal reset behavior, and parity are proven.
+// Compile-time implementation facts only. The prepared owner supplies exact
+// device/model/residency/temporal/completion and parity evidence after warmup.
 OpenVulkanVideoNoiseRemovalCapabilityFacts
 CurrentOpenVulkanVideoNoiseRemovalFacts();
 

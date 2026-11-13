@@ -119,13 +119,14 @@ bool TestYunetExplicitVulkanProviderAndTensorPolicyIsFailClosed() {
                     "explicit Vulkan YuNet policy must not append TensorRT") &&
             Require(cuda_policy.prefer_cuda,
                     "existing Open CUDA YuNet policy should remain compatible");
-  ok &= Require(ValidateYunetInputTensorContract({1, 3, 320, 320}, false,
-                                                 320, 320, &error),
+  ok &= Require(ValidateYunetInputTensorContract({1, 3, 320, 320}, false, 320,
+                                                 320, &error),
                 "matching fixed YuNet geometry should validate: " + error);
-  ok &= Require(ValidateYunetInputTensorContract({1, 3, -1, -1}, false,
-                                                 320, 320, &error),
-                "dynamic YuNet geometry should accept the manifest runtime "
-                "shape: " + error);
+  ok &= Require(
+      ValidateYunetInputTensorContract({1, 3, -1, -1}, false, 320, 320, &error),
+      "dynamic YuNet geometry should accept the manifest runtime "
+      "shape: " +
+          error);
   ok &= Require(
       !ValidateYunetInputTensorContract({1, 3, 640, 640}, false, 320, 320,
                                         &error) &&
@@ -169,8 +170,7 @@ bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed() {
 
   const auto facts = CurrentOpenVulkanEyeContactFacts();
   const auto readiness = EvaluateOpenVulkanEyeContactReadiness(facts);
-  const std::string formatted =
-      FormatOpenVulkanEyeContactReadiness(readiness);
+  const std::string formatted = FormatOpenVulkanEyeContactReadiness(readiness);
 
   bool ok = true;
 #if STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -180,17 +180,30 @@ bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed() {
   ok &= Require(!facts.backend_compiled,
                 "Vulkan-off build should report the backend disabled fact");
 #endif
-  ok &= Require(!facts.live_stage_implemented,
-                "eye contact must not claim a callable Vulkan live stage");
-  ok &= Require(!facts.production_adapter_available &&
-                    !facts.vulkan_inference_provider_available,
-                "eye contact must distinguish absent adapter and provider");
-  ok &= Require(!facts.shared_device_imported &&
-                    !facts.queue_ownership_explicit,
-                "eye contact must not claim shared device/queue ownership");
-  ok &= Require(!facts.model_pack_selected &&
-                    !facts.artifact_contract_validated,
-                "ONNX template presence must not satisfy Vulkan artifacts");
+#if STUDIOCAST_ENABLE_OPEN_VULKAN && STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  ok &= Require(facts.vulkan_inference_provider_available,
+                "the production ncnn build should expose its provider");
+#if STUDIOCAST_HAVE_DLIB
+  ok &= Require(facts.live_stage_implemented &&
+                    facts.production_adapter_available,
+                "the ncnn/dlib build should expose the resident eye stage");
+#else
+  ok &= Require(!facts.live_stage_implemented &&
+                    !facts.production_adapter_available,
+                "the eye stage requires its compiled landmark dependency");
+#endif
+#else
+  ok &= Require(
+      !facts.live_stage_implemented && !facts.production_adapter_available &&
+          !facts.vulkan_inference_provider_available,
+      "missing production ncnn must not expose an eye adapter/provider");
+#endif
+  ok &=
+      Require(!facts.shared_device_imported && !facts.queue_ownership_explicit,
+              "eye contact must not claim shared device/queue ownership");
+  ok &=
+      Require(!facts.model_pack_selected && !facts.artifact_contract_validated,
+              "ONNX template presence must not satisfy Vulkan artifacts");
   ok &= Require(!facts.device_resident_analysis &&
                     !facts.device_resident_tensor_io,
                 "CPU analysis/tensors must not claim device residency");
@@ -198,7 +211,7 @@ bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed() {
                 "internal Open Video CPU work is not a selectable fallback");
   ok &= Require(facts.dispatch_count == 0 && facts.cpu_readback_count == 0 &&
                     facts.cpu_fallback_count == 0,
-                "diagnostics-only eye contact must perform no frame work");
+                "compile-time eye facts must perform no frame work");
   ok &= Require(!readiness.production_ready &&
                     readiness.reason_code ==
                         kOpenVulkanEyeContactUnavailableReason &&
@@ -208,11 +221,61 @@ bool TestOpenVulkanEyeContactCapabilityFactsAreFailClosed() {
   ok &= Require(
       formatted.find("[open_vulkan_eye_contact_unavailable]") !=
               std::string::npos &&
-          formatted.find(
-              "[open_vulkan_eye_contact_runtime_unavailable]") !=
+          formatted.find("[open_vulkan_eye_contact_runtime_unavailable]") !=
               std::string::npos &&
-          formatted.find("CPU tensors") != std::string::npos,
-      "formatted readiness must expose the runtime/CPU boundary");
+          formatted.find("converted artifacts") != std::string::npos &&
+          formatted.find("parity evidence") != std::string::npos,
+      "formatted readiness must identify missing prepared model/context "
+      "evidence");
+
+  using Facts = studiocast::video::OpenVulkanEyeContactCapabilityFacts;
+  Facts complete;
+  complete.backend_compiled = complete.live_stage_implemented = true;
+  complete.production_adapter_available =
+      complete.vulkan_inference_provider_available = true;
+  complete.non_cpu_device_selected = complete.compute_queue_available =
+      complete.context_healthy = true;
+  complete.shared_device_imported = complete.queue_ownership_explicit = true;
+  complete.model_pack_selected = complete.artifact_contract_validated = true;
+  complete.device_resident_analysis = complete.device_resident_tensor_io = true;
+  complete.warmup_complete = complete.bounded_reusable_allocations = true;
+  complete.synchronization_contract_validated = complete.parity_validated =
+      true;
+  complete.dispatch_count = 1;
+  const auto ready = EvaluateOpenVulkanEyeContactReadiness(complete);
+  ok &= Require(
+      ready.production_ready &&
+          ready.reason_code ==
+              studiocast::video::kOpenVulkanEyeContactProductionReadyReason &&
+          ready.blocker_code.empty() && ready.detail.empty(),
+      "complete synthetic eye evidence must return the exact success "
+      "attestation");
+  unsigned index = 0;
+  for (auto member :
+       {&Facts::backend_compiled, &Facts::live_stage_implemented,
+        &Facts::production_adapter_available,
+        &Facts::vulkan_inference_provider_available,
+        &Facts::non_cpu_device_selected, &Facts::compute_queue_available,
+        &Facts::context_healthy, &Facts::shared_device_imported,
+        &Facts::queue_ownership_explicit, &Facts::model_pack_selected,
+        &Facts::artifact_contract_validated, &Facts::device_resident_analysis,
+        &Facts::device_resident_tensor_io, &Facts::warmup_complete,
+        &Facts::bounded_reusable_allocations,
+        &Facts::synchronization_contract_validated, &Facts::parity_validated}) {
+    Facts missing = complete;
+    missing.*member = false;
+    ok &= Require(
+        !EvaluateOpenVulkanEyeContactReadiness(missing).production_ready,
+        "missing eye readiness prerequisite " + std::to_string(index++));
+  }
+  for (auto member : {&Facts::dispatch_count, &Facts::cpu_readback_count,
+                      &Facts::cpu_fallback_count}) {
+    Facts invalid = complete;
+    invalid.*member = member == &Facts::dispatch_count ? 0 : 1;
+    ok &= Require(
+        !EvaluateOpenVulkanEyeContactReadiness(invalid).production_ready,
+        "invalid eye execution/transfer evidence must fail closed");
+  }
   return ok;
 }
 
@@ -236,11 +299,17 @@ bool TestOpenVulkanVideoNoiseRemovalCapabilityFactsAreFailClosed() {
   ok &= Require(!facts.backend_compiled,
                 "Vulkan-off build should report the backend disabled fact");
 #endif
-  ok &= Require(!facts.live_stage_implemented,
-                "video denoise must not claim a callable Vulkan live stage");
-  ok &= Require(!facts.production_adapter_available &&
-                    !facts.vulkan_inference_provider_available,
-                "video denoise must distinguish absent adapter and provider");
+#if STUDIOCAST_ENABLE_OPEN_VULKAN && STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
+  ok &= Require(
+      facts.live_stage_implemented && facts.production_adapter_available &&
+          facts.vulkan_inference_provider_available,
+      "the production ncnn build should expose the resident denoiser");
+#else
+  ok &= Require(
+      !facts.live_stage_implemented && !facts.production_adapter_available &&
+          !facts.vulkan_inference_provider_available,
+      "missing production ncnn must not expose a denoise adapter/provider");
+#endif
   ok &=
       Require(!facts.shared_device_imported && !facts.queue_ownership_explicit,
               "video denoise must not claim shared device/queue ownership");
@@ -263,12 +332,13 @@ bool TestOpenVulkanVideoNoiseRemovalCapabilityFactsAreFailClosed() {
                     !facts.capture_sequence_discontinuity_reset,
                 "host FastDVDnet history semantics do not prove a Vulkan "
                 "temporal contract");
-  ok &= Require(!facts.parity_validated && !facts.selectable_cpu_fallback,
-                "neither Vulkan parity nor selectable CPU fallback exists");
+  ok &= Require(
+      !facts.parity_validated && !facts.selectable_cpu_fallback,
+      "compile-time availability must not infer parity or CPU fallback");
   ok &= Require(
       facts.dispatch_count == 0 && facts.temporal_history_reset_count == 0 &&
           facts.cpu_readback_count == 0 && facts.cpu_fallback_count == 0,
-      "diagnostics-only video denoise must perform no frame work");
+      "compile-time video denoise facts must perform no frame work");
   ok &= Require(!readiness.production_ready &&
                     readiness.reason_code ==
                         kOpenVulkanVideoNoiseRemovalUnavailableReason &&
@@ -281,10 +351,11 @@ bool TestOpenVulkanVideoNoiseRemovalCapabilityFactsAreFailClosed() {
           formatted.find(
               "[open_vulkan_video_noise_removal_runtime_unavailable]") !=
               std::string::npos &&
-          formatted.find("host temporal history") != std::string::npos &&
-          formatted.find("ONNX-only") != std::string::npos,
-      "formatted readiness must expose the runtime, history, and artifact "
-      "boundaries");
+          formatted.find("resident five-frame") != std::string::npos &&
+          formatted.find("converted FastDVDnet") != std::string::npos &&
+          formatted.find("parity evidence") != std::string::npos,
+      "formatted readiness must identify missing prepared model/history "
+      "evidence");
   return ok;
 }
 
@@ -318,9 +389,15 @@ bool TestOpenVulkanVideoNoiseRemovalTemporalReadinessGatesAreExact() {
   facts.parity_validated = true;
   facts.dispatch_count = 1;
 
-  bool ok = Require(
-      EvaluateOpenVulkanVideoNoiseRemovalReadiness(facts).production_ready,
-      "complete synthetic evidence should satisfy readiness");
+  const auto ready = EvaluateOpenVulkanVideoNoiseRemovalReadiness(facts);
+  bool ok =
+      Require(ready.production_ready &&
+                  ready.reason_code ==
+                      studiocast::video::
+                          kOpenVulkanVideoNoiseRemovalProductionReadyReason &&
+                  ready.blocker_code.empty() && ready.detail.empty(),
+              "complete synthetic evidence should return the exact success "
+              "attestation");
   const auto require_gate = [&](bool Facts::*member,
                                 const std::string &message) {
     Facts missing = facts;
@@ -344,6 +421,25 @@ bool TestOpenVulkanVideoNoiseRemovalTemporalReadinessGatesAreExact() {
                      "readiness");
   ok &= require_gate(&Facts::parity_validated,
                      "temporal/output parity must gate readiness");
+  unsigned index = 0;
+  for (auto member :
+       {&Facts::backend_compiled, &Facts::live_stage_implemented,
+        &Facts::production_adapter_available,
+        &Facts::vulkan_inference_provider_available,
+        &Facts::non_cpu_device_selected, &Facts::compute_queue_available,
+        &Facts::context_healthy, &Facts::shared_device_imported,
+        &Facts::queue_ownership_explicit, &Facts::model_pack_selected,
+        &Facts::artifact_contract_validated,
+        &Facts::fully_device_resident_tensor_io,
+        &Facts::device_resident_preprocess, &Facts::device_resident_postprocess,
+        &Facts::warmup_complete, &Facts::synchronization_contract_validated})
+    ok &= require_gate(member, "missing denoise readiness prerequisite " +
+                                   std::to_string(index++));
+  Facts unexecuted = facts;
+  unexecuted.dispatch_count = 0;
+  ok &= Require(!EvaluateOpenVulkanVideoNoiseRemovalReadiness(unexecuted)
+                     .production_ready,
+                "unexecuted denoise must not claim ready");
 
   Facts readback = facts;
   readback.cpu_readback_count = 1;
