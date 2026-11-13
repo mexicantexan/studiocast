@@ -16,9 +16,9 @@ namespace studiocast::vulkan {
 struct VulkanVideoExecutionFactoryConfiguration;
 struct VulkanProductionModelDiagnostics;
 
-// Synchronous production executor for one exact Open Vulkan island: optional
-// shared resident matting, background composition and key light, then final
-// resize, fixed-center vignette and mirror. UtilityKernels and its adopted or
+// Synchronous production executor for one exact Open Vulkan island: denoise,
+// eye correction, shared matting/background/key light, AutoFrame, final resize,
+// fixed or tracked vignette and mirror. UtilityKernels and its adopted or
 // owned VulkanDevice must outlive this object; other adapters cannot submit
 // work to these prepared resources.
 class QualifiedFinalResidentExecutor final

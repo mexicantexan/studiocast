@@ -351,11 +351,12 @@ public:
         const auto &registry = *selected_registry;
         const auto resolve =
             [&](const char *task, const std::string &requested,
-                const char *preferred,
                 std::shared_ptr<const open_video::ModelPack> *pack,
                 hal::ModelArtifactIdentity *identity, bool predictor = false) {
-              auto selected = registry.Find(
-                  task, requested.empty() ? preferred : requested);
+              const auto id = requested.empty()
+                                  ? registry.DefaultModelIdForTask(task)
+                                  : requested;
+              auto selected = registry.Find(task, id);
               if (!selected)
                 return false;
               std::string error;
@@ -389,29 +390,26 @@ public:
               return true;
             };
         if (needs_denoise &&
-            !resolve("video_denoise",
-                     request.effects.video_noise_removal.model_id,
-                     "fastdvdnet_sigma15", &configuration.denoise_pack,
-                     &configuration.denoise_identity))
+            !resolve(
+                "video_denoise", request.effects.video_noise_removal.model_id,
+                &configuration.denoise_pack, &configuration.denoise_identity))
           unavailable(hal::SemanticEffectId::video_noise_removal);
         if (needs_face &&
             !resolve("face_detection", request.effects.auto_frame.model_id,
-                     "yunet_opencv_zoo_2023mar_fp32", &configuration.face_pack,
-                     &configuration.face_identity)) {
+                     &configuration.face_pack, &configuration.face_identity)) {
           unavailable(hal::SemanticEffectId::eye_contact);
           unavailable(hal::SemanticEffectId::auto_frame);
         }
         if (needs_eye &&
             !resolve("eye_contact", request.effects.eye_contact.model_id,
-                     "gaze_correction_cam_flx_v0_1_1", &configuration.eye_pack,
-                     &configuration.eye_identity))
+                     &configuration.eye_pack, &configuration.eye_identity))
           unavailable(hal::SemanticEffectId::eye_contact);
         if (needs_eye && configuration.eye_pack) {
           std::string landmark_id;
           for (const auto &dependency : configuration.eye_pack->depends_on)
             if (dependency.rfind("face_landmarks:", 0) == 0)
               landmark_id = dependency.substr(15);
-          if (!resolve("face_landmarks", landmark_id, "dlib_68_ibug_300w",
+          if (!resolve("face_landmarks", landmark_id,
                        &configuration.landmarks_pack,
                        &configuration.landmarks_identity, true))
             unavailable(hal::SemanticEffectId::eye_contact);

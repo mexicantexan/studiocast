@@ -1,4 +1,5 @@
 #include "core/open_video/model_pack_registry.h"
+#include "core/util/json.h"
 #include "core/video/cpu_primitive_hal.h"
 #include "core/video/image_ppm.h"
 #include "core/video/mjpeg_decode.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <new>
@@ -21,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -888,6 +891,116 @@ bool BudgetRejection(const Options &options) {
   return true;
 }
 
+bool NativeInstalledDefaultSelection(const Options &options) {
+  const auto registry =
+      studiocast::open_video::ModelPackRegistry::Scan(options.model_root);
+  const auto original =
+      registry.Find("video_denoise", options.denoise_model_id);
+  if (!Require(original.has_value(),
+               "default regression needs the selected local pack"))
+    return false;
+  struct Fixture {
+    std::filesystem::path root;
+    std::string old_data;
+    bool had_data = false, created = false;
+    ~Fixture() {
+      if (had_data)
+        setenv("XDG_DATA_HOME", old_data.c_str(), 1);
+      else
+        unsetenv("XDG_DATA_HOME");
+      if (created) {
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+      }
+    }
+  } fixture;
+  if (const auto *old = std::getenv("XDG_DATA_HOME")) {
+    fixture.old_data = old;
+    fixture.had_data = true;
+  }
+  fixture.root = std::filesystem::temp_directory_path() /
+                 ("studiocast-vulkan-defaults-" + std::to_string(getpid()));
+  fixture.created = std::filesystem::create_directory(fixture.root);
+  if (!Require(fixture.created,
+               "default fixture must own a fresh temporary root"))
+    return false;
+  const auto models = fixture.root / "studiocast/models/open_video";
+  const auto add_alias = [&](const std::string &id, bool native) {
+    const auto target = models / "video_denoise" / id;
+    std::filesystem::create_directories(target);
+    for (const auto &file : original->files) {
+      const auto destination = target / file.name;
+      std::filesystem::create_directories(destination.parent_path());
+      std::filesystem::copy_file(file.path, destination);
+    }
+    std::ifstream input(original->manifest_path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    auto manifest = studiocast::util::json::Minify(contents.str());
+    const auto needle =
+        "\"id\":\"" + studiocast::util::json::EscapeString(original->id) + "\"";
+    const auto at = manifest.find(needle);
+    if (at == std::string::npos)
+      return false;
+    manifest.replace(at, needle.size(), "\"id\":\"" + id + "\"");
+    if (!native) {
+      const auto graphs = manifest.find(",\"ncnn_vulkan_networks\":[");
+      if (graphs == std::string::npos)
+        return false;
+      manifest = manifest.substr(0, graphs) + "}";
+    }
+    std::ofstream output(target / "model.json");
+    output << manifest;
+    return output.good();
+  };
+  if (!Require(add_alias("bbb_fixture_byo_denoise", true) &&
+                   setenv("XDG_DATA_HOME", fixture.root.c_str(), 1) == 0,
+               "could not create the read-only-payload BYO default fixture"))
+    return false;
+  auto effects = Base(options);
+  effects.video_noise_removal.enabled = true;
+  effects.video_noise_removal.model_id.clear();
+  auto source = std::make_unique<ObservedSource>();
+  auto *observed = source.get();
+  video::ProductionVideoBackendManager manager(std::move(source));
+  hal::ReasonId reason = hal::ReasonId::none;
+  auto request = Request(Case{"defaults", effects});
+  if (!Require(
+          manager.Setup(request, nullptr, &reason) == hal::StatusId::ready &&
+              observed->model_count == 1 &&
+              observed->models[0].default_selected &&
+              observed->models[0].requested_model_id.empty() &&
+              observed->models[0].selected_model_id ==
+                  "bbb_fixture_byo_denoise",
+          "empty selection did not use the installed registry's BYO default"))
+    return false;
+  effects.video_noise_removal.model_id = "fixture_missing_explicit_id";
+  request = Request(Case{"defaults_explicit_missing", effects});
+  if (!Require(
+          manager.Setup(request, nullptr, &reason) == hal::StatusId::degraded &&
+              observed->model_count == 0 && !observed->lease.factory.factory,
+          "an explicit missing model was replaced with the installed default"))
+    return false;
+  if (!Require(add_alias("aaa_fixture_default_without_vulkan", false),
+               "could not create the ordinary unsupported daemon default"))
+    return false;
+  effects.video_noise_removal.model_id.clear();
+  request = Request(Case{"defaults_invalid_native", effects});
+  if (!Require(
+          manager.Setup(request, nullptr, &reason) == hal::StatusId::degraded &&
+              observed->model_count == 0 && !observed->lease.factory.factory,
+          "an incompatible daemon default was replaced with another native "
+          "pack"))
+    return false;
+  const auto shutdown = manager.Shutdown();
+  std::cout << "defaults byo_selected=1 explicit_missing_not_replaced=1"
+               " incompatible_default_not_replaced=1 originals_read_only=1\n";
+  return Require(shutdown.quiescent &&
+                     shutdown.driver_context_release_permitted &&
+                     !shutdown.pending,
+                 "default-selection fixture did not shut down safely");
+}
+
 bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
   auto effects = Base(options);
   // Keep this fault-injection test smaller than one native wait. Injection
@@ -922,17 +1035,18 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
   std::vector<std::uint8_t> output(input.size(), 0x5a);
   const auto request = Request(test);
   const auto failed = manager.Execute(Binding(request, input, &output, 1));
-  if (!Require(failed.status == hal::StatusId::quarantined &&
-                   failed.reason == hal::ReasonId::synchronization_failed &&
-                   !failed.output_ready &&
-                   !manager.Snapshot().resident.latest_committed_frame.valid &&
-                   manager.Snapshot().resident.telemetry.active_backend_frames == 0 &&
-                   std::all_of(output.begin(), output.end(),
-                               [](auto byte) { return byte == 0x5a; }) &&
-                   Collect(*observed, &after) &&
-                   !after.device.context_healthy &&
-                   after.completed_batches == before.completed_batches,
-               "a submitted timeout published output/activity or lost its poison"))
+  if (!Require(
+          failed.status == hal::StatusId::quarantined &&
+              failed.reason == hal::ReasonId::synchronization_failed &&
+              !failed.output_ready &&
+              !manager.Snapshot().resident.latest_committed_frame.valid &&
+              manager.Snapshot().resident.telemetry.active_backend_frames ==
+                  0 &&
+              std::all_of(output.begin(), output.end(),
+                          [](auto byte) { return byte == 0x5a; }) &&
+              Collect(*observed, &after) && !after.device.context_healthy &&
+              after.completed_batches == before.completed_batches,
+          "a submitted timeout published output/activity or lost its poison"))
     return false;
   const auto same_counts = [](const auto &a, const auto &b) {
     return a.inference_count == b.inference_count &&
@@ -946,7 +1060,8 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
            same_counts(before.left_eye, after.left_eye) &&
            same_counts(before.right_eye, after.right_eye);
   };
-  if (!Require(no_success(), "timed-out queued models promoted inference success"))
+  if (!Require(no_success(),
+               "timed-out queued models promoted inference success"))
     return false;
   const auto retry = manager.Execute(Binding(request, input, &output, 2));
   if (!Require(retry.status != hal::StatusId::executed &&
@@ -975,10 +1090,10 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
               << " release=" << shutdown.driver_context_release_permitted
               << " pending=" << shutdown.pending << '\n';
   }
-  return Require(shutdown.quiescent &&
-                     shutdown.driver_context_release_permitted &&
-                     !shutdown.pending,
-                 "bounded late retirement could not safely destroy the failed batch");
+  return Require(
+      shutdown.quiescent && shutdown.driver_context_release_permitted &&
+          !shutdown.pending,
+      "bounded late retirement could not safely destroy the failed batch");
 }
 } // namespace
 
@@ -1054,6 +1169,11 @@ int main(int argc, char **argv) {
   }
   if (options.case_name.empty() || options.case_name == "budgets") {
     if (!BudgetRejection(options))
+      return 1;
+    ++executed;
+  }
+  if (options.case_name.empty() || options.case_name == "defaults") {
+    if (!options.prepare_only && !NativeInstalledDefaultSelection(options))
       return 1;
     ++executed;
   }
