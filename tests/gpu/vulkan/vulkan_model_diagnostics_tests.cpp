@@ -59,6 +59,20 @@ int main() {
       std::cerr << "FAIL missing available effect: " << name << '\n';
       return 1;
     }
+  for (const auto *task : {"matting", "video_denoise", "face_detection",
+                           "face_landmarks", "eye_contact"}) {
+    const auto selected = d.prepared_model_ids.find(task);
+    const auto expected = d.default_model_ids.find(task);
+    if (selected == d.prepared_model_ids.end() ||
+        expected == d.default_model_ids.end() ||
+        selected->second != expected->second ||
+        std::find(d.installed_models.begin(), d.installed_models.end(),
+                  selected->second) == d.installed_models.end()) {
+      std::cerr << "FAIL missing/mismatched cached model selection for " << task
+                << '\n';
+      return 1;
+    }
+  }
   if (d.eye_contact_reason_code != "open_vulkan_eye_contact_production_ready" ||
       d.video_noise_removal_reason_code !=
           "open_vulkan_video_noise_removal_production_ready" ||

@@ -278,6 +278,9 @@ struct OpenVulkanDiagnostics {
   std::vector<std::string> installed_models;
   std::vector<ModelInfo> models;
   std::string default_model_id;
+  // Cached default-probe selection; active configured models use typed status.
+  std::map<std::string, std::string> default_model_ids;
+  std::map<std::string, std::string> prepared_model_ids;
   std::map<std::string, std::string> missing_models;
 
   std::vector<std::string> available_effects;

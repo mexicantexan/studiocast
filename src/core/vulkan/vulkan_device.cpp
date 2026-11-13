@@ -812,6 +812,16 @@ std::string OpenVulkanDiagnostics::ToJson() const {
   AppendJsonStringArray(&oss, installed_models);
   oss << ",";
   oss << "\"default_model_id\":\"" << JsonEscape(default_model_id) << "\",";
+  if (!default_model_ids.empty()) {
+    oss << "\"default_model_ids\":";
+    AppendJsonStringMap(&oss, default_model_ids);
+    oss << ",";
+  }
+  if (!prepared_model_ids.empty()) {
+    oss << "\"prepared_model_ids\":";
+    AppendJsonStringMap(&oss, prepared_model_ids);
+    oss << ",";
+  }
   oss << "\"models\":";
   AppendJsonModels(&oss, models);
   oss << ",";

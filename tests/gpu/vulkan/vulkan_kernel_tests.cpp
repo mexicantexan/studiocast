@@ -868,6 +868,8 @@ bool TestVulkanDeviceSelectionPolicy() {
       1, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 300, 0, "Intel GPU")};
   diagnostics.device_candidates[0].stable_id = intelStableId;
   diagnostics.device_candidates[0].selected = true;
+  diagnostics.default_model_ids["video_denoise"] = "daemon-default";
+  diagnostics.prepared_model_ids["video_denoise"] = "prepared-pack";
   const std::string json = diagnostics.ToJson();
   ok &= Require(
       json.find("\"device_selection_request\":\"index:1\"") !=
@@ -878,6 +880,12 @@ bool TestVulkanDeviceSelectionPolicy() {
           json.find("\"device_candidates\":[{") != std::string::npos &&
           json.find("\"device_name\":\"Intel GPU\"") != std::string::npos,
       "Vulkan diagnostics JSON should expose selection candidates");
+  ok &= Require(
+      json.find("\"default_model_ids\":{\"video_denoise\":\"daemon-default\"}") !=
+              std::string::npos &&
+          json.find("\"prepared_model_ids\":{\"video_denoise\":\"prepared-pack\"}") !=
+              std::string::npos,
+      "cached default selection and prepared model identities should remain distinct");
   return ok;
 }
 

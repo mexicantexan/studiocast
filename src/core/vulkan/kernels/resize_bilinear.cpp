@@ -451,8 +451,6 @@ PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
   };
 
   for (const auto &m : reg.ListModels()) {
-    if (m.task != "matting")
-      continue;
     installed_model_ids.insert(m.id);
     d->installed_models.push_back(m.id);
     OpenVulkanDiagnostics::ModelInfo mi;
@@ -478,6 +476,14 @@ PopulateOpenVulkanModelDiagnostics(OpenVulkanDiagnostics *d) {
       }
     }
   }
+  for (const auto *task :
+       {"video_denoise", "face_detection", "face_landmarks", "eye_contact"}) {
+    const auto id = reg.DefaultModelIdForTask(task);
+    if (!id.empty() && reg.Find(task, id))
+      d->default_model_ids[task] = id;
+  }
+  if (!d->default_model_id.empty())
+    d->default_model_ids["matting"] = d->default_model_id;
   facts.selected = !d->default_model_id.empty();
   if (facts.selected)
     facts.pack = reg.Find("matting", d->default_model_id);
@@ -869,17 +875,17 @@ bool PrepareMattingDiagnostics(OpenVulkanDiagnostics *d,
       effects.virtual_key_light.enabled = true;
     }
     effects.video_noise_removal.enabled =
-        select("video_denoise", "fastdvdnet_sigma15",
+        select("video_denoise", registry.DefaultModelIdForTask("video_denoise"),
                &configuration.denoise_pack, &configuration.denoise_identity);
-    effects.auto_frame.enabled =
-        select("face_detection", "yunet_opencv_zoo_2023mar_fp32",
-               &configuration.face_pack, &configuration.face_identity);
+    effects.auto_frame.enabled = select(
+        "face_detection", registry.DefaultModelIdForTask("face_detection"),
+        &configuration.face_pack, &configuration.face_identity);
     effects.eye_contact.enabled =
         effects.auto_frame.enabled &&
-        select("eye_contact", "gaze_correction_cam_flx_v0_1_1",
+        select("eye_contact", registry.DefaultModelIdForTask("eye_contact"),
                &configuration.eye_pack, &configuration.eye_identity);
     if (effects.eye_contact.enabled) {
-      std::string landmark = "dlib_68_ibug_300w";
+      std::string landmark = registry.DefaultModelIdForTask("face_landmarks");
       for (const auto &dependency : configuration.eye_pack->depends_on)
         if (dependency.rfind("face_landmarks:", 0) == 0)
           landmark = dependency.substr(15);
@@ -914,6 +920,7 @@ bool PrepareMattingDiagnostics(OpenVulkanDiagnostics *d,
         prepared.installed_models = std::move(d->installed_models);
         prepared.models = std::move(d->models);
         prepared.default_model_id = std::move(d->default_model_id);
+        prepared.default_model_ids = std::move(d->default_model_ids);
         prepared.missing_models = std::move(d->missing_models);
         prepared.install_hints = std::move(d->install_hints);
         prepared.warnings = std::move(d->warnings);
@@ -981,6 +988,12 @@ bool ReviewedNetwork(const std::shared_ptr<const open_video::ModelPack> &pack,
 
 void ApplyPreparedModelDiagnostics(OpenVulkanDiagnostics *d,
                                    const VulkanProductionModelDiagnostics &m) {
+  for (const auto *pack :
+       {m.matting_pack.get(), m.denoise_pack.get(), m.face_pack.get(),
+        m.landmarks_pack.get(), m.eye_pack.get()}) {
+    if (pack)
+      d->prepared_model_ids[pack->task] = pack->id;
+  }
   const auto &c = m.capabilities;
   const bool common =
       c.build_enabled && c.runtime_loaded && c.non_cpu_physical_device &&
