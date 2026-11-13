@@ -589,6 +589,134 @@ bool TestMattingFinalGeometryContract() {
       "knobs opaque");
 }
 
+bool TestAllModelProgramContract() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  const std::array semantics{hal::SemanticEffectId::video_noise_removal,
+                             hal::SemanticEffectId::eye_contact,
+                             hal::SemanticEffectId::virtual_background_blur,
+                             hal::SemanticEffectId::virtual_key_light,
+                             hal::SemanticEffectId::auto_frame,
+                             hal::SemanticEffectId::vignette,
+                             hal::SemanticEffectId::mirror};
+  const auto proof = [](hal::SemanticCapabilityEvidence &c,
+                        hal::CapabilityEvidenceCode code) {
+    c.evidence[c.evidence_count++] = {
+        code,       hal::StatusId::ready,   hal::ReasonId::none,
+        c.semantic, hal::BackendId::vulkan, true};
+  };
+  proof(registration.semantic_capabilities[0],
+        hal::CapabilityEvidenceCode::vulkan_tracked_vignette_center_supported);
+  registration.semantic_capabilities[0].supports_tracked_vignette_center = true;
+  for (const auto code :
+       {hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid,
+        hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready})
+    proof(registration.semantic_capabilities[0], code);
+  for (std::size_t i = 0; i < 5; ++i) {
+    const auto code =
+        i == 0   ? hal::CapabilityEvidenceCode::vulkan_denoise_runtime_ready
+        : i == 1 ? hal::CapabilityEvidenceCode::vulkan_eye_runtime_ready
+        : i == 4 ? hal::CapabilityEvidenceCode::vulkan_face_runtime_ready
+                 : hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready;
+    auto capability = Capability(semantics[i], code);
+    proof(capability,
+          hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
+    proof(capability, hal::CapabilityEvidenceCode::vulkan_warmup_complete);
+    if (i == 1)
+      for (const auto extra :
+           {hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+            hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready,
+            hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled})
+        proof(capability, extra);
+    if (i == 4)
+      proof(capability, hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready);
+    registration
+        .semantic_capabilities[registration.semantic_capability_count++] =
+        capability;
+  }
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId;
+  configuration.matting_identity.artifact_generation = 1;
+  configuration.matting_identity.model_id_hash[0] = 3;
+  configuration.matting_identity.artifact_set_hash[0] = 4;
+  configuration.denoise_identity = configuration.face_identity =
+      configuration.eye_identity = configuration.matting_identity;
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(factory.Initialize(&reason) == hal::StatusId::ready &&
+                   registry.Register(factory.adapter_registration(), &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(factory.factory_registration(),
+                                               &reason) == hal::StatusId::ready,
+               "all-model exact injected registration must initialize"))
+    return false;
+  auto request = Request();
+  request.intent.stages = {};
+  request.intent.stage_count = semantics.size();
+  request.temporal.temporal = true;
+  request.temporal.history_frames = 5;
+  const auto add = [](video::CanonicalVideoStage &stage,
+                      video::CanonicalVideoParameterId id, std::int64_t value) {
+    auto &p = stage.parameters[stage.parameter_count++];
+    p.id = id;
+    p.kind = video::CanonicalVideoParameterKind::signed_integer;
+    p.signed_value = value;
+  };
+  for (std::size_t i = 0; i < semantics.size(); ++i) {
+    auto &stage = request.intent.stages[i];
+    stage.intent.stage_id = static_cast<std::uint32_t>(i + 1);
+    stage.intent.semantic = semantics[i];
+    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+    if (i < 5)
+      stage.model = configuration.matting_identity;
+    using Id = video::CanonicalVideoParameterId;
+    if (i == 0 || i == 1 || i == 2 || i == 4)
+      add(stage, Id::strength, i == 2 ? 17 : 65);
+    if (i == 1 || i == 5) {
+      if (i == 5)
+        add(stage, Id::intensity, 47);
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = i == 1 ? Id::look_away_enabled : Id::center_on_tracked_face;
+      p.kind = video::CanonicalVideoParameterKind::boolean;
+      p.boolean_value = i == 5;
+      stage.intent.requires_tracked_vignette_center = i == 5;
+    }
+    if (i == 2) {
+      for (const auto id : {Id::remove_color_rgb, Id::greenscreen_mode}) {
+        auto &p = stage.parameters[stage.parameter_count++];
+        p.id = id;
+        p.kind = video::CanonicalVideoParameterKind::unsigned_integer;
+      }
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = Id::greenscreen_temporal;
+      p.kind = video::CanonicalVideoParameterKind::boolean;
+    }
+    if (i == 3) {
+      add(stage, Id::intensity, 65);
+      add(stage, Id::temperature_preset, 1);
+      add(stage, Id::direction_pan_degrees, -35);
+    }
+    if (i == 4) {
+      add(stage, Id::smoothing, 35);
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = Id::headroom;
+      p.kind = video::CanonicalVideoParameterKind::real;
+      p.real_value = .15;
+    }
+  }
+  const auto status = coordinator.Prepare(request, nullptr, &reason);
+  if (status != hal::StatusId::ready)
+    std::cerr << "all-model injected status/reason="
+              << static_cast<unsigned>(status) << '/'
+              << static_cast<unsigned>(reason) << '\n';
+  return Require(status == hal::StatusId::ready && adapter.prepare_calls == 1 &&
+                     coordinator.Snapshot().readiness.evidence_count == 25,
+                 "all seven canonical model and utility stages must prepare");
+}
+
 bool TestShutdownRetainsUnprovenNativeOwner() {
   FakeVulkanAdapter adapter;
   bool safe = false;
@@ -695,8 +823,9 @@ bool TestMalformedSourceStageCount() {
 bool TestUnavailableOptionalStageIsolation() {
   FakeVulkanAdapter adapter;
   auto registration = Registration(&adapter);
-  auto &missing = registration.semantic_capabilities[
-      registration.semantic_capability_count++];
+  auto &missing =
+      registration
+          .semantic_capabilities[registration.semantic_capability_count++];
   missing.semantic = hal::SemanticEffectId::video_noise_removal;
   missing.provider =
       hal::SemanticEffectProviderId::open_vulkan_production_kernels;
@@ -772,21 +901,19 @@ bool TestMissingSelectedPackNeedsNoNativeContext() {
       "hermetic-explicitly-nonexistent-denoise-pack-20261112";
   request.wait.timeout_nanoseconds = UINT64_C(100000000);
   auto result = source->AcquireResidentSetup(request);
-  bool ok = Require(result.status == hal::StatusId::degraded &&
-                        !result.lease.live() &&
-                        result.resolution_registration.resident_adapter ==
-                            nullptr &&
-                        result.resolution_registration
-                                .semantic_capabilities[0].status ==
-                            hal::StatusId::unavailable,
-                    "a missing optional selected pack must resolve without "
-                    "creating a native context");
+  bool ok = Require(
+      result.status == hal::StatusId::degraded && !result.lease.live() &&
+          result.resolution_registration.resident_adapter == nullptr &&
+          result.resolution_registration.semantic_capabilities[0].status ==
+              hal::StatusId::unavailable,
+      "a missing optional selected pack must resolve without "
+      "creating a native context");
   stage.required = true;
   result = source->AcquireResidentSetup(request);
-  ok &= Require(result.status == hal::StatusId::unavailable &&
-                    !result.lease.live() &&
-                    result.reason == hal::ReasonId::required_stage_failed,
-                "a missing required selected pack must fail before native setup");
+  ok &= Require(
+      result.status == hal::StatusId::unavailable && !result.lease.live() &&
+          result.reason == hal::ReasonId::required_stage_failed,
+      "a missing required selected pack must fail before native setup");
   return ok;
 }
 
@@ -1180,6 +1307,7 @@ int main() {
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
   ok &= TestMattingFinalGeometryContract();
+  ok &= TestAllModelProgramContract();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
   ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
