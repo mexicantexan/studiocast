@@ -1056,9 +1056,7 @@ StatusId VulkanHalResidentAdapter::ResetTemporalState(
   slot->completed_token = {};
   if (status != StatusId::ready && status != StatusId::degraded) {
     slot->quarantined = true;
-    slot->quarantine_reason = reason == ReasonId::device_lost
-                                  ? reason
-                                  : ReasonId::synchronization_failed;
+    slot->quarantine_reason = ReasonId::synchronization_failed;
   }
   return status;
 }

@@ -505,6 +505,28 @@ bool TestQuarantinePreservesTimeoutVersusDeviceLoss() {
         "real device loss must retain device-lost evidence");
     adapter.DestroyPrepared(&handle);
   }
+  {
+    FakeQualifiedExecutor executor;
+    executor.reset_status = StatusId::quarantined;
+    VulkanHalResidentAdapter adapter(kAdapterId, executor);
+    const auto program = Program(911);
+    studiocast::hal::PreparedProgramHandle handle;
+    ReadinessSnapshot readiness;
+    ReasonId reason = ReasonId::none;
+    ok &=
+        Require(adapter.SetProgramOptions(Options(program)) &&
+                    adapter.Prepare(program, &handle, &readiness, &reason) ==
+                        StatusId::ready &&
+                    adapter.ResetTemporalState(handle, ReasonId::device_lost) ==
+                        StatusId::quarantined,
+                "status-only reset failure must quarantine");
+    const auto retry = adapter.Execute(handle, {});
+    ok &= Require(
+        retry.reason == ReasonId::synchronization_failed &&
+            executor.execute_calls == 0,
+        "a reset trigger must not fabricate actual device-loss evidence");
+    adapter.DestroyPrepared(&handle);
+  }
   return ok;
 }
 
