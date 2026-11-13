@@ -610,6 +610,14 @@ public:
                          ReasonId *reason) noexcept override {
     return adapter_->BindHostFrame(program, binding, tokens, reason);
   }
+  StatusId
+  DiscardUnsubmittedHostFrame(const hal::PreparedProgramHandle &program,
+                              const hal::HostFrameTokens &tokens,
+                              std::uint64_t sequence,
+                              ReasonId *reason) noexcept override {
+    return adapter_->DiscardUnsubmittedHostFrame(program, tokens, sequence,
+                                                 reason);
+  }
   StatusId ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
                                   const hal::CompletionToken &completion,
                                   const hal::ResourceHandle &output,
@@ -743,13 +751,18 @@ public:
     quarantined_ = reason == ReasonId::device_lost;
   }
 
-  StatusId ResetTemporal(ReasonId) noexcept override {
+  StatusId ResetTemporal(ReasonId reason) noexcept override {
     if (stopped_)
       return StatusId::stopped;
     if (!prepared_)
       return quarantined_ ? StatusId::quarantined : StatusId::stale;
-    // Production Vulkan final stages are explicitly non-temporal.
-    return StatusId::ready;
+    const auto status = session_.ResetTemporalState(reason);
+    if (status != StatusId::ready && status != StatusId::degraded) {
+      prepared_ = false;
+      pending_ = false;
+      quarantined_ = status == StatusId::quarantined;
+    }
+    return status;
   }
 
   void Shutdown() noexcept override {

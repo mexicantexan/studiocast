@@ -115,6 +115,9 @@ public:
           const VulkanResidentProgramOptions &options,
           const VulkanHostFrameBinding &binding,
           std::uint64_t capture_sequence) noexcept = 0;
+  virtual hal::StatusId
+  ResetTemporalState(const VulkanExecutorPreparedProgram &,
+                     hal::ReasonId) noexcept = 0;
   virtual void
   DestroyPrepared(VulkanExecutorPreparedProgram *prepared) noexcept = 0;
   virtual void Shutdown() noexcept = 0;
@@ -163,6 +166,10 @@ public:
                               const hal::HostFrameBinding &binding,
                               hal::HostFrameTokens *tokens,
                               hal::ReasonId *reason) noexcept override;
+  hal::StatusId DiscardUnsubmittedHostFrame(const hal::PreparedProgramHandle &,
+                                            const hal::HostFrameTokens &,
+                                            std::uint64_t capture_sequence,
+                                            hal::ReasonId *) noexcept override;
   hal::StatusId
   ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
                          const hal::CompletionToken &completion,

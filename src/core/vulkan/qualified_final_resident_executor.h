@@ -49,6 +49,8 @@ public:
           const VulkanResidentProgramOptions &options,
           const VulkanHostFrameBinding &binding,
           std::uint64_t capture_sequence) noexcept override;
+  hal::StatusId ResetTemporalState(const VulkanExecutorPreparedProgram &,
+                                   hal::ReasonId) noexcept override;
   void
   DestroyPrepared(VulkanExecutorPreparedProgram *prepared) noexcept override;
   void Shutdown() noexcept override;

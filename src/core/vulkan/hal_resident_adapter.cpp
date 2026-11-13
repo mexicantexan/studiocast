@@ -951,10 +951,59 @@ StatusId VulkanHalResidentAdapter::ResolveHostFrameOutput(
 }
 
 StatusId VulkanHalResidentAdapter::ResetTemporalState(
-    const hal::PreparedProgramHandle &program, ReasonId) noexcept {
+    const hal::PreparedProgramHandle &program, ReasonId reason) noexcept {
   if (shutdown_)
     return StatusId::stopped;
-  return FindSlot(program) ? StatusId::ready : StatusId::stale;
+  auto *slot = FindSlot(program);
+  if (!slot)
+    return StatusId::stale;
+  if (slot->quarantined || slot->executing)
+    return StatusId::quarantined;
+  const auto status =
+      executor_->ResetTemporalState(slot->executor_program, reason);
+  slot->output_ready = false;
+  slot->completed_token = {};
+  if (status != StatusId::ready && status != StatusId::degraded)
+    slot->quarantined = true;
+  return status;
+}
+
+StatusId VulkanHalResidentAdapter::DiscardUnsubmittedHostFrame(
+    const hal::PreparedProgramHandle &program,
+    const hal::HostFrameTokens &tokens, std::uint64_t sequence,
+    ReasonId *reason) noexcept {
+  SetReason(reason, ReasonId::none);
+  if (shutdown_) {
+    SetReason(reason, ReasonId::shutdown_requested);
+    return StatusId::stopped;
+  }
+  auto *slot = FindSlot(program);
+  if (!slot) {
+    SetReason(reason, ReasonId::stale_program);
+    return StatusId::stale;
+  }
+  if (slot->quarantined) {
+    SetReason(reason, ReasonId::device_lost);
+    return StatusId::quarantined;
+  }
+  if (!sequence || !slot->neutral_binding || !slot->binding_armed ||
+      slot->executing || slot->output_ready ||
+      sequence != slot->binding_capture_sequence ||
+      !ResourceMatches(tokens.input, slot->binding_resource) ||
+      !ResourceMatches(tokens.output, slot->binding_output_resource)) {
+    SetReason(reason, ReasonId::host_frame_binding_invalid);
+    return StatusId::blocked;
+  }
+  slot->binding_armed = false;
+  slot->binding = {};
+  slot->host_binding = {};
+  slot->binding_resource = {};
+  slot->binding_output_resource = {};
+  slot->binding_capture_sequence = 0;
+  slot->binding_id = 0;
+  slot->neutral_binding = false;
+  slot->completed_token = {};
+  return StatusId::ready;
 }
 
 void VulkanHalResidentAdapter::DestroyPrepared(

@@ -306,6 +306,12 @@ public:
     *prepared = {};
   }
 
+  StatusId ResetTemporalState(const VulkanExecutorPreparedProgram &,
+                              ReasonId) noexcept override {
+    ++reset_calls;
+    return reset_status;
+  }
+
   void Shutdown() noexcept override {
     ++shutdown_calls;
     shutdown = true;
@@ -323,6 +329,8 @@ public:
   bool shutdown = false;
   std::uint64_t prepare_calls = 0;
   std::uint64_t execute_calls = 0;
+  std::uint64_t reset_calls = 0;
+  StatusId reset_status = StatusId::ready;
   std::uint64_t destroy_calls = 0;
   std::uint64_t shutdown_calls = 0;
   std::uint64_t next_state_id = 1;
@@ -390,6 +398,60 @@ bool Configure(PreparedProgramSession *session,
   const StatusId status = session->Configure(
       program, *adapter, readiness ? readiness : &local, &reason);
   return status == StatusId::ready && reason == ReasonId::none;
+}
+
+bool TestResetAndExactUnsubmittedRetirement() {
+  FakeQualifiedExecutor executor;
+  VulkanHalResidentAdapter adapter(kAdapterId, executor);
+  const auto program = Program(909);
+  bool ok =
+      Require(adapter.SetProgramOptions(Options(program)), "reset options");
+  studiocast::hal::PreparedProgramHandle handle;
+  ReadinessSnapshot readiness;
+  ReasonId reason;
+  ok &= Require(adapter.Prepare(program, &handle, &readiness, &reason) ==
+                    StatusId::ready,
+                "reset fixture prepare");
+  std::array<std::uint8_t, kFrameBytes> input{}, output{};
+  HostFrameTokens tokens;
+  ok &= Require(adapter.BindHostFrame(handle,
+                                      CommonBinding(program, input, output, 1),
+                                      &tokens, &reason) == StatusId::ready,
+                "arm never-submitted binding");
+  auto forged = tokens;
+  ++forged.output.resource_id;
+  ok &= Require(adapter.DiscardUnsubmittedHostFrame(
+                    handle, forged, 1, &reason) == StatusId::blocked,
+                "foreign discard cannot retire current binding");
+  ok &= Require(adapter.DiscardUnsubmittedHostFrame(
+                    handle, tokens, 1, &reason) == StatusId::ready &&
+                    executor.execute_calls == 0,
+                "exact unsubmitted binding retirement performs no execution");
+  ok &= Require(adapter.DiscardUnsubmittedHostFrame(
+                    handle, tokens, 1, &reason) == StatusId::blocked,
+                "discard cannot retire binding twice");
+  ok &= Require(adapter.BindHostFrame(handle,
+                                      CommonBinding(program, input, output, 2),
+                                      &tokens, &reason) == StatusId::ready,
+                "retired binding permits next frame");
+  ok &= Require(
+      adapter.ResetTemporalState(handle, ReasonId::temporal_discontinuity) ==
+              StatusId::ready &&
+          executor.reset_calls == 1,
+      "reset forwards to exact prepared executor");
+  executor.reset_status = StatusId::failed;
+  ok &= Require(
+      adapter.ResetTemporalState(handle, ReasonId::temporal_discontinuity) ==
+              StatusId::failed &&
+          executor.reset_calls == 2,
+      "reset failure propagates");
+  const auto executed =
+      adapter.Execute(handle, Request(program, tokens.input, 2));
+  ok &= Require(executed.status == StatusId::quarantined &&
+                    executor.execute_calls == 0,
+                "failed reset blocks subsequent native execution");
+  adapter.DestroyPrepared(&handle);
+  return ok;
 }
 
 bool TestPreparedExecutionAndCommittedAttribution() {
@@ -1387,6 +1449,7 @@ bool TestReconfigurationTemporalCpuTailAndAllocationFreeLoop() {
 
 int main() {
   bool ok = true;
+  ok &= TestResetAndExactUnsubmittedRetirement();
   ok &= TestPreparedExecutionAndCommittedAttribution();
   ok &= TestMetadataAllowancesFailBeforeNativePrepare();
   ok &= TestCapabilityAndSemanticGates();

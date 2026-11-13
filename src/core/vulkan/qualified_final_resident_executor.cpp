@@ -699,6 +699,23 @@ QualifiedFinalResidentExecutor::Find(std::uint64_t state_id) noexcept {
   return nullptr;
 }
 
+hal::StatusId QualifiedFinalResidentExecutor::ResetTemporalState(
+    const VulkanExecutorPreparedProgram &prepared, hal::ReasonId) noexcept {
+  if (shutdown_)
+    return StatusId::stopped;
+  Slot *slot = Find(prepared.state_id);
+  if (!slot || prepared.opaque[0] != slot->program_id ||
+      prepared.opaque[1] != slot->canonical_plan_hash ||
+      prepared.opaque[2] != slot->execution_domain.logical_context_generation ||
+      prepared.opaque[3] != adapter_instance_id_)
+    return StatusId::stale;
+  if (slot->quarantined || !kernels_->device()->health_state().healthy())
+    return StatusId::quarantined;
+  // Model-free/matting-only programs have no history. Model leaves extend
+  // this exact forwarding boundary with their prepared reset contracts.
+  return StatusId::ready;
+}
+
 void QualifiedFinalResidentExecutor::Release(Slot *slot) noexcept {
   if (!slot)
     return;
