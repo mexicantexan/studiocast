@@ -1,0 +1,81 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Image { uint rgb[]; };
+layout(std430,binding=1) readonly buffer Forest { uint forest[]; };
+layout(std430,binding=2) buffer Scratch { uint scratch[]; };
+layout(std430,binding=3) buffer Output { uint output_points[]; };
+layout(std430,binding=4) buffer Unused4 { uint unused4[]; };
+layout(std430,binding=5) buffer State { uint st[]; };
+layout(std430,binding=6) buffer Unused6 { uint unused6[]; };
+layout(std430,binding=7) readonly buffer Frame { uint frame[]; };
+layout(push_constant) uniform Push { uint p[32]; };
+float f(uint word) { return uintBitsToFloat(forest[word]); }
+float shape(uint i) { return uintBitsToFloat(scratch[i]); }
+void setshape(uint i,float x) { scratch[i]=floatBitsToUint(x); }
+double inverse(uint i) { uint o=p[14]+i*2;return packDouble2x32(uvec2(forest[o],forest[o+1])); }
+void main() {
+ if(gl_GlobalInvocationID.x!=0||gl_GlobalInvocationID.y!=0)return;
+ st[8]=0;
+ if(st[5]==0||st[7]==0)return;
+ float left=uintBitsToFloat(st[16]),top=uintBitsToFloat(st[17]);
+ float right=left+uintBitsToFloat(st[18]),bottom=top+uintBitsToFloat(st[19]);
+ if(int(right)<=int(left)||int(bottom)<=int(top))return;
+ // Match dlib's rectangle -> vector<float,2> -> matrix<double> conversions.
+ double qx[3]=double[3](double(float(int(left))),double(float(int(right))),double(float(int(right))));
+ double qy[3]=double[3](double(float(int(top))),double(float(int(top))),double(float(int(bottom))));
+ precise double m[6];
+ for(uint j=0;j<3;j++) {
+   precise double x=qx[0]*inverse(j);x=x+qx[1]*inverse(3+j);x=x+qx[2]*inverse(6+j);
+   precise double y=qy[0]*inverse(j);y=y+qy[1]*inverse(3+j);y=y+qy[2]*inverse(6+j);
+   m[j]=x;m[3+j]=y;
+ }
+ for(uint i=0;i<136;i++)setshape(i,f(p[5]+i));
+ for(uint c=0;c<p[4];c++) {
+   precise double mx0=0.,mx1=0.,my0=0.,my1=0.;
+   for(uint i=0;i<68;i++) {
+     mx0+=double(f(p[5]+2*i));my0+=double(f(p[5]+2*i+1));
+     mx1+=double(shape(2*i));my1+=double(shape(2*i+1));
+   }
+   mx0/=68.;my0/=68.;mx1/=68.;my1/=68.;
+   precise double aa=0.,bb=0.,den=0.;
+   for(uint i=0;i<68;i++) {
+     precise double x=double(f(p[5]+2*i))-mx0,y=double(f(p[5]+2*i+1))-my0;
+     precise double u=double(shape(2*i))-mx1,v=double(shape(2*i+1))-my1;
+     aa+=x*u+y*v;bb+=x*v-y*u;den+=x*x+y*y;
+   }
+   precise float a=float(aa/den),b=float(bb/den);
+   uint fb=forest[p[11]+c],fe=forest[p[11]+c+1];
+   for(uint j=fb;j<fe;j++) {
+     uint k=forest[p[12]+j];
+     float dx=f(p[13]+j*2),dy=f(p[13]+j*2+1);
+     precise float nx=shape(2*k)+a*dx-b*dy,ny=shape(2*k+1)+b*dx+a*dy;
+     precise double mapped_x=m[0]*double(nx)+m[1]*double(ny)+m[2];
+     precise double mapped_y=m[3]*double(nx)+m[4]*double(ny)+m[5];
+     int x=int(floor(mapped_x+.5)),y=int(floor(mapped_y+.5));
+     float value=0.;
+     if(x>=0&&y>=0&&x<int(p[1])&&y<int(p[2])) {
+       uint pixel=rgb[uint(y)*p[3]+uint(x)];
+       value=float(((pixel&255u)+((pixel>>8)&255u)+((pixel>>16)&255u))/3u);
+     }
+     scratch[136+j-fb]=floatBitsToUint(value);
+   }
+   for(uint t=forest[p[6]+c];t<forest[p[6]+c+1];t++) {
+     uint sb=forest[p[7]+t],count=forest[p[7]+t+1]-sb,n=0;
+     while(n<count) {
+       uint s=p[9]+(sb+n)*3;
+       float va=uintBitsToFloat(scratch[136+forest[s]]),vb=uintBitsToFloat(scratch[136+forest[s+1]]);
+       n=(va-vb>f(s+2))?2*n+1:2*n+2;
+     }
+     uint leaf=forest[p[8]+t]+n-count;
+     for(uint i=0;i<136;i++)setshape(i,shape(i)+f(p[10]+leaf*136+i));
+   }
+ }
+ for(uint i=0;i<68;i++) {
+   precise double x=m[0]*double(shape(2*i))+m[1]*double(shape(2*i+1))+m[2];
+   precise double y=m[3]*double(shape(2*i))+m[4]*double(shape(2*i+1))+m[5];
+   output_points[2*i]=floatBitsToUint(float(floor(x+.5)));
+   output_points[2*i+1]=floatBitsToUint(float(floor(y+.5)));
+ }
+ st[8]=1;
+}

@@ -40,6 +40,10 @@ struct PreparedVulkanTrackingSetup {
   float auto_frame_headroom = .15F;
   int vignette_intensity = 0;
   bool vignette_tracked_center = false;
+  // True only when another enabled effect produces the compatible same-frame
+  // matte. Auto Frame's always-enqueued fallback graph alone remains on the
+  // established ten-capture-sequence bounds-update cadence.
+  bool matte_shared_current_frame = false;
   const open_video::DlibPredictorData *predictor = nullptr;
   open_video::ValidatedModelArtifactIdentity face_artifact{};
   open_video::ValidatedModelArtifactIdentity landmark_artifact{};
@@ -81,9 +85,9 @@ public:
   bool AppendEyeInputs(vulkan::ResidentCommandBatch &,
                        const vulkan::VulkanImage &, std::string *error);
   bool AppendEyeTailAndComposite(vulkan::ResidentCommandBatch &,
-                                const vulkan::VulkanImage &,
-                                const vulkan::VulkanImage &output,
-                                std::string *error);
+                                 const vulkan::VulkanImage &,
+                                 const vulkan::VulkanImage &output,
+                                 std::string *error);
   bool AppendAutoFrame(vulkan::ResidentCommandBatch &,
                        const vulkan::VulkanImage &,
                        const vulkan::VulkanImage *alpha,
@@ -92,6 +96,9 @@ public:
                       const vulkan::VulkanImage &,
                       const vulkan::VulkanImage &output, std::string *error);
   bool AppendReset(vulkan::ResidentCommandBatch &, std::string *error);
+  // Candidate setup/warmup establishes every enabled phase's fixed image
+  // binding. Once sealed, live calls may only replay those exact bindings.
+  bool SealBindingsForExecution(std::string *error);
 
   bool Shutdown(std::string *error) noexcept;
   bool ready() const noexcept;
