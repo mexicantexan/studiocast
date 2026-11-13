@@ -36,6 +36,8 @@ struct Runner {
   vk::VulkanDevice device;
   vk::kernels::TrackingKernels kernels;
   vk::VulkanBuffer dummy;
+  // Recorded preprocessing bindings remain borrowed until kernel shutdown.
+  vk::VulkanBuffer preprocess_image, preprocess_output;
   std::string error;
   unsigned slot = 0;
   double maximum_execute_ms = 0;
@@ -243,6 +245,125 @@ void DlibOracle(Runner &r, const char *root) {
   std::cout << "PASS native GPU dlib: exact136coordinates across20cases "
                "max_execute_ms="
             << r.maximum_execute_ms << std::endl;
+}
+// Independent literal oracle for YunetFaceDetector::ComputeLetterbox and
+// FillInputTensorBgr: uniform inverse scale, zero padding, clamped border
+// weights, RGB byte input and planar BGR float output in [0,255].
+std::vector<float> CanonicalYunetInput(const std::vector<std::uint8_t> &rgb,
+                                       int w, int h, std::size_t stride) {
+  constexpr int extent = 640;
+  std::vector<float> out(3 * extent * extent, 0.F);
+  if (w <= 1 || h <= 1)
+    return out;
+  const float scale =
+      std::min(float(extent) / float(w), float(extent) / float(h));
+  const float inverse = 1.F / scale;
+  const int cw = std::max(1, int(std::lround(float(w) * scale))),
+            ch = std::max(1, int(std::lround(float(h) * scale))),
+            px = (extent - cw) / 2, py = (extent - ch) / 2;
+  for (int y = py; y < py + ch; ++y) {
+    const float sy = (float(y - py) + .5F) * inverse - .5F;
+    int y0 = int(std::floor(sy));
+    float fy = sy - float(y0);
+    if (y0 < 0) {
+      y0 = 0;
+      fy = 0;
+    }
+    int y1 = y0 + 1;
+    if (y1 >= h) {
+      y1 = h - 1;
+      fy = 0;
+    }
+    for (int x = px; x < px + cw; ++x) {
+      const float sx = (float(x - px) + .5F) * inverse - .5F;
+      int x0 = int(std::floor(sx));
+      float fx = sx - float(x0);
+      if (x0 < 0) {
+        x0 = 0;
+        fx = 0;
+      }
+      int x1 = x0 + 1;
+      if (x1 >= w) {
+        x1 = w - 1;
+        fx = 0;
+      }
+      for (unsigned c = 0; c < 3; ++c) {
+        const auto value = [&](int xx, int yy) {
+          return float(
+              rgb[std::size_t(yy) * stride + std::size_t(xx) * 3 + 2 - c]);
+        };
+        const float a = value(x0, y0) + (value(x1, y0) - value(x0, y0)) * fx,
+                    b = value(x0, y1) + (value(x1, y1) - value(x0, y1)) * fx;
+        out[c * extent * extent + unsigned(y * extent + x)] = a + (b - a) * fy;
+      }
+    }
+  }
+  return out;
+}
+void YunetPreprocessOracle(Runner &r) {
+  auto &image = r.preprocess_image;
+  auto &output = r.preprocess_output;
+  r.Allocate(image, 1283u * 1280u * 4u, false);
+  r.Allocate(output, 3u * 640u * 640u * 4u, false);
+  const std::array<std::array<unsigned, 2>, 8> shapes{{{64, 64},
+                                                       {67, 51},
+                                                       {1280, 719},
+                                                       {719, 1280},
+                                                       {641, 479},
+                                                       {320, 640},
+                                                       {640, 320},
+                                                       {1, 23}}};
+  for (const auto &shape : shapes) {
+    const unsigned w = shape[0], h = shape[1], pitch = w + 3;
+    const std::size_t stride = std::size_t(w) * 3 + 5;
+    std::vector<std::uint8_t> rgb(stride * h, 0xa5);
+    std::vector<std::uint32_t> packed(std::size_t(pitch) * h, 0xdeadbeef);
+    for (unsigned y = 0; y < h; ++y)
+      for (unsigned x = 0; x < w; ++x) {
+        const std::array<unsigned, 3> channels{
+            (x * 17 + y * 31 + 13) & 255, (x * 43 + y * 7 + 89) & 255,
+            w == 64 ? (x == 0 ? 64u : 192u) : (x * 11 + y * 53 + 157) & 255};
+        packed[std::size_t(y) * pitch + x] = 0xff000000;
+        for (unsigned c = 0; c < 3; ++c) {
+          rgb[std::size_t(y) * stride + std::size_t(x) * 3 + c] =
+              static_cast<std::uint8_t>(channels[c]);
+          packed[std::size_t(y) * pitch + x] |= channels[c] << (8 * c);
+        }
+      }
+    const auto expected = CanonicalYunetInput(rgb, int(w), int(h), stride);
+    Need(w != 64 || expected[0] == 64.F,
+         "canonical first blue sample must clamp to64, not extrapolate6.4");
+    auto d = r.Dispatch(1);
+    d.buffers[0] = Bind(image);
+    d.buffers[1] = Bind(output);
+    d.parameters[1] = w;
+    d.parameters[2] = h;
+    d.parameters[3] = pitch;
+    d.parameters[25] = Bits(1.F / 255.F);
+    d.parameters[26] = Bits(1.F / (1.F / 255.F));
+    d.invocations = 3 * 640 * 640;
+    r.Upload(image, packed.data(), packed.size() * 4);
+    r.Execute(r.Record(std::span(&d, 1)));
+    const auto actual = r.Read<float>(output, expected.size());
+    float maximum = 0;
+    std::size_t worst = 0;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      Need(std::isfinite(actual[i]), "nonfinite YuNet input tensor");
+      const float error = std::abs(actual[i] - expected[i]);
+      if (error > maximum) {
+        maximum = error;
+        worst = i;
+      }
+    }
+    std::cout << "YuNet preprocess " << w << 'x' << h
+              << " max_error=" << maximum << " index=" << worst
+              << " expected=" << expected[worst] << " actual=" << actual[worst]
+              << std::endl;
+    Need(maximum <= .0001F,
+         "GPU YuNet preprocessing differs from canonical BGR/letterbox/border");
+  }
+  std::cout << "PASS native GPU YuNet preprocess:8geometries clampededges/"
+               "uniformscale/oddaspect/letterbox/BGR/pitchedinput\n";
 }
 void YunetOracle(Runner &r) {
   vk::VulkanBuffer cls, obj, boxes, candidates, masks, state, frame;
@@ -828,6 +949,13 @@ int main() {
     const auto *root = std::getenv("STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Need(root, "set STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Runner runner;
+    const auto *preprocess_only =
+        std::getenv("STUDIOCAST_VULKAN_TRACKING_ONLY_PREPROCESS");
+    if (preprocess_only && std::strcmp(preprocess_only, "1") == 0) {
+      YunetPreprocessOracle(runner);
+      Need(runner.kernels.Shutdown(&runner.error), runner.error);
+      return 0;
+    }
     const auto *diagnostic_subset =
         std::getenv("STUDIOCAST_VULKAN_TRACKING_ONLY_CROP");
     if (diagnostic_subset && std::strcmp(diagnostic_subset, "1") == 0) {
@@ -837,6 +965,7 @@ int main() {
       Need(runner.kernels.Shutdown(&runner.error), runner.error);
       return 0;
     }
+    YunetPreprocessOracle(runner);
     DlibOracle(runner, root);
     YunetOracle(runner);
     EyeInputsOracle(runner);

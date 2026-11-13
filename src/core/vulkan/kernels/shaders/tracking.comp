@@ -78,10 +78,14 @@ void main() {
    uint sw=max(1u,uint(floor(float(p[1])*scale+.5))),sh=max(1u,uint(floor(float(p[2])*scale+.5)));
    uint px=(640-sw)/2,py=(640-sh)/2;
    float v=0.;
-   if(x>=px&&x<px+sw&&y>=py&&y<py+sh) {
-     precise float sx=(float(x-px)+.5)*geometry_div(float(p[1]),float(sw))-.5;
-     precise float sy=(float(y-py)+.5)*geometry_div(float(p[2]),float(sh))-.5;
-     precise float normalized=sample_rgb(sx,sy,2-c)*uintBitsToFloat(p[25]);
+   if(p[1]>1&&p[2]>1&&x>=px&&x<px+sw&&y>=py&&y<py+sh) {
+     // Canonical YuNet uses one inverse letterbox scale even when content
+     // extents were rounded, and zero border weights outside the source.
+     // Keep the Auto Frame crop sampler's distinct extrapolation unchanged.
+     float inverse_scale=geometry_div(1.,scale);
+     precise float sx=(float(x-px)+.5)*inverse_scale-.5;
+     precise float sy=(float(y-py)+.5)*inverse_scale-.5;
+     precise float normalized=sample_rgb(clamp(sx,0.,float(p[1]-1)),clamp(sy,0.,float(p[2]-1)),2-c)*uintBitsToFloat(p[25]);
      v=normalized*uintBitsToFloat(p[26]);
    }
    b1[i]=floatBitsToUint(v);return;
