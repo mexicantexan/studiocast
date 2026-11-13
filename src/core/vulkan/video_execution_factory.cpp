@@ -1094,7 +1094,8 @@ struct VulkanVideoExecutionFactory::Impl {
     if (production && production->kernels.device()->Initialized()) {
       const auto health = production->kernels.device()->health_state();
       return (health.healthy() ||
-              health.health == VulkanContextHealth::unsafe_timeout) &&
+              health.health == VulkanContextHealth::unsafe_timeout ||
+              health.health == VulkanContextHealth::fatal_submission_error) &&
              health.completed_serial >= health.submitted_serial &&
              production->kernels.device()->SafeToDestroyResources();
     }
