@@ -325,11 +325,62 @@ QString planTextFromObject(const QJsonObject &plan) {
     text += QStringLiteral("  %1 verified artifact files, %2 model bytes\n")
                 .arg(artifactCount)
                 .arg(modelBytes);
+    int sdkArchives = 0;
+    qint64 sdkBytes = 0;
+    QString sdkDetails;
+    for (const QJsonValue &value :
+         plan.value(QStringLiteral("downloads")).toArray()) {
+      const QJsonObject download = value.toObject();
+      if (jsonString(download, QStringLiteral("dependency")) !=
+          QStringLiteral("ncnn-vulkan"))
+        continue;
+      ++sdkArchives;
+      const qint64 bytes = static_cast<qint64>(
+          download.value(QStringLiteral("size")).toDouble());
+      sdkBytes += bytes;
+      sdkDetails +=
+          QStringLiteral("  - %1: %2 bytes\n    Source: %3\n    SHA-256: %4\n  "
+                         "  License: %5\n")
+              .arg(jsonString(download, QStringLiteral("filename")))
+              .arg(bytes)
+              .arg(jsonString(download, QStringLiteral("url")),
+                   jsonString(download, QStringLiteral("sha256")),
+                   jsonString(
+                       download.value(QStringLiteral("license")).toObject(),
+                       QStringLiteral("id")));
+    }
+    if (sdkArchives > 0) {
+      qint64 sdkBuildReserve = 0;
+      for (const QJsonValue &value :
+           plan.value(QStringLiteral("operations")).toArray()) {
+        const QJsonObject operation = value.toObject();
+        if (jsonString(operation, QStringLiteral("kind")) ==
+            QStringLiteral("vulkan_sdk_provision"))
+          sdkBuildReserve += static_cast<qint64>(
+              operation.value(QStringLiteral("inputs"))
+                  .toObject()
+                  .value(QStringLiteral("lock"))
+                  .toObject()
+                  .value(QStringLiteral("build_reserve_bytes"))
+                  .toDouble());
+      }
+      text += QStringLiteral("\nVulkan runtime dependencies (%1 source "
+                             "archives): %2 download bytes\n")
+                  .arg(sdkArchives)
+                  .arg(sdkBytes);
+      text += sdkDetails;
+      text += QStringLiteral("  User-local SDK build reserve: %1 bytes\n")
+                  .arg(sdkBuildReserve);
+    }
     const QJsonObject disk = plan.value(QStringLiteral("disk")).toObject();
-    text += QStringLiteral("  Reviewed downloads: %1 bytes; disk required/free: %2/%3 bytes\n")
-                .arg(allDownloadBytes)
-                .arg(static_cast<qint64>(disk.value(QStringLiteral("required_bytes")).toDouble()))
-                .arg(static_cast<qint64>(disk.value(QStringLiteral("free_bytes")).toDouble()));
+    text +=
+        QStringLiteral(
+            "  Reviewed downloads: %1 bytes; disk required/free: %2/%3 bytes\n")
+            .arg(allDownloadBytes)
+            .arg(static_cast<qint64>(
+                disk.value(QStringLiteral("required_bytes")).toDouble()))
+            .arg(static_cast<qint64>(
+                disk.value(QStringLiteral("free_bytes")).toDouble()));
   }
 
   QMap<QString, QStringList> operationsByCategory;

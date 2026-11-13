@@ -19,7 +19,7 @@ BACKEND = ROOT / "installer/backend/studiocast-installer-backend"
 BACKEND_PACKAGE = ROOT / "installer/backend/studiocast_installer_backend"
 BACKEND_MODULES = (
     "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
-    "manifest.py", "packaged.py", "plan.py", "recommendation.py", "typed_video_status.py",
+    "manifest.py", "packaged.py", "plan.py", "recommendation.py", "typed_video_status.py", "vulkan_dependency.py",
 )
 FIXTURES = ROOT / "tests/data/installer_release"
 KEY_ID = "fixture-ed25519-2026"
@@ -187,7 +187,7 @@ def facts() -> dict:
                          "desired_configuration": None, "reason_codes": ["install.manifest.absent"]},
         "paths": {"free_bytes": 20_000_000_000,
                   "required_bytes": {"download": 1, "build": 1, "staging": 1}},
-        "toolchain": {"tools": {}, "missing_build_dependencies": [], "reason_codes": []},
+        "toolchain": {"tools": {}, "missing_build_dependencies": [], "missing_vulkan_sdk_dependencies": [], "reason_codes": []},
         "runtime": {"onnxruntime": {"present": False, "compatible": False,
                     "providers": {"cpu": False, "cuda": False}, "probe": "not_run"}},
         "systemd_user": {"systemctl_present": False, "manager_usable": False, "reason_codes": []},
@@ -315,7 +315,10 @@ class PackagingIntegrationTests(unittest.TestCase):
                          "PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ",
                          "installer/models/studiocast-model-transaction",
                          "installer/models/model_transactions.py", "curated-model-catalog-v1.json",
-                         "resources/model_packs/", "installer/privileged/client_contract.py"):
+                         "resources/model_packs/", "installer/privileged/client_contract.py",
+                         "installer/dependencies/ncnn-vulkan-v1.json",
+                         "scripts/build_ncnn_vulkan_dependency.py",
+                         "cmake/patches/ncnn-studiocast-replay.patch"):
             self.assertIn(required, cmake)
         for module in BACKEND_MODULES:
             self.assertIn(f"studiocast_installer_backend/{module}", cmake)

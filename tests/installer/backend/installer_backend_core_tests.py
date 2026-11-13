@@ -31,7 +31,7 @@ from studiocast_installer_backend.facts import effect_capabilities  # noqa: E402
 BACKEND_MODULES = (
     "__init__.py", "cli.py", "contracts.py", "executor.py", "facts.py",
     "manifest.py", "packaged.py", "plan.py", "recommendation.py",
-    "typed_video_status.py",
+    "typed_video_status.py", "vulkan_dependency.py",
 )
 DEFAULT_PACKS = [
     "fastenhancer_s_vd_v1", "fastenhancer_m_vd_v1", "modnet-webnn-256-fp32",
@@ -120,7 +120,7 @@ def base_facts(**installation):
         "installation": install,
         "paths": {"free_bytes": 20_000_000_000,
                   "required_bytes": {"download": 1, "build": 1, "staging": 1}},
-        "toolchain": {"tools": {}, "missing_build_dependencies": [], "reason_codes": []},
+        "toolchain": {"tools": {}, "missing_build_dependencies": [], "missing_vulkan_sdk_dependencies": [], "reason_codes": []},
         "runtime": {"onnxruntime": {"present": True, "compatible": True,
                     "providers": {"cpu": True, "cuda": True}, "probe": "usable"}},
         "systemd_user": {"systemctl_present": True, "manager_usable": True,
@@ -1761,7 +1761,9 @@ class InstallerBackendCoreTests(unittest.TestCase):
         configure = next(x for x in plan["operations"] if x["id"] == "build.configure")
         self.assertEqual(configure["inputs"]["cmake"], {
             "STUDIOCAST_ENABLE_OPEN_AUDIO": False, "STUDIOCAST_ENABLE_OPEN_CUDA": False,
-            "STUDIOCAST_ENABLE_OPEN_VULKAN": False})
+            "STUDIOCAST_ENABLE_OPEN_VULKAN": False,
+            "STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING": False,
+            "STUDIOCAST_ENABLE_DLIB": False})
         self.assertTrue(plan["plan_digest"].startswith("sha256:"))
         facts = base_facts(); facts["v4l2"].update(module_available=False, module_loaded=False,
                                                   device_present=False, persistence_state="absent")

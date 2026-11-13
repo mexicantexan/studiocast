@@ -850,6 +850,8 @@ def host_analyze(target_version: str | None) -> dict[str, Any]:
             "free_bytes": disk, "required_bytes": {"download": 0, "build": 4_000_000_000, "staging": 1_000_000_000}},
         "toolchain": {"tools": {name: command_exists(name) for name in ("cmake", "ninja", "c++", "pkg-config")},
             "build_dependencies": ["cmake", "ninja", "c++", "pkg-config"],
+            "missing_vulkan_sdk_dependencies": (["git"] if not command_exists("git") else []) +
+                ([] if Path("/usr/include/dlib/image_processing/shape_predictor.h").is_file() else ["dlib"]),
             "missing_build_dependencies": [name for name in ("cmake", "ninja", "c++", "pkg-config") if not command_exists(name)],
             "reason_codes": []},
         "runtime": {"dependencies": {}, "onnxruntime": ort,

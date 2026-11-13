@@ -170,7 +170,7 @@ verify_staged_metadata() {
     "${appdir}/usr/share/studiocast/installer/studiocast-installer-backend" \
     --help
   local backend_module
-  for backend_module in __init__.py cli.py contracts.py executor.py facts.py manifest.py packaged.py plan.py recommendation.py typed_video_status.py; do
+  for backend_module in __init__.py cli.py contracts.py executor.py facts.py manifest.py packaged.py plan.py recommendation.py typed_video_status.py vulkan_dependency.py; do
     require_file "${appdir}/usr/share/studiocast/installer/studiocast_installer_backend/${backend_module}"
   done
   require_file "${appdir}/usr/share/studiocast/installer/release/release_channel.py"
@@ -182,6 +182,16 @@ verify_staged_metadata() {
   require_executable "${model_launcher}"
   require_file "${appdir}/usr/share/studiocast/installer/models/model_transactions.py"
   require_file "${appdir}/usr/share/studiocast/installer/models/curated-model-catalog-v1.json"
+
+  require_file "${appdir}/usr/share/studiocast/installer/dependencies/ncnn-vulkan-v1.json"
+  require_file "${appdir}/usr/share/studiocast/scripts/build_ncnn_vulkan_dependency.py"
+  require_file "${appdir}/usr/share/studiocast/cmake/patches/ncnn-studiocast-replay.patch"
+  python3 - "${appdir}/usr/share/studiocast/installer" <<'PYSDK'
+import sys
+sys.path.insert(0, sys.argv[1])
+from studiocast_installer_backend.vulkan_dependency import load_dependency
+load_dependency()
+PYSDK
 
   local model_summary
   model_summary="$(capture_command "packaged curated model catalog" "${model_launcher}" list --json)"

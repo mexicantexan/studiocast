@@ -360,10 +360,29 @@ class Transport:
 
 
 class UrlTransport(Transport):
-    def __init__(self, opener: Optional[Callable[..., Any]] = None):
+    def __init__(self, opener: Optional[Callable[..., Any]] = None, maximum_bytes: Optional[int] = None):
         self._opener = opener or urllib.request.urlopen
+        if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
+            raise ValueError("maximum_bytes must be a positive integer")
+        self.maximum_bytes = maximum_bytes
+
+    def _copy(self, incoming: Any, outgoing: Any, offset: int) -> None:
+        if self.maximum_bytes is None:
+            shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+            return
+        remaining = self.maximum_bytes - offset
+        while True:
+            block = incoming.read(min(1024 * 1024, remaining + 1))
+            if len(block) > remaining:
+                raise ReleaseChannelError("release.download.size_exceeded", "download exceeds pinned size")
+            if not block:
+                break
+            outgoing.write(block)
+            remaining -= len(block)
 
     def append(self, url: str, destination: Path, offset: int) -> None:
+        if self.maximum_bytes is not None and (type(offset) is not int or not 0 <= offset <= self.maximum_bytes):
+            raise ReleaseChannelError("release.download.size_exceeded", "partial exceeds pinned size")
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme == "file":
             source = Path(urllib.request.url2pathname(parsed.path))
@@ -371,7 +390,7 @@ class UrlTransport(Transport):
                 raise ReleaseChannelError("release.download.source_unavailable", f"local source unavailable: {source}")
             with source.open("rb") as incoming, destination.open("ab") as outgoing:
                 incoming.seek(offset)
-                shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+                self._copy(incoming, outgoing, offset)
             return
         if parsed.scheme != "https":
             raise ReleaseChannelError("release.download.scheme", "only HTTPS and local file transports are supported")
@@ -394,7 +413,7 @@ class UrlTransport(Transport):
                         "server returned an invalid range for the partial artifact",
                     )
                 with destination.open("ab") as outgoing:
-                    shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+                    self._copy(incoming, outgoing, offset)
         except ReleaseChannelError:
             raise
         except (OSError, urllib.error.URLError) as exc:

@@ -74,6 +74,7 @@ install(FILES
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/plan.py
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/recommendation.py
         ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/typed_video_status.py
+        ${PROJECT_SOURCE_DIR}/installer/backend/studiocast_installer_backend/vulkan_dependency.py
         DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/studiocast_installer_backend"
         COMPONENT Installer
 )
@@ -127,3 +128,15 @@ install(FILES
         PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
         COMPONENT Installer
 )
+
+# The SDK builder/patch/lock are authenticated by the same signed component as
+# the backend. Preserve their repository-relative layout for isolated builds.
+install(FILES ${PROJECT_SOURCE_DIR}/installer/dependencies/ncnn-vulkan-v1.json
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/installer/dependencies"
+        COMPONENT Installer)
+install(FILES ${PROJECT_SOURCE_DIR}/scripts/build_ncnn_vulkan_dependency.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/scripts"
+        COMPONENT Installer)
+install(FILES ${PROJECT_SOURCE_DIR}/cmake/patches/ncnn-studiocast-replay.patch
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/studiocast/cmake/patches"
+        COMPONENT Installer)
