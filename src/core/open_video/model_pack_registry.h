@@ -108,6 +108,43 @@ struct NcnnVulkanMattingSpec {
   std::string precision; // fp32 or fp16
 };
 
+// Native ncnn tensor geometry, with batch one implicit. dims=1 is a vector
+// (w), dims=2 a row-major matrix (h,w), dims=3 planar (c,h,w). External
+// bindings are always unpacked FP32. Only video_denoise permits dynamic_hw;
+// zero w/h are specialized to padded camera geometry once during setup.
+struct NcnnVulkanTensorSpec {
+  std::string blob;
+  std::uint32_t dims = 0;
+  int w = 0;
+  int h = 1;
+  int c = 1;
+  bool dynamic_hw = false;
+};
+
+inline constexpr std::size_t kMaxNcnnVulkanInputs = 3;
+inline constexpr std::size_t kMaxNcnnVulkanOutputs = 12;
+
+// Optional schema-v2 ncnn_vulkan_networks[] section. Kept separate from the
+// published matting section so existing ONNX and MODNet metadata is unchanged.
+struct NcnnVulkanNetworkSpec {
+  std::string role; // main, left, right
+  std::string profile; // fastdvdnet_rgb_v1, yunet_640_v1, flx_prefix_v1
+  std::string param_file;
+  std::string bin_file;
+  std::filesystem::path param_path;
+  std::filesystem::path bin_path;
+  std::string param_sha256;
+  std::string bin_sha256;
+  std::string source_onnx_sha256;
+  std::string converter_name;
+  std::string converter_version;
+  std::string precision;
+  std::array<NcnnVulkanTensorSpec, kMaxNcnnVulkanInputs> inputs{};
+  std::array<NcnnVulkanTensorSpec, kMaxNcnnVulkanOutputs> outputs{};
+  std::size_t input_count = 0;
+  std::size_t output_count = 0;
+};
+
 struct ModelPack {
   // Schema version (1 for legacy packs using onnx_filename; 2 for v2 packs).
   int schema_version = 1;
@@ -130,6 +167,8 @@ struct ModelPack {
   // Present only when a schema-v2 matting manifest declares a complete
   // production ncnn Vulkan artifact contract.
   std::optional<NcnnVulkanMattingSpec> ncnn_vulkan;
+
+  std::vector<NcnnVulkanNetworkSpec> ncnn_vulkan_networks;
 
   // Derived from install layout.
   std::filesystem::path root_dir;
@@ -246,6 +285,12 @@ struct ModelPackVerification {
 // not match.
 bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
                                              std::string *error);
+
+// Setup-only strict role/artifact/tensor/provenance validation. The returned
+// network is already parsed; expensive checks never belong in Execute.
+bool ValidateProductionNcnnVulkanNetworkPack(
+    const ModelPack &pack, const NcnnVulkanNetworkSpec &network,
+    std::string *error);
 
 // Registry for model packs under:
 //   <models_root>/open_video/<subject>/<pack_dir>/
