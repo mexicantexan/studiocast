@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 
+#include "core/vulkan/resident_command_batch.h"
 #include "core/vulkan/vulkan_device.h"
 #include "core/vulkan/vulkan_image.h"
 #include "core/vulkan/vulkan_tensor.h"
@@ -79,6 +80,19 @@ public:
   // subsequent frames.
   void InvalidateDescriptorBindingCacheForSetup() noexcept;
 
+  // Setup allocates distinct bindings/parameters/commands for every deferred
+  // dispatch. No slot is rewritten while its collector ticket is pending.
+  bool PrepareDeferredSlotsForSetup(std::size_t slots, std::string *error_out);
+  bool BeginDeferredFrame(ResidentCommandBatch &batch, std::string *error_out);
+  // A still-recording or unsafe batch remains attached and denies reuse.
+  void EndDeferredFrame() noexcept;
+  // Discards only the current never-appended operation. Its slot remains
+  // consumed; queued bindings and callbacks are never changed.
+  void DiscardUnsubmittedOperation() noexcept;
+  bool deferred_frame_active() const noexcept {
+    return deferred_batch_ != nullptr;
+  }
+
   bool CropResizeBilinear(const VulkanImage &src, const VulkanImage &dst,
                           float crop_x, float crop_y, float crop_w,
                           float crop_h, std::string *error_out);
@@ -109,8 +123,7 @@ public:
   // exact-shape non-mapped DEVICE_LOCAL image, and completes the transfer
   // before return.
   // Neither allocation nor filesystem/image decoding belongs here.
-  bool UploadRgb24ToDeviceLocal(const std::uint8_t *src,
-                                std::size_t src_stride,
+  bool UploadRgb24ToDeviceLocal(const std::uint8_t *src, std::size_t src_stride,
                                 const VulkanImage &upload_staging,
                                 const VulkanImage &device_dst,
                                 std::string *error_out);
@@ -119,8 +132,7 @@ public:
   // effects and parity fixtures. The source bytes are already in the matching
   // staging/destination memory channel order; no channel reinterpretation is
   // performed.
-  bool UploadU8x3ToDeviceLocal(const std::uint8_t *src,
-                               std::size_t src_stride,
+  bool UploadU8x3ToDeviceLocal(const std::uint8_t *src, std::size_t src_stride,
                                const VulkanImage &upload_staging,
                                const VulkanImage &device_dst,
                                std::string *error_out);
@@ -139,9 +151,9 @@ public:
   // invalidates it, and unpacks the three stored channels into caller-owned
   // CPU memory. This is a final transport operation, not an intermediate
   // effect readback.
-  bool ReadbackU8x3(const VulkanImage &src,
-                    const VulkanImage &readback_staging, std::uint8_t *dst,
-                    std::size_t dst_stride, std::string *error_out);
+  bool ReadbackU8x3(const VulkanImage &src, const VulkanImage &readback_staging,
+                    std::uint8_t *dst, std::size_t dst_stride,
+                    std::string *error_out);
 
   // Explicit degraded CPU-tail seam. Copies a device-local, non-mapped alpha
   // image into one caller-owned reusable host-visible staging image, waits for
@@ -193,6 +205,7 @@ public:
                               std::string *error_out);
 
 private:
+  friend struct UtilityKernelsTestAccess;
   enum class Op : std::uint32_t {
     crop_resize_u8x3 = 1,
     preprocess_to_nchw = 2,
@@ -227,6 +240,25 @@ private:
                        std::uint32_t dispatch_w, std::uint32_t dispatch_h,
                        std::string *error_out);
   bool SubmitRecorded(std::string *error_out);
+  bool AcquireDeferredSlot(std::string *error_out);
+  VkCommandBuffer RecordingCommand() const noexcept;
+  static void DeferredCompletion(void *, const ResidentCommandTicket &,
+                                 ResidentCommandCompletion) noexcept;
+
+  struct DeferredSlot {
+    VulkanBuffer params;
+    VkCommandBuffer command = nullptr;
+    VkDescriptorSet descriptors = nullptr;
+    std::array<VkBuffer, 7> bound{};
+    ResidentCommandTicket ticket{};
+    bool pending = false;
+  };
+  std::array<DeferredSlot, 64> deferred_slots_{};
+  std::size_t deferred_capacity_ = 0;
+  std::size_t deferred_cursor_ = 0;
+  VkDescriptorPool deferred_descriptor_pool_ = nullptr;
+  ResidentCommandBatch *deferred_batch_ = nullptr;
+  DeferredSlot *active_deferred_slot_ = nullptr;
 
   VulkanDevice device_;
   VulkanBuffer params_;

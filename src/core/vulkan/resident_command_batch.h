@@ -74,8 +74,8 @@ public:
   bool Initialize(VulkanDevice *device, std::size_t capacity,
                   std::string *error);
   bool BeginFrame(std::uint64_t capture_sequence, std::string *error);
-  bool Append(const ResidentCommandGroup &group,
-              ResidentCommandTicket *ticket, std::string *error);
+  bool Append(const ResidentCommandGroup &group, ResidentCommandTicket *ticket,
+              std::string *error);
   ResidentCommandMark Mark() const noexcept;
   bool Rollback(const ResidentCommandMark &mark, std::string *error);
   bool Complete(std::string *error);

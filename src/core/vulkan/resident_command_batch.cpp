@@ -56,7 +56,8 @@ struct ResidentCommandBatch::Impl {
   }
 };
 
-ResidentCommandBatch::ResidentCommandBatch() : impl_(std::make_unique<Impl>()) {}
+ResidentCommandBatch::ResidentCommandBatch()
+    : impl_(std::make_unique<Impl>()) {}
 ResidentCommandBatch::~ResidentCommandBatch() {
   AbortUnsubmitted();
   if (impl_->state == ResidentCommandBatchState::unsafe_pending) {
@@ -67,8 +68,8 @@ ResidentCommandBatch::~ResidentCommandBatch() {
 }
 
 bool ResidentCommandBatch::Initialize(VulkanDevice *device,
-                                     std::size_t capacity,
-                                     std::string *error) {
+                                      std::size_t capacity,
+                                      std::string *error) {
   if (error)
     error->clear();
   auto &s = *impl_;
@@ -91,7 +92,7 @@ bool ResidentCommandBatch::Initialize(VulkanDevice *device,
 }
 
 bool ResidentCommandBatch::BeginFrame(std::uint64_t sequence,
-                                     std::string *error) {
+                                      std::string *error) {
   if (error)
     error->clear();
   auto &s = *impl_;
@@ -111,8 +112,8 @@ bool ResidentCommandBatch::BeginFrame(std::uint64_t sequence,
 }
 
 bool ResidentCommandBatch::Append(const ResidentCommandGroup &group,
-                                 ResidentCommandTicket *ticket,
-                                 std::string *error) {
+                                  ResidentCommandTicket *ticket,
+                                  std::string *error) {
   if (ticket)
     *ticket = {};
   if (error)
@@ -125,7 +126,8 @@ bool ResidentCommandBatch::Append(const ResidentCommandGroup &group,
       group.count > s.capacity - s.count ||
       s.participant_count == s.participants.size() ||
       s.next_ticket_index == UINT32_MAX)
-    return Fail(error, "Resident command group is stale, foreign or over budget.");
+    return Fail(error,
+                "Resident command group is stale, foreign or over budget.");
   for (std::uint32_t i = 0; i < group.count; ++i) {
     if (!group.commands[i])
       return Fail(error, "Resident command group contains a null command.");
@@ -158,7 +160,7 @@ ResidentCommandMark ResidentCommandBatch::Mark() const noexcept {
 }
 
 bool ResidentCommandBatch::Rollback(const ResidentCommandMark &mark,
-                                   std::string *error) {
+                                    std::string *error) {
   if (error)
     error->clear();
   auto &s = *impl_;
@@ -186,15 +188,16 @@ bool ResidentCommandBatch::Complete(std::string *error) {
   auto &s = *impl_;
   if (s.state != ResidentCommandBatchState::recording || !s.Owned() ||
       !s.ExactContext() || !s.count)
-    return Fail(error, "Resident command collector cannot complete this frame.");
-  const bool completed = s.device->SubmitAndWait(s.commands.data(), s.count,
-                                                 error);
+    return Fail(error,
+                "Resident command collector cannot complete this frame.");
+  const bool completed =
+      s.device->SubmitAndWait(s.commands.data(), s.count, error);
   s.state = completed ? ResidentCommandBatchState::completed
                       : ResidentCommandBatchState::unsafe_pending;
   if (completed)
     ++s.completions;
   s.Notify(0, completed ? ResidentCommandCompletion::completed
-                       : ResidentCommandCompletion::unsafe_pending);
+                        : ResidentCommandCompletion::unsafe_pending);
   if (completed)
     s.Clear();
   return completed;
@@ -218,7 +221,8 @@ bool ResidentCommandBatch::RetireAfterQuiescence(std::string *error) {
     return Fail(error, "Failed resident frame has no exact quiescence proof.");
   const auto health = s.device->health_state();
   if (health.completed_serial < health.submitted_serial)
-    return Fail(error, "Failed resident frame still has incomplete submissions.");
+    return Fail(error,
+                "Failed resident frame still has incomplete submissions.");
   s.Notify(0, ResidentCommandCompletion::retired_after_quiescence);
   s.Clear();
   s.state = ResidentCommandBatchState::idle;
