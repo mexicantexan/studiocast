@@ -35,6 +35,7 @@ struct DlibPredictorData {
   // forms Q*pinv(P), retaining the native predictor's half-pixel decisions.
   std::array<double, 9> rectangle_basis_pseudoinverse{};
   std::uint32_t maximum_features = 0;
+  std::uint32_t maximum_trees = 0;
   std::size_t resident_bytes = 0;
 };
 

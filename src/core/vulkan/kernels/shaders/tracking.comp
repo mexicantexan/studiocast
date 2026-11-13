@@ -1,0 +1,256 @@
+#version 450
+layout(local_size_x=64) in;
+layout(std430,binding=0) buffer B0 { uint b0[]; };
+layout(std430,binding=1) buffer B1 { uint b1[]; };
+layout(std430,binding=2) buffer B2 { uint b2[]; };
+layout(std430,binding=3) buffer B3 { uint b3[]; };
+layout(std430,binding=4) buffer B4 { uint b4[]; };
+layout(std430,binding=5) buffer State { uint st[]; };
+layout(std430,binding=6) buffer B6 { uint b6[]; };
+layout(std430,binding=7) readonly buffer Frame { uint frame[]; };
+layout(push_constant) uniform Push { uint p[32]; };
+shared uint suppressed_words[157];
+shared uint accept_candidate, stop_candidates;
+uint tid() { return gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*gl_NumWorkGroups.x*64; }
+float sf(uint i) { return uintBitsToFloat(st[i]); }
+void fs(uint i,float v) { st[i]=floatBitsToUint(v); }
+float cf(uint i,uint c) { return uintBitsToFloat(b4[i*8+c]); }
+bool finite1(float x) { return !isnan(x)&&!isinf(x); }
+uint byte1(float x) { return uint(clamp(floor(clamp(x,0.,255.)+.5),0.,255.)); }
+float channel(uint v,uint c) { return float((v>>(8*c))&255u); }
+// Geometry operands are bounded normal finite floats and positive divisors.
+// Recover the quotient's rounding residual with explicit fused operations;
+// a plain SPIR-V FDiv may use a reciprocal approximation and move a crop
+// across the reference byte sampler's half-pixel rounding boundary.
+float geometry_div(float a,float b) {
+  precise float quotient=a/b;
+  precise float residual=fma(-quotient,b,a);
+  precise float result=fma(residual,1./b,quotient);
+  return result;
+}
+float sample_rgb(float x,float y,uint c) {
+  uint x0=uint(clamp(int(x),0,int(p[1])-1)),y0=uint(clamp(int(y),0,int(p[2])-1));
+  uint x1=min(p[1]-1,x0+1),y1=min(p[2]-1,y0+1);
+  float fx=x-float(x0),fy=y-float(y0);
+  precise float a=channel(b0[y0*p[3]+x0],c)+fx*(channel(b0[y0*p[3]+x1],c)-channel(b0[y0*p[3]+x0],c));
+  precise float b=channel(b0[y1*p[3]+x0],c)+fx*(channel(b0[y1*p[3]+x1],c)-channel(b0[y1*p[3]+x0],c));
+  precise float result=a+fy*(b-a);
+  return result;
+}
+bool less_seq(uvec2 a,uvec2 b) { return a.y<b.y||(a.y==b.y&&a.x<b.x); }
+uvec2 add_seq(uvec2 a,uint n) { uint lo=a.x+n;return uvec2(lo,a.y+uint(lo<a.x)); }
+void begin_frame() {
+  uvec2 next=uvec2(frame[0],frame[1]),prev=uvec2(st[0],st[1]);
+  if(st[2]!=0&&all(equal(next,prev)))return;
+  if(st[2]!=0&&any(notEqual(next,add_seq(prev,1)))) {
+    st[46]=0;st[47]=0;st[48]=0;st[49]=0;st[45]=0;
+  }
+  st[0]=next.x;st[1]=next.y;st[2]=1;
+  st[3]=0;st[4]=0;st[5]=0;st[6]=0;st[7]=1;st[8]=0;
+  fs(50,.5);fs(51,.5);
+}
+bool better(uint a,uint b) {
+  float sa=cf(a,4),sb=cf(b,4);
+  return sa>sb||(sa==sb&&b4[a*8+5]<b4[b*8+5]);
+}
+float iou(uint a,uint b) {
+  vec4 x=vec4(cf(a,0),cf(a,1),cf(a,2),cf(a,3));
+  vec4 y=vec4(cf(b,0),cf(b,1),cf(b,2),cf(b,3));
+  vec2 lo=max(x.xy,y.xy),hi=min(x.xy+x.zw,y.xy+y.zw);
+  vec2 wh=max(vec2(0),hi-lo);
+  precise float inter=wh.x*wh.y;
+  precise float uni=x.z*x.w+y.z*y.w-inter;
+  return uni>0.?inter/uni:0.;
+}
+vec4 clamp_rect(vec4 r) {
+  r.zw=clamp(r.zw,vec2(1),vec2(p[1],p[2]));
+  r.xy=clamp(r.xy,vec2(0),vec2(p[1],p[2])-r.zw);
+  return r;
+}
+void main() {
+ uint i=tid(),op=p[0];
+ if(op==0) { if(i==0)begin_frame();return; }
+ if(op==11) { if(i<5512)st[i]=0;return; }
+ if(op==1) {
+   if(i>=3*640*640)return;
+   uint c=i/(640*640),q=i%(640*640),x=q%640,y=q/640;
+   float scale=min(geometry_div(640.,float(p[1])),geometry_div(640.,float(p[2])));
+   uint sw=max(1u,uint(floor(float(p[1])*scale+.5))),sh=max(1u,uint(floor(float(p[2])*scale+.5)));
+   uint px=(640-sw)/2,py=(640-sh)/2;
+   float v=0.;
+   if(x>=px&&x<px+sw&&y>=py&&y<py+sh) {
+     precise float sx=(float(x-px)+.5)*geometry_div(float(p[1]),float(sw))-.5;
+     precise float sy=(float(y-py)+.5)*geometry_div(float(p[2]),float(sh))-.5;
+     precise float normalized=sample_rgb(sx,sy,2-c)*uintBitsToFloat(p[25]);
+     v=normalized*uintBitsToFloat(p[26]);
+   }
+   b1[i]=floatBitsToUint(v);return;
+ }
+ if(op==2) {
+   if(i>=16384)return;
+   for(uint c=0;c<8;c++)b4[i*8+c]=0;
+   b4[i*8+4]=floatBitsToUint(-1./0.);b4[i*8+5]=i;
+   return;
+ }
+ if(op==3) {
+   uint stride=p[5],cols=640/stride,n=cols*cols;
+   if(i>=n)return;
+   float cls=uintBitsToFloat(b1[i]),obj=uintBitsToFloat(b2[i]);
+   if(!finite1(cls)||!finite1(obj)){atomicAnd(st[7],0);return;}
+   precise float score=sqrt(clamp(cls,0.,1.)*clamp(obj,0.,1.));
+   if(score<.9)return;
+   vec4 box=vec4(uintBitsToFloat(b3[i*4]),uintBitsToFloat(b3[i*4+1]),uintBitsToFloat(b3[i*4+2]),uintBitsToFloat(b3[i*4+3]));
+   if(any(isnan(box))||any(isinf(box))){atomicAnd(st[7],0);return;}
+   precise vec2 center=(vec2(i%cols,i/cols)+box.xy)*float(stride);
+   vec2 size=exp(box.zw)*float(stride);
+   float scale=min(geometry_div(640.,float(p[1])),geometry_div(640.,float(p[2])));
+   uint sw=max(1u,uint(floor(float(p[1])*scale+.5))),sh=max(1u,uint(floor(float(p[2])*scale+.5)));
+   vec2 pos=(center-size*.5-vec2((640-sw)/2,(640-sh)/2))/scale;
+   size/=scale;
+   if(any(isnan(size))||any(isinf(size))){atomicAnd(st[7],0);return;}
+   pos=clamp(pos,vec2(0),vec2(p[1],p[2]));
+   size=clamp(size,vec2(0),vec2(p[1],p[2])-pos);
+   uint d=(p[6]+i)*8;
+   b4[d]=floatBitsToUint(pos.x);b4[d+1]=floatBitsToUint(pos.y);
+   b4[d+2]=floatBitsToUint(size.x);b4[d+3]=floatBitsToUint(size.y);
+   b4[d+4]=floatBitsToUint(score);b4[d+5]=p[6]+i;b4[d+6]=1;
+   return;
+ }
+ if(op==4) {
+   if(i>=16384)return;
+   uint other=i^p[12];if(other<=i)return;
+   bool descending=(i&p[11])==0;
+   if(descending?better(other,i):better(i,other))
+     for(uint c=0;c<8;c++){uint v=b4[i*8+c];b4[i*8+c]=b4[other*8+c];b4[other*8+c]=v;}
+   return;
+ }
+ if(op==5) {
+   if(i>=5000*157)return;
+   uint row=i/157,word=i%157,bits=0;
+   if(b4[row*8+6]!=0)
+     for(uint bit=0;bit<32;bit++) {
+       uint j=word*32+bit;
+       if(j>row&&j<5000&&b4[j*8+6]!=0&&iou(row,j)>.3)bits|=1u<<bit;
+     }
+   b6[i]=bits;return;
+ }
+ if(op==6) {
+   uint lane=gl_LocalInvocationID.x;
+   for(uint w=lane;w<157;w+=64)suppressed_words[w]=0;
+   if(lane==0){st[4]=0;st[5]=0;st[6]=0;}
+   barrier();
+   if(st[7]==0){if(lane==0)st[3]=1;return;}
+   float eye_score=-1.,eye_area=0.,auto_area=-1.;
+   for(uint n=0;n<5000;n++) {
+     if(lane==0){stop_candidates=uint(b4[n*8+6]==0);accept_candidate=uint((suppressed_words[n/32]&(1u<<(n%32)))==0);}
+     barrier();
+     if(stop_candidates!=0)break;
+     if(accept_candidate!=0) {
+       if(lane==0) {
+         st[512+st[4]++]=n;
+         float score=cf(n,4),area=cf(n,2)*cf(n,3);
+         if(st[5]==0||score>eye_score+.00001||(abs(score-eye_score)<.00001&&area>eye_area)) {
+           st[5]=1;eye_score=score;eye_area=area;
+           for(uint c=0;c<5;c++)st[16+c]=b4[n*8+c];
+         }
+         if(st[6]==0||area>auto_area) {
+           st[6]=1;auto_area=area;
+           fs(24,cf(n,0)-cf(n,2)*.4);fs(25,cf(n,1)-cf(n,3)*.4);
+           fs(26,cf(n,2)*1.8);fs(27,cf(n,3)*2.6);fs(28,score);
+         }
+       }
+       for(uint w=lane;w<157;w+=64)suppressed_words[w]|=b6[n*157+w];
+     }
+     barrier();
+   }
+   for(uint w=lane;w<157;w+=64)st[128+w]=suppressed_words[w];
+   if(lane==0)st[3]=1;return;
+ }
+ if(op==7) {
+   if(frame[2]==0)return;
+   uint count=p[20]*p[21],partial=(count+255)/256;
+   if(i>=partial)return;
+   uint x0=p[20],y0=p[21],x1=0,y1=0,n=0;
+   for(uint j=i*256;j<min(count,(i+1)*256);j++) {
+     uint x=j%p[20],y=j/p[20];
+     float alpha=uintBitsToFloat(b0[y*p[22]+x]);
+     if(alpha>.35){x0=min(x0,x);y0=min(y0,y);x1=max(x1,x);y1=max(y1,y);n++;}
+   }
+   b6[i*5]=x0;b6[i*5+1]=y0;b6[i*5+2]=x1;b6[i*5+3]=y1;b6[i*5+4]=n;return;
+ }
+ if(op==8) {
+   if(i!=0)return;
+   // Detector failure preserves input; an actual no-face result may use matte.
+   if(st[7]==0){st[52]=0;return;}
+   vec4 box=vec4(sf(24),sf(25),sf(26),sf(27));uint source=st[6]!=0?1u:0u;
+   bool found=source!=0;
+   if(!found&&p[23]!=0&&frame[2]==0){st[52]=0;return;}
+   uvec2 seq=uvec2(frame[0],frame[1]),last=uvec2(st[48],st[49]);
+   bool due=p[24]!=0||all(equal(last,uvec2(0)))||!less_seq(seq,add_seq(last,10));
+   if(!found&&p[23]!=0) {
+     if(due) {
+       uint count=p[20]*p[21],x0=p[20],y0=p[21],x1=0,y1=0,n=0;
+       for(uint j=0;j<(count+255)/256;j++) {
+         x0=min(x0,b6[j*5]);y0=min(y0,b6[j*5+1]);
+         x1=max(x1,b6[j*5+2]);y1=max(y1,b6[j*5+3]);n+=b6[j*5+4];
+       }
+       st[47]=uint(n>=max(32u,count/500)&&x1>=x0);
+       st[48]=seq.x;st[49]=seq.y;
+       if(st[47]!=0) {
+         fs(32,float(x0)*float(p[1])/float(p[20]));fs(33,float(y0)*float(p[2])/float(p[21]));
+         fs(34,float(x1+1-x0)*float(p[1])/float(p[20]));fs(35,float(y1+1-y0)*float(p[2])/float(p[21]));
+       }
+     }
+     found=st[47]!=0;source=found?2u:0u;
+     box=vec4(sf(32),sf(33),sf(34),sf(35));
+   }
+   found=found&&all(not(isnan(box)))&&all(not(isinf(box)))&&box.z>.5&&box.w>.5&&box.x<float(p[1])&&box.y<float(p[2])&&box.x+box.z>0.&&box.y+box.w>0.;
+   if(!found)source=0;
+   if(source!=st[45])st[46]=0;
+   st[45]=source;
+   float strength=geometry_div(float(min(p[13],100u)),100.),aspect=geometry_div(float(p[1]),float(p[2]));
+   vec4 target;
+   if(found) {
+     precise float pad=2.4-strength*1.2,cx=box.x+box.z*.5;
+     precise float cy=box.y+box.w*.5-clamp(uintBitsToFloat(p[15]),0.,1.)*box.w;
+     precise float ch=box.w*pad,cw=ch*aspect,minw=box.z*pad;
+     if(cw<minw){cw=minw;ch=geometry_div(cw,aspect);}
+     cw=clamp(cw,float(p[1])*.35,float(p[1]));ch=clamp(ch,float(p[2])*.35,float(p[2]));
+     target=clamp_rect(vec4(cx-cw*.5,cy-ch*.5,cw,ch));
+   } else {
+     precise float zoom=1.+strength*.5,cw=float(p[1]),ch=geometry_div(cw,aspect);
+     if(ch>float(p[2])){ch=float(p[2]);cw=ch*aspect;}
+     cw=min(float(p[1]),geometry_div(cw,zoom));ch=min(float(p[2]),geometry_div(ch,zoom));
+     target=clamp_rect(vec4((float(p[1])-cw)*.5,(float(p[2])-ch)*.5,cw,ch));
+   }
+   vec4 previous_crop=vec4(sf(40),sf(41),sf(42),sf(43));
+   precise float a=geometry_div(1.,1.+9.*geometry_div(float(min(p[14],100u)),100.));
+   if(st[46]!=0){precise vec4 blended=previous_crop+(target-previous_crop)*a;target=blended;}
+   target=clamp_rect(target);st[46]=1;
+   for(uint c=0;c<4;c++)fs(40+c,target[c]);
+   if(found){precise float tx=geometry_div((box.x+box.z*.5-target.x)*float(p[1]),target.z);precise float ty=geometry_div((box.y+box.w*.5-target.y)*float(p[2]),target.w);fs(50,geometry_div(tx,float(p[1])));fs(51,geometry_div(ty,float(p[2])));}
+   st[52]=1;return;
+ }
+ if(op==9||op==10) {
+   if(i>=p[1]*p[2])return;
+   uint x=i%p[1],y=i/p[1];uint packed=0xff000000u;
+   if(op==9) {
+     vec4 crop=vec4(sf(40),sf(41),sf(42),sf(43));
+     if(st[52]==0){b1[y*p[4]+x]=b0[y*p[3]+x];return;}
+     if(abs(crop.x)<=.5&&abs(crop.y)<=.5&&abs(crop.z-float(p[1]))<=.5&&abs(crop.w-float(p[2]))<=.5){b1[y*p[4]+x]=b0[y*p[3]+x];return;}
+     precise float sx=crop.x+(float(x)+.5)*geometry_div(crop.z,float(p[1]))-.5;
+     precise float sy=crop.y+(float(y)+.5)*geometry_div(crop.w,float(p[2]))-.5;
+     for(uint c=0;c<3;c++)packed|=byte1(sample_rgb(sx,sy,c))<<(8*c);
+   } else {
+     float cx=float(p[1])*.5,cy=float(p[2])*.5;
+     if(p[17]!=0){cx=float(p[1])*sf(50);cy=float(p[2])*sf(51);}
+     vec2 norm=(vec2(x,y)+vec2(.5)-vec2(cx,cy))*vec2(geometry_div(2.,float(p[1])),geometry_div(2.,float(p[2])));
+     float radial=clamp(sqrt(dot(norm,norm))*.7071067811865476,0.,1.);
+     precise float radial_squared=radial*radial;
+     precise float factor=max(0.,1.-uintBitsToFloat(p[16])*radial_squared);
+     uint src=b0[y*p[3]+x];
+     for(uint c=0;c<3;c++)packed|=uint(clamp(roundEven(channel(src,c)*factor),0.,255.))<<(8*c);
+   }
+   b1[y*p[4]+x]=packed;return;
+ }
+}
