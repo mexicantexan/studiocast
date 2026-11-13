@@ -253,7 +253,7 @@ bool PreparedVulkanFastDvdnet::Prepare(
   if (s.setup.device || !setup.device || !setup.device->Initialized() ||
       !setup.owner_generation || setup.width <= 0 || setup.height <= 0 ||
       setup.width > 4096 || setup.height > 4096 || !pw || !ph ||
-      setup.strength <= 0 || setup.strength > 100 || !setup.quota ||
+      setup.strength < 0 || setup.strength > 100 || !setup.quota ||
       setup.quota->device != setup.device ||
       setup.quota->context != setup.device->context_identity() ||
       !hal::ValidateExecutionDomain(setup.domain) ||
@@ -340,8 +340,10 @@ bool PreparedVulkanFastDvdnet::Prepare(
   const auto allocations_after = setup.device->allocation_stats();
   s.used.persistent_bytes =
       allocations_after.current_bytes - allocations_before.current_bytes;
-  s.used.resource_count =
-      allocations_after.allocation_count - allocations_before.allocation_count;
+  const auto resources = allocations_after.allocation_count - allocations_before.allocation_count;
+  if (resources > UINT32_MAX)
+    return Fail(error, "FastDVDnet resource count exceeds fixed contract.");
+  s.used.resource_count = static_cast<std::uint32_t>(resources);
   s.used.in_flight_slots = 1;
   if (s.used.persistent_bytes > setup.reservation.persistent_bytes)
     return Fail(error,

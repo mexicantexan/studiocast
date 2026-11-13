@@ -21,11 +21,21 @@ struct VulkanVideoExecutionFactoryConfiguration {
   // Maximum native wait per submission, fixed before device acquisition.
   std::uint64_t execution_fence_timeout_ns = UINT64_C(100000000);
   std::shared_ptr<const open_video::ModelPack> matting_pack;
+  std::shared_ptr<const open_video::ModelPack> denoise_pack;
+  std::shared_ptr<const open_video::ModelPack> face_pack;
+  std::shared_ptr<const open_video::ModelPack> landmarks_pack;
+  std::shared_ptr<const open_video::ModelPack> eye_pack;
   std::shared_ptr<const video::effects::BroadcastCameraEffects> effects;
   hal::ModelArtifactIdentity matting_identity{};
+  hal::ModelArtifactIdentity denoise_identity{};
+  hal::ModelArtifactIdentity face_identity{};
+  hal::ModelArtifactIdentity landmarks_identity{};
+  hal::ModelArtifactIdentity eye_identity{};
   hal::ResourceBudget reservation{};
   int input_width = 0;
   int input_height = 0;
+  int output_width = 0;
+  int output_height = 0;
   // Hermetic injected-constructor seam; production ignores these callbacks.
   hal::StatusId (*injected_shutdown_probe)(void *) noexcept = nullptr;
   void *injected_shutdown_context = nullptr;

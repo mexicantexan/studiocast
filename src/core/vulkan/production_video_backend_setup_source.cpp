@@ -104,6 +104,7 @@ public:
                      hal::ReasonId::strict_backend_unavailable);
     }
     bool needs_matting = false;
+    bool needs_denoise = false, needs_eye = false, needs_face = false;
     for (std::size_t index = 0; index < caller.intent.stage_count; ++index) {
       const auto semantic = caller.intent.stages[index].intent.semantic;
       const bool consumer =
@@ -112,8 +113,16 @@ public:
           semantic == hal::SemanticEffectId::virtual_background_replace ||
           semantic == hal::SemanticEffectId::virtual_key_light;
       needs_matting = needs_matting || consumer;
+      needs_denoise |= semantic == hal::SemanticEffectId::video_noise_removal;
+      needs_eye |= semantic == hal::SemanticEffectId::eye_contact;
+      needs_face |= semantic == hal::SemanticEffectId::auto_frame ||
+                    semantic == hal::SemanticEffectId::eye_contact;
+      needs_matting |= semantic == hal::SemanticEffectId::auto_frame;
       if (semantic != hal::SemanticEffectId::mirror &&
-          semantic != hal::SemanticEffectId::vignette && !consumer) {
+          semantic != hal::SemanticEffectId::vignette &&
+          semantic != hal::SemanticEffectId::video_noise_removal &&
+          semantic != hal::SemanticEffectId::eye_contact &&
+          semantic != hal::SemanticEffectId::auto_frame && !consumer) {
         return Failure(hal::StatusId::blocked,
                        hal::ReasonId::semantic_effect_unsupported);
       }
@@ -133,9 +142,14 @@ public:
           request.wait.timeout_nanoseconds;
       configuration.input_width = static_cast<int>(caller.host_input.width);
       configuration.input_height = static_cast<int>(caller.host_input.height);
+      configuration.output_width = static_cast<int>(caller.host_output.width);
+      configuration.output_height = static_cast<int>(caller.host_output.height);
       configuration.effects =
           std::make_shared<const video::effects::BroadcastCameraEffects>(
               request.effects);
+      std::optional<open_video::ModelPackRegistry> selected_registry;
+      if (needs_matting || needs_denoise || needs_face)
+        selected_registry = open_video::ModelPackRegistry::ScanDefault();
       if (needs_matting) {
         // Native graph resources are reserved before context/session
         // acquisition.
@@ -157,7 +171,7 @@ public:
             caller.budget.in_flight_slots != 1)
           return Failure(hal::StatusId::resource_exhausted,
                          hal::ReasonId::resource_exhausted);
-        const auto registry = open_video::ModelPackRegistry::ScanDefault();
+        const auto &registry = *selected_registry;
         const auto &id = request.effects.virtual_background.model_id;
         std::optional<open_video::ModelPack> selected;
         if (!id.empty())
@@ -225,6 +239,77 @@ public:
             video::kMaxPerFrameSynchronizationsV1;
         configuration.minimum_synchronizations_per_frame = 2;
       }
+      if (needs_denoise || needs_face) {
+        const auto &registry = *selected_registry;
+        const auto resolve =
+            [&](const char *task, const std::string &requested,
+                const char *preferred,
+                std::shared_ptr<const open_video::ModelPack> *pack,
+                hal::ModelArtifactIdentity *identity, bool predictor = false) {
+              auto selected = registry.Find(
+                  task, requested.empty() ? preferred : requested);
+              if (!selected)
+                return false;
+              std::string error;
+              if (!predictor) {
+                if (selected->ncnn_vulkan_networks.empty())
+                  return false;
+                for (const auto &network : selected->ncnn_vulkan_networks)
+                  if (!open_video::ValidateProductionNcnnVulkanNetworkPack(
+                          *selected, network, &error))
+                    return false;
+              }
+              const auto file = std::find_if(
+                  selected->files.begin(), selected->files.end(),
+                  [&](const auto &artifact) {
+                    return artifact.kind ==
+                           (predictor ? "dlib_shape_predictor" : "ncnn_param");
+                  });
+              if (file == selected->files.end())
+                return false;
+              const auto validated =
+                  open_video::ValidateModelArtifactIdentity(*selected, *file);
+              if (!validated.ok())
+                return false;
+              identity->model_id_hash = validated.identity.model_id_sha256;
+              identity->artifact_set_hash =
+                  validated.identity.artifact_set_sha256;
+              identity->artifact_generation =
+                  validated.identity.registry_generation;
+              *pack = std::make_shared<const open_video::ModelPack>(
+                  std::move(*selected));
+              return true;
+            };
+        if ((needs_denoise &&
+             !resolve("video_denoise",
+                      request.effects.video_noise_removal.model_id,
+                      "fastdvdnet_sigma15", &configuration.denoise_pack,
+                      &configuration.denoise_identity)) ||
+            (needs_face &&
+             !resolve("face_detection", request.effects.auto_frame.model_id,
+                      "yunet_opencv_zoo_2023mar_fp32", &configuration.face_pack,
+                      &configuration.face_identity)) ||
+            (needs_eye &&
+             !resolve("eye_contact", request.effects.eye_contact.model_id,
+                      "gaze_correction_cam_flx_v0_1_1", &configuration.eye_pack,
+                      &configuration.eye_identity)))
+          return Failure(hal::StatusId::unavailable,
+                         hal::ReasonId::capability_evidence_incomplete);
+        if (needs_eye) {
+          std::string landmark_id;
+          for (const auto &dependency : configuration.eye_pack->depends_on)
+            if (dependency.rfind("face_landmarks:", 0) == 0)
+              landmark_id = dependency.substr(15);
+          if (!resolve("face_landmarks", landmark_id, "dlib_68_ibug_300w",
+                       &configuration.landmarks_pack,
+                       &configuration.landmarks_identity, true))
+            return Failure(hal::StatusId::unavailable,
+                           hal::ReasonId::capability_evidence_incomplete);
+        }
+        configuration.maximum_synchronizations_per_frame =
+            video::kMaxPerFrameSynchronizationsV1;
+        configuration.minimum_synchronizations_per_frame = 1;
+      }
       auto factory =
           std::make_unique<VulkanVideoExecutionFactory>(configuration);
       hal::ReasonId reason = hal::ReasonId::none;
@@ -250,8 +335,13 @@ public:
       if (needs_matting) {
         for (std::size_t i = 0; i < result.plan.intent.stage_count; ++i) {
           auto &stage = result.plan.intent.stages[i];
-          if (stage.intent.semantic == hal::SemanticEffectId::mirror ||
-              stage.intent.semantic == hal::SemanticEffectId::vignette)
+          if (stage.intent.semantic !=
+                  hal::SemanticEffectId::virtual_background_blur &&
+              stage.intent.semantic !=
+                  hal::SemanticEffectId::virtual_background_remove &&
+              stage.intent.semantic !=
+                  hal::SemanticEffectId::virtual_background_replace &&
+              stage.intent.semantic != hal::SemanticEffectId::virtual_key_light)
             continue;
           const auto &identity = configuration.matting_identity;
           if (stage.model.artifact_generation != 0 &&
@@ -281,6 +371,63 @@ public:
              configuration.matting_identity.artifact_set_hash) {
           hash ^= value;
           hash *= UINT64_C(1099511628211);
+        }
+        result.plan.invalidation_key.model_artifact_hash = hash ? hash : 1;
+      }
+      for (std::size_t i = 0; i < result.plan.intent.stage_count; ++i) {
+        auto &stage = result.plan.intent.stages[i];
+        const hal::ModelArtifactIdentity *identity = nullptr;
+        const std::shared_ptr<const open_video::ModelPack> *pack = nullptr;
+        const std::string *requested = nullptr;
+        if (stage.intent.semantic ==
+            hal::SemanticEffectId::video_noise_removal) {
+          identity = &configuration.denoise_identity;
+          pack = &configuration.denoise_pack;
+          requested = &request.effects.video_noise_removal.model_id;
+        } else if (stage.intent.semantic ==
+                   hal::SemanticEffectId::eye_contact) {
+          identity = &configuration.eye_identity;
+          pack = &configuration.eye_pack;
+          requested = &request.effects.eye_contact.model_id;
+        } else if (stage.intent.semantic == hal::SemanticEffectId::auto_frame) {
+          identity = &configuration.face_identity;
+          pack = &configuration.face_pack;
+          requested = &request.effects.auto_frame.model_id;
+        }
+        if (!identity)
+          continue;
+        if (!*pack || !identity->artifact_generation ||
+            (stage.model.artifact_generation &&
+             (stage.model.artifact_generation !=
+                  identity->artifact_generation ||
+              stage.model.model_id_hash != identity->model_id_hash ||
+              stage.model.artifact_set_hash != identity->artifact_set_hash)))
+          return Failure(hal::StatusId::blocked,
+                         hal::ReasonId::reconfiguration_required);
+        stage.model = *identity;
+        auto &selection =
+            result.model_selections[result.model_selection_count++];
+        selection.semantic = stage.intent.semantic;
+        selection.requested_model_id = *requested;
+        selection.selected_model_id = (*pack)->id;
+        selection.default_selected = requested->empty();
+        selection.artifact = *identity;
+      }
+      if (needs_denoise || needs_face) {
+        std::uint64_t hash = UINT64_C(1469598103934665603);
+        for (const auto *identity :
+             {&configuration.matting_identity, &configuration.denoise_identity,
+              &configuration.face_identity, &configuration.landmarks_identity,
+              &configuration.eye_identity}) {
+          if (!identity->artifact_generation)
+            continue;
+          result.plan.invalidation_key.generations.model =
+              std::max(result.plan.invalidation_key.generations.model,
+                       identity->artifact_generation);
+          for (const auto byte : identity->artifact_set_hash) {
+            hash ^= byte;
+            hash *= UINT64_C(1099511628211);
+          }
         }
         result.plan.invalidation_key.model_artifact_hash = hash ? hash : 1;
       }

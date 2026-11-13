@@ -1,6 +1,7 @@
 #include "core/vulkan/hal_resident_adapter.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -52,6 +53,35 @@ bool IsMattingSemantic(SemanticEffectId semantic) noexcept {
          semantic == SemanticEffectId::virtual_background_remove ||
          semantic == SemanticEffectId::virtual_background_replace ||
          semantic == SemanticEffectId::virtual_key_light;
+}
+
+bool IsModelSemantic(SemanticEffectId semantic) noexcept {
+  return IsMattingSemantic(semantic) ||
+         semantic == SemanticEffectId::video_noise_removal ||
+         semantic == SemanticEffectId::eye_contact ||
+         semantic == SemanticEffectId::auto_frame;
+}
+int SemanticOrder(SemanticEffectId semantic) noexcept {
+  switch (semantic) {
+  case SemanticEffectId::video_noise_removal:
+    return 0;
+  case SemanticEffectId::eye_contact:
+    return 1;
+  case SemanticEffectId::virtual_background_blur:
+  case SemanticEffectId::virtual_background_remove:
+  case SemanticEffectId::virtual_background_replace:
+    return 2;
+  case SemanticEffectId::virtual_key_light:
+    return 3;
+  case SemanticEffectId::auto_frame:
+    return 4;
+  case SemanticEffectId::vignette:
+    return 5;
+  case SemanticEffectId::mirror:
+    return 6;
+  default:
+    return -1;
+  }
 }
 
 bool IsZeroModelIdentity(const hal::ModelArtifactIdentity &identity) noexcept {
@@ -237,7 +267,13 @@ bool VulkanHalResidentAdapter::SetProgramOptions(
   if (shutdown_ || options.program_id == 0 ||
       options.canonical_plan_hash == 0 ||
       options.vignette_intensity_percent < 0 ||
-      options.vignette_intensity_percent > 100) {
+      options.vignette_intensity_percent > 100 ||
+      options.denoise_strength < 0 || options.denoise_strength > 100 ||
+      options.eye_strength < 0 || options.eye_strength > 100 ||
+      options.auto_frame_strength < 0 || options.auto_frame_strength > 100 ||
+      options.auto_frame_smoothing < 0 || options.auto_frame_smoothing > 100 ||
+      !std::isfinite(options.auto_frame_headroom) ||
+      options.auto_frame_headroom < 0 || options.auto_frame_headroom > 1) {
     return false;
   }
   pending_options_ = options;
@@ -288,7 +324,14 @@ StatusId VulkanHalResidentAdapter::Prepare(
   }
   if (!program.requires_upload || !program.requires_final_readback)
     return fail(StatusId::blocked, ReasonId::malformed_contract);
-  if (program.temporal.temporal)
+  const bool temporal_semantics = std::any_of(
+      program.stages.begin(), program.stages.begin() + program.stage_count,
+      [](const auto &stage) {
+        return stage.semantic == SemanticEffectId::video_noise_removal ||
+               stage.semantic == SemanticEffectId::eye_contact ||
+               stage.semantic == SemanticEffectId::auto_frame;
+      });
+  if (program.temporal.temporal != temporal_semantics)
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   if (program.cpu_tail_count != 0)
     return fail(StatusId::blocked, ReasonId::cpu_tail_required);
@@ -313,9 +356,15 @@ StatusId VulkanHalResidentAdapter::Prepare(
   bool has_matting = false;
   bool has_background = false;
   bool has_keylight = false;
+  bool has_denoise = false, has_eye = false, has_auto_frame = false;
+  int previous_order = -1;
   const hal::ImageDescriptor *previous_output = nullptr;
   for (std::size_t index = 0; index < program.stage_count; ++index) {
     const auto &stage = program.stages[index];
+    const int order = SemanticOrder(stage.semantic);
+    if (order < 0 || order <= previous_order)
+      return fail(StatusId::blocked, ReasonId::malformed_contract);
+    previous_order = order;
     if (stage.backend != BackendId::vulkan ||
         stage.provider !=
             SemanticEffectProviderId::open_vulkan_production_kernels ||
@@ -334,12 +383,22 @@ StatusId VulkanHalResidentAdapter::Prepare(
                                    hal::Mutability::read_write) ||
         (previous_output &&
          !SameImageStorage(*previous_output, stage.input.image)) ||
-        (IsMattingSemantic(stage.semantic)
-             ? IsZeroModelIdentity(stage.model)
+        (IsModelSemantic(stage.semantic)
+             ? (IsZeroModelIdentity(stage.model) &&
+                !(stage.semantic == SemanticEffectId::video_noise_removal &&
+                  pending_options_.denoise_strength == 0) &&
+                !(stage.semantic == SemanticEffectId::eye_contact &&
+                  pending_options_.eye_strength == 0))
              : !IsZeroModelIdentity(stage.model))) {
       return fail(StatusId::blocked, ReasonId::malformed_descriptor);
     }
-    if (IsMattingSemantic(stage.semantic)) {
+    if (stage.semantic == SemanticEffectId::video_noise_removal) {
+      has_denoise = true;
+    } else if (stage.semantic == SemanticEffectId::eye_contact) {
+      has_eye = true;
+    } else if (stage.semantic == SemanticEffectId::auto_frame) {
+      has_auto_frame = true;
+    } else if (IsMattingSemantic(stage.semantic)) {
       const bool key = stage.semantic == SemanticEffectId::virtual_key_light;
       if (has_mirror || has_vignette ||
           (key ? has_keylight : (has_background || has_keylight)))
@@ -372,14 +431,20 @@ StatusId VulkanHalResidentAdapter::Prepare(
     previous_output = &stage.output.image;
   }
   if (has_mirror != pending_options_.request_mirror ||
+      has_denoise != pending_options_.request_denoise ||
+      has_eye != pending_options_.request_eye ||
+      has_auto_frame != pending_options_.request_auto_frame ||
       has_vignette != pending_options_.request_vignette ||
       has_keylight != pending_options_.request_keylight ||
       has_background !=
           (pending_options_.background != SemanticEffectId::invalid)) {
     return fail(StatusId::blocked, ReasonId::malformed_contract);
   }
-  if (has_vignette && pending_options_.vignette_center !=
-                          VulkanVignetteCenterMode::fixed_frame_center) {
+  if (has_vignette &&
+      pending_options_.vignette_center !=
+          VulkanVignetteCenterMode::fixed_frame_center &&
+      !(has_auto_frame && pending_options_.vignette_center ==
+                              VulkanVignetteCenterMode::tracked_face)) {
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   }
   const std::uint64_t required_upload = RequiredImageSpan(program.host_input);
@@ -396,6 +461,16 @@ StatusId VulkanHalResidentAdapter::Prepare(
   if (evidence.execution_domain != program.execution_domain ||
       !CommonEvidenceReady(evidence) ||
       (has_matting && !evidence.matting_production_ready) ||
+      (has_denoise && pending_options_.denoise_strength > 0 &&
+       !evidence.denoise_production_ready) ||
+      (has_eye && pending_options_.eye_strength > 0 &&
+       !evidence.eye_production_ready) ||
+      (has_auto_frame &&
+       (!evidence.face_production_ready || !evidence.tracking_gpu_ready)) ||
+      (has_vignette &&
+       pending_options_.vignette_center ==
+           VulkanVignetteCenterMode::tracked_face &&
+       !evidence.vignette_tracked_center_ready) ||
       (has_mirror && !evidence.mirror_production_ready) ||
       (has_vignette && !evidence.vignette_fixed_center_production_ready)) {
     return fail(StatusId::blocked,
@@ -748,6 +823,13 @@ VulkanHalResidentAdapter::Execute(const hal::PreparedProgramHandle &program,
       }
       if (slot->program.stages[index].semantic == SemanticEffectId::mirror)
         execution_options.request_mirror = false;
+      if (slot->program.stages[index].semantic ==
+          SemanticEffectId::video_noise_removal)
+        execution_options.request_denoise = false;
+      if (slot->program.stages[index].semantic == SemanticEffectId::eye_contact)
+        execution_options.request_eye = false;
+      if (slot->program.stages[index].semantic == SemanticEffectId::auto_frame)
+        execution_options.request_auto_frame = false;
       if (slot->program.stages[index].semantic == SemanticEffectId::vignette)
         execution_options.request_vignette = false;
       continue;
