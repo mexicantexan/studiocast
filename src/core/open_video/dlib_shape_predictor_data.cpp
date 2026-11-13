@@ -204,7 +204,8 @@ bool LoadDlibPredictorData(const ModelPack &pack,
     for (int r = 0; r < 3; ++r)
       for (int c = 0; c < 3; ++c)
         data.rectangle_basis_pseudoinverse[r * 3 + c] = inverse(r, c);
-    reader.Charge(136 * 2 + data.maximum_features, sizeof(float));
+    reader.Charge(136 * 2, sizeof(float));
+    reader.Charge(data.maximum_features, sizeof(float));
     reader.Charge(9, sizeof(double));
     data.resident_bytes = reader.used;
     *out = std::move(data);
