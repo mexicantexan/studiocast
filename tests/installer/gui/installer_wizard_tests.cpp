@@ -137,8 +137,10 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
   QJsonArray packs;
   for (const QString &pack : DefaultPacks())
     packs.append(pack);
-  const QList<qint64> sizes = {832775, 2033628,  25888640, 12113,   25844000,
-                               232589, 99693937, 1062936,  1062994, 9948304};
+  const QList<qint64> sizes = {832775,  2033628, 25888640, 12113,    25844000,
+                               232589,  6423,    212628,   99693937, 1062936,
+                               1062994, 2726,    1000192,  2726,     1000192,
+                               9948304, 7383,    19815200};
   const QStringList artifacts = {
       QStringLiteral("fastenhancer_s_vd_v1:model.onnx"),
       QStringLiteral("fastenhancer_m_vd_v1:model.onnx"),
@@ -146,10 +148,19 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
       QStringLiteral("modnet-webnn-256-fp32:model.ncnn.param"),
       QStringLiteral("modnet-webnn-256-fp32:model.ncnn.bin"),
       QStringLiteral("yunet_opencv_zoo_2023mar_fp32:model.onnx"),
+      QStringLiteral("yunet_opencv_zoo_2023mar_fp32:model.ncnn.param"),
+      QStringLiteral("yunet_opencv_zoo_2023mar_fp32:model.ncnn.bin"),
       QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_face_landmarks.dat"),
       QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_left.onnx"),
       QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_right.onnx"),
-      QStringLiteral("fastdvdnet_sigma15:model.onnx")};
+      QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_left.ncnn.param"),
+      QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_left.ncnn.bin"),
+      QStringLiteral(
+          "gaze_correction_cam_flx_v0_1_1:gaze_flx_right.ncnn.param"),
+      QStringLiteral("gaze_correction_cam_flx_v0_1_1:gaze_flx_right.ncnn.bin"),
+      QStringLiteral("fastdvdnet_sigma15:model.onnx"),
+      QStringLiteral("fastdvdnet_sigma15:model.ncnn.param"),
+      QStringLiteral("fastdvdnet_sigma15:model.ncnn.bin")};
   QJsonArray downloads;
   for (qsizetype index = 0; index < artifacts.size(); ++index) {
     const QString artifactId = artifacts.at(index);
@@ -158,7 +169,7 @@ QJsonObject Plan(const QString &intent = QStringLiteral("install"),
         {QStringLiteral("pack_id"), artifactId.section(QLatin1Char(':'), 0, 0)},
         {QStringLiteral("size"), sizes.at(index)}});
   }
-  const qint64 modelBytes = 166611916;
+  const qint64 modelBytes = 188659386;
   QJsonArray operations{QJsonObject{
       {QStringLiteral("id"), QStringLiteral("preflight.validate")},
       {QStringLiteral("privilege"), QStringLiteral("none")},
@@ -828,12 +839,12 @@ bool TestPlanValidationExactExecutionAndLabels(FakeBackend &backend) {
                   reviewText->toPlainText().contains(
                       QStringLiteral("Models/downloads (7 pack IDs)")) &&
                   reviewText->toPlainText().contains(QStringLiteral(
-                      "10 verified artifact files, 166611916 model bytes")) &&
+                      "18 verified artifact files, 188659386 model bytes")) &&
                   reviewText->toPlainText().contains(
                       QStringLiteral("dlib_68_ibug_300w:shape_predictor_68_"
                                      "face_landmarks.dat: 99693937 bytes")) &&
                   reviewText->toPlainText().contains(QStringLiteral(
-                      "disk required/free: 2186495954/20000000000 bytes")) &&
+                      "disk required/free: 2208543424/20000000000 bytes")) &&
                   reviewText->toPlainText().contains(
                       QStringLiteral("Vulkan runtime dependencies (2 source "
                                      "archives): 19884035 download bytes")) &&
@@ -1093,8 +1104,8 @@ bool TestCustomAdvancedSelectionsAndRecommendedDefaults(FakeBackend &backend) {
                        destination && installModels,
                    "Custom route should expose typed backend, v4l, and model controls");
   ok = Expect(installModels && installModels->toolTip().contains(
-                                  QStringLiteral("ten verified artifacts")),
-              "model tooltip should describe all ten curated artifacts") && ok;
+                                  QStringLiteral("eighteen verified artifacts")),
+              "model tooltip should describe all eighteen curated artifacts") && ok;
   openCuda->setChecked(false);
   openAudio->setChecked(true);
   device->setValue(42);

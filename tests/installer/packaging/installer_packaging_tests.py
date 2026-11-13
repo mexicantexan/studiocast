@@ -33,10 +33,10 @@ MODEL_PACK_SIZE_ROWS = [
     ("fastenhancer_s_vd_v1", 1, 832775),
     ("fastenhancer_m_vd_v1", 1, 2033628),
     ("modnet-webnn-256-fp32", 3, 51744753),
-    ("yunet_opencv_zoo_2023mar_fp32", 1, 232589),
+    ("yunet_opencv_zoo_2023mar_fp32", 3, 451640),
     ("dlib_68_ibug_300w", 1, 99693937),
-    ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
-    ("fastdvdnet_sigma15", 1, 9948304),
+    ("gaze_correction_cam_flx_v0_1_1", 6, 4131766),
+    ("fastdvdnet_sigma15", 3, 29770887),
 ]
 
 
@@ -163,11 +163,11 @@ include("{ROOT}/installer/CMakeLists.txt")
 
 def catalog_size_summary() -> dict:
     return {
-        "schema_version": 1, "catalog_version": "2026-11-12",
-        "catalog_sha256": "sha256:f9032f14672d9e811998e3a2de142aa488f2284e8bb467148c555bf76dd546e6",
+        "schema_version": 1, "catalog_version": "2026-11-12-vulkan-all-candidate",
+        "catalog_sha256": "sha256:097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e",
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
-        "pack_count": 7, "artifact_count": 10, "download_bytes": 166611916,
+        "pack_count": 7, "artifact_count": 18, "download_bytes": 188659386,
         "packs": [
             {"id": pack_id, "artifact_count": artifact_count,
              "download_bytes": download_bytes, "size_status": "known"}
@@ -275,15 +275,15 @@ class PackagingIntegrationTests(unittest.TestCase):
         marker = text.rfind("\n{")
         return json.loads(text[marker + 1 if marker >= 0 else 0:])
 
-    def test_bundle_catalog_gate_requires_ten_trusted_artifacts_and_exact_bytes(self) -> None:
+    def test_bundle_catalog_gate_requires_eighteen_trusted_artifacts_and_exact_bytes(self) -> None:
         verifier = (ROOT / "packaging/appimage/verify_bundle.sh").read_text()
         script = verifier.split('python3 - "${model_summary}" <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
         launcher = self.backend_path.parent / "models/studiocast-model-transaction"
         listed = subprocess.run([str(launcher), "list", "--json"], env=self.env,
                                 text=True, capture_output=True, check=True)
         summary = json.loads(listed.stdout)
-        for mutation, expected_error in (("none", None), ("old_count", "exactly 10 artifacts"),
-                                         ("wrong_total", "exactly 166611916 model bytes"),
+        for mutation, expected_error in (("none", None), ("old_count", "exactly 18 artifacts"),
+                                         ("wrong_total", "exactly 188659386 model bytes"),
                                          ("untrusted", "trusted artifact sizes"),
                                          ("zero_size", "incomplete trusted artifact sizes")):
             with self.subTest(mutation=mutation):
@@ -547,13 +547,14 @@ class PackagingIntegrationTests(unittest.TestCase):
                          {item["code"] for item in plan["blockers"]})
         model_downloads = [item for item in plan["downloads"]
                            if not item["required_for_core"]]
-        self.assertEqual(len(model_downloads), 10)
+        self.assertEqual(len(model_downloads), 18)
         self.assertEqual([item["size"] for item in model_downloads],
-                         [832775, 2033628, 25888640, 12113, 25844000, 232589, 99693937,
-                          1062936, 1062994, 9948304])
+                         [832775, 2033628, 25888640, 12113, 25844000, 232589, 6423, 212628,
+                          99693937, 1062936, 1062994, 2726, 1000192, 2726, 1000192,
+                          9948304, 7383, 19815200])
         self.assertNotIn("artifact_sizes_untrusted",
                          {item["code"] for item in plan["blockers"]})
-        expected_downloads = receipt["archive_size"] + 166611916
+        expected_downloads = receipt["archive_size"] + 188659386
         self.assertEqual(plan["disk"]["download_bytes"], expected_downloads)
         self.assertEqual(plan["disk"]["required_bytes"], expected_downloads + 3)
 

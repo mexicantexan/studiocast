@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-12",
+  "catalog_version": "2026-11-12-vulkan-all-candidate",
   "policy_version": 1,
   "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/main",
   "size_metadata": {
@@ -65,13 +65,57 @@
       "default": true,
       "pack_path": "face_detection/Best Quality (YuNet FP32)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/model.json", "destination": "model.json", "sha256": "d9c66b74a5d785a2c63315e917077d0b1620fd57b17c7075dd2dd82c6bdfa8c3"},
-        {"source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "69c55937f939aaa08ec46097d441bdabbd3d2576707cc6880408c719bdd94d42"}
+        {
+          "source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/model.json",
+          "destination": "model.json",
+          "sha256": "6de02bf3508d2c8e3b0a602daf3c0d0b61574510c6d3578efe6428902b89fb5d"
+        },
+        {
+          "source": "resources/model_packs/open_video/face_detection/Best Quality (YuNet FP32)/LICENSE.txt",
+          "destination": "LICENSE.txt",
+          "sha256": "3ffea3aecfac7e9180c51b2461477892148fb8923ab1616de59a04e7a19bef4c"
+        }
       ],
-      "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "OpenCV Zoo YuNet model; upstream MIT terms are summarized in LICENSE.txt."},
-      "provenance": {"project": "OpenCV Zoo YuNet", "url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet", "release": "2023mar FP32"},
+      "license": {
+        "spdx": "MIT",
+        "redistribution": "permitted",
+        "notes": "OpenCV Zoo YuNet model; upstream MIT terms are summarized in LICENSE.txt."
+      },
+      "provenance": {
+        "project": "OpenCV Zoo YuNet",
+        "url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+        "release": "2023mar FP32"
+      },
       "artifacts": [
-        {"name": "model.onnx", "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4", "size_bytes": 232589, "size_status": "known", "source_paths": ["open_video/face_detection/Best Quality (YuNet FP32)/model.onnx", "face_detection/Best Quality (YuNet FP32)/model.onnx", "open_cuda/face_detection/Best Quality (YuNet FP32)/model.onnx"]}
+        {
+          "name": "model.onnx",
+          "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+          "size_bytes": 232589,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/face_detection/Best Quality (YuNet FP32)/model.onnx",
+            "face_detection/Best Quality (YuNet FP32)/model.onnx",
+            "open_cuda/face_detection/Best Quality (YuNet FP32)/model.onnx"
+          ]
+        },
+        {
+          "name": "model.ncnn.param",
+          "sha256": "a79870770c2e87ce218950ba471b4fd82f2ec3c9c5908405b05e4e93fa3e8293",
+          "size_bytes": 6423,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/face_detection/Best Quality (YuNet FP32)/revisions/ncnn-video-fp32-20261020-c078387a8a5f3cc83543e7141e945ec03f05fd54dc14406eb8c8c5ce5514e321/model.ncnn.param"
+          ]
+        },
+        {
+          "name": "model.ncnn.bin",
+          "sha256": "8faa696d61ad6bf5c13ed5d6c8ae35e376c660968db53d723a329020856ca5c9",
+          "size_bytes": 212628,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/face_detection/Best Quality (YuNet FP32)/revisions/ncnn-video-fp32-20261020-c078387a8a5f3cc83543e7141e945ec03f05fd54dc14406eb8c8c5ce5514e321/model.ncnn.bin"
+          ]
+        }
       ]
     },
     {
@@ -97,14 +141,86 @@
       "default": true,
       "pack_path": "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/model.json", "destination": "model.json", "sha256": "c3143c5be8b20080c9bd6661a196564a3eed09058ecad3825ad93a1a77c7ef4b"},
-        {"source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "e7cf82d67f571ca7adac6522dd5f4cc7d20ad786c2a3488299058f59952f8072"}
+        {
+          "source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/model.json",
+          "destination": "model.json",
+          "sha256": "5a1ad53d20bd6e88e14c4bb5c39d4c8b1a76dd7cc077409724cc9941bbe40a6c"
+        },
+        {
+          "source": "resources/model_packs/open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/LICENSE.txt",
+          "destination": "LICENSE.txt",
+          "sha256": "567d413328a3b7d5625177d1ea6b0990666d70410ed319ce50821f41087be13e"
+        }
       ],
-      "license": {"spdx": "BSD-3-Clause", "redistribution": "permitted", "notes": "Depends on the separately licensed non-commercial dlib iBUG landmark pack."},
-      "provenance": {"project": "gaze-correction-cam", "url": "https://github.com/WangWilly/gaze-correction-cam", "release": "FLX v0.1.1 FP32 export"},
+      "license": {
+        "spdx": "BSD-3-Clause",
+        "redistribution": "permitted",
+        "notes": "Depends on the separately licensed non-commercial dlib iBUG landmark pack."
+      },
+      "provenance": {
+        "project": "gaze-correction-cam",
+        "url": "https://github.com/WangWilly/gaze-correction-cam",
+        "release": "FLX v0.1.1 FP32 export"
+      },
       "artifacts": [
-        {"name": "gaze_flx_left.onnx", "sha256": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00", "size_bytes": 1062936, "size_status": "known", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx"]},
-        {"name": "gaze_flx_right.onnx", "sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1", "size_bytes": 1062994, "size_status": "known", "source_paths": ["open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx", "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx"]}
+        {
+          "name": "gaze_flx_left.onnx",
+          "sha256": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00",
+          "size_bytes": 1062936,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx",
+            "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx",
+            "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_left.onnx"
+          ]
+        },
+        {
+          "name": "gaze_flx_right.onnx",
+          "sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1",
+          "size_bytes": 1062994,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx",
+            "eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx",
+            "open_cuda/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/gaze_flx_right.onnx"
+          ]
+        },
+        {
+          "name": "gaze_flx_left.ncnn.param",
+          "sha256": "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9",
+          "size_bytes": 2726,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/revisions/ncnn-video-fp32-20261020-918075a9a3502a38c6df94f27f1ec4a765c09bd226de1229e8e5bd57d853bf20/gaze_flx_left.ncnn.param"
+          ]
+        },
+        {
+          "name": "gaze_flx_left.ncnn.bin",
+          "sha256": "7597eb7e151ec1de71fb33ce7f511b856f258d538f939727401598e18d180416",
+          "size_bytes": 1000192,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/revisions/ncnn-video-fp32-20261020-918075a9a3502a38c6df94f27f1ec4a765c09bd226de1229e8e5bd57d853bf20/gaze_flx_left.ncnn.bin"
+          ]
+        },
+        {
+          "name": "gaze_flx_right.ncnn.param",
+          "sha256": "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9",
+          "size_bytes": 2726,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/revisions/ncnn-video-fp32-20261020-918075a9a3502a38c6df94f27f1ec4a765c09bd226de1229e8e5bd57d853bf20/gaze_flx_right.ncnn.param"
+          ]
+        },
+        {
+          "name": "gaze_flx_right.ncnn.bin",
+          "sha256": "9333359e7c4924312b4af161ae0678471abf7d301c7893474e534c4f9541802b",
+          "size_bytes": 1000192,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/eye_contact/Better Quality (Gaze Correction Cam v0.1.1 FP32)/revisions/ncnn-video-fp32-20261020-918075a9a3502a38c6df94f27f1ec4a765c09bd226de1229e8e5bd57d853bf20/gaze_flx_right.ncnn.bin"
+          ]
+        }
       ]
     },
     {
@@ -114,13 +230,55 @@
       "default": true,
       "pack_path": "video_denoise/Good Quality (FastDVDnet sigma15)",
       "metadata": [
-        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.json", "destination": "model.json", "sha256": "9daf66251194aeaab5c67f18331e18a40596b951a8049b4d359d36fe1e97285e"},
-        {"source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/LICENSE.txt", "destination": "LICENSE.txt", "sha256": "e419e198d08f7d62fbc6bbb74409836289246db14ed28a134f79e1a2ea5afedc"}
+        {
+          "source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/model.json",
+          "destination": "model.json",
+          "sha256": "eb8a2f1142fdfee24253cd068c1414aca98ddb06e3b82f2478e5bcae849ced48"
+        },
+        {
+          "source": "resources/model_packs/open_video/video_denoise/Good Quality (FastDVDnet sigma15)/LICENSE.txt",
+          "destination": "LICENSE.txt",
+          "sha256": "bbec85c35b20b4a8c964836e199ed47df5b396a5d3c3269432b69cd78d932574"
+        }
       ],
-      "license": {"spdx": "MIT", "redistribution": "permitted", "notes": "FastDVDnet MIT license summary and paper provenance are installed with the pack."},
-      "provenance": {"project": "FastDVDnet", "url": "https://github.com/m-tassano/fastdvdnet", "release": "upstream c8fdf6182a0340e89dd18f5df25b47337cbede6f; exporter 9384cd12bfa3ed56f0d7693964376897d18ebb9f; self-contained FP32 opset17; Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044"},
+      "license": {
+        "spdx": "MIT",
+        "redistribution": "permitted",
+        "notes": "FastDVDnet MIT license summary and paper provenance are installed with the pack."
+      },
+      "provenance": {
+        "project": "FastDVDnet",
+        "url": "https://github.com/m-tassano/fastdvdnet",
+        "release": "upstream c8fdf6182a0340e89dd18f5df25b47337cbede6f; exporter 9384cd12bfa3ed56f0d7693964376897d18ebb9f; self-contained FP32 opset17; Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044"
+      },
       "artifacts": [
-        {"name": "model.onnx", "sha256": "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac", "size_bytes": 9948304, "size_status": "known", "source_paths": ["open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac/model.onnx"]}
+        {
+          "name": "model.onnx",
+          "sha256": "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac",
+          "size_bytes": 9948304,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac/model.onnx"
+          ]
+        },
+        {
+          "name": "model.ncnn.param",
+          "sha256": "f3bb19a906f5c811f9627e167181afa04a8adc76fa2e77e8f1ab00d27535c102",
+          "size_bytes": 7383,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/ncnn-video-fp32-20261020-31dee74f844200c8ca8f22a6416e02a682b3f04058b4ede17dc29c40b47bbff0/model.ncnn.param"
+          ]
+        },
+        {
+          "name": "model.ncnn.bin",
+          "sha256": "b31f624553b8072fe53fc2f46a060495b8016ad2f0c6ee9d0f66f88604fdec3f",
+          "size_bytes": 19815200,
+          "size_status": "known",
+          "source_paths": [
+            "open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/ncnn-video-fp32-20261020-31dee74f844200c8ca8f22a6416e02a682b3f04058b4ede17dc29c40b47bbff0/model.ncnn.bin"
+          ]
+        }
       ]
     }
   ]

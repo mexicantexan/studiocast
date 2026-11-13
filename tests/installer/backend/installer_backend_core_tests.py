@@ -38,15 +38,15 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
-MODEL_CATALOG_SHA256 = "sha256:f9032f14672d9e811998e3a2de142aa488f2284e8bb467148c555bf76dd546e6"
+MODEL_CATALOG_SHA256 = "sha256:097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e"
 MODEL_PACK_SIZE_ROWS = [
     ("fastenhancer_s_vd_v1", 1, 832775),
     ("fastenhancer_m_vd_v1", 1, 2033628),
     ("modnet-webnn-256-fp32", 3, 51744753),
-    ("yunet_opencv_zoo_2023mar_fp32", 1, 232589),
+    ("yunet_opencv_zoo_2023mar_fp32", 3, 451640),
     ("dlib_68_ibug_300w", 1, 99693937),
-    ("gaze_correction_cam_flx_v0_1_1", 2, 2125930),
-    ("fastdvdnet_sigma15", 1, 9948304),
+    ("gaze_correction_cam_flx_v0_1_1", 6, 4131766),
+    ("fastdvdnet_sigma15", 3, 29770887),
 ]
 CANONICAL_EFFECTS = [
     "mirror", "virtual_background.blur", "virtual_background.remove",
@@ -79,7 +79,7 @@ def terminal_result(text: str) -> dict:
 def catalog_size_summary() -> dict:
     return {
         "schema_version": 1,
-        "catalog_version": "2026-11-12",
+        "catalog_version": "2026-11-12-vulkan-all-candidate",
         "catalog_sha256": MODEL_CATALOG_SHA256,
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
@@ -1346,8 +1346,8 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertEqual(one["selections"]["model_pack_ids"], DEFAULT_PACKS)
         self.assertEqual(one["disk"], {"free_bytes": 20_000_000_000,
                                        "base_required_bytes": 3,
-                                       "download_bytes": 166611916,
-                                       "required_bytes": 166611919})
+                                       "download_bytes": 188659386,
+                                       "required_bytes": 188659389})
         self.assertNotIn("artifact_sizes_untrusted", {item["code"] for item in one["blockers"]})
         self.assertEqual(one["selections"]["effects"]["virtual_background"]["selected"], "cuda")
         facts = base_facts(); facts["effects"]["capabilities"]["virtual_background"]["cuda"] = "unavailable"
@@ -1867,25 +1867,27 @@ class InstallerBackendCoreTests(unittest.TestCase):
         self.assertNotIn("configuration.service.selection_required", selected_codes)
         self.assertNotIn("configuration.virtual_camera.selection_required", selected_codes)
 
-    def test_pack_catalog_is_exact_seven_ids_ten_hashed_artifacts(self):
+    def test_pack_catalog_is_exact_seven_ids_eighteen_hashed_artifacts(self):
         plan = self.s.json("plan", "install", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                            "--no-v4l2loopback", "--no-service", "--models", "--allow-unsupported")
         downloads = plan["downloads"]
-        self.assertEqual(len(downloads), 10)
+        self.assertEqual(len(downloads), 18)
         self.assertEqual({x["pack_id"] for x in downloads}, set(DEFAULT_PACKS))
         self.assertTrue(all(x["sha256"].startswith("sha256:") for x in downloads))
         self.assertEqual([x["size"] for x in downloads],
-                         [832775, 2033628, 25888640, 12113, 25844000, 232589, 99693937,
-                          1062936, 1062994, 9948304])
+                         [832775, 2033628, 25888640, 12113, 25844000, 232589, 6423, 212628,
+                          99693937, 1062936, 1062994, 2726, 1000192, 2726, 1000192,
+                          9948304, 7383, 19815200])
         self.assertTrue(all(x["size_status"] == "known" for x in downloads))
-        self.assertEqual(plan["disk"]["download_bytes"], 166611916)
-        self.assertEqual(plan["disk"]["required_bytes"], 166611919)
+        self.assertEqual(plan["disk"]["download_bytes"], 188659386)
+        self.assertEqual(plan["disk"]["required_bytes"], 188659389)
         self.assertEqual(plan["disk"]["free_bytes"], 20_000_000_000)
         transactions = [x for x in plan["operations"] if x["kind"] == "model_transaction"]
         self.assertEqual(len(transactions), 7)
         gaze = next(x for x in transactions if x["inputs"]["pack_id"] == "gaze_correction_cam_flx_v0_1_1")
         self.assertEqual([a["name"] for a in gaze["inputs"]["pack"]["artifacts"]],
-                         ["gaze_flx_left.onnx", "gaze_flx_right.onnx"])
+                         ["gaze_flx_left.onnx", "gaze_flx_right.onnx", "gaze_flx_left.ncnn.param",
+                          "gaze_flx_left.ncnn.bin", "gaze_flx_right.ncnn.param", "gaze_flx_right.ncnn.bin"])
 
     def test_recommended_models_use_trusted_sizes_and_low_disk_blocks_before_apply(self):
         plan = self.s.json("plan", "install", "--facts", str(self.s.facts),
@@ -1899,14 +1901,14 @@ class InstallerBackendCoreTests(unittest.TestCase):
                             if op["kind"] == "model_transaction"))
 
         low_disk_facts = base_facts()
-        low_disk_facts["paths"]["free_bytes"] = 166611918
+        low_disk_facts["paths"]["free_bytes"] = 188659388
         self.s.write_facts(low_disk_facts)
         blocked = self.s.json("plan", "install", "--facts", str(self.s.facts),
                               "--no-v4l2loopback", "--no-service", "--models")
         disk_blocker = next(item for item in blocked["blockers"]
                             if item["code"] == "disk.staging.insufficient")
         self.assertEqual((disk_blocker["free_bytes"], disk_blocker["required_bytes"]),
-                         (166611918, 166611919))
+                         (188659388, 188659389))
         path = self.s.root / "blocked-model-plan.json"
         path.write_text(json.dumps(blocked), encoding="utf-8")
         result = self.s.run("apply-plan", "--plan", str(path),

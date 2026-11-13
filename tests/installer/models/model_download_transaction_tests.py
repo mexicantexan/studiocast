@@ -154,7 +154,7 @@ class TempTest(unittest.TestCase):
 
 
 class CatalogContractTests(TempTest):
-    def test_real_catalog_has_exact_seven_defaults_and_ten_artifacts(self):
+    def test_real_catalog_has_exact_seven_defaults_and_eighteen_artifacts(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
         ids = [pack["id"] for pack in catalog["packs"] if pack["default"]]
         self.assertEqual(
@@ -170,9 +170,9 @@ class CatalogContractTests(TempTest):
             },
         )
         self.assertEqual(len(ids), 7)
-        self.assertEqual(sum(len(pack["artifacts"]) for pack in catalog["packs"]), 10)
+        self.assertEqual(sum(len(pack["artifacts"]) for pack in catalog["packs"]), 18)
         gaze = next(pack for pack in catalog["packs"] if pack["id"] == "gaze_correction_cam_flx_v0_1_1")
-        self.assertEqual({item["name"] for item in gaze["artifacts"]}, {"gaze_flx_left.onnx", "gaze_flx_right.onnx"})
+        self.assertEqual({item["name"] for item in gaze["artifacts"]}, {"gaze_flx_left.onnx", "gaze_flx_right.onnx", "gaze_flx_left.ncnn.param", "gaze_flx_left.ncnn.bin", "gaze_flx_right.ncnn.param", "gaze_flx_right.ncnn.bin"})
         expected = {
             ("fastenhancer_s_vd_v1", "model.onnx"): (832775, "e2d0e91bbfab4af1316bb2c41126a38c8b3cd015b93bb630d651af8fdbf7f2e8"),
             ("fastenhancer_m_vd_v1", "model.onnx"): (2033628, "367059e724dd367c056dc906e9698ec5864c80c9a88e0597f7a2b0f81c506aaa"),
@@ -184,12 +184,20 @@ class CatalogContractTests(TempTest):
             ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_left.onnx"): (1062936, "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00"),
             ("gaze_correction_cam_flx_v0_1_1", "gaze_flx_right.onnx"): (1062994, "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"),
             ("fastdvdnet_sigma15", "model.onnx"): (9948304, "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac"),
+            ('yunet_opencv_zoo_2023mar_fp32', 'model.ncnn.param'): (6423, 'a79870770c2e87ce218950ba471b4fd82f2ec3c9c5908405b05e4e93fa3e8293'),
+            ('yunet_opencv_zoo_2023mar_fp32', 'model.ncnn.bin'): (212628, '8faa696d61ad6bf5c13ed5d6c8ae35e376c660968db53d723a329020856ca5c9'),
+            ('gaze_correction_cam_flx_v0_1_1', 'gaze_flx_left.ncnn.param'): (2726, '7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9'),
+            ('gaze_correction_cam_flx_v0_1_1', 'gaze_flx_left.ncnn.bin'): (1000192, '7597eb7e151ec1de71fb33ce7f511b856f258d538f939727401598e18d180416'),
+            ('gaze_correction_cam_flx_v0_1_1', 'gaze_flx_right.ncnn.param'): (2726, '7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9'),
+            ('gaze_correction_cam_flx_v0_1_1', 'gaze_flx_right.ncnn.bin'): (1000192, '9333359e7c4924312b4af161ae0678471abf7d301c7893474e534c4f9541802b'),
+            ('fastdvdnet_sigma15', 'model.ncnn.param'): (7383, 'f3bb19a906f5c811f9627e167181afa04a8adc76fa2e77e8f1ab00d27535c102'),
+            ('fastdvdnet_sigma15', 'model.ncnn.bin'): (19815200, 'b31f624553b8072fe53fc2f46a060495b8016ad2f0c6ee9d0f66f88604fdec3f'),
         }
         actual = {(pack["id"], item["name"]): (item["size_bytes"], item["sha256"])
                   for pack in catalog["packs"] for item in pack["artifacts"]}
         self.assertEqual(actual, expected)
-        self.assertEqual(sum(size for size, _ in actual.values()), 166611916)
-        self.assertEqual(catalog["catalog_version"], "2026-11-12")
+        self.assertEqual(sum(size for size, _ in actual.values()), 188659386)
+        self.assertEqual(catalog["catalog_version"], "2026-11-12-vulkan-all-candidate")
         self.assertEqual(catalog["size_metadata"], {
             "trusted": True,
             "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
@@ -197,6 +205,42 @@ class CatalogContractTests(TempTest):
         self.assertTrue(all(item["size_status"] == "known" for pack in catalog["packs"]
                             for item in pack["artifacts"]))
         self.assertNotIn("maxine", json.dumps(catalog).lower())
+
+    def test_added_vulkan_graphs_bind_original_onnx_and_content_named_sources(self):
+        catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        expected = {
+            "fastdvdnet_sigma15": ("fastdvdnet_rgb_v1", {"main"},
+                "31dee74f844200c8ca8f22a6416e02a682b3f04058b4ede17dc29c40b47bbff0"),
+            "yunet_opencv_zoo_2023mar_fp32": ("yunet_640_v1", {"main"},
+                "c078387a8a5f3cc83543e7141e945ec03f05fd54dc14406eb8c8c5ce5514e321"),
+            "gaze_correction_cam_flx_v0_1_1": ("flx_prefix_v1", {"left", "right"},
+                "918075a9a3502a38c6df94f27f1ec4a765c09bd226de1229e8e5bd57d853bf20"),
+        }
+        for pack in catalog["packs"]:
+            if pack["id"] not in expected:
+                continue
+            profile, roles, revision = expected[pack["id"]]
+            manifest = json.loads((REPO_ROOT / pack["metadata"][0]["source"]).read_text())
+            files = {item["name"]: item for item in manifest["files"]}
+            artifacts = {item["name"]: item for item in pack["artifacts"]}
+            networks = manifest["ncnn_vulkan_networks"]
+            self.assertEqual({network["role"] for network in networks}, roles)
+            self.assertEqual(len(networks), len(roles))
+            for network in networks:
+                self.assertEqual(network["profile"], profile)
+                self.assertEqual(network["precision"], "fp32")
+                self.assertEqual(network["converter"], {"name": "pnnx", "version": "20261020"})
+                source, = [item for item in files.values()
+                           if item["kind"] == "onnx" and item["role"] == network["role"]]
+                self.assertEqual(network["source_onnx_sha256"], source["sha256"])
+                for field, kind in (("param_file", "ncnn_param"), ("bin_file", "ncnn_bin")):
+                    name = network[field]
+                    self.assertEqual(files[name]["kind"], kind)
+                    self.assertEqual(files[name]["role"], "vulkan_" + network["role"])
+                    self.assertEqual(files[name]["sha256"], artifacts[name]["sha256"])
+                    self.assertEqual(artifacts[name]["source_paths"], [
+                        "open_video/" + pack["pack_path"] + "/revisions/ncnn-video-fp32-20261020-"
+                        + revision + "/" + name])
 
     def test_catalog_metadata_and_license_hashes_match_trusted_sources(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
@@ -255,7 +299,7 @@ class CatalogContractTests(TempTest):
     def test_curated_fastdvdnet_repair_uses_only_versioned_verified_artifact(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
         pack = next(item for item in catalog["packs"] if item["id"] == "fastdvdnet_sigma15")
-        artifact, = pack["artifacts"]
+        artifact = pack["artifacts"][0]
         expected_hash = "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac"
         self.assertEqual(artifact["source_paths"], [
             "open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/"
@@ -265,7 +309,7 @@ class CatalogContractTests(TempTest):
                       pack["provenance"]["release"])
         metadata = json.loads((REPO_ROOT / pack["metadata"][0]["source"]).read_text())
         self.assertEqual(metadata["id"], "fastdvdnet_sigma15")
-        self.assertEqual(metadata["files"], [{"name": "model.onnx", "kind": "onnx",
+        self.assertEqual([item for item in metadata["files"] if item["kind"] == "onnx"], [{"name": "model.onnx", "kind": "onnx",
                                              "role": "main", "sha256": expected_hash}])
         self.assertEqual(metadata["origin"]["upstream_commit"],
                          "c8fdf6182a0340e89dd18f5df25b47337cbede6f")
@@ -287,7 +331,7 @@ class CatalogContractTests(TempTest):
         self.assertEqual(pack["provenance"]["project"], "OpenCV Zoo YuNet")
         self.assertEqual(pack["provenance"]["release"], "2023mar FP32")
         self.assertEqual(
-            pack["artifacts"],
+            pack["artifacts"][:1],
             [{
                 "name": "model.onnx",
                 "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
@@ -343,7 +387,7 @@ class CatalogContractTests(TempTest):
                 "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1",
         }
         self.assertEqual(
-            {item["name"]: item["sha256"] for item in pack["artifacts"]},
+            {item["name"]: item["sha256"] for item in pack["artifacts"] if item["name"].endswith(".onnx")},
             expected_artifacts,
         )
 
@@ -355,7 +399,7 @@ class CatalogContractTests(TempTest):
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata["id"], pack["id"])
         self.assertEqual(
-            {item["name"]: item["sha256"] for item in metadata["files"]},
+            {item["name"]: item["sha256"] for item in metadata["files"] if item["kind"] == "onnx"},
             expected_artifacts,
         )
         self.assertEqual(metadata["onnx"]["inputs"], [

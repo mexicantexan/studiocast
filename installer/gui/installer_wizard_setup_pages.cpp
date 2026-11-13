@@ -360,7 +360,7 @@ ServiceOptionsPage::ServiceOptionsPage(QWidget *parent) : QWizardPage(parent) {
   installModels_->setObjectName(QStringLiteral("scInstallerInstallModels"));
   installModels_->setToolTip(
       QStringLiteral("Recommended downloads exactly seven default packs with "
-                     "ten verified artifacts. Custom may select individual "
+                     "eighteen verified artifacts. Custom may select individual "
                      "curated packs; Maxine does not disable these fallbacks."));
   removeUserData_ = new QCheckBox(
       QStringLiteral("Preserve settings"), this);

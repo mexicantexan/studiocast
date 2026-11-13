@@ -18,6 +18,30 @@
       "kind": "onnx",
       "role": "right",
       "sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"
+    },
+    {
+      "name": "gaze_flx_left.ncnn.param",
+      "kind": "ncnn_param",
+      "role": "vulkan_left",
+      "sha256": "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9"
+    },
+    {
+      "name": "gaze_flx_left.ncnn.bin",
+      "kind": "ncnn_bin",
+      "role": "vulkan_left",
+      "sha256": "7597eb7e151ec1de71fb33ce7f511b856f258d538f939727401598e18d180416"
+    },
+    {
+      "name": "gaze_flx_right.ncnn.param",
+      "kind": "ncnn_param",
+      "role": "vulkan_right",
+      "sha256": "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9"
+    },
+    {
+      "name": "gaze_flx_right.ncnn.bin",
+      "kind": "ncnn_bin",
+      "role": "vulkan_right",
+      "sha256": "9333359e7c4924312b4af161ae0678471abf7d301c7893474e534c4f9541802b"
     }
   ],
   "onnx": {
@@ -82,5 +106,109 @@
     ],
     "license": "BSD-3-Clause",
     "notes": "Upstream ships TensorFlow checkpoints (L/R eye). StudioCast expects C++-friendly ONNX exports hosted separately.\nThis pack is the reference FP32 template (no binaries are committed)."
-  }
+  },
+  "ncnn_vulkan_networks": [
+    {
+      "role": "left",
+      "profile": "flx_prefix_v1",
+      "param_file": "gaze_flx_left.ncnn.param",
+      "bin_file": "gaze_flx_left.ncnn.bin",
+      "source_onnx_sha256": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00",
+      "converter": {
+        "name": "pnnx",
+        "version": "20261020"
+      },
+      "precision": "fp32",
+      "inputs": [
+        {
+          "blob": "eye_rgb:0",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 3
+        },
+        {
+          "blob": "anchors:0",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 12
+        },
+        {
+          "blob": "angles:0",
+          "dims": 1,
+          "w": 2,
+          "h": 1,
+          "c": 1
+        }
+      ],
+      "outputs": [
+        {
+          "blob": "flow",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 2
+        },
+        {
+          "blob": "lcm",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 2
+        }
+      ]
+    },
+    {
+      "role": "right",
+      "profile": "flx_prefix_v1",
+      "param_file": "gaze_flx_right.ncnn.param",
+      "bin_file": "gaze_flx_right.ncnn.bin",
+      "source_onnx_sha256": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1",
+      "converter": {
+        "name": "pnnx",
+        "version": "20261020"
+      },
+      "precision": "fp32",
+      "inputs": [
+        {
+          "blob": "eye_rgb:0",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 3
+        },
+        {
+          "blob": "anchors:0",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 12
+        },
+        {
+          "blob": "angles:0",
+          "dims": 1,
+          "w": 2,
+          "h": 1,
+          "c": 1
+        }
+      ],
+      "outputs": [
+        {
+          "blob": "flow",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 2
+        },
+        {
+          "blob": "lcm",
+          "dims": 3,
+          "w": 64,
+          "h": 48,
+          "c": 2
+        }
+      ]
+    }
+  ]
 }
