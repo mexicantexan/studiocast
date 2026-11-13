@@ -64,11 +64,16 @@ struct VulkanHealthState {
   }
 };
 
+inline constexpr std::uint32_t kMaxVulkanSubmitCommandBuffers = 128;
+
 struct VulkanAllocationStats {
   VkDeviceSize budget_bytes = 0;
   VkDeviceSize current_bytes = 0;
   VkDeviceSize high_water_bytes = 0;
-  std::uint64_t allocation_count = 0;
+  std::uint64_t allocation_count = 0;       // currently live reservations
+  std::uint64_t total_allocation_count = 0; // monotonic, never decremented
+  std::uint64_t resource_limit = 0; // zero preserves legacy unlimited count
+  std::uint64_t high_water_allocation_count = 0;
 };
 
 struct VulkanDeviceConfig {
@@ -77,6 +82,7 @@ struct VulkanDeviceConfig {
   // to the derived physical-device total.
   VkDeviceSize allocation_budget_bytes = 0;
   std::uint64_t fence_timeout_ns = VK_DEFAULT_FENCE_TIMEOUT_NS;
+  std::uint64_t allocation_resource_limit = 0;
 };
 
 enum class VulkanBufferAccess {
@@ -124,7 +130,8 @@ public:
   bool SafeToDestroyChildren() const;
   VulkanHealthSnapshot HealthSnapshot() const;
   VulkanAllocationStats AllocationStats() const;
-  bool ReserveAllocation(VkDeviceSize bytes, std::string *error_out);
+  bool ReserveAllocation(VkDeviceSize bytes, std::string *error_out,
+                         std::uint64_t resources = 1);
   void ReleaseAllocation(VkDeviceSize bytes) noexcept;
   bool RecordDriverFailure(VkResult result, std::string_view operation,
                            bool submission_failure, std::string *error_out);
@@ -143,6 +150,7 @@ public:
   VkPhysicalDeviceMemoryProperties memory_properties{};
   VkDeviceSize allocation_budget_bytes = 0;
   std::uint64_t fence_timeout_ns = VK_DEFAULT_FENCE_TIMEOUT_NS;
+  bool shader_float64_enabled = false;
 
   mutable std::mutex health_mutex;
   VulkanHealthSnapshot health;
@@ -401,6 +409,9 @@ struct VulkanDeviceAdoption {
   PFN_vkGetInstanceProcAddr entry_point = nullptr;
   std::shared_ptr<void> owner;
   std::string owner_kind;
+  // Trusted in-tree owner proves the actual created device enabled FP64.
+  // Physical capability or an unauthenticated boolean alone is insufficient.
+  bool (*shader_float64_attestation)(const void *, VkDevice) noexcept = nullptr;
 };
 
 class VulkanDevice {
@@ -449,6 +460,13 @@ public:
   VulkanHealthState health_state() const noexcept;
   VulkanAllocationStats allocation_stats() const;
   bool SafeToDestroyResources() const;
+  bool shader_float64_enabled() const noexcept {
+    return context_ && context_->shader_float64_enabled;
+  }
+  // Setup-only tightening of the caller's whole-context reservation. Counts
+  // every VulkanBuffer allocation across graph, leaf, history and staging.
+  bool ConfigureAllocationLimits(VkDeviceSize bytes, std::uint64_t resources,
+                                 std::string *error_out);
 
   bool FindMemoryType(std::uint32_t type_bits, VkFlags required_flags,
                       VkFlags preferred_flags, std::uint32_t *type_index,

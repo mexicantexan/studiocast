@@ -1,4 +1,5 @@
 #include "core/open_video/vulkan_matting_runtime.h"
+#include "core/vulkan/resident_command_batch.h"
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
 #include "core/open_video/model_pack_registry.h"
 #include "core/open_video/ncnn_vulkan_context.h"
@@ -147,6 +148,9 @@ struct Program {
   std::unique_ptr<ncnn::Extractor> extractor;
   ncnn::VkMat input, output;
   ncnn::VkBufferMemory external_input{};
+  vk::ResidentCommandTicket ticket{};
+  bool queued = false, unsafe = false;
+  std::uint64_t inference_count = 0, completion_count = 0;
   vk::VkCommandBuffer prefix = nullptr, suffix = nullptr,
                       initialization = nullptr;
   std::array<vk::VkCommandBuffer, 3> commands{};
@@ -179,7 +183,7 @@ public:
   }
   ~NcnnVulkanMattingRuntime() override {
     if (program_ && program_->context &&
-        !program_->context->SafeToDestroyChildren())
+        (program_->queued || !program_->context->SafeToDestroyChildren()))
       Quarantine(std::move(program_));
   }
   Result ConfigureResourceBudget(
@@ -434,12 +438,13 @@ public:
       return DriverFailure(error);
     evidence_.warmup_complete = true;
     ++evidence_.warmup_inference_count;
-    ++evidence_.completion_count;
+    ++program_->completion_count;
     return Result::Success();
   }
   Result Run(const VulkanMattingBufferBinding &input,
              const VulkanMattingBufferBinding &alpha) override {
-    if (input.buffer != resources_.input_buffer ||
+    if (program_->queued || program_->unsafe ||
+        input.buffer != resources_.input_buffer ||
         alpha.buffer != resources_.alpha_buffer ||
         input.byte_offset != resources_.input_offset ||
         alpha.byte_offset != resources_.alpha_offset)
@@ -448,17 +453,62 @@ public:
     std::string error;
     if (!device_->SubmitAndWait(program_->commands.data(), 3, &error))
       return DriverFailure(error);
-    ++evidence_.inference_count;
-    ++evidence_.completion_count;
+    ++program_->inference_count;
+    ++program_->completion_count;
     return Result::Success();
   }
-  VulkanMattingRuntimeEvidence Evidence() const override { return evidence_; }
+  Result Enqueue(const VulkanMattingBufferBinding &input,
+                 const VulkanMattingBufferBinding &alpha,
+                 vk::ResidentCommandBatch &batch) override {
+    if (!program_ || !evidence_.warmup_complete || program_->queued ||
+        program_->unsafe ||
+        batch.context_identity() != program_->context->identity ||
+        input.buffer != resources_.input_buffer ||
+        alpha.buffer != resources_.alpha_buffer ||
+        input.byte_offset != resources_.input_offset ||
+        alpha.byte_offset != resources_.alpha_offset)
+      return Fail(Failure::context_generation_mismatch,
+                  "Invalid/stale queued matting binding");
+    vk::ResidentCommandGroup group;
+    group.context = program_->context->identity;
+    group.commands = program_->commands.data();
+    group.count = 3;
+    group.owner = program_.get();
+    group.owner_generation = group.context.generation;
+    group.on_completion =
+        [](void *opaque, const vk::ResidentCommandTicket &ticket,
+           vk::ResidentCommandCompletion completion) noexcept {
+          auto &p = *static_cast<Program *>(opaque);
+          if (!p.queued || !(p.ticket == ticket))
+            return;
+          if (completion == vk::ResidentCommandCompletion::unsafe_pending) {
+            p.unsafe = true;
+            return;
+          }
+          p.queued = false;
+          if (completion == vk::ResidentCommandCompletion::completed &&
+              !p.unsafe) {
+            ++p.inference_count;
+            ++p.completion_count;
+          }
+        };
+    std::string error;
+    if (!batch.Append(group, &program_->ticket, &error))
+      return Fail(Failure::execution_failed, error);
+    program_->queued = true;
+    return Result::Success();
+  }
+  VulkanMattingRuntimeEvidence Evidence() const override {
+    auto out = evidence_;
+    RefreshExecutionEvidence(&out);
+    return out;
+  }
   void
   RefreshExecutionEvidence(VulkanMattingRuntimeEvidence *out) const override {
     out->warmup_complete = evidence_.warmup_complete;
     out->warmup_inference_count = evidence_.warmup_inference_count;
-    out->inference_count = evidence_.inference_count;
-    out->completion_count = evidence_.completion_count;
+    out->inference_count = program_ ? program_->inference_count : 0;
+    out->completion_count = program_ ? program_->completion_count : 0;
     out->dynamic_allocation_count = evidence_.dynamic_allocation_count;
     out->cpu_readback_count = evidence_.cpu_readback_count;
     out->cpu_layers_used = evidence_.cpu_layers_used;

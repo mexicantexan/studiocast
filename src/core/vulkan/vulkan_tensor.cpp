@@ -20,8 +20,7 @@ void ResetSize(VulkanTensorSize *size_out) {
 
 } // namespace
 
-bool CheckedNchwF32Size(int n, int c, int h, int w,
-                        VulkanTensorSize *size_out,
+bool CheckedNchwF32Size(int n, int c, int h, int w, VulkanTensorSize *size_out,
                         std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -61,7 +60,8 @@ VulkanTensor::~VulkanTensor() { Free(); }
 
 bool VulkanTensor::AllocateNchwF32(VulkanDevice *device, int n_in, int c_in,
                                    int h_in, int w_in, bool map_memory,
-                                   std::string *error_out) {
+                                   std::string *error_out,
+                                   VkDeviceSize allocation_limit) {
   Free();
   VulkanTensorSize size;
   if (!CheckedNchwF32Size(n_in, c_in, h_in, w_in, &size, error_out))
@@ -79,7 +79,7 @@ bool VulkanTensor::AllocateNchwF32(VulkanDevice *device, int n_in, int c_in,
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                          required_memory_flags, preferred_memory_flags,
-                         map_memory, error_out)) {
+                         map_memory, error_out, allocation_limit)) {
     return false;
   }
 
@@ -102,8 +102,8 @@ void VulkanTensor::Free() noexcept {
 
 bool VulkanTensor::Valid() const {
   VulkanTensorSize size;
-  return storage_.Valid() && CheckedNchwF32Size(n_, c_, h_, w_, &size,
-                                                nullptr) &&
+  return storage_.Valid() &&
+         CheckedNchwF32Size(n_, c_, h_, w_, &size, nullptr) &&
          bytes_ == size.bytes && storage_.size() >= bytes_;
 }
 

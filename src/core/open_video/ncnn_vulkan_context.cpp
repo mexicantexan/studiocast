@@ -18,10 +18,22 @@ template <class To, class From> To Handle(From value) {
 } // namespace
 #endif
 namespace studiocast::open_vulkan {
+bool ValidateProductionVulkanCoreFeatures(bool require_shader_float64,
+                                          bool shader_float64_supported,
+                                          std::string *error_out) {
+  if (!require_shader_float64 || shader_float64_supported)
+    return true;
+  if (error_out)
+    *error_out = "[vulkan_shader_float64_unavailable] GPU dlib requires "
+                 "enabled shaderFloat64.";
+  return false;
+}
+
 bool InitializeProductionVulkanMattingDevice(
     vulkan::VulkanDevice *device,
     const vulkan::VulkanDeviceSelection &selection,
-    const vulkan::VulkanDeviceConfig &config, std::string *error_out) {
+    const vulkan::VulkanDeviceConfig &config, std::string *error_out,
+    bool require_shader_float64) {
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
   if (!device || device->Initialized()) {
     if (error_out)
@@ -78,6 +90,11 @@ bool InitializeProductionVulkanMattingDevice(
       *error_out = "Selected Vulkan device is unavailable to ncnn.";
     return false;
   }
+  if (!ValidateProductionVulkanCoreFeatures(
+          require_shader_float64,
+          ncnn::get_gpu_info(index).physicalDevicefeatures().shaderFloat64,
+          error_out))
+    return false;
   owner->device = std::make_unique<ncnn::VulkanDevice>(index, true);
   if (!owner->device->is_valid()) {
     if (error_out)
@@ -95,11 +112,26 @@ bool InitializeProductionVulkanMattingDevice(
   adopted.queue_family_index = owner->device->info.compute_queue_family_index();
   adopted.owner = owner;
   adopted.owner_kind = detail::kNcnnOwnerKind;
+  adopted.shader_float64_attestation = [](const void *value,
+                                          vulkan::VkDevice logical) noexcept {
+    const auto &native = *static_cast<const detail::NcnnVulkanContext *>(value);
+    // Pinned ncnn passes physicalDevicefeatures() unchanged to pEnabledFeatures
+    // immediately before vkCreateDevice. Successful creation proves enablement.
+    return native.device && native.device->is_valid() &&
+           Handle<vulkan::VkDevice>(native.device->vkdevice()) == logical &&
+           native.device->info.physicalDevicefeatures().shaderFloat64;
+  };
   if (!device->InitializeAdopted(selection, config, std::move(adopted),
                                  error_out))
     return false;
+  const auto context =
+      std::static_pointer_cast<vulkan::detail::VulkanContextState>(
+          device->RetainContext());
   VkCommandBuffer dummy = VK_NULL_HANDLE;
   if (owner->device->studiocast_initialize_dummy(&dummy) != 0 ||
+      !context->ReserveAllocation(
+          owner->device->studiocast_dummy_allocation_bytes(), error_out,
+          owner->device->studiocast_dummy_allocation_count()) ||
       !device->SubmitAndWait(Handle<vulkan::VkCommandBuffer>(dummy), error_out))
     return false;
   const auto buffer = owner->device->get_dummy_buffer();
@@ -111,6 +143,7 @@ bool InitializeProductionVulkanMattingDevice(
   }
   return true;
 #else
+  (void)require_shader_float64;
   (void)device;
   (void)selection;
   (void)config;
