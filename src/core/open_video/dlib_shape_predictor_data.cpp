@@ -17,6 +17,7 @@ namespace {
 class SnapshotStream final : public std::streambuf {
 public:
   explicit SnapshotStream(std::FILE *file) : file_(file) {}
+
 private:
   int_type underflow() override {
     if (gptr() && gptr() < egptr())
@@ -97,7 +98,7 @@ bool LoadDlibPredictorData(const ModelPack &pack,
     if (!validation.ok() || !(validation.identity == artifact))
       throw std::runtime_error("selected dlib predictor identity mismatch");
     auto snapshot = OpenVerifiedModelFileSnapshot(file->path, file->sha256,
-                                                 maximum_bytes, error);
+                                                  maximum_bytes, error);
     if (!snapshot)
       return false;
     SnapshotStream stream(snapshot.get());
@@ -131,7 +132,8 @@ bool LoadDlibPredictorData(const ModelPack &pack,
         for (unsigned long s = 0; s < count; ++s) {
           const auto a = reader.Count(), b = reader.Count();
           data.splits.push_back({static_cast<std::uint32_t>(a),
-                                 static_cast<std::uint32_t>(b), reader.Scalar()});
+                                 static_cast<std::uint32_t>(b),
+                                 reader.Scalar()});
         }
         const auto leaves = reader.Count();
         if (!leaves || leaves != count + 1 || (leaves & (leaves - 1)))
@@ -146,10 +148,13 @@ bool LoadDlibPredictorData(const ModelPack &pack,
             data.leaves.size() / 136 >
                 std::numeric_limits<std::uint32_t>::max())
           throw std::runtime_error("dlib flattened table offset overflow");
-        data.tree_splits.push_back(static_cast<std::uint32_t>(data.splits.size()));
-        data.tree_leaves.push_back(static_cast<std::uint32_t>(data.leaves.size() / 136));
+        data.tree_splits.push_back(
+            static_cast<std::uint32_t>(data.splits.size()));
+        data.tree_leaves.push_back(
+            static_cast<std::uint32_t>(data.leaves.size() / 136));
       }
-      data.cascade_trees.push_back(static_cast<std::uint32_t>(data.tree_splits.size() - 1));
+      data.cascade_trees.push_back(
+          static_cast<std::uint32_t>(data.tree_splits.size() - 1));
     }
     if (reader.Count() != cascades)
       throw std::runtime_error("dlib feature cascade count mismatch");
@@ -165,14 +170,17 @@ bool LoadDlibPredictorData(const ModelPack &pack,
           throw std::runtime_error("invalid dlib feature anchor");
         data.feature_anchors.push_back(static_cast<std::uint32_t>(anchor));
       }
-      if (data.feature_anchors.size() > std::numeric_limits<std::uint32_t>::max())
+      if (data.feature_anchors.size() >
+          std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("dlib feature table offset overflow");
-      data.cascade_features.push_back(static_cast<std::uint32_t>(data.feature_anchors.size()));
-      data.maximum_features = std::max(data.maximum_features,
-                                       static_cast<std::uint32_t>(count));
+      data.cascade_features.push_back(
+          static_cast<std::uint32_t>(data.feature_anchors.size()));
+      data.maximum_features =
+          std::max(data.maximum_features, static_cast<std::uint32_t>(count));
       for (auto t = data.cascade_trees[c]; t < data.cascade_trees[c + 1]; ++t)
         for (auto s = data.tree_splits[t]; s < data.tree_splits[t + 1]; ++s)
-          if (data.splits[s].feature_a >= count || data.splits[s].feature_b >= count)
+          if (data.splits[s].feature_a >= count ||
+              data.splits[s].feature_b >= count)
             throw std::runtime_error("invalid dlib split feature index");
     }
     if (reader.Count() != cascades)
@@ -187,11 +195,12 @@ bool LoadDlibPredictorData(const ModelPack &pack,
         data.feature_deltas.push_back({x, y});
       }
     }
-    if (in.peek() != std::char_traits<char>::eof() || std::ferror(snapshot.get()))
+    if (in.peek() != std::char_traits<char>::eof() ||
+        std::ferror(snapshot.get()))
       throw std::runtime_error("dlib predictor trailing bytes/read failure");
-    dlib::matrix<double, 3, 3> basis;
+    dlib::matrix<double, 3, 0> basis(3, 3);
     basis = 0, 1, 1, 0, 0, 1, 1, 1, 1;
-    const dlib::matrix<double, 3, 3> inverse = dlib::pinv(basis);
+    const dlib::matrix<double, 0, 3> inverse = dlib::pinv(basis);
     for (int r = 0; r < 3; ++r)
       for (int c = 0; c < 3; ++c)
         data.rectangle_basis_pseudoinverse[r * 3 + c] = inverse(r, c);

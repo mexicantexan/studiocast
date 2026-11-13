@@ -81,9 +81,9 @@ public:
   bool AppendEyeInputs(vulkan::ResidentCommandBatch &,
                        const vulkan::VulkanImage &, std::string *error);
   bool AppendEyeTailAndComposite(vulkan::ResidentCommandBatch &,
-                                const vulkan::VulkanImage &,
-                                const vulkan::VulkanImage &output,
-                                std::string *error);
+                                 const vulkan::VulkanImage &,
+                                 const vulkan::VulkanImage &output,
+                                 std::string *error);
   bool AppendAutoFrame(vulkan::ResidentCommandBatch &,
                        const vulkan::VulkanImage &,
                        const vulkan::VulkanImage *alpha,
