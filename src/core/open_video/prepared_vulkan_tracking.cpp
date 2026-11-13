@@ -639,8 +639,7 @@ bool PreparedVulkanTracking::AppendAutoFrame(
   plan.parameters[20] = alpha ? alpha->width() : 0;
   plan.parameters[21] = alpha ? alpha->height() : 0;
   plan.parameters[23] = alpha ? 1 : 0;
-  // A supplied current-frame matte is shared analysis; consume it immediately.
-  plan.parameters[24] = alpha ? 1 : 0;
+  plan.parameters[24] = alpha && p.setup.matte_shared_current_frame ? 1 : 0;
   auto &crop = commands[count++];
   crop = p.Dispatch(9);
   crop.buffers[0] = Bind(image);

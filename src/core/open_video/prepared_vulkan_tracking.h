@@ -40,6 +40,10 @@ struct PreparedVulkanTrackingSetup {
   float auto_frame_headroom = .15F;
   int vignette_intensity = 0;
   bool vignette_tracked_center = false;
+  // True only when another enabled effect produces the compatible same-frame
+  // matte. Auto Frame's always-enqueued fallback graph alone remains on the
+  // established ten-capture-sequence bounds-update cadence.
+  bool matte_shared_current_frame = false;
   const open_video::DlibPredictorData *predictor = nullptr;
   open_video::ValidatedModelArtifactIdentity face_artifact{};
   open_video::ValidatedModelArtifactIdentity landmark_artifact{};
