@@ -104,6 +104,16 @@ on:
         required: false
         type: string
         default: ''
+      require_vulkan_model_effects_runtime:
+        description: "Run the full resident Vulkan model-effects matrix and cold diagnostics on a preprovisioned GPU runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_model_effects_face_path:
+        description: "Preinstalled local face-positive JPEG fixture expected by the production smoke; never downloaded or uploaded."
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -509,6 +519,114 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vulkan-matting-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
+
+  vulkan-model-effects-production:
+    name: Production Vulkan model effects (opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_model_effects_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_matting_runner_labels || '["ubuntu-24.04"]') }}
+    env:
+      VULKAN_NCNN_PREFIX: ${{ inputs.vulkan_ncnn_prefix }}
+      VULKAN_MODEL_ROOT: ${{ inputs.vulkan_matting_model_root }}
+      VULKAN_MODEL_ID: ${{ inputs.vulkan_matting_model_id }}
+      VULKAN_REPLACE_PATH: ${{ inputs.vulkan_matting_replace_path }}
+      VULKAN_FACE_PATH: ${{ inputs.vulkan_model_effects_face_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure production Vulkan model effects
+        run: |
+          set -euo pipefail
+          : "${VULKAN_NCNN_PREFIX:?Provide the preinstalled pinned patched ncnn prefix}"
+          : "${VULKAN_MODEL_ROOT:?Provide the complete preinstalled read-only model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          : "${VULKAN_FACE_PATH:?Provide the preinstalled hash-verified face-positive JPEG fixture}"
+          [[ "${VULKAN_NCNN_PREFIX}" == /* ]]
+          test -d "${VULKAN_NCNN_PREFIX}"
+          for sdk_file in lib/cmake/ncnn/ncnnConfig.cmake lib/libncnn.a \
+            share/licenses/studiocast-ncnn/dependency.json \
+            share/licenses/studiocast-ncnn/ncnn-LICENSE.txt \
+            share/licenses/studiocast-ncnn/glslang-LICENSE.txt; do
+            test -f "${VULKAN_NCNN_PREFIX}/${sdk_file}"
+            test -r "${VULKAN_NCNN_PREFIX}/${sdk_file}"
+          done
+          model_root="$(realpath -e -- "${VULKAN_MODEL_ROOT}")"
+          [[ "${model_root}" == /*/studiocast/models/open_video ]]
+          test -d "${model_root}"
+          test -r "${model_root}"
+          test -f "${VULKAN_REPLACE_PATH}"
+          test -r "${VULKAN_REPLACE_PATH}"
+          test -f "${VULKAN_FACE_PATH}"
+          test -r "${VULKAN_FACE_PATH}"
+          mkdir -p build/qualification
+          git rev-parse HEAD > build/qualification/source.txt
+          sha256sum -- "${VULKAN_FACE_PATH}" "${VULKAN_REPLACE_PATH}" \
+            "${VULKAN_NCNN_PREFIX}/share/licenses/studiocast-ncnn/dependency.json" \
+            > build/qualification/preinstalled-inputs.sha256
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -Dncnn_DIR="${VULKAN_NCNN_PREFIX}/lib/cmake/ncnn" \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF \
+            2>&1 | tee build/qualification/configure.log
+          grep -Eq '^STUDIOCAST_DLIB_AVAILABLE:INTERNAL=(TRUE|ON|1)$' build/CMakeCache.txt
+          grep -E '^CMAKE_BUILD_TYPE:STRING=|^STUDIOCAST_DLIB_AVAILABLE:INTERNAL=|^STUDIOCAST_ENABLE_(OPEN_CUDA|CUDA_KERNELS|OPEN_VULKAN|OPEN_AUDIO|NCNN_VULKAN_MATTING|DLIB):BOOL=' \
+            build/CMakeCache.txt > build/qualification/build-options.txt
+
+      - name: Build production Vulkan model effects validation
+        run: |
+          set -euo pipefail
+          cmake --build build --target \
+            studiocast-vulkan-effects-production-smoke \
+            studiocast-vulkan-model-diagnostics-tests \
+            2>&1 | tee build/qualification/build.log
+
+      - name: Required production Vulkan model effects validation
+        run: |
+          set -euo pipefail
+          : "${VULKAN_MODEL_ROOT:?Provide the complete preinstalled read-only model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          : "${VULKAN_FACE_PATH:?Provide the preinstalled face-positive JPEG fixture}"
+          model_root="$(realpath -e -- "${VULKAN_MODEL_ROOT}")"
+          [[ "${model_root}" == /*/studiocast/models/open_video ]]
+          test -d "${model_root}"
+          test -r "${model_root}"
+          test -f "${VULKAN_REPLACE_PATH}"
+          test -r "${VULKAN_REPLACE_PATH}"
+          test -f "${VULKAN_FACE_PATH}"
+          test -r "${VULKAN_FACE_PATH}"
+          test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/studiocast-vulkan-models.XXXXXX")"
+          mkdir -p "${test_root}"/{home,config,cache,state}
+          export HOME="${test_root}/home" XDG_CONFIG_HOME="${test_root}/config" \
+            XDG_CACHE_HOME="${test_root}/cache" XDG_STATE_HOME="${test_root}/state"
+          model_data_home="${model_root%/studiocast/models/open_video}"
+          export XDG_DATA_HOME="${model_data_home:-/}"
+          mkdir -p build/qualification
+          vulkaninfo --summary 2>&1 | tee build/qualification/vulkan-summary.log
+          STUDIOCAST_REQUIRE_VULKAN_MODEL_DIAGNOSTICS=1 \
+            ./build/studiocast-vulkan-model-diagnostics-tests \
+            2>&1 | tee build/qualification/model-diagnostics.log
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-effects-production-smoke --require \
+              --model-root "${model_root}" --model-id "${VULKAN_MODEL_ID}" \
+              --replace-path "${VULKAN_REPLACE_PATH}" --face-path "${VULKAN_FACE_PATH}" \
+              --frames 3 \
+              2>&1 | tee build/qualification/model-effects-production.log
+
+      - name: Preserve Vulkan model effects qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-model-effects-qualification-${{ github.sha }}
           path: build/qualification/
           if-no-files-found: ignore
 

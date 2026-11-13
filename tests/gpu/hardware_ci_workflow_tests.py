@@ -26,6 +26,7 @@ class HardwareWorkflowTests(unittest.TestCase):
     def test_hardware_jobs_are_explicit_dispatch_opt_ins(self):
         inputs = {"cuda-runtime-smoke": "require_cuda_runtime"}
         inputs["vulkan-matting-production"] = "require_vulkan_matting_runtime"
+        inputs["vulkan-model-effects-production"] = "require_vulkan_model_effects_runtime"
         inputs.update({f"vulkan-runtime-smoke-{vendor}":
                        f"require_vulkan_{vendor}_runtime"
                        for vendor in ("nvidia", "amd", "intel")})
@@ -118,6 +119,199 @@ class HardwareWorkflowTests(unittest.TestCase):
             self.assertNotEqual(0, subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", script], cwd=root, env=env,
                 capture_output=True, text=True).returncode)
+
+    def vulkan_models_fixture(self, root):
+        (root / "bin").mkdir()
+        (root / "build/qualification").mkdir(parents=True)
+        sdk = root / "sdk $(touch escaped); 'prefix'"
+        sdk_files = ("lib/cmake/ncnn/ncnnConfig.cmake", "lib/libncnn.a",
+                     "share/licenses/studiocast-ncnn/dependency.json",
+                     "share/licenses/studiocast-ncnn/ncnn-LICENSE.txt",
+                     "share/licenses/studiocast-ncnn/glslang-LICENSE.txt")
+        for relative in sdk_files:
+            path = sdk / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"preinstalled SDK fixture")
+        model_root = root / "model root $(touch escaped)/studiocast/models/open_video"
+        model_root.mkdir(parents=True)
+        face = root / "face $(touch escaped); 'local'.jpg"
+        replacement = root / "replacement '$(touch escaped)'.png"
+        face.write_bytes(b"local face fixture")
+        replacement.write_bytes(b"preinstalled replacement fixture")
+        runner_temp = root / "runner temp"
+        runner_temp.mkdir()
+        env = dict(os.environ, HOME=str(root / "original-home"),
+                   XDG_DATA_HOME=str(root / "original-data"),
+                   XDG_CONFIG_HOME=str(root / "original-config"),
+                   XDG_CACHE_HOME=str(root / "original-cache"),
+                   XDG_STATE_HOME=str(root / "original-state"),
+                   PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                   RUNNER_TEMP=str(runner_temp), VULKAN_NCNN_PREFIX=str(sdk),
+                   VULKAN_MODEL_ROOT=str(model_root), VULKAN_MODEL_ID="model'; touch escaped; #\nsecond line",
+                   VULKAN_REPLACE_PATH=str(replacement), VULKAN_FACE_PATH=str(face),
+                   CMAKE_INVOCATIONS=str(root / "cmake-calls"), SMOKE_INVOCATIONS=str(root / "smoke-calls"),
+                   DIAGNOSTICS_ENV=str(root / "diagnostics-env"), SMOKE_ENV=str(root / "smoke-env"),
+                   FAKE_CONFIGURE_EXIT="0", FAKE_BUILD_EXIT="0", FAKE_DLIB_RECEIPT="TRUE",
+                   FAKE_DIAGNOSTICS_EXIT="0", FAKE_SMOKE_EXIT="0", FAKE_INVENTORY_EXIT="0")
+        scripts = {
+            "bin/cmake": '#!/bin/bash\nprintf "%s\\0" "$@" > "$CMAKE_INVOCATIONS"\n'
+                'if [[ "${1:-}" == --build ]]; then exit "$FAKE_BUILD_EXIT"; fi\n'
+                'printf "CMAKE_BUILD_TYPE:STRING=Release\\nSTUDIOCAST_DLIB_AVAILABLE:INTERNAL=%s\\n" '
+                '"$FAKE_DLIB_RECEIPT" > build/CMakeCache.txt\n'
+                'printf "fixture configure output\\n"\nexit "$FAKE_CONFIGURE_EXIT"\n',
+            "bin/git": '#!/bin/bash\nprintf "fixture source SHA\\n"\n',
+            "bin/vulkaninfo": '#!/bin/bash\nprintf "fixture Vulkan device evidence\\n"\nexit "$FAKE_INVENTORY_EXIT"\n',
+            "build/studiocast-vulkan-model-diagnostics-tests": '#!/bin/bash\n'
+                '[[ "$STUDIOCAST_REQUIRE_VULKAN_MODEL_DIAGNOSTICS" == 1 ]] || exit 99\n'
+                'printf "%s\\0" "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" '
+                '"$XDG_STATE_HOME" > "$DIAGNOSTICS_ENV"\n'
+                'printf "fixture native cold diagnostics\\n"\nexit "$FAKE_DIAGNOSTICS_EXIT"\n',
+            "build/studiocast-vulkan-effects-production-smoke": '#!/bin/bash\n'
+                '[[ "$STUDIOCAST_REQUIRE_VULKAN_RUNTIME" == 1 ]] || exit 99\n'
+                'printf "%s\\0" "$@" > "$SMOKE_INVOCATIONS"\n'
+                'printf "%s\\0" "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" '
+                '"$XDG_STATE_HOME" > "$SMOKE_ENV"\n'
+                'printf "fixture native full matrix\\n"\nexit "$FAKE_SMOKE_EXIT"\n',
+        }
+        for relative, script in scripts.items():
+            path = root / relative
+            path.write_text(script)
+            path.chmod(0o755)
+        return env, sdk_files
+
+    def test_full_vulkan_models_job_uses_only_preinstalled_inputs_and_exact_dlib_receipt(self):
+        job = "vulkan-model-effects-production"
+        block = JOBS[job]
+        for forbidden in ("apt-get", "curl ", "wget ", "scripts/setup.sh", "continue-on-error"):
+            self.assertNotIn(forbidden, block)
+        self.assertIn("inputs.vulkan_matting_runner_labels", block)
+        for variable, input_name in (("VULKAN_NCNN_PREFIX", "vulkan_ncnn_prefix"),
+                                     ("VULKAN_MODEL_ROOT", "vulkan_matting_model_root"),
+                                     ("VULKAN_MODEL_ID", "vulkan_matting_model_id"),
+                                     ("VULKAN_REPLACE_PATH", "vulkan_matting_replace_path"),
+                                     ("VULKAN_FACE_PATH", "vulkan_model_effects_face_path")):
+            self.assertIn(variable + ": ${{ inputs." + input_name + " }}", block)
+        self.assertIn("if: ${{ always() }}", block)
+        self.assertIn("path: build/qualification/", block)
+        configure = run_step(job, "Configure production Vulkan model effects")
+        self.assertNotIn("${{", configure)
+        with tempfile.TemporaryDirectory(prefix="studiocast-vulkan-models-configure-") as directory:
+            root = Path(directory)
+            env, sdk_files = self.vulkan_models_fixture(root)
+            calls = root / "cmake-calls"
+            def invoke(**overrides):
+                calls.unlink(missing_ok=True)
+                return subprocess.run(["bash", "-c", configure], cwd=root, env=env | overrides,
+                                      capture_output=True, text=True)
+            for code in (0, 1, 77):
+                with self.subTest(configure_exit=code):
+                    result = invoke(FAKE_CONFIGURE_EXIT=str(code))
+                    self.assertEqual(code, result.returncode, result.stderr)
+                    arguments = calls.read_bytes().decode().split("\0")[:-1]
+                    self.assertIn("-Dncnn_DIR=" + env["VULKAN_NCNN_PREFIX"] + "/lib/cmake/ncnn", arguments)
+                    for flag in ("OPEN_CUDA=OFF", "CUDA_KERNELS=OFF", "OPEN_AUDIO=OFF", "DLIB=ON",
+                                 "OPEN_VULKAN=ON", "NCNN_VULKAN_MATTING=ON"):
+                        self.assertIn("-DSTUDIOCAST_ENABLE_" + flag, arguments)
+                    self.assertIn("-DCMAKE_BUILD_TYPE=Release", arguments)
+                    self.assertIn("fixture configure output", (root / "build/qualification/configure.log").read_text())
+                    self.assertFalse((root / "escaped").exists())
+            for receipt in ("", "FALSE", "OFF", "0", "true", "NOTFOUND"):
+                with self.subTest(missing_dlib=receipt):
+                    self.assertNotEqual(0, invoke(FAKE_DLIB_RECEIPT=receipt).returncode)
+            for receipt in ("TRUE", "ON", "1"):
+                self.assertEqual(0, invoke(FAKE_DLIB_RECEIPT=receipt).returncode)
+            missing = [{key: ""} for key in ("VULKAN_NCNN_PREFIX", "VULKAN_MODEL_ROOT", "VULKAN_MODEL_ID",
+                                             "VULKAN_REPLACE_PATH", "VULKAN_FACE_PATH")]
+            wrong_root = root / "wrong-shape"
+            wrong_root.mkdir()
+            missing += [{"VULKAN_NCNN_PREFIX": str(root / "absent-sdk")},
+                        {"VULKAN_MODEL_ROOT": str(root / "absent-models")},
+                        {"VULKAN_MODEL_ROOT": str(wrong_root)},
+                        {"VULKAN_FACE_PATH": str(root / "absent.jpg")},
+                        {"VULKAN_FACE_PATH": str(root)},
+                        {"VULKAN_REPLACE_PATH": str(root / "absent.png")},
+                        {"VULKAN_REPLACE_PATH": str(root)}]
+            for overrides in missing:
+                with self.subTest(missing=overrides):
+                    self.assertNotEqual(0, invoke(**overrides).returncode)
+                    self.assertFalse(calls.exists())
+            for relative in sdk_files:
+                source = Path(env["VULKAN_NCNN_PREFIX"]) / relative
+                saved = source.read_bytes()
+                source.unlink()
+                with self.subTest(missing_sdk_file=relative):
+                    self.assertNotEqual(0, invoke().returncode)
+                    self.assertFalse(calls.exists())
+                source.write_bytes(saved)
+            self.assertTrue((root / "build/qualification/source.txt").is_file())
+            self.assertTrue((root / "build/qualification/preinstalled-inputs.sha256").is_file())
+
+    def test_full_vulkan_models_build_and_native_steps_propagate_every_failure(self):
+        job = "vulkan-model-effects-production"
+        build = run_step(job, "Build production Vulkan model effects validation")
+        native = run_step(job, "Required production Vulkan model effects validation")
+        self.assertNotIn("${{", native)
+        self.assertNotIn("ctest", native)
+        with tempfile.TemporaryDirectory(prefix="studiocast-vulkan-models-native-") as directory:
+            root = Path(directory)
+            env, _ = self.vulkan_models_fixture(root)
+            for code in (0, 1, 77):
+                result = subprocess.run(["bash", "-c", build], cwd=root, env=env | {"FAKE_BUILD_EXIT": str(code)},
+                                        capture_output=True, text=True)
+                self.assertEqual(code, result.returncode, result.stderr)
+                arguments = (root / "cmake-calls").read_bytes().decode().split("\0")[:-1]
+                self.assertEqual(["--build", "build", "--target", "studiocast-vulkan-effects-production-smoke",
+                                  "studiocast-vulkan-model-diagnostics-tests"], arguments)
+            expected_args = ["--require", "--model-root", str(Path(env["VULKAN_MODEL_ROOT"]).resolve()),
+                             "--model-id", env["VULKAN_MODEL_ID"], "--replace-path", env["VULKAN_REPLACE_PATH"],
+                             "--face-path", env["VULKAN_FACE_PATH"], "--frames", "3"]
+            def invoke(**overrides):
+                for name in ("smoke-calls", "diagnostics-env", "smoke-env"):
+                    (root / name).unlink(missing_ok=True)
+                return subprocess.run(["bash", "-c", native], cwd=root, env=env | overrides,
+                                      capture_output=True, text=True)
+            for diagnostics, smoke, expected in ((0, 0, 0), (1, 0, 1), (77, 0, 77), (0, 1, 1), (0, 77, 77)):
+                with self.subTest(diagnostics=diagnostics, smoke=smoke):
+                    result = invoke(FAKE_DIAGNOSTICS_EXIT=str(diagnostics), FAKE_SMOKE_EXIT=str(smoke))
+                    self.assertEqual(expected, result.returncode, result.stderr)
+                    self.assertTrue((root / "build/qualification/model-diagnostics.log").exists())
+                    if diagnostics:
+                        self.assertFalse((root / "smoke-calls").exists())
+                        continue
+                    self.assertEqual(expected_args, (root / "smoke-calls").read_bytes().decode().split("\0")[:-1])
+                    cold_env = (root / "diagnostics-env").read_bytes().decode().split("\0")[:-1]
+                    smoke_env = (root / "smoke-env").read_bytes().decode().split("\0")[:-1]
+                    self.assertEqual(cold_env, smoke_env)
+                    self.assertEqual(str(Path(env["VULKAN_MODEL_ROOT"]).parents[2]), cold_env[1])
+                    self.assertTrue(Path(cold_env[0]).is_relative_to(Path(env["RUNNER_TEMP"])))
+                    isolated = Path(cold_env[0]).parent
+                    self.assertEqual([str(isolated / name) for name in ("config", "cache", "state")], cold_env[2:])
+                    self.assertNotEqual(env["HOME"], cold_env[0])
+                    self.assertFalse((root / "escaped").exists())
+                    self.assertTrue((root / "build/qualification/model-effects-production.log").exists())
+            self.assertEqual(1, invoke(FAKE_INVENTORY_EXIT="1").returncode)
+            self.assertFalse((root / "diagnostics-env").exists())
+            missing = [{key: ""} for key in
+                       ("VULKAN_MODEL_ROOT", "VULKAN_MODEL_ID", "VULKAN_REPLACE_PATH", "VULKAN_FACE_PATH")]
+            missing += [{"VULKAN_MODEL_ROOT": str(root)},
+                        {"VULKAN_MODEL_ROOT": str(root / "absent")},
+                        {"VULKAN_REPLACE_PATH": str(root / "absent.png")},
+                        {"VULKAN_REPLACE_PATH": str(root)},
+                        {"VULKAN_FACE_PATH": str(root / "absent.jpg")},
+                        {"VULKAN_FACE_PATH": str(root)}]
+            for overrides in missing:
+                with self.subTest(native_prerequisite=overrides):
+                    result = invoke(**overrides)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertFalse((root / "diagnostics-env").exists())
+                    self.assertFalse((root / "smoke-calls").exists())
+            for binary_name in ("studiocast-vulkan-model-diagnostics-tests", "studiocast-vulkan-effects-production-smoke"):
+                binary = root / "build" / binary_name
+                saved = binary.read_bytes()
+                binary.unlink()
+                self.assertNotEqual(0, invoke().returncode)
+                binary.write_bytes(saved)
+                binary.chmod(0o755)
 
     def test_cuda_configuration_requires_available_dlib(self):
         script = run_step("cuda-runtime-smoke", "Configure (Open CUDA runtime validation)")
