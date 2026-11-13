@@ -75,6 +75,7 @@ hal::ExecutionDomainId Domain() {
 
 struct RunnerState {
   std::uint64_t calls = 0;
+  bool fail_required = false;
 };
 
 bool RunStage(void *opaque, const video::CanonicalVideoStage &stage,
@@ -84,7 +85,7 @@ bool RunStage(void *opaque, const video::CanonicalVideoStage &stage,
   ++state->calls;
   if (stage.intent.semantic == hal::SemanticEffectId::video_noise_removal) {
     rgb[0] = 0x22;
-    return true;
+    return !state->fail_required;
   }
   rgb[0] = 0xff;
   if (error != nullptr)
@@ -216,18 +217,31 @@ bool TestFailedPublicationClearsCurrentAttributionOnly() {
     return false;
   const auto selected = executor->Snapshot();
   const auto second = executor->Execute(Binding(input, &output, 2));
-  auto forged = second.completion;
-  forged.complete = false;
+  const auto calls = state.calls;
+  const auto duplicate = executor->Execute(Binding(input, &output, 99));
   bool ok = Require(
-      second.output_ready &&
-          executor->CommitOutput(forged, false, &reason) ==
-              hal::StatusId::blocked &&
-          reason == hal::ReasonId::output_not_committed &&
-          executor->Snapshot().latest_committed_frame.valid &&
-          executor->Snapshot().latest_committed_frame.capture_sequence == 1 &&
-          executor->Snapshot().telemetry.active_provider ==
-              selected.telemetry.active_provider,
-      "forged failed commit must preserve valid pending/current attribution");
+      duplicate.status == hal::StatusId::blocked && state.calls == calls &&
+          executor->Snapshot().latest_committed_frame.valid,
+      "duplicate Execute must preserve pending/current publication");
+  std::array<hal::CompletionToken, 5> forged{};
+  forged.fill(second.completion);
+  ++forged[0].token_id;
+  ++forged[1].program_id;
+  ++forged[2].adapter_instance_id;
+  ++forged[3].capture_sequence;
+  forged[4].complete = false;
+  for (const auto &token : forged) {
+    ok &= Require(
+        second.output_ready &&
+            executor->CommitOutput(token, false, &reason) ==
+                hal::StatusId::blocked &&
+            reason == hal::ReasonId::output_not_committed &&
+            executor->Snapshot().latest_committed_frame.valid &&
+            executor->Snapshot().latest_committed_frame.capture_sequence == 1 &&
+            executor->Snapshot().telemetry.active_provider ==
+                selected.telemetry.active_provider,
+        "forged completion must preserve pending and current publication");
+  }
   ok &= Require(
       executor->CommitOutput(second.completion, false, &reason) ==
               hal::StatusId::failed &&
@@ -268,6 +282,123 @@ bool TestFailedPublicationClearsCurrentAttributionOnly() {
           executor->Snapshot().telemetry.active_provider ==
               selected.telemetry.active_provider,
       "next exact compatibility publication must recover current attribution");
+  return ok;
+}
+
+bool TestExecutionFailureAndCleanupClearOnlyCurrentActivity() {
+  bool ok = true;
+  for (const int boundary :
+       {0, 1, 2}) { // Required runner failure, invalidation, shutdown.
+    RunnerState state;
+    open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+    auto executor = open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+        Config(&state), &setup);
+    if (!Require(executor != nullptr, "activity fixture must prepare"))
+      return false;
+    std::array<std::byte, kFrameBytes> input{}, output{};
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto first = executor->Execute(Binding(input, &output, 1));
+    if (!Require(first.output_ready &&
+                     executor->CommitOutput(first.completion, true, &reason) ==
+                         hal::StatusId::ready,
+                 "activity fixture must first publish"))
+      return false;
+    const auto selected = executor->Snapshot();
+    std::array<hal::HostFrameBinding, 6> malformed{};
+    malformed.fill(Binding(input, &output, 2));
+    malformed[0].input_plane_count = 0;
+    malformed[1].input_planes[0].read_data = nullptr;
+    malformed[2].capture_sequence = 0;
+    ++malformed[3].input_descriptor.width;
+    --malformed[4].input_planes[0].span_bytes;
+    ++malformed[5].input_planes[0].row_stride_bytes;
+    const auto calls = state.calls;
+    for (const auto &binding : malformed) {
+      const auto rejected = executor->Execute(binding);
+      ok &= Require(
+          rejected.status == hal::StatusId::blocked &&
+              rejected.reason == hal::ReasonId::host_frame_binding_invalid &&
+              state.calls == calls &&
+              executor->Snapshot().latest_committed_frame.valid &&
+              executor->Snapshot().latest_committed_frame.capture_sequence ==
+                  1 &&
+              executor->Snapshot().telemetry.active_backend ==
+                  selected.telemetry.active_backend,
+          "foreign binding must not erase current publication or enter stages");
+    }
+    if (boundary == 0) {
+      state.fail_required = true;
+      const auto failed = executor->Execute(Binding(input, &output, 2));
+      ok &= Require(failed.status == hal::StatusId::failed &&
+                        failed.reason == hal::ReasonId::required_stage_failed &&
+                        !failed.output_ready && state.calls == calls + 1,
+                    "required stage must expose real execution failure");
+    } else if (boundary == 1) {
+      executor->Invalidate(hal::ReasonId::reconfiguration_required);
+    } else {
+      executor->Shutdown();
+    }
+    const auto failed = executor->Snapshot();
+    ok &= Require(
+        !failed.latest_committed_frame.valid &&
+            failed.telemetry.active_backend == hal::BackendId::invalid &&
+            failed.telemetry.active_provider ==
+                hal::SemanticEffectProviderId::invalid &&
+            failed.telemetry.committed_output_frames == 1 &&
+            failed.telemetry.active_backend_frames == 1 &&
+            failed.telemetry.selected_backend ==
+                selected.telemetry.selected_backend &&
+            failed.readiness.selected_backend ==
+                selected.readiness.selected_backend &&
+            failed.readiness.provider == selected.readiness.provider &&
+            failed.plan_id == selected.plan_id,
+        "real failure/cleanup must clear current activity and retain selected "
+        "history");
+    if (boundary == 0) {
+      ok &= Require(failed.prepared &&
+                        failed.readiness.available ==
+                            selected.readiness.available &&
+                        failed.readiness.status == selected.readiness.status &&
+                        failed.telemetry.required_stage_failures == 1,
+                    "failed frame must preserve prepared retry eligibility");
+      state.fail_required = false;
+      const auto recovered = executor->Execute(Binding(input, &output, 3));
+      ok &= Require(
+          recovered.output_ready &&
+              executor->CommitOutput(recovered.completion, true, &reason) ==
+                  hal::StatusId::ready &&
+              executor->Snapshot().latest_committed_frame.capture_sequence ==
+                  3 &&
+              executor->Snapshot()
+                      .latest_committed_frame.output_commit_sequence == 2 &&
+              executor->Snapshot().telemetry.committed_output_frames == 2,
+          "next valid frame must recover after runner failure");
+    } else {
+      const auto expected =
+          boundary == 1 ? hal::StatusId::stale : hal::StatusId::stopped;
+      ok &=
+          Require(!failed.prepared && !failed.readiness.available &&
+                      failed.readiness.status == expected &&
+                      executor->Execute(Binding(input, &output, 3)).status ==
+                          expected &&
+                      state.calls == calls &&
+                      executor->CommitOutput(first.completion, true, &reason) ==
+                          hal::StatusId::blocked,
+                  "invalidated/stopped owner must stay closed without stale "
+                  "publication");
+      auto replacement =
+          open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+              Config(&state), &setup);
+      if (!replacement)
+        return false;
+      const auto recovered = replacement->Execute(Binding(input, &output, 3));
+      ok &= Require(
+          recovered.output_ready &&
+              replacement->CommitOutput(recovered.completion, true, &reason) ==
+                  hal::StatusId::ready,
+          "fresh setup must restore publication after cleanup");
+    }
+  }
   return ok;
 }
 
@@ -333,6 +464,7 @@ void operator delete[](void *memory, std::size_t) noexcept {
 int main() {
   if (!TestFailOpenPreservesAndExecuteDoesNotAllocate() ||
       !TestFailedPublicationClearsCurrentAttributionOnly() ||
+      !TestExecutionFailureAndCleanupClearOnlyCurrentActivity() ||
       !TestMixedOrMalformedAttributionIsRejected())
     return 1;
   std::cout << "Prepared Open Video compatibility executor tests passed\n";

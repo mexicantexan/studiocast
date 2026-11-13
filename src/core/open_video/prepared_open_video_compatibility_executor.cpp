@@ -109,6 +109,12 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
   bool have_eye_contact = false;
   bool invalidated = false;
 
+  void ClearCurrentActivity() noexcept {
+    snapshot.latest_committed_frame = {};
+    snapshot.telemetry.active_backend = hal::BackendId::invalid;
+    snapshot.telemetry.active_provider = hal::SemanticEffectProviderId::invalid;
+  }
+
   bool Setup(PreparedOpenVideoCompatibilitySetupResult *result) {
     const int width = static_cast<int>(config.plan.host_input.width);
     const int height = static_cast<int>(config.plan.host_input.height);
@@ -345,6 +351,7 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
       ++impl_->snapshot.telemetry.required_stage_failures;
       result.status = hal::StatusId::failed;
       result.reason = hal::ReasonId::required_stage_failed;
+      impl_->ClearCurrentActivity();
       return result;
     }
     impl_->pending_stages[index] = stage_result;
@@ -399,11 +406,8 @@ hal::StatusId PreparedOpenVideoCompatibilityExecutor::CommitOutput(
     return hal::StatusId::blocked;
   }
   // Only an exact pending completion may replace current publication evidence.
+  impl_->ClearCurrentActivity();
   auto &committed = impl_->snapshot.latest_committed_frame;
-  committed = {};
-  impl_->snapshot.telemetry.active_backend = hal::BackendId::invalid;
-  impl_->snapshot.telemetry.active_provider =
-      hal::SemanticEffectProviderId::invalid;
   if (!output_write_succeeded) {
     impl_->pending = {};
     SetReason(reason, hal::ReasonId::output_write_failed);
@@ -437,9 +441,14 @@ void PreparedOpenVideoCompatibilityExecutor::Invalidate(
     return;
   impl_->invalidated = true;
   impl_->pending = {};
+  impl_->ClearCurrentActivity();
   impl_->snapshot.status = hal::StatusId::stale;
   impl_->snapshot.reason = reason;
   impl_->snapshot.prepared = false;
+  impl_->snapshot.readiness.status = impl_->snapshot.status;
+  impl_->snapshot.readiness.reason = reason;
+  impl_->snapshot.readiness.available = impl_->snapshot.readiness.degraded =
+      false;
 }
 
 hal::StatusId
@@ -456,10 +465,15 @@ void PreparedOpenVideoCompatibilityExecutor::Shutdown() noexcept {
   if (!impl_ || impl_->snapshot.stopped)
     return;
   impl_->pending = {};
+  impl_->ClearCurrentActivity();
   impl_->snapshot.status = hal::StatusId::stopped;
   impl_->snapshot.reason = hal::ReasonId::shutdown_requested;
   impl_->snapshot.prepared = false;
   impl_->snapshot.stopped = true;
+  impl_->snapshot.readiness.status = impl_->snapshot.status;
+  impl_->snapshot.readiness.reason = impl_->snapshot.reason;
+  impl_->snapshot.readiness.available = impl_->snapshot.readiness.degraded =
+      false;
 }
 
 video::VideoExecutionAdapterSnapshot
