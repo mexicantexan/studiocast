@@ -212,6 +212,25 @@ void UtilityKernels::Shutdown() noexcept {
 
   frame_batch_.Shutdown();
 
+  for (auto &slot : deferred_slots_) {
+    if (destroy_children && slot.command && vf.vkFreeCommandBuffers)
+      vf.vkFreeCommandBuffers(device_.device(), device_.command_pool(), 1,
+                              &slot.command);
+    slot.command = nullptr;
+    slot.descriptors = nullptr;
+    slot.params.Free();
+    slot.bound.fill(nullptr);
+    slot.pending = false;
+  }
+  if (destroy_children && deferred_descriptor_pool_ &&
+      vf.vkDestroyDescriptorPool)
+    vf.vkDestroyDescriptorPool(device_.device(), deferred_descriptor_pool_,
+                               nullptr);
+  deferred_descriptor_pool_ = nullptr;
+  deferred_capacity_ = deferred_cursor_ = 0;
+  deferred_batch_ = nullptr;
+  active_deferred_slot_ = nullptr;
+
   if (destroy_children && command_buffer_ && vf.vkFreeCommandBuffers) {
     vf.vkFreeCommandBuffers(device_.device(), device_.command_pool(), 1,
                             &command_buffer_);
@@ -436,12 +455,143 @@ void UtilityKernels::InvalidateDescriptorBindingCacheForSetup() noexcept {
   bound_buffers_.fill(nullptr);
   batch_bound_buffers_.fill(nullptr);
   final_bound_buffers_.fill(nullptr);
+  for (auto &slot : deferred_slots_)
+    if (!slot.pending)
+      slot.bound.fill(nullptr);
+}
+
+bool UtilityKernels::PrepareDeferredSlotsForSetup(std::size_t slots,
+                                                  std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!initialized_ || deferred_batch_ || !slots ||
+      slots > deferred_slots_.size()) {
+    if (error_out)
+      *error_out = "Invalid deferred utility slot reservation.";
+    return false;
+  }
+  if (slots <= deferred_capacity_)
+    return true;
+  if (deferred_descriptor_pool_) {
+    if (error_out)
+      *error_out = "Deferred utility slot reservation is immutable.";
+    return false;
+  }
+  const auto &vf = device_.f();
+  VkDescriptorPoolSize size{};
+  size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  size.descriptorCount = static_cast<std::uint32_t>(slots * 7);
+  VkDescriptorPoolCreateInfo pool{};
+  pool.maxSets = static_cast<std::uint32_t>(slots);
+  pool.poolSizeCount = 1;
+  pool.pPoolSizes = &size;
+  if (!device_.CheckDriverResult(
+          vf.vkCreateDescriptorPool(device_.device(), &pool, nullptr,
+                                    &deferred_descriptor_pool_),
+          "vkCreateDescriptorPool(deferred)", false, error_out))
+    return false;
+  // A partial setup is owned until normal safe Shutdown; no frame can use it.
+  for (std::size_t i = 0; i < slots; ++i) {
+    auto &slot = deferred_slots_[i];
+    if (!slot.params.Allocate(
+            &device_, sizeof(Params), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true, error_out))
+      return false;
+    VkDescriptorSetAllocateInfo set{};
+    set.descriptorPool = deferred_descriptor_pool_;
+    set.descriptorSetCount = 1;
+    set.pSetLayouts = &descriptor_set_layout_;
+    if (!device_.CheckDriverResult(
+            vf.vkAllocateDescriptorSets(device_.device(), &set,
+                                        &slot.descriptors),
+            "vkAllocateDescriptorSets(deferred)", false, error_out))
+      return false;
+    VkCommandBufferAllocateInfo command{};
+    command.commandPool = device_.command_pool();
+    command.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command.commandBufferCount = 1;
+    if (!device_.CheckDriverResult(
+            vf.vkAllocateCommandBuffers(device_.device(), &command,
+                                        &slot.command),
+            "vkAllocateCommandBuffers(deferred)", false, error_out))
+      return false;
+  }
+  deferred_capacity_ = slots;
+  return true;
+}
+
+bool UtilityKernels::BeginDeferredFrame(ResidentCommandBatch &batch,
+                                        std::string *error_out) {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (error_out)
+    error_out->clear();
+  if (!initialized_ || !deferred_capacity_ || deferred_batch_ ||
+      batch.state() != ResidentCommandBatchState::recording ||
+      batch.context_identity() != device_.context_identity() ||
+      std::any_of(deferred_slots_.begin(), deferred_slots_.end(),
+                  [](const auto &slot) { return slot.pending; })) {
+    if (error_out)
+      *error_out = "Deferred utility frame is foreign or still pending.";
+    return false;
+  }
+  deferred_batch_ = &batch;
+  deferred_cursor_ = 0;
+  active_deferred_slot_ = nullptr;
+  return true;
+}
+
+void UtilityKernels::EndDeferredFrame() noexcept {
+  std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+  if (!deferred_batch_ ||
+      deferred_batch_->state() == ResidentCommandBatchState::recording ||
+      deferred_batch_->state() == ResidentCommandBatchState::unsafe_pending)
+    return;
+  deferred_batch_ = nullptr;
+  active_deferred_slot_ = nullptr;
+}
+
+bool UtilityKernels::AcquireDeferredSlot(std::string *error_out) {
+  if (!deferred_batch_)
+    return true;
+  if (active_deferred_slot_ || deferred_cursor_ >= deferred_capacity_ ||
+      deferred_batch_->state() != ResidentCommandBatchState::recording ||
+      deferred_slots_[deferred_cursor_].pending) {
+    if (error_out)
+      *error_out = "Deferred utility command/parameter slot unavailable.";
+    return false;
+  }
+  active_deferred_slot_ = &deferred_slots_[deferred_cursor_++];
+  return true;
+}
+
+VkCommandBuffer UtilityKernels::RecordingCommand() const noexcept {
+  return active_deferred_slot_ ? active_deferred_slot_->command
+                               : command_buffer_;
+}
+
+void UtilityKernels::DeferredCompletion(
+    void *owner, const ResidentCommandTicket &ticket,
+    ResidentCommandCompletion completion) noexcept {
+  auto &slot = *static_cast<DeferredSlot *>(owner);
+  if (!slot.pending || slot.ticket != ticket)
+    return;
+  if (completion != ResidentCommandCompletion::unsafe_pending)
+    slot.pending = false;
 }
 
 bool UtilityKernels::BindBuffers(VkBuffer u8_src0, VkBuffer u8_src1,
                                  VkBuffer f32_src0, VkBuffer u8_out,
                                  VkBuffer f32_out, VkBuffer scratch,
                                  std::string *error_out) {
+  if (!AcquireDeferredSlot(error_out))
+    return false;
+  if (active_deferred_slot_)
+    return BindBuffersForSet(active_deferred_slot_->descriptors,
+                             active_deferred_slot_->params.buffer(),
+                             &active_deferred_slot_->bound, u8_src0, u8_src1,
+                             f32_src0, u8_out, f32_out, scratch, error_out);
   return BindBuffersForSet(descriptor_set_, params_.buffer(), &bound_buffers_,
                            u8_src0, u8_src1, f32_src0, u8_out, f32_out, scratch,
                            error_out);
@@ -465,23 +615,31 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
                        : init_error_;
     return false;
   }
-  if (!params_.mapped()) {
+  auto &parameter_buffer =
+      active_deferred_slot_ ? active_deferred_slot_->params : params_;
+  const auto command = RecordingCommand();
+  const auto descriptors = active_deferred_slot_
+                               ? active_deferred_slot_->descriptors
+                               : descriptor_set_;
+  const auto &buffers =
+      active_deferred_slot_ ? active_deferred_slot_->bound : bound_buffers_;
+  if (!parameter_buffer.mapped()) {
     if (error_out)
       *error_out = "Vulkan utility params buffer is not mapped.";
     return false;
   }
-  std::memcpy(params_.mapped(), &params, sizeof(params));
-  if (!params_.Flush(error_out))
+  std::memcpy(parameter_buffer.mapped(), &params, sizeof(params));
+  if (!parameter_buffer.Flush(error_out))
     return false;
 
   const auto &vf = device_.f();
-  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
+  VkResult result = vf.vkResetCommandBuffer(command, 0);
   if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
                                  error_out))
     return false;
 
   VkCommandBufferBeginInfo begin{};
-  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
+  result = vf.vkBeginCommandBuffer(command, &begin);
   if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
                                  error_out))
     return false;
@@ -494,15 +652,14 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
       VulkanBufferBarrier(VulkanBufferAccess::host_or_compute_write,
                           VulkanBufferAccess::compute_read);
   std::array<VkBufferMemoryBarrier, 3> data_read_barriers{};
-  const VkBuffer data_read_buffers[] = {bound_buffers_[0], bound_buffers_[1],
-                                        bound_buffers_[2]};
+  const VkBuffer data_read_buffers[] = {buffers[0], buffers[1], buffers[2]};
   for (std::size_t i = 0; i < data_read_barriers.size(); ++i) {
     data_read_barriers[i].srcAccessMask = data_read.src_access_mask;
     data_read_barriers[i].dstAccessMask = data_read.dst_access_mask;
     data_read_barriers[i].buffer = data_read_buffers[i];
     data_read_barriers[i].size = VK_WHOLE_SIZE;
   }
-  vf.vkCmdPipelineBarrier(command_buffer_, data_read.src_stage_mask,
+  vf.vkCmdPipelineBarrier(command, data_read.src_stage_mask,
                           data_read.dst_stage_mask, 0, 0, nullptr,
                           static_cast<std::uint32_t>(data_read_barriers.size()),
                           data_read_barriers.data(), 0, nullptr);
@@ -512,24 +669,22 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
   VkBufferMemoryBarrier parameter_read_barrier{};
   parameter_read_barrier.srcAccessMask = parameter_read.src_access_mask;
   parameter_read_barrier.dstAccessMask = parameter_read.dst_access_mask;
-  parameter_read_barrier.buffer = params_.buffer();
+  parameter_read_barrier.buffer = parameter_buffer.buffer();
   parameter_read_barrier.size = VK_WHOLE_SIZE;
-  vf.vkCmdPipelineBarrier(command_buffer_, parameter_read.src_stage_mask,
+  vf.vkCmdPipelineBarrier(command, parameter_read.src_stage_mask,
                           parameter_read.dst_stage_mask, 0, 0, nullptr, 1,
                           &parameter_read_barrier, 0, nullptr);
 
-  vf.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                       pipeline_);
-  vf.vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                             pipeline_layout_, 0, 1, &descriptor_set_, 0,
-                             nullptr);
+  vf.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+  vf.vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             pipeline_layout_, 0, 1, &descriptors, 0, nullptr);
 
   auto dispatch_op = [&](Op op_value) {
     const std::uint32_t op_u32 = static_cast<std::uint32_t>(op_value);
-    vf.vkCmdPushConstants(command_buffer_, pipeline_layout_,
+    vf.vkCmdPushConstants(command, pipeline_layout_,
                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(op_u32),
                           &op_u32);
-    vf.vkCmdDispatch(command_buffer_, CeilDiv(dispatch_w, kBlockX),
+    vf.vkCmdDispatch(command, CeilDiv(dispatch_w, kBlockX),
                      CeilDiv(dispatch_h, kBlockY), 1);
   };
 
@@ -538,10 +693,9 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
     VkBufferMemoryBarrier scratch_ready{};
     scratch_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     scratch_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    scratch_ready.buffer = bound_buffers_[5];
+    scratch_ready.buffer = buffers[5];
     scratch_ready.size = VK_WHOLE_SIZE;
-    vf.vkCmdPipelineBarrier(command_buffer_,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vf.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                             1, &scratch_ready, 0, nullptr);
     dispatch_op(second);
@@ -551,15 +705,15 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
   for (std::size_t i = 0; i < host_barriers.size(); ++i) {
     host_barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     host_barriers[i].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    host_barriers[i].buffer = bound_buffers_[3 + i];
+    host_barriers[i].buffer = buffers[3 + i];
     host_barriers[i].size = VK_WHOLE_SIZE;
   }
-  vf.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  vf.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr,
                           static_cast<std::uint32_t>(host_barriers.size()),
                           host_barriers.data(), 0, nullptr);
 
-  result = vf.vkEndCommandBuffer(command_buffer_);
+  result = vf.vkEndCommandBuffer(command);
   if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true, error_out))
     return false;
 
@@ -567,6 +721,26 @@ bool UtilityKernels::DispatchTwoPass(const Params &params, Op first, Op second,
 }
 
 bool UtilityKernels::SubmitRecorded(std::string *error_out) {
+  if (deferred_batch_) {
+    auto *slot = active_deferred_slot_;
+    if (!slot) {
+      if (error_out)
+        *error_out = "Deferred utility has no distinct recording slot.";
+      return false;
+    }
+    ResidentCommandGroup group;
+    group.context = device_.context_identity();
+    group.commands = &slot->command;
+    group.count = 1;
+    group.owner = slot;
+    group.owner_generation = group.context.generation;
+    group.on_completion = DeferredCompletion;
+    const bool queued =
+        deferred_batch_->Append(group, &slot->ticket, error_out);
+    slot->pending = queued;
+    active_deferred_slot_ = nullptr;
+    return queued;
+  }
   ++synchronous_submission_count_;
   return device_.SubmitAndWait(command_buffer_, error_out);
 }
@@ -734,6 +908,10 @@ bool UtilityKernels::ResizeMirrorHorizontalU8x3(const VulkanImage &src,
                        error_out)) {
     return false;
   }
+
+  if (deferred_batch_)
+    return ResizeBilinear(src, scratch, error_out) &&
+           MirrorHorizontalU8x3(scratch, dst, error_out);
 
   Params resize_params{};
   resize_params.src_w = static_cast<std::uint32_t>(src.width());
@@ -923,10 +1101,11 @@ bool UtilityKernels::ResizeBilinearF32_1(const VulkanImage &src,
   return Dispatch(p, Op::resize_f32_1, p.dst_w, p.dst_h, error_out);
 }
 
-bool UtilityKernels::UploadRgb24ToDeviceLocal(
-    const std::uint8_t *src, std::size_t src_stride,
-    const VulkanImage &upload_staging, const VulkanImage &device_dst,
-    std::string *error_out) {
+bool UtilityKernels::UploadRgb24ToDeviceLocal(const std::uint8_t *src,
+                                              std::size_t src_stride,
+                                              const VulkanImage &upload_staging,
+                                              const VulkanImage &device_dst,
+                                              std::string *error_out) {
   if (upload_staging.format() != VulkanPixelFormat::rgb_u8 ||
       device_dst.format() != VulkanPixelFormat::rgb_u8) {
     if (error_out) {
@@ -939,26 +1118,26 @@ bool UtilityKernels::UploadRgb24ToDeviceLocal(
                                  error_out);
 }
 
-bool UtilityKernels::UploadU8x3ToDeviceLocal(
-    const std::uint8_t *src, std::size_t src_stride,
-    const VulkanImage &upload_staging, const VulkanImage &device_dst,
-    std::string *error_out) {
+bool UtilityKernels::UploadU8x3ToDeviceLocal(const std::uint8_t *src,
+                                             std::size_t src_stride,
+                                             const VulkanImage &upload_staging,
+                                             const VulkanImage &device_dst,
+                                             std::string *error_out) {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
   if (!ValidateRgbOrBgrImage(upload_staging,
-                             "UploadRgb24ToDeviceLocal(staging)",
-                             error_out) ||
-      !ValidateRgbOrBgrImage(device_dst,
-                             "UploadRgb24ToDeviceLocal(dst)", error_out)) {
+                             "UploadRgb24ToDeviceLocal(staging)", error_out) ||
+      !ValidateRgbOrBgrImage(device_dst, "UploadRgb24ToDeviceLocal(dst)",
+                             error_out)) {
     return false;
   }
   if (!Initialize(error_out))
     return false;
   if (!ValidateContext(device_, upload_staging,
                        "UploadRgb24ToDeviceLocal(staging)", error_out) ||
-      !ValidateContext(device_, device_dst,
-                       "UploadRgb24ToDeviceLocal(dst)", error_out)) {
+      !ValidateContext(device_, device_dst, "UploadRgb24ToDeviceLocal(dst)",
+                       error_out)) {
     return false;
   }
   const std::size_t minimum_stride =
@@ -980,43 +1159,45 @@ bool UtilityKernels::UploadU8x3ToDeviceLocal(
     return false;
   }
 
-  PackRgb24ToRgba32(
-      src, src_stride, upload_staging.width(), upload_staging.height(),
-      static_cast<std::uint32_t *>(upload_staging.mapped()),
-      upload_staging.pitch_pixels());
+  PackRgb24ToRgba32(src, src_stride, upload_staging.width(),
+                    upload_staging.height(),
+                    static_cast<std::uint32_t *>(upload_staging.mapped()),
+                    upload_staging.pitch_pixels());
   if (!upload_staging.Flush(error_out))
     return false;
 
+  if (!AcquireDeferredSlot(error_out))
+    return false;
+  const auto command = RecordingCommand();
   const auto &vf = device_.f();
-  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
+  VkResult result = vf.vkResetCommandBuffer(command, 0);
   if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
                                  error_out)) {
     return false;
   }
   VkCommandBufferBeginInfo begin{};
-  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
+  result = vf.vkBeginCommandBuffer(command, &begin);
   if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
                                  error_out)) {
     return false;
   }
   if (!device_.RecordBufferBarrier(
-          command_buffer_, upload_staging.buffer(),
-          upload_staging.byte_size(), upload_staging.context_identity(),
-          VulkanBufferAccess::host_write, VulkanBufferAccess::transfer_read,
-          error_out)) {
+          command, upload_staging.buffer(), upload_staging.byte_size(),
+          upload_staging.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::transfer_read, error_out)) {
     return false;
   }
   VkBufferCopy copy{};
   copy.size = device_dst.byte_size();
-  vf.vkCmdCopyBuffer(command_buffer_, upload_staging.buffer(),
-                     device_dst.buffer(), 1, &copy);
+  vf.vkCmdCopyBuffer(command, upload_staging.buffer(), device_dst.buffer(), 1,
+                     &copy);
   if (!device_.RecordBufferBarrier(
-          command_buffer_, device_dst.buffer(), device_dst.byte_size(),
+          command, device_dst.buffer(), device_dst.byte_size(),
           device_dst.context_identity(), VulkanBufferAccess::transfer_write,
           VulkanBufferAccess::compute_read, error_out)) {
     return false;
   }
-  result = vf.vkEndCommandBuffer(command_buffer_);
+  result = vf.vkEndCommandBuffer(command);
   if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
                                  error_out)) {
     return false;
@@ -1024,15 +1205,16 @@ bool UtilityKernels::UploadU8x3ToDeviceLocal(
   return SubmitRecorded(error_out);
 }
 
-bool UtilityKernels::UploadF32_1ToDeviceLocal(
-    const float *src, std::size_t src_count,
-    const VulkanImage &upload_staging, const VulkanImage &device_dst,
-    std::string *error_out) {
+bool UtilityKernels::UploadF32_1ToDeviceLocal(const float *src,
+                                              std::size_t src_count,
+                                              const VulkanImage &upload_staging,
+                                              const VulkanImage &device_dst,
+                                              std::string *error_out) {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
     error_out->clear();
-  if (!ValidateF32Image(upload_staging,
-                        "UploadF32_1ToDeviceLocal(staging)", error_out) ||
+  if (!ValidateF32Image(upload_staging, "UploadF32_1ToDeviceLocal(staging)",
+                        error_out) ||
       !ValidateF32Image(device_dst, "UploadF32_1ToDeviceLocal(dst)",
                         error_out)) {
     return false;
@@ -1041,8 +1223,8 @@ bool UtilityKernels::UploadF32_1ToDeviceLocal(
     return false;
   if (!ValidateContext(device_, upload_staging,
                        "UploadF32_1ToDeviceLocal(staging)", error_out) ||
-      !ValidateContext(device_, device_dst,
-                       "UploadF32_1ToDeviceLocal(dst)", error_out)) {
+      !ValidateContext(device_, device_dst, "UploadF32_1ToDeviceLocal(dst)",
+                       error_out)) {
     return false;
   }
   const std::size_t expected_count =
@@ -1067,6 +1249,12 @@ bool UtilityKernels::UploadF32_1ToDeviceLocal(
   if (!upload_staging.Flush(error_out))
     return false;
 
+  if (deferred_batch_) {
+    if (error_out)
+      *error_out =
+          "Intermediate float transport is forbidden in a resident frame.";
+    return false;
+  }
   const auto &vf = device_.f();
   VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
   if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
@@ -1080,10 +1268,9 @@ bool UtilityKernels::UploadF32_1ToDeviceLocal(
     return false;
   }
   if (!device_.RecordBufferBarrier(
-          command_buffer_, upload_staging.buffer(),
-          upload_staging.byte_size(), upload_staging.context_identity(),
-          VulkanBufferAccess::host_write, VulkanBufferAccess::transfer_read,
-          error_out)) {
+          command_buffer_, upload_staging.buffer(), upload_staging.byte_size(),
+          upload_staging.context_identity(), VulkanBufferAccess::host_write,
+          VulkanBufferAccess::transfer_read, error_out)) {
     return false;
   }
   VkBufferCopy copy{};
@@ -1106,8 +1293,7 @@ bool UtilityKernels::UploadF32_1ToDeviceLocal(
 
 bool UtilityKernels::ReadbackU8x3(const VulkanImage &src,
                                   const VulkanImage &readback_staging,
-                                  std::uint8_t *dst,
-                                  std::size_t dst_stride,
+                                  std::uint8_t *dst, std::size_t dst_stride,
                                   std::string *error_out) {
   std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
   if (error_out)
@@ -1118,8 +1304,8 @@ bool UtilityKernels::ReadbackU8x3(const VulkanImage &src,
     return false;
   }
   if (!ValidateRgbOrBgrImage(src, "ReadbackU8x3(src)", error_out) ||
-      !ValidateRgbOrBgrImage(readback_staging,
-                             "ReadbackU8x3(staging)", error_out)) {
+      !ValidateRgbOrBgrImage(readback_staging, "ReadbackU8x3(staging)",
+                             error_out)) {
     return false;
   }
   if (!ValidateContext(device_, src, "ReadbackU8x3(src)", error_out) ||
@@ -1127,8 +1313,7 @@ bool UtilityKernels::ReadbackU8x3(const VulkanImage &src,
                        error_out)) {
     return false;
   }
-  const std::size_t minimum_stride =
-      static_cast<std::size_t>(src.width()) * 3u;
+  const std::size_t minimum_stride = static_cast<std::size_t>(src.width()) * 3u;
   if (!SameDimensions(src, readback_staging) ||
       src.format() != readback_staging.format() ||
       src.byte_size() != readback_staging.byte_size() ||
@@ -1136,49 +1321,58 @@ bool UtilityKernels::ReadbackU8x3(const VulkanImage &src,
       src.mapped() || !readback_staging.host_visible() ||
       !readback_staging.mapped() || !dst || dst_stride < minimum_stride) {
     if (error_out) {
-      *error_out =
-          "ReadbackU8x3 requires a non-mapped DEVICE_LOCAL source, an "
-          "exact-shape/format mapped host-visible staging image, and "
-          "tight-or-padded destination storage.";
+      *error_out = "ReadbackU8x3 requires a non-mapped DEVICE_LOCAL source, an "
+                   "exact-shape/format mapped host-visible staging image, and "
+                   "tight-or-padded destination storage.";
     }
     return false;
   }
 
+  if (!AcquireDeferredSlot(error_out))
+    return false;
+  const auto command = RecordingCommand();
   const auto &vf = device_.f();
-  VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
+  VkResult result = vf.vkResetCommandBuffer(command, 0);
   if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
                                  error_out)) {
     return false;
   }
   VkCommandBufferBeginInfo begin{};
-  result = vf.vkBeginCommandBuffer(command_buffer_, &begin);
+  result = vf.vkBeginCommandBuffer(command, &begin);
   if (!device_.CheckDriverResult(result, "vkBeginCommandBuffer", true,
                                  error_out)) {
     return false;
   }
   if (!device_.RecordBufferBarrier(
-          command_buffer_, src.buffer(), src.byte_size(), src.context_identity(),
+          command, src.buffer(), src.byte_size(), src.context_identity(),
           VulkanBufferAccess::host_or_compute_write,
           VulkanBufferAccess::transfer_read, error_out)) {
     return false;
   }
   VkBufferCopy copy{};
   copy.size = src.byte_size();
-  vf.vkCmdCopyBuffer(command_buffer_, src.buffer(), readback_staging.buffer(),
-                     1, &copy);
-  if (!device_.RecordBufferBarrier(
-          command_buffer_, readback_staging.buffer(),
-          readback_staging.byte_size(), readback_staging.context_identity(),
-          VulkanBufferAccess::transfer_write, VulkanBufferAccess::host_read,
-          error_out)) {
+  vf.vkCmdCopyBuffer(command, src.buffer(), readback_staging.buffer(), 1,
+                     &copy);
+  if (!device_.RecordBufferBarrier(command, readback_staging.buffer(),
+                                   readback_staging.byte_size(),
+                                   readback_staging.context_identity(),
+                                   VulkanBufferAccess::transfer_write,
+                                   VulkanBufferAccess::host_read, error_out)) {
     return false;
   }
-  result = vf.vkEndCommandBuffer(command_buffer_);
+  result = vf.vkEndCommandBuffer(command);
   if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
                                  error_out) ||
-      !SubmitRecorded(error_out) || !readback_staging.Invalidate(error_out)) {
+      !SubmitRecorded(error_out)) {
     return false;
   }
+  if (deferred_batch_) {
+    ++synchronous_submission_count_;
+    if (!deferred_batch_->Complete(error_out))
+      return false;
+  }
+  if (!readback_staging.Invalidate(error_out))
+    return false;
   UnpackRgba32ToRgb24(
       static_cast<const std::uint32_t *>(readback_staging.mapped()),
       readback_staging.pitch_pixels(), src.width(), src.height(), dst,
@@ -1204,13 +1398,12 @@ bool UtilityKernels::ReadbackF32_1(const VulkanImage &src,
     return false;
   }
   if (!ValidateContext(device_, src, "ReadbackF32_1(src)", error_out) ||
-      !ValidateContext(device_, readback_staging,
-                       "ReadbackF32_1(staging)", error_out)) {
+      !ValidateContext(device_, readback_staging, "ReadbackF32_1(staging)",
+                       error_out)) {
     return false;
   }
-  const std::size_t expected_count =
-      static_cast<std::size_t>(src.width()) *
-      static_cast<std::size_t>(src.height());
+  const std::size_t expected_count = static_cast<std::size_t>(src.width()) *
+                                     static_cast<std::size_t>(src.height());
   if (src.width() != readback_staging.width() ||
       src.height() != readback_staging.height() || !src.device_local() ||
       src.mapped() != nullptr || !readback_staging.host_visible() ||
@@ -1225,6 +1418,12 @@ bool UtilityKernels::ReadbackF32_1(const VulkanImage &src,
     return false;
   }
 
+  if (deferred_batch_) {
+    if (error_out)
+      *error_out =
+          "Intermediate float transport is forbidden in a resident frame.";
+    return false;
+  }
   const auto &vf = device_.f();
   VkResult result = vf.vkResetCommandBuffer(command_buffer_, 0);
   if (!device_.CheckDriverResult(result, "vkResetCommandBuffer", true,
@@ -1247,18 +1446,17 @@ bool UtilityKernels::ReadbackF32_1(const VulkanImage &src,
   copy.size = src.byte_size();
   vf.vkCmdCopyBuffer(command_buffer_, src.buffer(), readback_staging.buffer(),
                      1, &copy);
-  if (!device_.RecordBufferBarrier(
-          command_buffer_, readback_staging.buffer(),
-          readback_staging.byte_size(), readback_staging.context_identity(),
-          VulkanBufferAccess::transfer_write, VulkanBufferAccess::host_read,
-          error_out)) {
+  if (!device_.RecordBufferBarrier(command_buffer_, readback_staging.buffer(),
+                                   readback_staging.byte_size(),
+                                   readback_staging.context_identity(),
+                                   VulkanBufferAccess::transfer_write,
+                                   VulkanBufferAccess::host_read, error_out)) {
     return false;
   }
   result = vf.vkEndCommandBuffer(command_buffer_);
   if (!device_.CheckDriverResult(result, "vkEndCommandBuffer", true,
                                  error_out) ||
-      !SubmitRecorded(error_out) ||
-      !readback_staging.Invalidate(error_out)) {
+      !SubmitRecorded(error_out) || !readback_staging.Invalidate(error_out)) {
     return false;
   }
   std::memcpy(dst, readback_staging.mapped(), expected_count * sizeof(float));
@@ -1465,6 +1663,10 @@ bool UtilityKernels::BoxBlurCompositeAlphaU8x3(
                        error_out)) {
     return false;
   }
+
+  if (deferred_batch_)
+    return BoxBlurSeparableU8x3(fg, blur_tmp, blurred, radius, error_out) &&
+           CompositeAlphaU8x3(fg, blurred, alpha, out, error_out);
 
   Params blur_params{};
   blur_params.src_w = static_cast<std::uint32_t>(fg.width());
@@ -1805,6 +2007,19 @@ bool UtilityKernels::ApplyFinalVignetteU8x3(
     mirror_params.crop_x = static_cast<float>(vignette_out.width());
     mirror_params.crop_w = -static_cast<float>(vignette_out.width());
     mirror_params.crop_h = static_cast<float>(vignette_out.height());
+  }
+
+  if (deferred_batch_) {
+    if (resize_scratch && !ResizeBilinear(src, *resize_scratch, error_out))
+      return false;
+    if (!BindBuffers(vignette_src.buffer(), nullptr,
+                     attenuation_factor.buffer(), vignette_out.buffer(),
+                     nullptr, nullptr, error_out) ||
+        !Dispatch(vignette_params, Op::composite_solid, vignette_params.dst_w,
+                  vignette_params.dst_h, error_out))
+      return false;
+    return !mirrored_out ||
+           MirrorHorizontalU8x3(vignette_out, *mirrored_out, error_out);
   }
 
   if (resize_scratch) {
