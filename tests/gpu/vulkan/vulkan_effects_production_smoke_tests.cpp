@@ -887,6 +887,97 @@ bool BudgetRejection(const Options &options) {
   }
   return true;
 }
+
+bool UnsafeTimeoutRetirement(const Options &options, bool full = false) {
+  auto effects = Base(options);
+  // Keep this fault-injection test smaller than one native wait. Injection
+  // skips the original frame's wait, whereas a real timeout already spent it.
+  effects.video_noise_removal.enabled = true;
+  if (full) {
+    effects.eye_contact.enabled = effects.auto_frame.enabled = true;
+    effects.virtual_background.mode = Background::blur;
+    effects.virtual_key_light.enabled = effects.vignette.enabled =
+        effects.mirror = true;
+    effects.vignette.center_on_tracked_face = true;
+  }
+  Case test{"unsafe_timeout", effects, 64, 64, 64, 64};
+  auto source = std::make_unique<ObservedSource>();
+  auto *observed = source.get();
+  video::ProductionVideoBackendManager manager(std::move(source));
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(manager.Setup(Request(test), nullptr, &reason) ==
+                   hal::StatusId::ready,
+               "timeout regression requires the actual prepared native owner"))
+    return false;
+  auto *factory = dynamic_cast<vulkan::VulkanVideoExecutionFactory *>(
+      observed->lease.factory.factory);
+  vulkan::VulkanProductionModelDiagnostics before, after;
+  std::string error;
+  if (!Require(factory && Collect(*observed, &before) &&
+                   vulkan::VulkanProductionTesting::InjectNextSubmissionTimeout(
+                       *factory, &error),
+               "could not arm the existing native fence-timeout test seam"))
+    return false;
+  std::vector<std::uint8_t> input(64u * 64u * 3u, 0);
+  std::vector<std::uint8_t> output(input.size(), 0x5a);
+  const auto request = Request(test);
+  const auto failed = manager.Execute(Binding(request, input, &output, 1));
+  if (!Require(failed.status == hal::StatusId::quarantined &&
+                   !failed.output_ready &&
+                   !manager.Snapshot().resident.latest_committed_frame.valid &&
+                   manager.Snapshot().resident.telemetry.active_backend_frames == 0 &&
+                   std::all_of(output.begin(), output.end(),
+                               [](auto byte) { return byte == 0x5a; }) &&
+                   Collect(*observed, &after) &&
+                   !after.device.context_healthy &&
+                   after.completed_batches == before.completed_batches,
+               "a submitted timeout published output/activity or lost its poison"))
+    return false;
+  const auto same_counts = [](const auto &a, const auto &b) {
+    return a.inference_count == b.inference_count &&
+           a.completion_count == b.completion_count &&
+           a.warmup_inference_count == b.warmup_inference_count;
+  };
+  const auto no_success = [&]() {
+    return same_counts(before.matting, after.matting) &&
+           same_counts(before.denoise, after.denoise) &&
+           same_counts(before.face, after.face) &&
+           same_counts(before.left_eye, after.left_eye) &&
+           same_counts(before.right_eye, after.right_eye);
+  };
+  if (!Require(no_success(), "timed-out queued models promoted inference success"))
+    return false;
+  const auto retry = manager.Execute(Binding(request, input, &output, 2));
+  if (!Require(retry.status != hal::StatusId::executed &&
+                   retry.status != hal::StatusId::degraded &&
+                   !retry.output_ready && Collect(*observed, &after) &&
+                   no_success(),
+               "a poisoned context accepted another frame"))
+    return false;
+  const auto started = Now(nullptr);
+  auto shutdown = manager.Shutdown();
+  std::cout << "unsafe_timeout full=" << full
+            << " queued=1 output=0 activity=0 success_promotion=0"
+               " retry_rejected=1 shutdown_attempt=1 shutdown_ns="
+            << Now(nullptr) - started << " quiescent=" << shutdown.quiescent
+            << " release=" << shutdown.driver_context_release_permitted
+            << " pending=" << shutdown.pending << '\n';
+  if (full && shutdown.pending) {
+    // A second explicitly requested shutdown is a separate bounded attempt;
+    // the poisoned execution path stays closed throughout this late proof.
+    const auto retry_started = Now(nullptr);
+    shutdown = manager.Shutdown();
+    std::cout << "unsafe_timeout full=1 shutdown_attempt=2 shutdown_ns="
+              << Now(nullptr) - retry_started
+              << " quiescent=" << shutdown.quiescent
+              << " release=" << shutdown.driver_context_release_permitted
+              << " pending=" << shutdown.pending << '\n';
+  }
+  return Require(shutdown.quiescent &&
+                     shutdown.driver_context_release_permitted &&
+                     !shutdown.pending,
+                 "bounded late retirement could not safely destroy the failed batch");
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -961,6 +1052,16 @@ int main(int argc, char **argv) {
   }
   if (options.case_name.empty() || options.case_name == "budgets") {
     if (!BudgetRejection(options))
+      return 1;
+    ++executed;
+  }
+  if (options.case_name.empty() || options.case_name == "unsafe_timeout") {
+    if (!options.prepare_only && !UnsafeTimeoutRetirement(options))
+      return 1;
+    ++executed;
+  }
+  if (options.case_name.empty() || options.case_name == "unsafe_timeout_all") {
+    if (!options.prepare_only && !UnsafeTimeoutRetirement(options, true))
       return 1;
     ++executed;
   }

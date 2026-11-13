@@ -1465,14 +1465,10 @@ void QualifiedFinalResidentExecutor::DestroyPrepared(
 void QualifiedFinalResidentExecutor::Shutdown() noexcept {
   if (shutdown_)
     return;
+  if (!RetireFailedFrameAfterQuiescence())
+    return;
   if (model_effects_) {
     auto &m = *model_effects_;
-    if (m.batch.state() == ResidentCommandBatchState::recording)
-      m.batch.AbortUnsubmitted();
-    if (m.batch.state() == ResidentCommandBatchState::unsafe_pending &&
-        !m.batch.RetireAfterQuiescence(nullptr))
-      return;
-    kernels_->EndDeferredFrame();
     if (!m.denoise.Shutdown(nullptr) || !m.tracking.Shutdown(nullptr) ||
         !m.face.Shutdown() || !m.left.Shutdown() || !m.right.Shutdown())
       return;
@@ -1483,6 +1479,23 @@ void QualifiedFinalResidentExecutor::Shutdown() noexcept {
   matting_.reset();
   matting_alpha_.Free();
   shutdown_ = true;
+}
+
+bool QualifiedFinalResidentExecutor::RetireFailedFrameAfterQuiescence() noexcept {
+  if (model_effects_) {
+    auto &batch = model_effects_->batch;
+    if (batch.state() == ResidentCommandBatchState::recording)
+      batch.AbortUnsubmitted();
+    if (batch.state() == ResidentCommandBatchState::unsafe_pending &&
+        !batch.RetireAfterQuiescence(nullptr))
+      return false;
+  }
+  if (kernels_) {
+    kernels_->EndDeferredFrame();
+    if (kernels_->deferred_frame_active())
+      return false;
+  }
+  return true;
 }
 
 } // namespace studiocast::vulkan

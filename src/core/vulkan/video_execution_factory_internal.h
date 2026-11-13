@@ -30,4 +30,12 @@ struct VulkanProductionModelDiagnostics {
 bool CollectProductionVulkanModelDiagnostics(
     const VulkanVideoExecutionFactory &, VulkanProductionModelDiagnostics *,
     std::string *error);
+
+// Explicit native regression seam, outside active frames only. Injects the
+// existing device test result after an actual queue submission, never a
+// production timeout override and never mutable device-handle access.
+struct VulkanProductionTesting {
+  static bool InjectNextSubmissionTimeout(VulkanVideoExecutionFactory &,
+                                          std::string *error);
+};
 } // namespace studiocast::vulkan

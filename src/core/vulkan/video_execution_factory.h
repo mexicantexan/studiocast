@@ -10,6 +10,7 @@
 
 namespace studiocast::vulkan {
 struct VulkanProductionModelDiagnostics;
+struct VulkanProductionTesting;
 
 // Setup-only configuration for the production-qualified Open Vulkan factory.
 // The public surface is deliberately neutral: Vulkan device, queue, and
@@ -88,6 +89,7 @@ public:
           video::VideoAdapterPrepareEvidence *evidence) noexcept override;
 
 private:
+  friend struct VulkanProductionTesting;
   friend bool
   CollectProductionVulkanModelDiagnostics(const VulkanVideoExecutionFactory &,
                                           VulkanProductionModelDiagnostics *,

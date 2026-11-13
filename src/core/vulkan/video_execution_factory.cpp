@@ -1093,7 +1093,8 @@ struct VulkanVideoExecutionFactory::Impl {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     if (production && production->kernels.device()->Initialized()) {
       const auto health = production->kernels.device()->health_state();
-      return health.healthy() &&
+      return (health.healthy() ||
+              health.health == VulkanContextHealth::unsafe_timeout) &&
              health.completed_serial >= health.submitted_serial &&
              production->kernels.device()->SafeToDestroyResources();
     }
@@ -1160,6 +1161,31 @@ bool CollectProductionVulkanModelDiagnostics(
 #endif
   if (error)
     *error = "No initialized production Vulkan diagnostics owner.";
+  return false;
+}
+
+bool VulkanProductionTesting::InjectNextSubmissionTimeout(
+    VulkanVideoExecutionFactory &factory, std::string *error) {
+  if (error)
+    error->clear();
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  auto &p = *factory.impl_;
+  if (p.initialized && !p.shutdown_attempts && p.production &&
+      !p.production->kernels.deferred_frame_active()) {
+    auto *device = p.production->kernels.device();
+    const auto health = device->health_state();
+    if (health.healthy() &&
+        health.completed_serial >= health.submitted_serial) {
+      device->InjectNextSubmissionResultForTesting(
+          VulkanSubmissionPhase::wait_for_fence, VK_TIMEOUT);
+      return true;
+    }
+  }
+#else
+  (void)factory;
+#endif
+  if (error)
+    *error = "Timeout injection requires a quiescent initialized native owner.";
   return false;
 }
 
@@ -1422,8 +1448,18 @@ VulkanVideoExecutionFactory::RequestShutdown() noexcept {
     if (impl_->injected && impl_->configuration.injected_shutdown_probe)
       proof = impl_->configuration.injected_shutdown_probe(
           impl_->configuration.injected_shutdown_context);
-    else if (!impl_->NativeQuiescenceProven()) {
-      proof = StatusId::quarantined;
+    else {
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+      if (!impl_->NativeQuiescenceProven() && impl_->production)
+        (void)impl_->production->kernels.device()
+            ->TryProvePendingSubmissionQuiescence(nullptr);
+      if (impl_->NativeQuiescenceProven() && impl_->production &&
+          impl_->production->executor &&
+          !impl_->production->executor->RetireFailedFrameAfterQuiescence())
+        proof = StatusId::quarantined;
+#endif
+      if (!impl_->NativeQuiescenceProven())
+        proof = StatusId::quarantined;
     }
   }
   if (proof != StatusId::ready) {

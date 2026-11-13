@@ -41,6 +41,9 @@ public:
     return initialization_failed_semantic_;
   }
   void CollectModelDiagnostics(VulkanProductionModelDiagnostics *) const;
+  // Shutdown-only: retire failed callback tickets after the exact device
+  // submission is proven quiescent. Never promotes a failed frame to success.
+  bool RetireFailedFrameAfterQuiescence() noexcept;
   const open_vulkan::VulkanMattingReadiness &MattingReadiness() const noexcept {
     return matting_readiness_;
   }
