@@ -37,6 +37,7 @@ struct VulkanResidentProgramOptions {
   int auto_frame_strength = 50;
   int auto_frame_smoothing = 50;
   float auto_frame_headroom = .15F;
+  bool conservative_temporal_contract = false;
   bool request_mirror = false;
   bool request_vignette = false;
   VulkanVignetteCenterMode vignette_center =

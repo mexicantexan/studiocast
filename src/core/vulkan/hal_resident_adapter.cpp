@@ -331,7 +331,9 @@ StatusId VulkanHalResidentAdapter::Prepare(
                stage.semantic == SemanticEffectId::eye_contact ||
                stage.semantic == SemanticEffectId::auto_frame;
       });
-  if (program.temporal.temporal != temporal_semantics)
+  if (program.temporal.temporal != temporal_semantics &&
+      !(program.temporal.temporal &&
+        pending_options_.conservative_temporal_contract))
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
   if (program.cpu_tail_count != 0)
     return fail(StatusId::blocked, ReasonId::cpu_tail_required);

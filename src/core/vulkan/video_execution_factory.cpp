@@ -1,5 +1,6 @@
 #include "core/vulkan/video_execution_factory.h"
 #include "core/vulkan/hal_resident_adapter.h"
+#include "core/vulkan/video_execution_factory_internal.h"
 
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
 #include "core/open_video/ncnn_vulkan_context.h"
@@ -172,6 +173,18 @@ bool ExactProductionCapability(
 
 bool IsMattingSemantic(SemanticEffectId semantic) noexcept;
 
+bool UnavailableCapability(
+    const hal::SemanticCapabilityEvidence &capability) noexcept {
+  return (capability.status == StatusId::blocked ||
+          capability.status == StatusId::unavailable) &&
+         capability.reason != ReasonId::none &&
+         !capability.production_eligible && capability.provider == kProvider;
+}
+std::uint32_t SemanticBit(SemanticEffectId semantic) noexcept {
+  const auto value = static_cast<std::uint32_t>(semantic);
+  return value < 32 ? (std::uint32_t{1} << value) : 0;
+}
+
 CapabilityEvidenceCode ModelRuntimeCode(SemanticEffectId semantic) noexcept {
   if (semantic == SemanticEffectId::video_noise_removal)
     return CapabilityEvidenceCode::vulkan_denoise_runtime_ready;
@@ -207,14 +220,18 @@ bool ExactRegistration(const hal::AdapterRegistration &registration,
       !ExactProductionCapability(
           *mirror,
           CapabilityEvidenceCode::open_vulkan_mirror_production_ready) ||
-      !ExactProductionCapability(
-          *vignette, CapabilityEvidenceCode::
-                         open_vulkan_vignette_fixed_center_production_ready)) {
+      (!UnavailableCapability(*vignette) &&
+       !ExactProductionCapability(
+           *vignette,
+           CapabilityEvidenceCode::
+               open_vulkan_vignette_fixed_center_production_ready))) {
     SetReason(reason, ReasonId::capability_evidence_incomplete);
     return false;
   }
   for (std::size_t i = 0; i < registration.semantic_capability_count; ++i) {
     const auto &capability = registration.semantic_capabilities[i];
+    if (UnavailableCapability(capability))
+      continue;
     if (capability.semantic == SemanticEffectId::mirror ||
         capability.semantic == SemanticEffectId::vignette)
       continue;
@@ -271,6 +288,20 @@ bool TemporalIntent(
       return true;
   }
   return false;
+}
+
+video::NormalizedVideoExecutionIntent
+ActiveIntent(const video::NormalizedVideoExecutionIntent &intent,
+             const hal::ResolutionResult &resolution) noexcept {
+  auto active = intent;
+  active.stages = {};
+  active.stage_count = 0;
+  if (intent.stage_count != resolution.stage_count)
+    return active;
+  for (std::size_t i = 0; i < intent.stage_count; ++i)
+    if (!resolution.stages[i].skipped_optional)
+      active.stages[active.stage_count++] = intent.stages[i];
+  return active;
 }
 
 struct ParsedProgramOptions {
@@ -608,7 +639,7 @@ BuildProgram(const video::VideoExecutionPlanRequest &request,
     stage.execution_domain = resolved.execution_domain;
     stage.input.kind = hal::StageIoKind::image;
     const bool native_size = IsModelSemantic(stage.semantic) &&
-                             resolved_index + 1 < resolution.stage_count;
+                             prepared_index + 1 < island.stage_count;
     const bool previous_native =
         prepared_index > 0 &&
         IsModelSemantic(program.stages[prepared_index - 1].semantic);
@@ -793,7 +824,7 @@ public:
   StatusId Configure(video::VideoAdapterPrepareEvidence *evidence) noexcept {
     ReasonId reason = ReasonId::none;
     hal::ReadinessSnapshot readiness;
-    const auto status = session_.Configure(plan_.prepared_program, adapter_,
+    auto status = session_.Configure(plan_.prepared_program, adapter_,
                                            &readiness, &reason);
     if (evidence) {
       evidence->status = status;
@@ -802,6 +833,30 @@ public:
       evidence->candidate_resources_rolled_back = !IsSetupSuccess(status);
     }
     readiness_ = readiness;
+    if (IsSetupSuccess(status)) {
+      readiness_.ready_stage_mask = 0;
+      readiness_.disabled_stage_mask = 0;
+      for (std::size_t i = 0; i < plan_.resolution.stage_count; ++i) {
+        const auto bit = std::uint32_t{1} << i;
+        if (plan_.resolution.stages[i].skipped_optional)
+          readiness_.disabled_stage_mask |= bit;
+        else
+          readiness_.ready_stage_mask |= bit;
+      }
+      if (evidence)
+        evidence->readiness = readiness_;
+    }
+    if (IsSetupSuccess(status) && plan_.resolution.degraded) {
+      status = StatusId::degraded;
+      readiness_.status = status;
+      readiness_.reason = plan_.resolution.reason;
+      readiness_.degraded = true;
+      if (evidence) {
+        evidence->status = status;
+        evidence->reason = readiness_.reason;
+        evidence->readiness = readiness_;
+      }
+    }
     AppendExactEvidence(registration_, plan_.intent, &readiness_);
     prepared_ = IsSetupSuccess(status);
     return status;
@@ -969,6 +1024,7 @@ struct VulkanVideoExecutionFactory::Impl {
   bool initialized = false;
   StatusId status = StatusId::invalid;
   ReasonId reason = ReasonId::none;
+  SemanticEffectId failed_semantic = SemanticEffectId::invalid;
 
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
   struct Production {
@@ -1062,6 +1118,35 @@ VulkanVideoExecutionFactory::VulkanVideoExecutionFactory(
 
 VulkanVideoExecutionFactory::~VulkanVideoExecutionFactory() = default;
 
+bool CollectProductionVulkanModelDiagnostics(
+    const VulkanVideoExecutionFactory &factory,
+    VulkanProductionModelDiagnostics *out, std::string *error) {
+  if (error)
+    error->clear();
+  if (!out)
+    return false;
+  *out = {};
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  const auto &p = *factory.impl_;
+  if (p.initialized && p.production && p.production->executor) {
+    out->device = p.production->kernels.Diagnostics();
+    out->allocations = p.production->kernels.device()->allocation_stats();
+    p.production->executor->CollectModelDiagnostics(out);
+    out->matting_pack = p.configuration.matting_pack;
+    out->denoise_pack = p.configuration.denoise_pack;
+    out->face_pack = p.configuration.face_pack;
+    out->landmarks_pack = p.configuration.landmarks_pack;
+    out->eye_pack = p.configuration.eye_pack;
+    return true;
+  }
+#else
+  (void)factory;
+#endif
+  if (error)
+    *error = "No initialized production Vulkan diagnostics owner.";
+  return false;
+}
+
 StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
   SetReason(reason, ReasonId::none);
   if (impl_->shutdown_attempts != 0) {
@@ -1085,6 +1170,29 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     const bool expanded_models = impl_->configuration.denoise_pack ||
                                  impl_->configuration.face_pack ||
                                  impl_->configuration.eye_pack;
+    const auto block_eye = [&]() {
+      impl_->configuration.unavailable_semantic_mask |=
+          SemanticBit(SemanticEffectId::eye_contact);
+      if (impl_->configuration.effects) {
+        auto effects = *impl_->configuration.effects;
+        effects.eye_contact.enabled = false;
+        impl_->configuration.effects =
+            std::make_shared<const video::effects::BroadcastCameraEffects>(
+                effects);
+        if (!effects.auto_frame.enabled) {
+          impl_->configuration.face_pack.reset();
+          impl_->configuration.face_identity = {};
+        }
+      }
+      impl_->configuration.eye_pack.reset();
+      impl_->configuration.eye_identity = {};
+      impl_->configuration.landmarks_pack.reset();
+      impl_->configuration.landmarks_identity = {};
+    };
+#if !defined(STUDIOCAST_HAVE_DLIB) || !STUDIOCAST_HAVE_DLIB
+    if (impl_->configuration.eye_pack)
+      block_eye();
+#endif
     if (impl_->configuration.matting_pack &&
         (impl_->configuration.input_width <= 0 ||
          impl_->configuration.input_height <= 0 ||
@@ -1120,7 +1228,7 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     }
     VulkanDeviceSelection selection;
     const bool selected = VulkanDevice::ResolveSelection(&selection, &error);
-    const bool device_ready =
+    bool device_ready =
         selected && ((impl_->configuration.matting_pack || expanded_models)
                          ? open_vulkan::InitializeProductionVulkanMattingDevice(
                                impl_->production->kernels.device(), selection,
@@ -1128,6 +1236,15 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
                                impl_->configuration.eye_pack != nullptr)
                          : impl_->production->kernels.device()->Initialize(
                                selection, device_config, &error));
+    if (!device_ready && impl_->configuration.eye_pack &&
+        error.rfind("[vulkan_shader_float64_unavailable]", 0) == 0) {
+      // The adopted-context helper checks the selected physical feature before
+      // constructing its logical device. Isolate only the affected effect.
+      block_eye();
+      device_ready = open_vulkan::InitializeProductionVulkanMattingDevice(
+          impl_->production->kernels.device(), selection, device_config, &error,
+          false);
+    }
     if (!device_ready || !impl_->production->kernels.Initialize(&error)) {
       impl_->status = StatusId::unavailable;
       impl_->reason = ReasonId::capability_evidence_incomplete;
@@ -1148,6 +1265,7 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
                *impl_->configuration.effects, impl_->configuration.input_width,
                impl_->configuration.input_height, &error))) {
         impl_->reason = ReasonId::capability_evidence_incomplete;
+        impl_->failed_semantic = SemanticEffectId::virtual_background_blur;
         impl_->status = StatusId::unavailable;
         impl_->DiscardFailedProduction();
         SetReason(reason, impl_->reason);
@@ -1156,6 +1274,8 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
       if (expanded_models && !impl_->production->executor->InitializeModels(
                                  impl_->configuration, &error)) {
         impl_->reason = ReasonId::capability_evidence_incomplete;
+        impl_->failed_semantic =
+            impl_->production->executor->InitializationFailedSemantic();
         impl_->status = StatusId::unavailable;
         impl_->DiscardFailedProduction();
         SetReason(reason, impl_->reason);
@@ -1231,10 +1351,40 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
                     CapabilityEvidenceCode::vulkan_matting_runtime_ready);
           }
         }
+        for (const auto semantic :
+             {SemanticEffectId::mirror, SemanticEffectId::vignette,
+              SemanticEffectId::video_noise_removal,
+              SemanticEffectId::eye_contact, SemanticEffectId::auto_frame,
+              SemanticEffectId::virtual_background_blur,
+              SemanticEffectId::virtual_background_remove,
+              SemanticEffectId::virtual_background_replace,
+              SemanticEffectId::virtual_key_light}) {
+          if (!(impl_->configuration.unavailable_semantic_mask &
+                SemanticBit(semantic)))
+            continue;
+          std::size_t index = 0;
+          while (index < impl_->registration.semantic_capability_count &&
+                 impl_->registration.semantic_capabilities[index].semantic !=
+                     semantic)
+            ++index;
+          if (index == impl_->registration.semantic_capability_count)
+            ++impl_->registration.semantic_capability_count;
+          auto &capability = impl_->registration.semantic_capabilities[index];
+          capability = {};
+          capability.semantic = semantic;
+          capability.provider = kProvider;
+          capability.status = StatusId::unavailable;
+          capability.reason = ReasonId::capability_evidence_incomplete;
+        }
         impl_->initialized =
             ExactRegistration(impl_->registration, &impl_->reason);
         impl_->status =
             impl_->initialized ? StatusId::ready : StatusId::blocked;
+        if (impl_->initialized &&
+            impl_->configuration.unavailable_semantic_mask) {
+          impl_->status = StatusId::degraded;
+          impl_->reason = ReasonId::capability_evidence_incomplete;
+        }
       }
     }
 #else
@@ -1298,6 +1448,10 @@ StatusId VulkanVideoExecutionFactory::initialization_status() const noexcept {
 
 ReasonId VulkanVideoExecutionFactory::initialization_reason() const noexcept {
   return impl_->reason;
+}
+SemanticEffectId
+VulkanVideoExecutionFactory::initialization_failed_semantic() const noexcept {
+  return impl_->failed_semantic;
 }
 
 hal::AdapterRegistration
@@ -1408,39 +1562,49 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
     return fail(StatusId::blocked, transfer_reason);
   }
 
-  ParsedProgramOptions parsed;
-  ReasonId parsed_reason = ReasonId::none;
-  if (!ParseOptions(request.intent, &parsed, &parsed_reason))
-    return fail(StatusId::blocked, parsed_reason);
-  for (std::size_t i = 0; i < request.intent.stage_count; ++i) {
-    const auto &stage = request.intent.stages[i];
-    const auto *identity =
-        ModelIdentity(impl_->configuration, stage.intent.semantic);
-    if (identity &&
-        (!identity->artifact_generation ||
-         stage.model.model_id_hash != identity->model_id_hash ||
-         stage.model.artifact_set_hash != identity->artifact_set_hash ||
-         stage.model.artifact_generation != identity->artifact_generation))
-      return fail(StatusId::blocked, ReasonId::reconfiguration_required);
-  }
-  if (frozen_resolution.stage_count != request.intent.stage_count ||
-      frozen_domain_plan.islands[0].stage_count != request.intent.stage_count) {
+  if (frozen_resolution.stage_count != request.intent.stage_count)
     return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
-  }
-  for (std::size_t index = 0; index < frozen_resolution.stage_count; ++index) {
-    const auto &stage = frozen_resolution.stages[index];
-    if (stage.skipped_optional ||
-        stage.intent.stage_id != request.intent.stages[index].intent.stage_id ||
-        stage.intent.semantic != request.intent.stages[index].intent.semantic ||
-        stage.selected_backend != BackendId::vulkan ||
+  std::size_t selected_count = 0;
+  for (std::size_t i = 0; i < frozen_resolution.stage_count; ++i) {
+    const auto &stage = frozen_resolution.stages[i];
+    if (stage.intent.stage_id != request.intent.stages[i].intent.stage_id ||
+        stage.intent.semantic != request.intent.stages[i].intent.semantic)
+      return fail(StatusId::blocked, ReasonId::malformed_contract);
+    if (stage.skipped_optional) {
+      const auto *capability =
+          FindCapability(impl_->registration, stage.intent.semantic);
+      if (stage.intent.required || !capability ||
+          !UnavailableCapability(*capability))
+        return fail(StatusId::blocked,
+                    ReasonId::capability_evidence_incomplete);
+      continue;
+    }
+    ++selected_count;
+    if (stage.selected_backend != BackendId::vulkan ||
         stage.provider != kProvider ||
         stage.execution_domain != impl_->registration.execution_domain ||
         (stage.intent.semantic != SemanticEffectId::mirror &&
          stage.intent.semantic != SemanticEffectId::vignette &&
-         !IsModelSemantic(stage.intent.semantic))) {
+         !IsModelSemantic(stage.intent.semantic)))
       return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
-    }
+    const auto *identity =
+        ModelIdentity(impl_->configuration, stage.intent.semantic);
+    const auto &model = request.intent.stages[i].model;
+    if (identity &&
+        (!identity->artifact_generation ||
+         model.model_id_hash != identity->model_id_hash ||
+         model.artifact_set_hash != identity->artifact_set_hash ||
+         model.artifact_generation != identity->artifact_generation))
+      return fail(StatusId::blocked, ReasonId::reconfiguration_required);
   }
+  if (!selected_count ||
+      frozen_domain_plan.islands[0].stage_count != selected_count)
+    return fail(StatusId::blocked, ReasonId::semantic_effect_unsupported);
+  ParsedProgramOptions parsed;
+  ReasonId parsed_reason = ReasonId::none;
+  const auto active_intent = ActiveIntent(request.intent, frozen_resolution);
+  if (!ParseOptions(active_intent, &parsed, &parsed_reason))
+    return fail(StatusId::blocked, parsed_reason);
 
   preflight.prepared_program =
       BuildProgram(request, frozen_resolution, frozen_domain_plan);
@@ -1452,15 +1616,19 @@ video::VideoAdapterFactoryPreflight VulkanVideoExecutionFactory::Preflight(
                     : StatusId::blocked,
                 validation_reason);
   }
-  preflight.status = StatusId::ready;
-  preflight.reason = ReasonId::none;
-  preflight.readiness.status = StatusId::ready;
-  preflight.readiness.reason = ReasonId::none;
+  preflight.status = frozen_resolution.degraded ? StatusId::degraded : StatusId::ready;
+  preflight.reason = frozen_resolution.degraded ? frozen_resolution.reason : ReasonId::none;
+  preflight.readiness.status = preflight.status;
+  preflight.readiness.reason = preflight.reason;
+  preflight.readiness.degraded = frozen_resolution.degraded;
   preflight.readiness.available = true;
-  preflight.readiness.ready_stage_mask =
-      request.intent.stage_count == 32
-          ? std::numeric_limits<std::uint32_t>::max()
-          : ((std::uint32_t{1} << request.intent.stage_count) - 1u);
+  for (std::size_t i = 0; i < frozen_resolution.stage_count; ++i) {
+    const auto bit = std::uint32_t{1} << i;
+    if (frozen_resolution.stages[i].skipped_optional)
+      preflight.readiness.disabled_stage_mask |= bit;
+    else
+      preflight.readiness.ready_stage_mask |= bit;
+  }
   AppendExactEvidence(impl_->registration, request.intent,
                       &preflight.readiness);
   return preflight;
@@ -1531,8 +1699,11 @@ VulkanVideoExecutionFactory::Prepare(
       return fail(StatusId::blocked, ReasonId::reconfiguration_required);
   }
   ParsedProgramOptions parsed;
-  if (!ParseOptions(plan.intent, &parsed, &reason))
+  const auto active_intent = ActiveIntent(plan.intent, plan.resolution);
+  if (!ParseOptions(active_intent, &parsed, &reason))
     return fail(StatusId::blocked, reason);
+  parsed.matting.conservative_temporal_contract =
+      plan.prepared_program.temporal.temporal && !TemporalIntent(active_intent);
   if (!impl_->SetProductionOptions(plan.prepared_program, parsed))
     return fail(StatusId::blocked, ReasonId::reconfiguration_required);
 

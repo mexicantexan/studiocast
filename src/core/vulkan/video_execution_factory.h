@@ -9,6 +9,7 @@
 #include <memory>
 
 namespace studiocast::vulkan {
+struct VulkanProductionModelDiagnostics;
 
 // Setup-only configuration for the production-qualified Open Vulkan factory.
 // The public surface is deliberately neutral: Vulkan device, queue, and
@@ -36,6 +37,7 @@ struct VulkanVideoExecutionFactoryConfiguration {
   int input_height = 0;
   int output_width = 0;
   int output_height = 0;
+  std::uint32_t unavailable_semantic_mask = 0;
   // Hermetic injected-constructor seam; production ignores these callbacks.
   hal::StatusId (*injected_shutdown_probe)(void *) noexcept = nullptr;
   void *injected_shutdown_context = nullptr;
@@ -68,6 +70,8 @@ public:
   [[nodiscard]] bool initialized() const noexcept;
   [[nodiscard]] hal::StatusId initialization_status() const noexcept;
   [[nodiscard]] hal::ReasonId initialization_reason() const noexcept;
+  [[nodiscard]] hal::SemanticEffectId
+  initialization_failed_semantic() const noexcept;
 
   [[nodiscard]] hal::AdapterRegistration adapter_registration() const noexcept;
   [[nodiscard]] video::VideoAdapterFactoryRegistration
@@ -84,6 +88,10 @@ public:
           video::VideoAdapterPrepareEvidence *evidence) noexcept override;
 
 private:
+  friend bool
+  CollectProductionVulkanModelDiagnostics(const VulkanVideoExecutionFactory &,
+                                          VulkanProductionModelDiagnostics *,
+                                          std::string *);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

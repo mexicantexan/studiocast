@@ -14,6 +14,7 @@
 
 namespace studiocast::vulkan {
 struct VulkanVideoExecutionFactoryConfiguration;
+struct VulkanProductionModelDiagnostics;
 
 // Synchronous production executor for one exact Open Vulkan island: optional
 // shared resident matting, background composition and key light, then final
@@ -36,6 +37,10 @@ public:
                          int width, int height, std::string *error);
   bool InitializeModels(const VulkanVideoExecutionFactoryConfiguration &,
                         std::string *error);
+  hal::SemanticEffectId InitializationFailedSemantic() const noexcept {
+    return initialization_failed_semantic_;
+  }
+  void CollectModelDiagnostics(VulkanProductionModelDiagnostics *) const;
   const open_vulkan::VulkanMattingReadiness &MattingReadiness() const noexcept {
     return matting_readiness_;
   }
@@ -112,6 +117,8 @@ private:
                                        std::uint64_t capture_sequence) noexcept;
   struct ModelEffects;
   std::unique_ptr<ModelEffects> model_effects_;
+  hal::SemanticEffectId initialization_failed_semantic_ =
+      hal::SemanticEffectId::invalid;
 
   std::uint64_t adapter_instance_id_ = 0;
   kernels::UtilityKernels *kernels_ = nullptr;
