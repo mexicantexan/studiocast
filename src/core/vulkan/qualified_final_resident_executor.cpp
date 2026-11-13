@@ -172,9 +172,16 @@ struct QualifiedFinalResidentExecutor::ModelEffects {
     b.w = tensor.w();
     b.h = tensor.h();
     b.c = tensor.c();
-    b.row_stride_bytes = static_cast<std::size_t>(tensor.w()) * sizeof(float);
+    // Tracking stores the two eye angles as two scalar channels. The reviewed
+    // FLX graph consumes the same contiguous bytes as a rank-one vector.
+    if (dims == 1) {
+      b.w = tensor.w() * tensor.h() * tensor.c();
+      b.h = 1;
+      b.c = 1;
+    }
+    b.row_stride_bytes = static_cast<std::size_t>(b.w) * sizeof(float);
     b.plane_stride_bytes =
-        b.row_stride_bytes * static_cast<std::size_t>(tensor.h());
+        b.row_stride_bytes * static_cast<std::size_t>(b.h);
     return b;
   }
   bool PrepareGraph(open_vulkan::NcnnVulkanInference &runtime,

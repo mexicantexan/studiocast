@@ -731,6 +731,13 @@ ProductionCapability(SemanticEffectId semantic,
         semantic,
         BackendId::vulkan,
         true};
+    capability.evidence[capability.evidence_count++] = {
+        CapabilityEvidenceCode::vulkan_warmup_complete,
+        StatusId::ready,
+        ReasonId::none,
+        semantic,
+        BackendId::vulkan,
+        true};
   }
   capability.evidence[capability.evidence_count++] = {
       production_code, StatusId::ready,   ReasonId::none,
@@ -741,7 +748,7 @@ ProductionCapability(SemanticEffectId semantic,
         semantic, BackendId::vulkan, true};
   };
   if (semantic == SemanticEffectId::auto_frame)
-    add(CapabilityEvidenceCode::vulkan_face_runtime_ready);
+    add(CapabilityEvidenceCode::vulkan_tracking_gpu_ready);
   if (semantic == SemanticEffectId::eye_contact) {
     add(CapabilityEvidenceCode::vulkan_face_runtime_ready);
     add(CapabilityEvidenceCode::vulkan_landmarks_runtime_ready);
