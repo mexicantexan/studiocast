@@ -28,6 +28,8 @@
 #include "core/video/open_vulkan_virtual_key_light.h"
 #include "core/vulkan/kernels/shaders/resize_rgb24_bilinear_spv.h"
 #include "core/vulkan/kernels/utility_kernels.h"
+#include "core/vulkan/video_execution_factory.h"
+#include "core/vulkan/video_execution_factory_internal.h"
 
 namespace studiocast::vulkan::kernels {
 
@@ -648,20 +650,23 @@ void ApplyOpenVulkanAutoFrameReleaseReadiness(OpenVulkanDiagnostics *d) {
   d->auto_frame_readiness_code.clear();
   d->auto_frame_blocker_code =
       std::string(studiocast::video::kOpenVulkanAutoFrameFaceProviderReason);
-  d->auto_frame_cpu_tail = true;
-  d->auto_frame_degraded_reason_code =
-      std::string(studiocast::video::kOpenVulkanAutoFrameCpuTailReason);
+  d->auto_frame_cpu_tail = false;
+  d->auto_frame_degraded_reason_code.clear();
   d->auto_frame_selectable_cpu_fallback = false;
   SetOpenVulkanEffectAvailability(
       d, studiocast::video::effects::contract::kEffectIdAutoFrame, false,
       d->auto_frame_blocker_code);
 }
 
-void ApplyOpenVulkanEyeContactReadiness(OpenVulkanDiagnostics *d) {
+void ApplyOpenVulkanEyeContactReadiness(
+    OpenVulkanDiagnostics *d,
+    const video::OpenVulkanEyeContactCapabilityFacts *prepared = nullptr) {
   if (!d)
     return;
 
-  auto current_facts = studiocast::video::CurrentOpenVulkanEyeContactFacts();
+  auto current_facts =
+      prepared ? *prepared
+               : studiocast::video::CurrentOpenVulkanEyeContactFacts();
   current_facts.non_cpu_device_selected = d->non_cpu_device_selected;
   current_facts.compute_queue_available = d->compute_queue_available;
   current_facts.context_healthy = d->context_healthy;
@@ -704,15 +709,20 @@ void ApplyOpenVulkanEyeContactReadiness(OpenVulkanDiagnostics *d) {
   d->available_effects.erase(std::remove(d->available_effects.begin(),
                                          d->available_effects.end(), effect_id),
                              d->available_effects.end());
-  d->blocked_effects[effect_id] = readiness.reason_code;
+  SetOpenVulkanEffectAvailability(d, effect_id, readiness.production_ready,
+                                  readiness.reason_code);
 }
 
-void ApplyOpenVulkanVideoNoiseRemovalReadiness(OpenVulkanDiagnostics *d) {
+void ApplyOpenVulkanVideoNoiseRemovalReadiness(
+    OpenVulkanDiagnostics *d,
+    const video::OpenVulkanVideoNoiseRemovalCapabilityFacts *prepared =
+        nullptr) {
   if (!d)
     return;
 
   auto current_facts =
-      studiocast::video::CurrentOpenVulkanVideoNoiseRemovalFacts();
+      prepared ? *prepared
+               : studiocast::video::CurrentOpenVulkanVideoNoiseRemovalFacts();
   current_facts.non_cpu_device_selected = d->non_cpu_device_selected;
   current_facts.compute_queue_available = d->compute_queue_available;
   current_facts.context_healthy = d->context_healthy;
@@ -776,7 +786,8 @@ void ApplyOpenVulkanVideoNoiseRemovalReadiness(OpenVulkanDiagnostics *d) {
   d->available_effects.erase(std::remove(d->available_effects.begin(),
                                          d->available_effects.end(), effect_id),
                              d->available_effects.end());
-  d->blocked_effects[effect_id] = readiness.reason_code;
+  SetOpenVulkanEffectAvailability(d, effect_id, readiness.production_ready,
+                                  readiness.reason_code);
 }
 
 // This attestation is deliberately limited to the converted artifact/profile
@@ -805,78 +816,276 @@ bool ReviewedMattingProfile(const open_video::ModelPack &pack) {
 // the daemon cache and never performs this hashing, preparation or inference.
 bool PrepareMattingDiagnostics(OpenVulkanDiagnostics *d,
                                OpenVulkanMattingModelFacts *facts,
-                               open_vulkan::VulkanMattingReadiness *readiness) {
-  if (!facts->pack || !open_vulkan::ProductionVulkanMattingBuildEnabled() ||
+                               open_vulkan::VulkanMattingReadiness *readiness,
+                               VulkanProductionModelDiagnostics *models) {
+  if (!open_vulkan::ProductionVulkanMattingBuildEnabled() ||
       !open_vulkan::ProductionVulkanMattingAdapterAvailable())
     return false;
   try {
-    std::string error;
-    if (!open_video::ValidateProductionNcnnVulkanMattingPack(*facts->pack,
-                                                             &error)) {
-      readiness->blocker_code =
-          open_vulkan::kOpenVulkanMattingModelInvalidReason;
-      readiness->detail = error;
-      return true;
+    VulkanVideoExecutionFactoryConfiguration configuration;
+    configuration.input_width = configuration.output_width = 4;
+    configuration.input_height = configuration.output_height = 4;
+    // One small startup profile shares one caller-owned aggregate reservation.
+    // This is a diagnostic bound, not a camera-resolution memory guarantee.
+    configuration.reservation.persistent_bytes = UINT64_C(512) << 20;
+    configuration.reservation.scratch_bytes = UINT64_C(256) << 20;
+    configuration.reservation.upload_staging_bytes = UINT64_C(1) << 20;
+    configuration.reservation.readback_staging_bytes = UINT64_C(1) << 20;
+    configuration.reservation.resource_count = 2048;
+    configuration.reservation.in_flight_slots = 1;
+    auto effects = video::effects::BroadcastCameraEffects{};
+    const auto registry = open_video::ModelPackRegistry::ScanDefault();
+    const auto select = [&](const char *task, const std::string &id,
+                            std::shared_ptr<const open_video::ModelPack> *pack,
+                            hal::ModelArtifactIdentity *identity) {
+      auto candidate = registry.Find(task, id);
+      if (!candidate)
+        return false;
+      const auto kind = std::string(task) == "face_landmarks"
+                            ? "dlib_shape_predictor"
+                            : "ncnn_param";
+      for (const auto &file : candidate->files) {
+        if (file.kind != kind)
+          continue;
+        const auto validated =
+            open_video::ValidateModelArtifactIdentity(*candidate, file);
+        if (!validated.ok())
+          return false;
+        identity->model_id_hash = validated.identity.model_id_sha256;
+        identity->artifact_set_hash = validated.identity.artifact_set_sha256;
+        identity->artifact_generation = validated.identity.registry_generation;
+        *pack = std::make_shared<const open_video::ModelPack>(
+            std::move(*candidate));
+        return true;
+      }
+      return false;
+    };
+    if (facts->pack &&
+        select("matting", facts->pack->id, &configuration.matting_pack,
+               &configuration.matting_identity)) {
+      effects.virtual_background.mode =
+          video::effects::VirtualBackgroundMode::blur;
+      effects.virtual_key_light.enabled = true;
     }
-    facts->contract_validated = true;
-    kernels::UtilityKernels utility;
-    if (!open_vulkan::InitializeProductionVulkanMattingDevice(utility.device(),
-                                                              &error) ||
-        !utility.Initialize(&error)) {
-      readiness->blocker_code =
-          open_vulkan::kOpenVulkanMattingAdapterUnavailableReason;
-      readiness->detail = error;
-      return true;
+    effects.video_noise_removal.enabled =
+        select("video_denoise", "fastdvdnet_sigma15",
+               &configuration.denoise_pack, &configuration.denoise_identity);
+    effects.auto_frame.enabled =
+        select("face_detection", "yunet_opencv_zoo_2023mar_fp32",
+               &configuration.face_pack, &configuration.face_identity);
+    effects.eye_contact.enabled =
+        effects.auto_frame.enabled &&
+        select("eye_contact", "gaze_correction_cam_flx_v0_1_1",
+               &configuration.eye_pack, &configuration.eye_identity);
+    if (effects.eye_contact.enabled) {
+      std::string landmark = "dlib_68_ibug_300w";
+      for (const auto &dependency : configuration.eye_pack->depends_on)
+        if (dependency.rfind("face_landmarks:", 0) == 0)
+          landmark = dependency.substr(15);
+      effects.eye_contact.enabled =
+          select("face_landmarks", landmark, &configuration.landmarks_pack,
+                 &configuration.landmarks_identity);
     }
-    const auto &shape = facts->pack->matting->output;
-    VulkanImage alpha;
-    if (!alpha.Allocate(utility.device(), shape.width, shape.height,
-                        VulkanPixelFormat::f32_1, false, &error)) {
-      readiness->blocker_code = open_vulkan::kOpenVulkanMattingAllocationReason;
-      readiness->detail = error;
-      return true;
+    effects.vignette.enabled = effects.auto_frame.enabled;
+    effects.vignette.center_on_tracked_face = true;
+    for (std::size_t attempt = 0; attempt < 5; ++attempt) {
+      configuration.effects =
+          std::make_shared<const video::effects::BroadcastCameraEffects>(
+              effects);
+      VulkanVideoExecutionFactory factory(configuration);
+      hal::ReasonId reason{};
+      const auto status = factory.Initialize(&reason);
+      if (status == hal::StatusId::ready || status == hal::StatusId::degraded) {
+        std::string error;
+        if (!CollectProductionVulkanModelDiagnostics(factory, models, &error))
+          throw std::runtime_error(error);
+        *readiness = models->matting_readiness;
+        facts->selected = models->matting_pack != nullptr;
+        facts->contract_validated =
+            models->capabilities.matting_production_ready;
+        facts->pack =
+            models->matting_pack
+                ? std::optional<open_video::ModelPack>(*models->matting_pack)
+                : std::nullopt;
+        auto prepared = models->device;
+        prepared.ok = true;
+        prepared.shader_pipeline_created = true;
+        prepared.installed_models = std::move(d->installed_models);
+        prepared.models = std::move(d->models);
+        prepared.default_model_id = std::move(d->default_model_id);
+        prepared.missing_models = std::move(d->missing_models);
+        prepared.install_hints = std::move(d->install_hints);
+        prepared.warnings = std::move(d->warnings);
+        prepared.matting_parity_validated =
+            facts->pack && ReviewedMattingProfile(*facts->pack) &&
+            readiness->production_ready;
+        *d = std::move(prepared);
+        return true;
+      }
+      const auto failed = factory.initialization_failed_semantic();
+      const auto shutdown = factory.RequestShutdown();
+      if (!shutdown.quiescent || !shutdown.driver_context_release_permitted)
+        throw std::runtime_error(
+            "Diagnostic Vulkan owner could not retire safely");
+      // Only a known optional component may be omitted after safe retirement.
+      if (failed == hal::SemanticEffectId::video_noise_removal &&
+          configuration.denoise_pack) {
+        configuration.denoise_pack.reset();
+        effects.video_noise_removal.enabled = false;
+      } else if (failed == hal::SemanticEffectId::eye_contact &&
+                 configuration.eye_pack) {
+        configuration.eye_pack.reset();
+        configuration.landmarks_pack.reset();
+        effects.eye_contact.enabled = false;
+      } else if (failed == hal::SemanticEffectId::auto_frame &&
+                 configuration.face_pack) {
+        configuration.face_pack.reset();
+        configuration.eye_pack.reset();
+        configuration.landmarks_pack.reset();
+        effects.auto_frame.enabled = effects.eye_contact.enabled =
+            effects.vignette.enabled = false;
+      } else if (failed == hal::SemanticEffectId::virtual_background_blur &&
+                 configuration.matting_pack) {
+        configuration.matting_pack.reset();
+        effects.virtual_background.mode =
+            video::effects::VirtualBackgroundMode::none;
+        effects.virtual_key_light.enabled = false;
+      } else {
+        throw std::runtime_error(
+            "Production Vulkan diagnostic preparation unavailable");
+      }
     }
-    open_vulkan::OpenVulkanMattingSession session(utility.device(), &utility,
-                                                  *facts->pack);
-    if (!session.BindAlphaOutputForSetup(&alpha, &error) ||
-        !session.EnsureInitialized(4, 4, &error) || !session.Warmup(&error)) {
-      *readiness = session.Readiness();
-      if (!error.empty())
-        readiness->detail = error;
-      return true;
-    }
-    *readiness = session.Readiness();
-    auto prepared = utility.Diagnostics();
-    prepared.ok = true;
-    prepared.shader_pipeline_created = true;
-    prepared.installed_models = std::move(d->installed_models);
-    prepared.models = std::move(d->models);
-    prepared.default_model_id = std::move(d->default_model_id);
-    prepared.missing_models = std::move(d->missing_models);
-    prepared.install_hints = std::move(d->install_hints);
-    prepared.warnings = std::move(d->warnings);
-    prepared.matting_parity_validated =
-        ReviewedMattingProfile(*facts->pack) &&
-        video::EvaluateOpenVulkanVirtualBackgroundBlurReadiness(prepared,
-                                                                *readiness)
-            .production_ready &&
-        video::EvaluateOpenVulkanVirtualBackgroundRemoveReadiness(prepared,
-                                                                  *readiness)
-            .production_ready &&
-        video::EvaluateOpenVulkanVirtualBackgroundReplaceReadiness(prepared,
-                                                                   *readiness)
-            .production_ready &&
-        video::EvaluateOpenVulkanVirtualKeyLightReadiness(prepared, *readiness)
-            .production_ready;
-    *d = std::move(prepared);
-    return true;
   } catch (const std::exception &error) {
     readiness->production_ready = false;
     readiness->blocker_code =
         open_vulkan::kOpenVulkanMattingRuntimeFailureReason;
     readiness->detail = error.what();
-    return true;
   }
+  return true;
+}
+
+bool ReviewedNetwork(const std::shared_ptr<const open_video::ModelPack> &pack,
+                     const char *role, const char *profile, const char *param,
+                     const char *bin) {
+  if (!pack)
+    return false;
+  for (const auto &network : pack->ncnn_vulkan_networks)
+    if (network.role == role && network.profile == profile &&
+        network.precision == "fp32" && network.converter_name == "pnnx" &&
+        network.converter_version == "20261020" &&
+        network.param_sha256 == param && network.bin_sha256 == bin)
+      return true;
+  return false;
+}
+
+void ApplyPreparedModelDiagnostics(OpenVulkanDiagnostics *d,
+                                   const VulkanProductionModelDiagnostics &m) {
+  const auto &c = m.capabilities;
+  const bool common =
+      c.build_enabled && c.runtime_loaded && c.non_cpu_physical_device &&
+      c.compute_queue_available && c.owned_context_healthy &&
+      c.utility_kernels_ready && c.exact_device_and_queue_shared &&
+      c.persistent_device_local_resources && c.bounded_reusable_allocations &&
+      c.no_host_intermediate_storage;
+  const bool face_reviewed = ReviewedNetwork(
+      m.face_pack, "main", "yunet_640_v1",
+      "a79870770c2e87ce218950ba471b4fd82f2ec3c9c5908405b05e4e93fa3e8293",
+      "8faa696d61ad6bf5c13ed5d6c8ae35e376c660968db53d723a329020856ca5c9");
+  auto eye = video::CurrentOpenVulkanEyeContactFacts();
+  eye.non_cpu_device_selected = c.non_cpu_physical_device;
+  eye.compute_queue_available = c.compute_queue_available;
+  eye.context_healthy = c.owned_context_healthy;
+  eye.shared_device_imported = m.face.shared_device_imported &&
+                               m.left_eye.shared_device_imported &&
+                               m.right_eye.shared_device_imported;
+  eye.queue_ownership_explicit = m.face.queue_ownership_explicit &&
+                                 m.left_eye.queue_ownership_explicit &&
+                                 m.right_eye.queue_ownership_explicit;
+  eye.model_pack_selected = m.eye_pack && m.face_pack && m.landmarks_pack;
+  eye.artifact_contract_validated = eye.device_resident_analysis =
+      eye.device_resident_tensor_io =
+          c.eye_production_ready && c.landmarks_production_ready &&
+          c.shader_float64_enabled;
+  eye.warmup_complete = m.face.warmup_complete && m.left_eye.warmup_complete &&
+                        m.right_eye.warmup_complete;
+  eye.bounded_reusable_allocations = c.bounded_reusable_allocations;
+  eye.synchronization_contract_validated = common && eye.warmup_complete;
+  eye.parity_validated =
+      eye.model_pack_selected && face_reviewed &&
+      ReviewedNetwork(
+          m.eye_pack, "left", "flx_prefix_v1",
+          "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9",
+          "7597eb7e151ec1de71fb33ce7f511b856f258d538f939727401598e18d180416") &&
+      ReviewedNetwork(
+          m.eye_pack, "right", "flx_prefix_v1",
+          "7990a15c75c916c04dcc3cab488f4267bd5b0dd6a1d4095d86e1e0bf69341ee9",
+          "9333359e7c4924312b4af161ae0678471abf7d301c7893474e534c4f9541802b");
+  if (eye.parity_validated) {
+    const auto landmark = std::find_if(
+        m.landmarks_pack->files.begin(), m.landmarks_pack->files.end(),
+        [](const auto &f) { return f.kind == "dlib_shape_predictor"; });
+    eye.parity_validated =
+        landmark != m.landmarks_pack->files.end() &&
+        landmark->sha256 ==
+            "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f";
+  }
+  eye.dispatch_count =
+      m.left_eye.warmup_inference_count + m.right_eye.warmup_inference_count;
+  ApplyOpenVulkanEyeContactReadiness(d, &eye);
+  auto denoise = video::CurrentOpenVulkanVideoNoiseRemovalFacts();
+  denoise.non_cpu_device_selected = c.non_cpu_physical_device;
+  denoise.compute_queue_available = c.compute_queue_available;
+  denoise.context_healthy = c.owned_context_healthy;
+  denoise.shared_device_imported = m.denoise.shared_device_imported;
+  denoise.queue_ownership_explicit = m.denoise.queue_ownership_explicit;
+  denoise.model_pack_selected = m.denoise_pack != nullptr;
+  denoise.artifact_contract_validated =
+      denoise.fully_device_resident_tensor_io =
+          denoise.device_resident_preprocess =
+              denoise.device_resident_postprocess = c.denoise_production_ready;
+  denoise.warmup_complete = m.denoise.warmup_complete;
+  denoise.synchronization_contract_validated =
+      common && denoise.warmup_complete;
+  denoise.bounded_reusable_allocations = c.bounded_reusable_allocations;
+  denoise.temporal_history_device_resident = denoise.temporal_history_bounded =
+      denoise.history_reset_on_disable = denoise.history_reset_on_reconfigure =
+          denoise.capture_sequence_discontinuity_reset =
+              c.denoise_production_ready;
+  denoise.parity_validated = ReviewedNetwork(
+      m.denoise_pack, "main", "fastdvdnet_rgb_v1",
+      "f3bb19a906f5c811f9627e167181afa04a8adc76fa2e77e8f1ab00d27535c102",
+      "b31f624553b8072fe53fc2f46a060495b8016ad2f0c6ee9d0f66f88604fdec3f");
+  denoise.dispatch_count = m.denoise.warmup_inference_count;
+  ApplyOpenVulkanVideoNoiseRemovalReadiness(d, &denoise);
+  const bool tracking = common && face_reviewed && m.face.warmup_complete &&
+                        c.face_production_ready && c.tracking_gpu_ready;
+  d->auto_frame_production_ready = tracking;
+  d->auto_frame_gpu_tracking_ready = common && c.tracking_gpu_ready;
+  d->auto_frame_model_contract_validated = c.face_production_ready;
+  d->auto_frame_warmup_complete = m.face.warmup_complete;
+  d->auto_frame_parity_validated = face_reviewed;
+  d->auto_frame_shared_device_imported = m.face.shared_device_imported;
+  d->auto_frame_queue_ownership_explicit = m.face.queue_ownership_explicit;
+  d->auto_frame_bounded_reusable_allocations =
+      common && m.face.bounded_reusable_allocations;
+  d->auto_frame_synchronization_contract_validated =
+      common && m.face.synchronous_completion;
+  d->auto_frame_cpu_layers_used = m.face.cpu_layers_used;
+  d->auto_frame_dynamic_allocation_count = m.face.dynamic_allocation_count;
+  d->auto_frame_cpu_readback_count = m.face.cpu_readback_count;
+  d->auto_frame_cpu_fallback_count =
+      0; // The prepared tracking island has no CPU fallback.
+  d->auto_frame_dispatch_count = m.face.warmup_inference_count;
+  d->auto_frame_cpu_tail = false;
+  d->auto_frame_degraded_reason_code.clear();
+  d->auto_frame_readiness_code =
+      tracking ? "open_vulkan_auto_frame_production_ready" : "";
+  d->auto_frame_blocker_code =
+      tracking ? "" : "vulkan_auto_frame_yunet_unavailable";
+  SetOpenVulkanEffectAvailability(d, "auto_frame", tracking,
+                                  d->auto_frame_blocker_code);
+  d->vignette_tracked_center_production_ready =
+      tracking && c.vignette_tracked_center_ready;
 }
 
 } // namespace
@@ -935,7 +1144,9 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   d.alpha_device_resident = false;
   d.output_device_resident = false;
   open_vulkan::VulkanMattingReadiness prepared;
-  const bool attempted = PrepareMattingDiagnostics(&d, &model_facts, &prepared);
+  VulkanProductionModelDiagnostics models;
+  const bool attempted =
+      PrepareMattingDiagnostics(&d, &model_facts, &prepared, &models);
   ApplyOpenVulkanMattingReadiness(&d, model_facts,
                                   attempted ? &prepared : nullptr);
   if (d.matting_production_ready) {
@@ -956,6 +1167,8 @@ OpenVulkanDiagnostics DiagnoseOpenVulkanDefault() {
   ApplyOpenVulkanAutoFrameReleaseReadiness(&d);
   ApplyOpenVulkanEyeContactReadiness(&d);
   ApplyOpenVulkanVideoNoiseRemovalReadiness(&d);
+  if (models.capabilities.build_enabled)
+    ApplyPreparedModelDiagnostics(&d, models);
   return d;
 }
 

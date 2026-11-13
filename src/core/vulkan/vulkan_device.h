@@ -289,12 +289,26 @@ struct OpenVulkanDiagnostics {
   std::string mirror_blocker_code;
 
   bool vignette_fixed_center_production_ready = false;
+  bool vignette_tracked_center_production_ready = false;
   std::string vignette_readiness_code;
   std::string vignette_blocker_code;
   std::string vignette_parameter_contract = "fixed_center";
 
   bool auto_frame_crop_stage_implemented = false;
   bool auto_frame_production_ready = false;
+  bool auto_frame_gpu_tracking_ready = false;
+  bool auto_frame_model_contract_validated = false;
+  bool auto_frame_warmup_complete = false;
+  bool auto_frame_parity_validated = false;
+  bool auto_frame_shared_device_imported = false;
+  bool auto_frame_queue_ownership_explicit = false;
+  bool auto_frame_bounded_reusable_allocations = false;
+  bool auto_frame_synchronization_contract_validated = false;
+  bool auto_frame_cpu_layers_used = false;
+  std::uint64_t auto_frame_dynamic_allocation_count = 0;
+  std::uint64_t auto_frame_cpu_readback_count = 0;
+  std::uint64_t auto_frame_cpu_fallback_count = 0;
+  std::uint64_t auto_frame_dispatch_count = 0;
   std::string auto_frame_readiness_code;
   std::string auto_frame_blocker_code = "vulkan_auto_frame_yunet_unavailable";
   bool auto_frame_cpu_tail = false;

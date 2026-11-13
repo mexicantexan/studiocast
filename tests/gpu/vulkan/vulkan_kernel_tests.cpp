@@ -18,7 +18,9 @@
 #include <png.h>
 
 #include "core/video/open_vulkan_auto_frame.h"
+#include "core/video/open_vulkan_eye_contact.h"
 #include "core/video/open_vulkan_mirror.h"
+#include "core/video/open_vulkan_video_noise_removal.h"
 #include "core/video/open_vulkan_vignette.h"
 #include "core/video/open_vulkan_virtual_background_blur.h"
 #include "core/video/open_vulkan_virtual_background_remove.h"
@@ -81,8 +83,8 @@ bool WritePngFixture(const std::filesystem::path &path, int width, int height,
   std::FILE *file = std::fopen(path.c_str(), "wb");
   if (!file)
     return false;
-  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr,
-                                            nullptr, nullptr);
+  png_structp png =
+      png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
   if (!png) {
     std::fclose(file);
     return false;
@@ -107,8 +109,8 @@ bool WritePngFixture(const std::filesystem::path &path, int width, int height,
   std::vector<png_bytep> rows(static_cast<std::size_t>(height));
   for (int y = 0; y < height; ++y) {
     rows[static_cast<std::size_t>(y)] = const_cast<png_bytep>(
-        rgb.data() + static_cast<std::size_t>(y) *
-                         static_cast<std::size_t>(width) * 3u);
+        rgb.data() +
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 3u);
   }
   png_write_image(png, rows.data());
   png_write_end(png, nullptr);
@@ -118,13 +120,12 @@ bool WritePngFixture(const std::filesystem::path &path, int width, int height,
 }
 
 bool WritePngRgbaFixture(const std::filesystem::path &path, int width,
-                         int height,
-                         const std::vector<std::uint8_t> &rgba) {
+                         int height, const std::vector<std::uint8_t> &rgba) {
   std::FILE *file = std::fopen(path.c_str(), "wb");
   if (!file)
     return false;
-  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr,
-                                            nullptr, nullptr);
+  png_structp png =
+      png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
   if (!png) {
     std::fclose(file);
     return false;
@@ -149,8 +150,8 @@ bool WritePngRgbaFixture(const std::filesystem::path &path, int width,
   std::vector<png_bytep> rows(static_cast<std::size_t>(height));
   for (int y = 0; y < height; ++y) {
     rows[static_cast<std::size_t>(y)] = const_cast<png_bytep>(
-        rgba.data() + static_cast<std::size_t>(y) *
-                          static_cast<std::size_t>(width) * 4u);
+        rgba.data() +
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4u);
   }
   png_write_image(png, rows.data());
   png_write_end(png, nullptr);
@@ -163,8 +164,8 @@ studiocast::video::detail::PreparedReplaceBackgroundSource
 PreparedReplaceAsset(const std::filesystem::path &path, int generation) {
   studiocast::video::detail::PreparedReplaceBackgroundSource prepared;
   prepared.path = path;
-  prepared.mtime = std::filesystem::file_time_type{} +
-                   std::chrono::seconds(generation);
+  prepared.mtime =
+      std::filesystem::file_time_type{} + std::chrono::seconds(generation);
   prepared.valid = true;
   return prepared;
 }
@@ -590,31 +591,32 @@ bool AllocateF32(studiocast::vulkan::kernels::UtilityKernels &kernels,
                          /*map_memory=*/true, error);
 }
 
-bool AllocateDeviceLocalU8(
-    studiocast::vulkan::kernels::UtilityKernels &kernels,
-    studiocast::vulkan::VulkanImage *image, int w, int h,
-    studiocast::vulkan::VulkanPixelFormat format, std::string *error) {
+bool AllocateDeviceLocalU8(studiocast::vulkan::kernels::UtilityKernels &kernels,
+                           studiocast::vulkan::VulkanImage *image, int w, int h,
+                           studiocast::vulkan::VulkanPixelFormat format,
+                           std::string *error) {
   return image->Allocate(kernels.device(), w, h, format,
                          /*map_memory=*/false, error);
 }
 
-bool UploadDeviceLocalU8(
-    studiocast::vulkan::kernels::UtilityKernels &kernels,
-    studiocast::vulkan::VulkanImage *upload_staging,
-    studiocast::vulkan::VulkanImage *device_image, int w, int h,
-    studiocast::vulkan::VulkanPixelFormat format,
-    const std::vector<std::uint8_t> &bytes, std::string *error) {
+bool UploadDeviceLocalU8(studiocast::vulkan::kernels::UtilityKernels &kernels,
+                         studiocast::vulkan::VulkanImage *upload_staging,
+                         studiocast::vulkan::VulkanImage *device_image, int w,
+                         int h, studiocast::vulkan::VulkanPixelFormat format,
+                         const std::vector<std::uint8_t> &bytes,
+                         std::string *error) {
   return AllocateU8(kernels, upload_staging, w, h, format, error) &&
          AllocateDeviceLocalU8(kernels, device_image, w, h, format, error) &&
-         kernels.UploadU8x3ToDeviceLocal(
-             bytes.data(), static_cast<std::size_t>(w) * 3u, *upload_staging,
-             *device_image, error);
+         kernels.UploadU8x3ToDeviceLocal(bytes.data(),
+                                         static_cast<std::size_t>(w) * 3u,
+                                         *upload_staging, *device_image, error);
 }
 
-std::vector<std::uint8_t> ReadbackDeviceLocalU8(
-    studiocast::vulkan::kernels::UtilityKernels &kernels,
-    const studiocast::vulkan::VulkanImage &device_image,
-    studiocast::vulkan::VulkanImage *readback_staging, std::string *error) {
+std::vector<std::uint8_t>
+ReadbackDeviceLocalU8(studiocast::vulkan::kernels::UtilityKernels &kernels,
+                      const studiocast::vulkan::VulkanImage &device_image,
+                      studiocast::vulkan::VulkanImage *readback_staging,
+                      std::string *error) {
   if ((!readback_staging->Valid() ||
        readback_staging->width() != device_image.width() ||
        readback_staging->height() != device_image.height() ||
@@ -626,9 +628,9 @@ std::vector<std::uint8_t> ReadbackDeviceLocalU8(
   std::vector<std::uint8_t> output(
       static_cast<std::size_t>(device_image.width()) *
       static_cast<std::size_t>(device_image.height()) * 3u);
-  if (!kernels.ReadbackU8x3(
-          device_image, *readback_staging, output.data(),
-          static_cast<std::size_t>(device_image.width()) * 3u, error)) {
+  if (!kernels.ReadbackU8x3(device_image, *readback_staging, output.data(),
+                            static_cast<std::size_t>(device_image.width()) * 3u,
+                            error)) {
     return {};
   }
   return output;
@@ -926,8 +928,7 @@ int main() {
         "SHADER_READ synchronization");
   }
   {
-    const auto diagnostics =
-        studiocast::vulkan::DiagnoseOpenVulkanDefault();
+    const auto diagnostics = studiocast::vulkan::DiagnoseOpenVulkanDefault();
     const auto mirror =
         studiocast::video::EvaluateOpenVulkanMirrorReadiness(diagnostics);
     const auto vignette =
@@ -935,8 +936,8 @@ int main() {
     const auto has_available = [&](std::string_view id) {
       const std::string value(id);
       return std::find(diagnostics.available_effects.begin(),
-                       diagnostics.available_effects.end(), value) !=
-             diagnostics.available_effects.end();
+                       diagnostics.available_effects.end(),
+                       value) != diagnostics.available_effects.end();
     };
     const std::string json = diagnostics.ToJson();
     ok &= Require(
@@ -944,7 +945,7 @@ int main() {
             has_available("mirror") == mirror.production_ready &&
             (mirror.production_ready
                  ? diagnostics.mirror_readiness_code ==
-                       "open_vulkan_mirror_production_ready" &&
+                           "open_vulkan_mirror_production_ready" &&
                        diagnostics.mirror_blocker_code.empty()
                  : diagnostics.mirror_readiness_code.empty() &&
                        diagnostics.mirror_blocker_code ==
@@ -958,7 +959,8 @@ int main() {
             diagnostics.vignette_parameter_contract == "fixed_center" &&
             (vignette.production_ready
                  ? diagnostics.vignette_readiness_code ==
-                       "open_vulkan_vignette_fixed_center_production_ready" &&
+                           "open_vulkan_vignette_fixed_center_production_"
+                           "ready" &&
                        diagnostics.vignette_blocker_code.empty()
                  : diagnostics.vignette_readiness_code.empty() &&
                        diagnostics.vignette_blocker_code ==
@@ -968,14 +970,14 @@ int main() {
     ok &= Require(
         diagnostics.auto_frame_crop_stage_implemented &&
             !diagnostics.auto_frame_production_ready &&
-            !has_available("auto_frame") && diagnostics.auto_frame_cpu_tail &&
+            !has_available("auto_frame") && !diagnostics.auto_frame_cpu_tail &&
             diagnostics.auto_frame_blocker_code ==
                 "vulkan_auto_frame_yunet_unavailable" &&
-            diagnostics.auto_frame_degraded_reason_code ==
-                "vulkan_effect_cpu_tail" &&
+            diagnostics.auto_frame_degraded_reason_code.empty() &&
             !diagnostics.auto_frame_selectable_cpu_fallback,
         "Auto Frame diagnostics must separate the crop implementation and "
-        "CPU tail from production and selectable fallback evidence");
+        "missing GPU tracking from production and selectable fallback "
+        "evidence");
     ok &= Require(
         json.find("\"mirror_production_ready\":") != std::string::npos &&
             json.find("\"mirror_readiness_code\":") != std::string::npos &&
@@ -989,23 +991,27 @@ int main() {
         "serialized pixel-effect/Auto Frame readiness schema is incomplete");
   }
   {
-    const auto diagnostics =
-        studiocast::vulkan::DiagnoseOpenVulkanDefault();
+    const auto diagnostics = studiocast::vulkan::DiagnoseOpenVulkanDefault();
     const auto blocked = diagnostics.blocked_effects.find("eye_contact");
     const bool falsely_available =
         std::find(diagnostics.available_effects.begin(),
-                  diagnostics.available_effects.end(), "eye_contact") !=
-        diagnostics.available_effects.end();
+                  diagnostics.available_effects.end(),
+                  "eye_contact") != diagnostics.available_effects.end();
     const std::string json = diagnostics.ToJson();
     ok &= Require(
         blocked != diagnostics.blocked_effects.end() &&
             blocked->second == "open_vulkan_eye_contact_unavailable" &&
-            !falsely_available &&
-            !diagnostics.eye_contact_production_ready &&
+            !falsely_available && !diagnostics.eye_contact_production_ready &&
             diagnostics.eye_contact_backend_compiled &&
-            !diagnostics.eye_contact_live_stage_implemented &&
-            !diagnostics.eye_contact_production_adapter_available &&
-            !diagnostics.eye_contact_vulkan_inference_provider_available &&
+            diagnostics.eye_contact_live_stage_implemented ==
+                studiocast::video::CurrentOpenVulkanEyeContactFacts()
+                    .live_stage_implemented &&
+            diagnostics.eye_contact_production_adapter_available ==
+                studiocast::video::CurrentOpenVulkanEyeContactFacts()
+                    .production_adapter_available &&
+            diagnostics.eye_contact_vulkan_inference_provider_available ==
+                studiocast::video::CurrentOpenVulkanEyeContactFacts()
+                    .vulkan_inference_provider_available &&
             diagnostics.eye_contact_non_cpu_device_selected ==
                 diagnostics.non_cpu_device_selected &&
             diagnostics.eye_contact_compute_queue_available ==
@@ -1062,10 +1068,16 @@ int main() {
             !falsely_available &&
             !diagnostics.video_noise_removal_production_ready &&
             diagnostics.video_noise_removal_backend_compiled &&
-            !diagnostics.video_noise_removal_live_stage_implemented &&
-            !diagnostics.video_noise_removal_production_adapter_available &&
-            !diagnostics
-                 .video_noise_removal_vulkan_inference_provider_available &&
+            diagnostics.video_noise_removal_live_stage_implemented ==
+                studiocast::video::CurrentOpenVulkanVideoNoiseRemovalFacts()
+                    .live_stage_implemented &&
+            diagnostics.video_noise_removal_production_adapter_available ==
+                studiocast::video::CurrentOpenVulkanVideoNoiseRemovalFacts()
+                    .production_adapter_available &&
+            diagnostics
+                    .video_noise_removal_vulkan_inference_provider_available ==
+                studiocast::video::CurrentOpenVulkanVideoNoiseRemovalFacts()
+                    .vulkan_inference_provider_available &&
             diagnostics.video_noise_removal_non_cpu_device_selected ==
                 diagnostics.non_cpu_device_selected &&
             diagnostics.video_noise_removal_compute_queue_available ==
@@ -1205,21 +1217,17 @@ int main() {
   }
   {
     using studiocast::video::ResolveOpenVulkanVirtualBackgroundBlurParameters;
-    const auto below =
-        ResolveOpenVulkanVirtualBackgroundBlurParameters(-10);
+    const auto below = ResolveOpenVulkanVirtualBackgroundBlurParameters(-10);
     const auto one = ResolveOpenVulkanVirtualBackgroundBlurParameters(1);
     const auto default_strength =
         ResolveOpenVulkanVirtualBackgroundBlurParameters(8);
-    const auto fifteen =
-        ResolveOpenVulkanVirtualBackgroundBlurParameters(15);
-    const auto sixteen =
-        ResolveOpenVulkanVirtualBackgroundBlurParameters(16);
+    const auto fifteen = ResolveOpenVulkanVirtualBackgroundBlurParameters(15);
+    const auto sixteen = ResolveOpenVulkanVirtualBackgroundBlurParameters(16);
     const auto sixty_three =
         ResolveOpenVulkanVirtualBackgroundBlurParameters(63);
     const auto sixty_four =
         ResolveOpenVulkanVirtualBackgroundBlurParameters(64);
-    const auto above =
-        ResolveOpenVulkanVirtualBackgroundBlurParameters(100);
+    const auto above = ResolveOpenVulkanVirtualBackgroundBlurParameters(100);
     ok &= Require(
         below.background_radius == 1 && below.alpha_feather_radius == 0 &&
             one.background_radius == 1 && one.alpha_feather_radius == 0 &&
@@ -1233,8 +1241,7 @@ int main() {
             sixty_three.alpha_feather_radius == 3 &&
             sixty_four.background_radius == 64 &&
             sixty_four.alpha_feather_radius == 4 &&
-            above.background_radius == 64 &&
-            above.alpha_feather_radius == 4,
+            above.background_radius == 64 && above.alpha_feather_radius == 4,
         "Vulkan blur strength and feather mapping must match canonical Open "
         "CUDA endpoint/default semantics");
 
@@ -1266,22 +1273,20 @@ int main() {
     fake_hardware.production_hardware_ready = true;
     fake_hardware.shader_pipeline_created = true;
     fake_hardware.ok = true;
-    const auto blocked = studiocast::video::
-        EvaluateOpenVulkanVirtualBackgroundBlurReadiness(fake_hardware,
-                                                         unavailable_matting);
-    ok &= Require(!blocked.production_ready &&
-                      blocked.reason_code ==
-                          studiocast::open_vulkan::
-                              kOpenVulkanMattingUnavailableReason &&
-                      blocked.detail.find(
-                          "open_vulkan_matting_adapter_unavailable") !=
-                          std::string::npos,
-                  "utility/synthetic-alpha evidence alone must not make blur "
-                  "available and must retain the exact matting blocker");
+    const auto blocked =
+        studiocast::video::EvaluateOpenVulkanVirtualBackgroundBlurReadiness(
+            fake_hardware, unavailable_matting);
+    ok &= Require(
+        !blocked.production_ready &&
+            blocked.reason_code ==
+                studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason &&
+            blocked.detail.find("open_vulkan_matting_adapter_unavailable") !=
+                std::string::npos,
+        "utility/synthetic-alpha evidence alone must not make blur "
+        "available and must retain the exact matting blocker");
   }
   {
-    using studiocast::video::
-        ResolveOpenVulkanVirtualBackgroundRemoveParameters;
+    using studiocast::video::ResolveOpenVulkanVirtualBackgroundRemoveParameters;
     const auto below =
         ResolveOpenVulkanVirtualBackgroundRemoveParameters(-10, "#12aBcD");
     const auto fifteen =
@@ -1297,12 +1302,10 @@ int main() {
     ok &= Require(
         below.alpha_feather_radius == 0 && below.background_r == 0x12 &&
             below.background_g == 0xab && below.background_b == 0xcd &&
-            fifteen.alpha_feather_radius == 0 &&
-            fifteen.background_r == 0x11 && fifteen.background_g == 0x22 &&
-            fifteen.background_b == 0x33 &&
-            sixteen.alpha_feather_radius == 1 &&
-            sixteen.background_r == 0xa1 && sixteen.background_g == 0xb2 &&
-            sixteen.background_b == 0xc3 &&
+            fifteen.alpha_feather_radius == 0 && fifteen.background_r == 0x11 &&
+            fifteen.background_g == 0x22 && fifteen.background_b == 0x33 &&
+            sixteen.alpha_feather_radius == 1 && sixteen.background_r == 0xa1 &&
+            sixteen.background_g == 0xb2 && sixteen.background_b == 0xc3 &&
             sixty_four.alpha_feather_radius == 4 &&
             above.alpha_feather_radius == 4 && above.background_r == 1 &&
             above.background_g == 2 && above.background_b == 3 &&
@@ -1340,33 +1343,30 @@ int main() {
     fake_hardware.production_hardware_ready = true;
     fake_hardware.shader_pipeline_created = true;
     fake_hardware.ok = true;
-    const auto blocked = studiocast::video::
-        EvaluateOpenVulkanVirtualBackgroundRemoveReadiness(fake_hardware,
-                                                           unavailable_matting);
-    ok &= Require(!blocked.production_ready &&
-                      blocked.reason_code ==
-                          studiocast::open_vulkan::
-                              kOpenVulkanMattingUnavailableReason &&
-                      blocked.detail.find(
-                          "open_vulkan_matting_adapter_unavailable") !=
-                          std::string::npos,
-                  "utility/synthetic-alpha evidence alone must not make "
-                  "remove available and must retain the exact matting "
-                  "blocker");
+    const auto blocked =
+        studiocast::video::EvaluateOpenVulkanVirtualBackgroundRemoveReadiness(
+            fake_hardware, unavailable_matting);
+    ok &= Require(
+        !blocked.production_ready &&
+            blocked.reason_code ==
+                studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason &&
+            blocked.detail.find("open_vulkan_matting_adapter_unavailable") !=
+                std::string::npos,
+        "utility/synthetic-alpha evidence alone must not make "
+        "remove available and must retain the exact matting "
+        "blocker");
   }
   {
     using studiocast::video::
         ResolveOpenVulkanVirtualBackgroundReplaceParameters;
-    const auto below =
-        ResolveOpenVulkanVirtualBackgroundReplaceParameters(-10);
+    const auto below = ResolveOpenVulkanVirtualBackgroundReplaceParameters(-10);
     const auto fifteen =
         ResolveOpenVulkanVirtualBackgroundReplaceParameters(15);
     const auto sixteen =
         ResolveOpenVulkanVirtualBackgroundReplaceParameters(16);
     const auto sixty_four =
         ResolveOpenVulkanVirtualBackgroundReplaceParameters(64);
-    const auto above =
-        ResolveOpenVulkanVirtualBackgroundReplaceParameters(100);
+    const auto above = ResolveOpenVulkanVirtualBackgroundReplaceParameters(100);
     ok &= Require(below.alpha_feather_radius == 0 &&
                       fifteen.alpha_feather_radius == 0 &&
                       sixteen.alpha_feather_radius == 1 &&
@@ -1406,19 +1406,18 @@ int main() {
     fake_hardware.production_hardware_ready = true;
     fake_hardware.shader_pipeline_created = true;
     fake_hardware.ok = true;
-    const auto blocked = studiocast::video::
-        EvaluateOpenVulkanVirtualBackgroundReplaceReadiness(
+    const auto blocked =
+        studiocast::video::EvaluateOpenVulkanVirtualBackgroundReplaceReadiness(
             fake_hardware, unavailable_matting);
-    ok &= Require(!blocked.production_ready &&
-                      blocked.reason_code ==
-                          studiocast::open_vulkan::
-                              kOpenVulkanMattingUnavailableReason &&
-                      blocked.detail.find(
-                          "open_vulkan_matting_adapter_unavailable") !=
-                          std::string::npos,
-                  "utility/asset/synthetic-alpha evidence alone must not make "
-                  "replace available and must retain the exact matting "
-                  "blocker");
+    ok &= Require(
+        !blocked.production_ready &&
+            blocked.reason_code ==
+                studiocast::open_vulkan::kOpenVulkanMattingUnavailableReason &&
+            blocked.detail.find("open_vulkan_matting_adapter_unavailable") !=
+                std::string::npos,
+        "utility/asset/synthetic-alpha evidence alone must not make "
+        "replace available and must retain the exact matting "
+        "blocker");
   }
   {
     using studiocast::video::ResolveOpenVulkanVirtualKeyLightParameters;
@@ -1789,8 +1788,7 @@ int main() {
     constexpr int height = 2;
     constexpr std::size_t stride = 8;
     const std::vector<std::uint8_t> padded_rgb = {
-        1,  2,  3,  4,  5,  6,  0xee, 0xef,
-        11, 12, 13, 14, 15, 16, 0xfe, 0xff,
+        1, 2, 3, 4, 5, 6, 0xee, 0xef, 11, 12, 13, 14, 15, 16, 0xfe, 0xff,
     };
     const std::vector<std::uint8_t> expected = {
         1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16,
@@ -1810,29 +1808,27 @@ int main() {
                       padded_rgb.data(), stride, staging, resident, &error),
                   "setup-only RGB24 device upload should dispatch: " + error);
     ok &= Require(upload_kernels.synchronous_submission_count() ==
-                      submissions_before + 1 &&
+                          submissions_before + 1 &&
                       staging.mapped() && staging.host_visible() &&
                       !resident.mapped() && resident.device_local(),
                   "replacement upload must use one synchronized transfer from "
                   "mapped staging to non-mapped DEVICE_LOCAL RGB");
     upload_kernels.InvalidateDescriptorBindingCacheForSetup();
-    ok &= Require(upload_kernels.ResizeBilinear(resident, mapped_readback,
-                                                &error) &&
-                      mapped_readback.Invalidate(&error),
-                  "uploaded replacement verification copy failed: " + error);
+    ok &= Require(
+        upload_kernels.ResizeBilinear(resident, mapped_readback, &error) &&
+            mapped_readback.Invalidate(&error),
+        "uploaded replacement verification copy failed: " + error);
     ok &= CompareU8Exact(ReadU8(mapped_readback), expected,
                          "setup-only padded RGB24 upload");
 
-    const auto rejected_before =
-        upload_kernels.synchronous_submission_count();
-    ok &= Require(!upload_kernels.UploadRgb24ToDeviceLocal(
-                      padded_rgb.data(), 5, staging, resident, &error) &&
-                      error.find("tight-or-padded RGB24") !=
-                          std::string::npos &&
-                      upload_kernels.synchronous_submission_count() ==
-                          rejected_before,
-                  "replacement upload must reject a short RGB24 stride before "
-                  "submission");
+    const auto rejected_before = upload_kernels.synchronous_submission_count();
+    ok &= Require(
+        !upload_kernels.UploadRgb24ToDeviceLocal(padded_rgb.data(), 5, staging,
+                                                 resident, &error) &&
+            error.find("tight-or-padded RGB24") != std::string::npos &&
+            upload_kernels.synchronous_submission_count() == rejected_before,
+        "replacement upload must reject a short RGB24 stride before "
+        "submission");
 
     VulkanImage bgr_staging, bgr_resident;
     if (!bgr_staging.Allocate(upload_kernels.device(), width, height,
@@ -1842,14 +1838,13 @@ int main() {
       return OptionalSkip("replacement BGR rejection allocation failed: " +
                           error);
     }
-    ok &= Require(!upload_kernels.UploadRgb24ToDeviceLocal(
-                      expected.data(), width * 3u, bgr_staging, bgr_resident,
-                      &error) &&
-                      error.find("rgb_u8") != std::string::npos &&
-                      upload_kernels.synchronous_submission_count() ==
-                          rejected_before,
-                  "RGB24 upload must reject BGR staging/destination without "
-                  "silently reinterpreting channel order");
+    ok &= Require(
+        !upload_kernels.UploadRgb24ToDeviceLocal(
+            expected.data(), width * 3u, bgr_staging, bgr_resident, &error) &&
+            error.find("rgb_u8") != std::string::npos &&
+            upload_kernels.synchronous_submission_count() == rejected_before,
+        "RGB24 upload must reject BGR staging/destination without "
+        "silently reinterpreting channel order");
 
     UtilityKernels foreign_upload_kernels;
     if (!foreign_upload_kernels.Initialize(&error))
@@ -1862,14 +1857,13 @@ int main() {
       return OptionalSkip("foreign replacement upload allocation failed: " +
                           error);
     }
-    ok &= Require(!upload_kernels.UploadRgb24ToDeviceLocal(
-                      expected.data(), width * 3u, staging, foreign_resident,
-                      &error) &&
-                      error.find("foreign") != std::string::npos &&
-                      upload_kernels.synchronous_submission_count() ==
-                          rejected_before,
-                  "replacement upload must reject a foreign destination before "
-                  "submission");
+    ok &= Require(
+        !upload_kernels.UploadRgb24ToDeviceLocal(
+            expected.data(), width * 3u, staging, foreign_resident, &error) &&
+            error.find("foreign") != std::string::npos &&
+            upload_kernels.synchronous_submission_count() == rejected_before,
+        "replacement upload must reject a foreign destination before "
+        "submission");
   }
 
   {
@@ -1924,8 +1918,8 @@ int main() {
     VulkanImage foreground_upload, gpu_foreground, gpu_output;
     VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     if (!UploadDeviceLocalU8(key_light_kernels, &foreground_upload,
-                             &gpu_foreground, w, h,
-                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+                             &gpu_foreground, w, h, VulkanPixelFormat::rgb_u8,
+                             foreground, &error) ||
         !AllocateDeviceLocalU8(key_light_kernels, &gpu_output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateU8(key_light_kernels, &output_readback, w, h,
@@ -2115,10 +2109,9 @@ int main() {
     constexpr int w = 2;
     constexpr int h = 2;
     VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
-    if (!UploadDeviceLocalU8(
-            lost_key_light_kernels, &foreground_upload, &foreground, w, h,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_key_light_kernels, &foreground_upload,
+                             &foreground, w, h, VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_key_light_kernels, &output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_key_light_kernels, &alpha_upload, w, h, &error) ||
@@ -2189,21 +2182,21 @@ int main() {
       return OptionalSkip("blur Vulkan context unavailable: " + error);
     constexpr int w = 5;
     constexpr int h = 3;
-    std::vector<std::uint8_t> foreground(
-        static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    std::vector<std::uint8_t> foreground(static_cast<std::size_t>(w) *
+                                         static_cast<std::size_t>(h) * 3u);
     for (std::size_t i = 0; i < foreground.size(); ++i)
       foreground[i] = static_cast<std::uint8_t>((i * 47u + 13u) & 0xffu);
     const std::vector<float> alpha = {
-        0.0f,  0.1f, 0.25f, 0.5f,  1.0f,  0.75f, 0.6f, 0.4f,
-        0.2f,  0.0f, 1.0f,  0.85f, 0.5f, 0.15f, 0.0f,
+        0.0f, 0.1f, 0.25f, 0.5f,  1.0f, 0.75f, 0.6f, 0.4f,
+        0.2f, 0.0f, 1.0f,  0.85f, 0.5f, 0.15f, 0.0f,
     };
 
     VulkanImage foreground_upload, gpu_foreground, gpu_output;
     VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     VulkanImage alpha_tmp, alpha_feathered, blur_tmp, blurred;
-    if (!UploadDeviceLocalU8(blur_kernels, &foreground_upload,
-                             &gpu_foreground, w, h,
-                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+    if (!UploadDeviceLocalU8(blur_kernels, &foreground_upload, &gpu_foreground,
+                             w, h, VulkanPixelFormat::rgb_u8, foreground,
+                             &error) ||
         !AllocateDeviceLocalU8(blur_kernels, &gpu_output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateU8(blur_kernels, &output_readback, w, h,
@@ -2233,9 +2226,9 @@ int main() {
     ok &= Require(alpha_upload.Flush(&error),
                   "production blur fixture flush failed: " + error);
     blur_kernels.InvalidateDescriptorBindingCacheForSetup();
-    ok &= Require(blur_kernels.ResizeBilinearF32_1(alpha_upload,
-                                                   resident_alpha, &error),
-                  "production blur resident alpha setup failed: " + error);
+    ok &= Require(
+        blur_kernels.ResizeBilinearF32_1(alpha_upload, resident_alpha, &error),
+        "production blur resident alpha setup failed: " + error);
     ok &= Require(
         !gpu_foreground.mapped() && gpu_foreground.device_local() &&
             !gpu_output.mapped() && gpu_output.device_local() &&
@@ -2250,10 +2243,9 @@ int main() {
     auto setup_readiness =
         SyntheticProductionMattingReadiness(blur_kernels, false);
     OpenVulkanVirtualBackgroundBlur blur;
-    ok &= Require(blur.EnsureInitialized(&blur_kernels, w, h, setup_readiness,
-                                         &error),
-                  "synthetic test-seam blur wrapper initialization failed: " +
-                      error);
+    ok &= Require(
+        blur.EnsureInitialized(&blur_kernels, w, h, setup_readiness, &error),
+        "synthetic test-seam blur wrapper initialization failed: " + error);
 
     OpenVulkanVirtualBackgroundBlurInput input;
     input.foreground = &gpu_foreground;
@@ -2297,8 +2289,7 @@ int main() {
     OpenVulkanVirtualBackgroundBlurCounters counters;
     const auto allocations_before =
         blur_kernels.device()->allocation_stats().allocation_count;
-    const auto submissions_before =
-        blur_kernels.synchronous_submission_count();
+    const auto submissions_before = blur_kernels.synchronous_submission_count();
     const int strengths[] = {1, 8, 16, 64};
     std::uint64_t expected_feather_dispatches = 0;
     for (int strength : strengths) {
@@ -2308,20 +2299,19 @@ int main() {
       ok &= Require(blur.Apply(input, &counters, &error),
                     "production blur wrapper dispatch failed at strength " +
                         std::to_string(strength) + ": " + error);
-      const auto output = ReadbackDeviceLocalU8(
-          blur_kernels, gpu_output, &output_readback, &error);
+      const auto output = ReadbackDeviceLocalU8(blur_kernels, gpu_output,
+                                                &output_readback, &error);
       std::vector<float> alpha_reference = alpha;
       if (parameters.alpha_feather_radius > 0) {
-        alpha_reference = BlurF32Reference(
-            alpha, w, h, parameters.alpha_feather_radius);
+        alpha_reference =
+            BlurF32Reference(alpha, w, h, parameters.alpha_feather_radius);
         ++expected_feather_dispatches;
       }
       ok &= CompareU8(
           output,
           CompositeReference(
               foreground,
-              BlurU8Reference(foreground, w, h,
-                              parameters.background_radius),
+              BlurU8Reference(foreground, w, h, parameters.background_radius),
               alpha_reference),
           "production Vulkan virtual background blur strength " +
               std::to_string(strength));
@@ -2335,7 +2325,7 @@ int main() {
             counters.cpu_fallback_calls == 0 &&
             blur_kernels.synchronous_submission_count() ==
                 submissions_before + 2 * std::size(strengths) +
-                                         expected_feather_dispatches &&
+                    expected_feather_dispatches &&
             blur_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before,
         "repeated production blur must reuse bounded resources, account only "
@@ -2382,31 +2372,29 @@ int main() {
     using studiocast::video::OpenVulkanVirtualBackgroundRemove;
     using studiocast::video::OpenVulkanVirtualBackgroundRemoveCounters;
     using studiocast::video::OpenVulkanVirtualBackgroundRemoveInput;
-    using studiocast::video::
-        ResolveOpenVulkanVirtualBackgroundRemoveParameters;
+    using studiocast::video::ResolveOpenVulkanVirtualBackgroundRemoveParameters;
 
     UtilityKernels remove_kernels;
     if (!remove_kernels.Initialize(&error))
       return OptionalSkip("remove Vulkan context unavailable: " + error);
     constexpr int w = 5;
     constexpr int h = 3;
-    std::vector<std::uint8_t> foreground(
-        static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    std::vector<std::uint8_t> foreground(static_cast<std::size_t>(w) *
+                                         static_cast<std::size_t>(h) * 3u);
     for (std::size_t i = 0; i < foreground.size(); ++i)
       foreground[i] = static_cast<std::uint8_t>((i * 29u + 7u) & 0xffu);
     // A binary-exact constant matte keeps the wrapper's byte parity assertion
     // exact across vendors while still exercising both feather dispatches.
     // Spatial f32 blur behavior is covered independently below.
-    const std::vector<float> alpha(static_cast<std::size_t>(w) *
-                                       static_cast<std::size_t>(h),
-                                   0.5f);
+    const std::vector<float> alpha(
+        static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0.5f);
 
     VulkanImage foreground_upload, gpu_foreground, gpu_output;
     VulkanImage output_readback, mapped_output, alpha_upload, resident_alpha;
     VulkanImage alpha_tmp, alpha_feathered;
     if (!UploadDeviceLocalU8(remove_kernels, &foreground_upload,
-                             &gpu_foreground, w, h,
-                             VulkanPixelFormat::rgb_u8, foreground, &error) ||
+                             &gpu_foreground, w, h, VulkanPixelFormat::rgb_u8,
+                             foreground, &error) ||
         !AllocateDeviceLocalU8(remove_kernels, &gpu_output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateU8(remove_kernels, &output_readback, w, h,
@@ -2430,8 +2418,8 @@ int main() {
     ok &= Require(alpha_upload.Flush(&error),
                   "production remove fixture flush failed: " + error);
     remove_kernels.InvalidateDescriptorBindingCacheForSetup();
-    ok &= Require(remove_kernels.ResizeBilinearF32_1(
-                      alpha_upload, resident_alpha, &error),
+    ok &= Require(remove_kernels.ResizeBilinearF32_1(alpha_upload,
+                                                     resident_alpha, &error),
                   "production remove resident alpha setup failed: " + error);
     ok &= Require(
         !gpu_foreground.mapped() && gpu_foreground.device_local() &&
@@ -2445,9 +2433,8 @@ int main() {
     auto setup_readiness =
         SyntheticProductionMattingReadiness(remove_kernels, false);
     OpenVulkanVirtualBackgroundRemove remove;
-    ok &= Require(remove.EnsureInitialized(
-                      &remove_kernels, w, h, 8, "#123456", setup_readiness,
-                      &error),
+    ok &= Require(remove.EnsureInitialized(&remove_kernels, w, h, 8, "#123456",
+                                           setup_readiness, &error),
                   "synthetic test-seam remove wrapper initialization failed: " +
                       error);
 
@@ -2504,27 +2491,26 @@ int main() {
     };
     std::uint64_t expected_feather_dispatches = 0;
     for (const auto &tc : cases) {
-      ok &= Require(remove.EnsureInitialized(
-                        &remove_kernels, w, h, tc.strength, tc.remove_color,
-                        current_readiness, &error),
+      ok &= Require(remove.EnsureInitialized(&remove_kernels, w, h, tc.strength,
+                                             tc.remove_color, current_readiness,
+                                             &error),
                     "production remove reconfiguration failed: " + error);
       const auto parameters =
-          ResolveOpenVulkanVirtualBackgroundRemoveParameters(
-              tc.strength, tc.remove_color);
+          ResolveOpenVulkanVirtualBackgroundRemoveParameters(tc.strength,
+                                                             tc.remove_color);
       ok &= Require(remove.Apply(input, &counters, &error),
                     "production remove wrapper dispatch failed at strength " +
                         std::to_string(tc.strength) + ": " + error);
-      const auto output = ReadbackDeviceLocalU8(
-          remove_kernels, gpu_output, &output_readback, &error);
+      const auto output = ReadbackDeviceLocalU8(remove_kernels, gpu_output,
+                                                &output_readback, &error);
       std::vector<float> alpha_reference = alpha;
       if (parameters.alpha_feather_radius > 0) {
-        alpha_reference = BlurF32Reference(
-            alpha, w, h, parameters.alpha_feather_radius);
+        alpha_reference =
+            BlurF32Reference(alpha, w, h, parameters.alpha_feather_radius);
         ++expected_feather_dispatches;
       }
       ok &= CompareU8Exact(
-          output,
-          CompositeSolidReference(foreground, alpha_reference, tc.rgb),
+          output, CompositeSolidReference(foreground, alpha_reference, tc.rgb),
           "production Vulkan virtual background remove strength/color parity " +
               std::to_string(tc.strength));
     }
@@ -2537,7 +2523,7 @@ int main() {
             counters.cpu_fallback_calls == 0 &&
             remove_kernels.synchronous_submission_count() ==
                 submissions_before + 2 * std::size(cases) +
-                                         expected_feather_dispatches &&
+                    expected_feather_dispatches &&
             remove_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before,
         "repeated production remove must reuse bounded resources, account "
@@ -2594,10 +2580,9 @@ int main() {
     VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
     VulkanImage alpha_tmp;
     VulkanImage alpha_feathered;
-    if (!UploadDeviceLocalU8(
-            lost_remove_kernels, &foreground_upload, &foreground, w, h,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_remove_kernels, &foreground_upload,
+                             &foreground, w, h, VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_remove_kernels, &output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_remove_kernels, &alpha_upload, w, h, &error) ||
@@ -2617,11 +2602,9 @@ int main() {
     auto readiness =
         SyntheticProductionMattingReadiness(lost_remove_kernels, true);
     OpenVulkanVirtualBackgroundRemove remove;
-    ok &= Require(remove.EnsureInitialized(
-                      &lost_remove_kernels, w, h, 1, "#102030", readiness,
-                      &error),
-                  "remove device-loss wrapper initialization failed: " +
-                      error);
+    ok &= Require(remove.EnsureInitialized(&lost_remove_kernels, w, h, 1,
+                                           "#102030", readiness, &error),
+                  "remove device-loss wrapper initialization failed: " + error);
     OpenVulkanVirtualBackgroundRemoveInput input;
     input.foreground = &foreground;
     input.alpha = &alpha;
@@ -2650,12 +2633,11 @@ int main() {
         "dispatches, and never substitute CPU/readback work");
     const auto submitted_after_loss =
         lost_remove_kernels.device()->health().submitted_serial;
-    ok &= Require(
-        !remove.Apply(input, &counters, &error) &&
-            lost_remove_kernels.device()->health().submitted_serial ==
-                submitted_after_loss,
-        "poisoned remove context must reject without another driver "
-        "submission");
+    ok &= Require(!remove.Apply(input, &counters, &error) &&
+                      lost_remove_kernels.device()->health().submitted_serial ==
+                          submitted_after_loss,
+                  "poisoned remove context must reject without another driver "
+                  "submission");
   }
 
   {
@@ -2678,9 +2660,9 @@ int main() {
     OpenVulkanVirtualBackgroundReplace replace;
     OpenVulkanVirtualBackgroundReplaceCounters counters;
     ok &= Require(
-        !replace.EnsureInitialized(
-            &lost_setup_kernels, 1, 1, 1,
-            PreparedReplaceAsset(ppm_path, 1), readiness, &counters, &error) &&
+        !replace.EnsureInitialized(&lost_setup_kernels, 1, 1, 1,
+                                   PreparedReplaceAsset(ppm_path, 1), readiness,
+                                   &counters, &error) &&
             error.find(
                 "vulkan_virtual_background_replace_initialization_failed") !=
                 std::string::npos &&
@@ -2714,31 +2696,26 @@ int main() {
     const auto png_path = assets.path / "background.PNG";
     const auto unsupported_path = assets.path / "background.jpg";
     const auto truncated_path = assets.path / "truncated.ppm";
-    std::vector<std::uint8_t> background(
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) *
-        3u);
+    std::vector<std::uint8_t> background(static_cast<std::size_t>(width) *
+                                         static_cast<std::size_t>(height) * 3u);
     std::vector<std::uint8_t> foreground(background.size());
     for (std::size_t i = 0; i < background.size(); ++i) {
       background[i] = static_cast<std::uint8_t>((i * 17u + 31u) & 0xffu);
       foreground[i] = static_cast<std::uint8_t>((i * 43u + 9u) & 0xffu);
     }
-    std::vector<std::uint8_t> png_rgba(
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) *
-        4u);
+    std::vector<std::uint8_t> png_rgba(static_cast<std::size_t>(width) *
+                                       static_cast<std::size_t>(height) * 4u);
     std::vector<std::uint8_t> png_background(background.size());
-    for (std::size_t pixel = 0;
-         pixel < static_cast<std::size_t>(width) *
-                     static_cast<std::size_t>(height);
+    for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(width) *
+                                            static_cast<std::size_t>(height);
          ++pixel) {
       const std::uint8_t asset_alpha =
           static_cast<std::uint8_t>((pixel * 37u + 19u) & 0xffu);
       for (std::size_t channel = 0; channel < 3u; ++channel) {
         const std::uint8_t value = background[pixel * 3u + channel];
         png_rgba[pixel * 4u + channel] = value;
-        png_background[pixel * 3u + channel] =
-            static_cast<std::uint8_t>(
-                (static_cast<std::uint32_t>(value) * asset_alpha + 127u) /
-                255u);
+        png_background[pixel * 3u + channel] = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(value) * asset_alpha + 127u) / 255u);
       }
       png_rgba[pixel * 4u + 3u] = asset_alpha;
     }
@@ -2782,16 +2759,15 @@ int main() {
     // feather radius produce the same pixels and would only test dispatch
     // accounting, not the strength-dependent alpha semantics.
     const std::vector<float> alpha = {
-        0.00f, 0.10f, 0.90f, 0.20f, 1.00f,
-        0.75f, 0.30f, 0.50f, 0.95f, 0.05f,
-        0.40f, 1.00f, 0.15f, 0.65f, 0.25f,
+        0.00f, 0.10f, 0.90f, 0.20f, 1.00f, 0.75f, 0.30f, 0.50f,
+        0.95f, 0.05f, 0.40f, 1.00f, 0.15f, 0.65f, 0.25f,
     };
     FillF32(alpha_upload, alpha);
     ok &= Require(alpha_upload.Flush(&error),
                   "production replace fixture flush failed: " + error);
     replace_kernels.InvalidateDescriptorBindingCacheForSetup();
-    ok &= Require(replace_kernels.ResizeBilinearF32_1(
-                      alpha_upload, resident_alpha, &error),
+    ok &= Require(replace_kernels.ResizeBilinearF32_1(alpha_upload,
+                                                      resident_alpha, &error),
                   "production replace resident alpha setup failed: " + error);
 
     auto setup_readiness =
@@ -2801,11 +2777,11 @@ int main() {
     auto prepared_ppm = PreparedReplaceAsset(ppm_path, 1);
     const auto setup_submissions_before =
         replace_kernels.synchronous_submission_count();
-    ok &= Require(replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8, prepared_ppm,
-                      setup_readiness, &counters, &error),
-                  "synthetic test-seam replace initialization failed: " +
-                      error);
+    ok &=
+        Require(replace.EnsureInitialized(&replace_kernels, width, height, 8,
+                                          prepared_ppm, setup_readiness,
+                                          &counters, &error),
+                "synthetic test-seam replace initialization failed: " + error);
     ok &= Require(
         counters.asset_allocation_calls == 3 &&
             counters.asset_decode_calls == 1 &&
@@ -2833,25 +2809,23 @@ int main() {
         replace_kernels.synchronous_submission_count();
     const auto cache_allocations_before =
         replace_kernels.device()->allocation_stats().allocation_count;
-    ok &= Require(replace.EnsureInitialized(
-                      &replace_kernels, width, height, 15, prepared_ppm,
-                      setup_readiness, &counters, &error) &&
-                      counters.asset_allocation_calls ==
-                          setup_counters.asset_allocation_calls &&
-                      counters.asset_decode_calls ==
-                          setup_counters.asset_decode_calls &&
-                      counters.asset_upload_calls ==
-                          setup_counters.asset_upload_calls &&
-                      counters.asset_resize_dispatch_calls ==
-                          setup_counters.asset_resize_dispatch_calls &&
-                      replace_kernels.synchronous_submission_count() ==
-                          cache_submissions_before &&
-                      replace_kernels.device()
-                              ->allocation_stats()
-                              .allocation_count == cache_allocations_before,
-                  "same path/mtime/geometry/context must reuse the replacement "
-                  "asset without allocation or submission while allowing "
-                  "strength-only reconfiguration");
+    ok &= Require(
+        replace.EnsureInitialized(&replace_kernels, width, height, 15,
+                                  prepared_ppm, setup_readiness, &counters,
+                                  &error) &&
+            counters.asset_allocation_calls ==
+                setup_counters.asset_allocation_calls &&
+            counters.asset_decode_calls == setup_counters.asset_decode_calls &&
+            counters.asset_upload_calls == setup_counters.asset_upload_calls &&
+            counters.asset_resize_dispatch_calls ==
+                setup_counters.asset_resize_dispatch_calls &&
+            replace_kernels.synchronous_submission_count() ==
+                cache_submissions_before &&
+            replace_kernels.device()->allocation_stats().allocation_count ==
+                cache_allocations_before,
+        "same path/mtime/geometry/context must reuse the replacement "
+        "asset without allocation or submission while allowing "
+        "strength-only reconfiguration");
 
     OpenVulkanVirtualBackgroundReplaceInput input;
     input.foreground = &gpu_foreground;
@@ -2904,25 +2878,23 @@ int main() {
       ok &= Require(replace.Apply(input, &counters, &error),
                     "production replace dispatch failed at strength " +
                         std::to_string(strength) + ": " + error);
-      const auto output = ReadbackDeviceLocalU8(
-          replace_kernels, gpu_output, &output_readback, &error);
+      const auto output = ReadbackDeviceLocalU8(replace_kernels, gpu_output,
+                                                &output_readback, &error);
       const auto parameters =
           ResolveOpenVulkanVirtualBackgroundReplaceParameters(strength);
       std::vector<float> alpha_reference = alpha;
       if (parameters.alpha_feather_radius > 0) {
-        alpha_reference = BlurF32Reference(
-            alpha, width, height, parameters.alpha_feather_radius);
+        alpha_reference = BlurF32Reference(alpha, width, height,
+                                           parameters.alpha_feather_radius);
         ++expected_feathers;
       }
       ok &= CompareU8Exact(
-          output,
-          CompositeReference(foreground, background, alpha_reference),
+          output, CompositeReference(foreground, background, alpha_reference),
           "production Vulkan virtual background replace strength parity " +
               std::to_string(strength));
     }
     ok &= Require(
-        counters.replacement_composite_dispatch_calls ==
-                std::size(strengths) &&
+        counters.replacement_composite_dispatch_calls == std::size(strengths) &&
             counters.alpha_feather_dispatch_calls == expected_feathers &&
             counters.asset_decode_calls == 1 &&
             counters.asset_upload_calls == 1 &&
@@ -2931,7 +2903,7 @@ int main() {
             counters.cpu_fallback_calls == 0 &&
             replace_kernels.synchronous_submission_count() ==
                 submissions_before_frames + 2 * std::size(strengths) +
-                                                 expected_feathers &&
+                    expected_feathers &&
             replace_kernels.device()->allocation_stats().allocation_count ==
                 allocations_before_frames,
         "repeated replace frames must reuse bounded setup resources, perform "
@@ -2944,11 +2916,9 @@ int main() {
     VulkanImage foreign_output;
     if (!AllocateU8(foreign_kernels, &foreign_output, width, height,
                     VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("foreign replace output allocation failed: " +
-                          error);
+      return OptionalSkip("foreign replace output allocation failed: " + error);
     }
-    const auto before_foreign =
-        replace_kernels.synchronous_submission_count();
+    const auto before_foreign = replace_kernels.synchronous_submission_count();
     input.output = &foreign_output;
     ok &= Require(
         !replace.Apply(input, &counters, &error) &&
@@ -2965,24 +2935,22 @@ int main() {
     const auto before_geometry = counters;
     const auto geometry_submissions_before =
         replace_kernels.synchronous_submission_count();
-    ok &= Require(replace.EnsureInitialized(
-                      &replace_kernels, 6, 4, 8, prepared_ppm,
-                      current_readiness, &counters, &error) &&
-                      counters.asset_decode_calls ==
-                          before_geometry.asset_decode_calls &&
-                      counters.asset_upload_calls ==
-                          before_geometry.asset_upload_calls &&
-                      counters.asset_resize_dispatch_calls ==
-                          before_geometry.asset_resize_dispatch_calls + 1 &&
-                      replace_kernels.synchronous_submission_count() ==
-                          geometry_submissions_before + 1,
-                  "frame geometry change must reuse the uploaded source and "
-                  "refresh only the bounded DEVICE_LOCAL replacement resize");
+    ok &= Require(
+        replace.EnsureInitialized(&replace_kernels, 6, 4, 8, prepared_ppm,
+                                  current_readiness, &counters, &error) &&
+            counters.asset_decode_calls == before_geometry.asset_decode_calls &&
+            counters.asset_upload_calls == before_geometry.asset_upload_calls &&
+            counters.asset_resize_dispatch_calls ==
+                before_geometry.asset_resize_dispatch_calls + 1 &&
+            replace_kernels.synchronous_submission_count() ==
+                geometry_submissions_before + 1,
+        "frame geometry change must reuse the uploaded source and "
+        "refresh only the bounded DEVICE_LOCAL replacement resize");
 
     const auto prepared_png = PreparedReplaceAsset(png_path, 2);
-    ok &= Require(replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8, prepared_png,
-                      current_readiness, &counters, &error) &&
+    ok &= Require(replace.EnsureInitialized(&replace_kernels, width, height, 8,
+                                            prepared_png, current_readiness,
+                                            &counters, &error) &&
                       counters.asset_decode_calls ==
                           before_geometry.asset_decode_calls + 1 &&
                       counters.asset_upload_calls ==
@@ -2991,8 +2959,8 @@ int main() {
                   "on path reconfiguration");
     ok &= Require(replace.Apply(input, &counters, &error),
                   "PNG-alpha replace dispatch failed: " + error);
-    const auto png_output = ReadbackDeviceLocalU8(
-        replace_kernels, gpu_output, &output_readback, &error);
+    const auto png_output = ReadbackDeviceLocalU8(replace_kernels, gpu_output,
+                                                  &output_readback, &error);
     ok &= CompareU8Exact(
         png_output, CompositeReference(foreground, png_background, alpha),
         "production Vulkan PNG replacement alpha-on-black parity");
@@ -3006,9 +2974,8 @@ int main() {
     const auto prepared_changed_png = PreparedReplaceAsset(png_path, 3);
     const auto before_changed = counters;
     ok &= Require(replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8,
-                      prepared_changed_png, current_readiness, &counters,
-                      &error) &&
+                      &replace_kernels, width, height, 8, prepared_changed_png,
+                      current_readiness, &counters, &error) &&
                       counters.asset_decode_calls ==
                           before_changed.asset_decode_calls + 1 &&
                       counters.asset_upload_calls ==
@@ -3041,9 +3008,9 @@ int main() {
                   "a failed asset refresh must never reuse the stale image");
 
     const auto truncated = PreparedReplaceAsset(truncated_path, 5);
-    ok &= Require(!replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8, truncated,
-                      current_readiness, &counters, &error) &&
+    ok &= Require(!replace.EnsureInitialized(&replace_kernels, width, height, 8,
+                                             truncated, current_readiness,
+                                             &counters, &error) &&
                       error.find("asset_invalid") != std::string::npos &&
                       error.find("PPM truncated") != std::string::npos,
                   "truncated PPM replacement must fail closed at setup");
@@ -3051,17 +3018,17 @@ int main() {
     studiocast::video::detail::PreparedReplaceBackgroundSource missing;
     missing.path = assets.path / "missing.png";
     missing.error = "failed to stat replace image: No such file";
-    ok &= Require(!replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8, missing,
-                      current_readiness, &counters, &error) &&
+    ok &= Require(!replace.EnsureInitialized(&replace_kernels, width, height, 8,
+                                             missing, current_readiness,
+                                             &counters, &error) &&
                       error.find("asset_invalid") != std::string::npos &&
                       error.find("failed to stat") != std::string::npos,
                   "missing/unstatable replacement must retain the prepared "
                   "setup failure");
     studiocast::video::detail::PreparedReplaceBackgroundSource empty;
-    ok &= Require(!replace.EnsureInitialized(
-                      &replace_kernels, width, height, 8, empty,
-                      current_readiness, &counters, &error) &&
+    ok &= Require(!replace.EnsureInitialized(&replace_kernels, width, height, 8,
+                                             empty, current_readiness,
+                                             &counters, &error) &&
                       error.find("asset_invalid") != std::string::npos &&
                       error.find("replace_path not set") != std::string::npos,
                   "empty replacement path must retain direct-wrapper stable "
@@ -3108,19 +3075,17 @@ int main() {
     if (!alpha_upload.Flush(&error) ||
         !lost_replace_kernels.ResizeBilinearF32_1(alpha_upload, alpha,
                                                   &error)) {
-      return OptionalSkip("replace device-loss fixture setup failed: " +
-                          error);
+      return OptionalSkip("replace device-loss fixture setup failed: " + error);
     }
     auto readiness =
         SyntheticProductionMattingReadiness(lost_replace_kernels, true);
     OpenVulkanVirtualBackgroundReplace replace;
     OpenVulkanVirtualBackgroundReplaceCounters counters;
-    ok &= Require(replace.EnsureInitialized(
-                      &lost_replace_kernels, width, height, 1,
-                      PreparedReplaceAsset(ppm_path, 1), readiness, &counters,
-                      &error),
-                  "replace device-loss wrapper initialization failed: " +
-                      error);
+    ok &=
+        Require(replace.EnsureInitialized(&lost_replace_kernels, width, height,
+                                          1, PreparedReplaceAsset(ppm_path, 1),
+                                          readiness, &counters, &error),
+                "replace device-loss wrapper initialization failed: " + error);
     OpenVulkanVirtualBackgroundReplaceInput input;
     input.foreground = &foreground;
     input.alpha = &alpha;
@@ -3151,11 +3116,12 @@ int main() {
         "dispatches, and never substitute CPU/readback work");
     const auto submitted_after_loss =
         lost_replace_kernels.device()->health().submitted_serial;
-    ok &= Require(!replace.Apply(input, &counters, &error) &&
-                      lost_replace_kernels.device()->health().submitted_serial ==
-                          submitted_after_loss,
-                  "poisoned replace context must reject without another "
-                  "driver submission");
+    ok &=
+        Require(!replace.Apply(input, &counters, &error) &&
+                    lost_replace_kernels.device()->health().submitted_serial ==
+                        submitted_after_loss,
+                "poisoned replace context must reject without another "
+                "driver submission");
   }
 
   {
@@ -3171,10 +3137,9 @@ int main() {
     VulkanImage foreground_upload, foreground, output, alpha_upload, alpha;
     VulkanImage alpha_tmp;
     VulkanImage alpha_feathered, blur_tmp, blurred;
-    if (!UploadDeviceLocalU8(
-            lost_blur_kernels, &foreground_upload, &foreground, w, h,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_blur_kernels, &foreground_upload, &foreground,
+                             w, h, VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_blur_kernels, &output, w, h,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateF32(lost_blur_kernels, &alpha_upload, w, h, &error) ||
@@ -3198,9 +3163,9 @@ int main() {
     auto readiness =
         SyntheticProductionMattingReadiness(lost_blur_kernels, true);
     OpenVulkanVirtualBackgroundBlur blur;
-    ok &= Require(blur.EnsureInitialized(&lost_blur_kernels, w, h, readiness,
-                                         &error),
-                  "blur device-loss wrapper initialization failed: " + error);
+    ok &= Require(
+        blur.EnsureInitialized(&lost_blur_kernels, w, h, readiness, &error),
+        "blur device-loss wrapper initialization failed: " + error);
     OpenVulkanVirtualBackgroundBlurInput input;
     input.foreground = &foreground;
     input.alpha = &alpha;
@@ -3274,16 +3239,16 @@ int main() {
                                tc.height, tc.format, source, &error) ||
           !AllocateDeviceLocalU8(kernels, &gpu_dst, tc.width, tc.height,
                                  tc.format, &error) ||
-          !AllocateDeviceLocalU8(kernels, &gpu_round_trip, tc.width,
-                                 tc.height, tc.format, &error)) {
+          !AllocateDeviceLocalU8(kernels, &gpu_round_trip, tc.width, tc.height,
+                                 tc.format, &error)) {
         return OptionalSkip(std::string("mirror allocation failed: ") + error);
       }
-      ok &= Require(gpu_src.device_local() && !gpu_src.mapped() &&
-                        gpu_dst.device_local() && !gpu_dst.mapped() &&
-                        gpu_round_trip.device_local() &&
-                        !gpu_round_trip.mapped(),
-                    std::string(tc.label) +
-                        " production mirror images must be DEVICE_LOCAL");
+      ok &=
+          Require(gpu_src.device_local() && !gpu_src.mapped() &&
+                      gpu_dst.device_local() && !gpu_dst.mapped() &&
+                      gpu_round_trip.device_local() && !gpu_round_trip.mapped(),
+                  std::string(tc.label) +
+                      " production mirror images must be DEVICE_LOCAL");
 
       OpenVulkanMirror mirror;
       ok &= Require(
@@ -3307,10 +3272,10 @@ int main() {
       ok &=
           Require(mirror.ApplyFinal(input, &counters, &error),
                   std::string(tc.label) + " mirror dispatch failed: " + error);
-      ok &= CompareU8Exact(ReadbackDeviceLocalU8(
-                               kernels, gpu_dst, &readback_staging, &error),
-                           MirrorU8Reference(source, tc.width, tc.height),
-                           std::string("Vulkan mirror ") + tc.label);
+      ok &= CompareU8Exact(
+          ReadbackDeviceLocalU8(kernels, gpu_dst, &readback_staging, &error),
+          MirrorU8Reference(source, tc.width, tc.height),
+          std::string("Vulkan mirror ") + tc.label);
 
       OpenVulkanMirrorFinalStageInput second;
       second.src = &gpu_dst;
@@ -3320,9 +3285,8 @@ int main() {
       ok &= Require(mirror.ApplyFinal(second, &counters, &error),
                     std::string(tc.label) +
                         " double mirror dispatch failed: " + error);
-      ok &= CompareU8Exact(ReadbackDeviceLocalU8(
-                               kernels, gpu_round_trip, &readback_staging,
-                               &error),
+      ok &= CompareU8Exact(ReadbackDeviceLocalU8(kernels, gpu_round_trip,
+                                                 &readback_staging, &error),
                            source,
                            std::string("Vulkan double mirror ") + tc.label);
       ok &= Require(counters.dispatch_calls == 2 &&
@@ -3343,9 +3307,8 @@ int main() {
       };
       VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_resized, gpu_dst;
-      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w,
-                               src_h, VulkanPixelFormat::rgb_u8, source,
-                               &error) ||
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w, src_h,
+                               VulkanPixelFormat::rgb_u8, source, &error) ||
           !AllocateDeviceLocalU8(kernels, &gpu_resized, dst_w, dst_h,
                                  VulkanPixelFormat::rgb_u8, &error) ||
           !AllocateDeviceLocalU8(kernels, &gpu_dst, dst_w, dst_h,
@@ -3379,15 +3342,14 @@ int main() {
                         counters.runtime_failure_frames == 0,
                     "combined resize/mirror should count one final mirror "
                     "operation");
-      ok &=
-          CompareU8(ReadbackDeviceLocalU8(kernels, gpu_dst, &readback_staging,
-                                          &error),
-                    MirrorU8Reference(
-                        ResizeU8Reference(source, src_w, src_h, dst_w, dst_h,
-                                          0.0f, 0.0f, static_cast<float>(src_w),
-                                          static_cast<float>(src_h)),
-                        dst_w, dst_h),
-                    "Vulkan combined resize/mirror");
+      ok &= CompareU8(
+          ReadbackDeviceLocalU8(kernels, gpu_dst, &readback_staging, &error),
+          MirrorU8Reference(ResizeU8Reference(source, src_w, src_h, dst_w,
+                                              dst_h, 0.0f, 0.0f,
+                                              static_cast<float>(src_w),
+                                              static_cast<float>(src_h)),
+                            dst_w, dst_h),
+          "Vulkan combined resize/mirror");
     }
   }
 
@@ -3459,9 +3421,9 @@ int main() {
                         " repeated initialization must not allocate again");
       if (!AllocateU8(kernels, &readback_staging, tc.width, tc.height,
                       tc.format, &error)) {
-        return OptionalSkip(std::string(tc.label) +
-                            " final readback staging allocation failed: " +
-                            error);
+        return OptionalSkip(
+            std::string(tc.label) +
+            " final readback staging allocation failed: " + error);
       }
 
       OpenVulkanVignetteFinalStageInput input;
@@ -3495,10 +3457,9 @@ int main() {
         const auto padded_reference = VignetteU8ReferencePadded(
             source, tc.width, tc.height,
             static_cast<std::size_t>(tc.width) * 3u, tc.intensity);
-        ok &= CompareU8(ReadbackDeviceLocalU8(
-                            kernels, gpu_dst, &readback_staging, &error),
-                        padded_reference,
-                        std::string("Vulkan vignette ") + tc.label);
+        ok &= CompareU8(
+            ReadbackDeviceLocalU8(kernels, gpu_dst, &readback_staging, &error),
+            padded_reference, std::string("Vulkan vignette ") + tc.label);
       }
       const auto allocations_after_frames =
           kernels.device()->allocation_stats();
@@ -3562,7 +3523,8 @@ int main() {
                                    &intensity_reconfigure_counters, &error) &&
             intensity_reconfigure_counters.factor_generation_calls == 1 &&
             intensity_reconfigure_counters.factor_upload_calls == 1 &&
-            intensity_reconfigure_counters.factor_upload_completion_calls == 1 &&
+            intensity_reconfigure_counters.factor_upload_completion_calls ==
+                1 &&
             kernels.device()->allocation_stats().allocation_count ==
                 intensity_reconfigure_allocations.allocation_count,
         "repeated reconfigure must reuse the attenuation buffer");
@@ -3579,9 +3541,8 @@ int main() {
       };
       VulkanImage upload_staging, readback_staging;
       VulkanImage gpu_src, gpu_resized, gpu_vignette, gpu_mirror;
-      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w,
-                               src_h, VulkanPixelFormat::rgb_u8, source,
-                               &error) ||
+      if (!UploadDeviceLocalU8(kernels, &upload_staging, &gpu_src, src_w, src_h,
+                               VulkanPixelFormat::rgb_u8, source, &error) ||
           !AllocateDeviceLocalU8(kernels, &gpu_resized, dst_w, dst_h,
                                  VulkanPixelFormat::rgb_u8, &error) ||
           !AllocateDeviceLocalU8(kernels, &gpu_vignette, dst_w, dst_h,
@@ -3609,8 +3570,8 @@ int main() {
           kernels.frame_batch_completion_count();
       if (!AllocateU8(kernels, &readback_staging, dst_w, dst_h,
                       VulkanPixelFormat::rgb_u8, &error)) {
-        return OptionalSkip("combined final readback staging allocation failed: " +
-                            error);
+        return OptionalSkip(
+            "combined final readback staging allocation failed: " + error);
       }
       const auto allocations_before_frame =
           kernels.device()->allocation_stats();
@@ -3629,10 +3590,10 @@ int main() {
       const auto vignetted = VignetteU8ReferencePadded(
           resized, dst_w, dst_h, static_cast<std::size_t>(dst_w) * 3u,
           intensity);
-      ok &= CompareU8(ReadbackDeviceLocalU8(
-                          kernels, gpu_mirror, &readback_staging, &error),
-                      MirrorU8Reference(vignetted, dst_w, dst_h),
-                      "Vulkan resize/vignette/mirror parity");
+      ok &= CompareU8(
+          ReadbackDeviceLocalU8(kernels, gpu_mirror, &readback_staging, &error),
+          MirrorU8Reference(vignetted, dst_w, dst_h),
+          "Vulkan resize/vignette/mirror parity");
       ok &= Require(kernels.device()->allocation_stats().current_bytes ==
                             allocations_before_frame.current_bytes &&
                         kernels.device()->allocation_stats().high_water_bytes ==
@@ -3898,15 +3859,16 @@ int main() {
                   "injected Vulkan device loss should produce a stable reason");
     const auto lost = lost_device.health();
     const auto lost_state = lost_device.health_state();
-    ok &= Require(lost.health == VulkanContextHealth::device_lost &&
-                      lost.poisoned && lost.reason_code == "vulkan_device_lost" &&
-                      lost_state.health == lost.health &&
-                      lost_state.poisoned == lost.poisoned &&
-                      lost_state.last_result == lost.last_result &&
-                      lost_state.submitted_serial == lost.submitted_serial &&
-                      lost_state.completed_serial == lost.completed_serial &&
-                      !lost_state.healthy(),
-                  "Vulkan device loss should poison and latch the context");
+    ok &=
+        Require(lost.health == VulkanContextHealth::device_lost &&
+                    lost.poisoned && lost.reason_code == "vulkan_device_lost" &&
+                    lost_state.health == lost.health &&
+                    lost_state.poisoned == lost.poisoned &&
+                    lost_state.last_result == lost.last_result &&
+                    lost_state.submitted_serial == lost.submitted_serial &&
+                    lost_state.completed_serial == lost.completed_serial &&
+                    !lost_state.healthy(),
+                "Vulkan device loss should poison and latch the context");
     const std::uint64_t submitted_after_loss = lost.submitted_serial;
     ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
                       lost_device.health().submitted_serial ==
@@ -4019,10 +3981,9 @@ int main() {
     if (!lost_kernels.Initialize(&error))
       return OptionalSkip("mirror device-loss context init failed: " + error);
     VulkanImage upload_staging, src, dst;
-    if (!UploadDeviceLocalU8(
-            lost_kernels, &upload_staging, &src, 2, 2,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_kernels, &dst, 2, 2,
                                VulkanPixelFormat::rgb_u8, &error)) {
       return OptionalSkip("mirror device-loss allocation failed: " + error);
@@ -4059,22 +4020,19 @@ int main() {
                           error);
     }
     VulkanImage upload_staging, src, dst;
-    if (!UploadDeviceLocalU8(
-            lost_auto_frame_kernels, &upload_staging, &src, 2, 2,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_auto_frame_kernels, &upload_staging, &src, 2,
+                             2, VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_auto_frame_kernels, &dst, 2, 2,
                                VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("Auto Frame device-loss allocation failed: " +
-                          error);
+      return OptionalSkip("Auto Frame device-loss allocation failed: " + error);
     }
 
     studiocast::video::OpenVulkanAutoFrame auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
     ok &= Require(auto_frame.EnsureInitialized(&lost_auto_frame_kernels, 2, 2,
                                                &counters, &error),
-                  "Auto Frame device-loss wrapper should initialize: " +
-                      error);
+                  "Auto Frame device-loss wrapper should initialize: " + error);
     lost_auto_frame_kernels.device()->InjectNextSubmissionResultForTesting(
         VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
     studiocast::video::OpenVulkanAutoFrameCropInput input;
@@ -4088,8 +4046,7 @@ int main() {
     input.cpu_crop_plan_complete = true;
     ok &= Require(
         !auto_frame.ApplyCrop(input, &counters, &error) &&
-            error.find("[vulkan_effect_runtime_failed]") !=
-                std::string::npos &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
             error.find("[vulkan_device_lost]") != std::string::npos &&
             counters.crop_resize_dispatch_calls == 1 &&
             counters.runtime_failure_frames == 1 &&
@@ -4117,10 +4074,9 @@ int main() {
                           error);
     }
     VulkanImage upload_staging, src, resized, dst;
-    if (!UploadDeviceLocalU8(
-            lost_batch_kernels, &upload_staging, &src, 2, 2,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_batch_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_batch_kernels, &resized, 3, 3,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateDeviceLocalU8(lost_batch_kernels, &dst, 3, 3,
@@ -4160,10 +4116,9 @@ int main() {
       return OptionalSkip("vignette device-loss context init failed: " + error);
     }
     VulkanImage upload_staging, src, resized, vignetted, mirrored;
-    if (!UploadDeviceLocalU8(
-            lost_vignette_kernels, &upload_staging, &src, 2, 2,
-            VulkanPixelFormat::rgb_u8,
-            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+    if (!UploadDeviceLocalU8(lost_vignette_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
         !AllocateDeviceLocalU8(lost_vignette_kernels, &resized, 3, 3,
                                VulkanPixelFormat::rgb_u8, &error) ||
         !AllocateDeviceLocalU8(lost_vignette_kernels, &vignetted, 3, 3,
@@ -4274,10 +4229,11 @@ int main() {
 
     studiocast::video::OpenVulkanAutoFrame auto_frame;
     studiocast::video::OpenVulkanAutoFrameCounters counters;
-    ok &= Require(auto_frame.EnsureInitialized(&kernels, w, h, &counters,
-                                               &error),
-                  "canonical Auto Frame crop should initialize on the shared "
-                  "production context: " + error);
+    ok &=
+        Require(auto_frame.EnsureInitialized(&kernels, w, h, &counters, &error),
+                "canonical Auto Frame crop should initialize on the shared "
+                "production context: " +
+                    error);
     studiocast::video::OpenVulkanAutoFrameCropInput input;
     input.src = &gpu_src;
     input.dst = &gpu_dst;
@@ -4302,24 +4258,24 @@ int main() {
     input.host_analysis_complete = true;
     input.cpu_crop_plan_complete = true;
     input.dst = &mapped_dst;
-    ok &= Require(
-        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
-            error.find("[vulkan_effect_residency_contract_failed]") !=
-                std::string::npos &&
-            rejection_counters.residency_rejection_frames == 1 &&
-            kernels.synchronous_submission_count() ==
-                submissions_before_rejections,
-        "Auto Frame must reject a mapped crop output before dispatch");
+    ok &=
+        Require(!auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+                    error.find("[vulkan_effect_residency_contract_failed]") !=
+                        std::string::npos &&
+                    rejection_counters.residency_rejection_frames == 1 &&
+                    kernels.synchronous_submission_count() ==
+                        submissions_before_rejections,
+                "Auto Frame must reject a mapped crop output before dispatch");
 
     input.dst = &gpu_src;
-    ok &= Require(
-        !auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
-            error.find("must be out of place") != std::string::npos &&
-            kernels.synchronous_submission_count() ==
-                submissions_before_rejections &&
-            rejection_counters.crop_resize_dispatch_calls == 0,
-        "Auto Frame must reject in-place crop/resize without a Vulkan "
-        "submission");
+    ok &=
+        Require(!auto_frame.ApplyCrop(input, &rejection_counters, &error) &&
+                    error.find("must be out of place") != std::string::npos &&
+                    kernels.synchronous_submission_count() ==
+                        submissions_before_rejections &&
+                    rejection_counters.crop_resize_dispatch_calls == 0,
+                "Auto Frame must reject in-place crop/resize without a Vulkan "
+                "submission");
 
     UtilityKernels foreign_kernels;
     if (!foreign_kernels.Initialize(&error)) {
@@ -4351,11 +4307,10 @@ int main() {
     input.dst = &gpu_dst;
     ok &= Require(auto_frame.ApplyCrop(input, &counters, &error),
                   "canonical Auto Frame crop should dispatch: " + error);
-    const auto auto_frame_output = ReadbackDeviceLocalU8(
-        kernels, gpu_dst, &output_readback, &error);
+    const auto auto_frame_output =
+        ReadbackDeviceLocalU8(kernels, gpu_dst, &output_readback, &error);
     ok &= CompareU8(auto_frame_output,
-                    ResizeU8Reference(src, w, h, w, h, 0.5f, 0.0f, 2.0f,
-                                      2.0f),
+                    ResizeU8Reference(src, w, h, w, h, 0.5f, 0.0f, 2.0f, 2.0f),
                     "canonical Vulkan Auto Frame crop parity");
     ok &= Require(counters.crop_resize_dispatch_calls == 1 &&
                       counters.runtime_failure_frames == 0 &&
@@ -4439,16 +4394,16 @@ int main() {
     const auto allocations_before =
         kernels.device()->allocation_stats().allocation_count;
     ok &= Require(kernels.ReadbackF32_1(resident, readback, cpu.data(),
-                                       cpu.size(), &error),
+                                        cpu.size(), &error),
                   "explicit staged alpha readback should succeed: " + error);
     ok &= CompareF32(cpu, expected, "Vulkan staged alpha readback");
     ok &= Require(kernels.ReadbackF32_1(resident, readback, cpu.data(),
-                                       cpu.size(), &error) &&
+                                        cpu.size(), &error) &&
                       kernels.device()->allocation_stats().allocation_count ==
                           allocations_before,
                   "repeated alpha readback must reuse bounded staging");
     ok &= Require(!kernels.ReadbackF32_1(upload, readback, cpu.data(),
-                                        cpu.size(), &error),
+                                         cpu.size(), &error),
                   "host-mapped inference alpha must not pass resident "
                   "readback source validation");
 
@@ -4460,13 +4415,12 @@ int main() {
     if (!foreign_staging.Allocate(foreign_kernels.device(), dw, dh,
                                   VulkanPixelFormat::f32_1,
                                   /*map_memory=*/true, &error)) {
-      return OptionalSkip("foreign Vulkan staging allocation failed: " +
-                          error);
+      return OptionalSkip("foreign Vulkan staging allocation failed: " + error);
     }
     const auto submissions_before_foreign =
         kernels.synchronous_submission_count();
     ok &= Require(!kernels.ReadbackF32_1(resident, foreign_staging, cpu.data(),
-                                        cpu.size(), &error) &&
+                                         cpu.size(), &error) &&
                       error.find("[vulkan_foreign_context]") !=
                           std::string::npos &&
                       kernels.synchronous_submission_count() ==
@@ -4474,7 +4428,7 @@ int main() {
                   "foreign readback staging must fail before submission");
     foreign_kernels.Shutdown();
     ok &= Require(!kernels.ReadbackF32_1(resident, foreign_staging, cpu.data(),
-                                        cpu.size(), &error) &&
+                                         cpu.size(), &error) &&
                       kernels.synchronous_submission_count() ==
                           submissions_before_foreign,
                   "stale readback staging must fail before submission");
@@ -4483,8 +4437,7 @@ int main() {
   {
     UtilityKernels loss_kernels;
     if (!loss_kernels.Initialize(&error))
-      return OptionalSkip("device-loss readback context unavailable: " +
-                          error);
+      return OptionalSkip("device-loss readback context unavailable: " + error);
     constexpr int w = 2;
     constexpr int h = 2;
     VulkanImage upload, resident, readback;
@@ -4507,8 +4460,8 @@ int main() {
     loss_kernels.device()->InjectNextSubmissionResultForTesting(
         studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
         studiocast::vulkan::VK_ERROR_DEVICE_LOST);
-    ok &= Require(!loss_kernels.ReadbackF32_1(
-                      resident, readback, cpu.data(), cpu.size(), &error),
+    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                              cpu.size(), &error),
                   "device loss during staged readback must fail");
     const auto poisoned = loss_kernels.device()->health();
     ok &= Require(poisoned.poisoned &&
@@ -4516,8 +4469,8 @@ int main() {
                           studiocast::vulkan::VulkanContextHealth::device_lost,
                   "staged readback device loss must poison the context");
     const auto submitted_after_loss = poisoned.submitted_serial;
-    ok &= Require(!loss_kernels.ReadbackF32_1(
-                      resident, readback, cpu.data(), cpu.size(), &error) &&
+    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                              cpu.size(), &error) &&
                       loss_kernels.device()->health().submitted_serial ==
                           submitted_after_loss,
                   "poisoned readback context must reject retries before a "

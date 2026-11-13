@@ -834,6 +834,33 @@ std::string OpenVulkanDiagnostics::ToJson() const {
       << JsonEscape(vignette_parameter_contract) << "\",";
   oss << "\"auto_frame_crop_stage_implemented\":"
       << BoolJson(auto_frame_crop_stage_implemented) << ",";
+  oss << "\"vignette_tracked_center_production_ready\":"
+      << BoolJson(vignette_tracked_center_production_ready) << ",";
+  oss << "\"auto_frame_gpu_tracking_ready\":"
+      << BoolJson(auto_frame_gpu_tracking_ready) << ",";
+  oss << "\"auto_frame_model_contract_validated\":"
+      << BoolJson(auto_frame_model_contract_validated) << ",";
+  oss << "\"auto_frame_warmup_complete\":"
+      << BoolJson(auto_frame_warmup_complete) << ",";
+  oss << "\"auto_frame_parity_validated\":"
+      << BoolJson(auto_frame_parity_validated) << ",";
+  oss << "\"auto_frame_shared_device_imported\":"
+      << BoolJson(auto_frame_shared_device_imported) << ",";
+  oss << "\"auto_frame_queue_ownership_explicit\":"
+      << BoolJson(auto_frame_queue_ownership_explicit) << ",";
+  oss << "\"auto_frame_bounded_reusable_allocations\":"
+      << BoolJson(auto_frame_bounded_reusable_allocations) << ",";
+  oss << "\"auto_frame_synchronization_contract_validated\":"
+      << BoolJson(auto_frame_synchronization_contract_validated) << ",";
+  oss << "\"auto_frame_cpu_layers_used\":"
+      << BoolJson(auto_frame_cpu_layers_used) << ",";
+  oss << "\"auto_frame_dynamic_allocation_count\":"
+      << auto_frame_dynamic_allocation_count << ",";
+  oss << "\"auto_frame_cpu_readback_count\":" << auto_frame_cpu_readback_count
+      << ",";
+  oss << "\"auto_frame_cpu_fallback_count\":" << auto_frame_cpu_fallback_count
+      << ",";
+  oss << "\"auto_frame_dispatch_count\":" << auto_frame_dispatch_count << ",";
   oss << "\"auto_frame_production_ready\":"
       << BoolJson(auto_frame_production_ready) << ",";
   oss << "\"auto_frame_readiness_code\":\""
