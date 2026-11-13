@@ -1,12 +1,12 @@
 #pragma once
 
 #include <array>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
-#include <memory>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -119,6 +119,8 @@ struct NcnnVulkanTensorSpec {
   int h = 1;
   int c = 1;
   bool dynamic_hw = false;
+  friend bool operator==(const NcnnVulkanTensorSpec &,
+                         const NcnnVulkanTensorSpec &) = default;
 };
 
 inline constexpr std::size_t kMaxNcnnVulkanInputs = 3;
@@ -127,7 +129,7 @@ inline constexpr std::size_t kMaxNcnnVulkanOutputs = 12;
 // Optional schema-v2 ncnn_vulkan_networks[] section. Kept separate from the
 // published matting section so existing ONNX and MODNet metadata is unchanged.
 struct NcnnVulkanNetworkSpec {
-  std::string role; // main, left, right
+  std::string role;    // main, left, right
   std::string profile; // fastdvdnet_rgb_v1, yunet_640_v1, flx_prefix_v1
   std::string param_file;
   std::string bin_file;
@@ -143,6 +145,8 @@ struct NcnnVulkanNetworkSpec {
   std::array<NcnnVulkanTensorSpec, kMaxNcnnVulkanOutputs> outputs{};
   std::size_t input_count = 0;
   std::size_t output_count = 0;
+  friend bool operator==(const NcnnVulkanNetworkSpec &,
+                         const NcnnVulkanNetworkSpec &) = default;
 };
 
 struct ModelPack {
@@ -235,8 +239,7 @@ struct ModelArtifactValidationResult {
 // frame loop. Manifest-declared installed-file hashes are enforced when
 // present; the actual installed bytes and manifest bytes are always hashed.
 ModelArtifactValidationResult
-ValidateModelArtifactIdentity(const ModelPack &pack,
-                              const ModelFile &artifact);
+ValidateModelArtifactIdentity(const ModelPack &pack, const ModelFile &artifact);
 
 // Allocation-free execution-time currentness check.
 bool ModelArtifactIdentityMatches(

@@ -21,7 +21,8 @@ namespace studiocast::open_vulkan {
 bool InitializeProductionVulkanMattingDevice(
     vulkan::VulkanDevice *device,
     const vulkan::VulkanDeviceSelection &selection,
-    const vulkan::VulkanDeviceConfig &config, std::string *error_out) {
+    const vulkan::VulkanDeviceConfig &config, std::string *error_out,
+    bool require_shader_float64) {
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
   if (!device || device->Initialized()) {
     if (error_out)
@@ -78,6 +79,13 @@ bool InitializeProductionVulkanMattingDevice(
       *error_out = "Selected Vulkan device is unavailable to ncnn.";
     return false;
   }
+  if (require_shader_float64 &&
+      !ncnn::get_gpu_info(index).physicalDevicefeatures().shaderFloat64) {
+    if (error_out)
+      *error_out = "[vulkan_shader_float64_unavailable] GPU dlib requires "
+                   "enabled shaderFloat64.";
+    return false;
+  }
   owner->device = std::make_unique<ncnn::VulkanDevice>(index, true);
   if (!owner->device->is_valid()) {
     if (error_out)
@@ -95,8 +103,24 @@ bool InitializeProductionVulkanMattingDevice(
   adopted.queue_family_index = owner->device->info.compute_queue_family_index();
   adopted.owner = owner;
   adopted.owner_kind = detail::kNcnnOwnerKind;
+  adopted.shader_float64_attestation = [](const void *value,
+                                          vulkan::VkDevice logical) noexcept {
+    const auto &native = *static_cast<const detail::NcnnVulkanContext *>(value);
+    // Pinned ncnn passes physicalDevicefeatures() unchanged to pEnabledFeatures
+    // immediately before vkCreateDevice. Successful creation proves enablement.
+    return native.device && native.device->is_valid() &&
+           Handle<vulkan::VkDevice>(native.device->vkdevice()) == logical &&
+           native.device->info.physicalDevicefeatures().shaderFloat64;
+  };
   if (!device->InitializeAdopted(selection, config, std::move(adopted),
                                  error_out))
+    return false;
+  const auto context =
+      std::static_pointer_cast<vulkan::detail::VulkanContextState>(
+          device->RetainContext());
+  if (!context->ReserveAllocation(
+          owner->device->studiocast_dummy_allocation_bytes(), error_out,
+          owner->device->studiocast_dummy_allocation_count()))
     return false;
   VkCommandBuffer dummy = VK_NULL_HANDLE;
   if (owner->device->studiocast_initialize_dummy(&dummy) != 0 ||
@@ -111,6 +135,7 @@ bool InitializeProductionVulkanMattingDevice(
   }
   return true;
 #else
+  (void)require_shader_float64;
   (void)device;
   (void)selection;
   (void)config;

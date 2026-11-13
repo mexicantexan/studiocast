@@ -4,16 +4,17 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cstdint>
 #include <cerrno>
+#include <cmath>
+#include <cstdint>
 #include <fcntl.h>
+#include <fstream>
 #include <limits>
+#include <map>
+#include <sstream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <fstream>
-#include <map>
-#include <sstream>
 
 #include "core/util/fs.h"
 #include "core/util/json.h"
@@ -218,7 +219,7 @@ bool ComputeSha256File(const fs::path &path, std::string *out,
 }
 
 std::array<std::uint8_t, 32> ComputeSha256Bytes(const std::uint8_t *data,
-                                               std::size_t size) {
+                                                std::size_t size) {
   Sha256 sha;
   if (data && size > 0)
     sha.Update(data, size);
@@ -342,10 +343,8 @@ std::uint64_t NextRegistryGeneration() noexcept {
   return generation == 0 ? 1 : generation;
 }
 
-bool HexToDigest(const std::string &hex,
-                 std::array<std::uint8_t, 32> *digest) {
-  if (!digest ||
-      !studiocast::model_integrity_internal::IsSha256Hex(hex))
+bool HexToDigest(const std::string &hex, std::array<std::uint8_t, 32> *digest) {
+  if (!digest || !studiocast::model_integrity_internal::IsSha256Hex(hex))
     return false;
   auto nibble = [](char c) -> std::uint8_t {
     if (c >= '0' && c <= '9')
@@ -354,9 +353,8 @@ bool HexToDigest(const std::string &hex,
     return static_cast<std::uint8_t>(10 + c - 'a');
   };
   for (std::size_t i = 0; i < digest->size(); ++i) {
-    (*digest)[i] =
-        static_cast<std::uint8_t>((nibble(hex[i * 2]) << 4) |
-                                  nibble(hex[i * 2 + 1]));
+    (*digest)[i] = static_cast<std::uint8_t>((nibble(hex[i * 2]) << 4) |
+                                             nibble(hex[i * 2 + 1]));
   }
   return true;
 }
@@ -367,8 +365,8 @@ bool CanonicalRegularFileWithin(const fs::path &root, const fs::path &path,
                                 std::string *detail) {
   std::error_code ec;
   const fs::path canonical_root = fs::weakly_canonical(root, ec);
-  if (ec || canonical_root.empty() ||
-      !fs::is_directory(canonical_root, ec) || ec) {
+  if (ec || canonical_root.empty() || !fs::is_directory(canonical_root, ec) ||
+      ec) {
     if (status)
       *status = ModelArtifactValidationStatus::invalid_path;
     if (detail)
@@ -384,8 +382,7 @@ bool CanonicalRegularFileWithin(const fs::path &root, const fs::path &path,
     return false;
   }
   const fs::path relative = canonical_path.lexically_relative(canonical_root);
-  if (relative.empty() || relative.is_absolute() ||
-      *relative.begin() == "..") {
+  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
     if (status)
       *status = ModelArtifactValidationStatus::invalid_path;
     if (detail)
@@ -484,6 +481,9 @@ bool GetIntOptional(const util::json::Value::Object &o, const char *key,
   if (!n)
     return Fail(error, std::string("model.json: field '") + key +
                            "' must be a number");
+  if (!std::isfinite(*n) || *n < std::numeric_limits<int>::min() ||
+      *n > std::numeric_limits<int>::max())
+    return Fail(error, "model.json: integer field is out of range");
   const int i = static_cast<int>(*n);
   if (static_cast<double>(i) != *n) {
     return Fail(error, std::string("model.json: field '") + key +
@@ -514,6 +514,9 @@ bool GetIntRequired(const util::json::Value::Object &o, const char *key,
   if (!n)
     return Fail(error, std::string("model.json: field '") + key +
                            "' must be a number");
+  if (!std::isfinite(*n) || *n < std::numeric_limits<int>::min() ||
+      *n > std::numeric_limits<int>::max())
+    return Fail(error, "model.json: integer field is out of range");
   const int i = static_cast<int>(*n);
   if (static_cast<double>(i) != *n) {
     return Fail(error, std::string("model.json: field '") + key +
@@ -846,6 +849,166 @@ bool ParseNcnnVulkanMattingSpec(const util::json::Value::Object &root,
   return true;
 }
 
+bool NcnnTensorMatches(const NcnnVulkanTensorSpec &t, const char *blob,
+                       unsigned dims, int w, int h, int c,
+                       bool dynamic = false) {
+  return t.blob == blob && t.dims == dims && t.w == w && t.h == h && t.c == c &&
+         t.dynamic_hw == dynamic;
+}
+
+bool ValidateNcnnNetworkMetadata(const ModelPack &pack,
+                                 const NcnnVulkanNetworkSpec &s,
+                                 std::string *error) {
+  if (pack.schema_version != 2 || s.precision != "fp32" ||
+      s.converter_name != "pnnx" || s.converter_version.empty() ||
+      !IsSafeRelativePath(s.param_file) || !IsSafeRelativePath(s.bin_file) ||
+      s.param_file == s.bin_file || !s.input_count || !s.output_count ||
+      s.input_count > kMaxNcnnVulkanInputs ||
+      s.output_count > kMaxNcnnVulkanOutputs)
+    return Fail(error,
+                "Invalid ncnn_vulkan_networks artifact/converter contract");
+  bool tensors = false;
+  if (pack.task == "video_denoise" && s.role == "main" &&
+      s.profile == "fastdvdnet_rgb_v1") {
+    tensors = s.input_count == 2 && s.output_count == 1 &&
+              NcnnTensorMatches(s.inputs[0], "noisy", 3, 0, 0, 15, true) &&
+              NcnnTensorMatches(s.inputs[1], "noise_map", 3, 0, 0, 1, true) &&
+              NcnnTensorMatches(s.outputs[0], "denoised", 3, 0, 0, 3, true);
+  } else if (pack.task == "face_detection" && s.role == "main" &&
+             s.profile == "yunet_640_v1") {
+    tensors = s.input_count == 1 && s.output_count == 12 &&
+              NcnnTensorMatches(s.inputs[0], "input", 3, 640, 640, 3);
+    constexpr const char *names[] = {"cls_8",   "cls_16", "cls_32", "obj_8",
+                                     "obj_16",  "obj_32", "bbox_8", "bbox_16",
+                                     "bbox_32", "kps_8",  "kps_16", "kps_32"};
+    constexpr int cells[] = {6400, 1600, 400};
+    for (std::size_t i = 0; i < 12; ++i)
+      tensors = tensors && NcnnTensorMatches(s.outputs[i], names[i], 2,
+                                             i < 6   ? 1
+                                             : i < 9 ? 4
+                                                     : 10,
+                                             cells[i % 3], 1);
+  } else if (pack.task == "eye_contact" &&
+             (s.role == "left" || s.role == "right") &&
+             s.profile == "flx_prefix_v1") {
+    tensors = s.input_count == 3 && s.output_count == 2 &&
+              NcnnTensorMatches(s.inputs[0], "eye_rgb:0", 3, 64, 48, 3) &&
+              NcnnTensorMatches(s.inputs[1], "anchors:0", 3, 64, 48, 12) &&
+              NcnnTensorMatches(s.inputs[2], "angles:0", 1, 2, 1, 1) &&
+              NcnnTensorMatches(s.outputs[0], "flow", 3, 64, 48, 2) &&
+              NcnnTensorMatches(s.outputs[1], "lcm", 3, 64, 48, 2);
+  }
+  if (!tensors)
+    return Fail(error,
+                "ncnn_vulkan_networks task/role/profile tensor mismatch");
+  const ModelFile *source = nullptr;
+  for (const auto &file : pack.files)
+    if (file.kind == "onnx" && file.role == s.role) {
+      if (source)
+        return Fail(error, "Ambiguous ncnn source ONNX role");
+      source = &file;
+    }
+  if (!source ||
+      !studiocast::model_integrity_internal::IsSha256Hex(
+          s.source_onnx_sha256) ||
+      studiocast::model_integrity_internal::NormalizeSha256Hex(
+          source->sha256) != s.source_onnx_sha256)
+    return Fail(error, "ncnn_vulkan_networks source ONNX identity mismatch");
+  return true;
+}
+
+bool ParseNcnnVulkanNetworks(const util::json::Value::Object &root,
+                             ModelPack *pack, std::string *error) {
+  const auto *value = Get(root, "ncnn_vulkan_networks");
+  if (!value)
+    return true;
+  const auto *array = value->AsArray();
+  if (!array || array->empty() || array->size() > 2)
+    return Fail(error,
+                "ncnn_vulkan_networks requires one main or two eye graphs");
+  for (const auto &value : *array) {
+    const auto *o = AsObject(value, error, "ncnn_vulkan_networks entry");
+    if (!o)
+      return false;
+    NcnnVulkanNetworkSpec s;
+    if (!GetStringRequired(*o, "role", &s.role, error) ||
+        !GetStringRequired(*o, "profile", &s.profile, error) ||
+        !GetStringRequired(*o, "param_file", &s.param_file, error) ||
+        !GetStringRequired(*o, "bin_file", &s.bin_file, error) ||
+        !GetStringRequired(*o, "source_onnx_sha256", &s.source_onnx_sha256,
+                           error) ||
+        !GetStringRequired(*o, "precision", &s.precision, error))
+      return false;
+    const auto *cv = Get(*o, "converter");
+    const auto *co = cv ? AsObject(*cv, error, "network converter") : nullptr;
+    if (!co || !GetStringRequired(*co, "name", &s.converter_name, error) ||
+        !GetStringRequired(*co, "version", &s.converter_version, error))
+      return false;
+    auto tensors = [&](const char *key, auto &out, std::size_t &count) {
+      const auto *v = Get(*o, key);
+      const auto *a = v ? v->AsArray() : nullptr;
+      if (!a || a->empty() || a->size() > out.size())
+        return Fail(error, "Invalid network tensor count");
+      count = a->size();
+      for (std::size_t i = 0; i < count; ++i) {
+        auto &t = out[i];
+        const auto *to = AsObject((*a)[i], error, "network tensor");
+        int dims = 0;
+        if (!to || !GetStringRequired(*to, "blob", &t.blob, error) ||
+            !GetIntRequired(*to, "dims", &dims, error) ||
+            !GetIntRequired(*to, "w", &t.w, error) ||
+            !GetIntRequired(*to, "h", &t.h, error) ||
+            !GetIntRequired(*to, "c", &t.c, error))
+          return false;
+        t.dims = static_cast<std::uint32_t>(dims);
+        if (const auto *dv = Get(*to, "dynamic_hw")) {
+          const auto *b = dv->AsBool();
+          if (!b)
+            return Fail(error, "dynamic_hw must be boolean");
+          t.dynamic_hw = *b;
+        }
+      }
+      return true;
+    };
+    if (!tensors("inputs", s.inputs, s.input_count) ||
+        !tensors("outputs", s.outputs, s.output_count) ||
+        !ValidateNcnnNetworkMetadata(*pack, s, error))
+      return false;
+    auto artifact = [&](const std::string &name, const char *kind,
+                        fs::path &path, std::string &sha) {
+      const ModelFile *found = nullptr;
+      for (const auto &f : pack->files)
+        if (f.name == name) {
+          if (found)
+            return Fail(error, "Duplicate ncnn network artifact");
+          found = &f;
+        }
+      if (!found || found->kind != kind || found->role != "vulkan_" + s.role ||
+          !studiocast::model_integrity_internal::IsSha256Hex(found->sha256))
+        return Fail(error, "ncnn network files[] kind/role/checksum mismatch");
+      std::error_code ec;
+      path = fs::absolute(found->path, ec).lexically_normal();
+      if (ec)
+        return Fail(error, "Cannot resolve ncnn network artifact");
+      sha = studiocast::model_integrity_internal::NormalizeSha256Hex(
+          found->sha256);
+      return true;
+    };
+    if (!artifact(s.param_file, "ncnn_param", s.param_path, s.param_sha256) ||
+        !artifact(s.bin_file, "ncnn_bin", s.bin_path, s.bin_sha256))
+      return false;
+    for (const auto &prior : pack->ncnn_vulkan_networks)
+      if (prior.role == s.role || prior.param_file == s.param_file ||
+          prior.bin_file == s.bin_file)
+        return Fail(error, "Duplicate ncnn network role/artifact");
+    pack->ncnn_vulkan_networks.push_back(std::move(s));
+  }
+  const std::size_t expected = pack->task == "eye_contact" ? 2 : 1;
+  if (pack->ncnn_vulkan_networks.size() != expected)
+    return Fail(error, "Incomplete ncnn network role set");
+  return true;
+}
+
 bool ParseModelJsonV1(const fs::path &pack_dir, ModelPack *out,
                       std::string *error) {
   const fs::path manifestPath = pack_dir / "model.json";
@@ -1011,6 +1174,8 @@ bool ParseModelJsonV2(const fs::path &pack_dir, ModelPack *out,
     out->matting = std::move(spec);
   }
 
+  if (!ParseNcnnVulkanNetworks(*obj, out, error))
+    return false;
   if (!ParseNcnnVulkanMattingSpec(*obj, out, error))
     return false;
 
@@ -1279,8 +1444,7 @@ ValidateModelArtifactIdentity(const ModelPack &pack,
           registered->sha256);
   if (!expected.empty()) {
     if (!studiocast::model_integrity_internal::IsSha256Hex(expected)) {
-      result.status =
-          ModelArtifactValidationStatus::invalid_manifest_checksum;
+      result.status = ModelArtifactValidationStatus::invalid_manifest_checksum;
       result.detail =
           "model manifest artifact checksum is not a SHA-256 digest";
       return result;
@@ -1302,8 +1466,7 @@ ValidateModelArtifactIdentity(const ModelPack &pack,
 
   std::array<std::uint8_t, 32 * 3> identity_material{};
   std::copy(result.identity.model_id_sha256.begin(),
-            result.identity.model_id_sha256.end(),
-            identity_material.begin());
+            result.identity.model_id_sha256.end(), identity_material.begin());
   std::copy(result.identity.manifest_sha256.begin(),
             result.identity.manifest_sha256.end(),
             identity_material.begin() + 32);
@@ -1322,6 +1485,44 @@ ValidateModelArtifactIdentity(const ModelPack &pack,
   result.status = ModelArtifactValidationStatus::ok;
   result.detail.clear();
   return result;
+}
+
+bool ValidateProductionNcnnVulkanNetworkPack(
+    const ModelPack &pack, const NcnnVulkanNetworkSpec &network,
+    std::string *error) {
+  if (!ValidateNcnnNetworkMetadata(pack, network, error))
+    return false;
+  bool declared = false;
+  for (const auto &candidate : pack.ncnn_vulkan_networks)
+    if (candidate == network)
+      declared = true;
+  if (!declared)
+    return Fail(error, "Foreign/stale ncnn network declaration");
+  for (const auto &name : {network.param_file, network.bin_file}) {
+    const ModelFile *file = nullptr;
+    for (const auto &f : pack.files)
+      if (f.name == name)
+        file = &f;
+    if (!file)
+      return Fail(error, "Missing declared ncnn artifact");
+    const auto validated = ValidateModelArtifactIdentity(pack, *file);
+    if (!validated.ok())
+      return Fail(error, validated.detail);
+    const bool param = name == network.param_file;
+    if (file->path.lexically_normal() !=
+            (param ? network.param_path : network.bin_path) ||
+        studiocast::model_integrity_internal::NormalizeSha256Hex(
+            file->sha256) !=
+            (param ? network.param_sha256 : network.bin_sha256))
+      return Fail(error,
+                  "ncnn artifact path/hash differs from registry declaration");
+  }
+  for (const auto &f : pack.files)
+    if (f.kind == "onnx" && f.role == network.role) {
+      const auto validated = ValidateModelArtifactIdentity(pack, f);
+      return validated.ok() || Fail(error, validated.detail);
+    }
+  return Fail(error, "Missing source ONNX artifact");
 }
 
 bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
@@ -1504,15 +1705,13 @@ ModelPackRegistry::Scan(const std::filesystem::path &open_video_models_dir) {
     std::string manifest_hash_error;
     if (!studiocast::model_integrity_internal::ComputeSha256File(
             manifest, &parsed_manifest_hex, &manifest_hash_error) ||
-        !HexToDigest(parsed_manifest_hex,
-                     &pack.registry_manifest_sha256)) {
+        !HexToDigest(parsed_manifest_hex, &pack.registry_manifest_sha256)) {
       const std::string dirKey = PackDirKey(open_video_models_dir, pack_dir);
       const std::string key = pack.id.empty() ? dirKey : pack.id;
-      reg.problems_[key] =
-          ClassifiedMessage("read_error",
-                            manifest_hash_error.empty()
-                                ? "failed to hash parsed model manifest"
-                                : manifest_hash_error);
+      reg.problems_[key] = ClassifiedMessage(
+          "read_error", manifest_hash_error.empty()
+                            ? "failed to hash parsed model manifest"
+                            : manifest_hash_error);
       continue;
     }
 

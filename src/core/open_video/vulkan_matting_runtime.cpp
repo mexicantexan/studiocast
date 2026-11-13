@@ -1,4 +1,5 @@
 #include "core/open_video/vulkan_matting_runtime.h"
+#include "core/vulkan/resident_command_batch.h"
 
 #include <cctype>
 #include <limits>
@@ -554,7 +555,8 @@ bool VulkanMattingRuntimeLifecycle::Warmup(std::string *error_out) {
 
 bool VulkanMattingRuntimeLifecycle::VerifyBinding(
     const VulkanMattingBufferBinding &binding, const char *name, int expected_n,
-    int expected_c, int expected_h, int expected_w, std::string *error_out) {
+    int expected_c, int expected_h, int expected_w, std::string *error_out,
+    bool queued) {
   std::size_t expected_bytes = 0;
   if (!ExpectedF32Bytes(expected_n, expected_c, expected_h, expected_w,
                         &expected_bytes) ||
@@ -589,7 +591,8 @@ bool VulkanMattingRuntimeLifecycle::VerifyBinding(
                     "identity/generation.",
                 true, error_out);
   }
-  if (!binding.access_synchronized || !binding.runtime_queue_ownership) {
+  if ((!queued && !binding.access_synchronized) ||
+      !binding.runtime_queue_ownership) {
     return Fail(VulkanMattingRuntimeFailure::synchronization_failed,
                 std::string("Open Vulkan matting ") + name +
                     " binding lacks explicit synchronization/queue ownership.",
@@ -622,6 +625,30 @@ bool VulkanMattingRuntimeLifecycle::Run(
   runtime_->RefreshExecutionEvidence(&execution_evidence_);
   return VerifyExecutionEvidence(execution_evidence_, /*warmup=*/false,
                                  error_out);
+}
+
+bool VulkanMattingRuntimeLifecycle::Enqueue(
+    const VulkanMattingBufferBinding &input,
+    const VulkanMattingBufferBinding &alpha_output,
+    vulkan::ResidentCommandBatch &batch, std::string *error_out) {
+  if (failure_latched())
+    return Fail(latched_failure_, latched_error_, false, error_out);
+  const auto identity = batch.context_identity();
+  if (!warmed_ || identity.context_id != device_.context_id ||
+      identity.generation != device_.context_generation ||
+      batch.state() != vulkan::ResidentCommandBatchState::recording)
+    return Fail(VulkanMattingRuntimeFailure::context_generation_mismatch,
+                "Queued matting requires exact prepared recording batch", true,
+                error_out);
+  if (!VerifyBinding(input, "queued input", graph_.input_n, graph_.input_c,
+                     graph_.input_h, graph_.input_w, error_out, true) ||
+      !VerifyBinding(alpha_output, "queued alpha", graph_.output_n,
+                     graph_.output_c, graph_.output_h, graph_.output_w,
+                     error_out, true))
+    return false;
+  // Completion evidence is refreshed by the owner only after batch Complete.
+  return AcceptResult(runtime_->Enqueue(input, alpha_output, batch), "enqueue",
+                      error_out);
 }
 
 bool VulkanMattingRuntimeLifecycle::LatchExternalFailure(

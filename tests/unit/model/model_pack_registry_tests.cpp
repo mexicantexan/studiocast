@@ -281,6 +281,106 @@ bool DiagnosticsContainsModel(
   });
 }
 
+bool TestNcnnVulkanNetworks() {
+  namespace ov = studiocast::open_video;
+  ScopedDataHome temp("studiocast-ncnn-networks");
+  if (!temp.ok())
+    return false;
+  const auto root = temp.path() / "models";
+  const auto pack = root / "video_denoise" / "fixture";
+  if (!WriteTextFile(pack / "model.onnx", "source\n") ||
+      !WriteTextFile(pack / "model.param", "param\n") ||
+      !WriteTextFile(pack / "model.bin", "weights\n"))
+    return false;
+  std::string source, param, bin, error;
+  for (const auto &entry : std::vector<std::pair<const char *, std::string *>>{
+           {"model.onnx", &source},
+           {"model.param", &param},
+           {"model.bin", &bin}})
+    if (!studiocast::model_integrity_internal::ComputeSha256File(
+            pack / entry.first, entry.second, &error))
+      return false;
+  const std::string manifest =
+      "{\"schema_version\":2,\"id\":\"generic_fixture\",\"display_name\":"
+      "\"fixture\","
+      "\"task\":\"video_denoise\",\"files\":["
+      "{\"name\":\"model.onnx\",\"kind\":\"onnx\",\"role\":\"main\",\"sha256\":"
+      "\"" +
+      source +
+      "\"},"
+      "{\"name\":\"model.param\",\"kind\":\"ncnn_param\",\"role\":\"vulkan_"
+      "main\",\"sha256\":\"" +
+      param +
+      "\"},"
+      "{\"name\":\"model.bin\",\"kind\":\"ncnn_bin\",\"role\":\"vulkan_main\","
+      "\"sha256\":\"" +
+      bin +
+      "\"}],"
+      "\"ncnn_vulkan_networks\":[{\"role\":\"main\",\"profile\":\"fastdvdnet_"
+      "rgb_v1\","
+      "\"param_file\":\"model.param\",\"bin_file\":\"model.bin\",\"precision\":"
+      "\"fp32\","
+      "\"source_onnx_sha256\":\"" +
+      source +
+      "\",\"converter\":{\"name\":\"pnnx\",\"version\":\"20261020\"},"
+      "\"inputs\":[{\"blob\":\"noisy\",\"dims\":3,\"w\":0,\"h\":0,\"c\":15,"
+      "\"dynamic_hw\":true},"
+      "{\"blob\":\"noise_map\",\"dims\":3,\"w\":0,\"h\":0,\"c\":1,\"dynamic_"
+      "hw\":true}],"
+      "\"outputs\":[{\"blob\":\"denoised\",\"dims\":3,\"w\":0,\"h\":0,\"c\":3,"
+      "\"dynamic_hw\":true}]}]}";
+  auto scan = [&](const std::string &text) {
+    WriteTextFile(pack / "model.json", text);
+    return ov::ModelPackRegistry::Scan(root);
+  };
+  auto registry = scan(manifest);
+  auto valid = registry.ResolveModel("generic_fixture");
+  if (!Expect(valid && valid->ncnn_vulkan_networks.size() == 1,
+              "generic network must parse"))
+    return false;
+  auto graph = valid->ncnn_vulkan_networks[0];
+  if (!Expect(
+          ov::ValidateProductionNcnnVulkanNetworkPack(*valid, graph, &error),
+          "valid network must verify: " + error))
+    return false;
+  graph.outputs[0].c = 4;
+  if (!Expect(
+          !ov::ValidateProductionNcnnVulkanNetworkPack(*valid, graph, &error),
+          "forged tensor contract must fail"))
+    return false;
+  const std::vector<std::pair<std::string, std::string>> mutations{
+      {"\"vulkan_main\"", "\"main\""},
+      {"\"param_file\":\"model.param\"", "\"param_file\":\"../model.param\""},
+      {"\"c\":15", "\"c\":14"},
+      {"\"dynamic_hw\":true", "\"dynamic_hw\":1"},
+      {"\"dims\":3", "\"dims\":2"},
+      {"\"w\":0", "\"w\":64"},
+      {"\"precision\":\"fp32\"", "\"precision\":\"fp16\""},
+      {"\"source_onnx_sha256\":\"" + source,
+       "\"source_onnx_sha256\":\"" + param},
+      {"\"profile\":\"fastdvdnet_rgb_v1\"", "\"profile\":\"flx_prefix_v1\""}};
+  for (const auto &[from, to] : mutations) {
+    auto changed = manifest;
+    const auto pos = changed.find(from);
+    if (pos == std::string::npos)
+      return false;
+    changed.replace(pos, from.size(), to);
+    if (!Expect(!scan(changed).ResolveModel("generic_fixture"),
+                "malformed network must fail: " + from))
+      return false;
+  }
+  registry = scan(manifest);
+  valid = registry.ResolveModel("generic_fixture");
+  if (!valid)
+    return false;
+  if (!WriteTextFile(pack / "model.bin", "mutated\n") ||
+      !Expect(!ov::ValidateProductionNcnnVulkanNetworkPack(
+                  *valid, valid->ncnn_vulkan_networks[0], &error),
+              "artifact mutation must fail"))
+    return false;
+  return true;
+}
+
 bool TestOpenVideoIntegrity() {
   namespace ov = studiocast::open_video;
   const auto root = std::filesystem::path("tests") / "data" / "models" /
@@ -1084,6 +1184,7 @@ bool TestVerifiedModelFileSnapshot() {
 
 int main() {
   bool ok = true;
+  ok = RunNamedTest("ncnn_vulkan_networks", TestNcnnVulkanNetworks) && ok;
   ok = RunNamedTest("verified_model_file_snapshot",
                     TestVerifiedModelFileSnapshot) &&
        ok;
