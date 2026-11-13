@@ -279,3 +279,66 @@ preservation passed. Promotion restores all ten original catalog artifact object
 (including public ONNX source candidates) and adds only the eight new artifacts. The
 exact fourteen-file publication approval remains pending; no new artifact was published
 or active catalog promoted.
+
+## Integrated failure remediation (2026-11-13)
+
+The earlier timeout/crash investigation found a reproducible driver-exit fault:
+the NVIDIA worker crashed in `libnvidia-glcore.so.535.309.01` during process exit
+while the failed submission was still pending. Complete owner retention prevented
+premature resource release but did not supply a shutdown retirement proof.
+The integrated bounded late-fence API (`f1447c8`, `3da0121`, `a709548`,
+`82230ef`) now permits one exact pending-fence check per shutdown request. A
+successful check retires failed callback tickets before destruction, keeps the
+context poisoned and never converts the failed frame into successful output.
+Lost devices and unproven completion remain retained and fail closed. Neither
+the 100 ms fence policy nor the normal 16-synchronization limit changed.
+
+Injected native denoise and full-program timeout tests now exit successfully
+after proven retirement, reject further execution and publish no failed output.
+The minimal shutdown proof took 52.70 ms. The full-program shutdown observation
+was 154.56 ms including destruction; that wall time is not a longer fence wait.
+One earlier full-program probe remained pending at its 100 ms limit and is
+retained in the evidence rather than counted as success. Logs:
+`/tmp/studiocast-vulkan-all-pipeline-release-unsafe-timeout-minimal-retired-20261112.log`
+and `/tmp/studiocast-vulkan-all-pipeline-release-unsafe-timeout-all-retired-20261112.log`.
+
+Vulkan timeout/fatal quarantine is now distinct from actual device loss
+(`2f82443`, `5e13901`). The neutral session, facade and coordinator repair
+(`adf2d5f`, source `b6cd07c` on
+`codex/quarantine-reason-retention-20261112`) retains the first actual cause
+through retries, binding/resolution, reset, discard, invalidation and rejected
+reconfiguration. Status-only quarantine defaults to synchronization failure;
+the reset trigger is not device-loss evidence. Actual device-loss counters
+advance only for an actual device-loss cause. Failed validated execution or
+publication clears current activity while preserving selection and historical
+counters. Forged completion tokens, including a changed complete bit, cannot
+clear or publish a real pending frame. Regression-first checks failed before
+the fixes; all nine focused neutral suites passed in the isolated disabled
+build with temporary HOME/XDG roots. Integrated Vulkan adapter/factory/executor
+checks passed three of three after the Vulkan cause fixes.
+
+The full 64×64 blur composition passed after writer-attribution repair:
+sequences 1/2/7/9 (failed writer)/10 (recovery), five completed GPU batches and
+four committed outputs, one upload/final readback/synchronization per batch,
+zero execution-time C++ allocations, and reset/gap assertions. Frame wall times
+were 90.16/88.38/50.54/47.99/47.92 ms, not latency percentiles. Log:
+`/tmp/studiocast-vulkan-all-pipeline-release-execute-all64-writer-fixed-20261112.log`.
+Other backgrounds, face-positive composition and final-head broad suites
+remain in progress.
+
+The larger-geometry investigation has isolated a 640×480 denoise-only warmup
+timeout on this P1000. Partial actual allocation at failure was 864,332,464
+bytes retained / 883,993,264 peak and 258 / 407 native allocations, below the
+unchanged 1,024-resource caller cap. These are partial denoise observations,
+not a successful whole-program budget or FHD qualification. The original full
+640×480 preparation also failed closed. No packing/precision setting or wait
+limit has been changed to hide this hardware limit. The exact minimized
+capture is `/tmp/studiocast-vulkan-all-pipeline-profile-denoise640-gdb-20261112.log`.
+
+Cached diagnostics now enumerate every installed Open Video task and expose
+separate per-task daemon-default and actually prepared model IDs (`40a4564`).
+New-task cold probes use registry defaults; ordinary status remains cache-only.
+Existing matting native-compatible default behavior is preserved. Production
+new-task default selection and the independent custom-pack native regression
+are being integrated separately. The scope documentation now covers all effects
+together (`efb399c`), while exact per-effect qualification remains mandatory.
