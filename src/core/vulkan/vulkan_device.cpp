@@ -363,11 +363,16 @@ VulkanHealthState VulkanContextState::HealthState() const noexcept {
 
 bool VulkanContextState::SafeToDestroyChildren() const {
   std::lock_guard<std::mutex> lock(health_mutex);
-  const bool fatal_wait_completion_unknown =
-      health.health == VulkanContextHealth::fatal_submission_error &&
+  // Late fence proof retires submitted work without clearing timeout poison.
+  // A timeout with no successful submission has no such retirement evidence.
+  if (health.health == VulkanContextHealth::unsafe_timeout &&
+      health.submitted_serial == 0)
+    return false;
+  const bool failed_wait_completion_unknown =
+      (health.health == VulkanContextHealth::fatal_submission_error ||
+       health.health == VulkanContextHealth::unsafe_timeout) &&
       health.submitted_serial > health.completed_serial;
-  return health.health != VulkanContextHealth::unsafe_timeout &&
-         !fatal_wait_completion_unknown;
+  return !failed_wait_completion_unknown;
 }
 
 VulkanHealthSnapshot VulkanContextState::HealthSnapshot() const {
@@ -487,7 +492,8 @@ bool VulkanContextState::RecordDriverFailure(VkResult result,
                               " failed: " + VkResultName(result) + ".";
   if (poison) {
     std::lock_guard<std::mutex> lock(health_mutex);
-    if (!health.poisoned) {
+    // A later device-loss result must prevent retrying an earlier timeout.
+    if (!health.poisoned || next_health == VulkanContextHealth::device_lost) {
       health.health = next_health;
       health.poisoned = true;
       health.reason_code = reason;
@@ -1727,6 +1733,68 @@ bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
   return SubmitAndWait(&command_buffer, 1, error_out);
 }
 
+bool VulkanDevice::TryProvePendingSubmissionQuiescence(std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  const auto context = context_;
+  const auto identity = context_identity_;
+  if (!initialized_ || !context || !identity.Valid()) {
+    if (error_out)
+      *error_out =
+          "Pending-submission retirement requires a live exact context.";
+    return false;
+  }
+  std::lock_guard<std::mutex> submit_lock(context->submission_mutex);
+  const auto fence = context->fence;
+  const auto device = context->device;
+  const auto exact = [&] {
+    return initialized_ && context_ == context && loader_ &&
+           loader_ == context->loader && context_identity_ == identity &&
+           context->identity == identity && device && device_ == device &&
+           context->device == device && fence && fence_ == fence &&
+           context->fence == fence;
+  };
+  const auto before = context->HealthState();
+  if (!exact() || before.health == VulkanContextHealth::device_lost ||
+      before.health == VulkanContextHealth::uninitialized ||
+      before.health == VulkanContextHealth::shutdown ||
+      before.completed_serial > before.submitted_serial) {
+    if (error_out)
+      *error_out = "Pending-submission retirement context is stale or lost.";
+    return false;
+  }
+  if (before.completed_serial == before.submitted_serial)
+    return context->SafeToDestroyChildren();
+  if (!before.poisoned ||
+      (before.health != VulkanContextHealth::unsafe_timeout &&
+       before.health != VulkanContextHealth::fatal_submission_error) ||
+      !context->loader || !context->f().vkWaitForFences ||
+      !context->fence_timeout_ns || context->fence_timeout_ns == UINT64_MAX) {
+    if (error_out)
+      *error_out = "Pending-submission retirement has no bounded failed fence.";
+    return false;
+  }
+  const auto timeout =
+      std::min(context->fence_timeout_ns, VK_DEFAULT_FENCE_TIMEOUT_NS);
+  const auto result =
+      context->f().vkWaitForFences(device, 1, &fence, 1, timeout);
+  if (!context->RecordDriverFailure(result, "Vulkan shutdown retirement fence",
+                                    true, error_out))
+    return false;
+  std::lock_guard<std::mutex> health_lock(context->health_mutex);
+  if (!exact() || context->health.health != before.health ||
+      context->health.poisoned != before.poisoned ||
+      context->health.submitted_serial != before.submitted_serial ||
+      context->health.completed_serial != before.completed_serial) {
+    if (error_out)
+      *error_out = "Pending-submission retirement fence identity changed.";
+    return false;
+  }
+  // Retirement proof only: preserve poison and the original failure evidence.
+  context->health.completed_serial = before.submitted_serial;
+  return true;
+}
+
 bool VulkanDevice::SubmitAndWait(const VkCommandBuffer *command_buffers,
                                  std::uint32_t count, std::string *error_out) {
   if (error_out)
@@ -1756,6 +1824,11 @@ bool VulkanDevice::SubmitAndWait(const VkCommandBuffer *command_buffers,
                    "] Vulkan submission rejected because the context is "
                    "latched unhealthy.";
     }
+    return false;
+  }
+  if (before.submitted_serial == UINT64_MAX) {
+    if (error_out)
+      *error_out = "Vulkan submission serial is exhausted.";
     return false;
   }
 
@@ -2184,6 +2257,13 @@ bool VulkanCommandBatch::Complete(std::string *error_out) {
       *error_out = "[" + before.reason_code +
                    "] Vulkan batch completion rejected an unhealthy context.";
     }
+    recording_ = false;
+    recording_owner_ = {};
+    return false;
+  }
+  if (context_->HealthState().submitted_serial == UINT64_MAX) {
+    if (error_out)
+      *error_out = "Vulkan submission serial is exhausted.";
     recording_ = false;
     recording_owner_ = {};
     return false;
