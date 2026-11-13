@@ -4,9 +4,12 @@
 #include "core/open_video/frame_analysis_cache.h"
 #include "core/open_video/gaze_correction_eye_contact.h"
 #include "core/open_video/yunet_face_detector.h"
+#include "core/video/cpu_primitive_hal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <vector>
@@ -47,6 +50,40 @@ bool SameImage(const hal::ImageDescriptor &left,
     }
   }
   return true;
+}
+
+// The compatibility stages and terminal CPU transport support packed RGB only.
+bool SupportedRgbImage(const hal::ImageDescriptor &image,
+                       bool output) noexcept {
+  if (!hal::ValidateImageDescriptor(image) || image.plane_count != 1 ||
+      image.format != hal::PixelFormat::rgb_u8 ||
+      image.channel_order != hal::ChannelOrder::rgb ||
+      image.color_space != hal::ColorSpace::srgb ||
+      image.color_range != hal::ColorRange::full ||
+      image.alpha_meaning != hal::AlphaMeaning::none ||
+      image.orientation != hal::Orientation::top_left ||
+      image.host_coherence != hal::HostCoherence::coherent ||
+      image.base_alignment_bytes > alignof(std::max_align_t) ||
+      image.width >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max() / 3) ||
+      image.height >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      (image.mutability != hal::Mutability::read_write &&
+       image.mutability != (output ? hal::Mutability::write_only
+                                   : hal::Mutability::read_only))) {
+    return false;
+  }
+  const auto &plane = image.planes[0];
+  const auto maximum =
+      static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max());
+  const auto row_bytes = std::uint64_t{image.width} * 3;
+  return plane.offset_bytes == 0 && plane.width == image.width &&
+         plane.height == image.height && plane.size_bytes <= maximum &&
+         plane.row_stride_bytes >= row_bytes &&
+         plane.row_stride_bytes <= maximum / image.height &&
+         image.height - 1 <= (maximum - row_bytes) / plane.row_stride_bytes &&
+         plane.size_bytes >=
+             plane.row_stride_bytes * (image.height - 1) + row_bytes;
 }
 
 bool SameCompletion(const hal::CompletionToken &left,
@@ -97,6 +134,10 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
   FrameAnalysisCache analysis;
   std::vector<std::uint8_t> output;
   std::vector<std::uint8_t> candidate;
+  std::vector<std::uint8_t> writer_output;
+  std::vector<std::uint8_t> resize_scratch;
+  const video::CpuPrimitiveTable *cpu = nullptr;
+  video::CpuRgb24BilinearResizePlan resize_plan{};
   std::array<std::string, hal::kMaxPreparedStages> frame_errors{};
   video::VideoExecutionAdapterSnapshot snapshot{};
   hal::CompletionToken pending{};
@@ -116,6 +157,14 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
   }
 
   bool Setup(PreparedOpenVideoCompatibilitySetupResult *result) {
+    if (!SupportedRgbImage(config.plan.host_input, false) ||
+        !SupportedRgbImage(config.plan.host_output, true) ||
+        config.plan.intent.stage_count == 0 ||
+        config.plan.intent.stage_count > hal::kMaxPreparedStages) {
+      result->status = hal::StatusId::blocked;
+      result->reason = hal::ReasonId::malformed_contract;
+      return false;
+    }
     const int width = static_cast<int>(config.plan.host_input.width);
     const int height = static_cast<int>(config.plan.host_input.height);
     if (config.selected_backend == hal::BackendId::invalid ||
@@ -128,9 +177,65 @@ struct PreparedOpenVideoCompatibilityExecutor::Impl {
       result->reason = hal::ReasonId::malformed_execution_domain;
       return false;
     }
-    output.resize(
-        static_cast<std::size_t>(config.plan.host_output.planes[0].size_bytes));
-    candidate.resize(output.size());
+    const auto &input = config.plan.host_input;
+    const auto &writer = config.plan.host_output;
+    const bool transport =
+        input.width != writer.width || input.height != writer.height ||
+        input.planes[0].row_stride_bytes != writer.planes[0].row_stride_bytes ||
+        input.planes[0].size_bytes != writer.planes[0].size_bytes;
+    // The CPU resizer clears complete destination rows, including final-row
+    // padding. Own that physical storage even when a descriptor only exposes
+    // its active final row, and never read that extra padding from the caller.
+    const auto capture_bytes = static_cast<std::size_t>(
+        std::max(input.planes[0].size_bytes,
+                 input.planes[0].row_stride_bytes * input.height));
+    const auto writer_bytes =
+        transport ? static_cast<std::size_t>(std::max(
+                        writer.planes[0].size_bytes,
+                        writer.planes[0].row_stride_bytes * writer.height))
+                  : 0;
+    std::size_t scratch_bytes = 0;
+    if (transport) {
+      cpu = &video::GetCpuPrimitiveTable();
+      if (!cpu->resize_rgb24_bilinear_plan_scratch_bytes ||
+          !cpu->prepare_resize_rgb24_bilinear ||
+          !cpu->apply_resize_rgb24_bilinear) {
+        result->status = hal::StatusId::blocked;
+        result->reason = hal::ReasonId::capability_evidence_incomplete;
+        return false;
+      }
+      scratch_bytes = cpu->resize_rgb24_bilinear_plan_scratch_bytes(
+          width, height, static_cast<int>(writer.width),
+          static_cast<int>(writer.height));
+    }
+    // Reserve capture ping-pong storage and the terminal writer transport
+    // without enlarging the caller's prepared CPU compatibility reservation.
+    const auto &budget = config.plan.budget;
+    if (capture_bytes > budget.persistent_bytes / 2 ||
+        writer_bytes > budget.persistent_bytes - 2 * capture_bytes ||
+        scratch_bytes > budget.scratch_bytes ||
+        (transport && scratch_bytes == 0) ||
+        budget.resource_count < (transport ? 4u : 2u) ||
+        budget.in_flight_slots != 1) {
+      result->status = hal::StatusId::resource_exhausted;
+      result->reason = hal::ReasonId::resource_exhausted;
+      return false;
+    }
+    output.resize(capture_bytes);
+    candidate.resize(capture_bytes);
+    if (transport) {
+      writer_output.resize(writer_bytes);
+      resize_scratch.resize(scratch_bytes);
+      if (cpu->prepare_resize_rgb24_bilinear(
+              width, height, static_cast<int>(writer.width),
+              static_cast<int>(writer.height), resize_scratch.data(),
+              resize_scratch.size(),
+              &resize_plan) != video::CpuPrimitiveResult::success) {
+        result->status = hal::StatusId::blocked;
+        result->reason = hal::ReasonId::malformed_contract;
+        return false;
+      }
+    }
     for (std::size_t index = 0; index < config.plan.intent.stage_count;
          ++index) {
       const auto semantic = config.plan.intent.stages[index].intent.semantic;
@@ -285,7 +390,8 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
 
   const auto frame_start = std::chrono::steady_clock::now();
   std::memcpy(impl_->output.data(), binding.input_planes[0].read_data,
-              impl_->output.size());
+              static_cast<std::size_t>(
+                  impl_->config.plan.host_input.planes[0].size_bytes));
   impl_->analysis.BeginFrame(binding.capture_sequence);
   bool degraded = false;
   result.stage_count = impl_->config.plan.intent.stage_count;
@@ -304,28 +410,28 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
       ok = impl_->config.prepared_stage_runner(
           impl_->config.prepared_stage_runner_context, stage,
           binding.capture_sequence, impl_->candidate.data(),
-          static_cast<int>(impl_->config.plan.host_output.width),
-          static_cast<int>(impl_->config.plan.host_output.height),
+          static_cast<int>(impl_->config.plan.host_input.width),
+          static_cast<int>(impl_->config.plan.host_input.height),
           static_cast<std::size_t>(
-              impl_->config.plan.host_output.planes[0].row_stride_bytes),
+              impl_->config.plan.host_input.planes[0].row_stride_bytes),
           &error);
     } else if (stage.intent.semantic ==
                hal::SemanticEffectId::video_noise_removal) {
       ok = impl_->denoiser.ApplyPreparedRgbInPlace(
           binding.capture_sequence, impl_->candidate.data(),
-          static_cast<int>(impl_->config.plan.host_output.width),
-          static_cast<int>(impl_->config.plan.host_output.height),
+          static_cast<int>(impl_->config.plan.host_input.width),
+          static_cast<int>(impl_->config.plan.host_input.height),
           static_cast<std::size_t>(
-              impl_->config.plan.host_output.planes[0].row_stride_bytes),
+              impl_->config.plan.host_input.planes[0].row_stride_bytes),
           impl_->config.effects.video_noise_removal.strength,
           impl_->config.effects.video_noise_removal.model_id, &error);
     } else if (stage.intent.semantic == hal::SemanticEffectId::eye_contact) {
       ok = impl_->gaze.ApplyPreparedRgbInPlace(
           binding.capture_sequence, impl_->candidate.data(),
-          static_cast<int>(impl_->config.plan.host_output.width),
-          static_cast<int>(impl_->config.plan.host_output.height),
+          static_cast<int>(impl_->config.plan.host_input.width),
+          static_cast<int>(impl_->config.plan.host_input.height),
           static_cast<std::size_t>(
-              impl_->config.plan.host_output.planes[0].row_stride_bytes),
+              impl_->config.plan.host_input.planes[0].row_stride_bytes),
           impl_->config.effects.eye_contact.strength,
           impl_->config.effects.eye_contact.look_away_enabled,
           impl_->config.effects.auto_frame.model_id,
@@ -357,20 +463,41 @@ PreparedOpenVideoCompatibilityExecutor::Execute(
     impl_->pending_stages[index] = stage_result;
   }
 
+  // Effects remain at capture geometry; this is only the prepared terminal
+  // host-output resize/stride tail, not an additional semantic effect provider.
+  if (impl_->cpu &&
+      impl_->cpu->apply_resize_rgb24_bilinear(
+          &impl_->resize_plan, impl_->output.data(),
+          static_cast<std::size_t>(
+              impl_->config.plan.host_input.planes[0].row_stride_bytes),
+          impl_->writer_output.data(),
+          static_cast<std::size_t>(
+              impl_->config.plan.host_output.planes[0].row_stride_bytes)) !=
+          video::CpuPrimitiveResult::success) {
+    impl_->ClearCurrentActivity();
+    result.status = hal::StatusId::failed;
+    result.reason = hal::ReasonId::malformed_contract;
+    return result;
+  }
+  auto &published = impl_->cpu ? impl_->writer_output : impl_->output;
   impl_->pending_stage_count = result.stage_count;
   impl_->pending = {
       impl_->next_token++,
       impl_->config.plan.plan_id,
-      UINT64_C(0x4f565043),
+      impl_->config.execution_domain.adapter_instance_id,
       binding.capture_sequence,
       true,
   };
   result.completion = impl_->pending;
+  result.execution_domain = impl_->config.execution_domain;
   result.output.descriptor = impl_->config.plan.host_output;
   result.output.plane_count = 1;
   result.output.planes[0].read_data =
-      reinterpret_cast<const std::byte *>(impl_->output.data());
-  result.output.planes[0].span_bytes = impl_->output.size();
+      reinterpret_cast<const std::byte *>(published.data());
+  result.output.planes[0].write_data =
+      reinterpret_cast<std::byte *>(published.data());
+  result.output.planes[0].span_bytes =
+      impl_->config.plan.host_output.planes[0].size_bytes;
   result.output.planes[0].row_stride_bytes =
       impl_->config.plan.host_output.planes[0].row_stride_bytes;
   result.output.capture_sequence = binding.capture_sequence;
@@ -416,6 +543,7 @@ hal::StatusId PreparedOpenVideoCompatibilityExecutor::CommitOutput(
   committed.valid = true;
   committed.program_id = impl_->config.plan.plan_id;
   committed.invalidation_key = impl_->config.plan.invalidation_key;
+  committed.execution_domain = impl_->config.execution_domain;
   committed.capture_sequence = completion.capture_sequence;
   committed.output_commit_sequence = ++impl_->commit_sequence;
   committed.stage_count = impl_->pending_stage_count;
