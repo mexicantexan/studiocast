@@ -403,8 +403,8 @@ bool WriterCommitOptionalFailureAndForeignResourcesFailClosed() {
   CHECK(frames.output == frames.input);
   CHECK(owner.CommitOutput(frame.completion, true, &reason) ==
         hal::StatusId::ready);
-  const auto baseline_committed =
-      owner.Snapshot().latest_committed_frame;
+  const auto baseline = owner.Snapshot();
+  const auto baseline_committed = baseline.latest_committed_frame;
   CHECK(baseline_committed.valid &&
         baseline_committed.capture_sequence == 1);
 
@@ -417,10 +417,21 @@ bool WriterCommitOptionalFailureAndForeignResourcesFailClosed() {
   CHECK(owner.CommitOutput(frame.completion, false, &reason) ==
         hal::StatusId::failed);
   CHECK(reason == hal::ReasonId::output_write_failed);
-  CHECK(owner.Snapshot().latest_committed_frame.program_id ==
-        baseline_committed.program_id);
-  CHECK(owner.Snapshot().latest_committed_frame.capture_sequence ==
-        baseline_committed.capture_sequence);
+  const auto failed = owner.Snapshot();
+  CHECK(!failed.latest_committed_frame.valid);
+  CHECK(failed.telemetry.active_backend == hal::BackendId::invalid);
+  CHECK(failed.telemetry.active_provider ==
+        hal::SemanticEffectProviderId::invalid);
+  CHECK(failed.telemetry.committed_output_frames == 1);
+  CHECK(failed.telemetry.active_backend_frames == 1);
+  CHECK(failed.prepared &&
+        failed.active_program.program_id == baseline.active_program.program_id);
+  CHECK(failed.readiness.status == baseline.readiness.status);
+  CHECK(failed.readiness.available == baseline.readiness.available);
+  CHECK(failed.readiness.execution_domain ==
+        baseline.readiness.execution_domain);
+  CHECK(failed.telemetry.selected_backend ==
+        baseline.telemetry.selected_backend);
 
   adapter.mode = ExecuteMode::optional_fail_open;
   frames.input.fill(0x6c);
@@ -437,6 +448,8 @@ bool WriterCommitOptionalFailureAndForeignResourcesFailClosed() {
         hal::StatusId::ready);
   const auto committed = owner.Snapshot().latest_committed_frame;
   CHECK(committed.valid && committed.capture_sequence == 3);
+  CHECK(committed.output_commit_sequence == 2);
+  CHECK(owner.Snapshot().telemetry.committed_output_frames == 2);
   CHECK(committed.execution_domain == registration.execution_domain);
 
   adapter.mode = ExecuteMode::foreign_output;
