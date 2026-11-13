@@ -229,7 +229,7 @@ the prior valid plan.
 | --- | --- | --- |
 | CPU primitives | Conversion, mirror, and prepared bilinear resize only | No semantic product-effect capability or silent CPU effect fallback is inferred |
 | Maxine resident | A qualified contiguous Maxine island with tight RGB24 host input/output and one exact RGB/BGR output-conversion tail | Runtime and model evidence remain required; unsupported or unavailable Maxine work fails closed instead of changing GPU backend |
-| Open Vulkan resident | Explicit strict Vulkan; fixed-center vignette/mirror, plus opt-in reviewed MODNet background blur/remove/replace and key light; tight RGB24 transport and final resize; zero CPU tails | Matting needs the patched replay runtime, verified converted model and real warmup. Tracked-center vignette, Auto Frame, eye contact and denoise remain blocked or non-production; unavailable vendor qualification is not inferred |
+| Open Vulkan resident | Explicit strict Vulkan; mirror, fixed/tracked vignette, MODNet background modes/key light, FastDVDnet denoise, YuNet Auto Frame and dlib/FLX eye contact; tight RGB24 transport and final resize | All model stages require exact prepared replay/runtime/artifact evidence. GPU tracking/landmarks/eye tails remain resident. Full combined qualification and new model publication are tracked in VULKAN_EFFECTS_COMPLETION.md; unavailable vendor qualification is not inferred |
 | Open CUDA resident | Strict CUDA and automatic CUDA selection use exact model/provider evidence; canonical effect composition and geometry are integrated | Bounded generated-input/in-memory-writer evidence is recorded above; final integrated evidence and critique are recorded above; family/release gates remain required |
 | Open Video compatibility | Native-to-host denoise/Eye Contact fallback is setup-only under unconstrained automatic selection, after permitted availability failure and proven safe cleanup | Strict CUDA or incompatible provider intent, mixed CUDA semantics, pending cleanup, and quarantine never take this fallback; explicit typed CPU compatibility remains separate and is not CUDA attribution |
 
@@ -280,8 +280,14 @@ deployment feedback without claiming AMD/Intel qualification. Exact predicates
 and remaining limits are in
 [INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md) and
 [VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
-Tracked-center vignette, Auto Frame, eye contact and video denoise retain their
-previous limitations. Creating a generic adapter alone promotes no capability.
+The expanded implementation adds exact effect-specific proofs for denoise, face
+inference, GPU tracking, eye prefixes, landmarks and enabled FP64. Auto Frame
+and tracked-center vignette require resident tracking; Eye Contact additionally
+requires compiled dlib and the selected physical/logical device to support/enable
+FP64. Missing optional models/features block only affected effects. Creating a
+generic adapter alone promotes no capability. See
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md) for the expanded
+implementation and qualification ledger.
 
 `production_video_setup_request.*` owns the shared
 `BuildProductionVideoBackendSetupRequest` builder used by the camera pipeline

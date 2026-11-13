@@ -2,8 +2,8 @@
 
 ## v0.2.9
 
-This release focuses on Open Vulkan groundwork, normalized video compute backend
-selection, and clearer diagnostics for GPU-backed video effects.
+This release adds prepared hardware execution for video effects, explicit compute
+backend selection, and model/runtime diagnostics across CUDA and Vulkan.
 
 ### Highlights
 
@@ -19,8 +19,15 @@ selection, and clearer diagnostics for GPU-backed video effects.
   Vulkan fallback/degraded status instead of silently running CUDA.
 - Added hardware-first Vulkan adapter discovery plus persistent, daemon-owned
   adapter selection for Intel, AMD, NVIDIA, and explicit CPU Vulkan fallback.
-- Added a fail-closed production ncnn Vulkan matting contract and runtime
-  lifecycle seam without promoting the CPU-transfer spike to production.
+- Added a production ncnn Vulkan owner for background effects/key light,
+  FastDVDnet denoise, YuNet Auto Frame, GPU dlib/FLX eye contact, tracked vignette,
+  resize and mirror, with exact artifact/device/readiness gates.
+- Added a shared bounded GPU command batch with one frame upload and final
+  readback, resident tracking/tensor/history state, optional-effect isolation,
+  finite waits and quarantine of unsafe submissions.
+- Added pinned user-local SDK provisioning to the normal installer; model
+  conversion/publication and hardware qualification remain separately verified
+  prerequisites described in `docs/VULKAN_EFFECTS_COMPLETION.md`.
 - Expanded optional hardware validation with Vulkan runtime smoke jobs and
   CPU/CUDA/Vulkan resize benchmarking.
 

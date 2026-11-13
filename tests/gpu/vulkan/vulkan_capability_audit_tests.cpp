@@ -34,15 +34,15 @@ constexpr std::array<CapabilityRow, 9> kExpectedCapabilities{{
     {kEffectIdVirtualBackgroundReplace, "production usable (opt-in matting)",
      "open_vulkan_matting_production_ready"},
     {kEffectIdAutoFrame,
-     "usable with degraded behavior; unavailable on the analyzed machine",
+     "resident implementation; exact qualification required",
      "vulkan_auto_frame_yunet_unavailable"},
-    {kEffectIdEyeContact, "diagnostics-only / stub-unavailable",
+    {kEffectIdEyeContact, "resident implementation; exact qualification required",
      "open_vulkan_eye_contact_unavailable"},
-    {kEffectIdVideoNoiseRemoval, "diagnostics-only / stub-unavailable",
+    {kEffectIdVideoNoiseRemoval, "resident implementation; exact qualification required",
      "open_vulkan_video_noise_removal_unavailable"},
     {kEffectIdVirtualKeyLight, "production usable (opt-in matting)",
      "open_vulkan_matting_production_ready"},
-    {kEffectIdVignette, "production usable (fixed center only)",
+    {kEffectIdVignette, "fixed and tracked resident implementations",
      "open_vulkan_vignette_fixed_center_production_ready"},
 }};
 
@@ -223,7 +223,7 @@ bool TestBlockedAndExperimentalEvidenceRemainsFailClosed() {
           Contains(denoise, "live_stage_implemented = false") &&
           Contains(denoise, "production_adapter_available = false") &&
           Contains(denoise, "selectable_cpu_fallback = false"),
-      "diagnostics-only effects must not gain a callable or CPU fallback path");
+      "model readiness defaults must not infer live adapter or selectable CPU fallback");
   ok &= Require(
       Contains(spike, "not a production capability contract") &&
           Contains(native, "OpenVerifiedModelFileSnapshot") &&

@@ -39,7 +39,8 @@ external approval.
   GPU, and replay cached commands. Existing published MODNet metadata remains
   unchanged. Separate graph pools share aggregate charged quota/lifetime; no
   cross-graph workspace reuse while recorded commands reference it.
-- FastDVDnet uses a five-frame GPU history, causal center output/noise-map and
+- FastDVDnet keeps three physical GPU histories and the causal logical window
+  `[t-2,t-1,t,t,t]`, with center output/noise-map and
   canonical strength. Pad odd extents by edge replication to multiples of four,
   then crop output. Reset on discontinuity/drop/disable/config/model/context
   changes and failure; no frame-time allocation or graph rebuild.
@@ -60,7 +61,7 @@ external approval.
   context/domain generations. Eye/Auto Frame share only compatible analysis.
 - Fixed-capacity frame collector: 128 command buffers/participants, exact tickets
   with batch/epoch/sequence/owner generations, typed completed/unsubmitted-abort/
-  unsafe-pending callbacks. One finite multi-buffer submission where possible;
+  unsafe-pending/late-retirement callbacks. One finite multi-buffer submission where possible;
   preserve 16 synchronizations and 100 ms fence policy. Per-dispatch parameter/
   descriptor slots remain distinct, including non-push descriptors. Pending or
   failed proof retains/quarantines the complete island; no successful counters
@@ -71,10 +72,14 @@ external approval.
   owners. Measure complete preparations at supported geometries and validate
   all six caller axes; document any reviewed new bound explicitly.
 - Direct recorded graphs may run while GPU no-face/cadence guards preserve
-  output. Strength-zero is setup-known and omits work. Record actual inference
+  output. Strength-zero is setup-known and omits live inference; setup still validates
+  and warms its selected graph. Record actual inference
   counters and measure enabled no-face overhead; do not claim CUDA's skipped
   inference count unless commands truly skip. GPU conditional execution is an
   optimization only if measurements justify its added runtime contract.
+- Model and tracking graphs record once. Utilities reuse bounded prepared slots;
+  a slot may be reset and recorded after its prior completion, with no frame
+  allocations or descriptor mutation while queued.
 
 ## Ownership and waves
 
@@ -136,3 +141,68 @@ Implementation, model validation/publication proposal, installer provisioning,
 full native matrix, and fresh independent critique remain in progress. Exact
 commits, merged branches, tests/results, reviewed budget, and remaining external
 prerequisites will be appended as work is integrated.
+
+## Integrated evidence ledger (in progress)
+
+The root integrated the shared contracts and deferred command collector first,
+then the runtime branch at `e2e8c1a`, installer provisioning at `353ae41`, and
+tracking at `0842bae`. Runtime tip `05df764` includes fixed native tensor ranks,
+shared allocation quotas and a monotonic native-allocation counter. Tracking tip
+`2a6ca5b` includes BYO checksum compatibility: an undeclared checksum still seals
+against the exact digest computed during selection. No installed pack was changed.
+
+The isolated tracking native run used the P1000 with the unchanged 100 ms fence:
+20 dlib cases matched every coordinate; 6,400 detector candidates matched the
+stable top-K/NMS reference (3,311 kept); crop, smoothing, discontinuity, 64-bit
+sequence carry, tracked vignette, matte cadence and seven composite cases matched
+exact output bytes. Thirty native FLX sampler/tail cases matched original full
+ONNX RGB with maximum error zero. Maximum standalone execution was 35.002 ms.
+These are leaf results, not combined production-manager or face-positive proof.
+The root's new shader-source hash checks and byte-for-byte recompilation of all
+three tracking shaders passed using isolated glslang 16.6.0. Older utility/resize
+bytecode uses its original compiler; no unrelated bytecode was regenerated.
+
+The generic runtime's earlier native oracle covered 45 FastDVDnet cases, 60
+YuNet head comparisons, and 15 cases per eye with unchanged maximum 2e-4 / mean
+2e-5 thresholds. Its post-counter integrated rerun remains pending. The measured
+214,668,160-byte / 336-resource peak was sequential inference qualification,
+not the combined pipeline or an FHD budget.
+
+Eight converter checks and eighteen hermetic SDK tests passed after integration.
+Actual pinned source archives passed bounded extraction/patch preparation; a full
+isolated SDK build is running without host installation. Root production-on
+compilation, full manager matrix, aggregate budget review, model-publication
+approval, cached readiness integration and fresh critique remain open.
+
+The exact bounded capability-evidence capacity grows from 24 to 25 records:
+the complete shared Vulkan proof union now includes explicit successful model
+warmup (17) alongside the six new model/FP64 codes. Per-semantic and aggregate
+proofs retain the warmup record; neither silently drops it. The installer parser
+uses the same capacity and still rejects overflows and inconsistent typed pairs.
+
+The actual archive-mode SDK build completed successfully in an isolated temporary
+prefix: 62 verified files / 36,913,614 bytes, exact upstream/glslang/replay/patch
+receipt, all required notices retained, no host installation. Integrated native
+generic inference and tracking reruns passed; tracking maximum standalone fence
+execution was 34.9349 ms. Ten integrated focused hermetic/loader-denied tests and
+five disabled-build focused tests passed with no failures.
+
+The production manager matrix exposed a High Eye Contact setup blocker: physical
+angle tensor storage held two scalar channels while its native rank-one graph
+view required width two/channel one. The same issue was independently confirmed
+by early security audit at `30f17c5`. Remediation `cf14d37` preserves the same two
+float bytes and changes only the rank-aware binding; native Eye64 preparation
+passed. The commit also fixes Auto Frame's distinct tracking proof (54 instead
+of duplicate face proof 51) and emits explicit completed warmup proof 17. The
+early audit found no other verified Critical/High in the inspected runtime,
+quota, command-lifetime, dlib parser or SDK trust paths. It does not replace the
+required final fresh critique after combined validation.
+
+Native prepare-only measured denoise64 at 117,346,480 live bytes/262 allocations,
+214,630,832 setup high-water bytes/407 allocations; Eye64 at 147,369,952 live
+bytes/367 allocations, 147,488,744 high-water bytes/390 allocations. All used the
+unchanged 100 ms native fence and 1,024 caller resource cap. Debug setup wall time
+includes selection, hashing, shader/graph preparation and predictor parsing; it
+is not an inference latency claim. Combined/FHD profiles, production execution,
+face-positive proof, Release diagnostic-refresh timing and final budgets remain
+under investigation before qualification.

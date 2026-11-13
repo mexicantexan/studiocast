@@ -716,6 +716,15 @@ cmake -S . -B build-vulkan-matting -G Ninja -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-vulkan-matting
 ```
 
+The normal installer now provisions this exact SDK from two verified, pinned
+source archives into an owned cache when Open Vulkan is selected. It shows SDK
+download bytes and build reserve separately from models, validates every prefix
+file/receipt, supports verified offline cache use, enables the production ncnn
+build flag, and checks actual dlib discovery before activation. Developer CMake
+options still default to OFF. No daemon frame or status request downloads a model
+or SDK. The same helper accepts `--ncnn-archive` and `--glslang-archive` instead
+of `--source`; both are exact pinned inputs, not arbitrary URLs.
+
 The dependency `--output` must not exist. Alternatively pass
 `-Dncnn_DIR=/tmp/studiocast-ncnn-dependency/prefix/lib/cmake/ncnn` to CMake.
 Use the patch and helper from the same StudioCast checkout; do not reuse a
@@ -734,7 +743,10 @@ submission protocol throughout. Preparation loads immutable verified artifact
 snapshots, rejects CPU layers and host tensor bridges, allocates fixed resident
 buffers, records inference once, and warms it up. Frames replay the graph under
 StudioCast's bounded submission/completion protocol; the complete context is
-bounded to 256 MiB and 512 resources. Failed or unproven completion retains the
+charged to one caller-owned context quota (the original matting-only profile
+uses 256 MiB and 512 resources). The full-model profile and actual resource
+qualification are recorded in [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
+Failed or unproven completion retains the
 whole island until quiescence is proven.
 
 The four consumers are background blur, remove, replace, and virtual key light.
@@ -742,8 +754,10 @@ They share one same-frame matte and can compose with resident mirror,
 fixed-center vignette, and final resize through
 `ProductionVideoBackendManager`. The intended transfer shape is one upload,
 zero intermediate readbacks or CPU tails, and one final writer-boundary
-readback. Vulkan Eye Contact, video denoise, Auto Frame tracking, and
-tracked-center vignette remain unavailable. Selected/readiness state is not
+readback. The expanded production owner adds FastDVDnet, YuNet, GPU dlib/FLX
+eye contact, GPU crop tracking and tracked-center vignette. New model publication
+and combined qualification remain explicit gates in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md). Selected/readiness state is not
 active state: the writer must successfully commit the output first.
 
 Model conversion, schema, exact artifact identities, and isolated validation
