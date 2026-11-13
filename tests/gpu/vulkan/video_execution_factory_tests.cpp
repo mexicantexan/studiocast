@@ -692,6 +692,104 @@ bool TestMalformedSourceStageCount() {
                  "scanning or native acquisition");
 }
 
+bool TestUnavailableOptionalStageIsolation() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  auto &missing = registration.semantic_capabilities[
+      registration.semantic_capability_count++];
+  missing.semantic = hal::SemanticEffectId::video_noise_removal;
+  missing.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  missing.status = hal::StatusId::unavailable;
+  missing.reason = hal::ReasonId::semantic_effect_unsupported;
+  vulkan::VulkanVideoExecutionFactory factory(registration, [] {
+    vulkan::VulkanVideoExecutionFactoryConfiguration c;
+    c.factory_id = kFactoryId;
+    return c;
+  }());
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(factory.Initialize(&reason) == hal::StatusId::ready &&
+                   registry.Register(factory.adapter_registration(), &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(factory.factory_registration(),
+                                               &reason) == hal::StatusId::ready,
+               "unavailable model capability must preserve the ready adapter"))
+    return false;
+  auto request = Request();
+  request.intent.stages[2] = request.intent.stages[1];
+  request.intent.stages[1] = request.intent.stages[0];
+  request.intent.stages[0] = {};
+  request.intent.stages[0].intent.stage_id = 1;
+  request.intent.stages[0].intent.semantic =
+      hal::SemanticEffectId::video_noise_removal;
+  request.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_open_preserve_input;
+  request.intent.stage_count = 3;
+  request.temporal.temporal = true;
+  request.temporal.history_frames = 5;
+  video::VideoExecutionPrepareEvidence evidence;
+  const auto status = coordinator.Prepare(request, &evidence, &reason);
+  const auto snapshot = coordinator.Snapshot();
+  bool ok = Require(status == hal::StatusId::degraded &&
+                        snapshot.plan.resolution.stages[0].skipped_optional &&
+                        snapshot.plan.prepared_program.stage_count == 2 &&
+                        evidence.readiness.ready_stage_mask == 6 &&
+                        evidence.readiness.disabled_stage_mask == 1 &&
+                        adapter.prepare_calls == 1,
+                    "missing optional denoise must preserve vignette/mirror "
+                    "and the canonical temporal contract");
+  std::uint8_t input[kBytes]{}, output[kBytes]{};
+  const auto frame = coordinator.Execute(Binding(input, output, 1));
+  ok &= Require(frame.status == hal::StatusId::executed ||
+                    frame.status == hal::StatusId::degraded,
+                "unrelated resident effects must still execute");
+  request.intent.stages[0].intent.required = true;
+  const auto previous_calls = adapter.prepare_calls;
+  const auto required = coordinator.Prepare(request, nullptr, &reason);
+  ok &= Require(required != hal::StatusId::ready &&
+                    required != hal::StatusId::degraded &&
+                    adapter.prepare_calls == previous_calls,
+                "a required missing stage must fail before adapter prepare");
+  return ok;
+}
+
+bool TestMissingSelectedPackNeedsNoNativeContext() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.plan.intent.stages = {};
+  request.plan.intent.stage_count = 1;
+  auto &stage = request.plan.intent.stages[0].intent;
+  stage.stage_id = 1;
+  stage.semantic = hal::SemanticEffectId::video_noise_removal;
+  stage.failure_action = hal::FailureAction::fail_open_preserve_input;
+  request.plan.temporal.temporal = true;
+  request.plan.temporal.history_frames = 5;
+  request.effects.video_noise_removal.enabled = true;
+  request.effects.video_noise_removal.model_id =
+      "hermetic-explicitly-nonexistent-denoise-pack-20261112";
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  auto result = source->AcquireResidentSetup(request);
+  bool ok = Require(result.status == hal::StatusId::degraded &&
+                        !result.lease.live() &&
+                        result.resolution_registration.resident_adapter ==
+                            nullptr &&
+                        result.resolution_registration
+                                .semantic_capabilities[0].status ==
+                            hal::StatusId::unavailable,
+                    "a missing optional selected pack must resolve without "
+                    "creating a native context");
+  stage.required = true;
+  result = source->AcquireResidentSetup(request);
+  ok &= Require(result.status == hal::StatusId::unavailable &&
+                    !result.lease.live() &&
+                    result.reason == hal::ReasonId::required_stage_failed,
+                "a missing required selected pack must fail before native setup");
+  return ok;
+}
+
 bool TestUnsupportedAndForeignPreflight() {
   Fixture fixture;
   if (!fixture.Initialize() || !fixture.Prepare(Request()))
@@ -1085,6 +1183,8 @@ int main() {
   ok &= TestShutdownRetainsUnprovenNativeOwner();
   ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
+  ok &= TestUnavailableOptionalStageIsolation();
+  ok &= TestMissingSelectedPackNeedsNoNativeContext();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();

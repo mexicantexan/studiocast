@@ -28,6 +28,16 @@ struct VulkanResidentProgramOptions {
   int keylight_intensity = 0;
   int keylight_temperature = 0;
   int keylight_pan = 0;
+  bool request_denoise = false;
+  int denoise_strength = 0;
+  bool request_eye = false;
+  int eye_strength = 0;
+  bool eye_look_away = false;
+  bool request_auto_frame = false;
+  int auto_frame_strength = 50;
+  int auto_frame_smoothing = 50;
+  float auto_frame_headroom = .15F;
+  bool conservative_temporal_contract = false;
   bool request_mirror = false;
   bool request_vignette = false;
   VulkanVignetteCenterMode vignette_center =
@@ -55,6 +65,13 @@ struct VulkanResidentCapabilityEvidence {
   bool mirror_production_ready = false;
   bool vignette_fixed_center_production_ready = false;
   bool matting_production_ready = false;
+  bool denoise_production_ready = false;
+  bool face_production_ready = false;
+  bool eye_production_ready = false;
+  bool tracking_gpu_ready = false;
+  bool landmarks_production_ready = false;
+  bool shader_float64_enabled = false;
+  bool vignette_tracked_center_ready = false;
   hal::ReasonId blocker = hal::ReasonId::none;
 };
 
@@ -115,6 +132,9 @@ public:
           const VulkanResidentProgramOptions &options,
           const VulkanHostFrameBinding &binding,
           std::uint64_t capture_sequence) noexcept = 0;
+  virtual hal::StatusId
+  ResetTemporalState(const VulkanExecutorPreparedProgram &,
+                     hal::ReasonId) noexcept = 0;
   virtual void
   DestroyPrepared(VulkanExecutorPreparedProgram *prepared) noexcept = 0;
   virtual void Shutdown() noexcept = 0;
@@ -163,6 +183,10 @@ public:
                               const hal::HostFrameBinding &binding,
                               hal::HostFrameTokens *tokens,
                               hal::ReasonId *reason) noexcept override;
+  hal::StatusId DiscardUnsubmittedHostFrame(const hal::PreparedProgramHandle &,
+                                            const hal::HostFrameTokens &,
+                                            std::uint64_t capture_sequence,
+                                            hal::ReasonId *) noexcept override;
   hal::StatusId
   ResolveHostFrameOutput(const hal::PreparedProgramHandle &program,
                          const hal::CompletionToken &completion,

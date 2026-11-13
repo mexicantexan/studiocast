@@ -1,4 +1,9 @@
 #include "core/vulkan/qualified_final_resident_executor.h"
+#include "core/open_video/dlib_shape_predictor_data.h"
+#include "core/open_video/prepared_vulkan_fastdvdnet.h"
+#include "core/open_video/prepared_vulkan_tracking.h"
+#include "core/vulkan/video_execution_factory.h"
+#include "core/vulkan/video_execution_factory_internal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -79,18 +84,33 @@ bool MatchesStageSubset(const hal::PreparedProgram &program,
   bool vignette = false;
   bool mirror = false;
   bool keylight = false;
+  bool denoise = false, eye = false, auto_frame = false;
   SemanticEffectId background = SemanticEffectId::invalid;
   for (std::size_t i = 0; i < program.stage_count; ++i) {
     const auto semantic = program.stages[i].semantic;
-    if (semantic == SemanticEffectId::virtual_background_blur ||
-        semantic == SemanticEffectId::virtual_background_remove ||
-        semantic == SemanticEffectId::virtual_background_replace) {
-      if (background != SemanticEffectId::invalid || keylight || vignette ||
-          mirror)
+    if (semantic == SemanticEffectId::video_noise_removal) {
+      if (denoise || eye || background != SemanticEffectId::invalid ||
+          keylight || auto_frame || vignette || mirror)
+        return false;
+      denoise = true;
+    } else if (semantic == SemanticEffectId::eye_contact) {
+      if (eye || background != SemanticEffectId::invalid || keylight ||
+          auto_frame || vignette || mirror)
+        return false;
+      eye = true;
+    } else if (semantic == SemanticEffectId::auto_frame) {
+      if (auto_frame || vignette || mirror)
+        return false;
+      auto_frame = true;
+    } else if (semantic == SemanticEffectId::virtual_background_blur ||
+               semantic == SemanticEffectId::virtual_background_remove ||
+               semantic == SemanticEffectId::virtual_background_replace) {
+      if (background != SemanticEffectId::invalid || keylight || auto_frame ||
+          vignette || mirror)
         return false;
       background = semantic;
     } else if (semantic == SemanticEffectId::virtual_key_light) {
-      if (keylight || vignette || mirror)
+      if (keylight || auto_frame || vignette || mirror)
         return false;
       keylight = true;
     } else if (semantic == SemanticEffectId::vignette) {
@@ -106,12 +126,344 @@ bool MatchesStageSubset(const hal::PreparedProgram &program,
     }
   }
   return vignette == options.request_vignette &&
+         denoise == options.request_denoise && eye == options.request_eye &&
+         auto_frame == options.request_auto_frame &&
          mirror == options.request_mirror &&
          keylight == options.request_keylight &&
          background == options.background;
 }
 
 } // namespace
+
+struct QualifiedFinalResidentExecutor::ModelEffects {
+  VulkanVideoExecutionFactoryConfiguration config;
+  std::shared_ptr<open_vulkan::VulkanInferenceSharedQuota> quota;
+  open_vulkan::PreparedVulkanFastDvdnet denoise;
+  open_vulkan::PreparedVulkanTracking tracking;
+  open_vulkan::NcnnVulkanInference face, left, right;
+  open_video::DlibPredictorData predictor;
+  VulkanImage denoise_input, denoise_output, face_input, eye_output;
+  VulkanImage auto_input, auto_output, vignette_input, vignette_output, alpha;
+  ResidentCommandBatch batch;
+  bool denoise_ready = false, face_ready = false, eye_ready = false;
+  bool tracking_ready = false, tracked_vignette_ready = false;
+  bool reset_tracking = true;
+
+  static open_vulkan::VulkanInferenceTensorBinding
+  Binding(VulkanDevice *device, const VulkanTensor &tensor,
+          std::uint32_t dims) {
+    open_vulkan::VulkanInferenceTensorBinding b;
+    auto &r = b.resource;
+    r.ownership_domain = device;
+    r.logical_device = reinterpret_cast<std::uintptr_t>(device->device());
+    r.buffer = reinterpret_cast<std::uintptr_t>(tensor.buffer());
+    r.byte_size = tensor.byte_size();
+    r.n = 1;
+    r.c = tensor.c();
+    r.h = tensor.h();
+    r.w = tensor.w();
+    r.device_resident = tensor.Valid();
+    r.device_local_memory = tensor.device_local();
+    r.host_mapped = tensor.mapped() != nullptr;
+    r.context_id = device->context_identity().context_id;
+    r.context_generation = device->context_identity().generation;
+    r.runtime_queue_ownership = true;
+    b.dims = dims;
+    b.w = tensor.w();
+    b.h = tensor.h();
+    b.c = tensor.c();
+    b.row_stride_bytes = static_cast<std::size_t>(tensor.w()) * sizeof(float);
+    b.plane_stride_bytes =
+        b.row_stride_bytes * static_cast<std::size_t>(tensor.h());
+    return b;
+  }
+  bool PrepareGraph(open_vulkan::NcnnVulkanInference &runtime,
+                    const open_video::ModelPack &pack, const char *role,
+                    const std::array<const VulkanTensor *, 3> &inputs,
+                    const std::array<const VulkanTensor *, 12> &outputs,
+                    std::string *error) {
+    const auto found = std::find_if(
+        pack.ncnn_vulkan_networks.begin(), pack.ncnn_vulkan_networks.end(),
+        [&](const auto &network) { return network.role == role; });
+    if (found == pack.ncnn_vulkan_networks.end()) {
+      if (error)
+        *error = "Required resident inference graph role is missing.";
+      return false;
+    }
+    if (!open_video::ValidateProductionNcnnVulkanNetworkPack(pack, *found,
+                                                             error))
+      return false;
+    auto *device = quota->device;
+    open_vulkan::VulkanInferenceBindings bindings;
+    bindings.owner_generation = config.factory_id;
+    bindings.input_count = found->input_count;
+    bindings.output_count = found->output_count;
+    for (std::size_t i = 0; i < bindings.input_count; ++i) {
+      if (!inputs[i])
+        return false;
+      bindings.inputs[i] = Binding(device, *inputs[i], found->inputs[i].dims);
+    }
+    for (std::size_t i = 0; i < bindings.output_count; ++i) {
+      if (!outputs[i])
+        return false;
+      bindings.outputs[i] =
+          Binding(device, *outputs[i], found->outputs[i].dims);
+    }
+    open_vulkan::VulkanMattingDeviceContext context;
+    context.ownership_domain = device;
+    context.physical_device =
+        reinterpret_cast<std::uintptr_t>(device->physical_device());
+    context.logical_device = reinterpret_cast<std::uintptr_t>(device->device());
+    context.queue = reinterpret_cast<std::uintptr_t>(device->queue());
+    context.queue_family_index = device->queue_family_index();
+    context.context_id = device->context_identity().context_id;
+    context.context_generation = device->context_identity().generation;
+    context.vendor_id = device->identity().vendor_id;
+    context.device_id = device->identity().device_id;
+    context.stable_device_id = device->identity().stable_id;
+    context.selected_device_index = device->diagnostics().selected_device_index;
+    context.non_cpu_device_selected =
+        device->diagnostics().non_cpu_device_selected;
+    context.compute_queue_available =
+        device->diagnostics().compute_queue_available;
+    context.context_healthy = device->health_state().healthy();
+    const auto prepared = runtime.Prepare(context, *found, bindings, quota);
+    if (!prepared.ok()) {
+      if (error)
+        *error = prepared.detail;
+      return false;
+    }
+    const auto warmed = runtime.Warmup();
+    if (!warmed.ok() && error)
+      *error = warmed.detail;
+    return warmed.ok();
+  }
+};
+
+bool QualifiedFinalResidentExecutor::InitializeModels(
+    const VulkanVideoExecutionFactoryConfiguration &configuration,
+    std::string *error) {
+  if (!configuration.effects || !kernels_ || !kernels_->Initialized() ||
+      configuration.input_width <= 0 || configuration.input_height <= 0 ||
+      configuration.output_width <= 0 || configuration.output_height <= 0)
+    return false;
+  model_effects_ = std::make_unique<ModelEffects>();
+  auto &m = *model_effects_;
+  m.config = configuration;
+  effects_ = *configuration.effects;
+  auto *device = kernels_->device();
+  m.quota = std::make_shared<open_vulkan::VulkanInferenceSharedQuota>();
+  m.quota->device = device;
+  m.quota->context = device->context_identity();
+  m.quota->allocation_budget_bytes = configuration.reservation.persistent_bytes;
+  for (const auto bytes : {configuration.reservation.scratch_bytes,
+                           configuration.reservation.upload_staging_bytes,
+                           configuration.reservation.readback_staging_bytes})
+    if (!Add(&m.quota->allocation_budget_bytes, bytes))
+      return false;
+  m.quota->allocation_budget_bytes =
+      std::min<std::size_t>(m.quota->allocation_budget_bytes,
+                            device->allocation_stats().budget_bytes);
+  m.quota->allocation_resource_limit = configuration.reservation.resource_count;
+  if (!device->ConfigureAllocationLimits(m.quota->allocation_budget_bytes,
+                                         m.quota->allocation_resource_limit,
+                                         error) ||
+      !m.batch.Initialize(device, kMaxResidentFrameCommands, error) ||
+      !kernels_->PrepareDeferredSlotsForSetup(64, error))
+    return false;
+  const auto image = [&](VulkanImage &target, bool final = false,
+                         VulkanPixelFormat format = VulkanPixelFormat::rgb_u8) {
+    return target.Allocate(
+        device, final ? configuration.output_width : configuration.input_width,
+        final ? configuration.output_height : configuration.input_height,
+        format, false, error);
+  };
+  if (configuration.denoise_pack) {
+    initialization_failed_semantic_ = SemanticEffectId::video_noise_removal;
+    if (!image(m.denoise_input) || !image(m.denoise_output))
+      return false;
+    const auto &networks = configuration.denoise_pack->ncnn_vulkan_networks;
+    const auto main =
+        std::find_if(networks.begin(), networks.end(), [](const auto &network) {
+          return network.role == "main";
+        });
+    if (main == networks.end())
+      return false;
+    if (!open_video::ValidateProductionNcnnVulkanNetworkPack(
+            *configuration.denoise_pack, *main, error))
+      return false;
+    open_vulkan::PreparedVulkanFastDvdnetSetup setup;
+    setup.device = device;
+    setup.domain = evidence_.execution_domain;
+    setup.owner_generation = configuration.factory_id;
+    setup.width = configuration.input_width;
+    setup.height = configuration.input_height;
+    setup.strength = effects_.video_noise_removal.strength;
+    setup.graph = *main;
+    setup.quota = m.quota;
+    setup.reservation = configuration.reservation;
+    if (!m.denoise.Prepare(setup, m.denoise_input, m.denoise_output, error))
+      return false;
+    m.denoise_ready = true;
+    initialization_failed_semantic_ = SemanticEffectId::invalid;
+  }
+  const bool eye = effects_.eye_contact.enabled;
+  const bool face = eye || effects_.auto_frame.enabled;
+  const bool tracked = effects_.vignette.enabled &&
+                       effects_.vignette.center_on_tracked_face &&
+                       effects_.auto_frame.enabled;
+  if (face || tracked) {
+    initialization_failed_semantic_ = SemanticEffectId::auto_frame;
+    if (!configuration.face_pack || !image(m.face_input) ||
+        (eye && !image(m.eye_output)) ||
+        (effects_.auto_frame.enabled &&
+         (!image(m.auto_input) || !image(m.auto_output))) ||
+        (tracked &&
+         (!image(m.vignette_input, true) || !image(m.vignette_output, true))) ||
+        (configuration.matting_pack &&
+         !image(m.alpha, false, VulkanPixelFormat::f32_1)))
+      return false;
+    open_vulkan::PreparedVulkanTrackingSetup setup;
+    setup.device = device;
+    setup.domain = evidence_.execution_domain;
+    setup.owner_generation = configuration.factory_id;
+    setup.frame_width = configuration.input_width;
+    setup.frame_height = configuration.input_height;
+    setup.final_width = configuration.output_width;
+    setup.final_height = configuration.output_height;
+    setup.face_analysis = face;
+    setup.eye_contact = eye;
+    setup.auto_frame = effects_.auto_frame.enabled;
+    setup.vignette = tracked;
+    setup.eye_strength = effects_.eye_contact.strength;
+    setup.look_away_enabled = effects_.eye_contact.look_away_enabled;
+    setup.auto_frame_strength = effects_.auto_frame.strength;
+    setup.auto_frame_smoothing = effects_.auto_frame.smoothing;
+    setup.auto_frame_headroom = effects_.auto_frame.headroom;
+    setup.vignette_intensity = effects_.vignette.intensity;
+    setup.vignette_tracked_center = tracked;
+    setup.matte_shared_current_frame =
+        effects_.virtual_background.mode !=
+            video::effects::VirtualBackgroundMode::none ||
+        effects_.virtual_key_light.enabled;
+    setup.reservation = configuration.reservation;
+    const auto validated = [&](const open_video::ModelPack &pack,
+                               const char *kind) {
+      const auto file = std::find_if(
+          pack.files.begin(), pack.files.end(),
+          [&](const auto &artifact) { return artifact.kind == kind; });
+      return file == pack.files.end()
+                 ? open_video::ModelArtifactValidationResult{}
+                 : open_video::ValidateModelArtifactIdentity(pack, *file);
+    };
+    const auto face_identity =
+        validated(*configuration.face_pack, "ncnn_param");
+    if (!face_identity.ok())
+      return false;
+    setup.face_artifact = face_identity.identity;
+    if (eye) {
+      initialization_failed_semantic_ = SemanticEffectId::eye_contact;
+      if (!configuration.landmarks_pack || !configuration.eye_pack)
+        return false;
+      const auto landmark =
+          validated(*configuration.landmarks_pack, "dlib_shape_predictor");
+      if (!landmark.ok() ||
+          !open_video::LoadDlibPredictorData(
+              *configuration.landmarks_pack, landmark.identity,
+              configuration.reservation.persistent_bytes, &m.predictor, error))
+        return false;
+      setup.predictor = &m.predictor;
+      setup.landmark_artifact = landmark.identity;
+      for (unsigned eye_index = 0; eye_index < 2; ++eye_index) {
+        const auto &pack = *configuration.eye_pack;
+        const auto network = std::find_if(
+            pack.ncnn_vulkan_networks.begin(), pack.ncnn_vulkan_networks.end(),
+            [&](const auto &item) {
+              return item.role == (eye_index == 0 ? "left" : "right");
+            });
+        if (network == pack.ncnn_vulkan_networks.end())
+          return false;
+        const auto artifact = std::find_if(
+            pack.files.begin(), pack.files.end(),
+            [&](const auto &item) { return item.name == network->param_file; });
+        if (artifact == pack.files.end())
+          return false;
+        const auto identity =
+            open_video::ValidateModelArtifactIdentity(pack, *artifact);
+        if (!identity.ok())
+          return false;
+        (eye_index == 0 ? setup.eye_left_artifact : setup.eye_right_artifact) =
+            identity.identity;
+      }
+    }
+    initialization_failed_semantic_ =
+        eye ? SemanticEffectId::eye_contact : SemanticEffectId::auto_frame;
+    if (!m.tracking.Prepare(setup, error))
+      return false;
+    m.tracking_ready = true;
+    const std::array<const VulkanTensor *, 3> face_inputs{
+        &m.tracking.FaceInput(), nullptr, nullptr};
+    initialization_failed_semantic_ = SemanticEffectId::auto_frame;
+    if (!m.PrepareGraph(m.face, *configuration.face_pack, "main", face_inputs,
+                        m.tracking.FaceOutputs(), error))
+      return false;
+    m.face_ready = true;
+    if (eye) {
+      initialization_failed_semantic_ = SemanticEffectId::eye_contact;
+      for (unsigned i = 0; i < 2; ++i) {
+        const auto in = m.tracking.EyeInputs(i);
+        const auto out = m.tracking.EyePrefixOutputs(i);
+        const std::array<const VulkanTensor *, 3> inputs{in.rgb, in.anchors,
+                                                         in.angles};
+        std::array<const VulkanTensor *, 12> outputs{};
+        outputs[0] = out.flow;
+        outputs[1] = out.lcm;
+        if (!m.PrepareGraph(i == 0 ? m.left : m.right, *configuration.eye_pack,
+                            i == 0 ? "left" : "right", inputs, outputs, error))
+          return false;
+      }
+      m.eye_ready = true;
+    }
+    // Record every enabled immutable phase against canonical fixed images at
+    // setup. Abort proves no phase was executed; live calls only append them.
+    initialization_failed_semantic_ = SemanticEffectId::auto_frame;
+    bool recorded = m.batch.BeginFrame(1, error) &&
+                    m.tracking.AppendReset(m.batch, error) &&
+                    m.tracking.AppendFacePreprocess(m.batch, m.face_input,
+                                                    error) &&
+                    m.tracking.AppendFaceDecode(m.batch, error);
+    if (recorded && eye) {
+      initialization_failed_semantic_ = SemanticEffectId::eye_contact;
+      recorded = m.tracking.AppendLandmarks(m.batch, m.face_input, error) &&
+                 m.tracking.AppendEyeInputs(m.batch, m.face_input, error) &&
+                 m.tracking.AppendEyeTailAndComposite(
+                     m.batch, m.face_input, m.eye_output, error);
+    }
+    if (recorded && setup.auto_frame) {
+      initialization_failed_semantic_ = SemanticEffectId::auto_frame;
+      recorded = m.tracking.AppendAutoFrame(
+          m.batch, m.auto_input, m.alpha.Valid() ? &m.alpha : nullptr,
+          m.auto_output, error);
+    }
+    if (recorded && tracked) {
+      initialization_failed_semantic_ = SemanticEffectId::vignette;
+      recorded = m.tracking.AppendVignette(
+          m.batch, m.vignette_input, m.vignette_output, error);
+    }
+    if (!recorded) {
+      m.batch.AbortUnsubmitted();
+      return false;
+    }
+    m.batch.AbortUnsubmitted();
+    initialization_failed_semantic_ = SemanticEffectId::invalid;
+    if (!m.tracking.SealBindingsForExecution(error))
+      return false;
+    m.tracked_vignette_ready = tracked;
+  }
+  initialization_failed_semantic_ = SemanticEffectId::invalid;
+  RefreshEvidence();
+  return true;
+}
 
 QualifiedFinalResidentExecutor::QualifiedFinalResidentExecutor(
     std::uint64_t adapter_instance_id,
@@ -181,6 +533,19 @@ void QualifiedFinalResidentExecutor::RefreshEvidence() noexcept {
       evidence_.exact_device_and_queue_shared;
   evidence_.matting_production_ready =
       common && matting_ && matting_readiness_.production_ready;
+  if (model_effects_) {
+    evidence_.denoise_production_ready =
+        common && model_effects_->denoise_ready;
+    evidence_.face_production_ready = common && model_effects_->face_ready;
+    evidence_.eye_production_ready = common && model_effects_->eye_ready;
+    evidence_.tracking_gpu_ready =
+        common && model_effects_->tracking_ready && effects_.auto_frame.enabled;
+    evidence_.landmarks_production_ready = common && model_effects_->eye_ready;
+    evidence_.shader_float64_enabled =
+        common && device.shader_float64_enabled();
+    evidence_.vignette_tracked_center_ready =
+        common && model_effects_->tracked_vignette_ready;
+  }
   evidence_.mirror_production_ready = common;
   evidence_.vignette_fixed_center_production_ready = common;
   evidence_.blocker =
@@ -190,6 +555,23 @@ void QualifiedFinalResidentExecutor::RefreshEvidence() noexcept {
 VulkanResidentCapabilityEvidence
 QualifiedFinalResidentExecutor::CapabilityEvidence() const noexcept {
   return evidence_;
+}
+
+void QualifiedFinalResidentExecutor::CollectModelDiagnostics(
+    VulkanProductionModelDiagnostics *out) const {
+  if (!out)
+    return;
+  out->capabilities = evidence_;
+  out->matting_readiness = matting_readiness_;
+  if (matting_)
+    out->matting = matting_->RuntimeEvidence();
+  if (model_effects_) {
+    out->denoise = model_effects_->denoise.evidence();
+    out->face = model_effects_->face.Evidence();
+    out->left_eye = model_effects_->left.Evidence();
+    out->right_eye = model_effects_->right.Evidence();
+    out->completed_batches = model_effects_->batch.completion_count();
+  }
 }
 
 hal::StatusId QualifiedFinalResidentExecutor::Prepare(
@@ -220,7 +602,9 @@ hal::StatusId QualifiedFinalResidentExecutor::Prepare(
       !MatchesStageSubset(program, options) ||
       (options.request_vignette &&
        options.vignette_center !=
-           VulkanVignetteCenterMode::fixed_frame_center) ||
+           VulkanVignetteCenterMode::fixed_frame_center &&
+       !(model_effects_ && evidence_.vignette_tracked_center_ready &&
+         options.vignette_center == VulkanVignetteCenterMode::tracked_face)) ||
       options.vignette_intensity_percent < 0 ||
       options.vignette_intensity_percent > 100 ||
       !IsRgb(program.host_input.format) || !IsRgb(program.host_output.format) ||
@@ -238,6 +622,28 @@ hal::StatusId QualifiedFinalResidentExecutor::Prepare(
       program.host_output.height >
           static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
     return fail(StatusId::blocked, ReasonId::malformed_descriptor);
+  }
+  if (model_effects_) {
+    const auto &c = model_effects_->config;
+    if (program.host_input.width != static_cast<std::uint32_t>(c.input_width) ||
+        program.host_input.height !=
+            static_cast<std::uint32_t>(c.input_height) ||
+        program.host_output.width !=
+            static_cast<std::uint32_t>(c.output_width) ||
+        program.host_output.height !=
+            static_cast<std::uint32_t>(c.output_height) ||
+        (options.request_denoise &&
+         options.denoise_strength != effects_.video_noise_removal.strength) ||
+        (options.request_eye &&
+         (options.eye_strength != effects_.eye_contact.strength ||
+          options.eye_look_away != effects_.eye_contact.look_away_enabled)) ||
+        (options.request_auto_frame &&
+         (options.auto_frame_strength != effects_.auto_frame.strength ||
+          options.auto_frame_smoothing != effects_.auto_frame.smoothing ||
+          options.auto_frame_headroom != effects_.auto_frame.headroom)) ||
+        (options.vignette_center == VulkanVignetteCenterMode::tracked_face &&
+         options.vignette_intensity_percent != effects_.vignette.intensity))
+      return fail(StatusId::blocked, ReasonId::reconfiguration_required);
   }
 
   Slot *slot = nullptr;
@@ -400,6 +806,20 @@ hal::StatusId QualifiedFinalResidentExecutor::Prepare(
       ++used.resource_count;
     }
   }
+  if (model_effects_) {
+    const auto actual = device->allocation_stats();
+    const auto separate = used.upload_staging_bytes +
+                          used.readback_staging_bytes + used.scratch_bytes;
+    if (actual.current_bytes >= separate)
+      used.persistent_bytes = std::max<std::uint64_t>(
+          used.persistent_bytes, actual.current_bytes - separate);
+    if (actual.allocation_count > UINT32_MAX)
+      budget_valid = false;
+    else
+      used.resource_count =
+          std::max(used.resource_count,
+                   static_cast<std::uint32_t>(actual.allocation_count));
+  }
   if (!budget_valid || !BudgetContains(program.budget, used)) {
     Release(slot);
     return fail(StatusId::resource_exhausted, ReasonId::resource_exhausted);
@@ -470,6 +890,18 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
       options.canonical_plan_hash != slot->canonical_plan_hash ||
       (options.request_vignette && !slot->options.request_vignette) ||
       (options.request_mirror && !slot->options.request_mirror) ||
+      (options.request_denoise &&
+       (!slot->options.request_denoise ||
+        options.denoise_strength != slot->options.denoise_strength)) ||
+      (options.request_eye &&
+       (!slot->options.request_eye ||
+        options.eye_strength != slot->options.eye_strength ||
+        options.eye_look_away != slot->options.eye_look_away)) ||
+      (options.request_auto_frame &&
+       (!slot->options.request_auto_frame ||
+        options.auto_frame_strength != slot->options.auto_frame_strength ||
+        options.auto_frame_smoothing != slot->options.auto_frame_smoothing ||
+        options.auto_frame_headroom != slot->options.auto_frame_headroom)) ||
       (options.request_vignette &&
        (options.vignette_center != slot->options.vignette_center ||
         options.vignette_intensity_percent !=
@@ -488,6 +920,8 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
     result.reason = ReasonId::malformed_contract;
     return finish();
   }
+  if (model_effects_)
+    return ExecuteExpanded(slot, program, options, binding, capture_sequence);
   const std::uint64_t submissions_before =
       kernels_->synchronous_submission_count();
   if (!kernels_->UploadU8x3ToDeviceLocal(
@@ -688,6 +1122,254 @@ VulkanExecutorResult QualifiedFinalResidentExecutor::Execute(
   return finish();
 }
 
+VulkanExecutorResult QualifiedFinalResidentExecutor::ExecuteExpanded(
+    Slot *slot, const hal::PreparedProgram &program,
+    const VulkanResidentProgramOptions &options,
+    const VulkanHostFrameBinding &binding, std::uint64_t sequence) noexcept {
+  auto &m = *model_effects_;
+  VulkanExecutorResult result;
+  result.stage_count = program.stage_count;
+  const auto started = std::chrono::steady_clock::now();
+  const auto finish = [&]() {
+    if (m.batch.state() == ResidentCommandBatchState::recording)
+      m.batch.AbortUnsubmitted();
+    kernels_->DiscardUnsubmittedOperation();
+    kernels_->EndDeferredFrame();
+    if (m.batch.state() == ResidentCommandBatchState::unsafe_pending ||
+        !kernels_->device()->health_state().healthy()) {
+      slot->quarantined = true;
+      result.device_lost = true;
+      result.status = StatusId::quarantined;
+      result.reason = ReasonId::synchronization_failed;
+    }
+    result.frame_elapsed_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+    return result;
+  };
+  if (!m.batch.BeginFrame(sequence, nullptr) ||
+      !kernels_->BeginDeferredFrame(m.batch, nullptr)) {
+    result.reason = ReasonId::synchronization_failed;
+    return finish();
+  }
+  if (!kernels_->UploadU8x3ToDeviceLocal(
+          binding.input, binding.input_row_stride_bytes, slot->upload_staging,
+          slot->source, nullptr)) {
+    result.reason = ReasonId::synchronization_failed;
+    return finish();
+  }
+  const VulkanImage *current = &slot->source;
+  bool face_queued = false, matte_queued = false, auto_queued = false;
+  bool reset_queued = false;
+  const VulkanImage &alpha = m.alpha.Valid() ? m.alpha : slot->alpha;
+  const auto ensure_face = [&]() {
+    if (face_queued)
+      return true;
+    if (!m.face_ready || !m.tracking_ready)
+      return false;
+    if (m.reset_tracking && !reset_queued) {
+      if (!m.tracking.AppendReset(m.batch, nullptr))
+        return false;
+      reset_queued = true;
+    }
+    if (!kernels_->ResizeBilinear(*current, m.face_input, nullptr) ||
+        !m.tracking.AppendFacePreprocess(m.batch, m.face_input, nullptr) ||
+        !m.face.Enqueue(m.batch).ok() ||
+        !m.tracking.AppendFaceDecode(m.batch, nullptr))
+      return false;
+    face_queued = true;
+    return true;
+  };
+  const auto ensure_matte = [&]() {
+    if (matte_queued)
+      return true;
+    if (!matting_ || !matting_readiness_.production_ready ||
+        !matting_->Enqueue(*current, &matting_alpha_, m.batch, nullptr) ||
+        !kernels_->ResizeBilinearF32_1(matting_alpha_, alpha, nullptr))
+      return false;
+    matte_queued = true;
+    return true;
+  };
+  for (std::size_t i = 0; i < program.stage_count; ++i) {
+    const auto semantic = program.stages[i].semantic;
+    if (semantic == SemanticEffectId::vignette ||
+        semantic == SemanticEffectId::mirror)
+      continue;
+    const auto mark = m.batch.Mark();
+    const bool prior_face = face_queued, prior_matte = matte_queued,
+               prior_reset = reset_queued;
+    const VulkanImage *next = current;
+    bool ok = false;
+    if (semantic == SemanticEffectId::video_noise_removal) {
+      ok = options.denoise_strength == 0 ||
+           (m.denoise_ready &&
+            kernels_->ResizeBilinear(*current, m.denoise_input, nullptr) &&
+            m.denoise.Append(m.batch, sequence, nullptr));
+      if (ok && options.denoise_strength > 0)
+        next = &m.denoise_output;
+    } else if (semantic == SemanticEffectId::eye_contact) {
+      ok = options.eye_strength == 0 ||
+           (m.eye_ready && ensure_face() &&
+            m.tracking.AppendLandmarks(m.batch, m.face_input, nullptr) &&
+            m.tracking.AppendEyeInputs(m.batch, m.face_input, nullptr) &&
+            m.left.Enqueue(m.batch).ok() && m.right.Enqueue(m.batch).ok() &&
+            m.tracking.AppendEyeTailAndComposite(m.batch, m.face_input,
+                                                 m.eye_output, nullptr));
+      if (ok && options.eye_strength > 0)
+        next = &m.eye_output;
+    } else if (semantic == SemanticEffectId::auto_frame) {
+      ok = ensure_face();
+      bool current_matte = false;
+      if (ok && matting_) {
+        const auto matte_mark = m.batch.Mark();
+        current_matte = ensure_matte();
+        if (!current_matte) {
+          kernels_->DiscardUnsubmittedOperation();
+          ok = m.batch.Rollback(matte_mark, nullptr);
+        }
+      }
+      ok = ok && kernels_->ResizeBilinear(*current, m.auto_input, nullptr) &&
+           m.tracking.AppendAutoFrame(m.batch, m.auto_input,
+                                      m.alpha.Valid() ? &m.alpha : nullptr,
+                                      m.auto_output, nullptr, current_matte);
+      if (ok) {
+        next = &m.auto_output;
+        auto_queued = true;
+      }
+    } else if (semantic == SemanticEffectId::virtual_key_light) {
+      const auto &p = slot->keylight.parameters();
+      ok = ensure_matte() &&
+           (p.passthrough() ||
+            kernels_->ApplyKeyLightU8x3(*current, alpha, p.target_r, p.target_g,
+                                        p.target_b, p.intensity, p.direction,
+                                        slot->keylight_output, nullptr));
+      if (ok && !p.passthrough())
+        next = &slot->keylight_output;
+    } else if (semantic == SemanticEffectId::virtual_background_blur ||
+               semantic == SemanticEffectId::virtual_background_remove ||
+               semantic == SemanticEffectId::virtual_background_replace) {
+      ok = ensure_matte();
+      int feather = 0;
+      if (semantic == SemanticEffectId::virtual_background_blur)
+        feather = video::ResolveOpenVulkanVirtualBackgroundBlurParameters(
+                      options.background_strength)
+                      .alpha_feather_radius;
+      else if (semantic == SemanticEffectId::virtual_background_remove)
+        feather = slot->background_remove.parameters().alpha_feather_radius;
+      else
+        feather = slot->background_replace.parameters().alpha_feather_radius;
+      const VulkanImage *composite_alpha = &alpha;
+      if (ok && feather > 0) {
+        ok = kernels_->BoxBlurSeparableF32_1(
+            alpha, slot->alpha_tmp, slot->alpha_feathered, feather, nullptr);
+        composite_alpha = &slot->alpha_feathered;
+      }
+      if (ok && semantic == SemanticEffectId::virtual_background_blur) {
+        const auto p = video::ResolveOpenVulkanVirtualBackgroundBlurParameters(
+            options.background_strength);
+        ok = kernels_->BoxBlurCompositeAlphaU8x3(
+            *current, slot->blur_tmp, slot->blurred, *composite_alpha,
+            slot->background_output, p.background_radius, nullptr);
+      } else if (ok &&
+                 semantic == SemanticEffectId::virtual_background_remove) {
+        const auto &p = slot->background_remove.parameters();
+        ok = kernels_->CompositeAlphaSolidU8x3(
+            *current, *composite_alpha, p.background_r, p.background_g,
+            p.background_b, slot->background_output, nullptr);
+      } else if (ok) {
+        ok = kernels_->CompositeAlphaU8x3(
+            *current, slot->background_replace.replacement_image(),
+            *composite_alpha, slot->background_output, nullptr);
+      }
+      if (ok)
+        next = &slot->background_output;
+    }
+    if (!ok) {
+      kernels_->DiscardUnsubmittedOperation();
+      if (!m.batch.Rollback(mark, nullptr)) {
+        result.reason = ReasonId::synchronization_failed;
+        return finish();
+      }
+      face_queued = prior_face;
+      matte_queued = prior_matte;
+      reset_queued = prior_reset;
+      result.stages[i].reason = ReasonId::optional_stage_failed_open;
+      if (program.stages[i].required) {
+        result.reason = ReasonId::required_stage_failed;
+        return finish();
+      }
+    } else {
+      current = next;
+      result.stages[i].succeeded = true;
+    }
+  }
+  if (current->width() != static_cast<int>(slot->output_width) ||
+      current->height() != static_cast<int>(slot->output_height)) {
+    if (!kernels_->ResizeBilinear(*current, slot->resize_scratch, nullptr)) {
+      result.reason = ReasonId::synchronization_failed;
+      return finish();
+    }
+    current = &slot->resize_scratch;
+  }
+  for (std::size_t i = 0; i < program.stage_count; ++i) {
+    const auto semantic = program.stages[i].semantic;
+    if (semantic != SemanticEffectId::vignette &&
+        semantic != SemanticEffectId::mirror)
+      continue;
+    const auto mark = m.batch.Mark();
+    bool ok = false;
+    const VulkanImage *next = current;
+    if (semantic == SemanticEffectId::vignette) {
+      if (options.vignette_center == VulkanVignetteCenterMode::tracked_face &&
+          auto_queued) {
+        ok = kernels_->ResizeBilinear(*current, m.vignette_input, nullptr) &&
+             m.tracking.AppendVignette(m.batch, m.vignette_input,
+                                       m.vignette_output, nullptr);
+        next = &m.vignette_output;
+      } else {
+        ok = kernels_->ApplyFinalVignetteU8x3(
+            *current, nullptr, slot->vignette.attenuation_factor_mask(),
+            slot->vignette_output, nullptr, nullptr);
+        next = &slot->vignette_output;
+      }
+    } else {
+      ok = kernels_->MirrorHorizontalU8x3(*current, slot->mirror_output,
+                                          nullptr);
+      next = &slot->mirror_output;
+    }
+    if (ok) {
+      current = next;
+      result.stages[i].succeeded = true;
+    } else {
+      kernels_->DiscardUnsubmittedOperation();
+      if (!m.batch.Rollback(mark, nullptr) || program.stages[i].required) {
+        result.reason = ReasonId::required_stage_failed;
+        return finish();
+      }
+      result.stages[i].reason = ReasonId::optional_stage_failed_open;
+    }
+  }
+  if (!kernels_->ReadbackU8x3(*current, slot->readback_staging, binding.output,
+                              binding.output_row_stride_bytes, nullptr)) {
+    result.reason = ReasonId::synchronization_failed;
+    return finish();
+  }
+  result.transfers.uploads = 1;
+  result.transfers.final_readbacks = 1;
+  result.transfers.synchronizations = 1;
+  if (matte_queued) {
+    matting_->UpdateCachedReadiness(&matting_readiness_);
+    ++slot->alpha_resize_completions;
+  }
+  if (reset_queued)
+    m.reset_tracking = false;
+  result.output_written = true;
+  result.status = StatusId::executed;
+  result.reason = ReasonId::none;
+  return finish();
+}
+
 QualifiedFinalResidentExecutor::Slot *
 QualifiedFinalResidentExecutor::Find(std::uint64_t state_id) noexcept {
   if (state_id == 0)
@@ -697,6 +1379,31 @@ QualifiedFinalResidentExecutor::Find(std::uint64_t state_id) noexcept {
       return &slot;
   }
   return nullptr;
+}
+
+hal::StatusId QualifiedFinalResidentExecutor::ResetTemporalState(
+    const VulkanExecutorPreparedProgram &prepared, hal::ReasonId) noexcept {
+  if (shutdown_)
+    return StatusId::stopped;
+  Slot *slot = Find(prepared.state_id);
+  if (!slot || prepared.opaque[0] != slot->program_id ||
+      prepared.opaque[1] != slot->canonical_plan_hash ||
+      prepared.opaque[2] != slot->execution_domain.logical_context_generation ||
+      prepared.opaque[3] != adapter_instance_id_)
+    return StatusId::stale;
+  if (slot->quarantined || !kernels_->device()->health_state().healthy())
+    return StatusId::quarantined;
+  if (model_effects_) {
+    auto &m = *model_effects_;
+    if (m.batch.state() == ResidentCommandBatchState::recording ||
+        m.batch.state() == ResidentCommandBatchState::unsafe_pending ||
+        !m.denoise.ResetTemporalState())
+      return StatusId::quarantined;
+    m.reset_tracking = true;
+  }
+  // Model-free/matting-only programs have no history. Model leaves extend
+  // this exact forwarding boundary with their prepared reset contracts.
+  return StatusId::ready;
 }
 
 void QualifiedFinalResidentExecutor::Release(Slot *slot) noexcept {
@@ -751,6 +1458,19 @@ void QualifiedFinalResidentExecutor::DestroyPrepared(
 void QualifiedFinalResidentExecutor::Shutdown() noexcept {
   if (shutdown_)
     return;
+  if (model_effects_) {
+    auto &m = *model_effects_;
+    if (m.batch.state() == ResidentCommandBatchState::recording)
+      m.batch.AbortUnsubmitted();
+    if (m.batch.state() == ResidentCommandBatchState::unsafe_pending &&
+        !m.batch.RetireAfterQuiescence(nullptr))
+      return;
+    kernels_->EndDeferredFrame();
+    if (!m.denoise.Shutdown(nullptr) || !m.tracking.Shutdown(nullptr) ||
+        !m.face.Shutdown() || !m.left.Shutdown() || !m.right.Shutdown())
+      return;
+    model_effects_.reset();
+  }
   for (auto &slot : slots_)
     Release(&slot);
   matting_.reset();
