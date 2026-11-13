@@ -342,3 +342,70 @@ Existing matting native-compatible default behavior is preserved. Production
 new-task default selection and the independent custom-pack native regression
 are being integrated separately. The scope documentation now covers all effects
 together (`efb399c`), while exact per-effect qualification remains mandatory.
+
+## Independent critique and final integration follow-up
+
+The packaging/model/installer/CI critic reviewed `82230ef` in
+`/tmp/studiocast-vulkan-packaging-critique-20261113-82230ef`, found no new
+Blocker/Critical/High, and independently passed 35 checks: SDK security 18,
+typed evidence 2, workflow propagation 7 and converter contracts 8. The known
+default-selection repair was excluded from that bounded review. That repair
+is now integrated at `a2fba7d` (source `6dbd021`): the actual native BYO-only
+default regression passes empty/default selection, explicit missing selection
+and an incompatible daemon default without silent replacement.
+
+The runtime critic at `9b75d99`, refreshed for `a2fba7d`, found one valid Medium:
+YuNet preprocessing extrapolated negative border coordinates and used rounded
+per-axis letterbox ratios rather than the canonical uniform inverse scale.
+`b7d4772` integrates source `1d92a07` from
+`codex/vulkan-yunet-preprocess-parity-20261113`. The new direct tensor oracle
+failed the old SPIR-V with maximum error 101.79, then passed eight geometries
+with maximum error 1.52588e-5 against the independent canonical CPU oracle.
+Generic Auto Frame crop sampling remains unchanged because its established
+contract intentionally differs. Only tracking SPIR-V was regenerated, and
+pinned-compiler byte-for-byte freshness passed.
+
+A new test fixture initially released preprocessing buffers while its recorded
+commands retained borrowed bindings. One-variable controls isolated the fixture
+lifetime: original test order with the new shader passed; releasing the new
+buffers before subsequent tests failed; retaining them through kernel shutdown
+passed. Production tracking already shuts kernels down before freeing its
+buffers and required no runtime change. The corrected full native oracle passed
+all eight preprocess cases, 20 exact dlib cases, detector/NMS, crop/matte and
+compositing cases, and 30 exact FLX tails; maximum standalone execution was
+17.5097 ms. Evidence and preserved negative controls are in
+`/tmp/studiocast-yunet-preprocess-evidence-20261113`.
+
+The wider manager matrix then exposed key-light-only execution still using the
+older per-kernel submission path: its unchanged one-synchronization assertion
+failed at seven synchronizations. `5e6b699` integrates source `26ed2be` and
+prepares the same collector for matting-only and adequately budgeted utility
+camera programs. The original key-light case now passes five batches/four
+commits at 22.75–22.83 ms, one inference per frame, one upload/final readback/
+synchronization and zero execution-time allocations. Existing tiny utility
+reservations retain their bounded legacy route. No fence or upper synchronization
+limit changed. Log:
+`/tmp/studiocast-vulkan-all-pipeline-keylight-batch-regression-20261113.log`.
+
+The reset review also found a bounded neutral scope extension: non-ready reset
+could leave a generic coordinator executor eligible, while the outer manager
+invented device loss from status-only quarantine and could retry an invalidated
+compatibility pointer. `6315d2c` and `31a86af` integrate focused sources
+`46b07e7` and `4d2b66d` from `codex/coordinator-reset-recovery-20261113`.
+Regression-first cases now require successful preparation before execution,
+publication or reset retries; actual current snapshot causes remain distinct
+from reset triggers. All nine neutral suites passed after root integration
+(0 skips/failures, temporary HOME/XDG, ICD discovery denied). Evidence:
+`/tmp/studiocast-neutral-reset-integrated-final-tests-20261113.log`.
+
+A fresh neutral critic at `31a86af` confirmed those paths but found two further
+Medium wrapper gaps using real wrappers with fake runners/adapters: Open CUDA
+snapshot/reset observers converted cause 21 to loss 13, and direct compatibility
+failed publication retained prior current activity. These are assigned as a
+bounded follow-up to `codex/open-video-projection-repair-20261113`, including
+the same cause projection in the prepared CUDA owner and their existing tests.
+No CUDA algorithms, GPU execution or public contract changes are authorized by
+this extension. A separate SDK-off optional-model isolation check and final
+combined/native/cold diagnostics matrix are still in progress. Seven integrated
+Vulkan hermetic suites passed at `5e6b699`; fresh final runtime critique and
+final-head broad suites remain required after the pending fixes.
