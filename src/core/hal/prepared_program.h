@@ -14,7 +14,8 @@ inline constexpr std::size_t kMaxCpuTails = 8;
 inline constexpr std::size_t kMaxExecutionBoundaries =
     (kMaxPreparedStages * 2) + kMaxCpuTails;
 inline constexpr std::size_t kMaxLatencyHistogramBuckets = 16;
-inline constexpr std::size_t kMaxCapabilityEvidenceRecords = 24;
+// The complete Vulkan model/runtime/warmup proof union has 25 distinct codes.
+inline constexpr std::size_t kMaxCapabilityEvidenceRecords = 25;
 
 enum class MemoryDomain : std::uint16_t {
   invalid = 0,
