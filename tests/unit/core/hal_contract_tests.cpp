@@ -208,6 +208,14 @@ public:
   bool provide_evidence = false;
   bool invalid_evidence = false;
   FakeExecuteMode execute_mode = FakeExecuteMode::success;
+  StatusId execution_failure = StatusId::invalid;
+  ReasonId failure_reason = ReasonId::none;
+  StatusId discard_status = StatusId::ready;
+  ReasonId discard_reason = ReasonId::none;
+  StatusId bind_status = StatusId::ready;
+  StatusId resolve_status = StatusId::ready;
+  std::uint64_t bind_calls = 0;
+  std::uint64_t resolve_calls = 0;
   std::uint64_t metadata_readbacks = 0;
   std::uint64_t metadata_tails = 0;
   std::uint64_t extra_uploads = 0;
@@ -347,6 +355,11 @@ public:
       result.output.execution_domain.adapter_instance_id += 1;
       break;
     }
+    if (execution_failure != StatusId::invalid) {
+      result.status = execution_failure;
+      result.reason = failure_reason;
+      result.output_valid = false;
+    }
     return result;
   }
 
@@ -360,6 +373,12 @@ public:
                          const HostFrameBinding &binding,
                          HostFrameTokens *tokens,
                          ReasonId *reason) noexcept override {
+    ++bind_calls;
+    if (bind_status != StatusId::ready) {
+      if (reason)
+        *reason = failure_reason;
+      return bind_status;
+    }
     host_binding = binding;
     host_unsubmitted = true;
     tokens->input = Resource(prepared_program, 5001);
@@ -386,6 +405,11 @@ public:
         *reason = ReasonId::host_frame_binding_invalid;
       return StatusId::blocked;
     }
+    if (discard_status != StatusId::ready) {
+      if (reason)
+        *reason = discard_reason;
+      return discard_status;
+    }
     host_unsubmitted = false;
     host_binding = {};
     host_tokens = {};
@@ -398,6 +422,12 @@ public:
                                   const ResourceHandle &,
                                   HostFrameOutputResolution *resolution,
                                   ReasonId *reason) noexcept override {
+    ++resolve_calls;
+    if (resolve_status != StatusId::ready) {
+      if (reason)
+        *reason = failure_reason;
+      return resolve_status;
+    }
     resolution->descriptor = host_binding.output_descriptor;
     resolution->planes = host_binding.output_planes;
     resolution->plane_count = host_binding.output_plane_count;
@@ -1150,6 +1180,176 @@ bool TestDeclaredMetadataTransferBounds() {
   return ok;
 }
 
+bool TestQuarantinePreservesActualCauseAndRequiresReconfigure() {
+  alignas(256) static std::array<std::byte, 640 * 480 * 3> input{}, output{};
+  bool ok = true;
+  // Reset has no output-reason channel; its trigger never attests device loss.
+  for (const int entry : {0, 1, 2, 3, 4}) {
+    for (const auto cause : {ReasonId::synchronization_failed,
+                             ReasonId::device_lost, ReasonId::none}) {
+      FakeAdapter adapter;
+      PreparedProgramSession session;
+      auto program = Program();
+      program.temporal.frame_drop_behavior = FrameDropBehavior::preserve_order;
+      if (!Configure(&session, &adapter, program))
+        return false;
+      const auto first = session.Execute(Request(program, 1));
+      ReasonId reason = ReasonId::none;
+      if (!Require(session.CommitOutput({first.completion, true}, &reason) ==
+                       StatusId::ready,
+                   "quarantine fixture must first publish a frame"))
+        return false;
+      const auto expected = entry == 1 || cause == ReasonId::none
+                                ? ReasonId::synchronization_failed
+                                : cause;
+      if (entry == 0) {
+        adapter.execution_failure = StatusId::quarantined;
+        adapter.failure_reason = cause;
+        const auto failed = session.Execute(Request(program, 2));
+        ok &= Require(failed.status == StatusId::quarantined &&
+                          failed.reason == expected && !failed.output_valid,
+                      "execution quarantine must preserve actual cause");
+      } else if (entry == 1) {
+        adapter.reset_status = StatusId::quarantined;
+        ok &= Require(
+            session.ResetTemporalState(cause) == StatusId::quarantined,
+            "reset must expose quarantine independently of its trigger");
+      } else if (entry >= 3) {
+        HostFrameBinding binding;
+        binding.input_descriptor = program.host_input;
+        binding.output_descriptor = program.host_output;
+        binding.input_plane_count = binding.output_plane_count = 1;
+        binding.capture_sequence = 2;
+        binding.input_planes[0] = {input.data(), nullptr, input.size(),
+                                   640 * 3};
+        binding.output_planes[0] = {nullptr, output.data(), output.size(),
+                                    640 * 3};
+        HostFrameTokens tokens;
+        adapter.failure_reason = cause;
+        if (entry == 3) {
+          adapter.bind_status = StatusId::quarantined;
+          ok &= Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                                StatusId::quarantined &&
+                            reason == expected && adapter.bind_calls == 1,
+                        "binding quarantine must retain actual supplied cause");
+        } else {
+          if (session.BindHostFrame(binding, &tokens, &reason) !=
+              StatusId::ready)
+            return false;
+          auto request = Request(program, 2);
+          request.input = tokens.input;
+          const auto pending = session.Execute(request);
+          adapter.resolve_status = StatusId::quarantined;
+          auto forged = pending.completion;
+          forged.complete = false;
+          HostFrameOutputResolution output_resolution;
+          ok &= Require(session.ResolveHostFrameOutput(
+                            forged, pending.output, &output_resolution,
+                            &reason) == StatusId::blocked &&
+                            reason == ReasonId::output_not_committed &&
+                            adapter.resolve_calls == 0 &&
+                            session.latest_committed_frame().valid &&
+                            !session.quarantined(),
+                        "forged output resolution cannot latch quarantine or "
+                        "clear publication");
+          ok &= Require(
+              session.ResolveHostFrameOutput(pending.completion, pending.output,
+                                             &output_resolution, &reason) ==
+                      StatusId::quarantined &&
+                  reason == expected && adapter.resolve_calls == 1 &&
+                  session.CommitOutput({pending.completion, true}, &reason) ==
+                      StatusId::failed,
+              "output resolution quarantine must consume pending publication "
+              "safely");
+        }
+      } else {
+        HostFrameBinding binding;
+        binding.input_descriptor = program.host_input;
+        binding.output_descriptor = program.host_output;
+        binding.input_plane_count = binding.output_plane_count = 1;
+        binding.capture_sequence = 3;
+        binding.input_planes[0] = {input.data(), nullptr, input.size(),
+                                   640 * 3};
+        binding.output_planes[0] = {nullptr, output.data(), output.size(),
+                                    640 * 3};
+        HostFrameTokens tokens;
+        if (!Require(session.BindHostFrame(binding, &tokens, &reason) ==
+                         StatusId::ready,
+                     "discard quarantine fixture must bind"))
+          return false;
+        adapter.discard_status = StatusId::quarantined;
+        adapter.discard_reason = cause;
+        auto request = Request(program, 3);
+        request.input = tokens.input;
+        const auto failed = session.Execute(request);
+        ok &=
+            Require(failed.status == StatusId::quarantined &&
+                        failed.reason == expected && adapter.discard_calls == 1,
+                    "discard quarantine must retain exact supplied cause");
+      }
+      ok &= Require(
+          session.quarantined() && session.prepared() &&
+              session.readiness().status == StatusId::quarantined &&
+              session.readiness().reason == expected &&
+              !session.readiness().available &&
+              session.telemetry().runtime_status == StatusId::quarantined &&
+              session.telemetry().runtime_reason == expected &&
+              !session.latest_committed_frame().valid &&
+              session.telemetry().active_backend == BackendId::invalid &&
+              session.telemetry().active_provider ==
+                  SemanticEffectProviderId::invalid &&
+              session.telemetry().selected_backend == BackendId::cuda &&
+              session.telemetry().committed_output_frames == 1 &&
+              session.telemetry().active_backend_frames == 1 &&
+              session.telemetry().device_losses ==
+                  (expected == ReasonId::device_lost ? 1u : 0u),
+          "quarantine must revoke current activity but preserve selected "
+          "history");
+      const auto executes = adapter.execute_calls;
+      const auto resets = adapter.reset_calls;
+      const auto binds = adapter.bind_calls;
+      const auto resolves = adapter.resolve_calls;
+      const auto retry = session.Execute(Request(program, 3));
+      ok &= Require(
+          retry.status == StatusId::quarantined && retry.reason == expected &&
+              session.ResetTemporalState(ReasonId::device_lost) ==
+                  StatusId::quarantined &&
+              adapter.execute_calls == executes &&
+              adapter.reset_calls == resets && adapter.bind_calls == binds &&
+              adapter.resolve_calls == resolves,
+          "retries must retain first quarantine cause without adapter work");
+      auto malformed = program;
+      malformed.program_id = 0;
+      ReadinessSnapshot candidate_readiness;
+      ok &= Require(
+          session.Configure(malformed, adapter, &candidate_readiness,
+                            &reason) == StatusId::blocked &&
+              session.readiness().status == StatusId::quarantined &&
+              session.readiness().reason == expected &&
+              session.telemetry().runtime_reason == expected,
+          "rejected reconfiguration cannot overwrite quarantine evidence");
+      session.Invalidate(ReasonId::reconfiguration_required);
+      ok &= Require(session.Execute(Request(program, 3)).reason == expected &&
+                        session.readiness().reason == expected &&
+                        session.telemetry().runtime_reason == expected,
+                    "invalidation cannot relabel an existing quarantine");
+      adapter.execution_failure = StatusId::invalid;
+      adapter.bind_status = adapter.resolve_status = StatusId::ready;
+      adapter.reset_status = adapter.discard_status = StatusId::ready;
+      ok &= Configure(&session, &adapter, program);
+      const auto recovered = session.Execute(Request(program, 3));
+      ok &= Require(
+          !session.quarantined() && recovered.output_valid &&
+              session.CommitOutput({recovered.completion, true}, &reason) ==
+                  StatusId::ready &&
+              session.latest_committed_frame().capture_sequence == 3 &&
+              session.telemetry().committed_output_frames == 2,
+          "successful reconfiguration must recover exact current publication");
+    }
+  }
+  return ok;
+}
+
 bool TestFatalTemporalResetInvalidatesActiveAttribution() {
   bool ok = true;
   for (const auto status :
@@ -1175,7 +1375,7 @@ bool TestFatalTemporalResetInvalidatesActiveAttribution() {
             adapter.reset_calls == 1 &&
             session.telemetry().runtime_reason ==
                 (status == StatusId::quarantined
-                     ? ReasonId::device_lost
+                     ? ReasonId::synchronization_failed
                      : ReasonId::temporal_discontinuity) &&
             !session.latest_committed_frame().valid &&
             !session.readiness().available,
@@ -1187,8 +1387,8 @@ bool TestFatalTemporalResetInvalidatesActiveAttribution() {
             adapter.execute_calls == 1,
         "failed reset cannot continue with unproven temporal history");
     ok &= Require(status != StatusId::quarantined ||
-                      session.telemetry().device_losses == 1,
-                  "reset device loss must latch quarantine telemetry");
+                      session.telemetry().device_losses == 0,
+                  "status-only reset quarantine cannot attest device loss");
   }
   return ok;
 }
@@ -1265,7 +1465,7 @@ bool TestHostBoundTemporalDiscontinuityResetResults() {
                       "post-reset contiguous host frame must commit");
       } else {
         const auto failure_reason = reset_status == StatusId::quarantined
-                                        ? ReasonId::device_lost
+                                        ? ReasonId::synchronization_failed
                                         : ReasonId::temporal_discontinuity;
         ok &= Require(
             frame.status == reset_status && frame.reason == failure_reason &&
@@ -1284,9 +1484,9 @@ bool TestHostBoundTemporalDiscontinuityResetResults() {
         const auto next_bind = session.BindHostFrame(binding, &tokens, &reason);
         ok &= Require(reset_status == StatusId::quarantined
                           ? next_bind == StatusId::quarantined &&
-                                reason == ReasonId::device_lost &&
+                                reason == ReasonId::synchronization_failed &&
                                 session.quarantined() &&
-                                session.telemetry().device_losses == 1
+                                session.telemetry().device_losses == 0
                           : next_bind == StatusId::stale &&
                                 reason == ReasonId::reconfiguration_required &&
                                 session.rebuild_requested(),
@@ -1768,6 +1968,7 @@ int main() {
   ok &= TestFailuresDeviceLossAndTransferEnforcement();
   ok &= TestCircuitBreakerActionsAndRetryTransitions();
   ok &= TestDeclaredMetadataTransferBounds();
+  ok &= TestQuarantinePreservesActualCauseAndRequiresReconfigure();
   ok &= TestFatalTemporalResetInvalidatesActiveAttribution();
   ok &= TestHostBoundTemporalDiscontinuityResetResults();
   ok &= TestRejectedTemporalFramesRetireOnlyTheirOwnBinding();

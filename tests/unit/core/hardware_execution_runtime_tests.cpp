@@ -247,6 +247,11 @@ public:
                               hal::HostFrameTokens *tokens,
                               hal::ReasonId *reason) noexcept override {
     ++bind_calls;
+    if (bind_failure != hal::StatusId::invalid) {
+      if (reason)
+        *reason = failure_reason;
+      return bind_failure;
+    }
     host_binding = binding;
     tokens->input = Resource(prepared_program, 7000 + binding.capture_sequence,
                              hal::MemoryDomain::upload_staging);
@@ -325,6 +330,11 @@ public:
       ++result.output.execution_domain.adapter_instance_id;
       break;
     }
+    if (execution_failure != hal::StatusId::invalid) {
+      result.status = execution_failure;
+      result.reason = failure_reason;
+      result.output_valid = false;
+    }
     return result;
   }
 
@@ -333,6 +343,11 @@ public:
       const hal::ResourceHandle &, hal::HostFrameOutputResolution *resolution,
       hal::ReasonId *reason) noexcept override {
     ++resolve_calls;
+    if (resolve_failure != hal::StatusId::invalid) {
+      if (reason)
+        *reason = failure_reason;
+      return resolve_failure;
+    }
     resolution->descriptor = host_binding.output_descriptor;
     resolution->planes = host_binding.output_planes;
     resolution->plane_count = host_binding.output_plane_count;
@@ -356,6 +371,10 @@ public:
 
   BindingMode binding_mode = BindingMode::valid;
   ExecuteMode execute_mode = ExecuteMode::success;
+  hal::StatusId execution_failure = hal::StatusId::invalid;
+  hal::ReasonId failure_reason = hal::ReasonId::none;
+  hal::StatusId bind_failure = hal::StatusId::invalid;
+  hal::StatusId resolve_failure = hal::StatusId::invalid;
   bool exhaust_prepare = false;
   std::uint64_t prepare_calls = 0;
   std::uint64_t bind_calls = 0;
@@ -678,6 +697,98 @@ bool TestFailedPublicationClearsOnlyCurrentActivity() {
   return ok;
 }
 
+bool TestQuarantinedAndFailedExecutionRevokesPriorActivity() {
+  bool ok = true;
+  for (const int entry : {0, 1, 2}) {
+    for (const auto status :
+         {hal::StatusId::quarantined, hal::StatusId::failed}) {
+      for (const auto cause :
+           {hal::ReasonId::synchronization_failed, hal::ReasonId::device_lost,
+            hal::ReasonId::none}) {
+        if (entry != 0 && status != hal::StatusId::quarantined)
+          continue;
+        FakeAdapter adapter;
+        hal::StaticAdapterRegistry registry;
+        if (!Register(&registry, &adapter, true, true))
+          return false;
+        video::HardwareExecutionRuntime runtime(registry);
+        hal::ReasonId reason = hal::ReasonId::none;
+        if (runtime.Configure(Setup(), &reason) != hal::StatusId::ready)
+          return false;
+        alignas(8) std::array<std::byte, 24> input{}, output{};
+        const auto first =
+            runtime.ExecuteHostFrame(Binding(1, &input, &output));
+        if (runtime.CommitOutput(first.completion, true, &reason) !=
+            hal::StatusId::ready)
+          return false;
+        if (entry == 0)
+          adapter.execution_failure = status;
+        else if (entry == 1)
+          adapter.bind_failure = status;
+        else
+          adapter.resolve_failure = status;
+        adapter.failure_reason = cause;
+        const auto failed =
+            runtime.ExecuteHostFrame(Binding(2, &input, &output));
+        const bool quarantined = status == hal::StatusId::quarantined ||
+                                 cause == hal::ReasonId::device_lost;
+        const auto expected = quarantined && cause == hal::ReasonId::none
+                                  ? hal::ReasonId::synchronization_failed
+                                  : cause;
+        ok &= Require(
+            failed.status ==
+                    (quarantined ? hal::StatusId::quarantined : status) &&
+                failed.reason == expected && !failed.output_ready &&
+                !runtime.frame_pending() &&
+                !runtime.latest_committed_frame().valid &&
+                runtime.telemetry().active_backend == hal::BackendId::invalid &&
+                runtime.telemetry().active_provider ==
+                    hal::SemanticEffectProviderId::invalid &&
+                runtime.telemetry().committed_output_frames == 1 &&
+                runtime.telemetry().active_backend_frames == 1 &&
+                runtime.telemetry().selected_backend == hal::BackendId::cuda,
+            "failed execution must revoke current activity and retain history");
+        if (quarantined) {
+          const auto calls = adapter.execute_calls;
+          const auto binds = adapter.bind_calls;
+          const auto resolves = adapter.resolve_calls;
+          ok &= Require(
+              runtime.ExecuteHostFrame(Binding(3, &input, &output)).reason ==
+                      expected &&
+                  runtime.readiness().reason == expected &&
+                  runtime.telemetry().device_losses ==
+                      (cause == hal::ReasonId::device_lost ? 1u : 0u) &&
+                  adapter.execute_calls == calls &&
+                  adapter.bind_calls == binds &&
+                  adapter.resolve_calls == resolves,
+              "facade quarantine must preserve truthful cause without "
+              "executing");
+          runtime.Invalidate(hal::ReasonId::reconfiguration_required);
+          ok &= Require(
+              runtime.ExecuteHostFrame(Binding(3, &input, &output)).reason ==
+                      expected &&
+                  runtime.readiness().reason == expected,
+              "facade invalidation cannot rewrite quarantine cause");
+        }
+        adapter.execution_failure = hal::StatusId::invalid;
+        adapter.bind_failure = adapter.resolve_failure = hal::StatusId::invalid;
+        if (runtime.Configure(Setup(), &reason) != hal::StatusId::ready)
+          return false;
+        const auto recovered =
+            runtime.ExecuteHostFrame(Binding(3, &input, &output));
+        ok &= Require(
+            recovered.output_ready &&
+                runtime.CommitOutput(recovered.completion, true, &reason) ==
+                    hal::StatusId::ready &&
+                runtime.latest_committed_frame().capture_sequence == 3 &&
+                runtime.telemetry().committed_output_frames == 2,
+            "facade reconfiguration must recover from quarantine");
+      }
+    }
+  }
+  return ok;
+}
+
 bool TestStrictCrossAdapterAndExactProgramRejection() {
   bool ok = true;
   hal::ReasonId reason = hal::ReasonId::none;
@@ -905,6 +1016,7 @@ int main() {
   ok &= TestPassthroughAndShadow();
   ok &= TestLiveExecutionCommitFailureAndOptionalFailOpen();
   ok &= TestFailedPublicationClearsOnlyCurrentActivity();
+  ok &= TestQuarantinedAndFailedExecutionRevokesPriorActivity();
   ok &= TestStrictCrossAdapterAndExactProgramRejection();
   ok &= TestMalformedResourcesExhaustionAndStaleCompletion();
   ok &= TestReconfigureTemporalDeviceLossShutdownAndNoAllocation();

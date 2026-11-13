@@ -720,6 +720,7 @@ VideoExecutionCoordinator::Prepare(const VideoExecutionPlanRequest &request,
       prepared_ = true;
       passthrough_ = false;
       quarantined_ = false;
+      quarantine_reason_ = hal::ReasonId::none;
       committed_ = {};
       prepare_.status = status;
       prepare_.reason = route_reason;
@@ -804,6 +805,7 @@ void VideoExecutionCoordinator::ActivatePassthrough(
   prepared_ = true;
   passthrough_ = true;
   quarantined_ = false;
+  quarantine_reason_ = hal::ReasonId::none;
   committed_ = {};
 }
 
@@ -822,8 +824,8 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
   if (!prepared_ || quarantined_) {
     frame.status =
         quarantined_ ? hal::StatusId::quarantined : hal::StatusId::blocked;
-    frame.reason = quarantined_ ? hal::ReasonId::device_lost
-                                : hal::ReasonId::stale_program;
+    frame.reason =
+        quarantined_ ? quarantine_reason_ : hal::ReasonId::stale_program;
     return frame;
   }
   if (passthrough_) {
@@ -846,6 +848,10 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     frame = executor_->Execute(binding);
   }
 
+  const auto reject_frame = [this, &frame]() noexcept {
+    ClearCurrentActivity();
+    return frame;
+  };
   ++telemetry_.execution_attempts;
   telemetry_.transfers.uploads += frame.transfers.uploads;
   telemetry_.transfers.final_readbacks += frame.transfers.final_readbacks;
@@ -859,18 +865,16 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
   telemetry_.runtime_status = frame.status;
   telemetry_.runtime_reason = frame.reason;
 
-  if (frame.reason == hal::ReasonId::device_lost) {
-    ++telemetry_.device_losses;
-    quarantined_ = true;
-    readiness_.status = hal::StatusId::quarantined;
-    readiness_.reason = hal::ReasonId::device_lost;
-    readiness_.available = false;
-    if (executor_)
-      executor_->Invalidate(hal::ReasonId::device_lost);
-    return frame;
+  if (frame.status == hal::StatusId::quarantined ||
+      frame.reason == hal::ReasonId::device_lost) {
+    Quarantine(frame.reason);
+    frame.status = hal::StatusId::quarantined;
+    frame.reason = quarantine_reason_;
+    frame.output_ready = frame.output.output_ready = false;
+    return reject_frame();
   }
   if (!IsFrameSuccess(frame.status))
-    return frame;
+    return reject_frame();
   const auto expected_adapter =
       passthrough_ ? 0 : plan_.domain_plan.islands[0].adapter_instance_id;
   if (!frame.completion.complete || frame.completion.token_id == 0 ||
@@ -892,7 +896,7 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
             : hal::ReasonId::incomplete_execution;
     telemetry_.runtime_status = frame.status;
     telemetry_.runtime_reason = frame.reason;
-    return frame;
+    return reject_frame();
   }
   const auto within = [](std::uint64_t value, std::uint64_t minimum,
                          std::uint64_t maximum) noexcept {
@@ -930,7 +934,7 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     frame.reason = hal::ReasonId::transfer_contract_violated;
     telemetry_.runtime_status = frame.status;
     telemetry_.runtime_reason = frame.reason;
-    return frame;
+    return reject_frame();
   }
   hal::ReasonId stage_reason = hal::ReasonId::none;
   if (!ValidateExecutedStages(frame, plan_, &stage_reason)) {
@@ -938,7 +942,7 @@ VideoExecutionFrameResult VideoExecutionCoordinator::Execute(
     frame.reason = stage_reason;
     telemetry_.runtime_status = frame.status;
     telemetry_.runtime_reason = frame.reason;
-    return frame;
+    return reject_frame();
   }
 
   ++telemetry_.execution_successes;
@@ -959,9 +963,7 @@ VideoExecutionCoordinator::CommitOutput(const hal::CompletionToken &completion,
     return hal::StatusId::failed;
   }
   // Only an exact pending completion may replace the current activity.
-  committed_ = {};
-  telemetry_.active_backend = hal::BackendId::invalid;
-  telemetry_.active_provider = hal::SemanticEffectProviderId::invalid;
+  ClearCurrentActivity();
   hal::ReasonId commit_reason = hal::ReasonId::none;
   hal::StatusId status = hal::StatusId::ready;
   if (!passthrough_) {
@@ -970,6 +972,12 @@ VideoExecutionCoordinator::CommitOutput(const hal::CompletionToken &completion,
   } else if (!output_write_succeeded) {
     status = hal::StatusId::failed;
     commit_reason = hal::ReasonId::output_write_failed;
+  }
+  if (status == hal::StatusId::quarantined ||
+      commit_reason == hal::ReasonId::device_lost) {
+    Quarantine(commit_reason);
+    status = hal::StatusId::quarantined;
+    commit_reason = quarantine_reason_;
   }
   if (!output_write_succeeded && commit_reason == hal::ReasonId::none) {
     status = hal::StatusId::failed;
@@ -1032,17 +1040,19 @@ VideoExecutionCoordinator::CommitOutput(const hal::CompletionToken &completion,
 }
 
 void VideoExecutionCoordinator::Invalidate(hal::ReasonId reason) noexcept {
-  if (executor_)
-    executor_->Invalidate(reason);
+  if (quarantined_ || reason == hal::ReasonId::device_lost) {
+    Quarantine(reason);
+  } else {
+    if (executor_)
+      executor_->Invalidate(reason);
+    readiness_.status = hal::StatusId::stale;
+    readiness_.reason = reason;
+    readiness_.available = false;
+  }
   ClearPending();
+  ClearCurrentActivity();
   prepared_ = false;
   passthrough_ = false;
-  quarantined_ = reason == hal::ReasonId::device_lost;
-  readiness_.status =
-      quarantined_ ? hal::StatusId::quarantined : hal::StatusId::stale;
-  readiness_.reason = reason;
-  readiness_.available = false;
-  committed_ = {};
   plan_ = {};
 }
 
@@ -1050,14 +1060,36 @@ hal::StatusId
 VideoExecutionCoordinator::ResetTemporal(hal::ReasonId reason) noexcept {
   if (stopped_)
     return hal::StatusId::stopped;
+  if (quarantined_)
+    return hal::StatusId::quarantined;
   if (frame_pending_)
     return hal::StatusId::blocked;
   if (!prepared_)
     return hal::StatusId::stale;
   const auto status =
       passthrough_ ? hal::StatusId::ready : executor_->ResetTemporal(reason);
-  if (status == hal::StatusId::ready)
+  if (status == hal::StatusId::ready) {
     ++telemetry_.temporal_resets;
+  } else if (status == hal::StatusId::quarantined) {
+    const auto snapshot = executor_->Snapshot();
+    // Only an exact current quarantine snapshot attests an operation cause.
+    hal::ReasonId failure = hal::ReasonId::none;
+    if (snapshot.plan_id == plan_.plan_id &&
+        snapshot.execution_domain ==
+            plan_.domain_plan.islands[0].execution_domain) {
+      if (snapshot.status == hal::StatusId::quarantined)
+        failure = snapshot.reason;
+      if (failure == hal::ReasonId::none &&
+          snapshot.telemetry.runtime_status == hal::StatusId::quarantined)
+        failure = snapshot.telemetry.runtime_reason;
+      if (failure == hal::ReasonId::none &&
+          snapshot.readiness.status == hal::StatusId::quarantined)
+        failure = snapshot.readiness.reason;
+    }
+    Quarantine(failure);
+  } else {
+    ClearCurrentActivity();
+  }
   return status;
 }
 
@@ -1077,6 +1109,30 @@ void VideoExecutionCoordinator::Shutdown() noexcept {
   telemetry_.runtime_reason = hal::ReasonId::shutdown_requested;
 }
 
+void VideoExecutionCoordinator::ClearCurrentActivity() noexcept {
+  committed_ = {};
+  telemetry_.active_backend = hal::BackendId::invalid;
+  telemetry_.active_provider = hal::SemanticEffectProviderId::invalid;
+}
+
+void VideoExecutionCoordinator::Quarantine(hal::ReasonId reason) noexcept {
+  if (!quarantined_) {
+    quarantine_reason_ = reason == hal::ReasonId::none
+                             ? hal::ReasonId::synchronization_failed
+                             : reason;
+    if (quarantine_reason_ == hal::ReasonId::device_lost)
+      ++telemetry_.device_losses;
+    if (executor_)
+      executor_->Invalidate(quarantine_reason_);
+  }
+  quarantined_ = true;
+  ClearPending();
+  ClearCurrentActivity();
+  readiness_.status = telemetry_.runtime_status = hal::StatusId::quarantined;
+  readiness_.reason = telemetry_.runtime_reason = quarantine_reason_;
+  readiness_.available = false;
+}
+
 void VideoExecutionCoordinator::ClearPending() noexcept {
   frame_pending_ = false;
   pending_completion_ = {};
@@ -1088,6 +1144,7 @@ void VideoExecutionCoordinator::ClearActive() noexcept {
   prepared_ = false;
   passthrough_ = false;
   quarantined_ = false;
+  quarantine_reason_ = hal::ReasonId::none;
   plan_ = {};
   committed_ = {};
 }

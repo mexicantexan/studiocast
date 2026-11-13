@@ -563,6 +563,8 @@ private:
   void AccumulateExecuteTelemetry(const ExecuteResult &result) noexcept;
   void HandleTemporalResetResult(StatusId status, ReasonId reason) noexcept;
   void RetirePendingFrame() noexcept;
+  void ClearCurrentActivity() noexcept;
+  void Quarantine(ReasonId reason) noexcept;
   [[nodiscard]] ExecuteResult RejectTemporalFrame(ReasonId reason) noexcept;
   void RestoreExecutionReadiness() noexcept;
   [[nodiscard]] bool
@@ -591,6 +593,7 @@ private:
   bool have_capture_sequence_ = false;
   bool prepared_ = false;
   bool quarantined_ = false;
+  ReasonId quarantine_reason_ = ReasonId::none;
   bool stopped_ = false;
   bool completion_pending_ = false;
   bool host_binding_pending_ = false;

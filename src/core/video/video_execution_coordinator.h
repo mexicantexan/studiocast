@@ -92,6 +92,8 @@ private:
                            const hal::ResolutionResult &resolution,
                            const hal::DomainPlan &domain_plan) noexcept;
   void ClearPending() noexcept;
+  void ClearCurrentActivity() noexcept;
+  void Quarantine(hal::ReasonId reason) noexcept;
   void ClearActive() noexcept;
 
   const hal::StaticAdapterRegistry *capabilities_ = nullptr;
@@ -113,6 +115,7 @@ private:
   bool passthrough_ = false;
   bool frame_pending_ = false;
   bool quarantined_ = false;
+  hal::ReasonId quarantine_reason_ = hal::ReasonId::none;
   bool stopped_ = false;
 };
 

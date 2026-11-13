@@ -302,6 +302,11 @@ HardwareFrameResult HardwareExecutionRuntime::ExecuteHostFrame(
     frame.reason = hal::ReasonId::output_not_committed;
     return frame;
   }
+  if (readiness().status == hal::StatusId::quarantined) {
+    frame.status = hal::StatusId::quarantined;
+    frame.reason = readiness().reason;
+    return frame;
+  }
   if (passthrough_) {
     if (!ValidatePassthroughBinding(binding)) {
       frame.status = hal::StatusId::blocked;
@@ -373,6 +378,10 @@ HardwareFrameResult HardwareExecutionRuntime::ExecuteHostFrame(
   const hal::StatusId resolved = session_.ResolveHostFrameOutput(
       executed.completion, executed.output, &frame.output, &resolve_reason);
   if (resolved != hal::StatusId::ready) {
+    if (resolved == hal::StatusId::quarantined) {
+      frame_pending_ = false;
+      pending_completion_ = {};
+    }
     frame.status = resolved;
     frame.reason = resolve_reason;
     return frame;
@@ -470,19 +479,28 @@ void HardwareExecutionRuntime::ActivatePassthrough(
 }
 
 void HardwareExecutionRuntime::Invalidate(hal::ReasonId reason) noexcept {
-  if (telemetry_from_session_)
-    local_telemetry_ = session_.telemetry();
   if (session_.prepared())
     session_.Invalidate(reason);
+  if (telemetry_from_session_) {
+    local_telemetry_ = session_.telemetry();
+    local_readiness_ = session_.readiness();
+  }
+  const bool quarantined =
+      local_readiness_.status == hal::StatusId::quarantined;
   telemetry_from_session_ = false;
   frame_pending_ = false;
   pending_completion_ = {};
   ClearActive();
-  local_readiness_.status = reason == hal::ReasonId::device_lost
-                                ? hal::StatusId::quarantined
-                                : hal::StatusId::stale;
-  local_readiness_.reason = reason;
+  if (!quarantined) {
+    local_readiness_.status = reason == hal::ReasonId::device_lost
+                                  ? hal::StatusId::quarantined
+                                  : hal::StatusId::stale;
+    local_readiness_.reason = reason;
+  }
   local_readiness_.available = false;
+  local_committed_frame_ = {};
+  local_telemetry_.active_backend = hal::BackendId::invalid;
+  local_telemetry_.active_provider = hal::SemanticEffectProviderId::invalid;
 }
 
 void HardwareExecutionRuntime::Shutdown() noexcept {

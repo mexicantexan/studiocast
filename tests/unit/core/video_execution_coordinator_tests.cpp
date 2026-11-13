@@ -336,6 +336,11 @@ public:
       result.transfers.cpu_tail_boundaries = 0;
       break;
     }
+    if (execution_failure != hal::StatusId::invalid) {
+      result.status = execution_failure;
+      result.reason = failure_reason;
+      result.output_ready = false;
+    }
     return result;
   }
 
@@ -349,8 +354,8 @@ public:
       return hal::StatusId::failed;
     }
     if (reason)
-      *reason = hal::ReasonId::none;
-    return hal::StatusId::ready;
+      *reason = commit_reason;
+    return commit_status;
   }
   void Invalidate(hal::ReasonId) noexcept override {
     ++invalidate_calls;
@@ -358,7 +363,13 @@ public:
   }
   hal::StatusId ResetTemporal(hal::ReasonId) noexcept override {
     ++reset_calls;
-    return hal::StatusId::ready;
+    if (reset_status == hal::StatusId::quarantined) {
+      snapshot_.readiness.status = reset_status;
+      snapshot_.readiness.reason = reset_reason;
+      if (!reset_snapshot_exact)
+        ++snapshot_.execution_domain.queue_or_stream_identity;
+    }
+    return reset_status;
   }
   void Shutdown() noexcept override {
     ++shutdown_calls;
@@ -369,6 +380,13 @@ public:
   }
 
   bool reject_commit = false;
+  hal::StatusId execution_failure = hal::StatusId::invalid;
+  hal::ReasonId failure_reason = hal::ReasonId::none;
+  hal::StatusId reset_status = hal::StatusId::ready;
+  hal::ReasonId reset_reason = hal::ReasonId::none;
+  bool reset_snapshot_exact = true;
+  hal::StatusId commit_status = hal::StatusId::ready;
+  hal::ReasonId commit_reason = hal::ReasonId::none;
   std::uint64_t execute_calls = 0;
   std::uint64_t commit_calls = 0;
   std::uint64_t invalidate_calls = 0;
@@ -893,6 +911,129 @@ bool TestFailedPublicationClearsOnlyCurrentActivity() {
             recovered.telemetry.active_provider == provider &&
             recovered.telemetry.active_backend_frames == 2,
         "successful recovery must publish only the exact new activity");
+  }
+  return ok;
+}
+
+bool TestQuarantineCauseAndFailedExecutionActivity() {
+  bool ok = true;
+  for (const int entry : {0, 1, 2, 3, 4}) {
+    for (const auto cause : {hal::ReasonId::synchronization_failed,
+                             hal::ReasonId::device_lost, hal::ReasonId::none}) {
+      const auto domain = Domain();
+      DummyResident resident(domain);
+      hal::StaticAdapterRegistry registry;
+      const auto provider =
+          hal::SemanticEffectProviderId::open_video_onnxruntime_cuda;
+      if (!RegisterCapability(&registry, &resident, domain, provider))
+        return false;
+      FakeFactory factory(domain, provider);
+      video::VideoExecutionCoordinator coordinator(registry);
+      hal::ReasonId reason = hal::ReasonId::none;
+      if (coordinator.RegisterFactory(
+              FactoryRegistration(1,
+                                  video::VideoExecutionRoute::prepared_resident,
+                                  domain, provider, &factory),
+              &reason) != hal::StatusId::ready ||
+          !Configure(&coordinator, Request()))
+        return false;
+      std::uint8_t input[24]{}, output[24]{};
+      const auto first = coordinator.Execute(Binding(input, output, 1));
+      if (coordinator.CommitOutput(first.completion, true, &reason) !=
+          hal::StatusId::ready)
+        return false;
+      const auto selected = coordinator.Snapshot();
+      const bool quarantined =
+          entry != 2 || cause == hal::ReasonId::device_lost;
+      const auto expected =
+          (quarantined && cause == hal::ReasonId::none) || entry == 4
+              ? hal::ReasonId::synchronization_failed
+              : cause;
+      if (entry == 1 || entry == 4) {
+        factory.latest_executor->reset_status = hal::StatusId::quarantined;
+        factory.latest_executor->reset_reason = cause;
+        factory.latest_executor->reset_snapshot_exact = entry != 4;
+        ok &= Require(coordinator.ResetTemporal(hal::ReasonId::device_lost) ==
+                          hal::StatusId::quarantined,
+                      "executor reset must report quarantine");
+      } else if (entry == 3) {
+        const auto pending = coordinator.Execute(Binding(input, output, 2));
+        auto forged = pending.completion;
+        ++forged.token_id;
+        factory.latest_executor->commit_status = hal::StatusId::quarantined;
+        factory.latest_executor->commit_reason = cause;
+        ok &= Require(coordinator.CommitOutput(forged, true, &reason) ==
+                              hal::StatusId::failed &&
+                          coordinator.Snapshot().latest_committed_frame.valid &&
+                          !coordinator.Snapshot().quarantined,
+                      "forged commit cannot consume a quarantine result or "
+                      "clear activity");
+        ok &= Require(
+            coordinator.CommitOutput(pending.completion, true, &reason) ==
+                    hal::StatusId::quarantined &&
+                reason == expected,
+            "valid commit quarantine must retain actual failure cause");
+      } else {
+        factory.latest_executor->execution_failure =
+            entry == 0 ? hal::StatusId::quarantined : hal::StatusId::failed;
+        factory.latest_executor->failure_reason = cause;
+        const auto failed = coordinator.Execute(Binding(input, output, 2));
+        ok &= Require(
+            failed.status == (quarantined ? hal::StatusId::quarantined
+                                          : hal::StatusId::failed) &&
+                failed.reason == expected && !failed.output_ready,
+            "coordinator must retain actual execution failure status/cause");
+      }
+      const auto failed = coordinator.Snapshot();
+      ok &= Require(failed.quarantined == quarantined &&
+                        !failed.latest_committed_frame.valid &&
+                        failed.telemetry.active_backend ==
+                            hal::BackendId::invalid &&
+                        failed.telemetry.active_provider ==
+                            hal::SemanticEffectProviderId::invalid &&
+                        failed.telemetry.committed_output_frames == 1 &&
+                        failed.telemetry.active_backend_frames == 1 &&
+                        failed.plan.plan_id == selected.plan.plan_id &&
+                        failed.telemetry.selected_backend ==
+                            selected.telemetry.selected_backend &&
+                        failed.telemetry.device_losses ==
+                            (expected == hal::ReasonId::device_lost ? 1u : 0u),
+                    "failed execution/reset must revoke current activity while "
+                    "retaining history");
+      if (quarantined) {
+        const auto calls = factory.latest_executor->execute_calls;
+        const auto resets = factory.latest_executor->reset_calls;
+        const auto retry = coordinator.Execute(Binding(input, output, 3));
+        ok &= Require(
+            retry.status == hal::StatusId::quarantined &&
+                retry.reason == expected &&
+                coordinator.ResetTemporal(hal::ReasonId::device_lost) ==
+                    hal::StatusId::quarantined &&
+                coordinator.Snapshot().readiness.reason == expected &&
+                coordinator.Snapshot().telemetry.runtime_reason == expected &&
+                factory.latest_executor->execute_calls == calls &&
+                factory.latest_executor->reset_calls == resets,
+            "coordinator rejected retries must preserve first actual "
+            "quarantine cause");
+        coordinator.Invalidate(hal::ReasonId::reconfiguration_required);
+        ok &= Require(coordinator.Execute(Binding(input, output, 3)).reason ==
+                              expected &&
+                          coordinator.Snapshot().readiness.reason == expected,
+                      "coordinator invalidation cannot relabel quarantine");
+      }
+      if (!Configure(&coordinator, Request()))
+        return false;
+      const auto recovered = coordinator.Execute(Binding(input, output, 3));
+      ok &= Require(
+          recovered.output_ready && !coordinator.Snapshot().quarantined &&
+              coordinator.CommitOutput(recovered.completion, true, &reason) ==
+                  hal::StatusId::ready &&
+              coordinator.Snapshot().latest_committed_frame.capture_sequence ==
+                  3 &&
+              coordinator.Snapshot().telemetry.committed_output_frames == 2,
+          "new prepared executor must recover exact publication after "
+          "quarantine");
+    }
   }
   return ok;
 }
@@ -1733,6 +1874,7 @@ int main() {
   ok &= TestStrictProviderMismatch();
   ok &= TestExecuteCommitAndWriterFailure();
   ok &= TestFailedPublicationClearsOnlyCurrentActivity();
+  ok &= TestQuarantineCauseAndFailedExecutionActivity();
   ok &= TestInvalidationStaleGenerationAndOldPlanRetention();
   ok &= TestWrongDomainAndStaleCompletion();
   ok &= TestOptionalFailOpenPreservesOutput();

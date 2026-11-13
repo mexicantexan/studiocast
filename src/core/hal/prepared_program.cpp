@@ -724,6 +724,7 @@ StatusId PreparedProgramSession::Configure(const PreparedProgram &program,
   handle_ = candidate;
   prepared_ = true;
   quarantined_ = false;
+  quarantine_reason_ = ReasonId::none;
   stopped_ = false;
   completion_pending_ = false;
   have_capture_sequence_ = false;
@@ -750,10 +751,7 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
   if (stopped_)
     return FailedExecute(StatusId::stopped, ReasonId::shutdown_requested);
   if (quarantined_)
-    return FailedExecute(StatusId::quarantined,
-                         readiness_.reason == ReasonId::none
-                             ? ReasonId::circuit_breaker_open
-                             : readiness_.reason);
+    return FailedExecute(StatusId::quarantined, quarantine_reason_);
   if (rebuild_requested_)
     return FailedExecute(StatusId::stale, ReasonId::reconfiguration_required);
   if (!prepared_ || adapter_ == nullptr)
@@ -853,27 +851,31 @@ PreparedProgramSession::Execute(const ExecuteRequest &request) noexcept {
   ++telemetry_.execution_attempts;
   ExecuteResult result = adapter_->Execute(handle_, effective_request);
   const auto fail_after_adapter = [this](ExecuteResult failure) noexcept {
+    ClearCurrentActivity();
     host_binding_pending_ = false;
     pending_host_tokens_ = {};
+    if (!quarantined_) {
+      telemetry_.runtime_status = failure.status;
+      telemetry_.runtime_reason = failure.reason;
+    }
     return failure;
   };
   result.dropped_capture_frames = dropped_capture_frames;
   result.temporal_state_reset = temporal_state_reset;
+  if (result.status == StatusId::quarantined ||
+      result.reason == ReasonId::device_lost) {
+    if (result.stage_count <= result.stages.size())
+      AccumulateExecuteTelemetry(result);
+    Quarantine(result.reason);
+    result.status = StatusId::quarantined;
+    result.reason = quarantine_reason_;
+    result.output_valid = false;
+    return fail_after_adapter(result);
+  }
   if (result.stage_count > result.stages.size())
     return fail_after_adapter(
         FailedExecute(StatusId::failed, ReasonId::malformed_contract));
   AccumulateExecuteTelemetry(result);
-  if (result.reason == ReasonId::device_lost) {
-    quarantined_ = true;
-    ++telemetry_.device_losses;
-    result.status = StatusId::quarantined;
-    readiness_.status = StatusId::quarantined;
-    readiness_.reason = ReasonId::device_lost;
-    readiness_.available = false;
-    telemetry_.runtime_status = StatusId::quarantined;
-    telemetry_.runtime_reason = ReasonId::device_lost;
-    return fail_after_adapter(result);
-  }
   // Adapter-side token/binding validation can fail before any stage runs.
   // Preserve that exact typed failure; stage circuit breakers have no result
   // to consume in this case.
@@ -989,7 +991,7 @@ StatusId PreparedProgramSession::BindHostFrame(const HostFrameBinding &binding,
     return StatusId::stopped;
   }
   if (quarantined_) {
-    SetReason(reason, readiness_.reason);
+    SetReason(reason, quarantine_reason_);
     return StatusId::quarantined;
   }
   if (rebuild_requested_) {
@@ -1009,8 +1011,16 @@ StatusId PreparedProgramSession::BindHostFrame(const HostFrameBinding &binding,
     return StatusId::blocked;
   }
   HostFrameTokens candidate;
+  ReasonId bind_reason = ReasonId::none;
   const StatusId status =
-      adapter_->BindHostFrame(handle_, binding, &candidate, reason);
+      adapter_->BindHostFrame(handle_, binding, &candidate, &bind_reason);
+  SetReason(reason, bind_reason);
+  if (status == StatusId::quarantined || bind_reason == ReasonId::device_lost) {
+    RetirePendingFrame();
+    Quarantine(bind_reason);
+    SetReason(reason, quarantine_reason_);
+    return StatusId::quarantined;
+  }
   if (status != StatusId::ready)
     return status;
   if (!ValidateResourceHandle(
@@ -1053,7 +1063,8 @@ StatusId PreparedProgramSession::ResolveHostFrameOutput(
       completion.program_id != pending_completion_.program_id ||
       completion.adapter_instance_id !=
           pending_completion_.adapter_instance_id ||
-      completion.capture_sequence != pending_completion_.capture_sequence) {
+      completion.capture_sequence != pending_completion_.capture_sequence ||
+      completion.complete != pending_completion_.complete) {
     SetReason(reason, ReasonId::output_not_committed);
     return StatusId::blocked;
   }
@@ -1062,8 +1073,17 @@ StatusId PreparedProgramSession::ResolveHostFrameOutput(
     return StatusId::blocked;
   }
   HostFrameOutputResolution candidate;
+  ReasonId resolve_reason = ReasonId::none;
   const StatusId status = adapter_->ResolveHostFrameOutput(
-      handle_, completion, output, &candidate, reason);
+      handle_, completion, output, &candidate, &resolve_reason);
+  SetReason(reason, resolve_reason);
+  if (status == StatusId::quarantined ||
+      resolve_reason == ReasonId::device_lost) {
+    RetirePendingFrame();
+    Quarantine(resolve_reason);
+    SetReason(reason, quarantine_reason_);
+    return StatusId::quarantined;
+  }
   if (status != StatusId::ready)
     return status;
   if (!candidate.output_ready ||
@@ -1106,9 +1126,7 @@ StatusId PreparedProgramSession::CommitOutput(const OutputCommit &commit,
   completion_pending_ = false;
   host_binding_pending_ = false;
   // A validated publication attempt replaces current activity, even on failure.
-  latest_committed_frame_ = {};
-  telemetry_.active_backend = BackendId::invalid;
-  telemetry_.active_provider = SemanticEffectProviderId::invalid;
+  ClearCurrentActivity();
   if (!commit.output_write_succeeded) {
     SetReason(reason, ReasonId::output_write_failed);
     pending_stage_count_ = 0;
@@ -1216,6 +1234,11 @@ bool PreparedProgramSession::MayRetainOldProgram(
 void PreparedProgramSession::RejectOldProgramRetention(
     ReasonId reason) noexcept {
   ++telemetry_.setup_retention_rejections;
+  if (quarantined_) {
+    Quarantine(quarantine_reason_);
+    DestroyActive();
+    return;
+  }
   telemetry_.runtime_status = StatusId::blocked;
   telemetry_.runtime_reason = reason;
   readiness_.status = StatusId::blocked;
@@ -1255,12 +1278,7 @@ void PreparedProgramSession::UpdateCircuitBreakers(
     switch (stage.circuit_breaker.action) {
     case CircuitBreakerAction::disable_stage:
       if (stage.required) {
-        quarantined_ = true;
-        readiness_.status = StatusId::quarantined;
-        readiness_.reason = ReasonId::required_stage_failed;
-        readiness_.available = false;
-        telemetry_.runtime_status = StatusId::quarantined;
-        telemetry_.runtime_reason = ReasonId::required_stage_failed;
+        Quarantine(ReasonId::required_stage_failed);
         break;
       }
       disabled_stage_mask_ |= bit;
@@ -1291,12 +1309,7 @@ void PreparedProgramSession::UpdateCircuitBreakers(
       }
       break;
     case CircuitBreakerAction::quarantine_program:
-      quarantined_ = true;
-      readiness_.status = StatusId::quarantined;
-      readiness_.reason = ReasonId::circuit_breaker_open;
-      readiness_.available = false;
-      telemetry_.runtime_status = StatusId::quarantined;
-      telemetry_.runtime_reason = ReasonId::circuit_breaker_open;
+      Quarantine(ReasonId::circuit_breaker_open);
       break;
     case CircuitBreakerAction::request_rebuild:
       rebuild_requested_ = true;
@@ -1310,6 +1323,8 @@ void PreparedProgramSession::UpdateCircuitBreakers(
       break;
     }
   }
+  if (quarantined_)
+    Quarantine(quarantine_reason_);
 }
 
 StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
@@ -1324,6 +1339,26 @@ StatusId PreparedProgramSession::ResetTemporalState(ReasonId reason) noexcept {
   const auto status = adapter_->ResetTemporalState(handle_, reason);
   HandleTemporalResetResult(status, reason);
   return status;
+}
+
+void PreparedProgramSession::ClearCurrentActivity() noexcept {
+  latest_committed_frame_ = {};
+  telemetry_.active_backend = BackendId::invalid;
+  telemetry_.active_provider = SemanticEffectProviderId::invalid;
+}
+
+void PreparedProgramSession::Quarantine(ReasonId reason) noexcept {
+  if (!quarantined_) {
+    quarantine_reason_ =
+        reason == ReasonId::none ? ReasonId::synchronization_failed : reason;
+    if (quarantine_reason_ == ReasonId::device_lost)
+      ++telemetry_.device_losses;
+  }
+  quarantined_ = true;
+  ClearCurrentActivity();
+  readiness_.status = telemetry_.runtime_status = StatusId::quarantined;
+  readiness_.reason = telemetry_.runtime_reason = quarantine_reason_;
+  readiness_.available = false;
 }
 
 void PreparedProgramSession::RetirePendingFrame() noexcept {
@@ -1343,17 +1378,19 @@ PreparedProgramSession::RejectTemporalFrame(ReasonId reason) noexcept {
         handle_, pending_host_tokens_, pending_host_binding_.capture_sequence,
         &discard_reason);
     if (discarded != StatusId::ready) {
-      const bool device_lost = discarded == StatusId::quarantined ||
-                               discard_reason == ReasonId::device_lost;
-      const auto status = device_lost ? StatusId::quarantined : StatusId::stale;
-      const auto failure = device_lost ? ReasonId::device_lost
-                                       : ReasonId::reconfiguration_required;
-      HandleTemporalResetResult(status, failure);
-      return FailedExecute(status, failure);
+      if (discarded == StatusId::quarantined ||
+          discard_reason == ReasonId::device_lost) {
+        RetirePendingFrame();
+        Quarantine(discard_reason);
+        return FailedExecute(StatusId::quarantined, quarantine_reason_);
+      }
+      HandleTemporalResetResult(StatusId::stale,
+                                ReasonId::reconfiguration_required);
+      return FailedExecute(StatusId::stale, ReasonId::reconfiguration_required);
     }
   }
   RetirePendingFrame();
-  latest_committed_frame_ = {};
+  ClearCurrentActivity();
   telemetry_.runtime_status = readiness_.status = StatusId::failed;
   telemetry_.runtime_reason = readiness_.reason = reason;
   readiness_.available = false;
@@ -1386,23 +1423,23 @@ void PreparedProgramSession::HandleTemporalResetResult(
     telemetry_.runtime_reason = readiness_.reason;
   } else {
     RetirePendingFrame();
-    latest_committed_frame_ = {};
+    ClearCurrentActivity();
+    if (status == StatusId::quarantined) {
+      // The adapter returns no cause: the reset trigger is not failure
+      // evidence.
+      Quarantine(ReasonId::none);
+      return;
+    }
     telemetry_.runtime_status = status;
-    telemetry_.runtime_reason =
-        status == StatusId::quarantined ? ReasonId::device_lost : reason;
+    telemetry_.runtime_reason = reason;
     readiness_.status = status;
     readiness_.reason = telemetry_.runtime_reason;
     readiness_.available = false;
-    if (status == StatusId::quarantined) {
-      quarantined_ = true;
-      ++telemetry_.device_losses;
-    } else {
-      // History is no longer proven valid. Reconfiguration is the recovery
-      // boundary; a contiguous next frame cannot skip the failed reset.
-      rebuild_requested_ = true;
-      readiness_.rebuild_requested = true;
-      ++telemetry_.rebuild_requests;
-    }
+    // History is no longer proven valid. Reconfiguration is the recovery
+    // boundary; a contiguous next frame cannot skip the failed reset.
+    rebuild_requested_ = true;
+    readiness_.rebuild_requested = true;
+    ++telemetry_.rebuild_requests;
   }
 }
 
@@ -1410,12 +1447,10 @@ void PreparedProgramSession::Invalidate(ReasonId reason) noexcept {
   completion_pending_ = false;
   host_binding_pending_ = false;
   pending_stage_count_ = 0;
-  latest_committed_frame_ = {};
   have_capture_sequence_ = false;
-  if (reason == ReasonId::device_lost) {
-    quarantined_ = true;
-    ++telemetry_.device_losses;
-  }
+  ClearCurrentActivity();
+  if (quarantined_ || reason == ReasonId::device_lost)
+    Quarantine(reason);
   DestroyActive();
 }
 
