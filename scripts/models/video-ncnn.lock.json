@@ -1,0 +1,43 @@
+{
+  "pnnx_version": "20261020",
+  "pnnx_sha256": "4db234cb90a27dc15e04e0d0edf5706c7a488ab8e6235cf8c146c6ec80fd9355",
+  "pnnx_wheel_url": "https://files.pythonhosted.org/packages/5c/b7/9665ea73f6503fea4f30abbd3eebcea1c8500095496167761a15482354bc/pnnx-20261020-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+  "pnnx_wheel_sha256": "d50d921e5897293d616444191c1a2dc5366423c81bdb4bd22a985fe8071cf17c",
+  "ncnn_commit": "24ea07e87f544a3fbc59980b57885a92c75f2d24",
+  "reference_cmake_options": [
+    "-DNCNN_VULKAN=OFF",
+    "-DNCNN_RUNTIME_CPU=OFF",
+    "-DNCNN_AVX=ON",
+    "-DNCNN_AVX2=ON",
+    "-DNCNN_FMA=ON",
+    "-DNCNN_AVXVNNI=ON",
+    "-DNCNN_AVX512=OFF",
+    "-DNCNN_INT8=OFF",
+    "-DNCNN_BF16=OFF",
+    "-DNCNN_OPENMP=OFF"
+  ],
+  "python_versions": {
+    "numpy": "2.1.3",
+    "onnx": "1.16.0",
+    "onnxruntime": "1.23.2"
+  },
+  "sources": {
+    "fastdvdnet": "0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac",
+    "yunet": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    "left": "1a5129972dbc2ace9170d79ad4986e8c5130a79ac2180c01c826ef242d8e3d00",
+    "right": "736b7c6b91d1475d45083b00325d54d380ae1c51767e1f7ef69a3d14083cfcf1"
+  },
+  "licenses": {
+    "yunet": {
+      "sha256": "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958",
+      "upstream_revision": "bfac311b2b30de4648307d9939d2f9e33e012007",
+      "url": "https://raw.githubusercontent.com/opencv/opencv_zoo/bfac311b2b30de4648307d9939d2f9e33e012007/models/face_detection_yunet/LICENSE"
+    },
+    "flx": {
+      "sha256": "6aa3c846221fc8606faad0394595a45f5a0cb97787ccfd0ba884ffab0b9c4d19",
+      "upstream_revision": "91e963eada612db50b243426f406402c81661e74",
+      "url": "https://raw.githubusercontent.com/WangWilly/gaze-correction-cam/91e963eada612db50b243426f406402c81661e74/LICENSE"
+    }
+  },
+  "flx_meshgrid_sha256": "2b34c278db9e38264e66b925f5d0901a9de3fd8674dad1138d8bfff76cd4ac73"
+}
