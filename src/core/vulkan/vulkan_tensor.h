@@ -23,7 +23,8 @@ public:
   ~VulkanTensor();
 
   bool AllocateNchwF32(VulkanDevice *device, int n_in, int c_in, int h_in,
-                       int w_in, bool map_memory, std::string *error_out);
+                       int w_in, bool map_memory, std::string *error_out,
+                       VkDeviceSize allocation_limit = 0);
   void Free() noexcept;
 
   bool Valid() const;

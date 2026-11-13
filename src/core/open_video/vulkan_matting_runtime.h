@@ -5,6 +5,10 @@
 #include <memory>
 #include <string>
 
+namespace studiocast::vulkan {
+class ResidentCommandBatch;
+}
+
 namespace studiocast::open_vulkan {
 
 // Failure classes are intentionally runtime-neutral. A production ncnn
@@ -230,6 +234,13 @@ public:
   virtual VulkanMattingRuntimeResult
   Run(const VulkanMattingBufferBinding &input,
       const VulkanMattingBufferBinding &alpha_output) = 0;
+  virtual VulkanMattingRuntimeResult Enqueue(const VulkanMattingBufferBinding &,
+                                             const VulkanMattingBufferBinding &,
+                                             vulkan::ResidentCommandBatch &) {
+    return VulkanMattingRuntimeResult::Failure(
+        VulkanMattingRuntimeFailure::unavailable,
+        "Queued matting unsupported by this adapter");
+  }
   virtual VulkanMattingRuntimeEvidence Evidence() const = 0;
   virtual void
   RefreshExecutionEvidence(VulkanMattingRuntimeEvidence *out) const {
@@ -258,6 +269,9 @@ public:
   bool Run(const VulkanMattingBufferBinding &input,
            const VulkanMattingBufferBinding &alpha_output,
            std::string *error_out);
+  bool Enqueue(const VulkanMattingBufferBinding &input,
+               const VulkanMattingBufferBinding &alpha_output,
+               vulkan::ResidentCommandBatch &batch, std::string *error_out);
   bool LatchExternalFailure(VulkanMattingRuntimeFailure failure,
                             std::string detail, std::string *error_out);
 
@@ -281,7 +295,8 @@ private:
                            std::string *error_out);
   bool VerifyBinding(const VulkanMattingBufferBinding &binding,
                      const char *name, int expected_n, int expected_c,
-                     int expected_h, int expected_w, std::string *error_out);
+                     int expected_h, int expected_w, std::string *error_out,
+                     bool queued = false);
   bool VerifyExecutionEvidence(const VulkanMattingRuntimeEvidence &evidence,
                                bool warmup, std::string *error_out);
 

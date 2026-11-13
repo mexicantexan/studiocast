@@ -35,10 +35,10 @@ struct VulkanInferenceTensorBinding {
 };
 
 struct VulkanInferenceBindings {
-  std::array<VulkanInferenceTensorBinding,
-             open_video::kMaxNcnnVulkanInputs> inputs{};
-  std::array<VulkanInferenceTensorBinding,
-             open_video::kMaxNcnnVulkanOutputs> outputs{};
+  std::array<VulkanInferenceTensorBinding, open_video::kMaxNcnnVulkanInputs>
+      inputs{};
+  std::array<VulkanInferenceTensorBinding, open_video::kMaxNcnnVulkanOutputs>
+      outputs{};
   std::size_t input_count = 0;
   std::size_t output_count = 0;
   std::uint64_t owner_generation = 0;
@@ -55,17 +55,20 @@ public:
   NcnnVulkanInference(const NcnnVulkanInference &) = delete;
   NcnnVulkanInference &operator=(const NcnnVulkanInference &) = delete;
 
-  VulkanMattingRuntimeResult Prepare(
-      const VulkanMattingDeviceContext &device,
-      const open_video::NcnnVulkanNetworkSpec &immutable_graph,
-      const VulkanInferenceBindings &bindings,
-      std::shared_ptr<VulkanInferenceSharedQuota> shared_quota);
+  VulkanMattingRuntimeResult
+  Prepare(const VulkanMattingDeviceContext &device,
+          const open_video::NcnnVulkanNetworkSpec &immutable_graph,
+          const VulkanInferenceBindings &bindings,
+          std::shared_ptr<VulkanInferenceSharedQuota> shared_quota);
   VulkanMattingRuntimeResult Warmup();
   // Enqueued producers need not be CPU-complete: the exact same-batch context,
   // generation, immutable binding, and recorded prefix barriers prove ordered
   // access. No caller-supplied synchronized bool can override these checks.
   VulkanMattingRuntimeResult Enqueue(vulkan::ResidentCommandBatch &batch);
+  // Full snapshot copies setup strings; use RefreshExecutionEvidence in frames.
   VulkanMattingRuntimeEvidence Evidence() const;
+  void
+  RefreshExecutionEvidence(VulkanMattingRuntimeEvidence *out) const noexcept;
   // False retains all resources after unsafe completion; late quiescence may
   // permit retirement but never fabricates successful inference counters.
   bool Shutdown() noexcept;
