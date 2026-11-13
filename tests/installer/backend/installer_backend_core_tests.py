@@ -2099,6 +2099,116 @@ class InstallerBackendCoreTests(unittest.TestCase):
         value = terminal_result(result.stdout)
         self.assertEqual(value["reviewed_operation_ids"], value["executed_operation_ids"])
 
+    def test_model_readiness_token_cannot_become_recommendation_blocker(self):
+        for effect, prefix, success in (
+            ("virtual_background.blur", "matting", "open_vulkan_matting_production_ready"),
+            ("eye_contact", "eye_contact", "open_vulkan_eye_contact_production_ready"),
+            ("video_noise_removal", "video_noise_removal", "open_vulkan_video_noise_removal_production_ready"),
+        ):
+            engine = {"available_effects": [effect], prefix + "_reason_code": success,
+                      prefix + "_production_ready": True}
+            engine.update(dict.fromkeys((
+                "compiled_enabled", "ok", "runtime_library_found", "instance_created",
+                "physical_device_found", "non_cpu_device_selected", "compute_queue_available",
+                "logical_device_created", "context_created", "context_healthy",
+                "production_hardware_ready", "shader_pipeline_created",
+            ), True))
+            matrix = effect_capabilities({"engines": {"open_vulkan": engine}}, {})[effect]
+            self.assertFalse(matrix["vulkan_evidence"]["production_ready"])
+            self.assertNotIn(success, matrix["blocker_reason_codes"]["vulkan"])
+            self.assertIn(f"effect.{effect}.vulkan.production_evidence_inconsistent",
+                          matrix["blocker_reason_codes"]["vulkan"])
+            upstream = "vulkan_device_lost"
+            engine[prefix + "_blocker_code"] = upstream
+            matrix = effect_capabilities({"engines": {"open_vulkan": engine}}, {})[effect]
+            self.assertIn(upstream, matrix["blocker_reason_codes"]["vulkan"])
+
+    def test_resident_auto_frame_requires_complete_current_native_evidence(self):
+        engine = {
+            "compiled_enabled": True, "ok": True,
+            "runtime_library_found": True, "instance_created": True,
+            "physical_device_found": True, "non_cpu_device_selected": True,
+            "compute_queue_available": True, "logical_device_created": True,
+            "context_created": True, "context_healthy": True,
+            "production_hardware_ready": True, "shader_pipeline_created": True,
+            "available_effects": ["auto_frame"], "blocked_effects": {},
+            "auto_frame_crop_stage_implemented": True,
+            "auto_frame_production_ready": True,
+            "auto_frame_readiness_code": "open_vulkan_auto_frame_production_ready",
+            "auto_frame_gpu_tracking_ready": True,
+            "auto_frame_model_contract_validated": True,
+            "auto_frame_warmup_complete": True,
+            "auto_frame_parity_validated": True,
+            "auto_frame_shared_device_imported": True,
+            "auto_frame_queue_ownership_explicit": True,
+            "auto_frame_bounded_reusable_allocations": True,
+            "auto_frame_synchronization_contract_validated": True,
+            "auto_frame_cpu_layers_used": False,
+            "auto_frame_dynamic_allocation_count": 0,
+            "auto_frame_cpu_readback_count": 0,
+            "auto_frame_cpu_fallback_count": 0,
+            "auto_frame_dispatch_count": 1,
+            "auto_frame_cpu_tail": False,
+            "auto_frame_selectable_cpu_fallback": False,
+        }
+        def capabilities(value):
+            return effect_capabilities({"engines": {"open_vulkan": value}}, {})
+        positive = capabilities(engine)
+        auto = positive["auto_frame"]
+        self.assertEqual(auto["vulkan"], "production_usable")
+        self.assertEqual(auto["success_reason_codes"]["vulkan"],
+                         ["open_vulkan_auto_frame_production_ready"])
+        self.assertEqual(auto["vulkan_evidence"]["degraded_reason_codes"], [])
+        facts = base_facts()
+        facts["effects"]["capabilities"] = positive
+        self.assertEqual(self.recommendation(facts)["selections"]["effects"]
+                         ["auto_frame"]["selected"], "vulkan")
+        for key, value in engine.items():
+            if key in {"blocked_effects", "available_effects"}:
+                continue
+            with self.subTest(missing=key):
+                candidate = copy.deepcopy(engine)
+                candidate.pop(key)
+                self.assertFalse(capabilities(candidate)["auto_frame"]
+                                 ["vulkan_evidence"]["production_ready"])
+            if type(value) is bool:
+                with self.subTest(inverted=key):
+                    candidate = copy.deepcopy(engine)
+                    candidate[key] = not value
+                    self.assertFalse(capabilities(candidate)["auto_frame"]
+                                     ["vulkan_evidence"]["production_ready"])
+        for key in ("auto_frame_dynamic_allocation_count", "auto_frame_cpu_readback_count",
+                    "auto_frame_cpu_fallback_count", "auto_frame_dispatch_count"):
+            for value in (None, False, True, -1, "0", 0.0, 0 if key.endswith("dispatch_count") else 1):
+                with self.subTest(counter=key, value=value):
+                    candidate = copy.deepcopy(engine)
+                    candidate[key] = value
+                    self.assertFalse(capabilities(candidate)["auto_frame"]
+                                     ["vulkan_evidence"]["production_ready"])
+        for key, value in (("available_effects", []), ("auto_frame_readiness_code", "ready")):
+            candidate = copy.deepcopy(engine)
+            candidate[key] = value
+            self.assertFalse(capabilities(candidate)["auto_frame"]
+                             ["vulkan_evidence"]["production_ready"])
+        for key, value in (("blocked_effects", {"auto_frame": "vulkan_device_lost"}),
+                           ("auto_frame_blocker_code", "vulkan_auto_frame_yunet_unavailable")):
+            candidate = copy.deepcopy(engine)
+            candidate[key] = value
+            self.assertFalse(capabilities(candidate)["auto_frame"]
+                             ["vulkan_evidence"]["production_ready"])
+        legacy = copy.deepcopy(engine)
+        legacy["auto_frame_cpu_tail"] = True
+        legacy["auto_frame_blocker_code"] = "vulkan_auto_frame_yunet_unavailable"
+        degraded = capabilities(legacy)["auto_frame"]
+        self.assertEqual(degraded["vulkan"], "usable_with_degraded_behavior")
+        self.assertFalse(degraded["vulkan_evidence"]["production_ready"])
+        self.assertIn("vulkan_effect_cpu_tail", degraded["vulkan_evidence"]["degraded_reason_codes"])
+        # Higher-priority engines still win independently for this exact effect.
+        for selected in ("cuda", "maxine"):
+            facts["effects"]["capabilities"]["auto_frame"][selected] = "production_usable"
+            self.assertEqual(self.recommendation(facts)["selections"]["effects"]
+                             ["auto_frame"]["selected"], selected)
+
     def test_host_analyzer_consumes_runtime_diagnostics_and_real_vulkan_compute_evidence(self):
         current_bin = Path(self.s.env["XDG_DATA_HOME"]) / "studiocast/current/bin"
         current_bin.mkdir(parents=True)
@@ -2475,7 +2585,10 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         shutil.rmtree(cache)
         self.assertEqual(subprocess.run([str(current / "bin/studiocast")]).returncode, 0)
 
-        self.s.write_facts(self.s.json("analyze", "--target-version", "0.2.9"))
+        facts = self.s.json("analyze", "--target-version", "0.2.9")
+        # The fake CMake payload is tiny; this tests rollback, not host disk space.
+        facts["paths"]["free_bytes"] = 20_000_000_000
+        self.s.write_facts(facts)
         update = self.s.json("plan", "update", "--facts", str(self.s.facts), "--source-dir", str(SOURCE),
                              "--no-v4l2loopback", "--no-service", "--no-models", "--allow-unsupported")
         path.write_text(json.dumps(update), encoding="utf-8")
@@ -2505,6 +2618,7 @@ case "${1:-}" in --query-gpu=*) printf '0, GPU-test, Test GPU, 550.1, 8.6\\n';; 
         self.assertEqual(current.resolve(), prior)
 
         facts = self.s.json("analyze", "--target-version", "0.2.9")
+        facts["paths"]["free_bytes"] = 20_000_000_000
         self.s.write_facts(facts)
         unit = Path(self.s.env["XDG_CONFIG_HOME"]) / "systemd/user/studiocastd.service"
         unit.parent.mkdir(parents=True, exist_ok=True)

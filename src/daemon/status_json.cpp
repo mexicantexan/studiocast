@@ -910,7 +910,10 @@ HasSatisfiedEvidence(const video::ProductCapabilityLane *lane,
     const auto &evidence = lane->semantic.evidence[i];
     if (evidence.code == code && evidence.satisfied &&
         evidence.status == hal::StatusId::ready &&
-        evidence.reason == hal::ReasonId::none) {
+        evidence.reason == hal::ReasonId::none &&
+        evidence.backend == hal::BackendId::vulkan &&
+        (evidence.semantic == lane->effect ||
+         evidence.semantic == hal::SemanticEffectId::invalid)) {
       return true;
     }
   }
@@ -1031,7 +1034,7 @@ void AppendOpenVulkanEngine(std::ostream &out,
                                 video::ProductCapabilityLaneId::open_vulkan);
   const auto *vignette = FindLane(snapshot, hal::SemanticEffectId::vignette,
                                   video::ProductCapabilityLaneId::open_vulkan);
-  const auto *matting =
+  const video::ProductCapabilityLane *matting =
       FindLane(snapshot, hal::SemanticEffectId::virtual_background_blur,
                video::ProductCapabilityLaneId::open_vulkan);
   const auto *auto_frame =
@@ -1043,14 +1046,54 @@ void AppendOpenVulkanEngine(std::ostream &out,
       FindLane(snapshot, hal::SemanticEffectId::video_noise_removal,
                video::ProductCapabilityLaneId::open_vulkan);
   const bool current = video::IsCapabilitySnapshotCurrent(snapshot);
-  const bool mirror_ready =
-      mirror && video::IsProductCapabilityLaneEligible(snapshot, *mirror);
+  const auto eligible = [&](const auto *lane) {
+    return lane && video::IsProductCapabilityLaneEligible(snapshot, *lane);
+  };
+  const auto model_eligible = [&](const auto *lane) {
+    return eligible(lane) &&
+           lane->semantic.cpu_tail == hal::CpuTailId::invalid &&
+           HasSatisfiedEvidence(lane, Evidence::vulkan_warmup_complete) &&
+           HasSatisfiedEvidence(lane, Evidence::vulkan_live_stage_present);
+  };
+  const bool mirror_ready = eligible(mirror);
   const bool vignette_ready =
-      vignette && video::IsProductCapabilityLaneEligible(snapshot, *vignette);
+      eligible(vignette) &&
+      HasSatisfiedEvidence(
+          vignette,
+          Evidence::open_vulkan_vignette_fixed_center_production_ready);
+  const bool tracked_vignette_ready =
+      model_eligible(vignette) &&
+      HasSatisfiedEvidence(vignette,
+                           Evidence::vulkan_tracked_vignette_center_supported);
+  // A shared runtime flag may describe any eligible matting consumer. Exact
+  // per-effect availability remains in available_effects and blocked_effects.
+  for (const auto semantic : {hal::SemanticEffectId::virtual_background_remove,
+                              hal::SemanticEffectId::virtual_background_replace,
+                              hal::SemanticEffectId::virtual_key_light}) {
+    const auto *candidate = FindLane(
+        snapshot, semantic, video::ProductCapabilityLaneId::open_vulkan);
+    if (!model_eligible(matting) && model_eligible(candidate))
+      matting = candidate;
+  }
+  const bool matting_ready = model_eligible(matting);
+  const bool eye_ready = model_eligible(eye);
+  const bool denoise_ready = model_eligible(denoise);
+  const bool auto_ready =
+      model_eligible(auto_frame) &&
+      auto_frame->semantic.cpu_tail == hal::CpuTailId::invalid;
   const auto common = [&](Evidence code) {
-    return HasSatisfiedEvidence(mirror, code) ||
-           HasSatisfiedEvidence(vignette, code) ||
-           HasSatisfiedEvidence(matting, code);
+    for (std::size_t i = 0; i < snapshot.lane_count; ++i)
+      if (snapshot.lanes[i].lane ==
+              video::ProductCapabilityLaneId::open_vulkan &&
+          HasSatisfiedEvidence(&snapshot.lanes[i], code))
+        return true;
+    return false;
+  };
+  const auto proof = [&](const auto *lane, Evidence code) {
+    return HasSatisfiedEvidence(lane, code);
+  };
+  const auto field = [&](std::string_view name, bool value) {
+    out << ",\"" << name << "\":" << (value ? "true" : "false");
   };
   const bool build = common(Evidence::vulkan_build_enabled);
   const bool loader = common(Evidence::vulkan_loader_available);
@@ -1062,11 +1105,13 @@ void AppendOpenVulkanEngine(std::ostream &out,
   const bool hardware_ready =
       build && loader && physical && non_cpu && queue && context;
 
+  const bool engine_ready = mirror_ready || vignette_ready ||
+                            tracked_vignette_ready || matting_ready ||
+                            eye_ready || denoise_ready || auto_ready;
   out << "{\"status_generation\":" << status_generation
       << ",\"compiled_enabled\":" << (build ? "true" : "false")
-      << ",\"ok\":" << ((mirror_ready || vignette_ready) ? "true" : "false")
-      << ",\"supported\":"
-      << ((mirror_ready || vignette_ready) ? "true" : "false")
+      << ",\"ok\":" << (engine_ready ? "true" : "false")
+      << ",\"supported\":" << (engine_ready ? "true" : "false")
       << ",\"runtime_library_found\":" << (loader ? "true" : "false")
       << ",\"instance_created\":" << (context ? "true" : "false")
       << ",\"physical_device_found\":" << (physical ? "true" : "false")
@@ -1128,8 +1173,10 @@ void AppendOpenVulkanEngine(std::ostream &out,
                                    ? RefreshBlocker(snapshot)
                                    : video::effects::EffectCapabilityCodeToken(
                                          vignette->code)));
-  out << ",\"vignette_parameter_contract\":\"fixed_center\""
-      << ",\"auto_frame_production_ready\":false"
+  out << ",\"vignette_parameter_contract\":\"fixed_center\"";
+  if (tracked_vignette_ready)
+    field("vignette_tracked_center_production_ready", true);
+  out << ",\"auto_frame_production_ready\":" << (auto_ready ? "true" : "false")
       << ",\"auto_frame_crop_stage_implemented\":"
       << ((auto_frame && auto_frame->semantic.live_stage) ? "true" : "false")
       << ",\"auto_frame_cpu_tail\":"
@@ -1140,16 +1187,45 @@ void AppendOpenVulkanEngine(std::ostream &out,
               ? "true"
               : "false")
       << ",\"auto_frame_selectable_cpu_fallback\":false"
-      << ",\"auto_frame_readiness_code\":\"\""
-      << ",\"auto_frame_degraded_reason_code\":\"vulkan_effect_cpu_tail\""
-      << ",\"auto_frame_blocker_code\":";
-  AppendJsonString(out, auto_frame ? video::effects::EffectCapabilityCodeToken(
+      << ",\"auto_frame_readiness_code\":";
+  AppendJsonString(out, auto_ready ? video::effects::EffectCapabilityCodeToken(
                                          auto_frame->code)
                                    : std::string_view{});
+  if (proof(auto_frame, Evidence::vulkan_face_runtime_ready) ||
+      proof(auto_frame, Evidence::vulkan_tracking_gpu_ready)) {
+    field("auto_frame_gpu_tracking_ready", auto_ready);
+    field("auto_frame_model_contract_validated",
+          proof(auto_frame, Evidence::vulkan_model_artifacts_valid));
+    field("auto_frame_warmup_complete",
+          proof(auto_frame, Evidence::vulkan_warmup_complete));
+    field("auto_frame_parity_validated", false);
+    field("auto_frame_shared_device_imported",
+          proof(auto_frame, Evidence::vulkan_exact_device_shared));
+    field("auto_frame_queue_ownership_explicit",
+          proof(auto_frame, Evidence::vulkan_exact_device_shared));
+    field("auto_frame_bounded_reusable_allocations",
+          proof(auto_frame, Evidence::vulkan_bounded_allocations));
+    field("auto_frame_synchronization_contract_validated",
+          proof(auto_frame, Evidence::vulkan_exact_device_shared));
+  }
+  // This cached capability matrix has no per-run dispatch or allocation counts,
+  // and carries no reviewed-artifact numerical parity attestation.
+  out << ",\"auto_frame_degraded_reason_code\":\"vulkan_effect_cpu_tail\""
+      << ",\"auto_frame_blocker_code\":";
+  AppendJsonString(
+      out, auto_ready
+               ? std::string_view{}
+               : (!RefreshBlocker(snapshot).empty()
+                      ? RefreshBlocker(snapshot)
+                      : (auto_frame ? video::effects::EffectCapabilityCodeToken(
+                                          auto_frame->code)
+                                    : std::string_view{})));
   out << ",\"matting_runtime\":\"\""
-      << ",\"matting_production_ready\":false"
+      << ",\"matting_production_ready\":" << (matting_ready ? "true" : "false")
       << ",\"matting_build_enabled\":" << (build ? "true" : "false")
-      << ",\"matting_adapter_available\":false"
+      << ",\"matting_adapter_available\":"
+      << (proof(matting, Evidence::vulkan_matting_runtime_ready) ? "true"
+                                                                 : "false")
       << ",\"matting_runtime_created\":"
       << (HasSatisfiedEvidence(matting, Evidence::vulkan_matting_runtime_ready)
               ? "true"
@@ -1196,16 +1272,24 @@ void AppendOpenVulkanEngine(std::ostream &out,
                                       matting->nested_code)
                                 : std::string_view{});
   out << ",\"matting_cpu_layers_used\":false"
-      << ",\"matting_shared_device_imported\":false"
-      << ",\"matting_queue_ownership_explicit\":false"
-      << ",\"matting_synchronous_completion\":false"
-      << ",\"matting_bounded_reusable_allocations\":false"
+      << ",\"matting_shared_device_imported\":"
+      << (proof(matting, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"matting_queue_ownership_explicit\":"
+      << (proof(matting, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"matting_synchronous_completion\":"
+      << (proof(matting, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"matting_bounded_reusable_allocations\":"
+      << (proof(matting, Evidence::vulkan_bounded_allocations) ? "true"
+                                                               : "false")
       << ",\"matting_persistent_allocation_count\":0"
       << ",\"matting_dynamic_allocation_count\":0"
       << ",\"matting_cpu_readback_count\":0"
       << ",\"matting_cpu_fallback_count\":0"
       << ",\"matting_parity_validated\":false"
-      << ",\"eye_contact_production_ready\":false"
+      << ",\"eye_contact_production_ready\":" << (eye_ready ? "true" : "false")
       << ",\"eye_contact_reason_code\":";
   AppendJsonString(out,
                    eye ? video::effects::EffectCapabilityCodeToken(eye->code)
@@ -1216,22 +1300,36 @@ void AppendOpenVulkanEngine(std::ostream &out,
   AppendJsonString(
       out, eye ? video::effects::EffectCapabilityCodeToken(eye->nested_code)
                : std::string_view{});
-  out << ",\"eye_contact_production_adapter_available\":false"
-      << ",\"eye_contact_vulkan_inference_provider_available\":false"
-      << ",\"eye_contact_shared_device_imported\":false"
-      << ",\"eye_contact_queue_ownership_explicit\":false"
-      << ",\"eye_contact_model_pack_selected\":false"
-      << ",\"eye_contact_artifact_contract_validated\":false"
-      << ",\"eye_contact_device_resident_analysis\":false"
-      << ",\"eye_contact_device_resident_tensor_io\":false"
-      << ",\"eye_contact_warmup_complete\":false"
-      << ",\"eye_contact_bounded_reusable_allocations\":false"
-      << ",\"eye_contact_synchronization_contract_validated\":false"
+  out << ",\"eye_contact_production_adapter_available\":"
+      << (proof(eye, Evidence::vulkan_eye_runtime_ready) ? "true" : "false")
+      << ",\"eye_contact_vulkan_inference_provider_available\":"
+      << (proof(eye, Evidence::vulkan_eye_runtime_ready) ? "true" : "false")
+      << ",\"eye_contact_shared_device_imported\":"
+      << (proof(eye, Evidence::vulkan_exact_device_shared) ? "true" : "false")
+      << ",\"eye_contact_queue_ownership_explicit\":"
+      << (proof(eye, Evidence::vulkan_exact_device_shared) ? "true" : "false")
+      << ",\"eye_contact_model_pack_selected\":"
+      << (proof(eye, Evidence::vulkan_model_artifacts_valid) ? "true" : "false")
+      << ",\"eye_contact_artifact_contract_validated\":"
+      << (proof(eye, Evidence::vulkan_model_artifacts_valid) ? "true" : "false")
+      << ",\"eye_contact_device_resident_analysis\":"
+      << (proof(eye, Evidence::vulkan_device_local_residency) ? "true"
+                                                              : "false")
+      << ",\"eye_contact_device_resident_tensor_io\":"
+      << (proof(eye, Evidence::vulkan_device_local_residency) ? "true"
+                                                              : "false")
+      << ",\"eye_contact_warmup_complete\":"
+      << (proof(eye, Evidence::vulkan_warmup_complete) ? "true" : "false")
+      << ",\"eye_contact_bounded_reusable_allocations\":"
+      << (proof(eye, Evidence::vulkan_bounded_allocations) ? "true" : "false")
+      << ",\"eye_contact_synchronization_contract_validated\":"
+      << (proof(eye, Evidence::vulkan_exact_device_shared) ? "true" : "false")
       << ",\"eye_contact_parity_validated\":false"
       << ",\"eye_contact_selectable_cpu_fallback\":false"
       << ",\"eye_contact_cpu_readback_count\":0"
       << ",\"eye_contact_cpu_fallback_count\":0"
-      << ",\"video_noise_removal_production_ready\":false"
+      << ",\"video_noise_removal_production_ready\":"
+      << (denoise_ready ? "true" : "false")
       << ",\"video_noise_removal_reason_code\":";
   AppendJsonString(
       out, denoise ? video::effects::EffectCapabilityCodeToken(denoise->code)
@@ -1242,18 +1340,41 @@ void AppendOpenVulkanEngine(std::ostream &out,
   AppendJsonString(out, denoise ? video::effects::EffectCapabilityCodeToken(
                                       denoise->nested_code)
                                 : std::string_view{});
-  out << ",\"video_noise_removal_production_adapter_available\":false"
-      << ",\"video_noise_removal_vulkan_inference_provider_available\":false"
-      << ",\"video_noise_removal_shared_device_imported\":false"
-      << ",\"video_noise_removal_queue_ownership_explicit\":false"
-      << ",\"video_noise_removal_model_pack_selected\":false"
-      << ",\"video_noise_removal_artifact_contract_validated\":false"
-      << ",\"video_noise_removal_fully_device_resident_tensor_io\":false"
-      << ",\"video_noise_removal_device_resident_preprocess\":false"
-      << ",\"video_noise_removal_device_resident_postprocess\":false"
-      << ",\"video_noise_removal_warmup_complete\":false"
-      << ",\"video_noise_removal_synchronization_contract_validated\":false"
-      << ",\"video_noise_removal_bounded_reusable_allocations\":false"
+  out << ",\"video_noise_removal_production_adapter_available\":"
+      << (proof(denoise, Evidence::vulkan_denoise_runtime_ready) ? "true"
+                                                                 : "false")
+      << ",\"video_noise_removal_vulkan_inference_provider_available\":"
+      << (proof(denoise, Evidence::vulkan_denoise_runtime_ready) ? "true"
+                                                                 : "false")
+      << ",\"video_noise_removal_shared_device_imported\":"
+      << (proof(denoise, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"video_noise_removal_queue_ownership_explicit\":"
+      << (proof(denoise, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"video_noise_removal_model_pack_selected\":"
+      << (proof(denoise, Evidence::vulkan_model_artifacts_valid) ? "true"
+                                                                 : "false")
+      << ",\"video_noise_removal_artifact_contract_validated\":"
+      << (proof(denoise, Evidence::vulkan_model_artifacts_valid) ? "true"
+                                                                 : "false")
+      << ",\"video_noise_removal_fully_device_resident_tensor_io\":"
+      << (proof(denoise, Evidence::vulkan_device_local_residency) ? "true"
+                                                                  : "false")
+      << ",\"video_noise_removal_device_resident_preprocess\":"
+      << (proof(denoise, Evidence::vulkan_device_local_residency) ? "true"
+                                                                  : "false")
+      << ",\"video_noise_removal_device_resident_postprocess\":"
+      << (proof(denoise, Evidence::vulkan_device_local_residency) ? "true"
+                                                                  : "false")
+      << ",\"video_noise_removal_warmup_complete\":"
+      << (proof(denoise, Evidence::vulkan_warmup_complete) ? "true" : "false")
+      << ",\"video_noise_removal_synchronization_contract_validated\":"
+      << (proof(denoise, Evidence::vulkan_exact_device_shared) ? "true"
+                                                               : "false")
+      << ",\"video_noise_removal_bounded_reusable_allocations\":"
+      << (proof(denoise, Evidence::vulkan_bounded_allocations) ? "true"
+                                                               : "false")
       << ",\"video_noise_removal_temporal_history_device_resident\":false"
       << ",\"video_noise_removal_temporal_history_bounded\":false"
       << ",\"video_noise_removal_history_reset_on_disable\":false"

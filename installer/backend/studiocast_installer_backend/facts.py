@@ -382,6 +382,8 @@ def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, An
     cuda_blocked = open_cuda.get("blocked_effects", {})
     cuda_blocked = cuda_blocked if isinstance(cuda_blocked, dict) else {}
     vulkan_available = set(open_vulkan.get("available_effects", []))
+    vulkan_blocked = open_vulkan.get("blocked_effects", {})
+    vulkan_blocked = vulkan_blocked if isinstance(vulkan_blocked, dict) else {}
     vulkan_common, vulkan_common_blocker = common_vulkan_effect_evidence(open_vulkan)
 
     out: dict[str, Any] = {}
@@ -515,20 +517,68 @@ def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, An
             evidence["live_stage_implemented"] = (
                 open_vulkan.get("auto_frame_crop_stage_implemented") is True)
             evidence["cpu_tail"] = open_vulkan.get("auto_frame_cpu_tail") is True
-            evidence["degraded_reason_codes"] = [str(
-                open_vulkan.get("auto_frame_degraded_reason_code") or
-                "vulkan_effect_cpu_tail")]
             evidence["selectable_cpu_fallback"] = (
                 open_vulkan.get("auto_frame_selectable_cpu_fallback") is True)
-            # The real crop stage and its CPU tracking tail are implementation
-            # facts, not production-ready or selectable CPU-engine evidence.
-            evidence["production_ready"] = False
-            if (effect in vulkan_available and evidence["live_stage_implemented"] and
-                    evidence["cpu_tail"]):
-                vulkan_status = "usable_with_degraded_behavior"
-            specific_blocker = (vulkan_common_blocker or str(
-                open_vulkan.get("auto_frame_blocker_code") or
-                "vulkan_auto_frame_yunet_unavailable"))
+            evidence["gpu_tracking_ready"] = (
+                open_vulkan.get("auto_frame_gpu_tracking_ready") is True)
+            dispatches = open_vulkan.get("auto_frame_dispatch_count")
+            evidence["dispatch_complete"] = type(dispatches) is int and dispatches > 0
+            evidence["runtime_ready"] = (evidence["gpu_tracking_ready"] and
+                                         evidence["dispatch_complete"])
+            evidence["model_artifact_ready"] = (
+                open_vulkan.get("auto_frame_model_contract_validated") is True)
+            evidence["warmup_complete"] = (
+                open_vulkan.get("auto_frame_warmup_complete") is True)
+            evidence["parity_validated"] = (
+                open_vulkan.get("auto_frame_parity_validated") is True)
+            evidence["exact_device_and_queue"] = (
+                open_vulkan.get("auto_frame_shared_device_imported") is True and
+                open_vulkan.get("auto_frame_queue_ownership_explicit") is True)
+            evidence["bounded_reusable_allocations"] = (
+                open_vulkan.get("auto_frame_bounded_reusable_allocations") is True)
+            evidence["synchronization_contract_validated"] = (
+                open_vulkan.get("auto_frame_synchronization_contract_validated") is True)
+            evidence["no_cpu_layers"] = (
+                open_vulkan.get("auto_frame_cpu_layers_used") is False)
+            for key, field in (("no_dynamic_allocations", "auto_frame_dynamic_allocation_count"),
+                               ("no_cpu_readback", "auto_frame_cpu_readback_count"),
+                               ("no_cpu_fallback", "auto_frame_cpu_fallback_count")):
+                count = open_vulkan.get(field)
+                evidence[key] = type(count) is int and count == 0
+            evidence["device_resident"] = (
+                evidence["gpu_tracking_ready"] and evidence["no_cpu_readback"] and
+                open_vulkan.get("auto_frame_cpu_tail") is False)
+            exact_ready = (evidence["daemon_production_ready"] and
+                           open_vulkan.get("auto_frame_readiness_code") ==
+                           "open_vulkan_auto_frame_production_ready")
+            evidence["effect_production_ready_attested"] = exact_ready
+            evidence["production_ready"] = bool(
+                evidence["common_ready"] and exact_ready and
+                evidence["live_stage_implemented"] and evidence["runtime_ready"] and
+                evidence["model_artifact_ready"] and evidence["warmup_complete"] and
+                evidence["parity_validated"] and evidence["exact_device_and_queue"] and
+                evidence["bounded_reusable_allocations"] and
+                evidence["synchronization_contract_validated"] and
+                evidence["device_resident"] and evidence["no_cpu_layers"] and
+                evidence["no_dynamic_allocations"] and evidence["no_cpu_readback"] and
+                evidence["no_cpu_fallback"] and
+                open_vulkan.get("auto_frame_cpu_tail") is False and
+                open_vulkan.get("auto_frame_selectable_cpu_fallback") is False and
+                not open_vulkan.get("auto_frame_blocker_code") and
+                not vulkan_blocked.get(effect) and effect in vulkan_available)
+            if evidence["production_ready"]:
+                vulkan_status = "production_usable"
+                success_codes["vulkan"] = ["open_vulkan_auto_frame_production_ready"]
+            else:
+                if (effect in vulkan_available and evidence["live_stage_implemented"] and
+                        evidence["cpu_tail"]):
+                    vulkan_status = "usable_with_degraded_behavior"
+                    evidence["degraded_reason_codes"] = [str(
+                        open_vulkan.get("auto_frame_degraded_reason_code") or
+                        "vulkan_effect_cpu_tail")]
+                specific_blocker = (vulkan_common_blocker or str(
+                    open_vulkan.get("auto_frame_blocker_code") or
+                    "vulkan_auto_frame_yunet_unavailable"))
         elif effect in {"virtual_background.blur", "virtual_background.remove",
                         "virtual_background.replace", "virtual_key_light"}:
             evidence["daemon_production_ready"] = (
@@ -584,10 +634,12 @@ def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, An
                 success_codes["vulkan"] = ["open_vulkan_matting_production_ready"]
             else:
                 vulkan_status = "experimental"
-                specific_blocker = (vulkan_common_blocker or str(
-                    open_vulkan.get("matting_reason_code") or
-                    "open_vulkan_matting_unavailable"))
+                reported = open_vulkan.get("matting_reason_code")
                 nested = open_vulkan.get("matting_blocker_code")
+                if reported == "open_vulkan_matting_production_ready":
+                    reported = nested or f"effect.{effect}.vulkan.production_evidence_inconsistent"
+                specific_blocker = (vulkan_common_blocker or str(
+                    reported or "open_vulkan_matting_unavailable"))
                 if nested and nested != specific_blocker:
                     blocker_codes["vulkan"].append(str(nested))
         elif effect == "eye_contact":
@@ -637,10 +689,12 @@ def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, An
                 vulkan_status = "production_usable"
                 success_codes["vulkan"] = ["open_vulkan_eye_contact_production_ready"]
             else:
-                specific_blocker = (vulkan_common_blocker or str(
-                    open_vulkan.get("eye_contact_reason_code") or
-                    "open_vulkan_eye_contact_unavailable"))
+                reported = open_vulkan.get("eye_contact_reason_code")
                 nested = open_vulkan.get("eye_contact_blocker_code")
+                if reported == "open_vulkan_eye_contact_production_ready":
+                    reported = nested or f"effect.{effect}.vulkan.production_evidence_inconsistent"
+                specific_blocker = (vulkan_common_blocker or str(
+                    reported or "open_vulkan_eye_contact_unavailable"))
                 if nested and nested != specific_blocker:
                     blocker_codes["vulkan"].append(str(nested))
         elif effect == "video_noise_removal":
@@ -714,10 +768,12 @@ def effect_capabilities(diagnostics: dict[str, Any] | None, maxine: dict[str, An
                 success_codes["vulkan"] = [
                     "open_vulkan_video_noise_removal_production_ready"]
             else:
-                specific_blocker = (vulkan_common_blocker or str(
-                    open_vulkan.get("video_noise_removal_reason_code") or
-                    "open_vulkan_video_noise_removal_unavailable"))
+                reported = open_vulkan.get("video_noise_removal_reason_code")
                 nested = open_vulkan.get("video_noise_removal_blocker_code")
+                if reported == "open_vulkan_video_noise_removal_production_ready":
+                    reported = nested or f"effect.{effect}.vulkan.production_evidence_inconsistent"
+                specific_blocker = (vulkan_common_blocker or str(
+                    reported or "open_vulkan_video_noise_removal_unavailable"))
                 if nested and nested != specific_blocker:
                     blocker_codes["vulkan"].append(str(nested))
 

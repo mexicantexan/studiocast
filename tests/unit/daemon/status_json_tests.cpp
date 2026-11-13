@@ -773,6 +773,157 @@ bool TestGoldenCompatibilityScenarios() {
   return ok;
 }
 
+void PromoteVulkanModel(ProductCapabilitySnapshot *snapshot,
+                        SemanticEffectId effect, Code code,
+                        bool tracked = false) {
+  using Evidence = studiocast::hal::CapabilityEvidenceCode;
+  Promote(snapshot, effect, ProductCapabilityLaneId::open_vulkan,
+          SemanticEffectProviderId::open_vulkan_production_kernels, code);
+  auto *lane = Lane(snapshot, effect, ProductCapabilityLaneId::open_vulkan);
+  // Retain the twelve exact common proofs; replace the primitive success proof
+  // with this semantic's real model/runtime/warmup evidence contract.
+  lane->semantic.evidence_count = 12;
+  const auto add = [&](Evidence evidence) {
+    lane->semantic.evidence[lane->semantic.evidence_count++] = {
+        evidence, StatusId::ready,   ReasonId::none,
+        effect,   BackendId::vulkan, true};
+  };
+  add(Evidence::vulkan_model_artifacts_valid);
+  add(Evidence::vulkan_warmup_complete);
+  add(Evidence::vulkan_live_stage_present);
+  if (effect == SemanticEffectId::video_noise_removal) {
+    add(Evidence::vulkan_denoise_runtime_ready);
+  } else if (effect == SemanticEffectId::eye_contact) {
+    add(Evidence::vulkan_face_runtime_ready);
+    add(Evidence::vulkan_eye_runtime_ready);
+    add(Evidence::vulkan_landmarks_runtime_ready);
+    add(Evidence::vulkan_shader_float64_enabled);
+  } else if (effect == SemanticEffectId::auto_frame || tracked) {
+    add(Evidence::vulkan_face_runtime_ready);
+    add(Evidence::vulkan_tracking_gpu_ready);
+    if (tracked)
+      add(Evidence::vulkan_tracked_vignette_center_supported);
+  } else {
+    add(Evidence::vulkan_matting_runtime_ready);
+  }
+  lane->semantic.supports_tracked_vignette_center = tracked;
+}
+
+bool TestVulkanModelLegacyProjectionUsesExactLanes() {
+  struct Scenario {
+    SemanticEffectId effect;
+    Code code;
+    const char *prefix;
+  };
+  const std::array scenarios{
+      Scenario{SemanticEffectId::virtual_background_blur,
+               Code::open_vulkan_matting_production_ready, "matting"},
+      Scenario{SemanticEffectId::virtual_key_light,
+               Code::open_vulkan_matting_production_ready, "matting"},
+      Scenario{SemanticEffectId::eye_contact,
+               Code::open_vulkan_eye_contact_production_ready, "eye_contact"},
+      Scenario{SemanticEffectId::video_noise_removal,
+               Code::open_vulkan_video_noise_removal_production_ready,
+               "video_noise_removal"},
+      Scenario{SemanticEffectId::auto_frame,
+               Code::open_vulkan_auto_frame_production_ready, "auto_frame"},
+  };
+  bool ok = true;
+  for (const auto &scenario : scenarios) {
+    auto snapshot = BaseSnapshot();
+    PromoteVulkanModel(&snapshot.capabilities, scenario.effect, scenario.code);
+    const auto result =
+        studiocast::daemon::SerializeVideoRuntimeStatusJson(snapshot);
+    ok &= Expect(result.ok, "qualified model-only lane must serialize without "
+                            "mirror or fixed vignette");
+    Value actual, expected;
+    if (!result.ok ||
+        !ParseJson(result.json, &actual, "positive Vulkan model projection"))
+      return false;
+    const std::string prefix = scenario.prefix;
+    const std::string expected_text =
+        "{\"engines\":{\"open_vulkan\":{\"ok\":true,\"supported\":true,\"" +
+        prefix + "_production_ready\":true,\"" + prefix +
+        "_warmup_complete\":true,\"" + prefix + "_parity_validated\":false}}}";
+    ok &= ParseJson(expected_text, &expected,
+                    "expected exact Vulkan model fields") &&
+          IsSubset(expected, actual, "$");
+    if (scenario.effect == SemanticEffectId::auto_frame) {
+      Value auto_expected;
+      ok &=
+          ParseJson(
+              R"({"engines":{"open_vulkan":{"auto_frame_gpu_tracking_ready":true,
+          "auto_frame_model_contract_validated":true,"auto_frame_cpu_tail":false,
+          "auto_frame_shared_device_imported":true,"auto_frame_queue_ownership_explicit":true,
+          "auto_frame_bounded_reusable_allocations":true,"auto_frame_synchronization_contract_validated":true,
+          "auto_frame_readiness_code":"open_vulkan_auto_frame_production_ready"}}})",
+              &auto_expected, "Auto Frame projection") &&
+          IsSubset(auto_expected, actual, "$");
+      ok &= Expect(
+          result.json.find("auto_frame_dispatch_count") == std::string::npos,
+          "capability projection must not invent per-run dispatch evidence");
+    }
+    // A warm graph is runtime readiness, never reviewed-artifact numerical
+    // parity or proof that any frame was committed by the writer.
+    ok &= Expect(result.json.find("\"active_backend\":\"vulkan\"") ==
+                     std::string::npos,
+                 "setup capability must not invent active Vulkan attribution");
+    auto *lane = Lane(&snapshot.capabilities, scenario.effect,
+                      ProductCapabilityLaneId::open_vulkan);
+    for (std::size_t index = 0; index < lane->semantic.evidence_count;
+         ++index) {
+      const auto saved = lane->semantic.evidence[index];
+      lane->semantic.evidence[index].satisfied = false;
+      const auto incomplete =
+          studiocast::daemon::SerializeVideoRuntimeStatusJson(snapshot);
+      ok &= Expect(!incomplete.ok ||
+                       incomplete.json.find("\"" + prefix +
+                                            "_production_ready\":true") ==
+                           std::string::npos,
+                   "missing exact proof must not project model readiness");
+      lane->semantic.evidence[index] = saved;
+      if (saved.code ==
+          studiocast::hal::CapabilityEvidenceCode::vulkan_warmup_complete) {
+        lane->semantic.evidence[index].backend = BackendId::cuda;
+        const auto foreign =
+            studiocast::daemon::SerializeVideoRuntimeStatusJson(snapshot);
+        ok &= Expect(
+            !foreign.ok ||
+                foreign.json.find("\"" + prefix + "_production_ready\":true") ==
+                    std::string::npos,
+            "foreign-backend warmup cannot prove exact Vulkan readiness");
+        lane->semantic.evidence[index] = saved;
+      }
+    }
+    snapshot.capabilities.refresh.status = CapabilityRefreshStatus::stale;
+    snapshot.capabilities.refresh.code = Code::capability_snapshot_stale;
+    snapshot.capabilities.refresh.requested_generation = 6;
+    snapshot.capabilities.refresh.completed_generation = 6;
+    const auto stale =
+        studiocast::daemon::SerializeVideoRuntimeStatusJson(snapshot);
+    ok &= Expect(!stale.ok || stale.json.find("\"" + prefix +
+                                              "_production_ready\":true") ==
+                                  std::string::npos,
+                 "stale model lane must not remain production ready");
+  }
+  auto tracked = BaseSnapshot();
+  PromoteVulkanModel(&tracked.capabilities, SemanticEffectId::vignette,
+                     Code::open_vulkan_vignette_tracked_center_production_ready,
+                     true);
+  const auto result =
+      studiocast::daemon::SerializeVideoRuntimeStatusJson(tracked);
+  ok &= Expect(result.ok &&
+                   result.json.find(
+                       "\"vignette_tracked_center_production_ready\":true") !=
+                       std::string::npos &&
+                   result.json.find(
+                       "\"vignette_fixed_center_production_ready\":false") !=
+                       std::string::npos,
+               "tracked-only proof must remain distinct from the fixed-center "
+               "recommendation contract");
+  return ok;
+}
+
 bool TestCompleteTypedCapabilityProjection() {
   auto snapshot = CurrentCapabilities();
   Promote(&snapshot, SemanticEffectId::mirror,
@@ -1250,6 +1401,7 @@ int main() {
   bool ok = true;
   ok &= TestGoldenCompatibilityScenarios();
   ok &= TestCompleteTypedCapabilityProjection();
+  ok &= TestVulkanModelLegacyProjectionUsesExactLanes();
   ok &= TestMalformedSnapshotsFailClosed();
   ok &= TestActivityRequiresGenerationValidSuccessfulCommit();
   ok &= TestMultiIslandZeroAndMultipleIslandProjection();

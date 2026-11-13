@@ -159,6 +159,13 @@ def engine_capability_usable(effect: str, matrix: dict[str, Any], engine: str) -
             "parity_validated", "no_cpu_layers", "no_dynamic_allocations",
             "no_cpu_readback", "no_cpu_fallback",
         ),
+        "auto_frame": (
+            "runtime_ready", "model_artifact_ready", "warmup_complete",
+            "exact_device_and_queue", "device_resident", "gpu_tracking_ready",
+            "dispatch_complete", "synchronization_contract_validated",
+            "bounded_reusable_allocations", "parity_validated", "no_cpu_layers",
+            "no_dynamic_allocations", "no_cpu_readback", "no_cpu_fallback",
+        ),
         "eye_contact": (
             "runtime_ready", "model_artifact_ready", "warmup_complete",
             "exact_device_and_queue", "device_resident",
@@ -178,6 +185,9 @@ def engine_capability_usable(effect: str, matrix: dict[str, Any], engine: str) -
     if (required_effect_keys is None or not all(
             evidence.get(key) is True for key in required_effect_keys)):
         return False
+    if effect == "auto_frame" and (evidence.get("cpu_tail") is not False or
+                                   evidence.get("selectable_cpu_fallback") is not False):
+        return False
     if effect == "vignette" and evidence.get("parameter_contract") != "fixed_center":
         return False
     expected_success = {
@@ -187,6 +197,7 @@ def engine_capability_usable(effect: str, matrix: dict[str, Any], engine: str) -
         "virtual_background.remove": "open_vulkan_matting_production_ready",
         "virtual_background.replace": "open_vulkan_matting_production_ready",
         "virtual_key_light": "open_vulkan_matting_production_ready",
+        "auto_frame": "open_vulkan_auto_frame_production_ready",
         "eye_contact": "open_vulkan_eye_contact_production_ready",
         "video_noise_removal": "open_vulkan_video_noise_removal_production_ready",
     }.get(effect)
