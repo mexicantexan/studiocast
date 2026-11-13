@@ -1,3 +1,4 @@
+#include "core/open_video/ncnn_vulkan_context.h"
 #include "core/vulkan/vulkan_device.h"
 
 #include <iostream>
@@ -74,6 +75,14 @@ bool CheckAggregateReservations() {
   context->allocation_stats.budget_bytes = 128;
   context->allocation_stats.resource_limit = 2;
   std::string error;
+  if (studiocast::open_vulkan::ValidateProductionVulkanCoreFeatures(true, false,
+                                                                    &error) ||
+      error.find("vulkan_shader_float64_unavailable") == std::string::npos ||
+      !studiocast::open_vulkan::ValidateProductionVulkanCoreFeatures(
+          false, false, &error) ||
+      !studiocast::open_vulkan::ValidateProductionVulkanCoreFeatures(true, true,
+                                                                     &error))
+    return false;
   if (!context->ReserveAllocation(32, &error) ||
       !context->ReserveAllocation(32, &error) ||
       context->ReserveAllocation(1, &error) ||

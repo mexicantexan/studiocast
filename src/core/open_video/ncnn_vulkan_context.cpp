@@ -18,6 +18,17 @@ template <class To, class From> To Handle(From value) {
 } // namespace
 #endif
 namespace studiocast::open_vulkan {
+bool ValidateProductionVulkanCoreFeatures(bool require_shader_float64,
+                                          bool shader_float64_supported,
+                                          std::string *error_out) {
+  if (!require_shader_float64 || shader_float64_supported)
+    return true;
+  if (error_out)
+    *error_out = "[vulkan_shader_float64_unavailable] GPU dlib requires "
+                 "enabled shaderFloat64.";
+  return false;
+}
+
 bool InitializeProductionVulkanMattingDevice(
     vulkan::VulkanDevice *device,
     const vulkan::VulkanDeviceSelection &selection,
@@ -79,13 +90,11 @@ bool InitializeProductionVulkanMattingDevice(
       *error_out = "Selected Vulkan device is unavailable to ncnn.";
     return false;
   }
-  if (require_shader_float64 &&
-      !ncnn::get_gpu_info(index).physicalDevicefeatures().shaderFloat64) {
-    if (error_out)
-      *error_out = "[vulkan_shader_float64_unavailable] GPU dlib requires "
-                   "enabled shaderFloat64.";
+  if (!ValidateProductionVulkanCoreFeatures(
+          require_shader_float64,
+          ncnn::get_gpu_info(index).physicalDevicefeatures().shaderFloat64,
+          error_out))
     return false;
-  }
   owner->device = std::make_unique<ncnn::VulkanDevice>(index, true);
   if (!owner->device->is_valid()) {
     if (error_out)
