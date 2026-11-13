@@ -232,6 +232,10 @@ bool ExactRegistration(const hal::AdapterRegistration &registration,
     const auto &capability = registration.semantic_capabilities[i];
     if (UnavailableCapability(capability))
       continue;
+    if (!hal::HasVulkanProductionEvidence(capability)) {
+      SetReason(reason, ReasonId::capability_evidence_incomplete);
+      return false;
+    }
     if (capability.semantic == SemanticEffectId::mirror ||
         capability.semantic == SemanticEffectId::vignette)
       continue;
@@ -247,6 +251,11 @@ bool ExactRegistration(const hal::AdapterRegistration &registration,
       return false;
     }
   }
+  // The shared registry also rejects malformed status/evidence shapes,
+  // duplicate proof records and duplicate semantic/provider entries.
+  hal::StaticAdapterRegistry validator;
+  if (validator.Register(registration, reason) != StatusId::ready)
+    return false;
   SetReason(reason, ReasonId::none);
   return true;
 }

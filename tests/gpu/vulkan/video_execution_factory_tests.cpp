@@ -717,6 +717,73 @@ bool TestAllModelProgramContract() {
                  "all seven canonical model and utility stages must prepare");
 }
 
+bool TestFactoryRejectsIncompleteAndDuplicateModelProofs() {
+  FakeVulkanAdapter adapter;
+  const auto registration_for = [&](bool eye) {
+    auto registration = Registration(&adapter);
+    const auto semantic = eye ? hal::SemanticEffectId::eye_contact
+                              : hal::SemanticEffectId::auto_frame;
+    auto capability = Capability(
+        semantic, eye ? hal::CapabilityEvidenceCode::vulkan_eye_runtime_ready
+                      : hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready);
+    const auto add = [&](hal::CapabilityEvidenceCode code) {
+      capability.evidence[capability.evidence_count++] = {
+          code,     hal::StatusId::ready,   hal::ReasonId::none,
+          semantic, hal::BackendId::vulkan, true};
+    };
+    add(hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
+    add(hal::CapabilityEvidenceCode::vulkan_warmup_complete);
+    add(hal::CapabilityEvidenceCode::vulkan_face_runtime_ready);
+    if (eye) {
+      add(hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready);
+      add(hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled);
+    }
+    registration
+        .semantic_capabilities[registration.semantic_capability_count++] =
+        capability;
+    return registration;
+  };
+  bool ok = true;
+  for (const auto missing :
+       {hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready,
+        hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled}) {
+    const bool eye =
+        missing ==
+            hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready ||
+        missing == hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled;
+    auto registration = registration_for(eye);
+    auto &capability = registration.semantic_capabilities[2];
+    auto found = std::find_if(
+        capability.evidence.begin(),
+        capability.evidence.begin() + capability.evidence_count,
+        [&](const auto &record) { return record.code == missing; });
+    std::move(found + 1,
+              capability.evidence.begin() + capability.evidence_count, found);
+    --capability.evidence_count;
+    vulkan::VulkanVideoExecutionFactory factory(registration, {});
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(factory.Initialize(&reason) == hal::StatusId::blocked &&
+                      reason == hal::ReasonId::capability_evidence_incomplete &&
+                      !factory.adapter_registration().resident_adapter &&
+                      adapter.prepare_calls == 0,
+                  "raw factory readiness must reject each missing model proof");
+  }
+  auto registration = registration_for(false);
+  auto &capability = registration.semantic_capabilities[2];
+  capability.evidence[capability.evidence_count] = capability.evidence[0];
+  ++capability.evidence_count;
+  vulkan::VulkanVideoExecutionFactory duplicate(registration, {});
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok &= Require(duplicate.Initialize(&reason) == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    !duplicate.adapter_registration().resident_adapter &&
+                    adapter.prepare_calls == 0,
+                "raw factory readiness must reject duplicate evidence records");
+  return ok;
+}
+
 bool TestShutdownRetainsUnprovenNativeOwner() {
   FakeVulkanAdapter adapter;
   bool safe = false;
@@ -1308,6 +1375,7 @@ int main() {
   ok &= TestExactFactoryAndCommit();
   ok &= TestMattingFinalGeometryContract();
   ok &= TestAllModelProgramContract();
+  ok &= TestFactoryRejectsIncompleteAndDuplicateModelProofs();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
   ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
