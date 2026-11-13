@@ -2,6 +2,7 @@
 #include "core/vulkan/vulkan_device.h"
 
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -105,8 +106,17 @@ bool CheckAggregateReservations() {
       context->ReserveAllocation(1, &error))
     return false;
   context->ReleaseAllocation(64);
-  return context->AllocationStats().current_bytes == 0 &&
-         context->AllocationStats().allocation_count == 0;
+  if (context->AllocationStats().current_bytes != 0 ||
+      context->AllocationStats().allocation_count != 0 ||
+      context->AllocationStats().total_allocation_count != 4)
+    return false;
+  context->allocation_stats.total_allocation_count =
+      std::numeric_limits<std::uint64_t>::max();
+  return !context->ReserveAllocation(1, &error) &&
+         context->AllocationStats().current_bytes == 0 &&
+         context->AllocationStats().allocation_count == 0 &&
+         context->AllocationStats().total_allocation_count ==
+             std::numeric_limits<std::uint64_t>::max();
 }
 
 } // namespace

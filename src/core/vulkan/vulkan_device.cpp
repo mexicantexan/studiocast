@@ -402,7 +402,11 @@ bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
 
   std::lock_guard<std::mutex> lock(allocation_mutex);
   const VkDeviceSize current = allocation_stats.current_bytes;
-  if (bytes > std::numeric_limits<VkDeviceSize>::max() - current) {
+  if (bytes > std::numeric_limits<VkDeviceSize>::max() - current ||
+      resources > std::numeric_limits<std::uint64_t>::max() -
+                      allocation_stats.allocation_count ||
+      resources > std::numeric_limits<std::uint64_t>::max() -
+                      allocation_stats.total_allocation_count) {
     if (error_out) {
       *error_out = "[vulkan_allocation_size_overflow] Vulkan allocation "
                    "accounting overflow.";
@@ -428,6 +432,7 @@ bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
   allocation_stats.high_water_bytes =
       std::max(allocation_stats.high_water_bytes, next);
   allocation_stats.allocation_count += resources;
+  allocation_stats.total_allocation_count += resources;
   allocation_stats.high_water_allocation_count =
       std::max(allocation_stats.high_water_allocation_count,
                allocation_stats.allocation_count);

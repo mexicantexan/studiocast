@@ -70,7 +70,8 @@ struct VulkanAllocationStats {
   VkDeviceSize budget_bytes = 0;
   VkDeviceSize current_bytes = 0;
   VkDeviceSize high_water_bytes = 0;
-  std::uint64_t allocation_count = 0;
+  std::uint64_t allocation_count = 0;       // currently live reservations
+  std::uint64_t total_allocation_count = 0; // monotonic, never decremented
   std::uint64_t resource_limit = 0; // zero preserves legacy unlimited count
   std::uint64_t high_water_allocation_count = 0;
 };

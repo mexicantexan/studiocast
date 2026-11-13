@@ -343,6 +343,8 @@ bool RunModel(vk::VulkanDevice &device, const fs::path &root,
     if (!Check(allocation_count == 0 &&
                    resources_after.allocation_count ==
                        resources_before.allocation_count &&
+                   resources_after.total_allocation_count ==
+                       resources_before.total_allocation_count &&
                    resources_after.current_bytes ==
                        resources_before.current_bytes,
                "Execute allocated resources"))
