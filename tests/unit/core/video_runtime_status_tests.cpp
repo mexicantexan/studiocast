@@ -569,8 +569,8 @@ bool TestStructuralCorruption() {
   eye->semantic.exact_evidence = true;
   ok &= Expect(
       studiocast::video::ValidateProductCapabilitySnapshot(snapshot).code ==
-          CapabilityValidationCode::vulkan_capability_promoted,
-      "non-production Vulkan effect must not be promoted");
+          CapabilityValidationCode::vulkan_matrix_inconsistent,
+      "Vulkan eye contact needs its own exact runtime proofs, not a mirror label");
 
   snapshot = CurrentCapabilities();
   Promote(&snapshot, SemanticEffectId::mirror,

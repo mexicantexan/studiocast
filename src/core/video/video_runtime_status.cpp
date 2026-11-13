@@ -115,64 +115,9 @@ ExpectedNonProductionVulkanDisposition(hal::SemanticEffectId effect) noexcept {
   return ProductCapabilityDisposition::unavailable;
 }
 
-[[nodiscard]] bool
-HasSatisfiedEvidence(const hal::SemanticCapabilityEvidence &capability,
-                     hal::CapabilityEvidenceCode code) noexcept {
-  if (capability.evidence_count > capability.evidence.size())
-    return false;
-  for (std::size_t i = 0; i < capability.evidence_count; ++i) {
-    const auto &evidence = capability.evidence[i];
-    if (evidence.code == code && evidence.satisfied &&
-        evidence.status == hal::StatusId::ready &&
-        evidence.reason == hal::ReasonId::none &&
-        (evidence.semantic == hal::SemanticEffectId::invalid ||
-         evidence.semantic == capability.semantic) &&
-        evidence.backend == hal::BackendId::vulkan) {
-      return true;
-    }
-  }
-  return false;
-}
-
 [[nodiscard]] bool HasExactProductionVulkanEvidence(
     const hal::SemanticCapabilityEvidence &capability) noexcept {
-  constexpr std::array common{
-      hal::CapabilityEvidenceCode::vulkan_build_enabled,
-      hal::CapabilityEvidenceCode::vulkan_loader_available,
-      hal::CapabilityEvidenceCode::vulkan_physical_device_available,
-      hal::CapabilityEvidenceCode::vulkan_non_cpu_device,
-      hal::CapabilityEvidenceCode::vulkan_compute_queue_available,
-      hal::CapabilityEvidenceCode::vulkan_context_healthy,
-      hal::CapabilityEvidenceCode::vulkan_utility_kernels_ready,
-      hal::CapabilityEvidenceCode::vulkan_exact_device_shared,
-      hal::CapabilityEvidenceCode::vulkan_device_local_residency,
-      hal::CapabilityEvidenceCode::vulkan_bounded_allocations,
-      hal::CapabilityEvidenceCode::vulkan_no_cpu_layers,
-      hal::CapabilityEvidenceCode::vulkan_no_intermediate_readbacks,
-  };
-  for (const auto code : common) {
-    if (!HasSatisfiedEvidence(capability, code))
-      return false;
-  }
-  const bool matting =
-      capability.semantic == hal::SemanticEffectId::virtual_background_blur ||
-      capability.semantic == hal::SemanticEffectId::virtual_background_remove ||
-      capability.semantic ==
-          hal::SemanticEffectId::virtual_background_replace ||
-      capability.semantic == hal::SemanticEffectId::virtual_key_light;
-  if (matting)
-    return HasSatisfiedEvidence(
-               capability,
-               hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready) &&
-           HasSatisfiedEvidence(
-               capability,
-               hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
-  const auto effect_code =
-      capability.semantic == hal::SemanticEffectId::mirror
-          ? hal::CapabilityEvidenceCode::open_vulkan_mirror_production_ready
-          : hal::CapabilityEvidenceCode::
-                open_vulkan_vignette_fixed_center_production_ready;
-  return HasSatisfiedEvidence(capability, effect_code);
+  return hal::HasVulkanProductionEvidence(capability);
 }
 
 [[nodiscard]] constexpr bool ProgramGenerationMatches(
@@ -512,13 +457,7 @@ CapabilityValidationResult ValidateProductCapabilitySnapshot(
     }
 
     if (lane.lane == ProductCapabilityLaneId::open_vulkan) {
-      const bool production_effect =
-          lane.effect == hal::SemanticEffectId::mirror ||
-          lane.effect == hal::SemanticEffectId::vignette ||
-          lane.effect == hal::SemanticEffectId::virtual_background_blur ||
-          lane.effect == hal::SemanticEffectId::virtual_background_remove ||
-          lane.effect == hal::SemanticEffectId::virtual_background_replace ||
-          lane.effect == hal::SemanticEffectId::virtual_key_light;
+      const bool production_effect = hal::IsVulkanProductionSemantic(lane.effect);
       if (hal_selectable && !production_effect) {
         result.code = CapabilityValidationCode::vulkan_capability_promoted;
         return result;
@@ -529,16 +468,20 @@ CapabilityValidationResult ValidateProductCapabilitySnapshot(
                 ? effects::EffectCapabilityCode::
                       open_vulkan_mirror_production_ready
             : lane.effect == hal::SemanticEffectId::vignette
-                ? effects::EffectCapabilityCode::
-                      open_vulkan_vignette_fixed_center_production_ready
-                : effects::EffectCapabilityCode::
-                      open_vulkan_matting_production_ready;
+                ? (lane.semantic.supports_tracked_vignette_center
+                       ? effects::EffectCapabilityCode::open_vulkan_vignette_tracked_center_production_ready
+                       : effects::EffectCapabilityCode::open_vulkan_vignette_fixed_center_production_ready)
+            : lane.effect == hal::SemanticEffectId::video_noise_removal
+                ? effects::EffectCapabilityCode::open_vulkan_video_noise_removal_production_ready
+            : lane.effect == hal::SemanticEffectId::eye_contact
+                ? effects::EffectCapabilityCode::open_vulkan_eye_contact_production_ready
+            : lane.effect == hal::SemanticEffectId::auto_frame
+                ? effects::EffectCapabilityCode::open_vulkan_auto_frame_production_ready
+                : effects::EffectCapabilityCode::open_vulkan_matting_production_ready;
         if (lane.code != expected ||
             lane.semantic.provider !=
                 hal::SemanticEffectProviderId::open_vulkan_production_kernels ||
-            !HasExactProductionVulkanEvidence(lane.semantic) ||
-            (lane.effect == hal::SemanticEffectId::vignette &&
-             lane.semantic.supports_tracked_vignette_center)) {
+            !HasExactProductionVulkanEvidence(lane.semantic)) {
           result.code = CapabilityValidationCode::vulkan_matrix_inconsistent;
           return result;
         }

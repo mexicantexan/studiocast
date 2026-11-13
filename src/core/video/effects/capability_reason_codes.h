@@ -75,6 +75,8 @@ enum class EffectCapabilityCode : std::uint32_t {
   open_vulkan_video_noise_removal_production_ready = 143,
   vulkan_probe_failed = 144,
   vulkan_probe_tool_unavailable = 145,
+  open_vulkan_auto_frame_production_ready = 146,
+  open_vulkan_vignette_tracked_center_production_ready = 147,
 
   capability_snapshot_current = 200,
   capability_refresh_not_run = 201,

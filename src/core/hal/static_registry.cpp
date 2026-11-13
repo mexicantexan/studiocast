@@ -100,37 +100,93 @@ bool ValidateSemanticCapability(
       capability.semantic != SemanticEffectId::vignette) {
     return false;
   }
-  // This is the current reviewed production boundary. Experimental Vulkan
-  // stages remain representable as evidence, but cannot register as selectable
-  // production providers.
   if (registration.backend == BackendId::vulkan &&
       capability.production_eligible &&
       (!IsVulkanProductionSemantic(capability.semantic) ||
-       capability.supports_tracked_vignette_center)) {
+       !HasVulkanProductionModelEvidence(capability)))
     return false;
-  }
-  if (registration.backend == BackendId::vulkan &&
-      capability.production_eligible &&
-      capability.semantic != SemanticEffectId::mirror &&
-      capability.semantic != SemanticEffectId::vignette) {
-    bool model = false, runtime = false;
-    for (std::size_t i = 0; i < capability.evidence_count; ++i) {
-      const auto &record = capability.evidence[i];
-      if (!record.satisfied || record.status != StatusId::ready ||
-          record.reason != ReasonId::none)
-        continue;
-      model |=
-          record.code == CapabilityEvidenceCode::vulkan_model_artifacts_valid;
-      runtime |=
-          record.code == CapabilityEvidenceCode::vulkan_matting_runtime_ready;
-    }
-    if (!model || !runtime)
-      return false;
-  }
   return true;
 }
 
 } // namespace
+
+bool HasVulkanProductionModelEvidence(
+    const SemanticCapabilityEvidence &capability) noexcept {
+  if (capability.evidence_count > capability.evidence.size() ||
+      !IsVulkanProductionSemantic(capability.semantic))
+    return false;
+  const auto has = [&](CapabilityEvidenceCode code) {
+    for (std::size_t i = 0; i < capability.evidence_count; ++i) {
+      const auto &record = capability.evidence[i];
+      if (record.code == code && record.satisfied &&
+          record.status == StatusId::ready && record.reason == ReasonId::none &&
+          record.backend == BackendId::vulkan &&
+          (record.semantic == capability.semantic ||
+           record.semantic == SemanticEffectId::invalid))
+        return true;
+    }
+    return false;
+  };
+  using Code = CapabilityEvidenceCode;
+  if (capability.semantic == SemanticEffectId::mirror)
+    return true;
+  if (capability.semantic == SemanticEffectId::vignette &&
+      !capability.supports_tracked_vignette_center)
+    return true;
+  if (!has(Code::vulkan_model_artifacts_valid))
+    return false;
+  switch (capability.semantic) {
+  case SemanticEffectId::virtual_background_blur:
+  case SemanticEffectId::virtual_background_remove:
+  case SemanticEffectId::virtual_background_replace:
+  case SemanticEffectId::virtual_key_light:
+    return has(Code::vulkan_matting_runtime_ready);
+  case SemanticEffectId::video_noise_removal:
+    return has(Code::vulkan_denoise_runtime_ready);
+  case SemanticEffectId::eye_contact:
+    return has(Code::vulkan_face_runtime_ready) &&
+           has(Code::vulkan_eye_runtime_ready) &&
+           has(Code::vulkan_landmarks_runtime_ready) &&
+           has(Code::vulkan_shader_float64_enabled);
+  case SemanticEffectId::auto_frame:
+    return has(Code::vulkan_face_runtime_ready) &&
+           has(Code::vulkan_tracking_gpu_ready);
+  case SemanticEffectId::vignette:
+    return has(Code::vulkan_face_runtime_ready) &&
+           has(Code::vulkan_tracking_gpu_ready) &&
+           has(Code::vulkan_tracked_vignette_center_supported);
+  default:
+    return false;
+  }
+}
+
+bool HasVulkanProductionEvidence(
+    const SemanticCapabilityEvidence &capability) noexcept {
+  if (!HasVulkanProductionModelEvidence(capability))
+    return false;
+  const auto has = [&](CapabilityEvidenceCode code) {
+    for (std::size_t i = 0; i < capability.evidence_count; ++i) {
+      const auto &record = capability.evidence[i];
+      if (record.code == code && record.satisfied &&
+          record.status == StatusId::ready && record.reason == ReasonId::none &&
+          record.backend == BackendId::vulkan &&
+          (record.semantic == capability.semantic ||
+           record.semantic == SemanticEffectId::invalid))
+        return true;
+    }
+    return false;
+  };
+  for (std::uint32_t id = 1; id <= 12; ++id)
+    if (!has(static_cast<CapabilityEvidenceCode>(id)))
+      return false;
+  if (capability.semantic == SemanticEffectId::mirror)
+    return has(CapabilityEvidenceCode::open_vulkan_mirror_production_ready);
+  if (capability.semantic == SemanticEffectId::vignette &&
+      !capability.supports_tracked_vignette_center)
+    return has(CapabilityEvidenceCode::
+                   open_vulkan_vignette_fixed_center_production_ready);
+  return true;
+}
 
 ExecutionResidencyClass
 ClassifyExecutionResidency(const ExecutionDomainId &domain) noexcept {

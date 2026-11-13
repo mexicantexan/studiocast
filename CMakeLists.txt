@@ -120,6 +120,11 @@ if (STUDIOCAST_ENABLE_DLIB)
     endif()
 endif()
 
+# Resolved discovery evidence for the verified installer. This is not a user
+# feature switch: enabled intent alone does not prove the predictor can build.
+set(STUDIOCAST_DLIB_AVAILABLE ${_studiocast_have_dlib} CACHE INTERNAL
+    "Resolved dlib availability for installer build validation" FORCE)
+
 set(_studiocast_onnxruntime_found FALSE)
 set(_studiocast_onnxruntime_target "")
 set(_studiocast_ort_has_cuda_ep_v2 FALSE)

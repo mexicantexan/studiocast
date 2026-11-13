@@ -100,7 +100,18 @@ IsVulkanProductionSemantic(SemanticEffectId semantic) noexcept {
          semantic == SemanticEffectId::virtual_background_blur ||
          semantic == SemanticEffectId::virtual_background_remove ||
          semantic == SemanticEffectId::virtual_background_replace ||
-         semantic == SemanticEffectId::virtual_key_light;
+         semantic == SemanticEffectId::virtual_key_light ||
+         semantic == SemanticEffectId::video_noise_removal ||
+         semantic == SemanticEffectId::eye_contact ||
+         semantic == SemanticEffectId::auto_frame;
 }
+
+// Semantic-specific model/analysis proofs; a matting attestation cannot qualify
+// another model effect. The full predicate additionally requires common device,
+// residency, allocation and no-host-bridge evidence.
+[[nodiscard]] bool HasVulkanProductionModelEvidence(
+    const SemanticCapabilityEvidence &capability) noexcept;
+[[nodiscard]] bool HasVulkanProductionEvidence(
+    const SemanticCapabilityEvidence &capability) noexcept;
 
 } // namespace studiocast::hal

@@ -51,6 +51,21 @@ if (BUILD_TESTING)
     studiocast_set_test_labels(studiocast-hal-contract-tests
             unit core video gpu)
 
+    add_executable(studiocast-vulkan-model-capability-tests
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/vulkan_model_capability_tests.cpp)
+    target_link_libraries(studiocast-vulkan-model-capability-tests PRIVATE
+            studiocast_hal_runtime)
+    target_include_directories(studiocast-vulkan-model-capability-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/src")
+    studiocast_set_project_warnings(studiocast-vulkan-model-capability-tests)
+    studiocast_enable_sanitizers(studiocast-vulkan-model-capability-tests)
+    set_target_properties(studiocast-vulkan-model-capability-tests PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME studiocast-vulkan-model-capability-tests
+            COMMAND studiocast-vulkan-model-capability-tests)
+    studiocast_set_test_labels(studiocast-vulkan-model-capability-tests
+            unit core video gpu vulkan)
+
     add_executable(studiocast-hal-resolver-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/hal_resolver_tests.cpp
     )
@@ -1252,6 +1267,15 @@ if (BUILD_TESTING)
                         "${PROJECT_SOURCE_DIR}/tests/installer/models/modnet_ncnn_conversion_tests.py")
         studiocast_set_test_labels(studiocast-modnet-ncnn-conversion-tests
                 unit installer model)
+
+        add_test(NAME studiocast-vulkan-model-evidence-tests
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "STUDIOCAST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+                        "PYTHONDONTWRITEBYTECODE=1"
+                        "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/installer/backend/vulkan_model_evidence_tests.py")
+        studiocast_set_test_labels(studiocast-vulkan-model-evidence-tests
+                unit installer gpu vulkan)
 
         add_test(NAME studiocast-installer-backend-core-tests
                 COMMAND "${CMAKE_COMMAND}" -E env

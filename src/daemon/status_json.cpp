@@ -319,6 +319,18 @@ EvidenceToken(hal::CapabilityEvidenceCode value) noexcept {
     return "open_vulkan_video_noise_removal_unavailable";
   case hal::CapabilityEvidenceCode::vulkan_effect_cpu_tail:
     return "vulkan_effect_cpu_tail";
+  case hal::CapabilityEvidenceCode::vulkan_denoise_runtime_ready:
+    return "vulkan_denoise_runtime_ready";
+  case hal::CapabilityEvidenceCode::vulkan_face_runtime_ready:
+    return "vulkan_face_runtime_ready";
+  case hal::CapabilityEvidenceCode::vulkan_eye_runtime_ready:
+    return "vulkan_eye_runtime_ready";
+  case hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready:
+    return "vulkan_landmarks_runtime_ready";
+  case hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready:
+    return "vulkan_tracking_gpu_ready";
+  case hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled:
+    return "vulkan_shader_float64_enabled";
   }
   return {};
 }

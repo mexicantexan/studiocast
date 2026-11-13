@@ -159,6 +159,12 @@ CAPABILITY_EVIDENCE_CODES = {
     47: "open_vulkan_eye_contact_unavailable",
     48: "open_vulkan_video_noise_removal_unavailable",
     49: "vulkan_effect_cpu_tail",
+    50: "vulkan_denoise_runtime_ready",
+    51: "vulkan_face_runtime_ready",
+    52: "vulkan_eye_runtime_ready",
+    53: "vulkan_landmarks_runtime_ready",
+    54: "vulkan_tracking_gpu_ready",
+    55: "vulkan_shader_float64_enabled",
 }
 CAPABILITY_CODES = {
     0: "", 1: "maxine.effect.usable", 2: "maxine.effect.unavailable",
@@ -214,6 +220,8 @@ CAPABILITY_CODES = {
     142: "open_vulkan_eye_contact_production_ready",
     143: "open_vulkan_video_noise_removal_production_ready",
     144: "vulkan_probe_failed", 145: "vulkan_probe_tool_unavailable",
+    146: "open_vulkan_auto_frame_production_ready",
+    147: "open_vulkan_vignette_tracked_center_production_ready",
     200: "capability_snapshot_current",
     201: "capability_refresh_not_run",
     202: "capability_refresh_in_progress",
@@ -572,8 +580,21 @@ def _selected_capability_is_exact(
     if effect in {"virtual_background.blur", "virtual_background.remove",
                   "virtual_background.replace", "virtual_key_light"}:
         required.update((15, 16))
-    elif effect in {"mirror", "vignette"}:
-        required.add(13 if effect == "mirror" else 14)
+    elif effect == "video_noise_removal":
+        required.update((16, 50))
+    elif effect == "eye_contact":
+        required.update((16, 51, 52, 53, 55))
+    elif effect == "auto_frame":
+        required.update((16, 51, 54))
+    elif effect == "mirror":
+        required.add(13)
+    elif effect == "vignette":
+        # The tracked success code requires its own resident tracking proofs;
+        # it cannot inherit fixed-center readiness or matting evidence.
+        if selection["code"]["id"] == 147:
+            required.update((16, 19, 51, 54))
+        else:
+            required.add(14)
     else:
         return False
     satisfied = {

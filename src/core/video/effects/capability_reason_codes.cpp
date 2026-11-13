@@ -128,6 +128,10 @@ std::string_view EffectCapabilityCodeToken(EffectCapabilityCode code) noexcept {
     return "vulkan_probe_failed";
   case EffectCapabilityCode::vulkan_probe_tool_unavailable:
     return "vulkan_probe_tool_unavailable";
+  case EffectCapabilityCode::open_vulkan_auto_frame_production_ready:
+    return "open_vulkan_auto_frame_production_ready";
+  case EffectCapabilityCode::open_vulkan_vignette_tracked_center_production_ready:
+    return "open_vulkan_vignette_tracked_center_production_ready";
   case EffectCapabilityCode::capability_snapshot_current:
     return "capability_snapshot_current";
   case EffectCapabilityCode::capability_refresh_not_run:
@@ -153,6 +157,8 @@ bool IsEffectCapabilitySuccessCode(EffectCapabilityCode code) noexcept {
   case EffectCapabilityCode::open_vulkan_matting_production_ready:
   case EffectCapabilityCode::open_vulkan_eye_contact_production_ready:
   case EffectCapabilityCode::open_vulkan_video_noise_removal_production_ready:
+  case EffectCapabilityCode::open_vulkan_auto_frame_production_ready:
+  case EffectCapabilityCode::open_vulkan_vignette_tracked_center_production_ready:
   case EffectCapabilityCode::capability_snapshot_current:
     return true;
   default:
