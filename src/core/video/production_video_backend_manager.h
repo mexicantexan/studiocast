@@ -311,12 +311,14 @@ public:
 
 private:
   void RefreshResidentSnapshot() noexcept;
+  void ClearCompatibilityPending() noexcept;
   [[nodiscard]] bool HasRetainableSetup() const noexcept;
 
   std::unique_ptr<IProductionVideoBackendSetupSource> setup_source_;
   ProductionVideoExecutionComposition composition_;
   std::unique_ptr<IVideoExecutionExecutor> compatibility_executor_;
   ProductionVideoBackendManagerSnapshot snapshot_{};
+  hal::CompletionToken compatibility_pending_{};
   bool resident_selected_ = false;
 };
 

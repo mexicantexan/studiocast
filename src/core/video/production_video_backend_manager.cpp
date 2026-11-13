@@ -12,6 +12,15 @@ void SetReason(hal::ReasonId *reason, hal::ReasonId value) noexcept {
     *reason = value;
 }
 
+bool SameCompletion(const hal::CompletionToken &left,
+                    const hal::CompletionToken &right) noexcept {
+  return left.token_id == right.token_id &&
+         left.program_id == right.program_id &&
+         left.adapter_instance_id == right.adapter_instance_id &&
+         left.capture_sequence == right.capture_sequence &&
+         left.complete == right.complete;
+}
+
 hal::ReasonId
 QuarantineCause(const hal::ReadinessSnapshot &readiness,
                 const hal::ExecutionTelemetry &telemetry) noexcept {
@@ -953,6 +962,11 @@ bool ProductionVideoBackendManager::HasRetainableSetup() const noexcept {
               ProductionVideoBackendManagerState::compatibility_ready);
 }
 
+void ProductionVideoBackendManager::ClearCompatibilityPending() noexcept {
+  compatibility_pending_ = {};
+  snapshot_.frame_pending = false;
+}
+
 void ProductionVideoBackendManager::RefreshResidentSnapshot() noexcept {
   snapshot_.resident = composition_.Snapshot();
   snapshot_.resident_prepared = snapshot_.resident.prepared;
@@ -1020,7 +1034,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     snapshot_.cpu_primitive_bits = request.cpu.table->capability_bits;
     snapshot_.setup_complete = true;
     snapshot_.resident_prepared = false;
-    snapshot_.frame_pending = false;
+    ClearCompatibilityPending();
     ++snapshot_.setup_successes;
     if (evidence != nullptr) {
       evidence->status = hal::StatusId::ready;
@@ -1125,6 +1139,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
       }
       return passthrough_status;
     }
+    ClearCompatibilityPending();
     resident_selected_ = true;
     if (compatibility_executor_) {
       compatibility_executor_->Shutdown();
@@ -1209,7 +1224,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     snapshot_.cpu_primitive_bits = 0;
     snapshot_.setup_complete = true;
     snapshot_.resident_prepared = false;
-    snapshot_.frame_pending = false;
+    ClearCompatibilityPending();
     ++snapshot_.setup_successes;
     if (evidence != nullptr) {
       evidence->status = candidate.status;
@@ -1266,6 +1281,7 @@ hal::StatusId ProductionVideoBackendManager::Setup(
     return status;
   }
 
+  ClearCompatibilityPending();
   resident_selected_ = true;
   if (compatibility_executor_) {
     compatibility_executor_->Shutdown();
@@ -1302,10 +1318,20 @@ hal::StatusId ProductionVideoBackendManager::Setup(
 VideoExecutionFrameResult ProductionVideoBackendManager::Execute(
     const hal::HostFrameBinding &binding) noexcept {
   if (compatibility_executor_ && snapshot_.setup_complete) {
+    if (compatibility_pending_.token_id != 0) {
+      VideoExecutionFrameResult result;
+      result.status = hal::StatusId::blocked;
+      result.reason = hal::ReasonId::output_not_committed;
+      return result;
+    }
     auto result = compatibility_executor_->Execute(binding);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
-    snapshot_.frame_pending = result.status == hal::StatusId::executed ||
-                              result.status == hal::StatusId::degraded;
+    if ((result.status == hal::StatusId::executed ||
+         result.status == hal::StatusId::degraded ||
+         result.status == hal::StatusId::passthrough) &&
+        result.completion.complete && result.completion.token_id != 0)
+      compatibility_pending_ = result.completion;
+    snapshot_.frame_pending = compatibility_pending_.token_id != 0;
     return result;
   }
   if (!resident_selected_) {
@@ -1338,10 +1364,15 @@ hal::StatusId ProductionVideoBackendManager::CommitOutput(
     const hal::CompletionToken &completion, bool output_write_succeeded,
     hal::ReasonId *reason) noexcept {
   if (compatibility_executor_ && snapshot_.setup_complete) {
+    if (compatibility_pending_.token_id == 0 ||
+        !SameCompletion(completion, compatibility_pending_)) {
+      SetReason(reason, hal::ReasonId::output_not_committed);
+      return hal::StatusId::blocked;
+    }
     const auto status = compatibility_executor_->CommitOutput(
         completion, output_write_succeeded, reason);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
-    snapshot_.frame_pending = false;
+    ClearCompatibilityPending();
     return status;
   }
   if (!resident_selected_) {
@@ -1380,12 +1411,14 @@ void ProductionVideoBackendManager::Invalidate(hal::ReasonId reason) noexcept {
   snapshot_.readiness.rebuild_requested = true;
   snapshot_.setup_complete = false;
   snapshot_.resident_prepared = false;
-  snapshot_.frame_pending = false;
+  ClearCompatibilityPending();
 }
 
 hal::StatusId
 ProductionVideoBackendManager::ResetTemporal(hal::ReasonId reason) noexcept {
   if (compatibility_executor_ && snapshot_.setup_complete) {
+    if (compatibility_pending_.token_id != 0)
+      return hal::StatusId::blocked;
     const auto previous = snapshot_.compatibility;
     const auto status = compatibility_executor_->ResetTemporal(reason);
     snapshot_.compatibility = compatibility_executor_->Snapshot();
@@ -1452,7 +1485,7 @@ ProductionVideoBackendManager::Shutdown() noexcept {
   snapshot_.readiness.degraded = result.pending;
   snapshot_.setup_complete = false;
   snapshot_.resident_prepared = false;
-  snapshot_.frame_pending = false;
+  ClearCompatibilityPending();
   resident_selected_ = false;
   return result;
 }

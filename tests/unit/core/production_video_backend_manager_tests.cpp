@@ -1381,6 +1381,104 @@ bool TestResetQuarantinePreservesActualOuterCause() {
   return ok;
 }
 
+bool TestCompatibilityPendingIdentitySurvivesRejectedCalls() {
+  bool ok = true;
+  for (const bool writer_succeeds : {true, false}) {
+    Counters counters;
+    auto source = std::make_unique<FakeSetupSource>(&counters);
+    source->mode = SourceMode::single_domain_compatibility;
+    video::ProductionVideoBackendManager manager(std::move(source));
+    const auto request = ResidentRequest();
+    video::ProductionVideoBackendSetupEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (manager.Setup(request, &evidence, &reason) != hal::StatusId::ready)
+      return false;
+    std::array<std::byte, kFrameBytes> input{}, output{};
+    const auto pending = manager.Execute(Binding(&input, &output, 1));
+    if (!Require(pending.output_ready && manager.Snapshot().frame_pending,
+                 "compatibility Execute must expose pending completion"))
+      return false;
+    std::array<hal::CompletionToken, 5> forged{};
+    forged.fill(pending.completion);
+    ++forged[0].token_id;
+    ++forged[1].program_id;
+    ++forged[2].adapter_instance_id;
+    ++forged[3].capture_sequence;
+    forged[4].complete = false;
+    for (const auto &token : forged) {
+      ok &= Require(manager.CommitOutput(token, writer_succeeds, &reason) ==
+                            hal::StatusId::blocked &&
+                        reason == hal::ReasonId::output_not_committed &&
+                        manager.Snapshot().frame_pending &&
+                        counters.commit_calls == 0,
+                    "forged completion must preserve public pending identity "
+                    "without backend dispatch");
+    }
+    const auto duplicate = manager.Execute(Binding(&input, &output, 2));
+    ok &= Require(
+        duplicate.status == hal::StatusId::blocked && !duplicate.output_ready &&
+            manager.Snapshot().frame_pending && counters.execute_calls == 1 &&
+            manager.ResetTemporal(hal::ReasonId::temporal_discontinuity) ==
+                hal::StatusId::blocked &&
+            counters.reset_calls == 0 && manager.Snapshot().frame_pending,
+        "duplicate Execute and reset cannot erase or replace pending identity");
+    auto rejected_setup = request;
+    ++rejected_setup.contract_version;
+    ok &= Require(
+        manager.Setup(rejected_setup, &evidence, &reason) ==
+                hal::StatusId::blocked &&
+            evidence.old_plan_retained && manager.Snapshot().frame_pending,
+        "failed retained setup must preserve its outstanding completion");
+    ok &= Require(
+        manager.CommitOutput(pending.completion, writer_succeeds, &reason) ==
+                (writer_succeeds ? hal::StatusId::ready
+                                 : hal::StatusId::failed) &&
+            !manager.Snapshot().frame_pending && counters.commit_calls == 1 &&
+            manager.Snapshot().setup_complete,
+        "only exact true/false writer result may consume pending completion");
+    ok &= Require(manager.CommitOutput(pending.completion, true, &reason) ==
+                          hal::StatusId::blocked &&
+                      counters.commit_calls == 1 &&
+                      !manager.Snapshot().frame_pending,
+                  "consumed completion replay must never dispatch again");
+    const auto before_setup = manager.Execute(Binding(&input, &output, 3));
+    ok &= Require(before_setup.output_ready && manager.Snapshot().frame_pending,
+                  "valid next Execute must create a fresh pending completion");
+    if (manager.Setup(request, &evidence, &reason) != hal::StatusId::ready)
+      return false;
+    ok &=
+        Require(!manager.Snapshot().frame_pending &&
+                    manager.CommitOutput(before_setup.completion, true,
+                                         &reason) == hal::StatusId::blocked &&
+                    counters.commit_calls == 1,
+                "successful replacement setup must clear old pending identity");
+    const auto before_invalidate = manager.Execute(Binding(&input, &output, 4));
+    ok &= Require(before_invalidate.output_ready &&
+                      manager.Snapshot().frame_pending,
+                  "invalidation fixture must have a pending frame");
+    manager.Invalidate(hal::ReasonId::reconfiguration_required);
+    ok &=
+        Require(!manager.Snapshot().frame_pending &&
+                    manager.CommitOutput(before_invalidate.completion, true,
+                                         &reason) == hal::StatusId::blocked &&
+                    counters.commit_calls == 1,
+                "invalidation must retire public and private pending identity");
+    if (manager.Setup(request, &evidence, &reason) != hal::StatusId::ready)
+      return false;
+    const auto before_shutdown = manager.Execute(Binding(&input, &output, 5));
+    ok &= Require(before_shutdown.output_ready &&
+                      manager.Snapshot().frame_pending,
+                  "shutdown fixture must have a pending frame");
+    (void)manager.Shutdown();
+    ok &= Require(!manager.Snapshot().frame_pending &&
+                      manager.CommitOutput(before_shutdown.completion, true,
+                                           &reason) == hal::StatusId::stopped &&
+                      counters.commit_calls == 1,
+                  "shutdown must retire pending identity without publication");
+  }
+  return ok;
+}
+
 bool TestOnlySelectedMaxineMayAddGreenscreenHistory() {
   bool ok = true;
   for (const bool automatic : {false, true}) {
@@ -1452,6 +1550,7 @@ int main() {
   ok &= TestSingleDomainCompatibilityTopologyIsExact();
   ok &= TestFailedTemporalResetRequiresSetupReprepare();
   ok &= TestResetQuarantinePreservesActualOuterCause();
+  ok &= TestCompatibilityPendingIdentitySurvivesRejectedCalls();
   if (!ok)
     return 1;
   std::cout << "Production video backend manager tests passed\n";
