@@ -31,6 +31,7 @@ These files describe current architecture or stable cross-subsystem behavior.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Active contract | Target layers, daemon authority, effects, and model layout | All contributors | 2026-07-23 |
 | [HARDWARE_EXECUTION_LAYER.md](HARDWARE_EXECUTION_LAYER.md) | Active staged-migration contract | Neutral HAL, prepared adapters, bounded evidence and qualification gates, execution domains, and typed status | Video/backend maintainers | 2026-11-12 |
 | [HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md) | Active migration and release contract | Family parity, route removal, and bounded hardware qualification | Video/release maintainers | 2026-11-12 |
+| [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md) | Active implementation plan | Remaining Vulkan model effects, resident tracking, model/runtime/installer integration and validation | Video/backend maintainers | 2026-11-12 |
 | [INSTALLER_MODEL_CATALOG.md](INSTALLER_MODEL_CATALOG.md) | Active contract | Curated model catalog and transactions | Installer/model maintainers | 2026-11-12 |
 | [INSTALLER_VULKAN_CAPABILITIES.md](INSTALLER_VULKAN_CAPABILITIES.md) | Active capability contract | Per-effect installer/runtime Vulkan evidence | Installer/Vulkan maintainers | 2026-07-22 |
 | [RELEASE_CHANNEL.md](RELEASE_CHANNEL.md) | Active security contract | Stable release transport, signing, and updates | Release/security maintainers | 2026-07-22 |

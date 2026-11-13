@@ -16,7 +16,9 @@ the existing production camera manager and prepared Vulkan island. Preserve
 strict device/provider selection, model identity, optional-stage behavior,
 writer-commit attribution, one upload, zero intermediate host readbacks, and one
 final readback. Mirror, fixed-center vignette, and final resize remain resident
-and composable. Other Vulkan model effects are outside this phase.
+and composable. This paragraph records the original matting phase. The user subsequently
+expanded the work to all remaining Vulkan effects in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
 
 The runtime will adopt an ncnn-owned Vulkan context before allocating StudioCast
 resources, matching the configured physical-device identity. One retained owner
