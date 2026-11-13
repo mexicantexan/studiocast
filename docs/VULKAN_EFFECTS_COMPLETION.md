@@ -221,35 +221,35 @@ under investigation before qualification.
 | Opt-in full-model CI | `codex/vulkan-models-hardware-ci-20261112`, `9e31f3e` → `e869a81` |
 
 The initial Auto Frame proof correction misread the base runtime code: it already
-emitted tracking54, so the additive record must remain face51. `cf8ec26` corrects
-the introduced duplicate54 and restores exact51+54. The complete seven-stage
+emitted tracking 54, so the additive record must remain face 51. `cf8ec26` corrects
+the introduced duplicate 54 and restores exact 51 + 54. The complete seven-stage
 factory test is integrated at `885cf97`. `1a0890a` then validates every raw factory
 capability with the shared full-proof predicate and static registry before
-publishing readiness; missing51/54/53/55 and duplicate-proof negatives pass. This
+publishing readiness; missing 51/54/53/55 and duplicate-proof negatives pass. This
 prevents invalid raw readiness from reaching a later lease rejection.
 
-Cold diagnostics initially under-reserved the forest setup upload at1MiB.
-`892158d` reserves64MiB for the exact roughly63.7MiB flattened forest; the whole
-small startup profile is explicitly833MiB with2,048resources, not a per-model
-multiplier. Actual optimized cold diagnostics then passed all9effects on the
-same prepared owner in23.51s, within the existing35s installed refresh timeout.
+Cold diagnostics initially under-reserved the forest setup upload at 1 MiB.
+`892158d` reserves 64 MiB for the exact roughly 63.7 MiB flattened forest; the whole
+small startup profile is explicitly 833 MiB with 2,048 resources, not a per-model
+multiplier. Actual optimized cold diagnostics then passed all nine effects on the
+same prepared owner in 23.51 s, within the existing 35 s installed refresh timeout.
 The native log is
 `/tmp/studiocast-vulkan-all-pipeline-release-cold-diagnostics-20261112.log`.
 
-The real full seven-stage64x64 preparation passed at375,072,288 retained bytes /
-802 native allocations, with815 setup high-water allocations and8.59s Release
+The real full seven-stage 64×64 preparation passed at 375,072,288 retained bytes /
+802 native allocations, with 815 setup high-water allocations and 8.59 s Release
 setup. All six caller axes remain unchanged; the general manager's existing
-maximum caller reservation is8GiBpersistent+4GiBscratch+1GiBupload+1GiBreadback,
-1,024resources and one in-flight frame. The actual context clamps the aggregate
+maximum caller reservation is 8 GiB persistent + 4 GiB scratch + 1 GiB upload + 1 GiB readback,
+1,024 resources and one in-flight frame. The actual context clamps the aggregate
 to the selected physical memory limit and charges every pool/buffer. This is an
 explicit aggregate upper limit, not a claim that each effect consumes its own
-256MiB or that FHD preparation/execution is qualified.
+256 MiB or that FHD preparation/execution is qualified.
 
-The full batch first hit the100ms fence and exited139 during unsafe teardown.
-A debugger rerun completed four batches in approximately90.9/88.9/48.4/48.0ms
+The full batch first hit the 100 ms fence and exited 139 during unsafe teardown.
+A debugger rerun completed four batches in approximately 90.9/88.9/48.4/48.0 ms
 with one upload/final readback/synchronization, no CPU tails and zero C++ Execute
 allocations. The timeout/crash is still under diagnosis; these four observations
-do not establish latency percentiles or waive the100ms limit. Independent
+do not establish latency percentiles or waive the 100 ms limit. Independent
 lifetime inspection found complete island retention but a genuine missing
 production bridge to recheck a poisoned context's exact pending fence during
 shutdown. A bounded late-retirement API and scoped crash reproduction are in
@@ -265,17 +265,17 @@ completions and recover on the next successful writer. The native assertion is
 retained unchanged.
 
 Before these latest remediation changes, broad loader-denied suites passed:
-production ncnn100tests (88executed/12native opt-ins skipped), all-optional94
-(88/6skipped), both49.47s. Disabled85tests had only the disk-dependent fake-build
+production ncnn 100 tests (88 executed / 12 native opt-ins skipped), all-optional 94
+(88 / 6 skipped), both 49.47 s. Disabled 85 tests had only the disk-dependent fake-build
 backend test fail; its two fixtures were corrected to use declared fixture free
 space and the affected backend test passed afterward. No assertion or disk gate
 was weakened. Fresh final-head suites remain required after remediation.
 
 Independent model/publication audit found no Critical/High asset/license blocker:
-all14file hashes, four complete finite FP32 graphs, original ONNX and prefix
-checks,45denoise/60face-head/15-per-eye numerical cases and30exact-tail cases,
+all 14 file hashes, four complete finite FP32 graphs, original ONNX and prefix
+checks,45 denoise / 60 face-head / 15 per-eye numerical cases and 30 exact-tail cases,
 full upstream license receipts, local/offline transactions and unmarked-user-pack
-preservation passed. Promotion restores all10original catalog artifact objects
-(including public ONNX source candidates) and adds only the8new artifacts. The
-exact14file publication approval remains pending; no new artifact was published
+preservation passed. Promotion restores all ten original catalog artifact objects
+(including public ONNX source candidates) and adds only the eight new artifacts. The
+exact fourteen-file publication approval remains pending; no new artifact was published
 or active catalog promoted.
