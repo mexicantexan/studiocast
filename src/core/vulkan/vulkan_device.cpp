@@ -381,7 +381,8 @@ VulkanAllocationStats VulkanContextState::AllocationStats() const {
 }
 
 bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
-                                           std::string *error_out) {
+                                           std::string *error_out,
+                                           std::uint64_t resources) {
   if (error_out)
     error_out->clear();
   if (!Healthy()) {
@@ -392,7 +393,7 @@ bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
     }
     return false;
   }
-  if (bytes == 0) {
+  if (bytes == 0 || resources == 0) {
     if (error_out)
       *error_out = "[vulkan_allocation_size_invalid] Vulkan allocation size "
                    "must be non-zero.";
@@ -409,7 +410,11 @@ bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
     return false;
   }
   const VkDeviceSize next = current + bytes;
-  if (next > allocation_stats.budget_bytes) {
+  if (next > allocation_stats.budget_bytes ||
+      (allocation_stats.resource_limit &&
+       (resources > allocation_stats.resource_limit ||
+        allocation_stats.allocation_count >
+            allocation_stats.resource_limit - resources))) {
     if (error_out) {
       *error_out =
           "[vulkan_allocation_budget_exceeded] Vulkan context "
@@ -422,7 +427,10 @@ bool VulkanContextState::ReserveAllocation(VkDeviceSize bytes,
   allocation_stats.current_bytes = next;
   allocation_stats.high_water_bytes =
       std::max(allocation_stats.high_water_bytes, next);
-  ++allocation_stats.allocation_count;
+  allocation_stats.allocation_count += resources;
+  allocation_stats.high_water_allocation_count =
+      std::max(allocation_stats.high_water_allocation_count,
+               allocation_stats.allocation_count);
   return true;
 }
 
@@ -1144,6 +1152,10 @@ bool VulkanDevice::InitializeAdopted(const VulkanDeviceSelection &selection,
   context_->loader = loader_;
   context_->native_owner = std::move(adopted_owner_);
   context_->native_owner_kind = std::move(adoption.owner_kind);
+  context_->shader_float64_enabled =
+      adoption.shader_float64_attestation &&
+      adoption.shader_float64_attestation(context_->native_owner.get(),
+                                          adoption.device);
   context_->identity = context_identity_;
   context_->instance = instance_;
   context_->physical_device = physical_device_;
@@ -1157,6 +1169,7 @@ bool VulkanDevice::InitializeAdopted(const VulkanDeviceSelection &selection,
   context_->health.health = VulkanContextHealth::healthy;
   context_->health.reason_code = "vulkan_context_healthy";
   context_->allocation_stats.budget_bytes = budget;
+  context_->allocation_stats.resource_limit = config_.allocation_resource_limit;
   diagnostics_.context_created = diagnostics_.context_healthy = true;
   diagnostics_.context_health = "healthy";
   diagnostics_.context_failure_reason.clear();
@@ -1280,6 +1293,7 @@ bool VulkanDevice::Initialize(const VulkanDeviceSelection &selection,
   context_->health.health = VulkanContextHealth::healthy;
   context_->health.reason_code = "vulkan_context_healthy";
   context_->allocation_stats.budget_bytes = budget;
+  context_->allocation_stats.resource_limit = config_.allocation_resource_limit;
 
   diagnostics_.context_created = true;
   diagnostics_.context_healthy = true;
@@ -1653,6 +1667,29 @@ bool VulkanDevice::FindMemoryType(std::uint32_t type_bits,
   return false;
 }
 
+bool VulkanDevice::ConfigureAllocationLimits(VkDeviceSize bytes,
+                                             std::uint64_t resources,
+                                             std::string *error_out) {
+  if (!context_ || !bytes || !resources || !context_->Healthy()) {
+    if (error_out)
+      *error_out = "Invalid aggregate Vulkan reservation.";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(context_->allocation_mutex);
+  auto &stats = context_->allocation_stats;
+  if (bytes > stats.budget_bytes || stats.current_bytes > bytes ||
+      (stats.resource_limit && resources > stats.resource_limit) ||
+      stats.allocation_count > resources) {
+    if (error_out)
+      *error_out = "Aggregate Vulkan reservation cannot enlarge or exclude "
+                   "existing resources.";
+    return false;
+  }
+  stats.budget_bytes = bytes;
+  stats.resource_limit = resources;
+  return true;
+}
+
 bool VulkanDevice::SubmitAndWait(VkCommandBuffer command_buffer,
                                  std::string *error_out) {
   return SubmitAndWait(&command_buffer, 1, error_out);
@@ -1668,7 +1705,8 @@ bool VulkanDevice::SubmitAndWait(const VkCommandBuffer *command_buffers,
                    "initialized.";
     return false;
   }
-  if (!command_buffers || count == 0 || count > 8 ||
+  if (!command_buffers || count == 0 ||
+      count > kMaxVulkanSubmitCommandBuffers ||
       std::any_of(command_buffers, command_buffers + count,
                   [](auto p) { return !p; })) {
     if (error_out)
