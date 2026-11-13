@@ -1021,13 +1021,13 @@ bool TestMissingSelectedPackNeedsNoNativeContext() {
 }
 
 bool TestCompiledOffInferenceKeepsUtilitySurvivors() {
-#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN && \
-    (!defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) ||                        \
-     !STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
   const auto *required =
       std::getenv("STUDIOCAST_REQUIRE_VULKAN_SDK_OFF_ISOLATION");
   if (!required || std::string(required) != "1")
     return true;
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN && \
+    (!defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) ||                        \
+     !STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
   const auto registry = open_video::ModelPackRegistry::ScanDefault();
   const auto selected = registry.Find(
       "video_denoise", registry.DefaultModelIdForTask("video_denoise"));
@@ -1096,9 +1096,13 @@ bool TestCompiledOffInferenceKeepsUtilitySurvivors() {
           blocked.reason == hal::ReasonId::required_stage_failed &&
           !blocked.lease.live(),
       "required compiled-off inference must fail before native acquisition");
+  if (ok)
+    std::cout << "PASS SDK-off optional NN isolated; utility survivors "
+                 "executed/committed; required NN blocked\n";
   return ok;
 #else
-  return true;
+  return Require(false,
+                 "SDK-off isolation requires Vulkan ON and ncnn Vulkan OFF");
 #endif
 }
 
@@ -1489,6 +1493,8 @@ int TestProductionSetupSourceIfAvailable() {
 } // namespace
 
 int main() {
+  if (!TestCompiledOffInferenceKeepsUtilitySurvivors())
+    return 1;
   bool ok = true;
   ok &= TestExactFactoryAndCommit();
   ok &= TestFactoryRetainsExactQuarantineReason();
@@ -1500,7 +1506,6 @@ int main() {
   ok &= TestMalformedSourceStageCount();
   ok &= TestUnavailableOptionalStageIsolation();
   ok &= TestMissingSelectedPackNeedsNoNativeContext();
-  ok &= TestCompiledOffInferenceKeepsUtilitySurvivors();
   ok &= TestUnsupportedAndForeignPreflight();
   ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
   ok &= TestFailureAndLifecycle();
