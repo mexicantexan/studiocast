@@ -125,6 +125,8 @@ bool LoadDlibPredictorData(const ModelPack &pack,
       const auto trees = reader.Count();
       if (!trees || trees > 100000)
         throw std::runtime_error("invalid dlib tree count");
+      data.maximum_trees =
+          std::max(data.maximum_trees, static_cast<std::uint32_t>(trees));
       reader.Charge(trees, 2 * sizeof(std::uint32_t));
       for (unsigned long t = 0; t < trees; ++t) {
         const auto count = reader.Count();
@@ -206,6 +208,7 @@ bool LoadDlibPredictorData(const ModelPack &pack,
         data.rectangle_basis_pseudoinverse[r * 3 + c] = inverse(r, c);
     reader.Charge(136 * 2, sizeof(float));
     reader.Charge(data.maximum_features, sizeof(float));
+    reader.Charge(data.maximum_trees, sizeof(std::uint32_t));
     reader.Charge(9, sizeof(double));
     data.resident_bytes = reader.used;
     *out = std::move(data);

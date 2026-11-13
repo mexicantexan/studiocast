@@ -9,6 +9,8 @@ layout(std430,binding=5) buffer State { uint st[]; };
 layout(std430,binding=6) buffer B6 { uint b6[]; };
 layout(std430,binding=7) readonly buffer Frame { uint frame[]; };
 layout(push_constant) uniform Push { uint p[32]; };
+shared uint suppressed_words[157];
+shared uint accept_candidate, stop_candidates;
 uint tid() { return gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*gl_NumWorkGroups.x*64; }
 float sf(uint i) { return uintBitsToFloat(st[i]); }
 void fs(uint i,float v) { st[i]=floatBitsToUint(v); }
@@ -122,30 +124,39 @@ void main() {
    b6[i]=bits;return;
  }
  if(op==6) {
-   if(i!=0)return;
-   for(uint w=0;w<157;w++)st[128+w]=0;
-   st[4]=0;st[5]=0;st[6]=0;
-   if(st[7]==0){st[3]=1;return;}
+   uint lane=gl_LocalInvocationID.x;
+   for(uint w=lane;w<157;w+=64)suppressed_words[w]=0;
+   if(lane==0){st[4]=0;st[5]=0;st[6]=0;}
+   barrier();
+   if(st[7]==0){if(lane==0)st[3]=1;return;}
    float eye_score=-1.,eye_area=0.,auto_area=-1.;
    for(uint n=0;n<5000;n++) {
-     if(b4[n*8+6]==0)break;
-     if((st[128+n/32]&(1u<<(n%32)))!=0)continue;
-     st[512+st[4]++]=n;
-     float score=cf(n,4),area=cf(n,2)*cf(n,3);
-     if(st[5]==0||score>eye_score+.00001||(abs(score-eye_score)<.00001&&area>eye_area)) {
-       st[5]=1;eye_score=score;eye_area=area;
-       for(uint c=0;c<5;c++)st[16+c]=b4[n*8+c];
+     if(lane==0){stop_candidates=uint(b4[n*8+6]==0);accept_candidate=uint((suppressed_words[n/32]&(1u<<(n%32)))==0);}
+     barrier();
+     if(stop_candidates!=0)break;
+     if(accept_candidate!=0) {
+       if(lane==0) {
+         st[512+st[4]++]=n;
+         float score=cf(n,4),area=cf(n,2)*cf(n,3);
+         if(st[5]==0||score>eye_score+.00001||(abs(score-eye_score)<.00001&&area>eye_area)) {
+           st[5]=1;eye_score=score;eye_area=area;
+           for(uint c=0;c<5;c++)st[16+c]=b4[n*8+c];
+         }
+         if(st[6]==0||area>auto_area) {
+           st[6]=1;auto_area=area;
+           fs(24,cf(n,0)-cf(n,2)*.4);fs(25,cf(n,1)-cf(n,3)*.4);
+           fs(26,cf(n,2)*1.8);fs(27,cf(n,3)*2.6);fs(28,score);
+         }
+       }
+       for(uint w=lane;w<157;w+=64)suppressed_words[w]|=b6[n*157+w];
      }
-     if(st[6]==0||area>auto_area) {
-       st[6]=1;auto_area=area;
-       fs(24,cf(n,0)-cf(n,2)*.4);fs(25,cf(n,1)-cf(n,3)*.4);
-       fs(26,cf(n,2)*1.8);fs(27,cf(n,3)*2.6);fs(28,score);
-     }
-     for(uint w=0;w<157;w++)st[128+w]|=b6[n*157+w];
+     barrier();
    }
-   st[3]=1;return;
+   for(uint w=lane;w<157;w+=64)st[128+w]=suppressed_words[w];
+   if(lane==0)st[3]=1;return;
  }
  if(op==7) {
+   if(frame[2]==0)return;
    uint count=p[20]*p[21],partial=(count+255)/256;
    if(i>=partial)return;
    uint x0=p[20],y0=p[21],x1=0,y1=0,n=0;
@@ -162,6 +173,7 @@ void main() {
    if(st[7]==0){st[52]=0;return;}
    vec4 box=vec4(sf(24),sf(25),sf(26),sf(27));uint source=st[6]!=0?1u:0u;
    bool found=source!=0;
+   if(!found&&p[23]!=0&&frame[2]==0){st[52]=0;return;}
    uvec2 seq=uvec2(frame[0],frame[1]),last=uvec2(st[48],st[49]);
    bool due=p[24]!=0||all(equal(last,uvec2(0)))||!less_seq(seq,add_seq(last,10));
    if(!found&&p[23]!=0) {

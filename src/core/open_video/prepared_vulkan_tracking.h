@@ -91,7 +91,8 @@ public:
   bool AppendAutoFrame(vulkan::ResidentCommandBatch &,
                        const vulkan::VulkanImage &,
                        const vulkan::VulkanImage *alpha,
-                       const vulkan::VulkanImage &output, std::string *error);
+                       const vulkan::VulkanImage &output, std::string *error,
+                       bool current_matte_available = true);
   bool AppendVignette(vulkan::ResidentCommandBatch &,
                       const vulkan::VulkanImage &,
                       const vulkan::VulkanImage &output, std::string *error);

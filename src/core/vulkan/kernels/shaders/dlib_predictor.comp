@@ -11,42 +11,53 @@ layout(std430,binding=6) buffer Unused6 { uint unused6[]; };
 layout(std430,binding=7) readonly buffer Frame { uint frame[]; };
 layout(push_constant) uniform Push { uint p[32]; };
 float f(uint word) { return uintBitsToFloat(forest[word]); }
-float shape(uint i) { return uintBitsToFloat(scratch[i]); }
-void setshape(uint i,float x) { scratch[i]=floatBitsToUint(x); }
+shared float sh[136];
+shared double m[6];
+shared float coefficient_a,coefficient_b;
+shared uint valid;
+float shape(uint i) { return sh[i]; }
+void setshape(uint i,float x) { sh[i]=x; }
 double inverse(uint i) { uint o=p[14]+i*2;return packDouble2x32(uvec2(forest[o],forest[o+1])); }
 void main() {
- if(gl_GlobalInvocationID.x!=0||gl_GlobalInvocationID.y!=0)return;
- st[8]=0;
- if(st[5]==0||st[7]==0)return;
- float left=uintBitsToFloat(st[16]),top=uintBitsToFloat(st[17]);
- float right=left+uintBitsToFloat(st[18]),bottom=top+uintBitsToFloat(st[19]);
- if(int(right)<=int(left)||int(bottom)<=int(top))return;
- // Match dlib's rectangle -> vector<float,2> -> matrix<double> conversions.
- double qx[3]=double[3](double(float(int(left))),double(float(int(right))),double(float(int(right))));
- double qy[3]=double[3](double(float(int(top))),double(float(int(top))),double(float(int(bottom))));
- precise double m[6];
- for(uint j=0;j<3;j++) {
-   precise double x=qx[0]*inverse(j);x=x+qx[1]*inverse(3+j);x=x+qx[2]*inverse(6+j);
-   precise double y=qy[0]*inverse(j);y=y+qy[1]*inverse(3+j);y=y+qy[2]*inverse(6+j);
-   m[j]=x;m[3+j]=y;
+ uint lane=gl_LocalInvocationID.x;
+ if(lane==0) {
+   st[8]=0;valid=uint(st[5]!=0&&st[7]!=0);
+   float left=uintBitsToFloat(st[16]),top=uintBitsToFloat(st[17]);
+   float right=left+uintBitsToFloat(st[18]),bottom=top+uintBitsToFloat(st[19]);
+   if(int(right)<=int(left)||int(bottom)<=int(top))valid=0;
+   double qx[3]=double[3](double(float(int(left))),double(float(int(right))),double(float(int(right))));
+   double qy[3]=double[3](double(float(int(top))),double(float(int(top))),double(float(int(bottom))));
+   for(uint j=0;j<3;j++) {
+     precise double x=qx[0]*inverse(j);x=x+qx[1]*inverse(3+j);x=x+qx[2]*inverse(6+j);
+     precise double y=qy[0]*inverse(j);y=y+qy[1]*inverse(3+j);y=y+qy[2]*inverse(6+j);
+     m[j]=x;m[3+j]=y;
+   }
  }
- for(uint i=0;i<136;i++)setshape(i,f(p[5]+i));
+ barrier();
+ if(valid==0)return;
+ for(uint i=lane;i<136;i+=64)setshape(i,f(p[5]+i));
+ barrier();
  for(uint c=0;c<p[4];c++) {
-   precise double mx0=0.,mx1=0.,my0=0.,my1=0.;
-   for(uint i=0;i<68;i++) {
-     mx0+=double(f(p[5]+2*i));my0+=double(f(p[5]+2*i+1));
-     mx1+=double(shape(2*i));my1+=double(shape(2*i+1));
+   if(lane==0) {
+     precise double mx0=0.,mx1=0.,my0=0.,my1=0.;
+     for(uint i=0;i<68;i++) {
+       mx0+=double(f(p[5]+2*i));my0+=double(f(p[5]+2*i+1));
+       mx1+=double(shape(2*i));my1+=double(shape(2*i+1));
+     }
+     mx0/=68.;my0/=68.;mx1/=68.;my1/=68.;
+     precise double aa=0.,bb=0.,den=0.;
+     for(uint i=0;i<68;i++) {
+       precise double x=double(f(p[5]+2*i))-mx0,y=double(f(p[5]+2*i+1))-my0;
+       precise double u=double(shape(2*i))-mx1,v=double(shape(2*i+1))-my1;
+       aa+=x*u+y*v;bb+=x*v-y*u;den+=x*x+y*y;
+     }
+     coefficient_a=float(aa/den);coefficient_b=float(bb/den);
+     if(isnan(coefficient_a)||isinf(coefficient_a)||isnan(coefficient_b)||isinf(coefficient_b))valid=0;
    }
-   mx0/=68.;my0/=68.;mx1/=68.;my1/=68.;
-   precise double aa=0.,bb=0.,den=0.;
-   for(uint i=0;i<68;i++) {
-     precise double x=double(f(p[5]+2*i))-mx0,y=double(f(p[5]+2*i+1))-my0;
-     precise double u=double(shape(2*i))-mx1,v=double(shape(2*i+1))-my1;
-     aa+=x*u+y*v;bb+=x*v-y*u;den+=x*x+y*y;
-   }
-   precise float a=float(aa/den),b=float(bb/den);
+   barrier();if(valid==0)return;
+   precise float a=coefficient_a,b=coefficient_b;
    uint fb=forest[p[11]+c],fe=forest[p[11]+c+1];
-   for(uint j=fb;j<fe;j++) {
+   for(uint j=fb+lane;j<fe;j+=64) {
      uint k=forest[p[12]+j];
      float dx=f(p[13]+j*2),dy=f(p[13]+j*2+1);
      precise float nx=shape(2*k)+a*dx-b*dy,ny=shape(2*k+1)+b*dx+a*dy;
@@ -60,22 +71,33 @@ void main() {
      }
      scratch[136+j-fb]=floatBitsToUint(value);
    }
-   for(uint t=forest[p[6]+c];t<forest[p[6]+c+1];t++) {
+   memoryBarrierBuffer();barrier();
+   uint tb=forest[p[6]+c],te=forest[p[6]+c+1],leaf_scratch=136+p[15];
+   for(uint t=tb+lane;t<te;t+=64) {
      uint sb=forest[p[7]+t],count=forest[p[7]+t+1]-sb,n=0;
      while(n<count) {
        uint s=p[9]+(sb+n)*3;
        float va=uintBitsToFloat(scratch[136+forest[s]]),vb=uintBitsToFloat(scratch[136+forest[s+1]]);
        n=(va-vb>f(s+2))?2*n+1:2*n+2;
      }
-     uint leaf=forest[p[8]+t]+n-count;
-     for(uint i=0;i<136;i++)setshape(i,shape(i)+f(p[10]+leaf*136+i));
+     scratch[leaf_scratch+t-tb]=forest[p[8]+t]+n-count;
    }
+   memoryBarrierBuffer();barrier();
+   // Coordinates are independent. Each worker retains exactly the original
+   // initial + leaf0 + leaf1 + ... FP32 addition order for its coordinates.
+   for(uint i=lane;i<136;i+=64) {
+     precise float value=shape(i);
+     for(uint t=tb;t<te;t++)value=value+f(p[10]+scratch[leaf_scratch+t-tb]*136+i);
+     setshape(i,value);
+   }
+   barrier();
  }
- for(uint i=0;i<68;i++) {
+ for(uint i=lane;i<68;i+=64) {
    precise double x=m[0]*double(shape(2*i))+m[1]*double(shape(2*i+1))+m[2];
    precise double y=m[3]*double(shape(2*i))+m[4]*double(shape(2*i+1))+m[5];
    output_points[2*i]=floatBitsToUint(float(floor(x+.5)));
    output_points[2*i+1]=floatBitsToUint(float(floor(y+.5)));
  }
- st[8]=1;
+ memoryBarrierBuffer();barrier();
+ if(lane==0)st[8]=1;
 }
