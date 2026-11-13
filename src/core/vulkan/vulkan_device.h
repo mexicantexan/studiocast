@@ -474,6 +474,10 @@ public:
   VulkanHealthState health_state() const noexcept;
   VulkanAllocationStats allocation_stats() const;
   bool SafeToDestroyResources() const;
+  // Setup/shutdown only: one finite wait on the exact pending submission fence.
+  // Late completion permits retirement, never execution or success attribution;
+  // the original poisoned health and failure diagnostics remain latched.
+  bool TryProvePendingSubmissionQuiescence(std::string *error_out);
   bool shader_float64_enabled() const noexcept {
     return context_ && context_->shader_float64_enabled;
   }
