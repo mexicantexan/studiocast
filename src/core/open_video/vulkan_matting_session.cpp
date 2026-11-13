@@ -415,7 +415,8 @@ bool OpenVulkanMattingSession::EnsureInitialized(int frame_w, int frame_h,
   impl_->resources.input_buffer = OpaqueHandle(impl_->input_tensor.buffer());
   impl_->resources.alpha_buffer = OpaqueHandle(impl_->fixed_alpha->buffer());
   impl_->resources.alpha_row_stride_bytes = impl_->fixed_alpha->pitch_bytes();
-  impl_->resources.alpha_buffer_capacity_bytes = impl_->fixed_alpha->byte_size();
+  impl_->resources.alpha_buffer_capacity_bytes =
+      impl_->fixed_alpha->byte_size();
   impl_->resources.input_bytes = impl_->input_tensor.bytes();
   impl_->resources.alpha_bytes = alpha_size.bytes;
   impl_->resources.allow_cpu_layers = false;
@@ -463,8 +464,33 @@ bool OpenVulkanMattingSession::Warmup(std::string *error_out) {
 bool OpenVulkanMattingSession::Run(
     const studiocast::vulkan::VulkanImage &input_rgb_gpu,
     studiocast::vulkan::VulkanImage *output_alpha_gpu, std::string *error_out) {
+  return RunInternal(input_rgb_gpu, output_alpha_gpu, nullptr, error_out);
+}
+
+bool OpenVulkanMattingSession::Enqueue(
+    const studiocast::vulkan::VulkanImage &input_rgb_gpu,
+    studiocast::vulkan::VulkanImage *output_alpha_gpu,
+    studiocast::vulkan::ResidentCommandBatch &batch, std::string *error_out) {
+  return RunInternal(input_rgb_gpu, output_alpha_gpu, &batch, error_out);
+}
+
+bool OpenVulkanMattingSession::RunInternal(
+    const studiocast::vulkan::VulkanImage &input_rgb_gpu,
+    studiocast::vulkan::VulkanImage *output_alpha_gpu,
+    studiocast::vulkan::ResidentCommandBatch *batch, std::string *error_out) {
   if (error_out)
     error_out->clear();
+  if (!impl_->kernels ||
+      (batch &&
+       (!impl_->buffers_ready || !impl_->kernels->deferred_frame_active() ||
+        batch->context_identity() != impl_->bound_context ||
+        batch->Mark().batch_id == 0)) ||
+      (!batch && impl_->kernels->deferred_frame_active())) {
+    if (error_out)
+      *error_out =
+          "Matting producer does not match the exact execution boundary.";
+    return false;
+  }
   if (!output_alpha_gpu || output_alpha_gpu != impl_->fixed_alpha) {
     return impl_->Latch(
         VulkanMattingRuntimeFailure::invalid_shape,
@@ -526,9 +552,15 @@ bool OpenVulkanMattingSession::Run(
         error_out);
   }
 
+  const auto queued_mark =
+      batch ? batch->Mark() : studiocast::vulkan::ResidentCommandMark{};
   std::string pp_err;
   if (!impl_->kernels->PreprocessToTensor(input_rgb_gpu, impl_->input_tensor,
                                           impl_->preprocess, &pp_err)) {
+    if (batch) {
+      impl_->kernels->DiscardUnsubmittedOperation();
+      (void)batch->Rollback(queued_mark, nullptr);
+    }
     const auto health = impl_->device->health();
     return impl_->Latch(
         health.health == studiocast::vulkan::VulkanContextHealth::device_lost
@@ -555,7 +587,7 @@ bool OpenVulkanMattingSession::Run(
   // PreprocessToTensor records the producer barrier and completes through the
   // device's serialized SubmitAndWait queue contract. A production adapter
   // must run synchronously on that same queue before returning.
-  input_binding.access_synchronized = true;
+  input_binding.access_synchronized = batch == nullptr;
   input_binding.runtime_queue_ownership = true;
 
   VulkanMattingBufferBinding alpha_binding;
@@ -573,11 +605,19 @@ bool OpenVulkanMattingSession::Run(
   alpha_binding.host_mapped = output_alpha_gpu->mapped() != nullptr;
   alpha_binding.context_id = impl_->bound_context.context_id;
   alpha_binding.context_generation = impl_->bound_context.generation;
-  alpha_binding.access_synchronized = true;
+  alpha_binding.access_synchronized = batch == nullptr;
   alpha_binding.runtime_queue_ownership = true;
 
-  if (!impl_->runtime_lifecycle->Run(input_binding, alpha_binding, error_out))
+  const bool accepted =
+      batch ? impl_->runtime_lifecycle->Enqueue(input_binding, alpha_binding,
+                                                *batch, error_out)
+            : impl_->runtime_lifecycle->Run(input_binding, alpha_binding,
+                                            error_out);
+  if (!accepted) {
+    if (batch)
+      (void)batch->Rollback(queued_mark, nullptr);
     return impl_->ReportReadiness(error_out);
+  }
   return true;
 }
 

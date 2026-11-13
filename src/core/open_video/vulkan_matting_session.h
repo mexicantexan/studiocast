@@ -53,6 +53,10 @@ public:
   bool Run(const studiocast::vulkan::VulkanImage &input_rgb_gpu,
            studiocast::vulkan::VulkanImage *output_alpha_gpu,
            std::string *error_out);
+  bool Enqueue(const studiocast::vulkan::VulkanImage &input_rgb_gpu,
+               studiocast::vulkan::VulkanImage *output_alpha_gpu,
+               studiocast::vulkan::ResidentCommandBatch &batch,
+               std::string *error_out);
 
   bool DeviceResidentInferenceAvailable() const;
   VulkanMattingReadiness Readiness() const;
@@ -66,6 +70,9 @@ public:
   const Options &options() const;
 
 private:
+  bool RunInternal(const studiocast::vulkan::VulkanImage &,
+                   studiocast::vulkan::VulkanImage *,
+                   studiocast::vulkan::ResidentCommandBatch *, std::string *);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
