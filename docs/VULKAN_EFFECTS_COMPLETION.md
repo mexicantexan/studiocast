@@ -1,6 +1,6 @@
 # Complete production Vulkan effects
 
-- Status: Implementation in progress; discovery and shared-contract freeze complete
+- Status: Local implementation and validation complete; publication approval and hardware qualification remain
 - Baseline: `15b8862398bbae774f8156ed70c2378245c9bef9`, branch `v0.2.9`
 - User decision, 2026-11-12: finish the remaining Vulkan model effects in this
   pass rather than keep them outside the earlier matting phase. The prior
@@ -137,10 +137,10 @@ host transfers or CPU tails, no Execute allocations, and bounded resources and
 submissions. Preserve the existing P1000 evidence without generalizing it to
 unavailable AMD/Intel, real-camera/V4L2, quality, or optimized latency coverage.
 
-Implementation, model validation/publication proposal, installer provisioning,
-full native matrix, and fresh independent critique remain in progress. Exact
-commits, merged branches, tests/results, reviewed budget, and remaining external
-prerequisites will be appended as work is integrated.
+All accepted local implementation is integrated. Publication/catalog activation
+awaits explicit authority, and the available-hardware failures below remain
+unqualified. The following ledger records chronological checkpoints; the final
+local gate at the end supersedes earlier in-progress observations.
 
 ## Integrated evidence ledger (in progress)
 
@@ -430,8 +430,8 @@ Vulkan residency are unchanged by this seam. Frame buffers and resize lookup
 scratch must fit explicit caller reservations and be prepared outside execution.
 Required verification includes actual camera acceptance, guarded up/down scaling,
 odd and padded geometry, malformed descriptors, allocation-denied execution and
-the existing publication/reset suites. This High remediation and its fresh
-independent critique remain blocking until integrated and verified.
+the existing publication/reset suites. This High remediation is integrated at
+`63953fe`; its final tests and fresh independent critique are recorded below.
 
 The source baseline for the completed available Vulkan matrix was `7c20594`.
 It passed 26 case assertions and 106 successful frames, all with one upload,
@@ -455,3 +455,100 @@ component/combination cases do not erase the failed observations. The existing
 100 ms fence and 16-synchronization cap are unchanged. Exact commands, executable
 SHA-256, metrics and all pass/fail/skip logs are recorded in
 `/tmp/studiocast-vulkan-all-pipeline-final-handoff-20261113.txt`.
+
+## Final local gate (2026-11-13)
+
+The complete prepared Vulkan program now includes denoise, Eye Contact and its
+resident face/landmark dependencies, all background modes/key light, Auto Frame,
+resize, tracked/fixed vignette and mirror. It retains one exact owner/device/
+queue, prepared graph bindings, aggregate reservation, GPU intermediates and
+bounded completion. Optional prerequisites remain isolated; required failures
+remain fail-closed. Normal installer SDK provisioning and strict opt-in native
+CI are integrated. No additional requested Vulkan effect is deferred.
+
+The compatibility High repair (`005f6c9` → `63953fe`) changes only the existing
+executor and tests. Effects use capture geometry; the existing prepared CPU
+primitive handles final writer geometry/stride. Physical backing covers complete
+rows while the caller's logical span remains exact. All owned frame/lookup bytes
+fit explicit reservations before allocation/model setup. The output has stable
+readable/writable aliases, and frame/completion/committed domains identify the
+actual owner. Guarded tight/minimal padded captures, up/down/odd/padded resize,
+optional partial failure, allocation-denied replay, malformed descriptors,
+exact/short reservations, foreign owners/generations and publication recovery pass.
+
+Fresh critic `compatibility_geometry_final_critique`, detached at `63953fe`,
+reviewed the actual camera consumer and independently ran the integrated
+compatibility binary with temporary HOME/XDG and Vulkan ICD discovery denied.
+It found no remaining Blocker/Critical/High or additional unmet requirement in
+that boundary. The earlier two High findings are resolved. Separate final Vulkan
+critique through `adb69a4` found no additional source Blocker/High and explicitly
+retained the failed hardware profiles. No accepted source change remains on an
+unmerged topic branch.
+
+All three complete Debug builds and broad hermetic suites pass at source head
+`63953fecc610b99137005c319a747d0cb8978083`:
+
+| Configuration | CTest total | Executed passes | Native opt-in skips | Failures | Wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vulkan + production ncnn + dlib | 100 | 88 | 12 | 0 | 64.69 s |
+| CUDA/Vulkan/audio/dlib, ncnn off | 94 | 88 | 6 | 0 | 64.41 s |
+| Optional backends off | 85 | 80 | 5 | 0 | 64.34 s |
+
+Each suite used fresh HOME/XDG roots, a real CMake executable on PATH and
+nonexistent `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`. No native result is inferred
+from those loader-denied suites. The exact command was
+`ctest --test-dir <build> --output-on-failure -j2`; logs begin with the tested
+source SHA and are
+`/tmp/studiocast-vulkan-safe-transport-final-{production,alloptional,disabled}-suite-20261113.log`.
+The integrated 13-suite publication/reset/owner/compatibility subset also passed
+with zero skips/failures in 0.34 s; log
+`/tmp/studiocast-safe-transport-integrated-final-tests-20261113.log`.
+Documentation validation passes all 43 Markdown files; source/bytecode provenance
+and the isolated pinned-compiler shader reproduction also pass.
+
+### Follow-up topic integration ledger
+
+These rows supplement the initial topic table above. All listed accepted source
+commits are on `v0.2.9`; read-only critics made no source commits.
+
+| Topic branch | Focused source → integrated commit |
+| --- | --- |
+| `codex/vulkan-late-retirement-20261112` | `9fad0fd` → `f1447c8`; `617655b` → `3da0121` |
+| `codex/quarantine-reason-retention-20261112` | `b6cd07c` → `adf2d5f` |
+| `codex/coordinator-reset-recovery-20261113` | `46b07e7` → `6315d2c`; `4d2b66d` → `31a86af` |
+| `codex/vulkan-yunet-preprocess-parity-20261113` | `1d92a07` → `b7d4772` |
+| `codex/vulkan-all-pipeline-20261112` | `8c0bc14` → `2f82443`; `4dfc5e7` → `5e13901`; `6dbd021` → `a2fba7d`; `26ed2be` → `5e6b699`; `bb61e5b` → `3388a9c`; `7c20594` → `adb69a4` |
+| `codex/open-video-projection-repair-20261113` | `bbec0a8` → `ef3ff23`; `883cf90` → `1f7f641`; test-only `2c685a8` → `a80e7f6` |
+| `codex/compatibility-current-activity-20261113` | `423ae3b` → `dc7cf2e`; `5d56762` → `e10e5b3` |
+| `codex/compatibility-output-transport-20261113` | `005f6c9` → `63953fe` |
+
+Fresh review iterations identified and closed the YuNet preprocessing Medium,
+neutral/CUDA cause projection and compatibility attribution/pending Mediums,
+and the two compatibility transport Highs. Each implementation handoff records
+its RED/GREEN evidence, exact tests, file ownership and clean isolated worktree.
+The final compatibility review is in
+`/tmp/studiocast-compat-final-critique-20261113-63953fe`; the read-only contract
+audit at `20cf31f` was guidance only and was not used as final acceptance.
+
+### Remaining authority and qualification
+
+The only prepared, unmerged proposal is the explicitly unapproved catalog branch
+`codex/vulkan-catalog-unapproved-proposal-20261113`, commit `01eaaa4`. It contains
+metadata/count/packaging changes only, no model binaries. The corrected proposal
+maps all eight new artifacts to the exact immutable publication destinations;
+the historical `62da60bd` derivative is not activation-ready. Its final catalog
+SHA is `097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e`.
+It passes 21 model, 56 backend, 13 packaging and 14 offscreen GUI scenarios. The
+active catalog remains unchanged at seven packs/ten artifacts until approval,
+public immutable retrieval, factual receipt/version/source pin and fresh catalog
+review. See [the publication proposal](VULKAN_MODEL_PUBLICATION.md).
+
+Hardware qualification is incomplete: combined cold batches can exceed 100 ms
+on this P1000; full-face 320×240 denoise warmup and 640×480 denoise preparation
+failed their limits. AMD/Intel, full-resolution combined throughput, actual
+camera/V4L2 transport, portrait quality, forced descriptor fallback, full native
+sanitizers and validation-layer cleanliness are not qualified. Existing look-away
+behavior remains its documented no-op contract. These limits are explicit
+deployment-feedback scope under the user's hardware decision, not passing tests
+or waived fences. No application release, Git push, installed-pack mutation or
+new external publication occurred during this expansion.
