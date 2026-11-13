@@ -1,5 +1,6 @@
 #include "core/open_video/dlib_shape_predictor_data.h"
 #include "core/open_video/ncnn_vulkan_context.h"
+#include "core/open_video/prepared_cuda_auto_frame.h"
 #include "core/open_video/yunet_face_detector.h"
 #include "core/vulkan/kernels/tracking_kernels.h"
 
@@ -495,6 +496,327 @@ void EyeInputsOracle(Runner &r) {
   std::cout << "PASS native GPU eye inputs: odd101x79 strength0/.01/.5/1 "
                "exactanchors/angles/geometry\n";
 }
+void CropAndVignetteOracle(Runner &r) {
+  constexpr unsigned w = 64, h = 48;
+  vk::VulkanBuffer image, cropped, vignetted, state, frame;
+  r.Allocate(image, w * h * 4, false);
+  r.Allocate(cropped, w * h * 4, false);
+  r.Allocate(vignetted, w * h * 4, false);
+  r.Allocate(state, 5512 * 4, false);
+  r.Allocate(frame, 16, false);
+  std::vector<std::uint32_t> pixels(w * h), zero(5512);
+  for (unsigned y = 0; y < h; y++)
+    for (unsigned x = 0; x < w; x++)
+      pixels[y * w + x] = ((x * 3 + y) & 255) | (((y * 4 + x) & 255) << 8) |
+                          (((x * 2 + y * 2) & 255) << 16) | 0xff000000;
+  r.Upload(image, pixels.data(), pixels.size() * 4);
+  r.Upload(state, zero.data(), zero.size() * 4);
+  auto base = r.Dispatch(0);
+  base.parameters[1] = w;
+  base.parameters[2] = h;
+  base.buffers[5] = Bind(state);
+  base.buffers[7] = Bind(frame);
+  const auto begin = r.Record(std::span(&base, 1));
+  auto plan = base;
+  plan.parameters[0] = 8;
+  plan.parameters[13] = 50;
+  plan.parameters[14] = 50;
+  plan.parameters[15] = Bits(.15F);
+  auto crop = base;
+  crop.parameters[0] = 9;
+  crop.parameters[3] = crop.parameters[4] = w;
+  crop.buffers[0] = Bind(image);
+  crop.buffers[1] = Bind(cropped);
+  crop.invocations = w * h;
+  const std::array<TrackingDispatch, 2> phases{plan, crop};
+  const auto plan_crop = r.Record(phases);
+  const auto crop_only = r.Record(std::span(&crop, 1));
+  auto vig = base;
+  vig.parameters[0] = 10;
+  vig.parameters[3] = vig.parameters[4] = w;
+  vig.parameters[16] = Bits(.7F);
+  vig.parameters[17] = 1;
+  vig.buffers[0] = Bind(cropped);
+  vig.buffers[1] = Bind(vignetted);
+  vig.invocations = w * h;
+  const auto vignette = r.Record(std::span(&vig, 1));
+  using A = video::PreparedCudaAutoFrame;
+  video::PreparedCudaAutoFrameRect previous{};
+  bool have = false;
+  std::uint64_t previous_seq = 0;
+  unsigned previous_source = 0;
+  for (unsigned n = 0; n < 6; n++) {
+    const std::uint64_t seq = std::array<std::uint64_t, 6>{
+        1, 2, 11, 12, 4294967295ULL, 4294967296ULL}[n];
+    const std::array<std::uint32_t, 4> parameters{unsigned(seq),
+                                                  unsigned(seq >> 32), 1, 0};
+    r.Upload(frame, parameters.data(), sizeof(parameters));
+    r.Execute(begin);
+    auto meta = r.Read<std::uint32_t>(state, 5512);
+    const bool found = n != 3;
+    const unsigned source = found ? 1 : 0;
+    const video::PreparedCudaAutoFrameRect box{float(n == 1 || n == 5 ? 32 : 8),
+                                               6, 16, 20};
+    meta[6] = found;
+    for (unsigned i = 0; i < 4; i++)
+      meta[24 + i] = Bits(std::array<float, 4>{box.x, box.y, box.w, box.h}[i]);
+    r.Upload(state, meta.data(), meta.size() * 4);
+    video::PreparedCudaAutoFrameTrackingBox signal{
+        video::PreparedCudaAutoFrameSource::face, box, .99F};
+    auto target =
+        found ? A::TargetCrop(signal, w, h, float(w) / h, {50, 50, .15F})
+              : A::CenterCrop(w, h, float(w) / h, 1.25F);
+    if (seq != previous_seq + 1 || source != previous_source)
+      have = false;
+    if (have) {
+      float a = A::SmoothingAlpha(50);
+      target = {previous.x + (target.x - previous.x) * a,
+                previous.y + (target.y - previous.y) * a,
+                previous.w + (target.w - previous.w) * a,
+                previous.h + (target.h - previous.h) * a};
+    }
+    previous = target;
+    have = true;
+    previous_seq = seq;
+    previous_source = source;
+    r.Execute(plan_crop);
+    meta = r.Read<std::uint32_t>(state, 5512);
+    const auto sf = [&](unsigned i) { return std::bit_cast<float>(meta[i]); };
+    Need(std::abs(sf(40) - target.x) < .0001F &&
+             std::abs(sf(41) - target.y) < .0001F &&
+             std::abs(sf(42) - target.w) < .0001F &&
+             std::abs(sf(43) - target.h) < .0001F,
+         "GPU crop geometry/smoothing/reset differs from canonical CPU "
+         "reference");
+    const float cx = found ? (box.x + box.w * .5F - target.x) / target.w : .5F,
+                cy = found ? (box.y + box.h * .5F - target.y) / target.h : .5F;
+    Need(std::abs(sf(50) - cx) < .0001F && std::abs(sf(51) - cy) < .0001F,
+         "GPU postcrop tracked center");
+    const auto actual = r.Read<std::uint32_t>(cropped, w * h);
+    for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+        const float sx = target.x + (x + .5F) * (target.w / w) - .5F,
+                    sy = target.y + (y + .5F) * (target.h / h) - .5F;
+        const int x0 = std::clamp(int(sx), 0, int(w) - 1),
+                  y0 = std::clamp(int(sy), 0, int(h) - 1),
+                  x1 = std::min(int(w) - 1, x0 + 1),
+                  y1 = std::min(int(h) - 1, y0 + 1);
+        const float fx = sx - x0, fy = sy - y0;
+        for (unsigned c = 0; c < 3; c++) {
+          const auto value = [&](unsigned xx, unsigned yy) {
+            return float((pixels[yy * w + xx] >> (c * 8)) & 255);
+          };
+          const float a = value(x0, y0) + fx * (value(x1, y0) - value(x0, y0)),
+                      b = value(x0, y1) + fx * (value(x1, y1) - value(x0, y1));
+          const int gold = std::clamp(int(a + fy * (b - a) + .5F), 0, 255);
+          Need(int((actual[y * w + x] >> (c * 8)) & 255) == gold,
+               "GPU crop RGB byte oracle n=" + std::to_string(n) +
+                   " xy=" + std::to_string(x) + "," + std::to_string(y) +
+                   " c=" + std::to_string(c) +
+                   " expected=" + std::to_string(gold) + " actual=" +
+                   std::to_string((actual[y * w + x] >> (c * 8)) & 255) +
+                   " cropx_cpu=" + std::to_string(target.x) +
+                   " cropx_gpu=" + std::to_string(sf(40)));
+        }
+      }
+    r.Execute(vignette);
+    const auto result = r.Read<std::uint32_t>(vignetted, w * h);
+    for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+        float nx = (x + .5F - w * cx) * (2.F / w),
+              ny = (y + .5F - h * cy) * (2.F / h),
+              radius = std::clamp(
+                  std::sqrt(nx * nx + ny * ny) * .7071067811865476F, 0.F, 1.F),
+              factor = std::max(0.F, 1.F - .7F * (radius * radius));
+        for (unsigned c = 0; c < 3; c++) {
+          const int gold = std::nearbyint(
+              float((actual[y * w + x] >> (c * 8)) & 255) * factor);
+          Need(std::abs(int((result[y * w + x] >> (c * 8)) & 255) - gold) <= 1,
+               "GPU tracked vignette byte oracle");
+        }
+      }
+  }
+  auto metadata = r.Read<std::uint32_t>(state, 5512);
+  metadata[40] = Bits(.1F);
+  metadata[41] = Bits(.2F);
+  metadata[42] = Bits(w - .2F);
+  metadata[43] = Bits(h - .2F);
+  metadata[52] = 1;
+  r.Upload(state, metadata.data(), metadata.size() * 4);
+  r.Execute(crop_only);
+  Need(r.Read<std::uint32_t>(cropped, w * h) == pixels,
+       "near-identity canonical crop must preserve exact input");
+  std::cout
+      << "PASS native GPU crop/sequence/smoothing/tracked vignette: canonical "
+         "geometry/centers/exactcropbytes, nearidentitypreservation\n";
+}
+void MatteCadenceOracle(Runner &r) {
+  vk::VulkanBuffer alpha, partials, state, frame;
+  r.Allocate(alpha, 32 * 24 * 4, false);
+  r.Allocate(partials, 3 * 20, false);
+  r.Allocate(state, 5512 * 4, false);
+  r.Allocate(frame, 16, false);
+  std::vector<std::uint32_t> zero(5512);
+  r.Upload(state, zero.data(), zero.size() * 4);
+  auto base = r.Dispatch(0);
+  base.parameters[1] = 64;
+  base.parameters[2] = 48;
+  base.buffers[5] = Bind(state);
+  base.buffers[7] = Bind(frame);
+  const auto begin = r.Record(std::span(&base, 1));
+  auto reduction = base;
+  reduction.parameters[0] = 7;
+  reduction.parameters[20] = 32;
+  reduction.parameters[21] = 24;
+  reduction.parameters[22] = 32;
+  reduction.buffers[0] = Bind(alpha);
+  reduction.buffers[6] = Bind(partials);
+  reduction.invocations = 3;
+  auto plan = base;
+  plan.parameters[0] = 8;
+  plan.parameters[13] = plan.parameters[14] = 50;
+  plan.parameters[15] = Bits(.15F);
+  plan.parameters[20] = 32;
+  plan.parameters[21] = 24;
+  plan.parameters[23] = 1;
+  plan.buffers[6] = Bind(partials);
+  std::array<TrackingDispatch, 2> phases{reduction, plan};
+  const auto fallback = r.Record(phases);
+  phases[1].parameters[24] = 1;
+  const auto shared = r.Record(phases);
+  std::array<float, 32 * 24> matte{};
+  for (unsigned seq = 1; seq <= 14; seq++) {
+    std::array<std::uint32_t, 4> parameters{seq, 0, seq >= 13 ? 0u : 1u, 0};
+    r.Upload(frame, parameters.data(), sizeof(parameters));
+    r.Execute(begin);
+    matte.fill(0);
+    const unsigned left = seq == 1 ? 4 : seq <= 11 ? 12 : 20;
+    for (unsigned y = 6; y < 14; y++)
+      for (unsigned x = left; x < left + 8; x++)
+        matte[y * 32 + x] = .8F;
+    r.Upload(alpha, matte.data(), sizeof(matte));
+    if (seq == 14) {
+      auto meta = r.Read<std::uint32_t>(state, 5512);
+      meta[6] = 1;
+      meta[24] = Bits(8);
+      meta[25] = Bits(6);
+      meta[26] = Bits(16);
+      meta[27] = Bits(20);
+      r.Upload(state, meta.data(), meta.size() * 4);
+    }
+    r.Execute(seq >= 12 ? shared : fallback);
+    const auto meta = r.Read<std::uint32_t>(state, 5512);
+    const float x = std::bit_cast<float>(meta[32]);
+    if (seq <= 10)
+      Need(x == 8 && meta[48] == 1,
+           "GPU matte bounds fallback cadence changed before10captureinterval");
+    if (seq == 11)
+      Need(x == 24 && meta[48] == 11,
+           "GPU matte bounds fallback cadence failed torefresh");
+    if (seq == 12)
+      Need(x == 40 && meta[48] == 12,
+           "GPU shared same-frame matte was not consumed immediately");
+    if (seq == 13)
+      Need(meta[52] == 0 && meta[48] == 12,
+           "unavailablematte must preserveinput without stalealpha");
+    if (seq == 14)
+      Need(meta[52] == 1 && meta[45] == 1 && meta[48] == 12,
+           "unavailablematte suppressed unrelated validfacecrop");
+  }
+  std::cout
+      << "PASS native GPU matte: "
+         "tiledbounds/10capturecadence/sharedcurrentframe/failureisolation\n";
+}
+void EyeCompositeOracle(Runner &r) {
+  constexpr unsigned w = 101, h = 79;
+  vk::VulkanBuffer image, left, right, output, state;
+  r.Allocate(image, w * h * 4, false);
+  r.Allocate(left, 9216 * 4, false);
+  r.Allocate(right, 9216 * 4, false);
+  r.Allocate(output, w * h * 4, false);
+  r.Allocate(state, 5512 * 4, false);
+  std::vector<std::uint32_t> pixels(w * h), metadata(5512);
+  std::array<std::vector<float>, 2> model{std::vector<float>(9216),
+                                          std::vector<float>(9216)};
+  for (unsigned y = 0; y < h; y++)
+    for (unsigned x = 0; x < w; x++)
+      pixels[y * w + x] = ((x * 3 + y) & 255) | (((y * 4 + x) & 255) << 8) |
+                          (((x * 2 + y * 2) & 255) << 16) | 0xff000000;
+  for (unsigned e = 0; e < 2; e++)
+    for (unsigned i = 0; i < 9216; i++)
+      model[e][i] = (int((i * 17 + e * 29) % 93) - 5) / 70.F;
+  r.Upload(image, pixels.data(), pixels.size() * 4);
+  r.Upload(left, model[0].data(), 9216 * 4);
+  r.Upload(right, model[1].data(), 9216 * 4);
+  const auto byte = [](float x) {
+    return unsigned(
+        std::clamp(int(std::floor(std::clamp(x, 0.F, 255.F) + .5F)), 0, 255));
+  };
+  const auto sample = [&](unsigned eye, unsigned c, float x, float y) {
+    x = std::clamp(x, 0.F, 63.F);
+    y = std::clamp(y, 0.F, 47.F);
+    unsigned x0 = std::floor(x), y0 = std::floor(y), x1 = std::min(63u, x0 + 1),
+             y1 = std::min(47u, y0 + 1);
+    float fx = x - x0, fy = y - y0;
+    const auto at = [&](unsigned xx, unsigned yy) {
+      return float(byte(
+          std::clamp(model[eye][c * 3072 + yy * 64 + xx], 0.F, 1.F) * 255.F));
+    };
+    float a = at(x0, y0) * (1 - fx) + at(x1, y0) * fx,
+          b = at(x0, y1) * (1 - fx) + at(x1, y1) * fx;
+    return a * (1 - fy) + b * fy;
+  };
+  unsigned case_number = 0;
+  for (float strength : {0.F, .01F, .5F, 1.F}) {
+    auto d = r.Dispatch(2);
+    d.shader = vk::kernels::TrackingShader::eye_contact;
+    d.parameters[1] = w;
+    d.parameters[2] = h;
+    d.parameters[3] = d.parameters[4] = w;
+    d.parameters[6] = Bits(strength);
+    d.buffers[0] = Bind(image);
+    d.buffers[1] = Bind(left);
+    d.buffers[2] = Bind(right);
+    d.buffers[3] = Bind(output);
+    d.buffers[5] = Bind(state);
+    d.invocations = w * h;
+    const auto cmd = r.Record(std::span(&d, 1));
+    for (unsigned flags = 0; flags < (strength == 1.F ? 4u : 1u); flags++) {
+      const std::array<std::array<float, 4>, 2> geometry{
+          {{25, 16, 30, 24}, {35, 20, 30, 24}}};
+      for (unsigned e = 0; e < 2; e++) {
+        for (unsigned i = 0; i < 4; i++)
+          metadata[60 + e * 5 + i] = Bits(geometry[e][i]);
+        metadata[64 + e * 5] = ((flags >> e) & 1) == 0;
+      }
+      r.Upload(state, metadata.data(), metadata.size() * 4);
+      r.Execute(cmd);
+      const auto actual = r.Read<std::uint32_t>(output, w * h);
+      for (unsigned y = 0; y < h; y++)
+        for (unsigned x = 0; x < w; x++)
+          for (unsigned c = 0; c < 3; c++) {
+            unsigned expected = (pixels[y * w + x] >> (c * 8)) & 255;
+            for (unsigned e = 0; e < 2; e++) {
+              const auto g = geometry[e];
+              if (!metadata[64 + e * 5] || x < g[0] || y < g[1] ||
+                  x >= g[0] + g[2] || y >= g[1] + g[3] || strength <= 0)
+                continue;
+              const float mx = (x - g[0] + .5F) * 64 / g[2] - .5F,
+                          my = (y - g[1] + .5F) * 48 / g[3] - .5F;
+              const float corrected = byte(sample(e, c, mx, my));
+              expected = byte(expected + (corrected - expected) * strength);
+            }
+            Need(
+                ((actual[y * w + x] >> (c * 8)) & 255) == expected,
+                "GPU eye byteblend/left-before-right overlap/clamping differs");
+          }
+      ++case_number;
+    }
+  }
+  std::cout << "PASS native GPU eye composite:" << case_number
+            << " exactbytecases "
+               "includingoverlap/invalidcrops/zero/intermediatestrength\n";
+}
 } // namespace
 int main() {
   if (!std::getenv("STUDIOCAST_REQUIRE_VULKAN_TRACKING")) {
@@ -505,9 +827,19 @@ int main() {
     const auto *root = std::getenv("STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Need(root, "set STUDIOCAST_DLIB_ORACLE_MODELS_ROOT");
     Runner runner;
+    if (std::getenv("STUDIOCAST_VULKAN_TRACKING_ONLY_CROP")) {
+      CropAndVignetteOracle(runner);
+      MatteCadenceOracle(runner);
+      EyeCompositeOracle(runner);
+      Need(runner.kernels.Shutdown(&runner.error), runner.error);
+      return 0;
+    }
     DlibOracle(runner, root);
     YunetOracle(runner);
     EyeInputsOracle(runner);
+    CropAndVignetteOracle(runner);
+    MatteCadenceOracle(runner);
+    EyeCompositeOracle(runner);
     if (const auto *fixtures =
             std::getenv("STUDIOCAST_VULKAN_MODEL_CANDIDATE_ROOT"))
       FlxTailOracle(runner, fixtures);

@@ -217,13 +217,31 @@ bool PreparedVulkanTracking::Prepare(const PreparedVulkanTrackingSetup &s,
     error->clear();
   if (!s.device || !s.device->Initialized() ||
       !hal::ValidateExecutionDomain(s.domain) || !s.owner_generation ||
-      s.frame_width < 2 || s.frame_height < 2 || s.final_width < 2 ||
-      s.final_height < 2 || s.frame_width > 8192 || s.frame_height > 8192 ||
-      s.final_width > 8192 || s.final_height > 8192 ||
-      s.reservation.in_flight_slots != 1 || s.reservation.resource_count < 84 ||
-      !s.reservation.persistent_bytes || !s.reservation.scratch_bytes ||
-      !s.reservation.upload_staging_bytes || !Shutdown(error))
+      !std::isfinite(s.auto_frame_headroom) || s.frame_width < 2 ||
+      s.frame_height < 2 || s.final_width < 2 || s.final_height < 2 ||
+      s.frame_width > 8192 || s.frame_height > 8192 || s.final_width > 8192 ||
+      s.final_height > 8192 || s.reservation.in_flight_slots != 1 ||
+      s.reservation.resource_count < 84 || !s.reservation.persistent_bytes ||
+      !s.reservation.scratch_bytes || !s.reservation.upload_staging_bytes ||
+      !Shutdown(error))
     return Fail(error, "invalid or under-reserved resident tracking setup");
+  if (s.domain.backend != hal::BackendId::vulkan ||
+      s.domain.api_family != hal::ApiFamily::vulkan ||
+      s.domain.logical_context_generation !=
+          s.device->context_identity().generation ||
+      s.domain.queue_or_stream_identity !=
+          reinterpret_cast<std::uintptr_t>(s.device->queue()) ||
+      s.domain.physical_device.vendor_id != s.device->identity().vendor_id ||
+      s.domain.physical_device.device_id != s.device->identity().device_id ||
+      s.domain.physical_device.stable_id != s.device->identity().device_uuid ||
+      s.domain.allocator_family != hal::AllocatorFamily::vulkan ||
+      s.domain.memory_handle_family != hal::MemoryHandleFamily::vulkan_buffer ||
+      s.domain.ownership_model != hal::OwnershipModel::adapter_exclusive ||
+      s.domain.synchronization_protocol !=
+          hal::SynchronizationProtocol::vulkan_queue_fence)
+    return Fail(
+        error,
+        "tracking execution domain does not match its exact native owner");
   // Zero strength is a live-plan omission. Setup still validates/warms the
   // selected graph and records exact bindings so canonical model failures and
   // uniform readiness remain observable without changing the saved strength.

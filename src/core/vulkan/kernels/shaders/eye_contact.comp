@@ -18,19 +18,26 @@ uint byte1(float v) { return uint(clamp(floor(clamp(v,0.,255.)+.5),0.,255.)); }
 float channel(uint v,uint c) { return float((v>>(c*8))&255u); }
 float mark(uint i) { return uintBitsToFloat(b1[i]); }
 float sf(uint i) { return uintBitsToFloat(st[i]); }
+float geometry_div(float a,float b) {
+ precise float quotient=a/b;
+ precise float residual=fma(-quotient,b,a);
+ precise float result=fma(residual,1./b,quotient);
+ return result;
+}
 float sample_frame(float x,float y,uint c) {
  x=clamp(x,0.,float(p[1]-1));y=clamp(y,0.,float(p[2]-1));
  uint x0=uint(floor(x)),y0=uint(floor(y)),x1=min(p[1]-1,x0+1),y1=min(p[2]-1,y0+1);
  float fx=x-float(x0),fy=y-float(y0);
  precise float a=channel(b0[y0*p[3]+x0],c)*(1.-fx)+channel(b0[y0*p[3]+x1],c)*fx;
  precise float b=channel(b0[y1*p[3]+x0],c)*(1.-fx)+channel(b0[y1*p[3]+x1],c)*fx;
- return a*(1.-fy)+b*fy;
+ precise float result=a*(1.-fy)+b*fy;
+ return result;
 }
 vec4 geometry(uint eye) {
  uint base=eye==0?42u:36u;
- float cx=(mark(base*2)+mark((base+3)*2))*.5;
- float cy=(mark(base*2+1)+mark((base+3)*2+1))*.5;
- float halfw=abs(mark((base+3)*2)-mark(base*2))*.75,boxh=1.5*halfw;
+ precise float cx=(mark(base*2)+mark((base+3)*2))*.5;
+ precise float cy=(mark(base*2+1)+mark((base+3)*2+1))*.5;
+ precise float halfw=abs(mark((base+3)*2)-mark(base*2))*.75,boxh=1.5*halfw;
  int left=clamp(int(floor(cx-halfw)),0,int(p[1])-2);
  int right=clamp(int(ceil(cx+halfw)),1,int(p[1])-1);
  int top=clamp(int(floor(cy-boxh*(7./12.))),0,int(p[2])-2);
@@ -44,7 +51,8 @@ float sample_corrected(uint eye,uint c,float x,float y) {
  float fx=x-float(x0),fy=y-float(y0);uint plane=c*3072;
  precise float a=float(byte1(clamp(corrected(eye,plane+y0*64+x0),0.,1.)*255.))*(1.-fx)+float(byte1(clamp(corrected(eye,plane+y0*64+x1),0.,1.)*255.))*fx;
  precise float b=float(byte1(clamp(corrected(eye,plane+y1*64+x0),0.,1.)*255.))*(1.-fx)+float(byte1(clamp(corrected(eye,plane+y1*64+x1),0.,1.)*255.))*fx;
- return a*(1.-fy)+b*fy;
+ precise float result=a*(1.-fy)+b*fy;
+ return result;
 }
 void main() {
  uint i=tid(),op=p[0];
@@ -65,8 +73,8 @@ void main() {
      uint c=i/3072,q=i%3072,x=q%64,y=q/64;
      const uint order[6]=uint[6](3,2,1,0,5,4);
      uint point=base+(eye==0?order[c/2]:c/2);
-     int rx=valid?int(floor((mark(2*point)-g.x)*64./g.z+.5)):0;
-     int ry=valid?int(floor((mark(2*point+1)-g.y)*48./g.w+.5)):0;
+     int rx=valid?int(floor(geometry_div((mark(2*point)-g.x)*64.,g.z)+.5)):0;
+     int ry=valid?int(floor(geometry_div((mark(2*point+1)-g.y)*48.,g.w)+.5)):0;
      b3[i]=floatBitsToUint(valid?float((c&1u)!=0?int(y)-ry:int(x)-rx):0.);
    }
    if(i==0){b4[0]=floatBitsToUint(0.);b4[1]=floatBitsToUint(-.10*uintBitsToFloat(p[6]));}
@@ -104,9 +112,10 @@ void main() {
        uint o=60+eye*5;
        vec4 g=vec4(sf(o),sf(o+1),sf(o+2),sf(o+3));
        if(st[o+4]==0||float(x)<g.x||float(y)<g.y||float(x)>=g.x+g.z||float(y)>=g.y+g.w||strength<=0.)continue;
-       float mx=(float(x)-g.x+.5)*64./g.z-.5,my=(float(y)-g.y+.5)*48./g.w-.5;
+       precise float mx=geometry_div((float(x)-g.x+.5)*64.,g.z)-.5,my=geometry_div((float(y)-g.y+.5)*48.,g.w)-.5;
        float corrected_byte=float(byte1(sample_corrected(eye,c,mx,my)));
-       value=byte1(float(value)+(corrected_byte-float(value))*strength);
+       precise float mixed=float(value)+(corrected_byte-float(value))*strength;
+       value=byte1(mixed);
      }
      out_value|=value<<(c*8);
    }
