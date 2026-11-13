@@ -199,6 +199,78 @@ bool TestFailOpenPreservesAndExecuteDoesNotAllocate() {
   return ok;
 }
 
+bool TestFailedPublicationClearsCurrentAttributionOnly() {
+  RunnerState state;
+  open_video::PreparedOpenVideoCompatibilitySetupResult setup;
+  auto executor = open_video::PreparedOpenVideoCompatibilityExecutor::Create(
+      Config(&state), &setup);
+  if (!Require(executor != nullptr, "publication fixture must prepare"))
+    return false;
+  std::array<std::byte, kFrameBytes> input{}, output{};
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto first = executor->Execute(Binding(input, &output, 1));
+  if (!Require(first.output_ready &&
+                   executor->CommitOutput(first.completion, true, &reason) ==
+                       hal::StatusId::ready,
+               "first compatibility publication must succeed"))
+    return false;
+  const auto selected = executor->Snapshot();
+  const auto second = executor->Execute(Binding(input, &output, 2));
+  auto forged = second.completion;
+  forged.complete = false;
+  bool ok = Require(
+      second.output_ready &&
+          executor->CommitOutput(forged, false, &reason) ==
+              hal::StatusId::blocked &&
+          reason == hal::ReasonId::output_not_committed &&
+          executor->Snapshot().latest_committed_frame.valid &&
+          executor->Snapshot().latest_committed_frame.capture_sequence == 1 &&
+          executor->Snapshot().telemetry.active_provider ==
+              selected.telemetry.active_provider,
+      "forged failed commit must preserve valid pending/current attribution");
+  ok &= Require(
+      executor->CommitOutput(second.completion, false, &reason) ==
+              hal::StatusId::failed &&
+          reason == hal::ReasonId::output_write_failed,
+      "exact failed writer must consume pending compatibility completion");
+  const auto failed = executor->Snapshot();
+  ok &=
+      Require(!failed.latest_committed_frame.valid &&
+                  failed.telemetry.active_backend == hal::BackendId::invalid &&
+                  failed.telemetry.active_provider ==
+                      hal::SemanticEffectProviderId::invalid &&
+                  failed.telemetry.committed_output_frames == 1 &&
+                  failed.telemetry.active_backend_frames == 1 &&
+                  failed.prepared && failed.plan_id == selected.plan_id &&
+                  failed.readiness.available == selected.readiness.available &&
+                  failed.readiness.status == selected.readiness.status &&
+                  failed.readiness.execution_domain ==
+                      selected.readiness.execution_domain &&
+                  failed.telemetry.selected_backend ==
+                      selected.telemetry.selected_backend,
+              "failed compatibility publication must clear current activity "
+              "but retain selected history");
+  ok &= Require(executor->CommitOutput(second.completion, true, &reason) ==
+                        hal::StatusId::blocked &&
+                    executor->Snapshot().telemetry.committed_output_frames == 1,
+                "failed compatibility completion must not later publish");
+  const auto third = executor->Execute(Binding(input, &output, 3));
+  ok &= Require(
+      third.output_ready &&
+          executor->CommitOutput(third.completion, true, &reason) ==
+              hal::StatusId::ready &&
+          executor->Snapshot().latest_committed_frame.valid &&
+          executor->Snapshot().latest_committed_frame.capture_sequence == 3 &&
+          executor->Snapshot().latest_committed_frame.output_commit_sequence ==
+              2 &&
+          executor->Snapshot().telemetry.committed_output_frames == 2 &&
+          executor->Snapshot().telemetry.active_backend_frames == 2 &&
+          executor->Snapshot().telemetry.active_provider ==
+              selected.telemetry.active_provider,
+      "next exact compatibility publication must recover current attribution");
+  return ok;
+}
+
 bool TestMixedOrMalformedAttributionIsRejected() {
   RunnerState state;
   open_video::PreparedOpenVideoCompatibilitySetupResult setup;
@@ -260,6 +332,7 @@ void operator delete[](void *memory, std::size_t) noexcept {
 
 int main() {
   if (!TestFailOpenPreservesAndExecuteDoesNotAllocate() ||
+      !TestFailedPublicationClearsCurrentAttributionOnly() ||
       !TestMixedOrMalformedAttributionIsRejected())
     return 1;
   std::cout << "Prepared Open Video compatibility executor tests passed\n";

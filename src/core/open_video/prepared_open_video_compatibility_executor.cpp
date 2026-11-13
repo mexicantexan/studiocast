@@ -398,13 +398,17 @@ hal::StatusId PreparedOpenVideoCompatibilityExecutor::CommitOutput(
     SetReason(reason, hal::ReasonId::output_not_committed);
     return hal::StatusId::blocked;
   }
+  // Only an exact pending completion may replace current publication evidence.
+  auto &committed = impl_->snapshot.latest_committed_frame;
+  committed = {};
+  impl_->snapshot.telemetry.active_backend = hal::BackendId::invalid;
+  impl_->snapshot.telemetry.active_provider =
+      hal::SemanticEffectProviderId::invalid;
   if (!output_write_succeeded) {
     impl_->pending = {};
     SetReason(reason, hal::ReasonId::output_write_failed);
     return hal::StatusId::failed;
   }
-  auto &committed = impl_->snapshot.latest_committed_frame;
-  committed = {};
   committed.valid = true;
   committed.program_id = impl_->config.plan.plan_id;
   committed.invalidation_key = impl_->config.plan.invalidation_key;
