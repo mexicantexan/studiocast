@@ -988,13 +988,17 @@ bool ReviewedNetwork(const std::shared_ptr<const open_video::ModelPack> &pack,
 
 void ApplyPreparedModelDiagnostics(OpenVulkanDiagnostics *d,
                                    const VulkanProductionModelDiagnostics &m) {
-  for (const auto *pack :
-       {m.matting_pack.get(), m.denoise_pack.get(), m.face_pack.get(),
-        m.landmarks_pack.get(), m.eye_pack.get()}) {
-    if (pack)
-      d->prepared_model_ids[pack->task] = pack->id;
-  }
   const auto &c = m.capabilities;
+  const auto record_prepared = [&](const auto &pack, bool prepared) {
+    if (pack && prepared)
+      d->prepared_model_ids[pack->task] = pack->id;
+  };
+  record_prepared(m.matting_pack, m.matting.warmup_complete);
+  record_prepared(m.denoise_pack, m.denoise.warmup_complete);
+  record_prepared(m.face_pack, m.face.warmup_complete);
+  record_prepared(m.landmarks_pack, c.landmarks_production_ready);
+  record_prepared(m.eye_pack,
+                  m.left_eye.warmup_complete && m.right_eye.warmup_complete);
   const bool common =
       c.build_enabled && c.runtime_loaded && c.non_cpu_physical_device &&
       c.compute_queue_available && c.owned_context_healthy &&
