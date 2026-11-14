@@ -116,7 +116,9 @@ def export(upstream: Path, output: Path) -> dict:
     repo = Path(__file__).resolve().parents[2]
     template = repo / "resources/model_packs" / PACK_PATH
     manifest = json.loads((template / "model.json").read_text())
-    manifest["files"][0]["sha256"] = sha256(artifact)
+    # This export produces ONNX only; promoted templates may also describe ncnn.
+    manifest["files"] = [dict(name="model.onnx", kind="onnx", role="main", sha256=sha256(artifact))]
+    manifest.pop("ncnn_vulkan_networks", None)
     manifest["origin"].update(upstream_commit=UPSTREAM_COMMIT,
                               weights_sha256=UPSTREAM_HASHES["model.pth"],
                               notes="Self-contained opset-17 FP32 export of verified upstream model.pth; "
@@ -127,8 +129,9 @@ def export(upstream: Path, output: Path) -> dict:
     catalog = json.loads((repo / "installer/models/curated-model-catalog-v1.json").read_text())
     catalog["catalog_version"] = "2026-11-10-fastdvdnet-candidate"
     definition = next(p for p in catalog["packs"] if p["id"] == "fastdvdnet_sigma15")
-    definition["artifacts"][0].update(sha256=sha256(artifact), size_bytes=artifact.stat().st_size,
-                                      source_paths=[PACK_PATH + "/model.onnx"])
+    definition["artifacts"] = [dict(name="model.onnx", sha256=sha256(artifact),
+                                     size_bytes=artifact.stat().st_size, size_status="known",
+                                     source_paths=[PACK_PATH + "/model.onnx"])]
     definition["provenance"]["release"] = f"upstream {UPSTREAM_COMMIT}; self-contained opset17; candidate, unpublished"
     for item in definition["metadata"]:
         item["sha256"] = sha256(pack / item["destination"])

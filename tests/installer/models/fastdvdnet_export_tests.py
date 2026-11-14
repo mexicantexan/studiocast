@@ -47,6 +47,25 @@ class ExportTrustTests(unittest.TestCase):
             sys.modules[tx_spec.name] = tx
             tx_spec.loader.exec_module(tx)
             catalog = tx.load_catalog(output / "curated-model-catalog-v1.candidate.json")
+            definition = next(p for p in catalog["packs"] if p["id"] == "fastdvdnet_sigma15")
+            manifest = json.loads((output / "source" / exporter.PACK_PATH / "model.json").read_text())
+            generated_hash = "723b9613b1619b16956a6632a78c7098278fe745638ee2bf2f1983585abcdac2"
+            self.assertEqual(manifest["files"], [
+                {"name": "model.onnx", "kind": "onnx", "role": "main", "sha256": generated_hash}])
+            self.assertNotIn("ncnn_vulkan_networks", manifest)
+            self.assertEqual(definition["artifacts"], [
+                {"name": "model.onnx", "sha256": generated_hash, "size_bytes": 17,
+                 "size_status": "known", "source_paths": [exporter.PACK_PATH + "/model.onnx"]}])
+            self.assertTrue(definition["default"])
+            self.assertEqual(manifest["id"], definition["id"])
+            self.assertEqual(manifest["origin"]["upstream_commit"], exporter.UPSTREAM_COMMIT)
+            self.assertEqual(manifest["origin"]["weights_sha256"], hashes["model.pth"])
+            active = next(p for p in json.loads(before)["packs"] if p["id"] == "fastdvdnet_sigma15")
+            template = SCRIPT.parents[2] / next(
+                item["source"] for item in active["metadata"] if item["destination"] == "model.json")
+            self.assertEqual(manifest["onnx"], json.loads(template.read_text())["onnx"])
+            self.assertEqual(definition["provenance"]["release"],
+                             f"upstream {exporter.UPSTREAM_COMMIT}; self-contained opset17; candidate, unpublished")
             result = tx.ModelTransactionInstaller(
                 catalog, output / "metadata", root / "models", root / "cache",
                 tx.FileTransport(output / "source"), retries=0,
@@ -54,9 +73,15 @@ class ExportTrustTests(unittest.TestCase):
             self.assertEqual(result["state"], "succeeded", result)
             pack = root / "models/video_denoise/Good Quality (FastDVDnet sigma15)"
             self.assertEqual((pack / "model.onnx").read_bytes(), b"tiny ONNX fixture")
+            self.assertEqual(json.loads((pack / "model.json").read_text()), manifest)
+            license_text = (pack / "LICENSE.txt").read_text()
+            self.assertIn("License:\n- MIT", license_text)
+            self.assertTrue(license_text.endswith(
+                "\nFull upstream license at pinned commit:\n\nfixture license\n"))
+            self.assertNotIn("Conversion notice:", license_text)
             self.assertEqual(active_catalog.read_bytes(), before)
-            active = next(p for p in json.loads(before)["packs"] if p["id"] == "fastdvdnet_sigma15")
-            self.assertIn("/revisions/", active["artifacts"][0]["source_paths"][0])
+            active_onnx = next(item for item in active["artifacts"] if item["name"] == "model.onnx")
+            self.assertIn("/revisions/", active_onnx["source_paths"][0])
 
     def test_reexport_preserves_exact_license_after_template_promotion(self):
         summary = "StudioCast model summary\n"
