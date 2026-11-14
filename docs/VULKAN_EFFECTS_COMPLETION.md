@@ -1,6 +1,6 @@
 # Complete production Vulkan effects
 
-- Status: Implementation and approved model publication integrated; final activation checks in progress, hardware limits remain
+- Status: Local implementation, approved model publication and catalog activation complete; hardware qualification limits remain
 - Baseline: `15b8862398bbae774f8156ed70c2378245c9bef9`, branch `v0.2.9`
 - User decision, 2026-11-12: finish the remaining Vulkan model effects in this
   pass rather than keep them outside the earlier matting phase. The prior
@@ -583,6 +583,52 @@ The activation agent's focused checks passed: 21 model transactions, 56 backend,
 assertions and clean diff. Root independently rechecked all new source bindings,
 old artifact/default/pack preservation and the integrated catalog hash. Local
 handoff: `/tmp/studiocast-vulkan-catalog-activation-handoff-20261113.md`.
-Integrated broad checks and fresh independent activation critique are the final
-local gates. Model publication does not change any hardware qualification claim
-or authorize an application release, Git push or installed-pack mutation.
+The first integrated broad checks found one genuine exporter regression: the
+ONNX-only FastDVDnet exporter inherited the newly curated ncnn artifacts and
+network metadata without generating those files. Its real local-source install
+failed on the missing ncnn parameter file. The bounded repair creates an exact
+ONNX-only candidate manifest and artifact list, retaining pinned upstream/tool
+verification, graph validation, CPU equivalence, I/O, provenance and license
+composition. The active catalog and published bytes are unchanged. Topic
+`codex/fastdvdnet-export-catalog-isolation-20261113`, source `185232b` → integrated
+`e3c325b`, changes only the exporter and its existing regression test. RED/GREEN
+evidence and focused checks (7 export, 21 model, 7 MODNet conversion and 8 video
+conversion tests) are recorded in
+`/tmp/studiocast-fastdvdnet-export-catalog-isolation-handoff-20261113.md`.
+Root independently passed all seven export checks, including three small real
+ONNX graph cases using the existing ONNX installation; no dependency download
+or new full-weight export was required.
+
+All three activation builds passed. After integrating the exporter repair,
+the final broad checks passed at source HEAD
+`e3c325b5aec6576af7a4871abba90e44f905fc82`:
+
+| Configuration | CTest total | Executed passes | Native opt-in skips | Failures | Wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vulkan + production ncnn + dlib | 100 | 88 | 12 | 0 | 103.02 s |
+| CUDA/Vulkan/audio/dlib, ncnn off | 94 | 88 | 6 | 0 | 102.79 s |
+| Optional backends off | 85 | 80 | 5 | 0 | 102.23 s |
+
+Each suite used fresh HOME/XDG roots, a real CMake executable on PATH and
+nonexistent `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`, with
+`ctest --test-dir <build> --output-on-failure -j2`. Logs begin with the exact
+source SHA and are
+`/tmp/studiocast-catalog-export-final-{production,alloptional,disabled}-suite-20261113.log`.
+These loader-denied suites do not imply additional native hardware coverage.
+
+Fresh independent publication critique at `351da86` verified the full inventory,
+receipt, remote preservation, packaged metadata, immutable source bindings and
+catalog/installer contracts; its own 21 model and 13 packaging checks passed.
+It correctly withheld overall completion until the exporter regression was
+repaired. The separate fresh-context post-repair critic at `e3c325b` found no
+blocker/high finding or valid unmet requirement. It independently passed all 7
+export, 21 model, 7 MODNet conversion and 8 video conversion checks under
+temporary HOME/XDG roots with the pre-existing ONNX installation, and confirmed
+the active catalog and packaged resources are unchanged by the repair. Neither
+read-only critic made a source commit. Documentation validation and integrated
+diff checks pass. All accepted work is integrated locally on `v0.2.9`.
+
+Model publication does not change any hardware qualification claim or authorize
+an application release, Git push or installed-pack mutation. Those actions and
+the hardware limits above are the remaining delivery/qualification boundaries,
+not unfinished local implementation or unpublished approved model payloads.
