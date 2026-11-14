@@ -1,6 +1,6 @@
 # Complete production Vulkan effects
 
-- Status: Local implementation and validation complete; publication approval and hardware qualification remain
+- Status: Implementation and approved model publication integrated; final activation checks in progress, hardware limits remain
 - Baseline: `15b8862398bbae774f8156ed70c2378245c9bef9`, branch `v0.2.9`
 - User decision, 2026-11-12: finish the remaining Vulkan model effects in this
   pass rather than keep them outside the earlier matting phase. The prior
@@ -137,10 +137,10 @@ host transfers or CPU tails, no Execute allocations, and bounded resources and
 submissions. Preserve the existing P1000 evidence without generalizing it to
 unavailable AMD/Intel, real-camera/V4L2, quality, or optimized latency coverage.
 
-All accepted local implementation is integrated. Publication/catalog activation
-awaits explicit authority, and the available-hardware failures below remain
-unqualified. The following ledger records chronological checkpoints; the final
-local gate at the end supersedes earlier in-progress observations.
+All accepted local implementation is integrated. The user subsequently approved
+model publication/catalog activation, now integrated as recorded at the end.
+Available-hardware failures remain unqualified. The following ledger records
+chronological checkpoints; the final gates supersede earlier in-progress observations.
 
 ## Integrated evidence ledger (in progress)
 
@@ -532,16 +532,11 @@ audit at `20cf31f` was guidance only and was not used as final acceptance.
 
 ### Remaining authority and qualification
 
-The only prepared, unmerged proposal is the explicitly unapproved catalog branch
-`codex/vulkan-catalog-unapproved-proposal-20261113`, commit `01eaaa4`. It contains
-metadata/count/packaging changes only, no model binaries. The corrected proposal
-maps all eight new artifacts to the exact immutable publication destinations;
-the historical `62da60bd` derivative is not activation-ready. Its final catalog
-SHA is `097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e`.
-It passes 21 model, 56 backend, 13 packaging and 14 offscreen GUI scenarios. The
-active catalog remains unchanged at seven packs/ten artifacts until approval,
-public immutable retrieval, factual receipt/version/source pin and fresh catalog
-review. See [the publication proposal](VULKAN_MODEL_PUBLICATION.md).
+The earlier unapproved proposal `01eaaa4` was held separately until the user's
+explicit approval. It is now integrated, with factual activation/version/source
+pinning, as recorded below. The historical `62da60bd` derivative is not
+activation-ready and remains unchanged. See
+[the publication record](VULKAN_MODEL_PUBLICATION.md).
 
 Hardware qualification is incomplete: combined cold batches can exceed 100 ms
 on this P1000; full-face 320×240 denoise warmup and 640×480 denoise preparation
@@ -550,5 +545,44 @@ camera/V4L2 transport, portrait quality, forced descriptor fallback, full native
 sanitizers and validation-layer cleanliness are not qualified. Existing look-away
 behavior remains its documented no-op contract. These limits are explicit
 deployment-feedback scope under the user's hardware decision, not passing tests
-or waived fences. No application release, Git push, installed-pack mutation or
-new external publication occurred during this expansion.
+or waived fences. No application release, Git push or installed-pack mutation
+occurred. The model publication below was separately approved and verified.
+
+## Approved publication and catalog activation (2026-11-14 UTC)
+
+The user approved the fourteen-file publication and local catalog activation
+after the local implementation handoff. Root reverified the unchanged inventory
+SHA `8411bb3f45ae31111f515724859128c13d7b59abf4b3058cef139f01fe8a0406`
+and all source bytes, inspected the actual remote tree and refused overwrites.
+One additive Hugging Face commit
+[`4713473184bf7ece0be6c097ff75f6c6c528c8ec`](https://huggingface.co/10dallasj/studiocast/commit/4713473184bf7ece0be6c097ff75f6c6c528c8ec)
+with parent `f6be359c49ba07163287fe3732dc4a3024b91f60` added exactly fourteen
+files / 22,066,504 bytes and preserved all 62 existing paths, blobs and sizes.
+Every new file and all ten original artifacts were retrieved without
+authentication at that immutable resulting commit and passed exact size/SHA-256
+verification. The factual receipt is
+`/tmp/studiocast-vulkan-model-publication-20261113/publication-receipt.json`,
+SHA `89b171deb9a5218f0b3da2947f09ed972b4c14fd0bdec532150aa2b646fd3e95`.
+Publication time was `2026-11-14T01:41:23.325423+00:00`, November 13 locally.
+
+Activation topic `codex/vulkan-catalog-activation-20261113` contains proposal
+cherry-pick `5af3452` → root `15a873b`, then activation `9b6dec2` → root
+`ffc50d6`. No accepted metadata work remains stranded on the proposal branch.
+Catalog version `2026-11-14`, SHA
+`2e5a02a067765fbc54aa1d798d44b25f9d940629e83509b153274ef7d7cdca1b`,
+pins its source to that verified immutable commit. Seven packs now contain
+eighteen artifacts / 188,659,386 bytes. Ten original artifact objects, IDs,
+defaults, source candidates and four unaffected pack objects are preserved.
+Six packaged metadata/license files match the published bytes exactly. The
+three affected packs retain upstream provenance and append actual publication
+identity. Artifact count/bytes/hash fixtures, GUI review and package verification
+remain strict and are updated together.
+
+The activation agent's focused checks passed: 21 model transactions, 56 backend,
+13 packaging and 14 offscreen GUI scenarios, plus receipt/preservation/hash/docs
+assertions and clean diff. Root independently rechecked all new source bindings,
+old artifact/default/pack preservation and the integrated catalog hash. Local
+handoff: `/tmp/studiocast-vulkan-catalog-activation-handoff-20261113.md`.
+Integrated broad checks and fresh independent activation critique are the final
+local gates. Model publication does not change any hardware qualification claim
+or authorize an application release, Git push or installed-pack mutation.
