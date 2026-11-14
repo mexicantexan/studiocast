@@ -38,7 +38,7 @@ DEFAULT_PACKS = [
     "yunet_opencv_zoo_2023mar_fp32", "dlib_68_ibug_300w",
     "gaze_correction_cam_flx_v0_1_1", "fastdvdnet_sigma15",
 ]
-MODEL_CATALOG_SHA256 = "sha256:097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e"
+MODEL_CATALOG_SHA256 = "sha256:2e5a02a067765fbc54aa1d798d44b25f9d940629e83509b153274ef7d7cdca1b"
 MODEL_PACK_SIZE_ROWS = [
     ("fastenhancer_s_vd_v1", 1, 832775),
     ("fastenhancer_m_vd_v1", 1, 2033628),
@@ -79,7 +79,7 @@ def terminal_result(text: str) -> dict:
 def catalog_size_summary() -> dict:
     return {
         "schema_version": 1,
-        "catalog_version": "2026-11-12-vulkan-all-candidate",
+        "catalog_version": "2026-11-14",
         "catalog_sha256": MODEL_CATALOG_SHA256,
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",

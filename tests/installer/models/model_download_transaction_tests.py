@@ -197,7 +197,7 @@ class CatalogContractTests(TempTest):
                   for pack in catalog["packs"] for item in pack["artifacts"]}
         self.assertEqual(actual, expected)
         self.assertEqual(sum(size for size, _ in actual.values()), 188659386)
-        self.assertEqual(catalog["catalog_version"], "2026-11-12-vulkan-all-candidate")
+        self.assertEqual(catalog["catalog_version"], "2026-11-14")
         self.assertEqual(catalog["size_metadata"], {
             "trusted": True,
             "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
@@ -208,6 +208,9 @@ class CatalogContractTests(TempTest):
 
     def test_added_vulkan_graphs_bind_original_onnx_and_content_named_sources(self):
         catalog = model_tx.load_catalog(REAL_CATALOG_PATH)
+        publication = "4713473184bf7ece0be6c097ff75f6c6c528c8ec"
+        self.assertEqual(catalog["default_source"],
+                         "https://huggingface.co/10dallasj/studiocast/resolve/" + publication)
         expected = {
             "fastdvdnet_sigma15": ("fastdvdnet_rgb_v1", {"main"},
                 "31dee74f844200c8ca8f22a6416e02a682b3f04058b4ede17dc29c40b47bbff0"),
@@ -220,6 +223,8 @@ class CatalogContractTests(TempTest):
             if pack["id"] not in expected:
                 continue
             profile, roles, revision = expected[pack["id"]]
+            self.assertIn("Hugging Face publication " + publication,
+                          pack["provenance"]["release"])
             manifest = json.loads((REPO_ROOT / pack["metadata"][0]["source"]).read_text())
             files = {item["name"]: item for item in manifest["files"]}
             artifacts = {item["name"]: item for item in pack["artifacts"]}
@@ -329,7 +334,9 @@ class CatalogContractTests(TempTest):
             if item["id"] == "yunet_opencv_zoo_2023mar_fp32"
         )
         self.assertEqual(pack["provenance"]["project"], "OpenCV Zoo YuNet")
-        self.assertEqual(pack["provenance"]["release"], "2023mar FP32")
+        self.assertEqual(pack["provenance"]["release"],
+                         "2023mar FP32; FP32 ncnn conversion via pnnx 20261020; "
+                         "Hugging Face publication 4713473184bf7ece0be6c097ff75f6c6c528c8ec")
         self.assertEqual(
             pack["artifacts"][:1],
             [{

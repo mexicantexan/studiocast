@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-12-vulkan-all-candidate",
+  "catalog_version": "2026-11-14",
   "policy_version": 1,
-  "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/main",
+  "default_source": "https://huggingface.co/10dallasj/studiocast/resolve/4713473184bf7ece0be6c097ff75f6c6c528c8ec",
   "size_metadata": {
     "trusted": true,
     "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256"
@@ -84,7 +84,7 @@
       "provenance": {
         "project": "OpenCV Zoo YuNet",
         "url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
-        "release": "2023mar FP32"
+        "release": "2023mar FP32; FP32 ncnn conversion via pnnx 20261020; Hugging Face publication 4713473184bf7ece0be6c097ff75f6c6c528c8ec"
       },
       "artifacts": [
         {
@@ -160,7 +160,7 @@
       "provenance": {
         "project": "gaze-correction-cam",
         "url": "https://github.com/WangWilly/gaze-correction-cam",
-        "release": "FLX v0.1.1 FP32 export"
+        "release": "FLX v0.1.1 FP32 export; FP32 ncnn conversion via pnnx 20261020; Hugging Face publication 4713473184bf7ece0be6c097ff75f6c6c528c8ec"
       },
       "artifacts": [
         {
@@ -249,7 +249,7 @@
       "provenance": {
         "project": "FastDVDnet",
         "url": "https://github.com/m-tassano/fastdvdnet",
-        "release": "upstream c8fdf6182a0340e89dd18f5df25b47337cbede6f; exporter 9384cd12bfa3ed56f0d7693964376897d18ebb9f; self-contained FP32 opset17; Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044"
+        "release": "upstream c8fdf6182a0340e89dd18f5df25b47337cbede6f; exporter 9384cd12bfa3ed56f0d7693964376897d18ebb9f; self-contained FP32 opset17; Hugging Face publication 8ffe968884e31ded74f857a2d0dca19f571ba044; FP32 ncnn conversion via pnnx 20261020; Hugging Face publication 4713473184bf7ece0be6c097ff75f6c6c528c8ec"
       },
       "artifacts": [
         {

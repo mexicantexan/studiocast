@@ -3,7 +3,7 @@
 - Status: Active installer/model transaction contract
 - Applies To: StudioCast v0.2.9 curated catalog and installer packaging
 - Audience: Installer, model, packaging, and release maintainers
-- Last Verified: 2026-11-12
+- Last Verified: 2026-11-14
 
 ## Default catalog
 
@@ -23,10 +23,47 @@ Open Video:
 - `gaze_correction_cam_flx_v0_1_1`
 - `fastdvdnet_sigma15`
 
-These are seven packs and ten artifacts: gaze correction has separate left-
-and right-eye ONNX files, and MODNet includes its preserved ONNX file plus two
-reviewed ncnn Vulkan artifacts. Maxine is not redistributed and its
+These are seven packs and eighteen artifacts: gaze correction has separate left-
+and right-eye ONNX files plus four reviewed ncnn Vulkan artifacts. MODNet,
+YuNet, and FastDVDnet each include their preserved ONNX file plus two reviewed
+ncnn Vulkan artifacts. Maxine is not redistributed and its
 presence never removes these open-source fallback defaults.
+
+### FastDVDnet, YuNet, and FLX Vulkan publication (2026-11-14 UTC)
+
+The user approved the unchanged fourteen-file publication inventory, SHA-256
+`8411bb3f45ae31111f515724859128c13d7b59abf4b3058cef139f01fe8a0406`,
+and local catalog activation. One additive
+[Hugging Face commit 47134731](https://huggingface.co/10dallasj/studiocast/commit/4713473184bf7ece0be6c097ff75f6c6c528c8ec)
+with parent `f6be359c49ba07163287fe3732dc4a3024b91f60` added exactly fourteen
+files (22,066,504 bytes) at the approved content-named revision paths. All 62
+existing remote paths, blob identities, and byte sizes were preserved; the
+result contains 76 files. Actual publication time was
+`2026-11-14T01:41:23.325423+00:00`, November 13 locally.
+
+Every new file and all ten original catalog artifacts were independently
+retrieved without authentication at that immutable resulting commit and matched
+their exact sizes and pinned SHA-256 values. Existing artifact objects and all
+their source candidates remain unchanged, including the working legacy MODNet
+fallback `matting/Good Quality/model.onnx`. The catalog's default source is
+pinned to `https://huggingface.co/10dallasj/studiocast/resolve/4713473184bf7ece0be6c097ff75f6c6c528c8ec`.
+All six packaged manifests/licenses are byte-identical to the newly published
+files. The three affected packs retain their original upstream provenance and
+add the actual ncnn publication commit; four unaffected pack objects are unchanged.
+
+Catalog version `2026-11-14`, SHA-256
+`2e5a02a067765fbc54aa1d798d44b25f9d940629e83509b153274ef7d7cdca1b`,
+adds eight model artifacts (22,047,470 bytes), retaining seven defaults and
+bringing the total to eighteen artifacts / 188,659,386 bytes. Receipt:
+`/tmp/studiocast-vulkan-model-publication-20261113/publication-receipt.json`,
+SHA-256 `89b171deb9a5218f0b3da2947f09ed972b4c14fd0bdec532150aa2b646fd3e95`.
+See [VULKAN_MODEL_PUBLICATION.md](VULKAN_MODEL_PUBLICATION.md) for the full
+publication record and [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md)
+for hardware qualification limits. Publication does not qualify runtime,
+camera quality, vendor coverage, or latency; the documented failed/unqualified
+combined deadline profiles remain in force. Installed packs are untouched.
+Normal ownership-safe verified update/repair and the signed application
+distribution chain remain required.
 
 ### MODNet Vulkan artifacts and publication (2026-11-12)
 
@@ -58,7 +95,7 @@ The catalog's first source candidate was absent; publication checks were correct
 to verify that existing fallback before any remote mutation.
 
 The four published files total 25,869,914 bytes. The two additional model
-artifacts add 25,856,113 download bytes, making the active `2026-11-12` catalog
+artifacts added 25,856,113 download bytes, making the then-active `2026-11-12` catalog
 seven packs, ten artifacts, and 166,611,916 artifact bytes. The ncnn sources have
 only the verified versioned paths, with no unpublished fallback. Receipt:
 `/tmp/studiocast-modnet-conversion-design-20261111/publication-receipt.json`.
@@ -168,7 +205,7 @@ provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files
 come only from hash-pinned files in the verified StudioCast source/package
 surface; they are not accepted from a model download source.
 
-Catalog version `2026-11-12` records independently verified artifact byte
+Catalog version `2026-11-14` records independently verified artifact byte
 counts paired with pinned hashes:
 
 | Pack/artifact | Bytes |
@@ -179,12 +216,20 @@ counts paired with pinned hashes:
 | `modnet-webnn-256-fp32/model.ncnn.param` | 12,113 |
 | `modnet-webnn-256-fp32/model.ncnn.bin` | 25,844,000 |
 | `yunet_opencv_zoo_2023mar_fp32/model.onnx` | 232,589 |
+| `yunet_opencv_zoo_2023mar_fp32/model.ncnn.param` | 6,423 |
+| `yunet_opencv_zoo_2023mar_fp32/model.ncnn.bin` | 212,628 |
 | `dlib_68_ibug_300w/shape_predictor_68_face_landmarks.dat` | 99,693,937 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.onnx` | 1,062,936 |
 | `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.onnx` | 1,062,994 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.ncnn.param` | 2,726 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.ncnn.bin` | 1,000,192 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.ncnn.param` | 2,726 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.ncnn.bin` | 1,000,192 |
 | `fastdvdnet_sigma15/model.onnx` | 9,948,304 |
+| `fastdvdnet_sigma15/model.ncnn.param` | 7,383 |
+| `fastdvdnet_sigma15/model.ncnn.bin` | 19,815,200 |
 
-The total is 166,611,916 bytes. Every entry is `size_status: known`, and the
+The total is 188,659,386 bytes. Every entry is `size_status: known`, and the
 catalog-level evidence reason is
 `artifact_sizes_independently_verified_against_pinned_sha256`. A trusted
 catalog requires every artifact to have a strictly positive integer size; a
@@ -244,7 +289,7 @@ succeed and another fails, the overall state is `degraded` with reason
 `optional_model_failure`; callers can offer Retry or Continue without hiding
 the committed packs.
 
-Recommended review plans carry all ten exact sizes and bind the selected
+Recommended review plans carry all eighteen exact sizes and bind the selected
 catalog version/hash, canonical pack objects, download rows, and disk totals.
 Apply reloads the packaged catalog and revalidates those bindings before any
 operation can mutate the filesystem. Custom and Advanced routes retain their

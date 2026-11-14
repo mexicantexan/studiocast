@@ -163,8 +163,8 @@ include("{ROOT}/installer/CMakeLists.txt")
 
 def catalog_size_summary() -> dict:
     return {
-        "schema_version": 1, "catalog_version": "2026-11-12-vulkan-all-candidate",
-        "catalog_sha256": "sha256:097cb1f2551263c52c52357839bd4350c090c93c5619193688432135a9c42d9e",
+        "schema_version": 1, "catalog_version": "2026-11-14",
+        "catalog_sha256": "sha256:2e5a02a067765fbc54aa1d798d44b25f9d940629e83509b153274ef7d7cdca1b",
         "trusted": True,
         "reason_code": "artifact_sizes_independently_verified_against_pinned_sha256",
         "pack_count": 7, "artifact_count": 18, "download_bytes": 188659386,
