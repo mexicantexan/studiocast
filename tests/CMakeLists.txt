@@ -26,6 +26,19 @@ elseif (BUILD_TESTING)
     message(STATUS "Skipping studiocast-audio-tests because libpulse-simple was not found.")
 endif()
 if (BUILD_TESTING)
+    add_executable(studiocast-vulkan-effects-smoke-allocation-tests
+            ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_effects_smoke_allocation_tests.cpp)
+    target_include_directories(studiocast-vulkan-effects-smoke-allocation-tests PRIVATE
+            "${PROJECT_SOURCE_DIR}/tests/support")
+    studiocast_set_project_warnings(studiocast-vulkan-effects-smoke-allocation-tests)
+    studiocast_enable_sanitizers(studiocast-vulkan-effects-smoke-allocation-tests)
+    set_target_properties(studiocast-vulkan-effects-smoke-allocation-tests PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME studiocast-vulkan-effects-smoke-allocation-tests
+            COMMAND studiocast-vulkan-effects-smoke-allocation-tests)
+    studiocast_set_test_labels(studiocast-vulkan-effects-smoke-allocation-tests
+            unit video gpu vulkan)
+
     add_executable(studiocast-hal-contract-tests
             ${PROJECT_SOURCE_DIR}/tests/unit/core/hal_contract_tests.cpp
     )
@@ -2005,7 +2018,8 @@ if (BUILD_TESTING)
             target_link_libraries(studiocast-vulkan-effects-production-smoke PRIVATE
                     studiocast_vulkan_backend studiocast_video_backend_composition studiocast_video_io)
             target_include_directories(studiocast-vulkan-effects-production-smoke PRIVATE
-                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}")
+                    "${PROJECT_SOURCE_DIR}/src" "${STUDIOCAST_GENERATED_DIR}"
+                    "${PROJECT_SOURCE_DIR}/tests/support")
             studiocast_set_project_warnings(studiocast-vulkan-effects-production-smoke)
             studiocast_enable_sanitizers(studiocast-vulkan-effects-production-smoke)
             set_target_properties(studiocast-vulkan-effects-production-smoke PROPERTIES

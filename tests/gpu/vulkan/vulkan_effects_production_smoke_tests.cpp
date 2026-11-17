@@ -1,3 +1,5 @@
+#include "vulkan_effects_smoke_allocations.h"
+
 #include "core/open_video/model_pack_registry.h"
 #include "core/util/json.h"
 #include "core/video/cpu_primitive_hal.h"
@@ -10,7 +12,6 @@
 #include "core/vulkan/video_execution_factory_internal.h"
 
 #include <algorithm>
-#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -18,58 +19,12 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <new>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
-
-namespace {
-std::atomic<bool> count_allocations{false};
-std::atomic<std::uint64_t> allocations{0};
-void CountAllocation() noexcept {
-  if (count_allocations.load(std::memory_order_relaxed))
-    allocations.fetch_add(1, std::memory_order_relaxed);
-}
-} // namespace
-void *operator new(std::size_t size) {
-  CountAllocation();
-  if (auto *memory = std::malloc(size ? size : 1))
-    return memory;
-  throw std::bad_alloc();
-}
-void *operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void *memory) noexcept { std::free(memory); }
-void operator delete[](void *memory) noexcept { std::free(memory); }
-void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void *memory, std::size_t) noexcept {
-  std::free(memory);
-}
-void *operator new(std::size_t size, std::align_val_t alignment) {
-  CountAllocation();
-  void *memory = nullptr;
-  if (posix_memalign(&memory, static_cast<std::size_t>(alignment),
-                     size ? size : 1) != 0)
-    throw std::bad_alloc();
-  return memory;
-}
-void *operator new[](std::size_t size, std::align_val_t alignment) {
-  return ::operator new(size, alignment);
-}
-void operator delete(void *memory, std::align_val_t) noexcept {
-  std::free(memory);
-}
-void operator delete[](void *memory, std::align_val_t) noexcept {
-  std::free(memory);
-}
-void operator delete(void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
-}
-void operator delete[](void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
-}
 
 namespace {
 namespace hal = studiocast::hal;
