@@ -2,6 +2,7 @@
 #include "core/vulkan/production_video_backend_setup_source.h"
 #include "core/vulkan/video_execution_factory.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
