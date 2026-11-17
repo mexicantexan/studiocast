@@ -144,6 +144,13 @@ ctest --test-dir <build> -L model
 ctest --test-dir <build> -L gpu
 ```
 
+The no-GPU CI jobs install distro `python3` and `python3-numpy` and configure
+CMake with `-DPython3_EXECUTABLE=/usr/bin/python3`, binding CTest to that
+interpreter. NumPy is required by the hermetic ncnn sampler and numerical
+rejection regression. This validation dependency is separate from the exact
+NumPy, ONNX, and ONNX Runtime versions required for
+[full offline model conversion](open_source_video_model_conversion_to_onnx.md#4-offline-fp32-ncnn-candidates-for-vulkan).
+
 ## Main binaries and tools
 
 | Binary | Purpose |
