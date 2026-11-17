@@ -632,3 +632,45 @@ Model publication does not change any hardware qualification claim or authorize
 an application release, Git push or installed-pack mutation. Those actions and
 the hardware limits above are the remaining delivery/qualification boundaries,
 not unfinished local implementation or unpublished approved model payloads.
+
+## Hosted PR delivery follow-up (2026-11-17)
+
+The user's continuation resumed the earlier explicit authorization to push
+`origin/v0.2.9`. Root fetched the remote, confirmed the clean local branch and
+preserved fast-forward ancestry, then pushed the completed work at `bb00bc3`.
+The existing PR is [#22](https://github.com/mexicantexan/studiocast/pull/22).
+Its description now reflects the actual integrated production effects and
+approved model publication rather than the superseded missing-adapter blocker.
+
+Hosted [run 44105178922](https://github.com/mexicantexan/studiocast/actions/runs/44105178922)
+passed package smoke but exposed one compiler portability defect in all four
+build jobs: the Vulkan factory test used `std::find_if` without directly
+including `<algorithm>`. GCC 12/13 rejected the translation unit. This is a
+bounded delivery-blocking test repair; no runtime behavior or model contract
+changes are included. Topic `codex/portable-vulkan-test-include-20261117`, source
+`8ed406a` → integrated `5a674a4`, owns only
+`tests/gpu/vulkan/video_execution_factory_tests.cpp` and adds that one include.
+
+The isolated GCC 12 CI-style Release compilation reproduced the exact error
+before the fix and passed afterward. Its affected target build and CTest passed
+(1/1, 0.03 s). Evidence is
+`/tmp/studiocast-portable-vulkan-test-evidence-20261117/{red,green,configure,build,ctest}.log`.
+Root rebuilt the affected target and reran its CTest in the existing production
+ncnn/dlib, enabled-without-ncnn and disabled configurations: all three passed,
+with zero skips or failures (0.15/0.12/0.04 s). These tests used isolated HOME/XDG
+roots and nonexistent Vulkan ICD paths. Logs begin with the tested source SHA:
+`/tmp/studiocast-pr22-include-{production,enabled,disabled}-integrated-20261117.log`.
+
+Fresh independent critic `portable_include_final_critique` reviewed integrated
+`5a674a4` and this documentation follow-up, finding no blocker/high or valid
+unmet requirement. Its own GCC 12.3 Release syntax checks reproduced the
+baseline failure and passed with Vulkan both OFF and ON after the fix. The
+existing GCC 12 factory test binary also passed independently under fresh
+HOME/XDG roots with a nonexistent ICD. The critic confirmed that every other
+source file is unchanged and made no source commit.
+
+The runtime, active catalog, packaged model metadata, published artifact bytes
+and hardware qualification limits are unchanged. Fresh hosted CI for the
+repaired pushed head remains the external build/test gate before merge. The
+existing master-push workflow owns the normal patch-version bump; this delivery
+does not merge the PR, release an application or deploy to a user system.
