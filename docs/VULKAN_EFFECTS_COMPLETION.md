@@ -730,3 +730,50 @@ All accepted local repairs are integrated. No assertion, runtime, model, catalog
 or hardware qualification boundary is changed by this repair. Fresh hosted CI
 on the pushed final head remains the external gate before merge; the PR records
 its live run and outcome without treating skipped hardware jobs as qualification.
+
+### Hosted numerical-test dependency provisioning
+
+Hosted [run 44112036790](https://github.com/mexicantexan/studiocast/actions/runs/44112036790)
+at `e4579c4` successfully compiled all four build profiles and passed package
+smoke. Each full CTest suite had one failure: the FLX sampler/numerical regression
+could not import NumPy. All other tests passed or explicitly skipped native
+opt-ins (85 tests per default profile, 94 with enabled features). This is a
+missing test-environment prerequisite, not a failed numerical comparison.
+
+NumPy is an existing conversion-tool dependency declared in
+`scripts/models/video-ncnn.lock.json`; its small regression cases must remain
+active. The bounded repair provisions the distro `python3-numpy` test package in
+the existing no-GPU CI build jobs and binds CTest to `/usr/bin/python3`, matching
+the interpreter for which the package is installed. This does not change the
+pinned full-export/conversion tooling, install packages on the development host,
+add a runtime dependency or modify numerical assertions. GPU opt-in and release
+jobs remain outside this repair.
+
+Topic `codex/ci-distro-numpy-validation-20261117`, source `d514a44` → integrated
+`977f7fa`, changes only `.github/workflows/ci.yml` and
+`docs/DEVELOPER_GUIDE.md`. It reproduced the exact missing-NumPy error with
+Python site packages disabled. Using the existing distro NumPy 1.21.5, all eight
+video conversion, seven MODNet conversion and seven hardware-workflow checks
+passed; the numerical cases executed. YAML parsing, job-scope comparison and
+shell syntax checks passed. The agent ran no host package installation.
+
+Root independently configured CMake from a fresh HOME/XDG root with explicit
+`Python3_EXECUTABLE=/usr/bin/python3`, the no-GPU Release profile and a
+nonexistent ICD. All three selected CTest suites passed in 4.01 s, including
+both numerical converter suites. The interpreter imported the existing NumPy
+1.21.5 from `/usr/lib/python3/dist-packages`. Log
+`/tmp/studiocast-pr22-numpy-integrated-20261117.log` begins with tested HEAD
+`977f7fa`; agent evidence is under `/tmp/studiocast-ci-numpy-evidence-20261117`.
+Fresh independent critic `ci_numpy_final_critique` reviewed integrated
+`977f7fa` and this documentation follow-up, finding no blocker/high or valid
+unmet requirement. It reproduced the missing-NumPy failure and independently
+passed all eight video, seven MODNet and seven hardware-workflow checks without
+skips. Its scratch CMake configuration passed four selected CTests, including
+documentation validation, in 3.94 s; CTest's JSON confirmed `/usr/bin/python3`
+for every selected suite. Its YAML comparison verified exactly three dependency
+additions and three interpreter flags, unchanged remaining jobs, correct
+install/configure/test order and valid shell syntax. Evidence is under
+`/tmp/studiocast-ci-numpy-critic-evidence-20261117`. The critic made no source
+commit or host changes. All accepted repairs are integrated; actual hosted
+package installation and the complete build/test/self-test matrix remain the
+external gate recorded in the PR.
