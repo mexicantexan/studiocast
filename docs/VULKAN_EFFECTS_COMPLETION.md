@@ -674,3 +674,59 @@ and hardware qualification limits are unchanged. Fresh hosted CI for the
 repaired pushed head remains the external build/test gate before merge. The
 existing master-push workflow owns the normal patch-version bump; this delivery
 does not merge the PR, release an application or deploy to a user system.
+
+### Additional CUDA test portability checks
+
+The next hosted [run 44107603362](https://github.com/mexicantexan/studiocast/actions/runs/44107603362)
+at `12730ea` passed package smoke and compiled past the Vulkan test. All four
+build jobs then exposed the same missing direct `<algorithm>` dependency in
+`tests/gpu/cuda/prepared_vignette_tests.cpp` and
+`tests/gpu/cuda/prepared_preprocess_kernel_bundle_tests.cpp`: GCC 12/13 rejected
+`std::clamp`; subsequent preprocess diagnostics were cascades from that error.
+The bounded routine repair is owned by topic
+`codex/portable-cuda-test-includes-20261117`, based on `12730ea`, and remains
+limited to direct standard-library includes in tests. Both reported translation
+units reproduced the exact failure and passed the same GCC 12 commands after
+adding `<algorithm>`.
+
+The complete GCC 12 build then found the same missing include for `std::none_of`
+in `tests/gpu/open_video/open_cuda_production_hal_owner_tests.cpp` and
+`std::clamp` in `tests/gpu/open_video/open_cuda_production_smoke_tests.cpp`.
+Continuing with Ninja's keep-going option checked every remaining default
+target before another push. The topic's final source scope is four test files,
+each adding the direct `<algorithm>` include; no assertions or executable logic
+are changed.
+
+Topic source `098cc92` is integrated as `a196dbf`. The complete GCC 12 Release
+build passed with Open CUDA ON and Vulkan, Open Audio, dlib, CUDA kernels and
+benchmarks OFF. The local build detected the existing ONNX Runtime; this is
+recorded rather than represented as an absent-SDK build. Broad hermetic CTest
+passed: 85 total, 80 executed, five explicit native opt-in skips, zero failures,
+57.26 s. Evidence is under
+`/tmp/studiocast-portable-cuda-test-evidence-20261117`: per-file RED/GREEN logs,
+the retained failed keep-going compilation logs, successful
+`full-build-final.log`, and `ctest.log`.
+
+After integration, root rebuilt all four affected targets in the existing
+production ncnn/dlib, enabled-without-ncnn and disabled configurations. Each
+CTest selection passed three tests and explicitly skipped the native smoke
+(four total, zero failures; 0.16/0.18/0.06 s). Fresh HOME/XDG roots, nonexistent
+ICD paths and no native opt-ins kept validation hermetic. Logs begin with the
+tested source SHA:
+`/tmp/studiocast-pr22-cuda-headers-{production,enabled,disabled}-integrated-20261117.log`.
+Fresh independent critic `cuda_header_batch_final_critique` reviewed integrated
+`a196dbf` and this documentation follow-up, finding no blocker/high or valid
+unmet requirement. It independently reproduced all four baseline failures and
+passed all eight fixed syntax checks (four translation units, each with
+`STUDIOCAST_HAVE_ONNXRUNTIME=0` and `1`). Its isolated runs passed the three
+focused binaries and explicitly skipped the native production smoke. Its scan
+of all C++ test sources/headers found twenty files using the checked algorithm
+functions, all with direct `<algorithm>` includes. Evidence is under
+`/tmp/studiocast-cuda-header-final-critic-evidence-20261117`. The critic made no
+source commit. Documentation validation passes all 43 Markdown files, and
+integrated diff checks pass.
+
+All accepted local repairs are integrated. No assertion, runtime, model, catalog
+or hardware qualification boundary is changed by this repair. Fresh hosted CI
+on the pushed final head remains the external gate before merge; the PR records
+its live run and outcome without treating skipped hardware jobs as qualification.
