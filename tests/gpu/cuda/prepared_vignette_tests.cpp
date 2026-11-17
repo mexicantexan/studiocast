@@ -1,5 +1,6 @@
 #include "core/cuda/kernels/prepared_vignette.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>

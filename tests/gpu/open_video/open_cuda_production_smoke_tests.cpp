@@ -3,6 +3,7 @@
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/production_video_setup_request.h"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>

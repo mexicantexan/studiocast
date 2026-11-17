@@ -1,6 +1,7 @@
 #include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
 #include "core/cuda/kernels/resize_bilinear.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>

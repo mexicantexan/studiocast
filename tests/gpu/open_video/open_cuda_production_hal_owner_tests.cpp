@@ -3,6 +3,7 @@
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/video_execution_coordinator.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
