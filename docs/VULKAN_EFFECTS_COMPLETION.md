@@ -924,6 +924,12 @@ default checks, cold diagnostics, native CUDA and real-camera/loopback execution
 remain unrun after the safety stop. No installed daemon, camera settings,
 loopback configuration or user model pack was changed.
 
+The pre-repair native C++ allocation counts have the original replacement
+family's coverage limitation. The repaired complete-family harness has not
+completed a native frame run, so those historical zero counts are not complete
+allocation qualification. Numerical comparisons and independently recorded GPU
+resource/transfer counters remain separate observations.
+
 ### Strict local compiler verification
 
 Proportional software verification also exercised the existing disabled-backend
@@ -1070,3 +1076,73 @@ pre-push audit, `origin/master` remains
 request. The conditionally authorized merge is withheld because the native
 safety failure remains unresolved. No release, tag, deployment or installed-pack
 mutation is performed.
+
+### Hosted same-version CPU SDK acquisition repair
+
+The first post-qualification push, documentation head `bda542c`, starts hosted
+[run 44214521214](https://github.com/mexicantexan/studiocast/actions/runs/44214521214).
+Ubuntu 22.04, Ubuntu 24.04, Linux Mint and package smoke pass; the enabled-features
+job fails before compilation while downloading its existing CPU ONNX Runtime
+1.17.3 tarball. Direct URL, release API and repository API checks also return
+HTTP 404. This establishes current endpoint unavailability, not deletion of a
+particular release. No blind CI retry or SDK upgrade is used.
+
+Microsoft's [official C++ documentation](https://onnxruntime.ai/docs/get-started/with-cpp.html)
+identifies `Microsoft.ML.OnnxRuntime` as its CPU release distribution. The
+official same-version NuGet package is available and independently audited:
+
+| Identity | Verified value |
+| --- | --- |
+| Package/version | `Microsoft.ML.OnnxRuntime` / `1.17.3`, Microsoft authors/owners |
+| Archive | 83,662,121 bytes; SHA256 `e7fecf6fe6ae54d5e43664c4e2354138b5b86d4f0ccf946fbab1ef48650524e3` |
+| Published integrity | Computed SHA512 matches official NuGet response metadata. |
+| Native library | 15,469,240 bytes; SHA256 `8bdcd79ab25e38d1d7646948e07a7d87ed95c2164a04e43dd685147fd5c86b4c` |
+| Native identity | Linux x64 CPU, SONAME `libonnxruntime.so.1.17.3`, API 17; only standard glibc/libstdc++ dependencies. |
+| Preserved contents | Nine C/C++ headers, `LICENSE` and `ThirdPartyNotices.txt`; no managed or GPU companion is needed for this native SDK. |
+
+The bounded repair changes acquisition of the already-declared Microsoft SDK,
+preserving its vendor, CPU flavor, x64 architecture and exact version. It does
+not claim tarball byte equivalence. Topic
+`fix/ci-onnxruntime-cpu-acquisition`, source `6de1812` → integrated `821fa75`,
+changes only the existing CPU acquisition step's run body, a fixed-identity
+stdlib staging helper, one hermetic test script and its CTest registration.
+Existing install prefix, pkg-config, ldconfig, feature flags, assertions and
+opt-in jobs remain unchanged. Normal user/GPU SDK setup is not modified or
+requalified by this repair; the original native safety failure remains a gate.
+
+The helper checks size and pinned SHA256 before ZIP parsing and stages only
+the fixed allowlist into a new destination. It rejects unsafe/duplicate,
+encrypted, symlink/special or colliding members, wrong identity/API and existing
+or symlinked destinations. Library bytes are staged under their versioned
+SONAME with a relative `libonnxruntime.so` link. Both notices are preserved.
+No archive metadata is executed, and the helper exposes no checksum bypass.
+
+Agent `ort_cpu_acquisition_audit` audits and implements the focused topic in an
+isolated worktree. Four hermetic test methods, seven existing hardware-workflow
+checks, eight video-converter and seven MODNet checks pass. YAML parsing, all
+57 workflow shell blocks and parsed-workflow comparison pass; only the CPU
+acquisition run body differs. Actual audited archive staging and a C++17 header
+syntax check pass without linking, loading, executing or installing the SDK.
+Root independently repeats the four preparation and seven workflow tests,
+stages the audited bytes, verifies the library hash and passes the header-only
+check. Evidence is under `/run/user/1000/studiocast-ort-audit-52ciighw` and
+`/run/user/1000/studiocast-ort-root-review-lk4h8m21`.
+
+Fresh-context critic `ci_sdk_acquisition_final_critique` finds no new blocker,
+High finding or unmet requirement in `bda542c..821fa75`. It independently
+passes the four helper and seven workflow tests, real-archive staging, exact
+library/license checks and static ELF inspection; it confirms the preserved
+SDK and workflow contracts. It makes no source commit or SDK/runtime changes.
+Evidence is under `/run/user/1000/studiocast-ort-critic-odir6cir`.
+
+At integrated code head `821fa750d60a38f78f997cf46572b486b1747a12`, both
+strict Release profiles pass full builds and CTest: 87 registered, 82 passed,
+five explicit native skips and zero failures each. GNU11 build/CTest take
+167.472/104.98 s; GNU12 take 92.266/44.320 s. The extra registered case is the
+hermetic SDK preparation test. Evidence is under
+`/run/user/1000/studiocast-ort-integrated-r8a1lhsp` and the existing GNU12 root's
+`ort821-{build,ctest}.log`/`ort821-results.json`. Prior failed logs remain intact.
+All checks use private roots and absent native opt-ins; no local self-test or
+downloaded SDK execution, linking, loading, host installation or service change
+occurs. A fresh hosted final-head run remains the end-to-end acquisition and
+self-test gate; this repair does not clear PR #22's native SIGSEGV hold.

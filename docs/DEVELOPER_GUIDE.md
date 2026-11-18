@@ -151,6 +151,18 @@ rejection regression. This validation dependency is separate from the exact
 NumPy, ONNX, and ONNX Runtime versions required for
 [full offline model conversion](open_source_video_model_conversion_to_onnx.md#4-offline-fp32-ncnn-candidates-for-vulkan).
 
+The enabled-features no-GPU job retains Microsoft's CPU ONNX Runtime 1.17.3
+SDK. Its [documented C++ distribution](https://onnxruntime.ai/docs/get-started/with-cpp.html)
+is acquired from the official NuGet package and staged by
+`scripts/dev/prepare_ci_onnxruntime.py`. The helper verifies the fixed archive
+size/SHA256 before parsing, checks package/API identity, and copies only the
+nine headers, Linux x64 library and notices into a new staging directory. It
+does not download, execute or install the SDK; the existing ephemeral-runner
+installation step keeps its original prefix and pkg-config configuration.
+SDK versions, normal user/GPU setup and model artifacts are unchanged. The
+registered preparation test uses synthetic archives and performs no network or
+system installation.
+
 ## Main binaries and tools
 
 | Binary | Purpose |
