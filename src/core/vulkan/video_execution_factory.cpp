@@ -180,10 +180,12 @@ bool UnavailableCapability(
          capability.reason != ReasonId::none &&
          !capability.production_eligible && capability.provider == kProvider;
 }
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
 std::uint32_t SemanticBit(SemanticEffectId semantic) noexcept {
   const auto value = static_cast<std::uint32_t>(semantic);
   return value < 32 ? (std::uint32_t{1} << value) : 0;
 }
+#endif
 
 CapabilityEvidenceCode ModelRuntimeCode(SemanticEffectId semantic) noexcept {
   if (semantic == SemanticEffectId::video_noise_removal)
