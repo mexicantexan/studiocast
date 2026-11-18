@@ -862,10 +862,16 @@ bool TestShutdownRetainsUnprovenNativeOwner() {
   // destroys its fake owner, keeping sanitizer runs free of intentional leaks.
   auto retained_safe = std::make_shared<bool>(false);
   configuration.injected_shutdown_context = retained_safe.get();
+  struct RetainedEffects {
+    video::effects::BroadcastCameraEffects effects;
+    std::shared_ptr<bool> safe;
+  };
+  auto retained_effects = std::make_shared<RetainedEffects>();
+  retained_effects->safe = retained_safe;
   configuration.effects =
       std::shared_ptr<const video::effects::BroadcastCameraEffects>(
-          new video::effects::BroadcastCameraEffects,
-          [retained_safe](const auto *effects) { delete effects; });
+          retained_effects, &retained_effects->effects);
+  retained_effects.reset();
   lifetime = configuration.effects;
   factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
       Registration(&adapter), configuration);
