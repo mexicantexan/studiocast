@@ -1,6 +1,7 @@
 #include "core/cuda/kernels/prepared_mirror.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -270,9 +271,12 @@ std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t> &source,
   for (int y = 0; y < height; ++y)
     for (int x = 0; x < width; ++x)
       for (int c = 0; c < 3; ++c)
-        expected[static_cast<std::size_t>(y) * pitch + x * 3 + c] =
-            source[static_cast<std::size_t>(y) * pitch + (width - 1 - x) * 3 +
-                   c];
+        expected[static_cast<std::size_t>(y) * pitch +
+                 static_cast<std::size_t>(x * 3) +
+                 static_cast<std::size_t>(c)] =
+            source[static_cast<std::size_t>(y) * pitch +
+                   static_cast<std::size_t>((width - 1 - x) * 3) +
+                   static_cast<std::size_t>(c)];
   return expected;
 }
 
@@ -301,19 +305,26 @@ int NativeOracle() {
   for (auto format : {PixelFormatGpu::rgb_u8, PixelFormatGpu::bgr_u8}) {
     for (const auto &[width, height] : shapes) {
       const std::size_t host_pitch = static_cast<std::size_t>(width) * 3 + 7;
-      std::vector<std::uint8_t> source(host_pitch * height, 0xa5);
-      std::vector<std::uint8_t> output(host_pitch * height, 0xcd);
+      std::vector<std::uint8_t> source(
+          host_pitch * static_cast<std::size_t>(height), 0xa5);
+      std::vector<std::uint8_t> output(
+          host_pitch * static_cast<std::size_t>(height), 0xcd);
       for (int y = 0; y < height; ++y)
         for (int x = 0; x < width; ++x)
           for (int c = 0; c < 3; ++c)
-            source[static_cast<std::size_t>(y) * host_pitch + x * 3 + c] =
+            source[static_cast<std::size_t>(y) * host_pitch +
+                   static_cast<std::size_t>(x * 3) +
+                   static_cast<std::size_t>(c)] =
                 static_cast<std::uint8_t>((y * 71 + x * 13 + c * 5) & 255);
       auto expected = Expected(source, width, height, host_pitch);
       for (int y = 0; y < height; ++y)
-        std::fill(expected.begin() + static_cast<std::size_t>(y) * host_pitch +
+        std::fill(expected.begin() +
+                      static_cast<std::ptrdiff_t>(static_cast<std::size_t>(y) *
+                                                  host_pitch) +
                       width * 3,
                   expected.begin() +
-                      (static_cast<std::size_t>(y) + 1) * host_pitch,
+                      static_cast<std::ptrdiff_t>(
+                          (static_cast<std::size_t>(y) + 1) * host_pitch),
                   0xcd);
       CudaImage gpu_source, gpu_output;
       const bool pass = gpu_source.Allocate(&driver, width, height,

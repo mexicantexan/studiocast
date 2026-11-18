@@ -158,8 +158,10 @@ struct CpuCrop {
 };
 CpuCrop Crop(const std::vector<float> &marks, int eye, int fw, int fh) {
   const int base = eye == 0 ? 42 : 36;
-  const float x0 = marks[2 * base], y0 = marks[2 * base + 1];
-  const float x3 = marks[2 * (base + 3)], y3 = marks[2 * (base + 3) + 1];
+  const float x0 = marks[static_cast<std::size_t>(2 * base)],
+              y0 = marks[static_cast<std::size_t>(2 * base + 1)];
+  const float x3 = marks[static_cast<std::size_t>(2 * (base + 3))],
+              y3 = marks[static_cast<std::size_t>(2 * (base + 3) + 1)];
   const float cx = (x0 + x3) * .5f, cy = (y0 + y3) * .5f;
   const float half = std::abs(x3 - x0) * .75f, box_h = 1.5f * half;
   const int left =
@@ -185,10 +187,13 @@ float SampleModel(const std::vector<float> &model, int channel, float x,
   const int x0 = static_cast<int>(std::floor(x));
   const int y0 = static_cast<int>(std::floor(y));
   const int x1 = std::min(63, x0 + 1), y1 = std::min(47, y0 + 1);
-  const float fx = x - x0, fy = y - y0;
+  const float fx = x - static_cast<float>(x0), fy = y - static_cast<float>(y0);
   const auto at = [&](int px, int py) {
     return static_cast<float>(Byte(
-        std::clamp(model[channel * 48 * 64 + py * 64 + px], 0.f, 1.f) * 255.f));
+        std::clamp(
+            model[static_cast<std::size_t>(channel * 48 * 64 + py * 64 + px)],
+            0.f, 1.f) *
+        255.f));
   };
   return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) +
          (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
@@ -214,8 +219,12 @@ std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t> &input,
         const auto &c = crops[eye];
         if (x >= c.left && y >= c.top && x < c.left + c.width &&
             y < c.top + c.height) {
-          const float mx = (x - c.left + .5f) * 64.f / c.width - .5f;
-          const float my = (y - c.top + .5f) * 48.f / c.height - .5f;
+          const float mx = (static_cast<float>(x - c.left) + .5f) * 64.f /
+                               static_cast<float>(c.width) -
+                           .5f;
+          const float my = (static_cast<float>(y - c.top) + .5f) * 48.f /
+                               static_cast<float>(c.height) -
+                           .5f;
           for (int channel = 0; channel < 3; ++channel) {
             const auto i =
                 static_cast<std::size_t>((y * width + x) * 3 + channel);
@@ -240,9 +249,10 @@ float SampleFrame(const std::vector<std::uint8_t> &frame, int fw, int fh,
   const int x0 = static_cast<int>(std::floor(x)),
             y0 = static_cast<int>(std::floor(y));
   const int x1 = std::min(fw - 1, x0 + 1), y1 = std::min(fh - 1, y0 + 1);
-  const float fx = x - x0, fy = y - y0;
+  const float fx = x - static_cast<float>(x0), fy = y - static_cast<float>(y0);
   const auto at = [&](int px, int py) {
-    return static_cast<float>(frame[(py * fw + px) * 3 + channel]);
+    return static_cast<float>(
+        frame[static_cast<std::size_t>((py * fw + px) * 3 + channel)]);
   };
   return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) +
          (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
@@ -273,25 +283,37 @@ CpuInputs ExpectedInputs(const std::vector<std::uint8_t> &frame,
       for (int y = 0; y < 48; ++y)
         for (int x = 0; x < 64; ++x) {
           const float sx =
-              std::clamp(crop.left + (x + .5f) * crop.width / 64.f - .5f,
+              std::clamp(static_cast<float>(crop.left) +
+                             (static_cast<float>(x) + .5f) *
+                                 static_cast<float>(crop.width) / 64.f -
+                             .5f,
                          static_cast<float>(crop.left),
                          static_cast<float>(crop.left + crop.width - 1));
           const float sy =
-              std::clamp(crop.top + (y + .5f) * crop.height / 48.f - .5f,
+              std::clamp(static_cast<float>(crop.top) +
+                             (static_cast<float>(y) + .5f) *
+                                 static_cast<float>(crop.height) / 48.f -
+                             .5f,
                          static_cast<float>(crop.top),
                          static_cast<float>(crop.top + crop.height - 1));
-          rgb[c * 48 * 64 + y * 64 + x] =
+          rgb[static_cast<std::size_t>(c * 48 * 64 + y * 64 + x)] =
               Byte(SampleFrame(frame, fw, fh, c, sx, sy)) / 255.f;
         }
     for (int c = 0; c < 12; ++c) {
       const int point = base + (eye == 0 ? left_order[c / 2] : c / 2);
       const int rx = static_cast<int>(
-          std::floor((marks[2 * point] - crop.left) * 64.f / crop.width + .5f));
-      const int ry = static_cast<int>(std::floor(
-          (marks[2 * point + 1] - crop.top) * 48.f / crop.height + .5f));
+          std::floor((marks[static_cast<std::size_t>(2 * point)] -
+                      static_cast<float>(crop.left)) *
+                         64.f / static_cast<float>(crop.width) +
+                     .5f));
+      const int ry = static_cast<int>(
+          std::floor((marks[static_cast<std::size_t>(2 * point + 1)] -
+                      static_cast<float>(crop.top)) *
+                         48.f / static_cast<float>(crop.height) +
+                     .5f));
       for (int y = 0; y < 48; ++y)
         for (int x = 0; x < 64; ++x)
-          anchors[c * 48 * 64 + y * 64 + x] =
+          anchors[static_cast<std::size_t>(c * 48 * 64 + y * 64 + x)] =
               static_cast<float>((c & 1) ? y - ry : x - rx);
     }
   }
@@ -423,24 +445,28 @@ int NativeOracle() {
     host[i] = static_cast<std::uint8_t>((i * 29 + 7) & 255);
   std::vector<float> marks(136, 0.f);
   for (int i = 0; i < 68; ++i) {
-    marks[2 * i] = 50.f;
-    marks[2 * i + 1] = 35.f;
+    marks[static_cast<std::size_t>(2 * i)] = 50.f;
+    marks[static_cast<std::size_t>(2 * i + 1)] = 35.f;
   }
   const float lx[6] = {78, 80, 82, 86, 82, 80}, ly[6] = {5, 3, 4, 5, 7, 7};
   const float rx[6] = {2, 4, 6, 10, 6, 4}, ry[6] = {68, 66, 67, 68, 70, 70};
   for (int i = 0; i < 6; ++i) {
-    marks[2 * (42 + i)] = lx[i];
-    marks[2 * (42 + i) + 1] = ly[i];
-    marks[2 * (36 + i)] = rx[i];
-    marks[2 * (36 + i) + 1] = ry[i];
+    marks[static_cast<std::size_t>(2 * (42 + i))] = lx[i];
+    marks[static_cast<std::size_t>(2 * (42 + i) + 1)] = ly[i];
+    marks[static_cast<std::size_t>(2 * (36 + i))] = rx[i];
+    marks[static_cast<std::size_t>(2 * (36 + i) + 1)] = ry[i];
   }
   std::vector<float> left_model(3 * 48 * 64), right_model(3 * 48 * 64);
   for (int c = 0; c < 3; ++c)
     for (int y = 0; y < 48; ++y)
       for (int x = 0; x < 64; ++x) {
         const auto i = c * 48 * 64 + y * 64 + x;
-        left_model[i] = ((17 * x + 11 * y + 31 * c) % 254 + .75f) / 255.f;
-        right_model[i] = ((7 * x + 19 * y + 47 * c + 23) % 254 + .75f) / 255.f;
+        left_model[static_cast<std::size_t>(i)] =
+            (static_cast<float>((17 * x + 11 * y + 31 * c) % 254) + .75f) /
+            255.f;
+        right_model[static_cast<std::size_t>(i)] =
+            (static_cast<float>((7 * x + 19 * y + 47 * c + 23) % 254) + .75f) /
+            255.f;
       }
   CudaImage source, output;
   CudaTensor lm, geo, le, re, la, ra, langle, rangle, lout, rout;
@@ -529,24 +555,28 @@ int NativeOracle() {
   ok = ok && run(marks, 1.f, true, false, "right model failure preservation");
   auto overlapping = marks;
   for (int i = 0; i < 6; ++i) {
-    overlapping[2 * (42 + i)] = 47.f + i;
-    overlapping[2 * (42 + i) + 1] = 38.f + (i & 1);
-    overlapping[2 * (36 + i)] = 49.f + i;
-    overlapping[2 * (36 + i) + 1] = 38.f + (i & 1);
+    overlapping[static_cast<std::size_t>(2 * (42 + i))] =
+        47.f + static_cast<float>(i);
+    overlapping[static_cast<std::size_t>(2 * (42 + i) + 1)] =
+        38.f + static_cast<float>(i & 1);
+    overlapping[static_cast<std::size_t>(2 * (36 + i))] =
+        49.f + static_cast<float>(i);
+    overlapping[static_cast<std::size_t>(2 * (36 + i) + 1)] =
+        38.f + static_cast<float>(i & 1);
   }
   ok = ok && run(overlapping, .5f, true, true,
                  "overlapping eyes composite left then right");
   auto one_invalid = marks;
   for (int point = 0; point < 6; ++point) {
-    one_invalid[2 * (42 + point)] = 50.f;
-    one_invalid[2 * (42 + point) + 1] = 35.f;
+    one_invalid[static_cast<std::size_t>(2 * (42 + point))] = 50.f;
+    one_invalid[static_cast<std::size_t>(2 * (42 + point) + 1)] = 35.f;
   }
   ok = ok && run(one_invalid, 1.f, true, true, "one resident crop invalid");
   auto invalid = marks;
   for (int eye_base : {36, 42})
     for (int point = 0; point < 6; ++point) {
-      invalid[2 * (eye_base + point)] = 50.f;
-      invalid[2 * (eye_base + point) + 1] = 35.f;
+      invalid[static_cast<std::size_t>(2 * (eye_base + point))] = 50.f;
+      invalid[static_cast<std::size_t>(2 * (eye_base + point) + 1)] = 35.f;
     }
   ok = ok && run(invalid, 1.f, true, true, "both resident crops invalid");
   if (kernels.live) {

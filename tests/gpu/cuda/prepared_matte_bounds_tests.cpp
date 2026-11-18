@@ -280,7 +280,7 @@ bool NativeOracle() {
     up.dstDevice = alpha.ptr;
     up.dstPitch = alpha.pitch;
     up.WidthInBytes = static_cast<std::size_t>(w) * 4;
-    up.Height = h;
+    up.Height = static_cast<std::size_t>(h);
     DeviceMatteBoundsRecord got{};
     CUDA_MEMCPY2D down{};
     down.srcMemoryType = CU_MEMORYTYPE_DEVICE;

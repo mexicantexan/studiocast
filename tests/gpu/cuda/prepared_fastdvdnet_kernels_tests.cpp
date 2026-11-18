@@ -53,10 +53,10 @@ int main() {
   ok=ok&&noisy.DownloadToCpuF32(&driver,&got_noisy,stream,&error)&&noise.DownloadToCpuF32(&driver,&got_noise,stream,&error)&&output.DownloadToCpuRgb24(&driver,got_rgb.data(),9,stream,&error)&&driver.StreamSynchronize(stream,&error);
   auto near=[](float a,float b){return std::fabs(a-b)<=1e-6f;};
   ok=ok&&got_noisy.size()==240&&got_noise.size()==16;
-  for(int i=0;ok&&i<16;++i){ok=near(got_noisy[i],0.25f)&&near(got_noisy[3*16+i],0.5f)&&near(got_noise[i],15.0f/255.0f);}
+  for(int i=0;ok&&i<16;++i){ok=near(got_noisy[static_cast<std::size_t>(i)],0.25f)&&near(got_noisy[static_cast<std::size_t>(3*16+i)],0.5f)&&near(got_noise[static_cast<std::size_t>(i)],15.0f/255.0f);}
   // Bottom/right padding replicates source pixel (2,1): RGB 150,160,170.
   ok=ok&&near(got_noisy[6*16+15],150.0f/255.0f)&&near(got_noisy[7*16+15],160.0f/255.0f)&&near(got_noisy[8*16+15],170.0f/255.0f);
-  for(int y=0;ok&&y<2;++y)for(int x=0;ok&&x<3;++x)for(int c=0;ok&&c<3;++c){const auto expected=static_cast<std::uint8_t>(std::nearbyint(std::clamp(den[c*16+y*4+x],0.0f,1.0f)*255.0f));ok=got_rgb[y*9+x*3+c]==expected;}
+  for(int y=0;ok&&y<2;++y)for(int x=0;ok&&x<3;++x)for(int c=0;ok&&c<3;++c){const auto expected=static_cast<std::uint8_t>(std::nearbyint(std::clamp(den[static_cast<std::size_t>(c*16+y*4+x)],0.0f,1.0f)*255.0f));ok=got_rgb[static_cast<std::size_t>(y*9+x*3+c)]==expected;}
   if(!ok)std::cerr<<"FastDVDnet generated-frame reference mismatch: geometry=3x2 padded=4x4 tolerance=1e-6\n";
   DestroyFastDvdnetKernels(&kernels,nullptr);denoised.Free(&driver,nullptr);noise.Free(&driver,nullptr);noisy.Free(&driver,nullptr);current.Free(&driver,nullptr);middle.Free(&driver,nullptr);oldest.Free(&driver,nullptr);output.Free(&driver,nullptr);input.Free(&driver,nullptr);cleanup_stream();
   if(ok)std::cout<<"PASS: device=0 geometry=3x2 padded=4x4 uploads=4 downloads=3 syncs=2 tolerance=1e-6\n";
