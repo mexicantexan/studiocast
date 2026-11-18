@@ -1321,7 +1321,8 @@ MultiIslandStatusValidationResult BuildMultiIslandVideoRuntimeStatusSnapshot(
       candidate.islands[i] = input.islands[i];
   }
   if (input.effect_count <= input.effects.size()) {
-    for (std::size_t i = 0; i < input.effect_count; ++i)
+    for (std::size_t i = 0;
+         i < candidate.effects.size() && i < input.effect_count; ++i)
       candidate.effects[i] = input.effects[i];
   }
   if (input.effect_count <= input.effects.size()) {

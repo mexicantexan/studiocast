@@ -830,6 +830,77 @@ bool TestMultiIslandPassthroughAndProductionFixtures() {
   return ok;
 }
 
+bool TestMultiIslandEffectCountBoundaries() {
+  bool ok = true;
+  const auto valid_input = MultiIslandPassthroughInput();
+  const std::size_t capacity = valid_input.effects.size();
+  for (const std::size_t count :
+       {std::size_t{0}, std::size_t{1}, capacity - 1, capacity, capacity + 1,
+        std::numeric_limits<std::size_t>::max()}) {
+    auto input = valid_input;
+    input.effect_count = count;
+    MultiIslandVideoRuntimeStatusSnapshot output;
+    output.status_generation = 999;
+    output.effects.back().active = true;
+    const auto result =
+        studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(input,
+                                                                   &output);
+    const auto expected =
+        count > capacity ? MultiIslandStatusValidationCode::wrong_effect_count
+        : count < capacity ? MultiIslandStatusValidationCode::missing_effect
+                           : MultiIslandStatusValidationCode::valid;
+    ok &= Expect(result.code == expected,
+                 "effect count boundaries must retain exact validation codes");
+    if (count == capacity) {
+      ok &= Expect(output.effect_count == count &&
+                       output.effects.back().effect ==
+                           valid_input.effects.back().effect &&
+                       output.effects.back().status == StatusId::passthrough,
+                   "full-capacity copy must preserve the final effect");
+    } else {
+      ok &= Expect(output.status_generation == 0 && output.effect_count == 0 &&
+                       output.island_count == 0 &&
+                       output.effects.front().effect ==
+                           SemanticEffectId::invalid &&
+                       output.effects.back().effect ==
+                           SemanticEffectId::invalid &&
+                       !output.effects.back().active,
+                   "invalid counts must reset a previously populated output");
+      if (count < capacity) {
+        ok &= Expect(result.effect_index == count &&
+                         result.effect ==
+                             studiocast::video::kCanonicalVideoEffects[count],
+                     "partial copy must report the first missing effect");
+      }
+    }
+  }
+
+  auto input = valid_input;
+  input.effect_count = 1;
+  input.effects.front().effect = SemanticEffectId::invalid;
+  MultiIslandVideoRuntimeStatusSnapshot output;
+  ok &= Expect(studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+                   input, &output).code ==
+                   MultiIslandStatusValidationCode::unknown_effect,
+               "a partial prefix must be copied before effect validation");
+  input = valid_input;
+  input.effect_count = capacity + 1;
+  input.status_generation = 0;
+  ok &= Expect(studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+                   input, &output).code ==
+                   MultiIslandStatusValidationCode::invalid_generation,
+               "generation validation must precede malformed effect counts");
+  input = ThreeIslandInput();
+  input.effect_count = capacity + 1;
+  input.islands[0].telemetry.transfers.uploads =
+      std::numeric_limits<std::uint64_t>::max();
+  ok &= Expect(studiocast::video::BuildMultiIslandVideoRuntimeStatusSnapshot(
+                   input, &output).code ==
+                   MultiIslandStatusValidationCode::aggregate_overflow,
+               "aggregate overflow must precede malformed effect counts");
+  return ok;
+}
+
 bool TestMultiIslandStructuralRejection() {
   MultiIslandVideoRuntimeStatusSnapshot snapshot;
   bool ok =
@@ -1179,6 +1250,7 @@ int main() {
   ok = TestActiveAttribution() && ok;
   ok = TestReadinessConsistency() && ok;
   ok = TestMultiIslandPassthroughAndProductionFixtures() && ok;
+  ok = TestMultiIslandEffectCountBoundaries() && ok;
   ok = TestMultiIslandStructuralRejection() && ok;
   ok = TestMultiIslandStrictAndFailureSemantics() && ok;
   ok = TestNativeCudaProviderUsesOpenCudaLane() && ok;
