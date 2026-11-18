@@ -613,7 +613,7 @@ readback. Each selected effect still needs its own model, warmup, ownership,
 resource and numerical qualification evidence; matting readiness alone cannot
 promote another effect. The model-backed implementation requires the pinned
 ncnn replay SDK and compatible checksummed artifacts. Available-hardware
-results, pending artifact publication and geometry limits are recorded in
+results, verified artifact publication and geometry limits are recorded in
 [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md); they do not
 qualify unavailable device families.
 
@@ -670,6 +670,9 @@ version `2026-11-11`: 9,948,304 bytes, SHA-256
 That checkpoint preserved the model ID/default and seven packs/eight artifacts
 (140,755,803 bytes). Catalog `2026-11-12` additionally includes the verified
 MODNet ncnn pair, retaining seven packs with ten artifacts and 166,611,916 bytes.
+Catalog `2026-11-14` adds the verified FastDVDnet, YuNet and FLX ncnn artifacts:
+seven packs, eighteen artifacts and 188,659,386 bytes, pinned to immutable
+[Hugging Face commit 47134731](https://huggingface.co/10dallasj/studiocast/commit/4713473184bf7ece0be6c097ff75f6c6c528c8ec).
 The sigma15 artifact,
 `model.json`, and full license match the approved reproducible export and the
 remotely verified bytes at
@@ -763,15 +766,15 @@ fixed-center vignette, and final resize through
 `ProductionVideoBackendManager`. The intended transfer shape is one upload,
 zero intermediate readbacks or CPU tails, and one final writer-boundary
 readback. The expanded production owner adds FastDVDnet, YuNet, GPU dlib/FLX
-eye contact, GPU crop tracking and tracked-center vignette. New model publication
-and combined qualification remain explicit gates in
+eye contact, GPU crop tracking and tracked-center vignette. Model publication is
+verified; combined hardware qualification remains an explicit gate in
 [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md). Selected/readiness state is not
 active state: the writer must successfully commit the output first.
 
 Model conversion, schema, exact artifact identities, and isolated validation
 are documented in [how_to_add_your_own_model.md](how_to_add_your_own_model.md).
-The active `2026-11-12` catalog supplies both published ncnn artifacts and the
-original ONNX file under the same MODNet ID; installed user packs remain
+The active `2026-11-14` catalog supplies the published ncnn artifacts and
+original ONNX files under the unchanged model IDs; installed user packs remain
 unchanged until an ownership-safe explicit model transaction.
 For required native commands and remaining hardware/quality gates, use
 [MANUAL_TESTING.md](MANUAL_TESTING.md). The original

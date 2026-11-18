@@ -777,3 +777,296 @@ install/configure/test order and valid shell syntax. Evidence is under
 commit or host changes. All accepted repairs are integrated; actual hosted
 package installation and the complete build/test/self-test matrix remain the
 external gate recorded in the PR.
+
+## Current-head hardware qualification (2026-11-17)
+
+Status: merge on hold for a native timeout/teardown SIGSEGV; hardware
+qualification remains incomplete before the user's conditionally authorized
+merge.
+The frozen qualification source is
+`73afcecb1915c2b6f456664ffac5471c07c203d4`, with the activated `2026-11-14`
+catalog and its unchanged seven packs/eighteen artifacts. Native tests use
+new isolated fixture metadata and hash-verified existing artifact bytes; they
+do not repair or replace installed user packs. Release builds and evidence
+remain isolated from the user's configuration.
+
+Available hardware is an NVIDIA Quadro P1000, driver 535.309.01, 4 GiB VRAM,
+with approximately 1.2 GiB occupied by existing desktop work at discovery.
+Repository runner inventory reports zero self-hosted runners, so AMD/Intel
+execution cannot be obtained here. Only Mesa overlay and Intel null-hardware
+layer manifests are installed; Khronos validation and `vulkaninfo` are absent.
+The source and pinned ncnn runtime expose no supported forced non-push-descriptor
+override. These missing prerequisites remain unqualified.
+
+The HD camera `/dev/video0` supports the bounded 320×240 test; `/dev/video1`
+and `/dev/video3` are metadata nodes and `/dev/video2` is an IR-only GREY camera.
+The existing `/dev/video10` loopback is output-only with exclusive caps and an
+uninitialized 0×0 format. Query opens succeed and no holder is observed, but
+partial `/proc` visibility prevents an absolute free-device guarantee. The
+installed user daemon is inactive. The planned private daemon/consumer would
+stop on busy devices, disable all audio creation, discard frames and preserve
+user settings; it has not run.
+
+The qualification phases are serialized native Vulkan/CUDA matrices and cold
+diagnostics, followed by a bounded real-camera/loopback run. A separate
+fake-context ASan/UBSan/LeakSanitizer target does not initialize the GPU and
+cannot substitute for full native sanitizer qualification. Earlier failed
+deadline cases remain retained; fresh outcomes do not erase them or change the
+100 ms fence and synchronization limits.
+
+The first native pass stopped immediately when `all_remove_odd`, 65×49 →
+32×24, timed out at 104.312 ms with zero active/output success and then exited
+by SIGSEGV. Other matrices, cold diagnostics, CUDA and real camera tests were
+paused at that safety boundary. Original evidence is retained under
+`/tmp/studiocast-hw-qualification-20261117`, including `qualification.json`,
+`REPORT.txt` and the exact case log. This outcome is a merge blocker; successful
+component or software CI results do not exonerate it.
+
+Auto Frame also failed the complete-artifact matrix's expected matte-inference
+check after a face-only setup. A read-only contract audit confirms that matting
+is optional for ordinary face-based Auto Frame. The original qualification
+failure remains retained until its absent matte is explained; runtime behavior
+and the healthy-fixture assertion are not being weakened to relabel it a pass.
+
+Seven scoped diagnostic invocations retain the original binary, models,
+geometry and deadline. The seventh reproduced the natural timeout followed by
+SIGSEGV with a fresh private cache. Its faulting worker stack is inside
+`libnvidia-glcore.so.535.309.01`; that location does not establish a driver-only
+cause. Debugger observations in separate invocations proved a successful late
+fence wait and child shutdown, so those observations do not cover a failed late
+proof or clear the intermittent crash. Evidence is under
+`/tmp/studiocast-hw-crash-diagnosis-20261117`; the original qualification logs
+and their hashes remain unchanged.
+
+A standard GNU ASan/UBSan production-smoke build from the same frozen source
+completed, reusing the existing external ncnn and system libraries. One native
+`all_remove_odd` invocation exited with an allocation/deallocation mismatch:
+the smoke harness overrides deleting operators with `free`, but omits the
+nothrow allocation overload used to create the production executor. The stack
+reaches explicit terminal shutdown after the frame/lifecycle checks; buffered
+stdout did not survive the sanitizer abort, so exact counters are unavailable.
+This is a separate harness defect, not evidence that the original crash is
+fixed. Leak checks were enabled but did not reach a clean conclusion. Evidence
+is under `/tmp/studiocast-asan-all-remove-odd-20261117-y1p2azmm`.
+
+The bounded harness repair is topic
+`fix/vulkan-smoke-nothrow-allocation-family`, source `a648594` → integrated
+`125fa55`. The production smoke and a GPU-free regression now share the exact
+replacement operators, including scalar/array/aligned nothrow allocation and
+matching deletion. No production code, model, deadline or native assertion is
+changed. The regression reproduced the original ASan mismatch before the fix;
+afterward it passes 120 allocation/deletion pairs and exactly 40 gated counts
+with mismatch, address, undefined-behavior and leak checks enabled. Root's
+independent integrated-source compile/run also passes with warnings treated as
+errors; evidence is under
+`/run/user/1000/studiocast-allocator-integrated-y4lbqmvp`.
+
+Fresh-context critic `smoke_allocator_final_critique` found no repair-specific
+blocker, High finding or valid unmet requirement. Its frozen-source GCC 11.4
+`-O3 -flto -Werror` sanitizer run and fresh CMake Release sanitizer CTest both
+pass, with mismatch and leak checks enabled. Optimized plain Clang 14 and direct
+Clang sanitizer launches also pass. Two Clang sanitizer launches through Python
+`subprocess.PIPE` spun and were bounded/terminated; shell-pipe and PTY launches
+pass, and disassembly shows no recursive allocation forwarding. This
+launch-dependent caveat remains unclassified, without a universal Clang
+sanitizer claim. Allocation failure was reviewed statically, not fault-injected.
+Critic evidence is under
+`/run/user/1000/studiocast-allocator-critique-t3w76z1u`; it made no source commit.
+
+The reviewed harness was rebuilt into the existing GNU production sanitizer
+profile. Its GPU-free allocation CTest passes with stack-use-after-return,
+mismatch and leak checks enabled. Exactly one new native `all_remove_odd`
+invocation used fresh private state, the same models/geometry/deadlines and
+ordinary PTY stdout capture. It reached the 180-second outer diagnostic limit
+during setup and was terminated, with no frame or summary rows. No sanitizer
+error was reported before termination, but there is no clean sanitizer or leak
+conclusion. Source is `125fa55`, binary SHA-256
+`ebe04071f3d03342fa197461bf61c3110368e67ed62867ccd3c7676f34bf7011`;
+evidence is under
+`/tmp/studiocast-asan-all-remove-odd-125fa55-20261117-22kxo3zu`.
+
+Automatic safety review rejected continuation of the diagnostic agent for
+"possible cybersecurity risk." The already-started invocation's completion
+was collected, its child and wrapper exited, and no restart or alternate native
+execution followed. The rejected post-fault attachment proposal and the later
+standard-sanitizer workflow are recorded as tooling limitations, not as a
+cybersecurity finding in StudioCast. The original crash and the outstanding
+hardware gates remain unresolved; the harness repair does not clear the merge
+hold.
+
+Before the safety stop, the six MODNet golden cases, four generic model golden
+comparisons (FastDVDnet, YuNet and both FLX eyes), native GPU tracking/dlib/FLX
+oracles and final-stage integration passed. MODNet's worst maximum absolute
+error was 0.000112742 with mask IoU 1; generic-model maximum errors ranged from
+0.00000220537 to 0.0000290871. The generic tests observed zero host Execute
+allocations and actual FP64 device creation. These component results do not
+substitute for the production matrix.
+
+The first production pass reached sixteen cases: nine passed (`mirror`,
+`vignette`, `denoise`, `denoise_zero`, `eye_no_face`, `eye_zero`,
+`tracked_vignette`, `keylight`, `all_blur`) and seven failed:
+
+| Case | Retained observation |
+| --- | --- |
+| `auto_frame` | Face-only setup; expected healthy-fixture matte inference absent. |
+| `blur` | Degraded setup, status 3/reason 28, zero stages; cause unproven. |
+| `all_blur_odd` | First frame timed out at 105.736 ms. |
+| `all_blur_face` | Degraded setup, six of seven stages, status 3/reason 28; cause unproven. |
+| `remove` | Degraded setup, status 3/reason 28, zero stages; cause unproven. |
+| `all_remove` | First frame timed out at 105.251 ms. |
+| `all_remove_odd` | First frame timed out at 104.312 ms, then SIGSEGV. |
+
+Successful production records observed one upload, one final readback and one
+synchronization, with zero intermediate readbacks, CPU tails or C++ Execute
+allocations. There were 37 writer commits; the small sample does not establish
+global p95 latency qualification. Remaining compositions, isolation/budget and
+default checks, cold diagnostics, native CUDA and real-camera/loopback execution
+remain unrun after the safety stop. No installed daemon, camera settings,
+loopback configuration or user model pack was changed.
+
+### Strict local compiler verification
+
+Proportional software verification also exercised the existing disabled-backend
+Release configuration with `STUDIOCAST_ENABLE_WERROR=ON`. Its failures are
+retained; warning flags, native opt-ins and behavioral assertions are not
+relaxed. Routine delivery repair extended to the following bounded changes:
+
+| Topic | Source → integrated commit | Change and focused evidence |
+| --- | --- | --- |
+| `fix/ncnn-network-parser-shadow` | `7ab3a4f` → `6aa941a` | Rename one loop-local JSON entry; identical strict compile fails before and passes after. |
+| `fix/vulkan-factory-feature-guard` | `50800b3` → `7824224` | Guard the Vulkan-only semantic-bit helper with its callers' feature condition; strict disabled/enabled-without-ncnn compiles pass, enabled preprocessing is byte-identical. |
+| `repair/cuda-auto-frame-werror` | `7b295fa` → `65a74f2` | Make existing numeric conversions explicit; strict compile passes and Release `.text` bytes match baseline. Existing fake-driver Auto Frame CTest passes 1/1. |
+| `fix/camera-pipeline-unused-backend-argument` | `62c29e2` → `0be1183` | Remove an unused private lambda argument and its pure field-read caller argument; identical strict compile passes. |
+| `fix/vulkan-quarantine-test-coownership` | `266eec4` → `aa451ff` | Use one shared aggregate and an effects alias to retain the shutdown-proof flag, avoiding a GCC allocation warning; strict compile and GPU-denied full factory test pass. All retention and positive-proof cleanup assertions are unchanged. |
+| `repair/cuda-fixture-werror` | `b1c50b5` → `a784f02` | Explicit conversions in four CUDA kernel fixtures; all strict compiles pass and all four complete object files match baseline byte-for-byte. Three default fake tests pass; native-only FastDVDnet correctly skips with exit 77. |
+| `fix/maxine-path-copy-string-construction` | `e78ca46` → `e49f5fa` | Explicit string append avoids a GCC12 `restrict` diagnostic; strict GCC11/12 compiles and 30 public path-formatting cases per compiler pass, preserving existing HOME-prefix behavior. |
+| `fix/gcc12-status-copy-bound` | `b3cc22e` → `91198f4` | Make the effects destination capacity explicit; strict GCC12 compile and focused status CTest pass, preserving malformed-count rejection and validation precedence. |
+| `repair/string-construction-werror` | `b767576` → `a3e73bd` | Append command spaces before the unchanged quoting helper, and explicitly construct an audit token. Strict GCC11/12 compiles, four existing exact-command/failure checks and the capability audit pass. |
+| `fix/optimized-test-allocation-hooks` | `b0c42c5` → `89e4a1e` | Keep real frees visible to ASan behind a test-only noinline boundary, and complete YuNet's independently failing local allocation family. Strict GCC11/12/Clang14 builds and GPU-denied YuNet fake tests pass. |
+| `repair/auto-frame-fixture-werror` | `99a8232` → `ae05dd8` | Two explicit fixture conversions; GCC11/12 strict compiles and default fake tests pass, with complete objects byte-identical to baseline. |
+
+These repairs preserve runtime algorithms, routing precedence, model integrity
+checks and lifetime requirements. The source repairs introduce no dependency,
+catalog or installed-pack change. The CUDA Auto Frame focused test build uses
+the ordinary non-Werror profile because unrelated baseline errors exist there;
+its separate exact-flags object compile retains `-Werror`. Its first `ctest`
+Python wrapper could not import CMake under a temporary HOME; the existing
+system `/usr/bin/ctest` runs the same test successfully without a host change.
+
+Focused evidence is under `/run/user/1000/studiocast-parser-shadow-check`,
+`studiocast-vulkan-factory-guard-check`, `studiocast-camera-unused-argument-checks`
+and `studiocast-vulkan-quarantine-test-check`, plus the
+`/run/user/1000/studiocast-cuda-auto-frame-werror-*.log` files. Quarantine-test
+linking uses a hash-verified private snapshot of eight existing disabled-backend
+archives, not mutable build outputs. Broad integrated verification remains the
+gate for the combined repairs.
+
+The four-fixture batch preserves numerical formulas, input bytes, tolerances,
+assertions and native opt-ins. Its 5/1/10/50 original diagnostics and successful
+strict compiles, object comparisons and private-archive links are recorded
+under `/run/user/1000/studiocast-cuda-fixture-werror-checks`. The FastDVDnet skip
+is not represented as hardware qualification. None of these software repairs
+changes the unresolved native timeout/SIGSEGV outcome.
+
+The fresh GCC12 discovery pass retained seven failing translation units and
+all dependency-blocked targets before batching repairs. The status-copy
+diagnostic refers to offset 336776, exactly one past its nine-element effects
+array; both source and destination capacities are nine, and the original guard
+permits only indices 0–8. It is a compiler bounds-analysis false positive, not
+evidence of a runtime overrun. The additional bound leaves the original count,
+zero defaults and validation sequence intact. Tests cover counts 0/1/8/9/10/
+SIZE_MAX, final-element copying, partial-prefix diagnostics, cleared outputs and
+generation/aggregate-overflow precedence. Evidence is under
+`/run/user/1000/studiocast-gcc12-status-check`.
+
+The allocation-hook follow-up distinguishes two findings. The complete Vulkan
+family already passes runtime sanitizer checks before the noinline boundary;
+its optimized compiler warning is a false positive. YuNet's original local
+hooks independently reproduce the real nothrow allocation/free mismatch, so
+its family is completed too. GNU11/12 optimized ASan/UBSan checks pass the
+unchanged Vulkan 120-pair/40-gated-count regression and 40 YuNet pairs/counts,
+with mismatch and leak checks enabled. A negative control omitting nothrow
+replacements still fails ASan across the new boundary. No sanitizer check,
+warning flag, native opt-in or behavioral assertion is disabled. Evidence is
+under `/run/user/1000/studiocast-optimized-allocation-hooks-check`.
+
+Additional focused evidence is under
+`/run/user/1000/studiocast-maxine-path-copy-check`,
+`/run/user/1000/studiocast-string-construction-checks` and
+`/run/user/1000/studiocast-auto-frame-fixture-checks`. Audio checks use existing
+fake command hooks, empty PATH and an aborting fallback executor; no real audio
+command is executed.
+
+Final integrated code head `ae05dd810974b1c5e67c83dbc1253f1dae622a31`
+passes both strict Release builds and full CTest suites:
+
+| Compiler/profile | Full build | Full CTest |
+| --- | --- | --- |
+| GNU11, optional backends/kernels/dlib disabled, benchmarks built | Exit 0, 57.955 s incremental final build | 86 registered: 81 passed, five explicit native skips, zero failed; 111.51 s. |
+| GNU12, optional backends/kernels/dlib and benchmarks disabled | Exit 0, 209.968 s incremental final build | 86 registered: 81 passed, five explicit native skips, zero failed; 52.588 s. |
+
+Both profiles retain `STUDIOCAST_ENABLE_WERROR=ON`, private HOME/XDG roots,
+nonexistent Vulkan ICD paths and absent native opt-ins. The skips are Open CUDA
+production smoke and native matte bounds, mirror, Eye Contact and FastDVDnet
+kernels. Building benchmark tools does not execute them. No local self-test or
+custom driver interposition is run during this follow-up; hosted CI's portable
+self-test remains a separate final-head gate.
+
+GNU11 evidence is under
+`/run/user/1000/studiocast-hardware-handoff-checks-8excdglf`, including
+`gcc11-final-{build,ctest}.log` and `gcc11-final-results.json`. Initial failures,
+the keep-going discovery logs and the recorded resource/integration changes
+remain retained. Two unchanged GNU11 test translation units eventually compile
+successfully after unusually long optimization; no optimization flag is
+reduced. The final build and suite above run after all repairs are integrated.
+
+GNU12 evidence is under
+`/run/user/1000/studiocast-final-gcc12-xwgYeSAr`. Its first full CTest run fails
+four IPC/GUI/installer tests because the long private TMPDIR makes UNIX socket
+paths exceed the OS limit. Only the fixture environment is corrected: a short
+private `/tmp/s12-0hj0j6tt` root and mode 0700 for its own XDG runtime directory.
+Conservative socket lengths including NUL change from 124/119/140/114 to
+91/86/107/81 bytes. The full rerun uses identical code, compiler, flags and
+native opt-ins and passes all four previously failing tests. The failed
+`final-ctest.log` is preserved alongside `final-ctest-short-temp.log`, fixture
+length/permission evidence and exact environments. Successful final build and
+CTest log SHA-256 values are respectively
+`9537661561fd1884ca554390d2ec6038900715dd8157e3ea993b9c01d1463c20` and
+`1eee9c6001ef5ae64c3c2f94fc1418bf4d0a1b1aa2cbc4147e87e10130429032`.
+
+Fresh-context critic `hardware_delivery_final_critique` reviewed every changed
+source file since `73afcec`, both documentation diffs and the applicable
+policies/contracts. It found no new repair-specific blocker, High finding or
+unmet requirement. Independent frozen-source GNU11/12 `-O3 -flto -Werror`
+ASan/UBSan runs pass the 120-pair/40-gated-count allocator regression with
+mismatch/leak checks enabled in a GPU-denied sandbox. It verifies both complete
+CTest results, the GNU12 hashes and retained fixture-failure evidence, and
+passes documentation validation for all 43 Markdown files. Evidence is under
+`/run/user/1000/studiocast-final-critique-b43cs9im`. This approves the repairs'
+scope; it does not approve merge or qualify the hardware. The original native
+SIGSEGV, remaining matrices/camera transport and clean full-native sanitizer
+gate remain unresolved. The critic makes no source commit.
+
+The task's agent ownership and handoffs are recorded here; source/topic and
+integrated commit mappings are given above:
+
+| Agent | Ownership/outcome |
+| --- | --- |
+| `hardware_native_qualification` | Frozen native qualification and seven diagnostic probes; read-only teardown evidence and CPU-only debugger feasibility check; no source commit. |
+| `camera_qualification_audit` | Camera plan, isolated sanitizer builds and the two native sanitizer attempts; camera remains unrun; no source commit. |
+| `auto_frame_hardware_failure_audit` | Read-only optional-matte and native-owner destruction-order audits; no source commit. |
+| `smoke_allocator_repair` | Six focused topics: initial smoke family, parser rename, Vulkan feature guard, quarantine fixture, Maxine path display and optimized allocation hooks; all accepted commits integrated. |
+| `cuda_auto_frame_warning_repair` | Four focused topics: Auto Frame conversions, four kernel fixtures, string construction and Auto Frame fixture conversions; all accepted commits integrated. |
+| `camera_unused_argument_repair` | Private status-selector argument cleanup; accepted commit integrated. |
+| `snapshot_copy_bound_repair` | Fixed-capacity copy proof and boundary tests; accepted commit integrated. |
+| `final_gcc12_software_validation` | Independent build/test operation on frozen code and causal temporary-root correction; no source commit. |
+| `smoke_allocator_final_critique` | Independent initial allocator and catalog/documentation critique; no source commit. |
+| `hardware_delivery_final_critique` | Fresh final integrated critique described above; no source commit. |
+
+Root reviews and integrates all twelve accepted implementation commits. At the
+pre-push audit, `origin/master` remains
+`adfb648efe6b7666f5bdcc1455e5a977971eda7b` and is an ancestor of code head
+`ae05dd8`; `origin/v0.2.9` remains `73afcec`. PR #22 is open with no auto-merge
+request. The conditionally authorized merge is withheld because the native
+safety failure remains unresolved. No release, tag, deployment or installed-pack
+mutation is performed.
