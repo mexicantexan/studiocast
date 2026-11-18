@@ -1269,6 +1269,12 @@ if (BUILD_TESTING)
         studiocast_set_test_labels(studiocast-hardware-ci-workflow-tests
                 unit gpu video)
 
+        add_test(NAME studiocast-ci-onnxruntime-preparation-tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tests/unit/core/ci_onnxruntime_preparation_tests.py")
+        studiocast_set_test_labels(studiocast-ci-onnxruntime-preparation-tests
+                unit core)
+
         add_test(NAME studiocast-fastdvdnet-export-tests
                 COMMAND "${Python3_EXECUTABLE}"
                         "${PROJECT_SOURCE_DIR}/tests/installer/models/fastdvdnet_export_tests.py")

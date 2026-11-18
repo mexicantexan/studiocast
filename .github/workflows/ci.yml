@@ -271,30 +271,26 @@ jobs:
           ORT_ARCH: x64
           ORT_FLAVOR: cpu
         run: |
-          if [[ "${ORT_FLAVOR}" == "cpu" ]]; then
-            ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}"
-          else
-            ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_FLAVOR}-${ORT_VERSION}"
-          fi
-          ort_tgz="${ort_name}.tgz"
-          ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ort_tgz}"
+          test "${ORT_VERSION}" = 1.17.3
+          test "${ORT_ARCH}" = x64
+          test "${ORT_FLAVOR}" = cpu
+          ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}"
+          ort_package="microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
+          ort_url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/${ort_package}"
           ort_prefix="/opt/studiocast/onnxruntime/${ORT_VERSION}"
           ort_root="${ort_prefix}/${ort_name}"
+          ort_stage="$(mktemp -d "${RUNNER_TEMP}/onnxruntime-cpu.XXXXXX")"
 
-          curl --fail --location --retry 3 --output "${RUNNER_TEMP}/${ort_tgz}" "${ort_url}"
+          curl --fail --location --retry 3 --output "${ort_stage}/${ort_package}" "${ort_url}"
+          python3 scripts/dev/prepare_ci_onnxruntime.py \
+            --archive "${ort_stage}/${ort_package}" --output "${ort_stage}/sdk"
           sudo mkdir -p "${ort_prefix}"
-          sudo tar -xzf "${RUNNER_TEMP}/${ort_tgz}" -C "${ort_prefix}"
+          test ! -e "${ort_root}"
+          test ! -L "${ort_root}"
+          sudo cp -a "${ort_stage}/sdk" "${ort_root}"
 
           test -f "${ort_root}/include/onnxruntime_cxx_api.h"
           ort_libdir="${ort_root}/lib"
-          if [[ -d "${ort_root}/lib64" ]]; then
-            ort_libdir="${ort_root}/lib64"
-          fi
-
-          if [[ ! -e "${ort_libdir}/libonnxruntime.so" ]]; then
-            sofile="$(ls -1 "${ort_libdir}"/libonnxruntime.so.* | head -n 1)"
-            sudo ln -sf "$(basename "${sofile}")" "${ort_libdir}/libonnxruntime.so"
-          fi
 
           echo "${ort_libdir}" | sudo tee /etc/ld.so.conf.d/studiocast-onnxruntime.conf >/dev/null
           sudo ldconfig
