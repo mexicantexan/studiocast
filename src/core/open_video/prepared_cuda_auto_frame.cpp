@@ -34,8 +34,8 @@ bool Usable(const PreparedCudaAutoFrameTrackingBox &b, int w, int h) {
   const auto &r = b.box;
   return b.source != PreparedCudaAutoFrameSource::none && std::isfinite(r.x) &&
          std::isfinite(r.y) && std::isfinite(r.w) && std::isfinite(r.h) &&
-         r.w > .5F && r.h > .5F && r.x < w && r.y < h && r.x + r.w > 0 &&
-         r.y + r.h > 0;
+         r.w > .5F && r.h > .5F && r.x < static_cast<float>(w) &&
+         r.y < static_cast<float>(h) && r.x + r.w > 0 && r.y + r.h > 0;
 }
 void Add(hal::TransferCounters *a, const hal::TransferCounters &b) {
   a->uploads += b.uploads;
@@ -175,7 +175,8 @@ PreparedCudaAutoFrameAnalysisResult PreparedCudaAutoFrameMatteAdapter::Analyze(
     if (const auto *artifact = c->artifacts.FindMatte(s, key_);
         artifact && key_.storage == FrameMatteStorage::cpu_f32_alpha &&
         artifact->cpu_alpha.size() ==
-            static_cast<std::size_t>(key_.matte_width) * key_.matte_height) {
+            static_cast<std::size_t>(key_.matte_width) *
+                static_cast<std::size_t>(key_.matte_height)) {
       PreparedCudaAutoFrameAnalysisResult result;
       result.ok = true;
       result.found = ComputeBox(artifact->cpu_alpha.data(), key_.matte_width,
@@ -212,10 +213,12 @@ bool PreparedCudaAutoFrameMatteAdapter::ComputeBox(
       }
   if (count < std::max(32, aw * ah / 500) || x1 < x0)
     return false;
-  const float sx = static_cast<float>(fw) / aw,
-              sy = static_cast<float>(fh) / ah;
+  const float sx = static_cast<float>(fw) / static_cast<float>(aw),
+              sy = static_cast<float>(fh) / static_cast<float>(ah);
   out->source = PreparedCudaAutoFrameSource::matte;
-  out->box = {x0 * sx, y0 * sy, (x1 + 1 - x0) * sx, (y1 + 1 - y0) * sy};
+  out->box = {static_cast<float>(x0) * sx, static_cast<float>(y0) * sy,
+              static_cast<float>(x1 + 1 - x0) * sx,
+              static_cast<float>(y1 + 1 - y0) * sy};
   out->confidence = 1;
   return true;
 }
@@ -302,25 +305,29 @@ void PreparedCudaAutoFrame::ResetTracking() noexcept {
 }
 
 float PreparedCudaAutoFrame::SmoothingAlpha(int p) noexcept {
-  return 1.F / (1.F + 9.F * (std::clamp(p, 0, 100) / 100.F));
+  return 1.F /
+         (1.F + 9.F * (static_cast<float>(std::clamp(p, 0, 100)) / 100.F));
 }
 PreparedCudaAutoFrameRect
 PreparedCudaAutoFrame::CenterCrop(int w, int h, float aspect,
                                   float zoom) noexcept {
   zoom = std::max(1.F, zoom);
-  float cw = w, ch = cw / aspect;
-  if (ch > h) {
-    ch = h;
+  float cw = static_cast<float>(w), ch = cw / aspect;
+  if (ch > static_cast<float>(h)) {
+    ch = static_cast<float>(h);
     cw = ch * aspect;
   }
-  cw = std::min<float>(w, cw / zoom);
-  ch = std::min<float>(h, ch / zoom);
-  return Clamp({(w - cw) / 2, (h - ch) / 2, cw, ch}, w, h);
+  cw = std::min<float>(static_cast<float>(w), cw / zoom);
+  ch = std::min<float>(static_cast<float>(h), ch / zoom);
+  return Clamp({(static_cast<float>(w) - cw) / 2,
+                (static_cast<float>(h) - ch) / 2, cw, ch},
+               w, h);
 }
 PreparedCudaAutoFrameRect PreparedCudaAutoFrame::TargetCrop(
     const PreparedCudaAutoFrameTrackingBox &b, int w, int h, float aspect,
     const PreparedCudaAutoFrameKnobs &k) noexcept {
-  const float strength = std::clamp(k.strength, 0, 100) / 100.F;
+  const float strength =
+      static_cast<float>(std::clamp(k.strength, 0, 100)) / 100.F;
   const float pad = 2.4F - strength * 1.2F, cx = b.box.x + b.box.w * .5F;
   const float cy =
       b.box.y + b.box.h * .5F - std::clamp(k.headroom, 0.F, 1.F) * b.box.h;
@@ -329,8 +336,8 @@ PreparedCudaAutoFrameRect PreparedCudaAutoFrame::TargetCrop(
     cw = minw;
     ch = cw / aspect;
   }
-  cw = std::clamp(cw, w * .35F, float(w));
-  ch = std::clamp(ch, h * .35F, float(h));
+  cw = std::clamp(cw, static_cast<float>(w) * .35F, static_cast<float>(w));
+  ch = std::clamp(ch, static_cast<float>(h) * .35F, static_cast<float>(h));
   return Clamp({cx - cw * .5F, cy - ch * .5F, cw, ch}, w, h);
 }
 
@@ -430,13 +437,14 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
     impl_->have_smooth = false;
     impl_->last_source = out.source;
   }
-  const float aspect =
-      static_cast<float>(impl_->setup.frame_width) / impl_->setup.frame_height;
+  const float aspect = static_cast<float>(impl_->setup.frame_width) /
+                       static_cast<float>(impl_->setup.frame_height);
   auto target =
       out.found
           ? TargetCrop(ar.box, input.w, input.h, aspect, impl_->setup.knobs)
           : CenterCrop(input.w, input.h, aspect,
-                       1.F + std::clamp(impl_->setup.knobs.strength, 0, 100) /
+                       1.F + static_cast<float>(
+                                 std::clamp(impl_->setup.knobs.strength, 0, 100)) /
                                  100.F * .5F);
   impl_->smooth = impl_->have_smooth
                       ? Lerp(impl_->smooth, target,
@@ -449,14 +457,16 @@ PreparedCudaAutoFrameFrameResult PreparedCudaAutoFrame::Execute(
                                     : impl_->smooth.x + impl_->smooth.w * .5F;
   const float tracked_y = out.found ? ar.box.box.y + ar.box.box.h * .5F
                                     : impl_->smooth.y + impl_->smooth.h * .5F;
-  out.tracked_center_x = (tracked_x - impl_->smooth.x) *
-                         impl_->setup.frame_width / impl_->smooth.w;
-  out.tracked_center_y = (tracked_y - impl_->smooth.y) *
-                         impl_->setup.frame_height / impl_->smooth.h;
+  out.tracked_center_x =
+      (tracked_x - impl_->smooth.x) *
+      static_cast<float>(impl_->setup.frame_width) / impl_->smooth.w;
+  out.tracked_center_y =
+      (tracked_y - impl_->smooth.y) *
+      static_cast<float>(impl_->setup.frame_height) / impl_->smooth.h;
   const bool full = std::abs(impl_->smooth.x) <= .5F &&
                     std::abs(impl_->smooth.y) <= .5F &&
-                    std::abs(impl_->smooth.w - input.w) <= .5F &&
-                    std::abs(impl_->smooth.h - input.h) <= .5F;
+                    std::abs(impl_->smooth.w - static_cast<float>(input.w)) <= .5F &&
+                    std::abs(impl_->smooth.h - static_cast<float>(input.h)) <= .5F;
   if (full) {
     out.status = PreparedCudaAutoFrameStatus::executed;
     out.valid_input_preserved = true;
