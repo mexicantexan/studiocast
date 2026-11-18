@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/video/cpu_primitive_hal.h"
 #include "core/video/production_video_backend_manager.h"
 #include "core/video/production_video_setup_request.h"
@@ -182,7 +184,7 @@ bool Run(const Options &options, video::effects::VirtualBackgroundMode mode,
          telemetry.fallback_frames == 0;
 }
 } // namespace
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -275,4 +277,8 @@ int main(int argc, char **argv) {
     return 1;
   std::cout << "Vulkan model-backed production manager matrix passed\n";
   return 0;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

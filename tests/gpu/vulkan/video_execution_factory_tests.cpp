@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/video/video_execution_coordinator.h"
 #include "core/vulkan/production_video_backend_setup_source.h"
 #include "core/vulkan/video_execution_factory.h"
@@ -934,6 +936,8 @@ bool TestShutdownRequiresExecutorRetirementAfterFenceProof() {
                 "retained fixture cleanup must also prove executor retirement");
   delete retained;
   ok &= Require(lifetime.expired(), "proved retained fixture must release");
+  ok &= Require(!util::UnsafeNativeResourcesRetained(),
+                "injected executor refusal must not mark native retention");
   return ok;
 }
 
@@ -1006,6 +1010,8 @@ bool TestShutdownRetainsUnprovenNativeOwner() {
   delete retained_factory;
   ok &= Require(lifetime.expired(),
                 "proved fixture cleanup must release the retained factory");
+  ok &= Require(!util::UnsafeNativeResourcesRetained(),
+                "injected proof refusal must not mark native retention");
   return ok;
 }
 

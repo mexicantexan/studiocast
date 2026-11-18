@@ -8,6 +8,7 @@ set(_studiocast_util_sources
         ${PROJECT_SOURCE_DIR}/src/core/util/json.cpp
         ${PROJECT_SOURCE_DIR}/src/core/util/os_release.cpp
         ${PROJECT_SOURCE_DIR}/src/core/util/proc.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/util/process_exit.cpp
         ${PROJECT_SOURCE_DIR}/src/core/util/strings.cpp
         ${PROJECT_SOURCE_DIR}/src/core/util/xdg.cpp)
 
@@ -659,7 +660,7 @@ set(_studiocast_expected_sources
         ${_studiocast_video_backend_composition_sources}
         ${_studiocast_video_runtime_sources}
         ${_studiocast_runtime_config_sources})
-set(_studiocast_expected_source_count 158)
+set(_studiocast_expected_source_count 159)
 if (_studiocast_x86_simd)
     list(APPEND _studiocast_expected_sources
             ${_studiocast_video_support_x86_sources})

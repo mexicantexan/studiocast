@@ -1,4 +1,7 @@
 #include "core/open_video/vulkan_matting_runtime.h"
+
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/resident_command_batch.h"
 #if STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING
 #include "core/open_video/model_pack_registry.h"
@@ -174,6 +177,7 @@ void Quarantine(std::unique_ptr<Program> program) {
   static auto *programs = new std::vector<std::unique_ptr<Program>>;
   std::lock_guard lock(*mutex);
   programs->push_back(std::move(program));
+  util::MarkUnsafeNativeResourcesRetained();
 }
 class NcnnVulkanMattingRuntime final : public VulkanMattingRuntime {
 public:

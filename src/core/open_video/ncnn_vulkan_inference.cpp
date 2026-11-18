@@ -1,4 +1,7 @@
 #include "core/open_video/ncnn_vulkan_inference.h"
+
+#include "core/util/process_exit.h"
+
 #include "core/open_video/ncnn_vulkan_context_internal.h"
 #include "core/vulkan/resident_command_batch.h"
 #include "core/vulkan/vulkan_image.h"
@@ -328,6 +331,7 @@ NcnnVulkanInference::~NcnnVulkanInference() {
     static auto *owners = new std::vector<std::unique_ptr<Impl>>;
     std::lock_guard lock(*mutex);
     owners->push_back(std::move(impl_));
+    util::MarkUnsafeNativeResourcesRetained();
   }
 #endif
 }

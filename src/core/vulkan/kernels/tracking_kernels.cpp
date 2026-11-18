@@ -1,5 +1,7 @@
 #include "core/vulkan/kernels/tracking_kernels.h"
 
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/kernels/shaders/dlib_predictor_spv.h"
 #include "core/vulkan/kernels/shaders/eye_contact_spv.h"
 #include "core/vulkan/kernels/shaders/tracking_spv.h"
@@ -26,8 +28,10 @@ struct TrackingKernels::Impl {
 
 TrackingKernels::TrackingKernels() : impl_(std::make_unique<Impl>()) {}
 TrackingKernels::~TrackingKernels() {
-  if (!Shutdown(nullptr))
+  if (!Shutdown(nullptr)) {
+    util::MarkUnsafeNativeResourcesRetained();
     (void)impl_.release();
+  }
 }
 bool TrackingKernels::Prepare(VulkanDevice *device, bool enable_dlib,
                               std::size_t command_capacity,

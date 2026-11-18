@@ -2,6 +2,7 @@
 
 #include "core/video/replace_background_cache_policy.h"
 #include "core/vulkan/video_execution_factory.h"
+#include "core/vulkan/video_execution_factory_internal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -123,6 +124,8 @@ public:
     if (shutdown_.pending) {
       // The setup lease already made its final bounded attempt. Retain the
       // complete factory, adapter, graph, context, queue, and buffers.
+      if (factory_)
+        MarkPermanentlyRetainedVulkanFactory(*factory_);
       (void)factory_.release();
     }
   }

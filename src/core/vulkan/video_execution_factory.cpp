@@ -1,4 +1,7 @@
 #include "core/vulkan/video_execution_factory.h"
+
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/hal_resident_adapter.h"
 #include "core/vulkan/video_execution_factory_internal.h"
 
@@ -1148,6 +1151,7 @@ struct VulkanVideoExecutionFactory::Impl {
                        (!shutdown_complete && !TryShutdownProduction()))) {
       // Native completion or child retirement is unproven. Retain the entire
       // island without retrying an earlier refused shutdown in destruction.
+      util::MarkUnsafeNativeResourcesRetained();
       (void)production.release();
       return;
     }
@@ -1173,6 +1177,16 @@ VulkanVideoExecutionFactory::VulkanVideoExecutionFactory(
 }
 
 VulkanVideoExecutionFactory::~VulkanVideoExecutionFactory() = default;
+
+void MarkPermanentlyRetainedVulkanFactory(
+    const VulkanVideoExecutionFactory &factory) noexcept {
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  if (factory.impl_->production)
+    util::MarkUnsafeNativeResourcesRetained();
+#else
+  (void)factory;
+#endif
+}
 
 bool CollectProductionVulkanModelDiagnostics(
     const VulkanVideoExecutionFactory &factory,

@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "vulkan_effects_smoke_allocations.h"
 
 #include "core/open_video/model_pack_registry.h"
@@ -1095,7 +1097,7 @@ bool UnsafeTimeoutRetirement(const Options &options, bool full = false,
 }
 } // namespace
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   Options options;
   if (!Parse(argc, argv, &options)) {
     std::cerr << "FAIL invalid or incomplete smoke arguments\n";
@@ -1200,4 +1202,8 @@ int main(int argc, char **argv) {
             << options.prepare_only
             << " camera_quality_vendor_qualification=not_claimed\n";
   return 0;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

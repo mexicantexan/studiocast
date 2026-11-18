@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1027,7 +1029,7 @@ void PrintCsv(const Options &opts, const ResolvedModel &model,
 
 } // namespace
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   Options opts;
   std::string error;
   if (!ParseArgs(argc, argv, &opts, &error)) {
@@ -1129,4 +1131,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   return 0;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

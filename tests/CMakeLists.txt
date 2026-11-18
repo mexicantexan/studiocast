@@ -26,6 +26,16 @@ elseif (BUILD_TESTING)
     message(STATUS "Skipping studiocast-audio-tests because libpulse-simple was not found.")
 endif()
 if (BUILD_TESTING)
+    add_executable(studiocast-process-exit-test-child
+            ${PROJECT_SOURCE_DIR}/tests/unit/core/process_exit_test_child.cpp)
+    target_link_libraries(studiocast-process-exit-test-child PRIVATE studiocast_util)
+    target_include_directories(studiocast-process-exit-test-child PRIVATE
+            "${PROJECT_SOURCE_DIR}/src")
+    studiocast_set_project_warnings(studiocast-process-exit-test-child)
+    studiocast_enable_sanitizers(studiocast-process-exit-test-child)
+    set_target_properties(studiocast-process-exit-test-child PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
     add_executable(studiocast-vulkan-effects-smoke-allocation-tests
             ${PROJECT_SOURCE_DIR}/tests/gpu/vulkan/vulkan_effects_smoke_allocation_tests.cpp)
     target_include_directories(studiocast-vulkan-effects-smoke-allocation-tests PRIVATE
@@ -710,6 +720,12 @@ if (BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
+        add_test(NAME studiocast-process-exit-tests
+                COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/unit/core/process_exit_tests.py
+                $<TARGET_FILE:studiocast-process-exit-test-child>)
+        studiocast_set_test_labels(studiocast-process-exit-tests unit core)
+        set_tests_properties(studiocast-process-exit-tests PROPERTIES TIMEOUT 30)
         add_test(NAME studiocast-embedded-ptx-freshness
                 COMMAND "${Python3_EXECUTABLE}"
                         "${PROJECT_SOURCE_DIR}/tests/gpu/cuda/validate_embedded_ptx.py"

@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -3927,7 +3929,7 @@ AppendWarningsToObjectJson(const std::string &objJson,
 
 } // namespace
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
 
@@ -4719,4 +4721,8 @@ int main(int argc, char **argv) {
   svc.Stop();
   audioSvc.Stop();
   return 0;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

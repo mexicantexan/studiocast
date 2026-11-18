@@ -1,5 +1,7 @@
 #include "core/open_video/prepared_vulkan_fastdvdnet.h"
 
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/kernels/shaders/fastdvdnet_spv.h"
 #include "core/vulkan/vulkan_tensor.h"
 
@@ -229,8 +231,10 @@ struct PreparedVulkanFastDvdnet::Impl {
 PreparedVulkanFastDvdnet::PreparedVulkanFastDvdnet()
     : impl_(std::make_unique<Impl>()) {}
 PreparedVulkanFastDvdnet::~PreparedVulkanFastDvdnet() {
-  if (!Shutdown(nullptr))
+  if (!Shutdown(nullptr)) {
+    util::MarkUnsafeNativeResourcesRetained();
     (void)impl_.release();
+  }
 }
 
 std::uint32_t

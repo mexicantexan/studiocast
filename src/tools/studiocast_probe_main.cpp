@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -4323,7 +4325,7 @@ int RunSelfTest(const SelfTestOptions &self_test_options) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   if (hasArg(argc, argv, "--self-test")) {
     return RunSelfTest(ParseSelfTestOptions(argc, argv));
   }
@@ -4347,4 +4349,8 @@ int main(int argc, char **argv) {
   if (!strict)
     return 0;
   return report.AllChecksPassed() ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

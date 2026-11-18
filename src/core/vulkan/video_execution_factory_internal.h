@@ -12,6 +12,10 @@
 
 namespace studiocast::vulkan {
 class VulkanVideoExecutionFactory;
+// Called only as the lease permanently abandons a failed factory. Injected
+// hermetic factories have no native island and must not change process policy.
+void MarkPermanentlyRetainedVulkanFactory(
+    const VulkanVideoExecutionFactory &) noexcept;
 struct VulkanProductionModelDiagnostics {
   OpenVulkanDiagnostics device;
   VulkanAllocationStats allocations;

@@ -92,6 +92,8 @@ public:
 
 private:
   friend struct VulkanProductionTesting;
+  friend void MarkPermanentlyRetainedVulkanFactory(
+      const VulkanVideoExecutionFactory &) noexcept;
   friend bool
   CollectProductionVulkanModelDiagnostics(const VulkanVideoExecutionFactory &,
                                           VulkanProductionModelDiagnostics *,

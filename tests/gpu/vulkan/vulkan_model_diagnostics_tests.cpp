@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/vulkan_device.h"
 
 #include <algorithm>
@@ -5,7 +7,7 @@
 #include <iostream>
 #include <string>
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   const bool without_landmarks =
       argc == 2 && std::string(argv[1]) == "--without-landmarks";
   if (argc != 1 && !without_landmarks)
@@ -114,4 +116,8 @@ int main(int argc, char **argv) {
             << d.video_noise_removal_dispatch_count << '/'
             << d.auto_frame_dispatch_count << '\n';
   return 0;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

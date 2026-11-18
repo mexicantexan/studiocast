@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/cuda/cuda_image.h"
 #include "core/cuda/kernels/resize_bilinear.h"
 #include "core/cuda/cuda_driver_api.h"
@@ -339,7 +341,7 @@ bool BenchVulkan(const Options &opts, const Case &c, bool csv) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   Options opts;
   if (!ParseArgs(argc, argv, &opts)) {
     PrintUsage(argv[0]);
@@ -364,4 +366,8 @@ int main(int argc, char **argv) {
     ok = BenchVulkan(opts, c, opts.csv) && ok;
   }
   return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

@@ -1,5 +1,7 @@
 #include "core/vulkan/vulkan_device.h"
 
+#include "core/util/process_exit.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -320,6 +322,8 @@ VulkanContextState::~VulkanContextState() {
   if (!loader)
     return;
   if (!SafeToDestroyChildren()) {
+    if (device)
+      util::MarkUnsafeNativeResourcesRetained();
     QuarantineUnsafeContextLoader(std::move(loader));
     if (native_owner)
       QuarantineUnsafeContextLoader(std::move(native_owner));

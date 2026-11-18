@@ -1,5 +1,7 @@
 #include "core/vulkan/resident_command_batch.h"
 
+#include "core/util/process_exit.h"
+
 #include <array>
 #include <atomic>
 #include <thread>
@@ -64,6 +66,7 @@ ResidentCommandBatch::~ResidentCommandBatch() {
     // The factory also retains participant Impls. Never destroy the exact
     // context/callback ledger merely because its outer wrapper is destroyed.
     (void)impl_.release();
+    util::MarkUnsafeNativeResourcesRetained();
   }
 }
 

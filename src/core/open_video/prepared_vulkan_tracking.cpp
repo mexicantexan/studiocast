@@ -1,5 +1,7 @@
 #include "core/open_video/prepared_vulkan_tracking.h"
 
+#include "core/util/process_exit.h"
+
 #include "core/vulkan/kernels/tracking_kernels.h"
 #include "core/vulkan/resident_command_batch.h"
 
@@ -207,8 +209,10 @@ struct PreparedVulkanTracking::Impl {
 PreparedVulkanTracking::PreparedVulkanTracking()
     : impl_(std::make_unique<Impl>()) {}
 PreparedVulkanTracking::~PreparedVulkanTracking() {
-  if (!Shutdown(nullptr))
+  if (!Shutdown(nullptr)) {
+    util::MarkUnsafeNativeResourcesRetained();
     (void)impl_.release();
+  }
 }
 
 bool PreparedVulkanTracking::Prepare(const PreparedVulkanTrackingSetup &s,
