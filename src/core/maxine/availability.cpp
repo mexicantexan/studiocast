@@ -30,7 +30,7 @@ std::string PrettyPathForCopy(const fs::path &p) {
   if (home && *home) {
     const std::string h(home);
     if (s.rfind(h, 0) == 0) {
-      return "~" + s.substr(h.size());
+      return std::string("~").append(s, h.size(), std::string::npos);
     }
   }
   return s;
