@@ -140,7 +140,7 @@ struct FakeCrop final : IPreparedCudaAutoFrameCropRuntime {
   bool Prepare(const PreparedCudaAutoFrameBinding &, int w, int h, std::size_t,
                std::string *error) noexcept override {
     output.ptr = 0x9000;
-    output.pitch = w * 3;
+    output.pitch = static_cast<std::size_t>(w * 3);
     output.w = w;
     output.h = h;
     output.format = cuda::PixelFormatGpu::rgb_u8;
@@ -428,7 +428,7 @@ bool MatteBoxReference() {
   std::vector<float> alpha(20 * 20);
   for (int y = 4; y < 16; ++y)
     for (int x = 5; x < 15; ++x)
-      alpha[y * 20 + x] = 1;
+      alpha[static_cast<std::size_t>(y * 20 + x)] = 1;
   PreparedCudaAutoFrameTrackingBox b;
   bool ok = Check(PreparedCudaAutoFrameMatteAdapter::ComputeBox(
                       alpha.data(), 20, 20, 200, 100, &b) &&
