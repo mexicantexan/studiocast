@@ -322,7 +322,8 @@ VulkanContextState::~VulkanContextState() {
   if (!loader)
     return;
   if (!SafeToDestroyChildren()) {
-    if (device)
+    // Hermetic function-table contexts own no runtime to finalize.
+    if (device && loader->IsLoaded())
       util::MarkUnsafeNativeResourcesRetained();
     QuarantineUnsafeContextLoader(std::move(loader));
     if (native_owner)

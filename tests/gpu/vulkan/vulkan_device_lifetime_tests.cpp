@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/vulkan/vulkan_device.h"
 #include "core/vulkan/video_execution_factory.h"
@@ -316,6 +318,24 @@ bool CheckShutdownLifetime(bool retain_external_owner) {
   return true;
 }
 
+bool CheckPureFakeRetentionDoesNotChangeProcessExit() {
+  using namespace studiocast::vulkan;
+  std::weak_ptr<VulkanLoader> witness;
+  {
+    auto context = std::make_shared<detail::VulkanContextState>();
+    context->loader = std::make_shared<VulkanLoader>();
+    witness = context->loader;
+    context->device = reinterpret_cast<VkDevice>(1);
+    context->health.health = VulkanContextHealth::unsafe_timeout;
+    context->health.poisoned = true;
+    context->health.submitted_serial = 1;
+    // This table owns no dynamic library or adopted runtime. Its actual
+    // permanent retention must not select the native-driver exit policy.
+  }
+  return !witness.expired() &&
+         !studiocast::util::UnsafeNativeResourcesRetained();
+}
+
 bool CheckAggregateReservations() {
   using namespace studiocast::vulkan;
   auto context = std::make_shared<detail::VulkanContextState>();
@@ -380,7 +400,8 @@ int main() {
               << " failed=" << failed << " exact=" << exact
               << " persistent=" << persistent << '\n';
   return unique && retained && CheckAggregateReservations() && late && failed &&
-                 exact && persistent
+                 exact && persistent &&
+                 CheckPureFakeRetentionDoesNotChangeProcessExit()
              ? 0
              : 1;
 }
