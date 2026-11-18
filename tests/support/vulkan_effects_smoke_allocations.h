@@ -14,6 +14,11 @@ void CountAllocation() noexcept {
   if (count_allocations.load(std::memory_order_relaxed))
     allocations.fetch_add(1, std::memory_order_relaxed);
 }
+// GCC 12 otherwise diagnoses these malloc-backed global replacements as
+// mismatched new/delete after inlining. ASan still observes the actual free.
+[[gnu::noinline]] void FreeAllocation(void *memory) noexcept {
+  std::free(memory);
+}
 } // namespace
 void *operator new(std::size_t size) {
   CountAllocation();
@@ -22,11 +27,13 @@ void *operator new(std::size_t size) {
   throw std::bad_alloc();
 }
 void *operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void *memory) noexcept { std::free(memory); }
-void operator delete[](void *memory) noexcept { std::free(memory); }
-void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete(void *memory) noexcept { FreeAllocation(memory); }
+void operator delete[](void *memory) noexcept { FreeAllocation(memory); }
+void operator delete(void *memory, std::size_t) noexcept {
+  FreeAllocation(memory);
+}
 void operator delete[](void *memory, std::size_t) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void *operator new(std::size_t size, std::align_val_t alignment) {
   CountAllocation();
@@ -40,16 +47,16 @@ void *operator new[](std::size_t size, std::align_val_t alignment) {
   return ::operator new(size, alignment);
 }
 void operator delete(void *memory, std::align_val_t) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete[](void *memory, std::align_val_t) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete(void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete[](void *memory, std::size_t, std::align_val_t) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 
 // Replace the nothrow family too: sanitizer/runtime defaults may otherwise
@@ -77,16 +84,16 @@ void *operator new[](std::size_t size, std::align_val_t alignment,
   return ::operator new(size, alignment, std::nothrow);
 }
 void operator delete(void *memory, const std::nothrow_t &) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete[](void *memory, const std::nothrow_t &) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete(void *memory, std::align_val_t,
                      const std::nothrow_t &) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
 void operator delete[](void *memory, std::align_val_t,
                        const std::nothrow_t &) noexcept {
-  std::free(memory);
+  FreeAllocation(memory);
 }
