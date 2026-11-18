@@ -1090,7 +1090,7 @@ struct VulkanVideoExecutionFactory::Impl {
 
   void DiscardFailedProduction() noexcept {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
-    if (!NativeQuiescenceProven()) {
+    if (!TryShutdownProduction()) {
       status = StatusId::quarantined;
       reason =
           production && production->kernels.device()->health_state().health ==
@@ -1107,6 +1107,24 @@ struct VulkanVideoExecutionFactory::Impl {
 
   std::uint64_t shutdown_attempts = 0;
   bool shutdown_complete = false;
+  bool production_shutdown_refused = false;
+
+  bool TryShutdownProduction() noexcept {
+    bool retired = true;
+    if (injected && configuration.injected_executor_shutdown)
+      retired = configuration.injected_executor_shutdown(
+          configuration.injected_shutdown_context);
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+    if (production) {
+      retired = NativeQuiescenceProven() &&
+                (!production->executor || production->executor->TryShutdown());
+      if (retired && production->adapter)
+        production->adapter->Shutdown();
+    }
+#endif
+    production_shutdown_refused = !retired;
+    return retired;
+  }
 
   bool NativeQuiescenceProven() const noexcept {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
@@ -1124,15 +1142,14 @@ struct VulkanVideoExecutionFactory::Impl {
 
   ~Impl() {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
-    if (production && !NativeQuiescenceProven()) {
-      // Completion is unproven. Retain the entire native island for process
-      // lifetime; destroying an uncertain queue's resources is unsafe.
+    if (production && (production_shutdown_refused ||
+                       (!shutdown_complete && !TryShutdownProduction()))) {
+      // Native completion or child retirement is unproven. Retain the entire
+      // island without retrying an earlier refused shutdown in destruction.
       (void)production.release();
       return;
     }
     if (production) {
-      if (production->adapter)
-        production->adapter->Shutdown();
       production->adapter.reset();
       production->executor.reset();
       production->kernels.Shutdown();
@@ -1494,14 +1511,12 @@ VulkanVideoExecutionFactory::RequestShutdown() noexcept {
       if (!impl_->NativeQuiescenceProven() && impl_->production)
         (void)impl_->production->kernels.device()
             ->TryProvePendingSubmissionQuiescence(nullptr);
-      if (impl_->NativeQuiescenceProven() && impl_->production &&
-          impl_->production->executor &&
-          !impl_->production->executor->RetireFailedFrameAfterQuiescence())
-        proof = StatusId::quarantined;
 #endif
       if (!impl_->NativeQuiescenceProven())
         proof = StatusId::quarantined;
     }
+    if (proof == StatusId::ready && !impl_->TryShutdownProduction())
+      proof = StatusId::quarantined;
   }
   if (proof != StatusId::ready) {
     result.status = StatusId::quarantined;
@@ -1515,14 +1530,6 @@ VulkanVideoExecutionFactory::RequestShutdown() noexcept {
     result.pending = true;
     return result;
   }
-#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
-  if (impl_->production) {
-    if (impl_->production->adapter)
-      impl_->production->adapter->Shutdown();
-    if (impl_->production->executor)
-      impl_->production->executor->Shutdown();
-  }
-#endif
   impl_->shutdown_complete = true;
   result.status = StatusId::stopped;
   result.reason = ReasonId::shutdown_requested;

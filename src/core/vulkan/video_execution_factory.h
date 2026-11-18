@@ -42,6 +42,8 @@ struct VulkanVideoExecutionFactoryConfiguration {
   // Hermetic injected-constructor seam; production ignores these callbacks.
   hal::StatusId (*injected_shutdown_probe)(void *) noexcept = nullptr;
   void *injected_shutdown_context = nullptr;
+  // Separate post-fence child-retirement gate; production uses TryShutdown.
+  bool (*injected_executor_shutdown)(void *) noexcept = nullptr;
 };
 
 class VulkanVideoExecutionFactory final : public video::IVideoAdapterFactory {

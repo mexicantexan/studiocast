@@ -1477,15 +1477,19 @@ void QualifiedFinalResidentExecutor::DestroyPrepared(
 }
 
 void QualifiedFinalResidentExecutor::Shutdown() noexcept {
+  (void)TryShutdown();
+}
+
+bool QualifiedFinalResidentExecutor::TryShutdown() noexcept {
   if (shutdown_)
-    return;
+    return true;
   if (!RetireFailedFrameAfterQuiescence())
-    return;
+    return false;
   if (model_effects_) {
     auto &m = *model_effects_;
     if (!m.denoise.Shutdown(nullptr) || !m.tracking.Shutdown(nullptr) ||
         !m.face.Shutdown() || !m.left.Shutdown() || !m.right.Shutdown())
-      return;
+      return false;
     model_effects_.reset();
   }
   for (auto &slot : slots_)
@@ -1493,6 +1497,7 @@ void QualifiedFinalResidentExecutor::Shutdown() noexcept {
   matting_.reset();
   matting_alpha_.Free();
   shutdown_ = true;
+  return true;
 }
 
 bool QualifiedFinalResidentExecutor::

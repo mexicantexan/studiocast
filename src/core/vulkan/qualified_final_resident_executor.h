@@ -65,6 +65,8 @@ public:
   void
   DestroyPrepared(VulkanExecutorPreparedProgram *prepared) noexcept override;
   void Shutdown() noexcept override;
+  // Release proof includes callback retirement and every model child's shutdown.
+  [[nodiscard]] bool TryShutdown() noexcept;
 
 private:
   struct Slot {

@@ -821,6 +821,76 @@ bool TestFactoryRejectsIncompleteAndDuplicateModelProofs() {
   return ok;
 }
 
+bool TestShutdownRequiresExecutorRetirementAfterFenceProof() {
+  FakeVulkanAdapter adapter;
+  struct Gates {
+    bool retired = false;
+    unsigned fence_calls = 0, executor_calls = 0;
+  } gates;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &gates;
+  configuration.injected_shutdown_probe = [](void *context) noexcept {
+    ++static_cast<Gates *>(context)->fence_calls;
+    return hal::StatusId::ready;
+  };
+  configuration.injected_executor_shutdown = [](void *context) noexcept {
+    auto &state = *static_cast<Gates *>(context);
+    ++state.executor_calls;
+    return state.retired;
+  };
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  std::weak_ptr<const video::effects::BroadcastCameraEffects> lifetime =
+      configuration.effects;
+  auto factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  configuration.effects.reset();
+  auto owner =
+      vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto refused = owner->RequestShutdown();
+  bool ok = Require(gates.fence_calls == 1 && gates.executor_calls == 1 &&
+                        refused.status == hal::StatusId::quarantined &&
+                        refused.reason == hal::ReasonId::synchronization_failed &&
+                        refused.pending && !refused.quiescent &&
+                        !refused.driver_context_release_permitted &&
+                        !lifetime.expired(),
+                    "successful fence proof must not waive refused executor "
+                    "retirement or release its owner");
+  gates.retired = true;
+  const auto completed = owner->RequestShutdown();
+  const auto repeated = owner->RequestShutdown();
+  ok &= Require(completed.quiescent &&
+                    completed.driver_context_release_permitted &&
+                    repeated.driver_context_release_permitted &&
+                    gates.fence_calls == 2 && gates.executor_calls == 2,
+                "explicit retry must retire executor once; completed shutdown "
+                "must be idempotent");
+  owner.reset();
+  ok &= Require(lifetime.expired(), "retired executor owner must be released");
+  gates.retired = false;
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  lifetime = configuration.effects;
+  factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  auto *retained = factory.get();
+  configuration.effects.reset();
+  owner = vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto pending = owner->RequestShutdown();
+  const auto calls = gates.executor_calls;
+  owner.reset();
+  ok &= Require(pending.pending && !lifetime.expired() &&
+                    gates.executor_calls == calls,
+                "destruction after refused executor retirement must retain "
+                "the complete owner without another attempt");
+  gates.retired = true;
+  ok &= Require(retained->RequestShutdown().driver_context_release_permitted,
+                "retained fixture cleanup must also prove executor retirement");
+  delete retained;
+  ok &= Require(lifetime.expired(), "proved retained fixture must release");
+  return ok;
+}
+
 bool TestShutdownRetainsUnprovenNativeOwner() {
   FakeVulkanAdapter adapter;
   bool safe = false;
@@ -1509,6 +1579,7 @@ int main() {
   ok &= TestAllModelProgramContract();
   ok &= TestFactoryRejectsIncompleteAndDuplicateModelProofs();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
+  ok &= TestShutdownRequiresExecutorRetirementAfterFenceProof();
   ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
   ok &= TestUnavailableOptionalStageIsolation();

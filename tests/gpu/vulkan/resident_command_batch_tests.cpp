@@ -1,5 +1,6 @@
 #include "core/vulkan/kernels/utility_kernels.h"
 #include "core/vulkan/resident_command_batch.h"
+#include "core/vulkan/qualified_final_resident_executor.h"
 
 #include <array>
 #include <iostream>
@@ -239,9 +240,17 @@ bool CheckDeferredSlots() {
                 "unsafe completion retains utility callback owners and slots");
   context->health.health = VulkanContextHealth::fatal_submission_error;
   context->health.completed_serial = context->health.submitted_serial;
+  QualifiedFinalResidentExecutor executor(77, utility);
+  ok &= Require(device->SafeToDestroyResources() &&
+                    !executor.TryShutdown() && utility.deferred_frame_active(),
+                "global fence proof cannot waive actual deferred callback "
+                "retirement in checked executor shutdown");
   ok &= Require(batch.RetireAfterQuiescence(&error),
                 "retire unsafe utility slots");
   utility.EndDeferredFrame();
+  ok &= Require(executor.TryShutdown() && executor.TryShutdown(),
+                "checked executor shutdown succeeds idempotently after "
+                "callback retirement");
   return ok;
 }
 } // namespace
