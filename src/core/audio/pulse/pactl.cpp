@@ -123,7 +123,8 @@ std::string BuildLoadModuleCommand(const std::string &module,
                                    const std::vector<std::string> &args) {
   std::string cmd = "pactl load-module " + ShellQuoteSingle(module);
   for (const auto &arg : args) {
-    cmd += " " + ShellQuoteSingle(arg);
+    cmd.push_back(' ');
+    cmd += ShellQuoteSingle(arg);
   }
   cmd += " 2>&1";
   return cmd;
@@ -555,8 +556,10 @@ bool UpdateSinkProplist(const std::string &sink_name_or_index,
 
   std::string cmd =
       "pactl update-sink-proplist " + ShellQuoteSingle(sink_name_or_index);
-  for (const auto &kv : kv_pairs)
-    cmd += " " + ShellQuoteSingle(kv);
+  for (const auto &kv : kv_pairs) {
+    cmd.push_back(' ');
+    cmd += ShellQuoteSingle(kv);
+  }
   cmd += " 2>&1";
 
   auto res = RunPactlCommand(cmd);
@@ -578,8 +581,10 @@ bool UpdateSourceProplist(const std::string &source_name_or_index,
 
   std::string cmd =
       "pactl update-source-proplist " + ShellQuoteSingle(source_name_or_index);
-  for (const auto &kv : kv_pairs)
-    cmd += " " + ShellQuoteSingle(kv);
+  for (const auto &kv : kv_pairs) {
+    cmd.push_back(' ');
+    cmd += ShellQuoteSingle(kv);
+  }
   cmd += " 2>&1";
 
   auto res = RunPactlCommand(cmd);

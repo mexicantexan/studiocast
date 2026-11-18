@@ -79,8 +79,9 @@ bool TestAuditCoversCanonicalEffects() {
                                std::string(row.status) + " |";
     ok &= Require(Contains(audit, prefix),
                   "audit row/status missing for " + std::string(row.effect_id));
-    ok &= Require(Contains(audit, "`" + std::string(row.reason_code) + "`"),
-                  "audit reason missing for " + std::string(row.effect_id));
+    ok &= Require(
+        Contains(audit, std::string("`").append(row.reason_code).append("`")),
+        "audit reason missing for " + std::string(row.effect_id));
   }
   ok &= Require(ids.size() == kExpectedCapabilities.size(),
                 "capability matrix must cover exactly nine effects");
