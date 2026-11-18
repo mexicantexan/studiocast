@@ -926,8 +926,8 @@ bool ParseNcnnVulkanNetworks(const util::json::Value::Object &root,
   if (!array || array->empty() || array->size() > 2)
     return Fail(error,
                 "ncnn_vulkan_networks requires one main or two eye graphs");
-  for (const auto &value : *array) {
-    const auto *o = AsObject(value, error, "ncnn_vulkan_networks entry");
+  for (const auto &entry : *array) {
+    const auto *o = AsObject(entry, error, "ncnn_vulkan_networks entry");
     if (!o)
       return false;
     NcnnVulkanNetworkSpec s;
