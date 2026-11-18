@@ -37,5 +37,19 @@ bool CollectProductionVulkanModelDiagnostics(
 struct VulkanProductionTesting {
   static bool InjectNextSubmissionTimeout(VulkanVideoExecutionFactory &,
                                           std::string *error);
+  struct RetentionWitness {
+    std::weak_ptr<const void> configuration;
+    std::weak_ptr<const void> context;
+  };
+  // Isolated process only: the actual next submission times out synthetically,
+  // and every shutdown fence proof remains denied through normal process exit.
+  // Neither witness keeps its owner alive. No driver/global dispatch is changed.
+  static bool InjectPersistentRetirementTimeout(VulkanVideoExecutionFactory &,
+                                               RetentionWitness *,
+                                               std::string *error);
+
+private:
+  friend struct VulkanProductionTestingAccess;
+  static void OverrideFenceWait(detail::VulkanContextState &);
 };
 } // namespace studiocast::vulkan

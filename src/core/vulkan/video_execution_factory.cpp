@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
 #include <utility>
@@ -1224,6 +1225,49 @@ bool VulkanProductionTesting::InjectNextSubmissionTimeout(
 #endif
   if (error)
     *error = "Timeout injection requires a quiescent initialized native owner.";
+  return false;
+}
+
+void VulkanProductionTesting::OverrideFenceWait(
+    detail::VulkanContextState &context) {
+  context.f().vkWaitForFences = [](VkDevice, std::uint32_t, const VkFence *,
+                                   VkBool32, std::uint64_t) -> VkResult {
+    return VK_TIMEOUT;
+  };
+}
+
+bool VulkanProductionTesting::InjectPersistentRetirementTimeout(
+    VulkanVideoExecutionFactory &factory, RetentionWitness *witness,
+    std::string *error) {
+  if (error)
+    error->clear();
+  if (witness)
+    *witness = {};
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  auto &p = *factory.impl_;
+  if (witness && p.configuration.effects && p.production) {
+    auto *device = p.production->kernels.device();
+    auto context = std::static_pointer_cast<detail::VulkanContextState>(
+        device->RetainContext());
+    if (context && context->loader && context->f().vkWaitForFences &&
+        context->identity == device->context_identity() &&
+        InjectNextSubmissionTimeout(factory, error)) {
+      // Every VulkanDevice constructs its own loader/function table. Keep the
+      // override on this exact prepared owner's table; ncnn/global loader state
+      // and other factories remain untouched. The next vkQueueSubmit is real.
+      std::lock_guard<std::mutex> lock(context->submission_mutex);
+      OverrideFenceWait(*context);
+      witness->configuration = p.configuration.effects;
+      witness->context = context;
+      return true;
+    }
+  }
+#else
+  (void)factory;
+#endif
+  if (error)
+    *error = "Persistent timeout injection requires one quiescent native owner "
+             "and weak retention witnesses.";
   return false;
 }
 

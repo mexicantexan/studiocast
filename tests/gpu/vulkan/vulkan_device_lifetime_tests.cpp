@@ -1,5 +1,7 @@
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/vulkan/vulkan_device.h"
+#include "core/vulkan/video_execution_factory.h"
+#include "core/vulkan/video_execution_factory_internal.h"
 
 #include <algorithm>
 #include <iostream>
@@ -28,6 +30,14 @@ struct VulkanDeviceTestAccess {
 };
 
 } // namespace studiocast::vulkan::detail
+
+namespace studiocast::vulkan {
+struct VulkanProductionTestingAccess {
+  static void OverrideFenceWait(detail::VulkanContextState &context) {
+    VulkanProductionTesting::OverrideFenceWait(context);
+  }
+};
+} // namespace studiocast::vulkan
 
 namespace {
 
@@ -113,6 +123,51 @@ struct RetirementDriver {
            context->health.poisoned && !device.SafeToDestroyResources();
   }
 };
+
+bool CheckPersistentRetirementTimeoutScope() {
+  VulkanVideoExecutionFactory uninitialized;
+  auto unrelated = std::make_shared<int>(1);
+  VulkanProductionTesting::RetentionWitness witness;
+  witness.configuration = unrelated;
+  witness.context = unrelated;
+  std::string error;
+  if (VulkanProductionTesting::InjectPersistentRetirementTimeout(
+          uninitialized, &witness, &error) ||
+      !witness.configuration.expired() || !witness.context.expired() ||
+      error.empty() ||
+      VulkanProductionTesting::InjectPersistentRetirementTimeout(
+          uninitialized, nullptr, &error))
+    return false;
+  RetirementDriver first;
+  first.device.InjectNextSubmissionResultForTesting(
+      VulkanSubmissionPhase::wait_for_fence, VK_TIMEOUT);
+  if (!first.Timeout() || first.submits != 1 || first.waits != 0)
+    return false;
+  const auto original = first.context->f().vkWaitForFences;
+  VulkanProductionTestingAccess::OverrideFenceWait(*first.context);
+  first.next_wait = VK_SUCCESS;
+  if (first.device.TryProvePendingSubmissionQuiescence(&error) ||
+      first.device.TryProvePendingSubmissionQuiescence(&error) ||
+      first.device.SafeToDestroyResources() || first.waits != 0 ||
+      first.context->health.completed_serial != 0)
+    return false;
+  {
+    RetirementDriver other;
+    if (other.context->loader == first.context->loader ||
+        other.context->f().vkWaitForFences != original || !other.Timeout())
+      return false;
+    other.next_wait = VK_SUCCESS;
+    if (!other.device.TryProvePendingSubmissionQuiescence(&error) ||
+        !other.device.SafeToDestroyResources() || other.waits != 2)
+      return false;
+  }
+  RetirementDriver::active = &first;
+  // Only a fake-context fixture restores this pointer, to avoid intentional
+  // quarantine leaks under sanitizers. The native opt-in process never does.
+  first.context->f().vkWaitForFences = original;
+  return first.device.TryProvePendingSubmissionQuiescence(&error) &&
+         first.waits == 1 && first.device.SafeToDestroyResources();
+}
 
 bool CheckLateSubmissionProof() {
   RetirementDriver s;
@@ -319,11 +374,13 @@ int main() {
   const bool late = CheckLateSubmissionProof();
   const bool failed = CheckFailedSubmissionProofs();
   const bool exact = CheckExactSubmissionProofs();
-  if (!late || !failed || !exact)
+  const bool persistent = CheckPersistentRetirementTimeoutScope();
+  if (!late || !failed || !exact || !persistent)
     std::cerr << "Pending-submission retirement proof regression: late=" << late
-              << " failed=" << failed << " exact=" << exact << '\n';
+              << " failed=" << failed << " exact=" << exact
+              << " persistent=" << persistent << '\n';
   return unique && retained && CheckAggregateReservations() && late && failed &&
-                 exact
+                 exact && persistent
              ? 0
              : 1;
 }
