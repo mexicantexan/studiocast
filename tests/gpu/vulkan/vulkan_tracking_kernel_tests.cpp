@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/open_video/dlib_shape_predictor_data.h"
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/prepared_cuda_auto_frame.h"
@@ -939,7 +941,7 @@ void EyeCompositeOracle(Runner &r) {
                "includingoverlap/invalidcrops/zero/intermediatestrength\n";
 }
 } // namespace
-int main() {
+static int RunMain() {
   const auto *required = std::getenv("STUDIOCAST_REQUIRE_VULKAN_TRACKING");
   if (!required || std::strcmp(required, "1") != 0) {
     std::cout << "SKIP: opt-in resident tracking kernels\n";
@@ -986,3 +988,5 @@ int main() {
     return 1;
   }
 }
+
+int main() { return studiocast::util::FinalizeProcessExit(RunMain()); }

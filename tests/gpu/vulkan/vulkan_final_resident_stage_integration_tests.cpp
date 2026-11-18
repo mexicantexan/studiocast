@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -951,7 +953,7 @@ bool RunOrderingAndIsolationCases(UtilityKernels *kernels) {
 
 } // namespace
 
-int main() {
+static int RunMain() {
   UtilityKernels kernels;
   std::string error;
   if (!kernels.Initialize(&error))
@@ -974,3 +976,5 @@ int main() {
     std::cout << "Open Vulkan final resident production-path tests passed\n";
   return ok ? 0 : 1;
 }
+
+int main() { return studiocast::util::FinalizeProcessExit(RunMain()); }

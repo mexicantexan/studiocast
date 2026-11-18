@@ -1,3 +1,5 @@
+#include "core/util/process_exit.h"
+
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_inference.h"
 #include "core/util/json.h"
@@ -396,7 +398,7 @@ bool RunModel(vk::VulkanDevice &device, const fs::path &root,
   return true;
 }
 } // namespace
-int main(int argc, char **argv) {
+static int RunMain(int argc, char **argv) {
   if (argc != 2) {
     std::cout << "SKIP: pass offline candidate root\n";
     return 77;
@@ -452,4 +454,8 @@ int main(int argc, char **argv) {
   device.Shutdown();
   ncnn::studiocast_release_gpu_instance();
   return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  return studiocast::util::FinalizeProcessExit(RunMain(argc, argv));
 }

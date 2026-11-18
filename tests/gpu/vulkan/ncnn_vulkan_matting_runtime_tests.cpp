@@ -1,3 +1,5 @@
+#include "../../support/vulkan_retention_child.h"
+
 #include "core/open_video/model_pack_registry.h"
 #include "core/open_video/ncnn_vulkan_context.h"
 #include "core/open_video/ncnn_vulkan_context_internal.h"
@@ -382,7 +384,7 @@ bool RealModelParity(vk::VulkanDevice &device, std::string *error) {
 }
 
 } // namespace
-int main() {
+static int RunMain(bool retention_child, bool *native_exercised) {
   if (!NcnnVerifiedFileSnapshots())
     return 1;
   if (std::getenv("STUDIOCAST_TEST_NCNN_SNAPSHOTS_ONLY") &&
@@ -396,6 +398,7 @@ int main() {
     std::cout << "SKIP: native ncnn Vulkan unavailable: " << error << '\n';
     return 77;
   }
+  *native_exercised = true;
   if (!ProviderGuards() || !ReplayGuards(device))
     return 1;
   char pattern[] = "/tmp/studiocast-native-ncnn-test-XXXXXX";
@@ -557,19 +560,39 @@ int main() {
                  ov::VulkanMattingRuntimeFailure::cpu_layer_rejected,
              "CPU-only layer was accepted"))
     return 1;
-  if (!Check(RealModelParity(device, &error), error))
+  if (!retention_child && !Check(RealModelParity(device, &error), error))
     return 1;
-  // A timed-out submitted replay must poison the domain and retain its program.
-  device.InjectNextSubmissionResultForTesting(
-      vk::VulkanSubmissionPhase::wait_for_fence, vk::VK_TIMEOUT);
-  if (!Check(!lifecycle->Run(in, out, &error), "timeout did not fail closed") ||
-      !Check(!device.SafeToDestroyResources(),
-             "unknown completion was treated as releasable") ||
-      !Check(lifecycle->failure_latched(),
-             "timeout did not latch runtime failure"))
-    return 1;
-  lifecycle.reset();
+  if (retention_child) {
+    // A timed-out submitted replay must poison the domain and retain its program.
+    device.InjectNextSubmissionResultForTesting(
+        vk::VulkanSubmissionPhase::wait_for_fence, vk::VK_TIMEOUT);
+    if (!Check(!lifecycle->Run(in, out, &error), "timeout did not fail closed") ||
+        !Check(!device.SafeToDestroyResources(),
+               "unknown completion was treated as releasable") ||
+        !Check(lifecycle->failure_latched(),
+               "timeout did not latch runtime failure"))
+      return 1;
+    lifecycle.reset();
+  }
   std::cout << "ncnn Vulkan native replay, parity, allocation reuse, CPU "
-               "rejection and timeout quarantine passed.\n";
+               "rejection passed.\n";
   return 0;
+}
+
+int main(int argc, char **argv) {
+  using namespace studiocast;
+  constexpr std::string_view marker = "NCNN_NATIVE_RETENTION_ASSERTIONS_PASSED";
+  const bool child = argc == 2 && std::string_view(argv[1]) ==
+                                      tests::kNativeRetentionChildArgument;
+  if (argc != 1 && !child)
+    return 2;
+  bool native_exercised = false;
+  const int status = RunMain(child, &native_exercised);
+  if (child)
+    return tests::FinishNativeRetentionChild(native_exercised ? status : 1,
+                                             marker);
+  if (status != 0 || !native_exercised || util::UnsafeNativeResourcesRetained())
+    return util::FinalizeProcessExit(status);
+  return util::FinalizeProcessExit(
+      tests::CheckNativeRetentionChild(marker) ? 0 : 1);
 }

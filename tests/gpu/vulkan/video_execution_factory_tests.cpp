@@ -1,3 +1,5 @@
+#include "../../support/vulkan_retention_child.h"
+
 #include "core/util/process_exit.h"
 
 #include "core/video/video_execution_coordinator.h"
@@ -1621,10 +1623,44 @@ int TestProductionSetupSourceIfAvailable() {
 
 } // namespace
 
-int main() {
+static bool TestExpectedRetentionChildRejectsOtherFailures() {
+  using studiocast::tests::ExpectedNativeRetentionResult;
+  constexpr std::string_view marker = "RETENTION_CHECKS_PASSED";
+  util::ExecResult result;
+  result.exit_code = 1;
+  result.stdout_str =
+      std::string(marker) +
+      "\nERROR: unsafe native resources retained; finalizing.\n";
+  bool ok = Require(ExpectedNativeRetentionResult(result, marker),
+                    "exact retained-child failure and assertions must pass");
+  for (const int status : {0, 7, 77, -1}) {
+    result.exit_code = status;
+    ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                  "ordinary success, unrelated failure, skip and signal must "
+                  "not satisfy retained-child verification");
+  }
+  result.exit_code = 1;
+  result.timed_out = true;
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "a timeout cannot satisfy retained-child verification");
+  result.timed_out = false;
+  result.cancelled = true;
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "cancellation cannot satisfy retained-child verification");
+  result.cancelled = false;
+  result.stdout_str = "ERROR: unsafe native resources retained; finalizing.\n";
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "missing assertions must fail despite the expected exit code");
+  result.stdout_str = std::string(marker) + '\n';
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "missing terminal guard evidence must fail");
+  return ok;
+}
+
+static int RunMain() {
   if (!TestCompiledOffInferenceKeepsUtilitySurvivors())
     return 1;
-  bool ok = true;
+  bool ok = TestExpectedRetentionChildRejectsOtherFailures();
   ok &= TestExactFactoryAndCommit();
   ok &= TestFactoryRetainsExactQuarantineReason();
   ok &= TestMattingFinalGeometryContract();
@@ -1647,3 +1683,5 @@ int main() {
 #endif
   return ok ? 0 : 1;
 }
+
+int main() { return studiocast::util::FinalizeProcessExit(RunMain()); }

@@ -1,3 +1,5 @@
+#include "../../support/vulkan_retention_child.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -891,7 +893,7 @@ bool TestVulkanDeviceSelectionPolicy() {
 
 } // namespace
 
-int main() {
+static int RunMain(bool *native_exercised) {
   using studiocast::vulkan::VulkanImage;
   using studiocast::vulkan::VulkanPixelFormat;
   using studiocast::vulkan::VulkanTensor;
@@ -1728,6 +1730,7 @@ int main() {
   UtilityKernels kernels;
   if (!kernels.Initialize(&error))
     return OptionalSkip(error);
+  *native_exercised = true;
 
   {
     const auto diagnostics = kernels.Diagnostics();
@@ -3840,347 +3843,6 @@ int main() {
     retained_across_shutdown.Free();
   }
 
-  {
-    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
-    using studiocast::vulkan::VK_ERROR_INITIALIZATION_FAILED;
-    using studiocast::vulkan::VK_TIMEOUT;
-    using studiocast::vulkan::VulkanContextHealth;
-    using studiocast::vulkan::VulkanDevice;
-    using studiocast::vulkan::VulkanSubmissionPhase;
-
-    VulkanDevice lost_device;
-    if (!lost_device.Initialize(&error))
-      return OptionalSkip("device-loss test context init failed: " + error);
-    const auto healthy_state = lost_device.health_state();
-    ok &= Require(healthy_state.healthy() &&
-                      healthy_state.health == VulkanContextHealth::healthy &&
-                      !healthy_state.poisoned,
-                  "typed frame-path health state must report a healthy "
-                  "initialized context without string diagnostics");
-    const auto fake_command =
-        reinterpret_cast<studiocast::vulkan::VkCommandBuffer>(
-            std::uintptr_t{1});
-    lost_device.InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
-    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
-                      error.find("[vulkan_device_lost]") != std::string::npos,
-                  "injected Vulkan device loss should produce a stable reason");
-    const auto lost = lost_device.health();
-    const auto lost_state = lost_device.health_state();
-    ok &=
-        Require(lost.health == VulkanContextHealth::device_lost &&
-                    lost.poisoned && lost.reason_code == "vulkan_device_lost" &&
-                    lost_state.health == lost.health &&
-                    lost_state.poisoned == lost.poisoned &&
-                    lost_state.last_result == lost.last_result &&
-                    lost_state.submitted_serial == lost.submitted_serial &&
-                    lost_state.completed_serial == lost.completed_serial &&
-                    !lost_state.healthy(),
-                "Vulkan device loss should poison and latch the context");
-    const std::uint64_t submitted_after_loss = lost.submitted_serial;
-    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
-                      lost_device.health().submitted_serial ==
-                          submitted_after_loss,
-                  "poisoned Vulkan context must reject later frames without "
-                  "retrying submission");
-
-    VulkanDevice reset_failure_device;
-    if (!reset_failure_device.Initialize(&error)) {
-      return OptionalSkip("reset-failure test context init failed: " + error);
-    }
-    reset_failure_device.InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::reset_fence, VK_ERROR_INITIALIZATION_FAILED);
-    ok &= Require(
-        !reset_failure_device.SubmitAndWait(fake_command, &error) &&
-            reset_failure_device.health().health ==
-                VulkanContextHealth::fatal_submission_error &&
-            reset_failure_device.health().submitted_serial == 0 &&
-            reset_failure_device.health().completed_serial == 0 &&
-            reset_failure_device.SafeToDestroyResources(),
-        "a reset failure proven before submission must poison later work but "
-        "must not quarantine child teardown");
-
-    VulkanDevice submit_failure_device;
-    if (!submit_failure_device.Initialize(&error)) {
-      return OptionalSkip("submit-failure test context init failed: " + error);
-    }
-    submit_failure_device.InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_INITIALIZATION_FAILED);
-    ok &= Require(
-        !submit_failure_device.SubmitAndWait(fake_command, &error) &&
-            submit_failure_device.health().health ==
-                VulkanContextHealth::fatal_submission_error &&
-            submit_failure_device.health().submitted_serial == 0 &&
-            submit_failure_device.health().completed_serial == 0 &&
-            submit_failure_device.SafeToDestroyResources(),
-        "a queue-submit failure must not claim an accepted submission or "
-        "quarantine child teardown");
-
-    const auto run_wait_failure_case = [&](studiocast::vulkan::VkResult failure,
-                                           VulkanContextHealth expected_health,
-                                           std::string_view expected_reason,
-                                           const char *label) {
-      UtilityKernels wait_failure_kernels;
-      if (!wait_failure_kernels.Initialize(&error)) {
-        return Require(false, std::string(label) +
-                                  " context initialization failed: " + error);
-      }
-      VulkanImage src, dst;
-      if (!AllocateU8(wait_failure_kernels, &src, 2, 2,
-                      VulkanPixelFormat::rgb_u8, &error) ||
-          !AllocateU8(wait_failure_kernels, &dst, 2, 2,
-                      VulkanPixelFormat::rgb_u8, &error)) {
-        return Require(false,
-                       std::string(label) + " allocation failed: " + error);
-      }
-      FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-      if (!src.Flush(&error)) {
-        return Require(false,
-                       std::string(label) + " source flush failed: " + error);
-      }
-      const auto before = wait_failure_kernels.device()->health();
-      wait_failure_kernels.device()->InjectNextSubmissionResultForTesting(
-          VulkanSubmissionPhase::wait_for_fence, failure);
-      bool case_ok = Require(
-          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
-              error.find(expected_reason) != std::string::npos,
-          std::string(label) +
-              " must fail at the actual post-submit fence-wait phase");
-      const auto failed = wait_failure_kernels.device()->health();
-      case_ok &= Require(
-          failed.health == expected_health && failed.poisoned &&
-              failed.reason_code == expected_reason &&
-              failed.submitted_serial == before.submitted_serial + 1 &&
-              failed.completed_serial == before.completed_serial &&
-              !wait_failure_kernels.device()->SafeToDestroyResources(),
-          std::string(label) +
-              " must retain an accepted-but-uncompleted serial and quarantine "
-              "resource teardown");
-      const auto submitted_after_failure = failed.submitted_serial;
-      case_ok &= Require(
-          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
-              wait_failure_kernels.device()->health().submitted_serial ==
-                  submitted_after_failure,
-          std::string(label) +
-              " must reject later work without another driver submission");
-      src.Free();
-      dst.Free();
-      case_ok &= Require(
-          !src.Valid() && !dst.Valid() &&
-              !wait_failure_kernels.device()->SafeToDestroyResources(),
-          std::string(label) +
-              " child release must clear facades while retaining teardown "
-              "quarantine for unknown GPU completion");
-      return case_ok;
-    };
-    ok &= run_wait_failure_case(VK_TIMEOUT, VulkanContextHealth::unsafe_timeout,
-                                "vulkan_submission_timeout", "wait timeout");
-    ok &= run_wait_failure_case(VK_ERROR_INITIALIZATION_FAILED,
-                                VulkanContextHealth::fatal_submission_error,
-                                "vulkan_submission_failed",
-                                "non-timeout wait failure");
-  }
-
-  {
-    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
-    using studiocast::vulkan::VulkanSubmissionPhase;
-
-    UtilityKernels lost_kernels;
-    if (!lost_kernels.Initialize(&error))
-      return OptionalSkip("mirror device-loss context init failed: " + error);
-    VulkanImage upload_staging, src, dst;
-    if (!UploadDeviceLocalU8(lost_kernels, &upload_staging, &src, 2, 2,
-                             VulkanPixelFormat::rgb_u8,
-                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
-        !AllocateDeviceLocalU8(lost_kernels, &dst, 2, 2,
-                               VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("mirror device-loss allocation failed: " + error);
-    }
-
-    studiocast::video::OpenVulkanMirror mirror;
-    ok &= Require(mirror.EnsureInitialized(&lost_kernels, 2, 2, &error),
-                  "mirror device-loss wrapper should initialize: " + error);
-    lost_kernels.device()->InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
-    studiocast::video::OpenVulkanMirrorCounters counters;
-    studiocast::video::OpenVulkanMirrorFinalStageInput input;
-    input.src = &src;
-    input.dst = &dst;
-    input.unmirrored_analysis_complete = true;
-    input.output_geometry_ready = true;
-    ok &= Require(
-        !mirror.ApplyFinal(input, &counters, &error) &&
-            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
-            error.find("[vulkan_device_lost]") != std::string::npos &&
-            counters.dispatch_calls == 1 &&
-            counters.runtime_failure_frames == 1,
-        "mirror device loss must retain shared and effect stable reasons and "
-        "count the failed submitted dispatch");
-  }
-
-  {
-    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
-    using studiocast::vulkan::VulkanSubmissionPhase;
-
-    UtilityKernels lost_auto_frame_kernels;
-    if (!lost_auto_frame_kernels.Initialize(&error)) {
-      return OptionalSkip("Auto Frame device-loss context init failed: " +
-                          error);
-    }
-    VulkanImage upload_staging, src, dst;
-    if (!UploadDeviceLocalU8(lost_auto_frame_kernels, &upload_staging, &src, 2,
-                             2, VulkanPixelFormat::rgb_u8,
-                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
-        !AllocateDeviceLocalU8(lost_auto_frame_kernels, &dst, 2, 2,
-                               VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("Auto Frame device-loss allocation failed: " + error);
-    }
-
-    studiocast::video::OpenVulkanAutoFrame auto_frame;
-    studiocast::video::OpenVulkanAutoFrameCounters counters;
-    ok &= Require(auto_frame.EnsureInitialized(&lost_auto_frame_kernels, 2, 2,
-                                               &counters, &error),
-                  "Auto Frame device-loss wrapper should initialize: " + error);
-    lost_auto_frame_kernels.device()->InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
-    studiocast::video::OpenVulkanAutoFrameCropInput input;
-    input.src = &src;
-    input.dst = &dst;
-    input.crop_x = 0.0f;
-    input.crop_y = 0.0f;
-    input.crop_w = 2.0f;
-    input.crop_h = 2.0f;
-    input.host_analysis_complete = true;
-    input.cpu_crop_plan_complete = true;
-    ok &= Require(
-        !auto_frame.ApplyCrop(input, &counters, &error) &&
-            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
-            error.find("[vulkan_device_lost]") != std::string::npos &&
-            counters.crop_resize_dispatch_calls == 1 &&
-            counters.runtime_failure_frames == 1 &&
-            counters.device_loss_frames == 1 &&
-            counters.cpu_resize_fallback_calls == 0,
-        "Auto Frame device loss must retain nested reasons, count the failed "
-        "dispatch, and never substitute CPU crop/resize");
-    const std::uint64_t submissions_after_loss =
-        lost_auto_frame_kernels.synchronous_submission_count();
-    ok &= Require(
-        !auto_frame.ApplyCrop(input, &counters, &error) &&
-            lost_auto_frame_kernels.synchronous_submission_count() ==
-                submissions_after_loss,
-        "poisoned Auto Frame shared context must reject without another "
-        "submission");
-  }
-
-  {
-    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
-    using studiocast::vulkan::VulkanSubmissionPhase;
-
-    UtilityKernels lost_batch_kernels;
-    if (!lost_batch_kernels.Initialize(&error)) {
-      return OptionalSkip("mirror batch device-loss context init failed: " +
-                          error);
-    }
-    VulkanImage upload_staging, src, resized, dst;
-    if (!UploadDeviceLocalU8(lost_batch_kernels, &upload_staging, &src, 2, 2,
-                             VulkanPixelFormat::rgb_u8,
-                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
-        !AllocateDeviceLocalU8(lost_batch_kernels, &resized, 3, 3,
-                               VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateDeviceLocalU8(lost_batch_kernels, &dst, 3, 3,
-                               VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("mirror batch device-loss allocation failed: " +
-                          error);
-    }
-
-    studiocast::video::OpenVulkanMirror mirror;
-    ok &=
-        Require(mirror.EnsureInitialized(&lost_batch_kernels, 3, 3, &error),
-                "mirror batch device-loss wrapper should initialize: " + error);
-    lost_batch_kernels.device()->InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
-    studiocast::video::OpenVulkanMirrorCounters counters;
-    studiocast::video::OpenVulkanMirrorResizeFinalStageInput input;
-    input.src = &src;
-    input.resized = &resized;
-    input.dst = &dst;
-    input.unmirrored_analysis_complete = true;
-    ok &= Require(
-        !mirror.ApplyResizeFinal(input, &counters, &error) &&
-            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
-            error.find("[vulkan_device_lost]") != std::string::npos &&
-            counters.dispatch_calls == 1 &&
-            counters.runtime_failure_frames == 1,
-        "combined resize/mirror device loss must retain shared and effect "
-        "stable reasons and count the failed submitted batch");
-  }
-
-  {
-    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
-    using studiocast::vulkan::VulkanSubmissionPhase;
-
-    UtilityKernels lost_vignette_kernels;
-    if (!lost_vignette_kernels.Initialize(&error)) {
-      return OptionalSkip("vignette device-loss context init failed: " + error);
-    }
-    VulkanImage upload_staging, src, resized, vignetted, mirrored;
-    if (!UploadDeviceLocalU8(lost_vignette_kernels, &upload_staging, &src, 2, 2,
-                             VulkanPixelFormat::rgb_u8,
-                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
-        !AllocateDeviceLocalU8(lost_vignette_kernels, &resized, 3, 3,
-                               VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateDeviceLocalU8(lost_vignette_kernels, &vignetted, 3, 3,
-                               VulkanPixelFormat::rgb_u8, &error) ||
-        !AllocateDeviceLocalU8(lost_vignette_kernels, &mirrored, 3, 3,
-                               VulkanPixelFormat::rgb_u8, &error)) {
-      return OptionalSkip("vignette device-loss allocation failed: " + error);
-    }
-
-    studiocast::video::OpenVulkanVignette vignette;
-    studiocast::video::OpenVulkanVignetteCounters counters;
-    ok &= Require(vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50,
-                                             &counters, &error),
-                  "vignette device-loss wrapper should initialize: " + error);
-    lost_vignette_kernels.device()->InjectNextSubmissionResultForTesting(
-        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
-    studiocast::video::OpenVulkanVignetteFinalStageInput input;
-    input.src = &src;
-    input.resize_scratch = &resized;
-    input.dst = &vignetted;
-    input.mirrored_dst = &mirrored;
-    input.preceding_effects_complete = true;
-    input.intensity_percent = 50;
-    ok &= Require(
-        !vignette.ApplyFinal(input, &counters, &error) &&
-            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
-            error.find("[vulkan_device_lost]") != std::string::npos &&
-            counters.dispatch_calls == 1 &&
-            counters.runtime_failure_frames == 1 &&
-            lost_vignette_kernels.last_frame_batch_stage_count() == 3,
-        "resize/vignette/mirror device loss must retain nested reasons, "
-        "record the bounded chain, and count the failed submitted frame");
-    const std::uint64_t submitted_after_loss =
-        lost_vignette_kernels.synchronous_submission_count();
-    const std::uint64_t generation_after_loss =
-        counters.factor_generation_calls;
-    const std::uint64_t upload_after_loss = counters.factor_upload_calls;
-    ok &= Require(
-        !vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50, &counters,
-                                    &error) &&
-            error.find("[vulkan_effect_initialization_failed]") !=
-                std::string::npos &&
-            error.find("[vulkan_device_lost]") != std::string::npos &&
-            counters.factor_generation_calls == generation_after_loss &&
-            counters.factor_upload_calls == upload_after_loss,
-        "reusable vignette setup must re-evaluate and reject a poisoned "
-        "context without regenerating configuration data");
-    ok &= Require(!vignette.ApplyFinal(input, &counters, &error) &&
-                      lost_vignette_kernels.synchronous_submission_count() ==
-                          submitted_after_loss,
-                  "poisoned vignette context must reject a later frame without "
-                  "another submission");
-  }
-
   auto flush = [&](auto &resource) {
     if (!resource.Flush(&error)) {
       std::cerr << "Flush failed: " << error << "\n";
@@ -4442,48 +4104,6 @@ int main() {
                   "stale readback staging must fail before submission");
   }
 
-  {
-    UtilityKernels loss_kernels;
-    if (!loss_kernels.Initialize(&error))
-      return OptionalSkip("device-loss readback context unavailable: " + error);
-    constexpr int w = 2;
-    constexpr int h = 2;
-    VulkanImage upload, resident, readback;
-    if (!AllocateF32(loss_kernels, &upload, w, h, &error) ||
-        !resident.Allocate(loss_kernels.device(), w, h,
-                           VulkanPixelFormat::f32_1,
-                           /*map_memory=*/false, &error) ||
-        !readback.Allocate(loss_kernels.device(), w, h,
-                           VulkanPixelFormat::f32_1,
-                           /*map_memory=*/true, &error)) {
-      return OptionalSkip("device-loss readback allocation failed: " + error);
-    }
-    const std::vector<float> alpha = {0.0f, 1.0f, 0.25f, 0.75f};
-    FillF32(upload, alpha);
-    flush(upload);
-    loss_kernels.InvalidateDescriptorBindingCacheForSetup();
-    ok &= Require(loss_kernels.ResizeBilinearF32_1(upload, resident, &error),
-                  "device-loss readback setup should dispatch: " + error);
-    std::vector<float> cpu(alpha.size());
-    loss_kernels.device()->InjectNextSubmissionResultForTesting(
-        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
-        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
-    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
-                                              cpu.size(), &error),
-                  "device loss during staged readback must fail");
-    const auto poisoned = loss_kernels.device()->health();
-    ok &= Require(poisoned.poisoned &&
-                      poisoned.health ==
-                          studiocast::vulkan::VulkanContextHealth::device_lost,
-                  "staged readback device loss must poison the context");
-    const auto submitted_after_loss = poisoned.submitted_serial;
-    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
-                                              cpu.size(), &error) &&
-                      loss_kernels.device()->health().submitted_serial ==
-                          submitted_after_loss,
-                  "poisoned readback context must reject retries before a "
-                  "new driver submission");
-  }
 
   {
     const int w = 3, h = 2, radius = 1;
@@ -4659,4 +4279,425 @@ int main() {
   }
 
   return ok ? 0 : 1;
+}
+
+static int RunUnsafeNativeChecks() {
+  using studiocast::tests::FailNativeSetup;
+  using studiocast::vulkan::VulkanImage;
+  using studiocast::vulkan::VulkanPixelFormat;
+  using studiocast::vulkan::VulkanTensor;
+  using studiocast::vulkan::kernels::ChannelOrder;
+  using studiocast::vulkan::kernels::ModelPreprocessSpec;
+  using studiocast::vulkan::kernels::UtilityKernels;
+  bool ok = true;
+  std::string error;
+  auto flush = [&](auto &resource) {
+    if (!resource.Flush(&error)) {
+      std::cerr << "Flush failed: " << error << '\n';
+      ok = false;
+    }
+  };
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VK_ERROR_INITIALIZATION_FAILED;
+    using studiocast::vulkan::VK_TIMEOUT;
+    using studiocast::vulkan::VulkanContextHealth;
+    using studiocast::vulkan::VulkanDevice;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    VulkanDevice lost_device;
+    if (!lost_device.Initialize(&error))
+      return FailNativeSetup("device-loss test context init failed: " + error);
+    const auto healthy_state = lost_device.health_state();
+    ok &= Require(healthy_state.healthy() &&
+                      healthy_state.health == VulkanContextHealth::healthy &&
+                      !healthy_state.poisoned,
+                  "typed frame-path health state must report a healthy "
+                  "initialized context without string diagnostics");
+    const auto fake_command =
+        reinterpret_cast<studiocast::vulkan::VkCommandBuffer>(
+            std::uintptr_t{1});
+    lost_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
+                      error.find("[vulkan_device_lost]") != std::string::npos,
+                  "injected Vulkan device loss should produce a stable reason");
+    const auto lost = lost_device.health();
+    const auto lost_state = lost_device.health_state();
+    ok &=
+        Require(lost.health == VulkanContextHealth::device_lost &&
+                    lost.poisoned && lost.reason_code == "vulkan_device_lost" &&
+                    lost_state.health == lost.health &&
+                    lost_state.poisoned == lost.poisoned &&
+                    lost_state.last_result == lost.last_result &&
+                    lost_state.submitted_serial == lost.submitted_serial &&
+                    lost_state.completed_serial == lost.completed_serial &&
+                    !lost_state.healthy(),
+                "Vulkan device loss should poison and latch the context");
+    const std::uint64_t submitted_after_loss = lost.submitted_serial;
+    ok &= Require(!lost_device.SubmitAndWait(fake_command, &error) &&
+                      lost_device.health().submitted_serial ==
+                          submitted_after_loss,
+                  "poisoned Vulkan context must reject later frames without "
+                  "retrying submission");
+
+    VulkanDevice reset_failure_device;
+    if (!reset_failure_device.Initialize(&error)) {
+      return FailNativeSetup("reset-failure test context init failed: " + error);
+    }
+    reset_failure_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::reset_fence, VK_ERROR_INITIALIZATION_FAILED);
+    ok &= Require(
+        !reset_failure_device.SubmitAndWait(fake_command, &error) &&
+            reset_failure_device.health().health ==
+                VulkanContextHealth::fatal_submission_error &&
+            reset_failure_device.health().submitted_serial == 0 &&
+            reset_failure_device.health().completed_serial == 0 &&
+            reset_failure_device.SafeToDestroyResources(),
+        "a reset failure proven before submission must poison later work but "
+        "must not quarantine child teardown");
+
+    VulkanDevice submit_failure_device;
+    if (!submit_failure_device.Initialize(&error)) {
+      return FailNativeSetup("submit-failure test context init failed: " + error);
+    }
+    submit_failure_device.InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_INITIALIZATION_FAILED);
+    ok &= Require(
+        !submit_failure_device.SubmitAndWait(fake_command, &error) &&
+            submit_failure_device.health().health ==
+                VulkanContextHealth::fatal_submission_error &&
+            submit_failure_device.health().submitted_serial == 0 &&
+            submit_failure_device.health().completed_serial == 0 &&
+            submit_failure_device.SafeToDestroyResources(),
+        "a queue-submit failure must not claim an accepted submission or "
+        "quarantine child teardown");
+
+    const auto run_wait_failure_case = [&](studiocast::vulkan::VkResult failure,
+                                           VulkanContextHealth expected_health,
+                                           std::string_view expected_reason,
+                                           const char *label) {
+      UtilityKernels wait_failure_kernels;
+      if (!wait_failure_kernels.Initialize(&error)) {
+        return Require(false, std::string(label) +
+                                  " context initialization failed: " + error);
+      }
+      VulkanImage src, dst;
+      if (!AllocateU8(wait_failure_kernels, &src, 2, 2,
+                      VulkanPixelFormat::rgb_u8, &error) ||
+          !AllocateU8(wait_failure_kernels, &dst, 2, 2,
+                      VulkanPixelFormat::rgb_u8, &error)) {
+        return Require(false,
+                       std::string(label) + " allocation failed: " + error);
+      }
+      FillU8(src, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+      if (!src.Flush(&error)) {
+        return Require(false,
+                       std::string(label) + " source flush failed: " + error);
+      }
+      const auto before = wait_failure_kernels.device()->health();
+      wait_failure_kernels.device()->InjectNextSubmissionResultForTesting(
+          VulkanSubmissionPhase::wait_for_fence, failure);
+      bool case_ok = Require(
+          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
+              error.find(expected_reason) != std::string::npos,
+          std::string(label) +
+              " must fail at the actual post-submit fence-wait phase");
+      const auto failed = wait_failure_kernels.device()->health();
+      case_ok &= Require(
+          failed.health == expected_health && failed.poisoned &&
+              failed.reason_code == expected_reason &&
+              failed.submitted_serial == before.submitted_serial + 1 &&
+              failed.completed_serial == before.completed_serial &&
+              !wait_failure_kernels.device()->SafeToDestroyResources(),
+          std::string(label) +
+              " must retain an accepted-but-uncompleted serial and quarantine "
+              "resource teardown");
+      const auto submitted_after_failure = failed.submitted_serial;
+      case_ok &= Require(
+          !wait_failure_kernels.MirrorHorizontalU8x3(src, dst, &error) &&
+              wait_failure_kernels.device()->health().submitted_serial ==
+                  submitted_after_failure,
+          std::string(label) +
+              " must reject later work without another driver submission");
+      src.Free();
+      dst.Free();
+      case_ok &= Require(
+          !src.Valid() && !dst.Valid() &&
+              !wait_failure_kernels.device()->SafeToDestroyResources(),
+          std::string(label) +
+              " child release must clear facades while retaining teardown "
+              "quarantine for unknown GPU completion");
+      return case_ok;
+    };
+    ok &= run_wait_failure_case(VK_TIMEOUT, VulkanContextHealth::unsafe_timeout,
+                                "vulkan_submission_timeout", "wait timeout");
+    ok &= run_wait_failure_case(VK_ERROR_INITIALIZATION_FAILED,
+                                VulkanContextHealth::fatal_submission_error,
+                                "vulkan_submission_failed",
+                                "non-timeout wait failure");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_kernels;
+    if (!lost_kernels.Initialize(&error))
+      return FailNativeSetup("mirror device-loss context init failed: " + error);
+    VulkanImage upload_staging, src, dst;
+    if (!UploadDeviceLocalU8(lost_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_kernels, &dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error)) {
+      return FailNativeSetup("mirror device-loss allocation failed: " + error);
+    }
+
+    studiocast::video::OpenVulkanMirror mirror;
+    ok &= Require(mirror.EnsureInitialized(&lost_kernels, 2, 2, &error),
+                  "mirror device-loss wrapper should initialize: " + error);
+    lost_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanMirrorCounters counters;
+    studiocast::video::OpenVulkanMirrorFinalStageInput input;
+    input.src = &src;
+    input.dst = &dst;
+    input.unmirrored_analysis_complete = true;
+    input.output_geometry_ready = true;
+    ok &= Require(
+        !mirror.ApplyFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1,
+        "mirror device loss must retain shared and effect stable reasons and "
+        "count the failed submitted dispatch");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_auto_frame_kernels;
+    if (!lost_auto_frame_kernels.Initialize(&error)) {
+      return FailNativeSetup("Auto Frame device-loss context init failed: " +
+                          error);
+    }
+    VulkanImage upload_staging, src, dst;
+    if (!UploadDeviceLocalU8(lost_auto_frame_kernels, &upload_staging, &src, 2,
+                             2, VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_auto_frame_kernels, &dst, 2, 2,
+                               VulkanPixelFormat::rgb_u8, &error)) {
+      return FailNativeSetup("Auto Frame device-loss allocation failed: " + error);
+    }
+
+    studiocast::video::OpenVulkanAutoFrame auto_frame;
+    studiocast::video::OpenVulkanAutoFrameCounters counters;
+    ok &= Require(auto_frame.EnsureInitialized(&lost_auto_frame_kernels, 2, 2,
+                                               &counters, &error),
+                  "Auto Frame device-loss wrapper should initialize: " + error);
+    lost_auto_frame_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanAutoFrameCropInput input;
+    input.src = &src;
+    input.dst = &dst;
+    input.crop_x = 0.0f;
+    input.crop_y = 0.0f;
+    input.crop_w = 2.0f;
+    input.crop_h = 2.0f;
+    input.host_analysis_complete = true;
+    input.cpu_crop_plan_complete = true;
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.crop_resize_dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1 &&
+            counters.device_loss_frames == 1 &&
+            counters.cpu_resize_fallback_calls == 0,
+        "Auto Frame device loss must retain nested reasons, count the failed "
+        "dispatch, and never substitute CPU crop/resize");
+    const std::uint64_t submissions_after_loss =
+        lost_auto_frame_kernels.synchronous_submission_count();
+    ok &= Require(
+        !auto_frame.ApplyCrop(input, &counters, &error) &&
+            lost_auto_frame_kernels.synchronous_submission_count() ==
+                submissions_after_loss,
+        "poisoned Auto Frame shared context must reject without another "
+        "submission");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_batch_kernels;
+    if (!lost_batch_kernels.Initialize(&error)) {
+      return FailNativeSetup("mirror batch device-loss context init failed: " +
+                          error);
+    }
+    VulkanImage upload_staging, src, resized, dst;
+    if (!UploadDeviceLocalU8(lost_batch_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_batch_kernels, &resized, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_batch_kernels, &dst, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error)) {
+      return FailNativeSetup("mirror batch device-loss allocation failed: " +
+                          error);
+    }
+
+    studiocast::video::OpenVulkanMirror mirror;
+    ok &=
+        Require(mirror.EnsureInitialized(&lost_batch_kernels, 3, 3, &error),
+                "mirror batch device-loss wrapper should initialize: " + error);
+    lost_batch_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanMirrorCounters counters;
+    studiocast::video::OpenVulkanMirrorResizeFinalStageInput input;
+    input.src = &src;
+    input.resized = &resized;
+    input.dst = &dst;
+    input.unmirrored_analysis_complete = true;
+    ok &= Require(
+        !mirror.ApplyResizeFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1,
+        "combined resize/mirror device loss must retain shared and effect "
+        "stable reasons and count the failed submitted batch");
+  }
+
+  {
+    using studiocast::vulkan::VK_ERROR_DEVICE_LOST;
+    using studiocast::vulkan::VulkanSubmissionPhase;
+
+    UtilityKernels lost_vignette_kernels;
+    if (!lost_vignette_kernels.Initialize(&error)) {
+      return FailNativeSetup("vignette device-loss context init failed: " + error);
+    }
+    VulkanImage upload_staging, src, resized, vignetted, mirrored;
+    if (!UploadDeviceLocalU8(lost_vignette_kernels, &upload_staging, &src, 2, 2,
+                             VulkanPixelFormat::rgb_u8,
+                             {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &resized, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &vignetted, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error) ||
+        !AllocateDeviceLocalU8(lost_vignette_kernels, &mirrored, 3, 3,
+                               VulkanPixelFormat::rgb_u8, &error)) {
+      return FailNativeSetup("vignette device-loss allocation failed: " + error);
+    }
+
+    studiocast::video::OpenVulkanVignette vignette;
+    studiocast::video::OpenVulkanVignetteCounters counters;
+    ok &= Require(vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50,
+                                             &counters, &error),
+                  "vignette device-loss wrapper should initialize: " + error);
+    lost_vignette_kernels.device()->InjectNextSubmissionResultForTesting(
+        VulkanSubmissionPhase::queue_submit, VK_ERROR_DEVICE_LOST);
+    studiocast::video::OpenVulkanVignetteFinalStageInput input;
+    input.src = &src;
+    input.resize_scratch = &resized;
+    input.dst = &vignetted;
+    input.mirrored_dst = &mirrored;
+    input.preceding_effects_complete = true;
+    input.intensity_percent = 50;
+    ok &= Require(
+        !vignette.ApplyFinal(input, &counters, &error) &&
+            error.find("[vulkan_effect_runtime_failed]") != std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.dispatch_calls == 1 &&
+            counters.runtime_failure_frames == 1 &&
+            lost_vignette_kernels.last_frame_batch_stage_count() == 3,
+        "resize/vignette/mirror device loss must retain nested reasons, "
+        "record the bounded chain, and count the failed submitted frame");
+    const std::uint64_t submitted_after_loss =
+        lost_vignette_kernels.synchronous_submission_count();
+    const std::uint64_t generation_after_loss =
+        counters.factor_generation_calls;
+    const std::uint64_t upload_after_loss = counters.factor_upload_calls;
+    ok &= Require(
+        !vignette.EnsureInitialized(&lost_vignette_kernels, 3, 3, 50, &counters,
+                                    &error) &&
+            error.find("[vulkan_effect_initialization_failed]") !=
+                std::string::npos &&
+            error.find("[vulkan_device_lost]") != std::string::npos &&
+            counters.factor_generation_calls == generation_after_loss &&
+            counters.factor_upload_calls == upload_after_loss,
+        "reusable vignette setup must re-evaluate and reject a poisoned "
+        "context without regenerating configuration data");
+    ok &= Require(!vignette.ApplyFinal(input, &counters, &error) &&
+                      lost_vignette_kernels.synchronous_submission_count() ==
+                          submitted_after_loss,
+                  "poisoned vignette context must reject a later frame without "
+                  "another submission");
+  }
+
+
+  {
+    UtilityKernels loss_kernels;
+    if (!loss_kernels.Initialize(&error))
+      return FailNativeSetup("device-loss readback context unavailable: " + error);
+    constexpr int w = 2;
+    constexpr int h = 2;
+    VulkanImage upload, resident, readback;
+    if (!AllocateF32(loss_kernels, &upload, w, h, &error) ||
+        !resident.Allocate(loss_kernels.device(), w, h,
+                           VulkanPixelFormat::f32_1,
+                           /*map_memory=*/false, &error) ||
+        !readback.Allocate(loss_kernels.device(), w, h,
+                           VulkanPixelFormat::f32_1,
+                           /*map_memory=*/true, &error)) {
+      return FailNativeSetup("device-loss readback allocation failed: " + error);
+    }
+    const std::vector<float> alpha = {0.0f, 1.0f, 0.25f, 0.75f};
+    FillF32(upload, alpha);
+    flush(upload);
+    loss_kernels.InvalidateDescriptorBindingCacheForSetup();
+    ok &= Require(loss_kernels.ResizeBilinearF32_1(upload, resident, &error),
+                  "device-loss readback setup should dispatch: " + error);
+    std::vector<float> cpu(alpha.size());
+    loss_kernels.device()->InjectNextSubmissionResultForTesting(
+        studiocast::vulkan::VulkanSubmissionPhase::queue_submit,
+        studiocast::vulkan::VK_ERROR_DEVICE_LOST);
+    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                              cpu.size(), &error),
+                  "device loss during staged readback must fail");
+    const auto poisoned = loss_kernels.device()->health();
+    ok &= Require(poisoned.poisoned &&
+                      poisoned.health ==
+                          studiocast::vulkan::VulkanContextHealth::device_lost,
+                  "staged readback device loss must poison the context");
+    const auto submitted_after_loss = poisoned.submitted_serial;
+    ok &= Require(!loss_kernels.ReadbackF32_1(resident, readback, cpu.data(),
+                                              cpu.size(), &error) &&
+                      loss_kernels.device()->health().submitted_serial ==
+                          submitted_after_loss,
+                  "poisoned readback context must reject retries before a "
+                  "new driver submission");
+  }
+  return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  using namespace studiocast;
+  constexpr std::string_view marker =
+      "KERNEL_NATIVE_RETENTION_ASSERTIONS_PASSED";
+  const bool child = argc == 2 && std::string_view(argv[1]) ==
+                                      tests::kNativeRetentionChildArgument;
+  if (argc != 1 && !child)
+    return 2;
+  if (child)
+    return tests::FinishNativeRetentionChild(RunUnsafeNativeChecks(), marker);
+  bool native_exercised = false;
+  const int status = RunMain(&native_exercised);
+  if (status != 0 || !native_exercised || util::UnsafeNativeResourcesRetained())
+    return util::FinalizeProcessExit(status);
+  return util::FinalizeProcessExit(
+      tests::CheckNativeRetentionChild(marker) ? 0 : 1);
 }
