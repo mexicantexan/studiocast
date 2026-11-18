@@ -821,6 +821,52 @@ bool TestFactoryRejectsIncompleteAndDuplicateModelProofs() {
   return ok;
 }
 
+bool TestInitializeCannotReplaceRefusedRollbackCandidate() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  registration.adapter_instance_id = 0;
+  struct Rollback {
+    bool retired = false;
+    unsigned calls = 0;
+  } rollback;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &rollback;
+  configuration.injected_executor_shutdown = [](void *context) noexcept {
+    auto &state = *static_cast<Rollback *>(context);
+    ++state.calls;
+    return state.retired;
+  };
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Require(factory.Initialize(&reason) == hal::StatusId::quarantined &&
+                        reason == hal::ReasonId::synchronization_failed &&
+                        !factory.initialized() && rollback.calls == 1,
+                    "failed setup with refused rollback must retain quarantine");
+  // Becoming safe does not itself authorize an implicit cleanup/replacement.
+  rollback.retired = true;
+  ok &= Require(factory.Initialize(&reason) == hal::StatusId::quarantined &&
+                    reason == hal::ReasonId::synchronization_failed &&
+                    !factory.initialized() && rollback.calls == 1,
+                "Initialize must not retry or overwrite a refused candidate");
+  const auto shutdown = factory.RequestShutdown();
+  ok &= Require(shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted &&
+                    rollback.calls == 2,
+                "only explicit shutdown may retry retained candidate retirement");
+  ok &= Require(factory.Initialize(&reason) == hal::StatusId::stopped &&
+                    reason == hal::ReasonId::shutdown_requested &&
+                    rollback.calls == 2,
+                "completed explicit shutdown must preserve terminal semantics");
+
+  rollback.calls = 0;
+  vulkan::VulkanVideoExecutionFactory safe_retry(registration, configuration);
+  ok &= Require(safe_retry.Initialize(&reason) == hal::StatusId::blocked &&
+                    safe_retry.Initialize(&reason) == hal::StatusId::blocked &&
+                    rollback.calls == 2,
+                "safely discarded failed candidates must remain retryable");
+  return ok;
+}
+
 bool TestShutdownRequiresExecutorRetirementAfterFenceProof() {
   FakeVulkanAdapter adapter;
   struct Gates {
@@ -1580,6 +1626,7 @@ int main() {
   ok &= TestFactoryRejectsIncompleteAndDuplicateModelProofs();
   ok &= TestShutdownRetainsUnprovenNativeOwner();
   ok &= TestShutdownRequiresExecutorRetirementAfterFenceProof();
+  ok &= TestInitializeCannotReplaceRefusedRollbackCandidate();
   ok &= TestFiniteFenceTimeoutContract();
   ok &= TestMalformedSourceStageCount();
   ok &= TestUnavailableOptionalStageIsolation();

@@ -1089,18 +1089,19 @@ struct VulkanVideoExecutionFactory::Impl {
   }
 
   void DiscardFailedProduction() noexcept {
-#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     if (!TryShutdownProduction()) {
       status = StatusId::quarantined;
-      reason =
-          production && production->kernels.device()->health_state().health ==
-                            VulkanContextHealth::device_lost
-              ? ReasonId::device_lost
-              : ReasonId::synchronization_failed;
+      reason = ReasonId::synchronization_failed;
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+      if (production && production->kernels.device()->health_state().health ==
+                            VulkanContextHealth::device_lost)
+        reason = ReasonId::device_lost;
+#endif
       // Destructor retains this complete failed candidate; no caller may
       // mistake missing session readiness for permission to release it.
       return;
     }
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     production.reset();
 #endif
   }
@@ -1232,6 +1233,12 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
     SetReason(reason, ReasonId::shutdown_requested);
     return StatusId::stopped;
   }
+  // Failed setup may retain an unsafe candidate without an explicit shutdown
+  // attempt. Never replace it or retry retirement implicitly through Initialize.
+  if (impl_->production_shutdown_refused) {
+    SetReason(reason, impl_->reason);
+    return impl_->status;
+  }
   if (impl_->initialized) {
     SetReason(reason, impl_->reason);
     return impl_->status;
@@ -1244,6 +1251,8 @@ StatusId VulkanVideoExecutionFactory::Initialize(ReasonId *reason) noexcept {
   } else if (impl_->injected) {
     impl_->initialized = ExactRegistration(impl_->registration, &impl_->reason);
     impl_->status = impl_->initialized ? StatusId::ready : StatusId::blocked;
+    if (!impl_->initialized)
+      impl_->DiscardFailedProduction();
   } else {
 #if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
     const auto block_eye = [&]() {
