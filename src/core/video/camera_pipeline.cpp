@@ -555,7 +555,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
     }
     return hal::SemanticEffectProviderId::invalid;
   };
-  const auto desired_backend = [&](hal::SemanticEffectId effect) {
+  const auto desired_backend = [&]() {
     if (input.compute_backend == ComputeBackendPreference::vulkan) {
       return hal::BackendId::vulkan;
     }
@@ -866,7 +866,7 @@ MultiIslandStatusValidationResult BuildCameraPipelineHalStatusSnapshot(
     auto &state = build.effects[effect_index];
     if (!requested(state.effect))
       continue;
-    const auto desired = desired_backend(state.effect);
+    const auto desired = desired_backend();
     state.requested = true;
     state.requested_backend = desired;
     state.requested_provider =
