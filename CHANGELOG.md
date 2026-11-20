@@ -100,6 +100,8 @@ backend selection, and model/runtime diagnostics across CUDA and Vulkan.
 
 - Replaced a deleted rolling-release AppImage runtime asset with an upstream
   fixed-release asset, pinned by commit, immutable asset ID, and SHA-256.
+- Preserve SquashFS permissions during independent AppImage verification so
+  the host umask cannot cause false mismatches or conceal mode differences.
 - Fixed audit findings around Vulkan virtual-background readiness, backend
   fallback reporting, degraded status, and CPU/pass-through behavior.
 - Prevented explicit Vulkan requests from being represented as CUDA-backed

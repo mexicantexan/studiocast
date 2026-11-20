@@ -253,7 +253,10 @@ may differ. The SquashFS must begin immediately after that runtime, end at the
 canonical padded file boundary with no appended payload, and reproduce the
 verified AppDir archive's complete file types, paths, modes, regular-file
 sizes/hashes, and symlink targets. Unsafe, dangling, cyclic, or escaping links
-fail closed. CI then byte-compares the embedded source archive to the verified
+fail closed. The trusted extractor runs with a child-only zero umask beneath a
+directory owned by the current user with no group or other access, so the host
+umask cannot alter the file modes being compared. CI then byte-compares the
+embedded source archive to the verified
 standalone source, compares
 `usr/share/studiocast/installer/trust/keys/studiocast-release-2026.pem` to the
 committed key, and rejects forbidden secret PEM markers in staged and uploaded
