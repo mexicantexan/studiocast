@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.9
+## v0.2.10
 
 This release adds prepared hardware execution for video effects, explicit compute
 backend selection, and model/runtime diagnostics across CUDA and Vulkan.
