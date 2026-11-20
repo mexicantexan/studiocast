@@ -98,6 +98,8 @@ backend selection, and model/runtime diagnostics across CUDA and Vulkan.
 
 ### Fixed
 
+- Replaced a deleted rolling-release AppImage runtime asset with an upstream
+  fixed-release asset, pinned by commit, immutable asset ID, and SHA-256.
 - Fixed audit findings around Vulkan virtual-background readiness, backend
   fallback reporting, degraded status, and CPU/pass-through behavior.
 - Prevented explicit Vulkan requests from being represented as CUDA-backed
