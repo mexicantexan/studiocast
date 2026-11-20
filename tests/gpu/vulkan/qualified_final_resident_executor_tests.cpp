@@ -1,4 +1,4 @@
-#include "../../support/vulkan_retention_child.h"
+#include "core/util/process_exit.h"
 
 #include "core/vulkan/qualified_final_resident_executor.h"
 
@@ -224,7 +224,7 @@ bool Close(const std::vector<std::uint8_t> &actual,
 
 } // namespace
 
-static int RunMain(bool retention_child, bool *native_exercised) {
+static int RunMain() {
   UtilityKernels kernels;
   std::string error;
   if (!kernels.Initialize(&error))
@@ -237,7 +237,6 @@ static int RunMain(bool retention_child, bool *native_exercised) {
   const auto evidence = executor.CapabilityEvidence();
   if (!kernels.device()->identity().device_uuid_valid)
     return OptionalSkip("Vulkan deviceUUID identity evidence is unavailable");
-  *native_exercised = true;
   bool ok = Require(evidence.blocker == ReasonId::none &&
                         evidence.mirror_production_ready &&
                         evidence.vignette_fixed_center_production_ready,
@@ -381,51 +380,36 @@ static int RunMain(bool retention_child, bool *native_exercised) {
                 "and per-stage timing");
   adapter.DestroyPrepared(&adapter_prepared);
 
-  if (retention_child) {
-    auto loss_program = Program(evidence.execution_domain, 103);
-    auto loss_options = Options(loss_program);
-    VulkanExecutorPreparedProgram loss_prepared;
-    ok &= Require(executor.Prepare(loss_program, loss_options, &loss_prepared,
-                                   &reason) == StatusId::ready,
-                  "device-loss fixture must prepare");
-    kernels.device()->InjectNextSubmissionResultForTesting(
-        vulkan::VulkanSubmissionPhase::queue_submit,
-        vulkan::VK_ERROR_DEVICE_LOST);
-    auto loss_result =
-        executor.Execute(loss_prepared, loss_program, loss_options, binding, 6);
-    ok &= Require(loss_result.status == StatusId::quarantined &&
-                      loss_result.reason == ReasonId::device_lost &&
-                      loss_result.device_lost && !loss_result.output_written,
-                  "driver device loss must quarantine the prepared island");
-    auto quarantined_result =
-        executor.Execute(loss_prepared, loss_program, loss_options, binding, 7);
-    ok &= Require(quarantined_result.status == StatusId::quarantined &&
-                      quarantined_result.reason == ReasonId::device_lost &&
-                      quarantined_result.transfers.uploads == 0,
-                  "quarantined island must reject later frames before transfer");
-    executor.DestroyPrepared(&loss_prepared);
-  }
+  // This injected queue-submit loss precedes native submission; its original
+  // quarantine checks do not require permanent owner retention.
+  auto loss_program = Program(evidence.execution_domain, 103);
+  auto loss_options = Options(loss_program);
+  VulkanExecutorPreparedProgram loss_prepared;
+  ok &= Require(executor.Prepare(loss_program, loss_options, &loss_prepared,
+                                 &reason) == StatusId::ready,
+                "device-loss fixture must prepare");
+  kernels.device()->InjectNextSubmissionResultForTesting(
+      vulkan::VulkanSubmissionPhase::queue_submit,
+      vulkan::VK_ERROR_DEVICE_LOST);
+  auto loss_result =
+      executor.Execute(loss_prepared, loss_program, loss_options, binding, 6);
+  ok &= Require(loss_result.status == StatusId::quarantined &&
+                    loss_result.reason == ReasonId::device_lost &&
+                    loss_result.device_lost && !loss_result.output_written,
+                "driver device loss must quarantine the prepared island");
+  auto quarantined_result =
+      executor.Execute(loss_prepared, loss_program, loss_options, binding, 7);
+  ok &= Require(quarantined_result.status == StatusId::quarantined &&
+                    quarantined_result.reason == ReasonId::device_lost &&
+                    quarantined_result.transfers.uploads == 0,
+                "quarantined island must reject later frames before transfer");
+  executor.DestroyPrepared(&loss_prepared);
 
   if (ok)
     std::cout << "Qualified Vulkan final resident executor tests passed\n";
   return ok ? 0 : 1;
 }
 
-int main(int argc, char **argv) {
-  using namespace studiocast;
-  constexpr std::string_view marker =
-      "QUALIFIED_NATIVE_RETENTION_ASSERTIONS_PASSED";
-  const bool child = argc == 2 && std::string_view(argv[1]) ==
-                                      tests::kNativeRetentionChildArgument;
-  if (argc != 1 && !child)
-    return 2;
-  bool native_exercised = false;
-  const int status = RunMain(child, &native_exercised);
-  if (child)
-    return tests::FinishNativeRetentionChild(native_exercised ? status : 1,
-                                             marker);
-  if (status != 0 || !native_exercised || util::UnsafeNativeResourcesRetained())
-    return util::FinalizeProcessExit(status);
-  return util::FinalizeProcessExit(
-      tests::CheckNativeRetentionChild(marker) ? 0 : 1);
+int main() {
+  return studiocast::util::FinalizeProcessExit(RunMain());
 }
