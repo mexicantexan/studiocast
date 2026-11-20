@@ -891,6 +891,27 @@ establish frame latency, output correctness or writer publication. A rejected
 reservation or timed-out native submission is a failure, not a skip or successful
 optional-effect qualification.
 
+Permanent-retention exit handling has a separate isolated negative case:
+use the same verified model/replacement inputs with
+`--case unsafe_timeout_retained --frames 3`, without `--prepare-only`. It submits
+actual work, injects a timeout and denies subsequent fence proof only on that
+owner's private dispatch table. The required result is **exit 1**, together with
+`configuration_retained=1 exact_context_retained=1` after manager destruction and
+the `unsafe native resources retained;` terminal diagnostic. Exit 0, exit 77,
+signals, timeouts or either missing witness are failures. This is synthetic
+failed-proof coverage, not a natural timeout or a successful rendered frame.
+
+Ordinary shutdown still retries only through bounded explicit attempts. If
+native resources are permanently retained, the application finishes ordinary
+local cleanup, reports failure and skips unsafe userspace driver finalizers at
+the already-requested process exit. It does not terminate the daemon merely
+because an optional effect timed out. Native component tests isolate intentional
+permanent quarantine in checked child processes; they do not use a generic
+expected-failure override. Immediate terminal exit is not quiescence proof,
+bounded kernel reclamation or clean sanitizer/LeakSanitizer qualification.
+The current repair, evidence and hardware limits are recorded in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
+
 The cached production diagnostics have their own required smoke. Set isolated
 HOME/config/cache/state roots and point XDG_DATA_HOME at the parent of the
 `studiocast` model-data directory:

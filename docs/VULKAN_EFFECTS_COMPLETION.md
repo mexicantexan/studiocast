@@ -778,11 +778,11 @@ commit or host changes. All accepted repairs are integrated; actual hosted
 package installation and the complete build/test/self-test matrix remain the
 external gate recorded in the PR.
 
-## Current-head hardware qualification (2026-11-17)
+## Hardware qualification checkpoint (2026-11-17)
 
-Status: merge on hold for a native timeout/teardown SIGSEGV; hardware
-qualification remains incomplete before the user's conditionally authorized
-merge.
+At this checkpoint, merge was on hold for a native timeout/teardown SIGSEGV and
+hardware qualification was incomplete. The terminal-cleanup follow-up below
+records the subsequent repair and its remaining hardware limits.
 The frozen qualification source is
 `73afcecb1915c2b6f456664ffac5471c07c203d4`, with the activated `2026-11-14`
 catalog and its unchanged seven packs/eighteen artifacts. Native tests use
@@ -1146,3 +1146,189 @@ All checks use private roots and absent native opt-ins; no local self-test or
 downloaded SDK execution, linking, loading, host installation or service change
 occurs. A fresh hosted final-head run remains the end-to-end acquisition and
 self-test gate; this repair does not clear PR #22's native SIGSEGV hold.
+
+## Vulkan terminal cleanup follow-up (2026-11-18 through 2026-11-20)
+
+Status: the exit crash is repaired and its native regression is validated;
+hardware qualification is partial. PR #22 records final-head hosted CI and merge
+state. The user renewed implementation, GitHub Actions and conditional merge
+authority, explicitly accepting best-effort hardware qualification and deployment
+feedback. No release, driver/package installation, service mutation or installed
+model change is included.
+
+Hosted Actions run `44220246291` completed successfully at exact source
+`7d529938c48f79759ac29ce2a7de37007317b199`. Ubuntu 22, Ubuntu 24 and Mint each
+passed 82 tests with five native skips and `SELFTEST OK`; enabled features passed
+90 tests with six native skips and `SELFTEST OK`. Package smoke passed AppDir,
+source archive and bundle verification. The official ONNX Runtime 1.17.3 package
+acquisition succeeded. All six hardware jobs skipped; the runner inventory is
+still zero. The enabled build is not warning-clean. Evidence is under
+`/run/user/1000/studiocast-ci-confirm-pw27_q73`.
+
+Read-only ownership audits found a real release-proof gap: the factory could
+permit release after a void executor shutdown refused callback or child
+retirement. The concrete checked shutdown now gates normal shutdown, failed
+setup rollback and destruction. A fresh critic then found that public
+`Initialize()` could replace a retained failed candidate before any explicit
+shutdown attempt. The retained-candidate guard closes that path; safe discarded
+failures remain retryable.
+
+| Topic | Source commit → integrated commit | Verification |
+| --- | --- | --- |
+| `fix/vulkan-checked-executor-shutdown` | `71b19e6` → `8ca35a0` | Factory regression red before repair, green afterward; real fake-context executor refuses shutdown despite global fence proof until callbacks retire. |
+| `fix/vulkan-initialize-retained-candidate` | `7f1e27c` → `8729c4b` | Public initialization/rollback regression red before guard, green afterward; strict disabled and enabled compilation passes. |
+| `test/vulkan-retained-timeout-proof` | `28725dd` → `ae4fd30` | Exact private dispatch timeout stub, scope/stickiness negative control and separate opt-in retained-owner case; no production frame-loop change. |
+
+At `8ca35a0`, strict GNU11 and GNU12 Release builds each pass all 87 registered
+tests: 82 passed, five native skips, zero failures. At integrated `ae4fd30`, GNU11
+again passes the full build and the same 87-test suite (35.04 s); the native ncnn
+build's three GPU-denied factory/batch/lifetime tests also pass. Fresh critic
+`retention_guards_fresh_critique` finds no new repair-specific Blocker/High or
+unmet requirement at `ae4fd30`. Earlier critic's initialization-retention High
+finding is remediated, rather than waived. Evidence includes
+`/run/user/1000/studiocast-retention-integrated-ks9apnc6` and
+`/run/user/1000/studiocast-retention-critique-h874g87m`.
+
+These repairs alone do not fix the native crash: the original uninstrumented
+`all_remove_odd` reproduces a natural 101.838 ms timeout followed by SIGSEGV at
+`8ca35a0`. Standard launch-under-GDB also reproduces it. All-stop GDB captures
+NVIDIA's `[vkrt] Analysis` worker faulting at glcore ELF offset `0x19309f0`, while
+the main thread is inside NVIDIA/GLX cleanup through the dynamic loader. Signal
+location alone is not a driver-only attribution. Evidence is under
+`/run/user/1000/studiocast-native-checked-f1m9yv3h` and
+`/run/user/1000/studiocast-current-allstop-f85hresv`.
+
+The isolated `unsafe_timeout_retained` case submits actual work, injects an
+initial timeout and denies every subsequent fence proof through its private
+dispatch table. It verifies no output/activity, rejected retries, unchanged
+allocations, pending shutdown, denied release, and weak configuration/context
+retention after manager destruction. Normal process return then reproduces
+SIGSEGV (20.61 s). Reducing this test to denoise alone also reproduces SIGSEGV
+(7.39 s). A diagnostic twin changes only terminal return after those assertions:
+flushing output and calling `std::_Exit(0)` avoids the fault (15.50 s). That
+diagnostic zero status is not production success, quiescence proof or sanitizer
+qualification. Original, twin and minimized binaries and patches are preserved
+under `studiocast-native-retained-proof-jbatj3jy`,
+`studiocast-retained-exit-twin-21x8xt0u` and
+`studiocast-retained-minimal-xwelgtd9` in `/run/user/1000`. Temporary source edits
+are restored.
+
+The implemented repair records actual permanent native retention, allows normal
+operation/fallback to continue, and makes the already-requested terminal process
+exit fail visibly after ordinary application cleanup. It preserves pending and
+denied-release evidence, avoids unsafe userspace finalizers, and adds no GPU
+wait or frame-loop work. This does not prove bounded kernel/driver reclamation
+or clean native sanitizer reporting.
+
+| Topic | Source commit → integrated commit | Result |
+| --- | --- | --- |
+| `fix/vulkan-retained-process-exit` | `232da9f` → `a5a1e25`; `8eb7661` → `6034ffb` | Neutral utility latch and terminal guard, permanent-retention producers and native entry points; pure fake tables do not select native exit handling. |
+| `fix/native-vulkan-retention-test-isolation` | `38ba80f` → `52ffe40` | Required native mains use the same terminal guard; intentional permanent-quarantine assertions run in checked exec children. |
+| `fix/qualified-vulkan-pre-submit-loss-test` | `75b4df0` → `78243ca` | Restore the original pre-submit device-loss assertions in the normal test path; this fixture has no pending native submission and does not require permanent retention. |
+
+`core/util/process_exit` has one monotonic latch. A temporary timeout or pending
+shutdown alone does not set it. Actual irreversible retention does, including the
+setup lease's whole-factory retention path where the factory destructor never
+runs. Each native application body returns before `FinalizeProcessExit` checks
+the latch, so ordinary local service, camera, audio and manager cleanup finishes
+first. Normal exit statuses remain unchanged. Retention emits an error, flushes
+stdout/stderr and terminates with status 1 without userspace finalizers. In
+particular, an existing status 77 cannot turn unsafe retention into a CTest skip.
+
+The process-exit regression covers six real GPU-free subprocess cases, ordinary
+statuses 0/7/77 and retained statuses 0/7/77. It proves local destruction, weak
+owner retention and skipped `atexit` handlers. Native negative children require
+exact status 1, their completed-assertions marker and the guard diagnostic;
+signals, timeouts, missing evidence and skips fail. No generic `WILL_FAIL` is
+used. The kernel move preserves all 293 assertion/comparison calls. A native run
+exposed the incorrect assumption that a synthetic queue-submit loss necessarily
+retained an owner; the original assertions were restored verbatim rather than
+changing production cleanup or weakening them.
+
+### Final local evidence and limitations
+
+At runtime source `52ffe40`, GNU11 and GNU12 strict disabled-backend Release
+profiles each pass 88 tests: 83 passed, five explicit native skips, zero failures.
+GNU12 build/CTest take 33.334/34.516 s. At final code `78243ca`, GNU11 again passes
+the full build and 88-test suite (63.135 s). Evidence is under
+`/run/user/1000/studiocast-exit-final-xvu5lzom`,
+`/run/user/1000/studiocast-final-gcc12-xwgYeSAr/exit52-*` and
+`/run/user/1000/studiocast-delivery-final-u5cei7rd`. Local CMake/CTest invocations
+use their actual executables because the user-local Python shims cannot import
+their package under an isolated HOME. Failed launcher logs remain preserved.
+
+The native Vulkan Release build retains the prior profile and verified replay
+SDK. The formerly crashing retained-owner case now exits exactly 1 with both
+retention witnesses and the guard diagnostic, without a signal. Four additional
+original `all_remove_odd` processes produce three passes and one deadline
+failure, preserved as normal exit 1 without a signal. Existing `unsafe_timeout_all`
+passes its positive late-proof control. Evidence is under
+`/run/user/1000/studiocast-vulkan-exit-qualified-40qan67z`.
+
+All six native component selections pass: MODNet numerical goldens, generic
+FastDVDnet/YuNet/FLX goldens, GPU tracking/dlib oracles, utility kernels with the
+proper empty-model control, final-stage integration and the corrected qualified
+executor. The actual manager matrix passes 25 of 29 selections, including
+Auto Frame's matte-inference assertion, real-face eye correction, model
+isolation, six budget axes, installed defaults and both timeout controls.
+Successful cases retain the one-upload/one-final-readback/one-synchronization,
+zero-intermediate-transfer, zero-CPU-tail, complete-family zero-Execute-allocation
+assertions. Both normal and missing-landmarks cold diagnostics pass. Native
+evidence is under `/run/user/1000/studiocast-native-final-xtj7i06x`; the corrected
+executor rerun is under
+`/run/user/1000/studiocast-qualified-native-fixed-d0gzvmmk`.
+
+The four manager failures remain failures, not skips or qualification passes:
+`all_blur_face`, `all_remove_face` and `all_replace_face` at 320×240 degrade to
+six stages during setup; a scoped diagnostic captures their model-preparation
+`vkWaitForFences` `VK_TIMEOUT`. `all_replace_odd` times out on its first frame at
+102.530 ms. The 100 ms policy is unchanged. No signal occurs in these tests.
+The temporary setup diagnostic is preserved under
+`/run/user/1000/studiocast-setup-failure-trace-_ggnw83v` and removed from source.
+These observations do not qualify sustained latency, FHD or full face-sized
+composition on this P1000. Existing desktop work and a concurrent two-job
+CPU-only CUDA build also exclude controlled performance claims.
+
+The separate current-source CUDA Release build matches the frozen prior CUDA
+configuration with zero profile differences. Required CUDA runtime self-test
+and all sixteen strict/automatic effect compositions pass. The pre-existing
+SDK and frozen binaries remain unchanged; no dependency was installed or
+downloaded. Build and execution evidence are under
+`/run/user/1000/studiocast-cuda-current-iwn8f5na` and
+`/run/user/1000/studiocast-cuda-final-_22ejumd`. This uses generated RGB and an
+in-memory writer; it does not qualify real-face CUDA correction or camera
+transport. The final test-only correction does not change CUDA runtime sources.
+
+Camera qualification is partial. The private daemon captured from `/dev/video0`
+and recorded 280 real Vulkan mirror/vignette writer commits at approximately
+15 FPS, with 280 uploads/readbacks/synchronizations and zero intermediate
+transfers, CPU tails or fallbacks. The raw consumer did not receive frames, so
+this is not an end-to-end camera pass. The physical camera's original
+1280×720 MJPG / 30 FPS settings were restored and the private daemon exited 0.
+Subsequently `/dev/video10` reports neither capture nor output capability and
+rejects format negotiation with `EINVAL`, preventing the second phase. No
+kernel/module reset, installed service change or privilege change was attempted.
+The loopback is not restored to its original uninitialized format; its current
+unavailable state needs host-side recovery/qualification. No captured image
+buffer was saved to a file. Evidence is under the `studiocast-camera-final-*` folders
+in `/run/user/1000`, particularly `yavvmawl` and `5ep5wk_2`.
+
+Automatic approval review rejected the subsequent read-only camera/loopback
+audit for "possible cybersecurity risk." This is a tooling limitation, not an
+application security finding. That audit was not retried through another
+mechanism. Camera consumer reads, model-backed camera transport, AMD/Intel,
+Khronos validation layers, forced non-push-descriptor execution, sustained
+latency and clean full-native sanitizer reporting remain unqualified. The user
+explicitly authorized best-effort hardware work and deployment feedback; these
+limits do not become successful hardware claims.
+
+Fresh critics approved the integrated retention guards (`ae4fd30`), process exit
+implementation (`52ffe40`) and qualified-loss correction (`78243ca`) without an
+unresolved Blocker/High or unmet source requirement. They independently ran
+GPU-denied tests and compared restored assertions; they did not run the GPU.
+Their evidence includes `studiocast-retention-critique-h874g87m` and
+`studiocast-exit-critic-o_fetg9k` under `/run/user/1000`; the final scoped critic
+`qualified_loss_final_critique` independently verifies the restored assertions
+and recorded native rerun. The final-head hosted workflow is still required before
+the conditionally authorized normal PR merge. A merge is not a signed release
+or deployment.

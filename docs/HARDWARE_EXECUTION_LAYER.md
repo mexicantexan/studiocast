@@ -126,6 +126,18 @@ receive a binding-validated retirement fence and freeze further normal enqueue
 and timing operations. A failed or device-lost fence does not prove quiescence;
 the owner retains the island until shutdown has explicit release proof.
 
+For Vulkan, release proof includes successful child/callback retirement in
+addition to the exact native fence. A refused failed-setup candidate cannot be
+replaced by another `Initialize()` call. Irreversible native retention also
+selects the terminal policy in `core/util/process_exit`: native executable
+bodies finish their ordinary local cleanup before checking that policy. Normal
+statuses remain unchanged; a retained native island produces exit 1 without
+userspace driver finalizers. Temporary pending shutdown does not select this
+policy, and no additional frame work or GPU wait is introduced. This is failure
+handling, not permission to claim quiescence or completed hardware qualification.
+See [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md) for the native
+exit regression and remaining platform limits.
+
 The current interface intentionally does not schedule true asynchronous work.
 Before asynchronous execution is added, the contract needs bounded in-flight
 slots, resource-reuse protection, cancellation, stale-generation handling,
