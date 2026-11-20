@@ -130,11 +130,11 @@ backend selection, and model/runtime diagnostics across CUDA and Vulkan.
   `-DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON` to compile it.
 - Installing Vulkan loader or ICD packages does not guarantee usable hardware
   support; runtime status reports device and fallback details.
-- Production Vulkan virtual-background matting remains unavailable until a
-  real ncnn adapter shares StudioCast's Vulkan device/queue/allocation domain,
-  runs a reviewed GPU-only graph, and proves device-resident input, alpha, and
-  output. The existing ncnn spike still uses CPU `ncnn::Mat` input/output and
-  is not a production fallback.
+- Production Vulkan model effects require the pinned StudioCast ncnn replay
+  SDK and compatible checksum-verified model packs. The production adapter
+  shares StudioCast's Vulkan device/queue and retains inference, tracking,
+  and intermediate images on GPU through the final readback. The separate
+  ncnn spike is not a production fallback.
 - Persisted Vulkan adapter identities use stable device properties rather than
   run-local enumeration indices. Indistinguishable identical adapters fail
   closed pending a stronger UUID/PCI identity.
@@ -142,9 +142,28 @@ backend selection, and model/runtime diagnostics across CUDA and Vulkan.
   support and valid Open Video model packs. On machines where `nvidia-smi` is
   unavailable during setup, pass `--onnxruntime-flavor gpu` when CUDA support is
   required.
-- The top-level `VERSION` file still reads `0.2.8` on this branch. Merging
-  `v0.2.9` to `master` should trigger the normal version-bump flow before
-  tagging the release.
+- The signed installer includes the matching source archive and curated model
+  metadata; model binaries are installed separately. Recommended operations
+  that reconcile virtual-camera host configuration require the separately
+  installed, trusted `studiocast-system-helper` OS package. The AppImage cannot
+  bootstrap that privileged helper; see `docs/SYSTEM_HELPER_PACKAGING.md`.
+
+### Qualification Limits
+
+- Software CI passes on Ubuntu 22.04, Ubuntu 24.04, and Linux Mint. On the
+  available NVIDIA Quadro P1000 / driver 535.309.01, the CUDA runtime self-test
+  and all 16 CUDA composition cases pass, as do six Vulkan component selections
+  and 25 of 29 Vulkan production-manager cases.
+- Four Vulkan combined-effect cases fail the unchanged 100 ms fence policy:
+  three face compositions time out during model warmup and one odd-size
+  replacement frame exceeds the deadline. These remain failures. Permanent
+  unsafe native retention now produces a diagnostic and controlled exit 1
+  after ordinary application cleanup instead of unsafe vendor finalization.
+- Real camera/loopback end-to-end consumption, AMD/Intel runtime behavior,
+  validation-layer coverage, sustained latency, and clean full-native sanitizer
+  reporting remain unqualified. The local loopback needs host recovery; its
+  state does not establish behavior on other installations. See
+  `docs/VULKAN_EFFECTS_COMPLETION.md` for exact evidence and limitations.
 
 ## v0.2.7
 
