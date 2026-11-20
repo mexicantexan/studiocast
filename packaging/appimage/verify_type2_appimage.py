@@ -395,6 +395,8 @@ def extract_and_verify(args: argparse.Namespace) -> dict[str, object]:
     parent_stat = parent.lstat()
     if not stat.S_ISDIR(parent_stat.st_mode) or parent.is_symlink():
         fail(f"extraction parent must be a real directory: {parent}")
+    if parent_stat.st_uid != os.geteuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
+        fail(f"extraction parent must be private and owned by the current user: {parent}")
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     try:
         result = subprocess.run(
@@ -406,6 +408,8 @@ def extract_and_verify(args: argparse.Namespace) -> dict[str, object]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            # Preserve payload modes for exact comparison inside the private parent.
+            umask=0,
             timeout=120,
             check=False,
         )

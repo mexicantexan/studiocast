@@ -103,7 +103,8 @@ class Type2AppImageVerifierTests(unittest.TestCase):
         output.chmod(0o755)
         return output
 
-    def verify(self, image: Path, archive: Path, name: str = "extracted") -> subprocess.CompletedProcess[str]:
+    def verify(self, image: Path, archive: Path, name: str = "extracted", *,
+               umask: int = 0o022) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 "python3", str(APPIMAGE_VERIFIER),
@@ -116,6 +117,7 @@ class Type2AppImageVerifierTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            umask=umask,
         )
 
     def test_valid_runtime_and_payload_are_verified_without_execution(self) -> None:
@@ -123,6 +125,44 @@ class Type2AppImageVerifierTests(unittest.TestCase):
         result = self.verify(self.image(self.payload(appdir)), self.archive(appdir))
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn('"verification": "studiocast-type2-appimage/v1"', result.stdout)
+
+    def test_payload_permissions_survive_restrictive_verifier_umask(self) -> None:
+        appdir = self.appdir()
+        source = appdir / "usr/share/studiocast/source/source.tar.gz"
+        source.chmod(0o777)
+        self.assertEqual(0o700, self.root.stat().st_mode & 0o777)
+        image = self.image(self.payload(appdir))
+        archive = self.archive(appdir)
+        for mask in (0o022, 0o077):
+            with self.subTest(umask=oct(mask)):
+                name = f"extracted-{mask:o}"
+                result = self.verify(image, archive, name, umask=mask)
+                self.assertEqual(0, result.returncode, result.stderr)
+                extracted = self.root / name / "usr/share/studiocast/source/source.tar.gz"
+                self.assertEqual(0o777, extracted.stat().st_mode & 0o7777)
+
+    def test_umask_cannot_hide_payload_permission_mismatch(self) -> None:
+        appdir = self.appdir()
+        source = appdir / "usr/share/studiocast/source/source.tar.gz"
+        source.chmod(0o755)
+        archive = self.archive(appdir)
+        source.chmod(0o777)
+        result = self.verify(self.image(self.payload(appdir)), archive)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("expected=0755 actual=0777", result.stderr)
+
+    def test_public_extraction_parent_is_rejected_before_writing_payload(self) -> None:
+        appdir = self.appdir()
+        (appdir / "usr/share/studiocast/source/source.tar.gz").chmod(0o644)
+        parent = self.root / "public"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+        result = self.verify(
+            self.image(self.payload(appdir)), self.archive(appdir), "public/extracted",
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("extraction parent must be private and owned by the current user", result.stderr)
+        self.assertFalse((parent / "extracted").exists())
 
     def test_malicious_runtime_and_ambiguous_squashfs_are_rejected(self) -> None:
         appdir = self.appdir()
