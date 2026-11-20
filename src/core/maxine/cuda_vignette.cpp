@@ -154,7 +154,7 @@ DONE:
 
 } // namespace
 
-bool CudaBgrVignette::Initialize(CudaDriverApi *cuda, std::string *error_out) {
+bool CudaBgrVignette::Initialize(studiocast::cuda::CudaDriverApi *cuda, std::string *error_out) {
   cuda_ = cuda;
   if (!cuda_) {
     if (error_out)
@@ -174,15 +174,15 @@ bool CudaBgrVignette::EnsureKernelLoaded(std::string *error_out) {
   }
 
   const auto &f = cuda_->f();
-  CUresult st = f.cuModuleLoadData(&module_, kVignettePtx);
-  if (st != CUDA_SUCCESS) {
+  studiocast::cuda::CUresult st = f.cuModuleLoadData(&module_, kVignettePtx);
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuModuleLoadData failed: " + cuda_->StatusToString(st);
     return false;
   }
 
   st = f.cuModuleGetFunction(&fn_, module_, "vignette_bgr_u8");
-  if (st != CUDA_SUCCESS || !fn_) {
+  if (st != studiocast::cuda::CUDA_SUCCESS || !fn_) {
     if (error_out)
       *error_out = "cuModuleGetFunction(vignette_bgr_u8) failed: " +
                    cuda_->StatusToString(st);
@@ -234,9 +234,9 @@ bool CudaBgrVignette::ApplyInPlace(NvCVImage *bgr_gpu, float intensity,
   const unsigned int gridX = (w + kBlockX - 1) / kBlockX;
   const unsigned int gridY = (h + kBlockY - 1) / kBlockY;
 
-  const CUresult st = cuda_->f().cuLaunchKernel(
+  const studiocast::cuda::CUresult st = cuda_->f().cuLaunchKernel(
       fn_, gridX, gridY, 1, kBlockX, kBlockY, 1, 0, stream, params, nullptr);
-  if (st != CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(vignette_bgr_u8) failed: " +
                    cuda_->StatusToString(st);

@@ -15,11 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../open_video/diagnose.h"
-#include "core/maxine/maxine_manager.h"
 #include "core/util/proc.h"
-#include "core/video/effects/broadcast_effect_maxine_gate.h"
-#include "core/video/effects/broadcast_effect_open_cuda_gate.h"
 #include "core/video/v4l2loopback.h"
 
 namespace studiocast::video {
@@ -143,6 +139,8 @@ std::string DiffPipelineCfg(const CameraPipelineConfig &a,
   add_b("prefer_mjpeg", a.prefer_mjpeg, b.prefer_mjpeg);
   add_i("scaling_backend", static_cast<int>(a.scaling_backend),
         static_cast<int>(b.scaling_backend));
+  add_i("compute_backend", static_cast<int>(a.compute_backend),
+        static_cast<int>(b.compute_backend));
   add_b("allow_cpu_resize", a.allow_cpu_resize, b.allow_cpu_resize);
 
   return first ? std::string("(no changes)") : oss.str();
@@ -230,6 +228,7 @@ bool VirtualCameraService::NeedsPipelineRestart(const CameraPipelineConfig &a,
          a.output_format != b.output_format ||
          a.prefer_mjpeg != b.prefer_mjpeg ||
          a.scaling_backend != b.scaling_backend ||
+         a.compute_backend != b.compute_backend ||
          a.allow_cpu_resize != b.allow_cpu_resize;
 }
 
@@ -422,6 +421,13 @@ VirtualCameraServiceStatus VirtualCameraService::Status() const {
   }
 
   s.pipeline = pipeline_ ? pipeline_->Status() : CameraPipelineStatus{};
+  if (!s.pipeline.running || s.pipeline.starting ||
+      s.pipeline_state != "running") {
+    // The supervisor state is the public lifecycle authority. A runner may be
+    // starting, stopping, failed/backing off, or retain compatibility fields;
+    // none of those states prove current-frame effect execution.
+    s.pipeline.effects_backends.clear();
+  }
   s.last_error = last_error_;
   return s;
 }
@@ -443,8 +449,6 @@ void VirtualCameraService::ThreadMain() {
   bool prevEnabled = false;
   bool prevWantRunRequested = false;
   bool prevWantRun = false;
-  bool prevBlocked = false;
-  bool prevEffectsSuppressed = false;
 
   CameraPipelineStatus prevPipeline{};
   bool havePrevPipeline = false;
@@ -463,14 +467,9 @@ void VirtualCameraService::ThreadMain() {
   auto stabilizeUntil = std::chrono::steady_clock::time_point{};
   std::deque<std::chrono::steady_clock::time_point> thrashEvents;
 
-  std::optional<studiocast::maxine::MaxineDiagnostics> maxineDiag;
-  auto lastMaxineDiagAt = std::chrono::steady_clock::time_point{};
-
-  std::optional<studiocast::open_cuda::OpenCudaDiagnostics> openCudaDiag;
-  auto lastOpenCudaDiagAt = std::chrono::steady_clock::time_point{};
-
   bool haveAppliedCfg = false;
   CameraPipelineConfig appliedPipelineCfg{};
+  std::optional<effects::BroadcastCameraEffects> appliedEffectsForPipeline;
 
   while (!stop_.load()) {
     VirtualCameraServiceConfig cfg;
@@ -685,9 +684,12 @@ void VirtualCameraService::ThreadMain() {
       consumerStableSince = std::chrono::steady_clock::time_point{};
     }
 
-    auto effects_for_pipeline = cfg.pipeline.effects;
-    bool effectsSuppressed = false;
-    std::string suppressMsg;
+    // Preserve canonical user intent. Backend discovery, strict selection,
+    // capability evidence, optional-stage degradation, and setup failure are
+    // owned by CameraPipeline's neutral production backend manager. The
+    // service supervises lifecycle only and must not probe or second-guess a
+    // backend before Start()/SetEffects().
+    const auto &effects_for_pipeline = cfg.pipeline.effects;
 
     const bool wantRunRequested =
         cfg.enabled && outputAvailableForState &&
@@ -712,214 +714,13 @@ void VirtualCameraService::ThreadMain() {
     bool wantRun = cfg.enabled && outputAvailableForState &&
                    (cfg.always_on || stabilizing || consumerStable);
 
-    // Gate expensive capture/processing threads based on engine availability.
-    // Keep loopback output alive (see EnsureOutputOpen above) so consumers
-    // still see a stable device.
-    bool blocked = false;
-    std::string blockedMsg;
-
-    if (wantRun) {
-      const auto plan =
-          effects::BuildBroadcastEffectsPlan(cfg.pipeline.effects);
-      const std::set<std::string> planned(plan.ordered_effect_ids.begin(),
-                                          plan.ordered_effect_ids.end());
-      const auto has = [&](std::string_view id) {
-        return planned.count(std::string(id)) != 0;
-      };
-
-      const bool wants_vb =
-          has(effects::contract::kEffectIdVirtualBackgroundBlur) ||
-          has(effects::contract::kEffectIdVirtualBackgroundRemove) ||
-          has(effects::contract::kEffectIdVirtualBackgroundReplace);
-
-      const bool wants_denoise =
-          has(effects::contract::kEffectIdVideoNoiseRemoval);
-      const bool wants_auto_frame = has(effects::contract::kEffectIdAutoFrame);
-      const bool wants_key_light =
-          has(effects::contract::kEffectIdVirtualKeyLight);
-      const bool wants_open_cuda_fx =
-          wants_vb || wants_denoise || wants_auto_frame || wants_key_light;
-
-      // Effects that currently require Maxine (no Open CUDA/Open Video
-      // fallback). NOTE: Eye Contact has an Open Video fallback in AUTO engine
-      // mode, so it should not block the pipeline when Maxine is unavailable.
-      const bool wants_maxine_only = false;
-
-      const auto ttl = std::chrono::seconds(2);
-
-      // --- Maxine gate ---
-      bool needMaxineGate = false;
-      bool needMaxineDiag = false;
-      if (cfg.pipeline.effects.engine ==
-          effects::EffectsEnginePreference::maxine) {
-        // Forced Maxine: any Maxine-backed effect blocks the pipeline when
-        // unavailable.
-        needMaxineGate =
-            effects::WantsMaxineForPlannedEffects(cfg.pipeline.effects);
-        needMaxineDiag = needMaxineGate;
-      } else if (cfg.pipeline.effects.engine ==
-                 effects::EffectsEnginePreference::auto_select) {
-        // Auto-select: only gate Maxine for effects that have no Open CUDA
-        // fallback.
-        needMaxineGate = wants_maxine_only;
-        // Still cache Maxine diagnostics if we need to decide whether Open CUDA
-        // effects can run on Maxine.
-        needMaxineDiag = needMaxineGate || wants_open_cuda_fx;
-      }
-
-      if (needMaxineDiag) {
-        if (!maxineDiag.has_value() ||
-            lastMaxineDiagAt == std::chrono::steady_clock::time_point{} ||
-            (now - lastMaxineDiagAt) >= ttl) {
-          studiocast::maxine::MaxineManager mgr;
-          maxineDiag = mgr.Diagnose(false);
-          lastMaxineDiagAt = now;
-        }
-      }
-
-      if (needMaxineGate && maxineDiag.has_value()) {
-        const auto gate =
-            effects::EvaluateMaxineGate(cfg.pipeline.effects, *maxineDiag);
-        if (!gate.ok) {
-          blocked = true;
-          blockedMsg = gate.message;
-          wantRun = false;
-        }
-      }
-
-      // --- Open CUDA gate ---
-      if (!blocked && wants_open_cuda_fx) {
-        bool needOpenCudaGate = false;
-        if (cfg.pipeline.effects.engine ==
-            effects::EffectsEnginePreference::open_cuda) {
-          needOpenCudaGate = true;
-        } else if (cfg.pipeline.effects.engine ==
-                   effects::EffectsEnginePreference::auto_select) {
-          // Auto-select: prefer Maxine when available; otherwise require Open
-          // CUDA for effects that have an Open CUDA implementation.
-          bool vb_available_in_maxine = false;
-          bool denoise_available_in_maxine = false;
-          bool auto_frame_available_in_maxine = false;
-          bool key_light_available_in_maxine = false;
-          if (maxineDiag.has_value()) {
-            const std::set<std::string> mx_avail(
-                maxineDiag->available_effects.begin(),
-                maxineDiag->available_effects.end());
-            if (wants_denoise) {
-              denoise_available_in_maxine =
-                  mx_avail.count(std::string(
-                      effects::contract::kEffectIdVideoNoiseRemoval)) != 0;
-            }
-            if (wants_vb) {
-              vb_available_in_maxine = true;
-              if (has(effects::contract::kEffectIdVirtualBackgroundBlur) &&
-                  !mx_avail.count(std::string(
-                      effects::contract::kEffectIdVirtualBackgroundBlur))) {
-                vb_available_in_maxine = false;
-              }
-              if (has(effects::contract::kEffectIdVirtualBackgroundRemove) &&
-                  !mx_avail.count(std::string(
-                      effects::contract::kEffectIdVirtualBackgroundRemove))) {
-                vb_available_in_maxine = false;
-              }
-              if (has(effects::contract::kEffectIdVirtualBackgroundReplace) &&
-                  !mx_avail.count(std::string(
-                      effects::contract::kEffectIdVirtualBackgroundReplace))) {
-                vb_available_in_maxine = false;
-              }
-            }
-            if (wants_auto_frame) {
-              auto_frame_available_in_maxine =
-                  mx_avail.count(
-                      std::string(effects::contract::kEffectIdAutoFrame)) != 0;
-            }
-            if (wants_key_light) {
-              key_light_available_in_maxine =
-                  mx_avail.count(std::string(
-                      effects::contract::kEffectIdVirtualKeyLight)) != 0;
-            }
-          }
-
-          // If any requested Open CUDA-capable effect is not available in
-          // Maxine, require Open CUDA.
-          needOpenCudaGate =
-              (wants_denoise && !denoise_available_in_maxine) ||
-              (wants_vb && !vb_available_in_maxine) ||
-              (wants_auto_frame && !auto_frame_available_in_maxine) ||
-              (wants_key_light && !key_light_available_in_maxine);
-        }
-
-        if (needOpenCudaGate &&
-            effects::WantsOpenCudaForPlannedEffects(cfg.pipeline.effects)) {
-          if (!openCudaDiag.has_value() ||
-              lastOpenCudaDiagAt == std::chrono::steady_clock::time_point{} ||
-              (now - lastOpenCudaDiagAt) >= ttl) {
-            openCudaDiag = studiocast::open_cuda::DiagnoseOpenCudaDefault();
-            lastOpenCudaDiagAt = now;
-          }
-
-          if (openCudaDiag.has_value()) {
-            const auto gate = effects::EvaluateOpenCudaGate(
-                cfg.pipeline.effects, *openCudaDiag);
-            if (!gate.ok) {
-              effectsSuppressed = true;
-              suppressMsg = gate.message;
-
-              // Selectively suppress only the effects that Open CUDA reports as
-              // unavailable.
-              const auto oc_has = [&](std::string_view id) {
-                const std::string sid(id);
-                return std::find(openCudaDiag->available_effects.begin(),
-                                 openCudaDiag->available_effects.end(),
-                                 sid) != openCudaDiag->available_effects.end();
-              };
-
-              if (effects_for_pipeline.video_noise_removal.enabled &&
-                  !oc_has(effects::contract::kEffectIdVideoNoiseRemoval)) {
-                effects_for_pipeline.video_noise_removal.enabled = false;
-              }
-
-              if (effects_for_pipeline.auto_frame.enabled &&
-                  !oc_has(effects::contract::kEffectIdAutoFrame)) {
-                effects_for_pipeline.auto_frame.enabled = false;
-              }
-
-              if (effects_for_pipeline.virtual_key_light.enabled &&
-                  !oc_has(effects::contract::kEffectIdVirtualKeyLight)) {
-                effects_for_pipeline.virtual_key_light.enabled = false;
-              }
-
-              if (effects_for_pipeline.virtual_background.mode !=
-                  effects::VirtualBackgroundMode::none) {
-                std::string_view vb_id;
-                switch (effects_for_pipeline.virtual_background.mode) {
-                case effects::VirtualBackgroundMode::blur:
-                  vb_id = effects::contract::kEffectIdVirtualBackgroundBlur;
-                  break;
-                case effects::VirtualBackgroundMode::remove:
-                  vb_id = effects::contract::kEffectIdVirtualBackgroundRemove;
-                  break;
-                case effects::VirtualBackgroundMode::replace:
-                  vb_id = effects::contract::kEffectIdVirtualBackgroundReplace;
-                  break;
-                default:
-                  break;
-                }
-                if (!vb_id.empty() && !oc_has(vb_id)) {
-                  effects_for_pipeline.virtual_background.mode =
-                      effects::VirtualBackgroundMode::none;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    // There is intentionally no service-level "blocked" state here. A setup
+    // failure is surfaced by CameraPipeline::Start and enters the existing
+    // bounded retry state; an optional stage may instead start degraded while
+    // preserving exact typed evidence in the pipeline snapshot.
 
     if (dbg) {
-      if (wantRunRequested != prevWantRunRequested || wantRun != prevWantRun ||
-          blocked != prevBlocked ||
-          effectsSuppressed != prevEffectsSuppressed) {
+      if (wantRunRequested != prevWantRunRequested || wantRun != prevWantRun) {
         std::ostringstream oss;
         oss << "decision enabled=" << (cfg.enabled ? 1 : 0)
             << " consumerPresent=" << (consumerPresent ? 1 : 0)
@@ -927,50 +728,34 @@ void VirtualCameraService::ThreadMain() {
             << " stabilizing=" << (stabilizing ? 1 : 0)
             << " wantRunRequested=" << (wantRunRequested ? 1 : 0)
             << " wantRun=" << (wantRun ? 1 : 0);
-        if (blocked)
-          oss << " blocked=\"" << blockedMsg << "\"";
-        if (effectsSuppressed)
-          oss << " suppressed=\"" << suppressMsg << "\"";
         VcamDbg(oss.str());
         prevWantRunRequested = wantRunRequested;
         prevWantRun = wantRun;
-        prevBlocked = blocked;
-        prevEffectsSuppressed = effectsSuppressed;
       }
     }
-
-    // Apply effects live regardless of consumer state.
-    pipeline_->SetEffects(effects_for_pipeline);
 
     auto pipelineCfgForPipeline = cfg.pipeline;
     pipelineCfgForPipeline.effects = effects_for_pipeline;
 
     auto pst = pipeline_->Status();
-    if (blocked) {
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (last_error_ != blockedMsg)
-          last_error_ = blockedMsg;
-      }
+    const bool pipelineRestartPending =
+        pst.running && haveAppliedCfg &&
+        NeedsPipelineRestart(appliedPipelineCfg, pipelineCfgForPipeline);
 
-      if (pst.running || pst.starting) {
-        if (dbg)
-          VcamDbg("pipeline Stop: blocked");
-        pipeline_->Stop();
-        CountStop("stop_blocked", false);
-        haveAppliedCfg = false;
-        nextStartRetry = std::chrono::steady_clock::time_point{};
-        pst = pipeline_->Status();
-      }
-    } else if (effectsSuppressed) {
-      std::lock_guard<std::mutex> lock(mu_);
-      if (last_error_ != suppressMsg)
-        last_error_ = suppressMsg;
+    // Start() consumes the effective effect configuration directly. While the
+    // pipeline is active, deliver only genuine live changes; stable supervisor
+    // polls must not create generation boundaries or repeat setup work. If a
+    // restart is already required, let the next Start() apply both changes in
+    // one generation instead of updating a pipeline that is about to stop.
+    if (!pipelineRestartPending && (pst.running || pst.starting) &&
+        (!appliedEffectsForPipeline.has_value() ||
+         *appliedEffectsForPipeline != effects_for_pipeline)) {
+      pipeline_->SetEffects(effects_for_pipeline);
+      appliedEffectsForPipeline = effects_for_pipeline;
     }
 
     // Restart if config changed and we are running.
-    if (pst.running && haveAppliedCfg &&
-        NeedsPipelineRestart(appliedPipelineCfg, pipelineCfgForPipeline)) {
+    if (pipelineRestartPending) {
       if (dbg)
         VcamDbg("pipeline Stop: config restart " +
                 DiffPipelineCfg(appliedPipelineCfg, pipelineCfgForPipeline));
@@ -1043,8 +828,7 @@ void VirtualCameraService::ThreadMain() {
           } else {
             {
               std::lock_guard<std::mutex> lock(mu_);
-              if (!effectsSuppressed &&
-                  last_error_.rfind("Pipeline start failed:", 0) == 0) {
+              if (last_error_.rfind("Pipeline start failed:", 0) == 0) {
                 last_error_.clear();
               }
               virtual_device_present_ = true;
@@ -1054,6 +838,7 @@ void VirtualCameraService::ThreadMain() {
             outputAvailableForState = true;
             haveAppliedCfg = true;
             appliedPipelineCfg = pipelineCfgForPipeline;
+            appliedEffectsForPipeline = effects_for_pipeline;
             nextStartRetry = std::chrono::steady_clock::time_point{};
             pipelineBecameRunningAt = now;
             if (cfg.always_on) {
@@ -1173,8 +958,6 @@ void VirtualCameraService::ThreadMain() {
     } else if (!outputAvailableForState) {
       pipelineState = "device_unavailable";
       activeNeeded = false;
-    } else if (blocked) {
-      pipelineState = "blocked";
     } else if (backingOff) {
       pipelineState = "backing_off";
       idleReason = "start_retry_backoff";

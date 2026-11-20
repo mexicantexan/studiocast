@@ -1,0 +1,32 @@
+{
+  "typed_video_status": {
+    "lifecycle": "failed",
+    "resolution": {
+      "status": "blocked",
+      "reason": "semantic_provider_unavailable",
+      "available": false
+    },
+    "active": {
+      "active_backend": "",
+      "effects": []
+    }
+  },
+  "engines": {
+    "open_vulkan": {
+      "matting_adapter_available": false,
+      "matting_production_ready": false
+    }
+  },
+  "video": {
+    "effect_readiness": {
+      "virtual_background.blur": {
+        "state": "backend_unavailable",
+        "backend": "open_vulkan",
+        "reason": "open_vulkan_matting_unavailable"
+      }
+    },
+    "pipeline": {
+      "effects_backends": ""
+    }
+  }
+}

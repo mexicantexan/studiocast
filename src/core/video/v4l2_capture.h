@@ -64,6 +64,15 @@ struct CapturedFrameView {
   bool timestamp_monotonic = false;
 };
 
+enum class CaptureAcquireResult {
+  frame,
+  no_frame,
+  failure,
+};
+
+// Pure classification used at the poll boundary and by hermetic tests.
+CaptureAcquireResult ClassifyCapturePollResult(int poll_result) noexcept;
+
 class V4l2Capture final {
 public:
   V4l2Capture() = default;
@@ -88,6 +97,13 @@ public:
   // Acquire a frame (DQBUF). Caller MUST call ReleaseFrame() with the returned
   // view.
   bool AcquireFrame(CapturedFrameView *out, int timeout_ms, std::string *error);
+
+  // Typed variant used by zero-timeout latest-frame draining. An expected
+  // timeout/EAGAIN returns no_frame without formatting an error; actual poll or
+  // DQBUF failures remain distinguishable and populate error when requested.
+  CaptureAcquireResult AcquireFrameDetailed(CapturedFrameView *out,
+                                            int timeout_ms,
+                                            std::string *error);
 
   // Release a frame back to driver (QBUF).
   bool ReleaseFrame(const CapturedFrameView &f, std::string *error);

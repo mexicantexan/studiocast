@@ -1,6 +1,7 @@
 #include "core/cuda/kernels/preprocess_to_nchw.h"
 
 #include "core/cuda/kernels/cuda_driver_cache.h"
+#include "core/cuda/kernels/prepared_preprocess_kernel_bundle.h"
 #include "core/cuda/kernels/ptx_pitch_contract.h"
 
 #include <cstdint>
@@ -47,7 +48,13 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     .param .f32 invStd1,
     .param .f32 invStd2,
     .param .u32 dstIsBgr,
-    .param .u32 srcIsBgr
+    .param .u32 srcIsBgr,
+    .param .u32 letterboxEnabled,
+    .param .u32 scaledW,
+    .param .u32 scaledH,
+    .param .u32 padX,
+    .param .u32 padY,
+    .param .u32 padValue
 )
 {
     .reg .pred  %p<8>;
@@ -70,6 +77,12 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     ld.param.f32 %f65, [invStd2];
     ld.param.u32 %r70, [dstIsBgr];
     ld.param.u32 %r71, [srcIsBgr];
+    ld.param.u32 %r72, [letterboxEnabled];
+    ld.param.u32 %r73, [scaledW];
+    ld.param.u32 %r74, [scaledH];
+    ld.param.u32 %r75, [padX];
+    ld.param.u32 %r76, [padY];
+    ld.param.u32 %r77, [padValue];
 
     mov.u32 %r7, %ctaid.x;
     mov.u32 %r8, %ntid.x;
@@ -85,6 +98,25 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     setp.ge.s32 %p2, %r14, %r6;
     or.pred %p3, %p1, %p2;
     @%p3 bra DONE;
+
+    setp.eq.u32 %p6, %r72, 0;
+    @%p6 bra SAMPLE_COORDS;
+    setp.lt.u32 %p1, %r10, %r75;
+    setp.lt.u32 %p2, %r14, %r76;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra PAD_PIXEL;
+    add.u32 %r78, %r75, %r73;
+    add.u32 %r79, %r76, %r74;
+    setp.ge.u32 %p1, %r10, %r78;
+    setp.ge.u32 %p2, %r14, %r79;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra PAD_PIXEL;
+    sub.u32 %r10, %r10, %r75;
+    sub.u32 %r14, %r14, %r76;
+    mov.u32 %r5, %r73;
+    mov.u32 %r6, %r74;
+
+SAMPLE_COORDS:
 
     // sx = srcW / dstW
     cvt.rn.f32.u32 %f1, %r2;
@@ -233,6 +265,18 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     mul.f32 %f67, %f47, %f66; // r
     mul.f32 %f68, %f53, %f66; // g
     mul.f32 %f69, %f59, %f66; // b
+    bra OUTPUT_PIXEL;
+
+PAD_PIXEL:
+    cvt.rn.f32.u32 %f67, %r77;
+    mov.f32 %f68, %f67;
+    mov.f32 %f69, %f67;
+    mov.f32 %f66, 0f3B808081;
+    mul.f32 %f67, %f67, %f66;
+    mul.f32 %f68, %f68, %f66;
+    mul.f32 %f69, %f69, %f66;
+
+OUTPUT_PIXEL:
 
     // Output channel order based on dstIsBgr
     // out0 = dstIsBgr ? b : r
@@ -250,6 +294,16 @@ static constexpr const char *kPreprocessPtx = R"ptx(
     mul.f32 %f75, %f75, %f65;
 
     // Compute output addresses (NCHW contiguous)
+    ld.param.u32 %r5, [dstW];
+    ld.param.u32 %r6, [dstH];
+    mov.u32 %r10, %ctaid.x;
+    mov.u32 %r85, %ntid.x;
+    mov.u32 %r86, %tid.x;
+    mad.lo.s32 %r10, %r10, %r85, %r86;
+    mov.u32 %r14, %ctaid.y;
+    mov.u32 %r85, %ntid.y;
+    mov.u32 %r86, %tid.y;
+    mad.lo.s32 %r14, %r14, %r85, %r86;
     mul.lo.u32 %r80, %r5, %r6;        // hw = dstW*dstH
     mad.lo.u32 %r81, %r14, %r5, %r10; // index
 
@@ -276,7 +330,7 @@ DONE:
 }
 )ptx";
 
-bool EnsureCudaReady(studiocast::maxine::CudaDriverApi **out_cuda,
+bool EnsureCudaReady(studiocast::cuda::CudaDriverApi **out_cuda,
                      std::string *error_out) {
   return detail::EnsureCudaReady(out_cuda, error_out);
 }
@@ -285,9 +339,11 @@ struct KernelState {
   // CUDA module/function handles are context-bound; keep this cache thread-local
   // with the thread-local driver/context owner in cuda_driver_cache.h.
   bool loaded = false;
-  studiocast::maxine::CUmodule module = nullptr;
-  studiocast::maxine::CUfunction fn = nullptr;
-  studiocast::maxine::CUcontext loaded_ctx = nullptr;
+  studiocast::cuda::CUmodule module = nullptr;
+  studiocast::cuda::CUfunction fn = nullptr;
+  studiocast::cuda::CUcontext loaded_ctx = nullptr;
+  studiocast::cuda::CudaDriverApi *owner = nullptr;
+  studiocast::cuda::CudaContextIdentity context_identity{};
 };
 
 KernelState &kernel() {
@@ -295,41 +351,62 @@ KernelState &kernel() {
   return s;
 }
 
-bool EnsureKernelLoaded(studiocast::maxine::CudaDriverApi *cuda,
-                        studiocast::maxine::CUfunction *out_fn,
-                        std::string *error_out) {
+bool LoadKernel(studiocast::cuda::CudaDriverApi *cuda,
+                bool require_exact_identity, std::string *error_out,
+                PreparedPreprocessKernelHandles *handles_out = nullptr,
+                PreparedPreprocessKernelStatus *status_out = nullptr) {
   if (error_out)
     error_out->clear();
-  if (out_fn)
-    *out_fn = nullptr;
-
-  studiocast::maxine::CUcontext cur = nullptr;
-  if (!detail::GetCurrentContext(cuda, &cur, error_out))
+  if (handles_out)
+    *handles_out = {};
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::invalid;
+  studiocast::cuda::CUcontext cur = nullptr;
+  if (!detail::GetCurrentContext(cuda, &cur, error_out)) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
     return false;
+  }
 
   KernelState &k = kernel();
   const auto &f = cuda->f();
 
-  if (k.loaded && k.loaded_ctx == cur) {
-    if (out_fn)
-      *out_fn = k.fn;
+  const auto *identity = cuda ? cuda->context_identity() : nullptr;
+  if (require_exact_identity && (!identity || !identity->Valid())) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
+    if (error_out)
+      *error_out = "PreparePreprocessKernel: CUDA context identity unavailable.";
+    return false;
+  }
+
+  if (k.loaded && k.loaded_ctx == cur && k.owner == cuda &&
+      (!require_exact_identity ||
+       (identity && k.context_identity == *identity))) {
+    if (handles_out) {
+      handles_out->context = k.loaded_ctx;
+      handles_out->module = k.module;
+      handles_out->function = k.fn;
+    }
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::ready;
     return true;
   }
 
-  studiocast::maxine::CUresult st = studiocast::maxine::CUDA_SUCCESS;
+  studiocast::cuda::CUresult st = studiocast::cuda::CUDA_SUCCESS;
   std::string jit_log;
-  studiocast::maxine::CUmodule module = nullptr;
-  studiocast::maxine::CUfunction fn = nullptr;
+  studiocast::cuda::CUmodule module = nullptr;
+  studiocast::cuda::CUfunction fn = nullptr;
   if (f.cuModuleLoadDataEx) {
     char info[8192] = {0};
     char err[8192] = {0};
 
-    studiocast::maxine::CUjit_option opts[] = {
-        studiocast::maxine::CU_JIT_INFO_LOG_BUFFER,
-        studiocast::maxine::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
-        studiocast::maxine::CU_JIT_ERROR_LOG_BUFFER,
-        studiocast::maxine::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
-        studiocast::maxine::CU_JIT_LOG_VERBOSE,
+    studiocast::cuda::CUjit_option opts[] = {
+        studiocast::cuda::CU_JIT_INFO_LOG_BUFFER,
+        studiocast::cuda::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+        studiocast::cuda::CU_JIT_ERROR_LOG_BUFFER,
+        studiocast::cuda::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        studiocast::cuda::CU_JIT_LOG_VERBOSE,
     };
     void *vals[] = {
         info,
@@ -348,7 +425,9 @@ bool EnsureKernelLoaded(studiocast::maxine::CudaDriverApi *cuda,
   } else {
     st = f.cuModuleLoadData(&module, kPreprocessPtx);
   }
-  if (st != studiocast::maxine::CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::module_load_failed;
     if (error_out) {
       *error_out = "cuModuleLoadData(preprocess_to_nchw_f32) failed: " +
                    cuda->StatusToString(st);
@@ -358,7 +437,10 @@ bool EnsureKernelLoaded(studiocast::maxine::CudaDriverApi *cuda,
     return false;
   }
   st = f.cuModuleGetFunction(&fn, module, "preprocess_to_nchw_f32");
-  if (st != studiocast::maxine::CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
+    if (status_out)
+      *status_out =
+          PreparedPreprocessKernelStatus::function_resolution_failed;
     if (error_out)
       *error_out = "cuModuleGetFunction(preprocess_to_nchw_f32) failed: " +
                    cuda->StatusToString(st);
@@ -368,6 +450,35 @@ bool EnsureKernelLoaded(studiocast::maxine::CudaDriverApi *cuda,
   k.fn = fn;
   k.loaded = true;
   k.loaded_ctx = cur;
+  k.owner = cuda;
+  k.context_identity = identity ? *identity
+                                : studiocast::cuda::CudaContextIdentity{};
+  if (handles_out) {
+    handles_out->context = k.loaded_ctx;
+    handles_out->module = k.module;
+    handles_out->function = k.fn;
+  }
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::ready;
+  return true;
+}
+
+bool ValidatePreparedKernel(
+    studiocast::cuda::CudaDriverApi *cuda,
+    const studiocast::cuda::CudaContextIdentity *expected,
+    studiocast::cuda::CUfunction *out_fn, std::string *error_out) {
+  if (out_fn)
+    *out_fn = nullptr;
+  KernelState &k = kernel();
+  const auto *current = cuda ? cuda->context_identity() : nullptr;
+  if (!k.loaded || !k.fn || !cuda || k.owner != cuda || !current ||
+      !current->Valid() || k.context_identity != *current ||
+      (expected && *expected != *current)) {
+    if (error_out)
+      *error_out = "PreprocessToTensor: setup-prepared CUDA kernel/context "
+                   "generation is missing, foreign, or stale.";
+    return false;
+  }
   if (out_fn)
     *out_fn = k.fn;
   return true;
@@ -375,10 +486,80 @@ bool EnsureKernelLoaded(studiocast::maxine::CudaDriverApi *cuda,
 
 } // namespace
 
-bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
-                        const ModelPreprocessSpec &spec,
-                        studiocast::maxine::CUstream stream,
-                        std::string *error_out) {
+bool PreparePreprocessKernel(studiocast::cuda::CudaDriverApi *cuda,
+                             std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (!cuda || !cuda->IsInitialized()) {
+    if (error_out)
+      *error_out = "PreparePreprocessKernel: CUDA driver is not initialized.";
+    return false;
+  }
+  if (!cuda->EnsureContext(error_out))
+    return false;
+  return LoadKernel(cuda, /*require_exact_identity=*/true, error_out);
+}
+
+bool PreparePreprocessKernelHandles(
+    CudaDriverApi *driver, const CudaContextIdentity &expected_context,
+    PreparedPreprocessKernelHandles *out,
+    PreparedPreprocessKernelStatus *status_out, std::string *error_out) {
+  if (error_out)
+    error_out->clear();
+  if (out)
+    *out = {};
+  if (status_out)
+    *status_out = PreparedPreprocessKernelStatus::invalid;
+  if (!driver || !driver->IsInitialized() || !expected_context.Valid() ||
+      !out) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::invalid_argument;
+    if (error_out)
+      *error_out = "Prepared preprocess kernel setup binding is invalid.";
+    return false;
+  }
+  if (!driver->EnsureContext(error_out)) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
+    return false;
+  }
+
+  const auto *current = driver->context_identity();
+  if (!current || !current->Valid()) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::unavailable;
+    if (error_out)
+      *error_out = "Prepared preprocess context identity is unavailable.";
+    return false;
+  }
+  if (current->physical_device != expected_context.physical_device ||
+      current->retained_context_id != expected_context.retained_context_id) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::foreign_context;
+    if (error_out)
+      *error_out = "Prepared preprocess setup context is foreign.";
+    return false;
+  }
+  if (current->logical_generation != expected_context.logical_generation) {
+    if (status_out)
+      *status_out = PreparedPreprocessKernelStatus::stale_context_generation;
+    if (error_out)
+      *error_out = "Prepared preprocess setup context generation is stale.";
+    return false;
+  }
+  return LoadKernel(driver, /*require_exact_identity=*/true, error_out, out,
+                    status_out);
+}
+
+namespace {
+
+bool PreprocessToTensorImpl(
+    studiocast::cuda::CudaDriverApi *cuda,
+    const studiocast::cuda::CudaContextIdentity *expected_context,
+    bool legacy_compatibility,
+    const CudaImage &src, const CudaTensor &dst,
+    const ModelPreprocessSpec &spec, studiocast::cuda::CUstream stream,
+    std::string *error_out) {
   if (error_out)
     error_out->clear();
   if (!src.Valid() || !dst.Valid()) {
@@ -423,12 +604,15 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
     return false;
   }
 
-  studiocast::maxine::CudaDriverApi *cuda = nullptr;
-  if (!EnsureCudaReady(&cuda, error_out))
+  studiocast::cuda::CUfunction fn = nullptr;
+  if (legacy_compatibility) {
+    if (!EnsureCudaReady(&cuda, error_out) ||
+        !LoadKernel(cuda, /*require_exact_identity=*/false, error_out))
+      return false;
+    fn = kernel().fn;
+  } else if (!ValidatePreparedKernel(cuda, expected_context, &fn, error_out)) {
     return false;
-  studiocast::maxine::CUfunction fn = nullptr;
-  if (!EnsureKernelLoaded(cuda, &fn, error_out))
-    return false;
+  }
 
   const auto &f = cuda->f();
 
@@ -449,6 +633,12 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
       (spec.dst_order == ChannelOrder::bgr) ? 1u : 0u;
   const std::uint32_t src_is_bgr =
       (src.format == PixelFormatGpu::bgr_u8) ? 1u : 0u;
+  const std::uint32_t letterbox_enabled = 0;
+  const std::uint32_t scaled_w = dst_w;
+  const std::uint32_t scaled_h = dst_h;
+  const std::uint32_t pad_x = 0;
+  const std::uint32_t pad_y = 0;
+  const std::uint32_t pad_value = 0;
 
   void *args[] = {
       const_cast<unsigned long long *>(&src_ptr),
@@ -466,6 +656,12 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
       const_cast<float *>(&inv2),
       const_cast<std::uint32_t *>(&dst_is_bgr),
       const_cast<std::uint32_t *>(&src_is_bgr),
+      const_cast<std::uint32_t *>(&letterbox_enabled),
+      const_cast<std::uint32_t *>(&scaled_w),
+      const_cast<std::uint32_t *>(&scaled_h),
+      const_cast<std::uint32_t *>(&pad_x),
+      const_cast<std::uint32_t *>(&pad_y),
+      const_cast<std::uint32_t *>(&pad_value),
   };
 
   constexpr unsigned int block_x = 16;
@@ -475,15 +671,37 @@ bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
   const unsigned int grid_y =
       (static_cast<unsigned int>(spec.dst_h) + block_y - 1u) / block_y;
 
-  const studiocast::maxine::CUresult st = f.cuLaunchKernel(
+  const studiocast::cuda::CUresult st = f.cuLaunchKernel(
       fn, grid_x, grid_y, 1, block_x, block_y, 1, 0, stream, args, nullptr);
-  if (st != studiocast::maxine::CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(preprocess_to_nchw_f32) failed: " +
                    cuda->StatusToString(st);
     return false;
   }
   return true;
+}
+
+} // namespace
+
+bool PreprocessToTensor(const CudaImage &src, const CudaTensor &dst,
+                        const ModelPreprocessSpec &spec,
+                        studiocast::cuda::CUstream stream,
+                        std::string *error_out) {
+  return PreprocessToTensorImpl(nullptr, nullptr,
+                                /*legacy_compatibility=*/true, src, dst, spec,
+                                stream, error_out);
+}
+
+bool PreprocessToTensorPrepared(
+    studiocast::cuda::CudaDriverApi *cuda,
+    const studiocast::cuda::CudaContextIdentity &context_identity,
+    const CudaImage &src, const CudaTensor &dst,
+    const ModelPreprocessSpec &spec, studiocast::cuda::CUstream stream,
+    std::string *error_out) {
+  return PreprocessToTensorImpl(cuda, &context_identity,
+                                /*legacy_compatibility=*/false, src, dst, spec,
+                                stream, error_out);
 }
 
 } // namespace studiocast::cuda::kernels

@@ -1,0 +1,68 @@
+{
+  "valid": true,
+  "schema_version": 1,
+  "hal_contract_version": 1,
+  "reason_code_version": 1,
+  "status_generation": 100,
+  "lifecycle": {
+    "id": 3,
+    "token": "running"
+  },
+  "writer_commit": {
+    "valid": true,
+    "capture_sequence": 501,
+    "output_commit_sequence": 9
+  },
+  "islands": [
+    {
+      "route": {
+        "id": 1,
+        "token": "final_visual"
+      },
+      "island_id": 1,
+      "adapter_instance_id": 101,
+      "backend": {
+        "id": 5,
+        "token": "vulkan"
+      },
+      "current": true
+    },
+    {
+      "route": {
+        "id": 2,
+        "token": "maxine_resident"
+      },
+      "island_id": 2,
+      "adapter_instance_id": 102,
+      "backend": {
+        "id": 3,
+        "token": "maxine"
+      },
+      "current": true
+    },
+    {
+      "route": {
+        "id": 3,
+        "token": "open_cuda_virtual_background"
+      },
+      "island_id": 3,
+      "adapter_instance_id": 103,
+      "backend": {
+        "id": 2,
+        "token": "cuda"
+      },
+      "current": true
+    }
+  ],
+  "aggregate": {
+    "current_island_count": 3,
+    "transfers": {
+      "uploads": 3,
+      "final_readbacks": 3,
+      "intermediate_readbacks": 0,
+      "intermediate_uploads": 0,
+      "synchronizations": 3,
+      "cpu_tail_boundaries": 2
+    }
+  }
+}

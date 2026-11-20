@@ -10,10 +10,20 @@ namespace studiocast::maxine {
 
 namespace {
 
-std::vector<SelectedGpu> ListGpusViaNvidiaSmi(std::string *error_out) {
+std::vector<SelectedGpu>
+ListGpusViaNvidiaSmi(std::string *error_out,
+                     const std::atomic_bool *stop_requested) {
+  util::ExecCaptureOptions options;
+  options.stop_requested = stop_requested;
   const auto res =
       util::ExecCapture("nvidia-smi --query-gpu=index,uuid,name,compute_cap "
-                        "--format=csv,noheader,nounits");
+                        "--format=csv,noheader,nounits",
+                        options);
+  if (res.cancelled) {
+    if (error_out)
+      *error_out = "nvidia-smi cancelled during service shutdown.";
+    return {};
+  }
   if (res.exit_code != 0) {
     if (error_out) {
       *error_out =
@@ -96,11 +106,12 @@ bool IsComputeCapabilitySupported(int major, int minor) {
   return false;
 }
 
-GpuSelectionResult SelectGpu(const config::GpuSelection &policy) {
+GpuSelectionResult SelectGpu(const config::GpuSelection &policy,
+                             const std::atomic_bool *stop_requested) {
   GpuSelectionResult result;
 
   std::string list_error;
-  result.all_gpus = ListGpusViaNvidiaSmi(&list_error);
+  result.all_gpus = ListGpusViaNvidiaSmi(&list_error, stop_requested);
   if (result.all_gpus.empty()) {
     result.error = list_error.empty() ? "No NVIDIA GPUs found." : list_error;
     return result;

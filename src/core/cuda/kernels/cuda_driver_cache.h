@@ -3,7 +3,7 @@
 #include <string>
 #include <utility>
 
-#include "core/maxine/cuda_driver_api.h"
+#include "core/cuda/cuda_driver_api.h"
 
 namespace studiocast::cuda::kernels::detail {
 
@@ -14,9 +14,9 @@ enum class CurrentContextState {
 };
 
 inline CurrentContextState
-ClassifyCurrentContext(studiocast::maxine::CUresult result,
-                       studiocast::maxine::CUcontext context) {
-  if (result != studiocast::maxine::CUDA_SUCCESS)
+ClassifyCurrentContext(studiocast::cuda::CUresult result,
+                       studiocast::cuda::CUcontext context) {
+  if (result != studiocast::cuda::CUDA_SUCCESS)
     return CurrentContextState::error;
   return context ? CurrentContextState::current : CurrentContextState::none;
 }
@@ -28,7 +28,7 @@ struct ThreadCudaDriverState {
   bool attempted = false;
   bool ok = false;
   std::string err;
-  studiocast::maxine::CudaDriverApi cuda;
+  studiocast::cuda::CudaDriverApi cuda;
 };
 
 inline ThreadCudaDriverState &ThreadCudaDriver() {
@@ -36,7 +36,7 @@ inline ThreadCudaDriverState &ThreadCudaDriver() {
   return state;
 }
 
-inline bool EnsureCudaReady(studiocast::maxine::CudaDriverApi **out_cuda,
+inline bool EnsureCudaReady(studiocast::cuda::CudaDriverApi **out_cuda,
                             std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -63,7 +63,7 @@ inline bool EnsureCudaReady(studiocast::maxine::CudaDriverApi **out_cuda,
     return false;
   }
 
-  studiocast::maxine::CUcontext cur = nullptr;
+  studiocast::cuda::CUcontext cur = nullptr;
   const auto cur_result = st.cuda.f().cuCtxGetCurrent(&cur);
   switch (ClassifyCurrentContext(cur_result, cur)) {
   case CurrentContextState::current:
@@ -95,8 +95,8 @@ inline bool EnsureCudaReady(studiocast::maxine::CudaDriverApi **out_cuda,
   return true;
 }
 
-inline bool GetCurrentContext(studiocast::maxine::CudaDriverApi *cuda,
-                              studiocast::maxine::CUcontext *out,
+inline bool GetCurrentContext(studiocast::cuda::CudaDriverApi *cuda,
+                              studiocast::cuda::CUcontext *out,
                               std::string *error_out) {
   if (out)
     *out = nullptr;
@@ -113,9 +113,9 @@ inline bool GetCurrentContext(studiocast::maxine::CudaDriverApi *cuda,
     return false;
   }
 
-  studiocast::maxine::CUcontext cur = nullptr;
+  studiocast::cuda::CUcontext cur = nullptr;
   const auto st = f.cuCtxGetCurrent(&cur);
-  if (st != studiocast::maxine::CUDA_SUCCESS || !cur) {
+  if (st != studiocast::cuda::CUDA_SUCCESS || !cur) {
     if (error_out)
       *error_out = "cuCtxGetCurrent failed: " + cuda->StatusToString(st);
     return false;

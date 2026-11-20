@@ -127,6 +127,22 @@ bool DlibFaceLandmarks::EnsureLandmarksForFrame(
     const std::uint8_t *rgb, int width, int height, std::size_t stride,
     std::uint64_t capture_sequence, const FaceDetection &face,
     FrameAnalysisCache *cache, std::string *error) {
+  return EnsureLandmarksForFrameImpl(
+      rgb, width, height, stride, capture_sequence, face, cache, true, error);
+}
+
+bool DlibFaceLandmarks::EnsurePreparedLandmarksForFrame(
+    const std::uint8_t *rgb, int width, int height, std::size_t stride,
+    std::uint64_t capture_sequence, const FaceDetection &face,
+    FrameAnalysisCache *cache, std::string *error) {
+  return EnsureLandmarksForFrameImpl(
+      rgb, width, height, stride, capture_sequence, face, cache, false, error);
+}
+
+bool DlibFaceLandmarks::EnsureLandmarksForFrameImpl(
+    const std::uint8_t *rgb, int width, int height, std::size_t stride,
+    std::uint64_t capture_sequence, const FaceDetection &face,
+    FrameAnalysisCache *cache, bool allow_setup, std::string *error) {
   if (error)
     error->clear();
 
@@ -146,8 +162,14 @@ bool DlibFaceLandmarks::EnsureLandmarksForFrame(
   if (cache->face_landmarks.has_value())
     return true;
 
-  if (!EnsureInitialized(error))
+  if (allow_setup) {
+    if (!EnsureInitialized(error))
+      return false;
+  } else if (!initialized_ || !impl_) {
+    if (error)
+      *error = "dlib prepared state is stale.";
     return false;
+  }
 
 #if !STUDIOCAST_HAVE_DLIB
   (void)face;
@@ -221,15 +243,13 @@ bool DlibFaceLandmarks::EnsureLandmarksForFrame(
     return false;
   }
 
-  FaceLandmarks out;
   const unsigned long n = det.num_parts();
-  out.points.reserve(n);
+  auto &out = cache->PrepareFaceLandmarks(n);
   for (unsigned long i = 0; i < n; ++i) {
     const auto pt = det.part(i);
     out.points.emplace_back(static_cast<float>(pt.x() + rx0),
                             static_cast<float>(pt.y() + ry0));
   }
-  cache->face_landmarks = std::move(out);
   return true;
 #endif
 }

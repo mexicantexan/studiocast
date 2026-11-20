@@ -1,0 +1,20 @@
+{
+  "typed_video_status": {
+    "lifecycle": "running",
+    "active": {
+      "active_backend": "mixed",
+      "mixed_backends": true
+    }
+  },
+  "video": {
+    "compute": {
+      "resolved_backend": "mixed",
+      "active_backend": "mixed",
+      "active_engines": ["open_vulkan", "maxine"]
+    },
+    "pipeline": {
+      "running": true,
+      "effects_backends": "eye_contact:maxine,mirror:open_vulkan"
+    }
+  }
+}

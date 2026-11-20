@@ -1,0 +1,29 @@
+{
+  "typed_video_status": {
+    "schema_version": 1,
+    "status_generation": 99,
+    "active": {
+      "active_backend": "",
+      "effects": []
+    }
+  },
+  "engines": {
+    "open_vulkan": {
+      "status_generation": 99,
+      "refresh_current": true,
+      "mirror_production_ready": true,
+      "vignette_fixed_center_production_ready": false,
+      "available_effects": ["mirror"]
+    }
+  },
+  "video": {
+    "compute": {
+      "status_generation": 99,
+      "resolved_backend": "vulkan",
+      "active_backend": ""
+    },
+    "pipeline": {
+      "effects_backends": ""
+    }
+  }
+}

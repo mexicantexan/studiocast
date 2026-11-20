@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "package": "studiocast-system-helper",
+  "authorized_entrypoint": {
+    "path": "/usr/libexec/studiocast/studiocast-system-helper",
+    "arguments": ["--json-stdin"]
+  },
+  "files": [
+    {
+      "source": "installer/privileged/studiocast_system_helper.py",
+      "destination": "/usr/libexec/studiocast/studiocast-system-helper",
+      "uid": 0,
+      "gid": 0,
+      "mode": "0755"
+    },
+    {
+      "source": "packaging/system-helper/com.studiocast.Installer1.policy",
+      "destination": "/usr/share/polkit-1/actions/com.studiocast.Installer1.policy",
+      "uid": 0,
+      "gid": 0,
+      "mode": "0644"
+    }
+  ]
+}

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/video/effects/broadcast_effects.h"
@@ -37,8 +41,55 @@ struct BroadcastEffectsPlan {
   std::string vignette_attach_to_effect_id;
 };
 
+// Allocation-free frame-loop representation compiled from the setup-time
+// string plan after backend availability and compatibility mutation is done.
+// Keep this enum aligned with the stable canonical effect IDs.
+enum class BroadcastEffectStage : std::uint8_t {
+  video_noise_removal,
+  eye_contact,
+  virtual_background_blur,
+  virtual_background_remove,
+  virtual_background_replace,
+  virtual_key_light,
+  auto_frame,
+  vignette,
+  mirror,
+  none,
+};
+
+inline constexpr std::size_t kBroadcastEffectStageCount = 9;
+
+std::string_view BroadcastEffectStageId(BroadcastEffectStage stage) noexcept;
+BroadcastEffectStage
+BroadcastEffectStageFromId(std::string_view effect_id) noexcept;
+
+struct PreparedBroadcastEffectsFramePlan {
+  PreparedBroadcastEffectsFramePlan() noexcept;
+
+  bool valid = true;
+  std::array<BroadcastEffectStage, kBroadcastEffectStageCount> ordered{};
+  std::array<std::int8_t, kBroadcastEffectStageCount> positions{};
+  std::uint8_t size = 0;
+  BroadcastEffectStage vignette_attachment = BroadcastEffectStage::none;
+  BroadcastEffectStage last_deferred_stage = BroadcastEffectStage::none;
+
+  bool Contains(BroadcastEffectStage stage) const noexcept;
+  bool AppearsAfter(BroadcastEffectStage stage,
+                    BroadcastEffectStage later) const noexcept;
+  BroadcastEffectStage StageAt(std::size_t index) const noexcept;
+};
+
+PreparedBroadcastEffectsFramePlan
+CompileBroadcastEffectsFramePlan(const BroadcastEffectsPlan &plan) noexcept;
+
 // Resolves effect ordering and compatibility/dependency rules.
 BroadcastEffectsPlan
 BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx);
+
+// Returns true when the canonical plan requests work from the selected video
+// compute backend. Mirror is compute work even when it is the only requested
+// effect; the live pipeline uses this seam when resolving an explicit Vulkan
+// backend and when deciding whether to initialize the shared Vulkan runtime.
+bool BroadcastEffectsPlanRequestsCompute(const BroadcastEffectsPlan &plan);
 
 } // namespace studiocast::video::effects

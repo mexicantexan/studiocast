@@ -45,6 +45,7 @@ private slots:
   void OnStart();
   void OnStop();
   void OnEnginePreferenceChanged(int index);
+  void OnComputeBackendChanged(int index);
   void OnMirrorToggled(bool checked);
   void OnBackgroundChanged(int index);
   void OnVbModelChanged(int index);
@@ -94,6 +95,7 @@ private:
   BuildCandidateEffectsFromUi() const;
 
   bool SendDaemonVideoConfig();
+  bool SendDaemonComputeBackendPreference();
   bool SendDaemonVideoEffects();
   bool SendDaemonEnabled(bool enabled);
 
@@ -111,6 +113,7 @@ private:
   QSpinBox *fpsSpin_ = nullptr;
 
   QComboBox *engineCombo_ = nullptr;
+  QComboBox *computeBackendCombo_ = nullptr;
   QCheckBox *mirrorCheck_ = nullptr;
 
   QLabel *cameraStateLabel_ = nullptr;
@@ -168,6 +171,7 @@ private:
   QCheckBox *vignetteCenterOnFaceCheck_ = nullptr;
 
   QLabel *effectEngineValue_ = nullptr;
+  QLabel *computeBackendValue_ = nullptr;
   QLabel *engineInfoBanner_ = nullptr;
   QLabel *maxineBanner_ = nullptr;
 

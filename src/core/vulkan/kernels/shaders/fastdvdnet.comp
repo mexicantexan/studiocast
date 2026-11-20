@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform Operation { uint op; } operation;
+layout(std430, binding = 0) readonly buffer Parameters {
+  uint width, height, padded_width, padded_height;
+  uint source_pitch, output_pitch, reset;
+  float sigma;
+} p;
+layout(std430, binding = 1) readonly buffer Source { uint pixels[]; } source;
+layout(std430, binding = 2) buffer Oldest { float values[]; } oldest;
+layout(std430, binding = 3) buffer Middle { float values[]; } middle;
+layout(std430, binding = 4) buffer Current { float values[]; } current;
+layout(std430, binding = 5) buffer Noisy { float values[]; } noisy;
+layout(std430, binding = 6) buffer NoiseMap { float values[]; } noise_map;
+layout(std430, binding = 7) readonly buffer Denoised { float values[]; } denoised;
+layout(std430, binding = 8) writeonly buffer Output { uint pixels[]; } output_image;
+
+void main() {
+  uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+  if (x >= p.padded_width || y >= p.padded_height) return;
+  uint index = y * p.padded_width + x;
+  uint plane = p.padded_width * p.padded_height;
+  if (operation.op == 0) {
+    uint sx = min(x, p.width - 1), sy = min(y, p.height - 1);
+    uint rgb = source.pixels[sy * p.source_pitch + sx];
+    for (uint channel = 0; channel < 3; ++channel) {
+      uint at = channel * plane + index;
+      float value = float((rgb >> (channel * 8)) & 255) / 255.0;
+      current.values[at] = value;
+      noisy.values[at] = p.reset != 0 ? value : oldest.values[at];
+      noisy.values[(3 + channel) * plane + index] =
+          p.reset != 0 ? value : middle.values[at];
+      noisy.values[(6 + channel) * plane + index] = value;
+      noisy.values[(9 + channel) * plane + index] = value;
+      noisy.values[(12 + channel) * plane + index] = value;
+    }
+    noise_map.values[index] = p.sigma;
+  } else {
+    uint rgb = 0xff000000;
+    for (uint channel = 0; channel < 3; ++channel) {
+      uint at = channel * plane + index;
+      oldest.values[at] = p.reset != 0 ? current.values[at] : middle.values[at];
+      middle.values[at] = current.values[at];
+      float raw = denoised.values[at];
+      float value = isnan(raw) ? 0.0 : clamp(raw, 0.0, 1.0);
+      rgb |= uint(roundEven(value * 255.0)) << (channel * 8);
+    }
+    if (x < p.width && y < p.height)
+      output_image.pixels[y * p.output_pitch + x] = rgb;
+  }
+}

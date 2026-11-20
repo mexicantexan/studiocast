@@ -51,7 +51,7 @@ bool CudaImage::Valid() const {
   return ptr != 0 && w > 0 && h > 0 && pitch >= RowBytes();
 }
 
-bool CudaImage::Allocate(studiocast::maxine::CudaDriverApi *cuda, int width,
+bool CudaImage::Allocate(studiocast::cuda::CudaDriverApi *cuda, int width,
                          int height, PixelFormatGpu fmt,
                          std::string *error_out) {
   if (error_out)
@@ -80,7 +80,7 @@ bool CudaImage::Allocate(studiocast::maxine::CudaDriverApi *cuda, int width,
   // exact active row width (RowBytes()).
   constexpr unsigned int kElementSizeBytes = 4;
 
-  studiocast::maxine::CudaDriverApi::PitchAllocation alloc{};
+  studiocast::cuda::CudaDriverApi::PitchAllocation alloc{};
   const std::size_t width_bytes = static_cast<std::size_t>(width) * bpp;
   const std::size_t alloc_width_bytes =
       ((width_bytes + (kElementSizeBytes - 1u)) / kElementSizeBytes) *
@@ -100,7 +100,7 @@ bool CudaImage::Allocate(studiocast::maxine::CudaDriverApi *cuda, int width,
   return true;
 }
 
-bool CudaImage::Free(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaImage::Free(studiocast::cuda::CudaDriverApi *cuda,
                      std::string *error_out) {
   if (error_out)
     error_out->clear();
@@ -134,7 +134,7 @@ bool CudaImage::Free(studiocast::maxine::CudaDriverApi *cuda,
   return true;
 }
 
-bool CudaImage::ReallocIfNeeded(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaImage::ReallocIfNeeded(studiocast::cuda::CudaDriverApi *cuda,
                                 int width, int height, PixelFormatGpu fmt,
                                 std::string *error_out) {
   if (error_out)
@@ -154,10 +154,10 @@ bool CudaImage::ReallocIfNeeded(studiocast::maxine::CudaDriverApi *cuda,
   return Allocate(cuda, width, height, fmt, error_out);
 }
 
-bool CudaImage::UploadFromCpuRgb24(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaImage::UploadFromCpuRgb24(studiocast::cuda::CudaDriverApi *cuda,
                                    const std::uint8_t *src,
                                    std::size_t src_stride_bytes,
-                                   studiocast::maxine::CUstream stream,
+                                   studiocast::cuda::CUstream stream,
                                    std::string *error_out) const {
   if (error_out)
     error_out->clear();
@@ -194,10 +194,10 @@ bool CudaImage::UploadFromCpuRgb24(studiocast::maxine::CudaDriverApi *cuda,
                                  error_out);
 }
 
-bool CudaImage::DownloadToCpuRgb24(studiocast::maxine::CudaDriverApi *cuda,
+bool CudaImage::DownloadToCpuRgb24(studiocast::cuda::CudaDriverApi *cuda,
                                    std::uint8_t *dst,
                                    std::size_t dst_stride_bytes,
-                                   studiocast::maxine::CUstream stream,
+                                   studiocast::cuda::CUstream stream,
                                    std::string *error_out) const {
   if (error_out)
     error_out->clear();

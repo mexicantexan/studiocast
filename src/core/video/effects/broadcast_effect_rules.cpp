@@ -7,6 +7,17 @@
 namespace studiocast::video::effects {
 namespace {
 
+constexpr std::size_t StageIndex(BroadcastEffectStage stage) {
+  return static_cast<std::size_t>(stage);
+}
+
+constexpr bool CanBeLastDeferredStage(BroadcastEffectStage stage) {
+  return stage != BroadcastEffectStage::none &&
+         stage != BroadcastEffectStage::video_noise_removal &&
+         stage != BroadcastEffectStage::vignette &&
+         stage != BroadcastEffectStage::mirror;
+}
+
 inline bool VignetteEffective(const BroadcastCameraEffects &fx) {
   return fx.vignette.enabled && fx.vignette.intensity > 0;
 }
@@ -50,6 +61,107 @@ inline bool IsGpuStageEffectId(std::string_view id) {
 
 } // namespace
 
+std::string_view BroadcastEffectStageId(BroadcastEffectStage stage) noexcept {
+  using namespace contract;
+  switch (stage) {
+  case BroadcastEffectStage::video_noise_removal:
+    return kEffectIdVideoNoiseRemoval;
+  case BroadcastEffectStage::eye_contact:
+    return kEffectIdEyeContact;
+  case BroadcastEffectStage::virtual_background_blur:
+    return kEffectIdVirtualBackgroundBlur;
+  case BroadcastEffectStage::virtual_background_remove:
+    return kEffectIdVirtualBackgroundRemove;
+  case BroadcastEffectStage::virtual_background_replace:
+    return kEffectIdVirtualBackgroundReplace;
+  case BroadcastEffectStage::virtual_key_light:
+    return kEffectIdVirtualKeyLight;
+  case BroadcastEffectStage::auto_frame:
+    return kEffectIdAutoFrame;
+  case BroadcastEffectStage::vignette:
+    return kEffectIdVignette;
+  case BroadcastEffectStage::mirror:
+    return kEffectIdMirror;
+  case BroadcastEffectStage::none:
+    return {};
+  }
+  return {};
+}
+
+BroadcastEffectStage
+BroadcastEffectStageFromId(std::string_view effect_id) noexcept {
+  for (std::size_t index = 0; index < kBroadcastEffectStageCount; ++index) {
+    const auto stage = static_cast<BroadcastEffectStage>(index);
+    if (effect_id == BroadcastEffectStageId(stage))
+      return stage;
+  }
+  return BroadcastEffectStage::none;
+}
+
+PreparedBroadcastEffectsFramePlan::PreparedBroadcastEffectsFramePlan() noexcept {
+  ordered.fill(BroadcastEffectStage::none);
+  positions.fill(-1);
+}
+
+bool PreparedBroadcastEffectsFramePlan::Contains(
+    BroadcastEffectStage stage) const noexcept {
+  const std::size_t index = StageIndex(stage);
+  return index < positions.size() && positions[index] >= 0;
+}
+
+bool PreparedBroadcastEffectsFramePlan::AppearsAfter(
+    BroadcastEffectStage stage, BroadcastEffectStage later) const noexcept {
+  const std::size_t stage_index = StageIndex(stage);
+  const std::size_t later_index = StageIndex(later);
+  return stage_index < positions.size() && later_index < positions.size() &&
+         positions[stage_index] >= 0 &&
+         positions[later_index] > positions[stage_index];
+}
+
+BroadcastEffectStage PreparedBroadcastEffectsFramePlan::StageAt(
+    std::size_t index) const noexcept {
+  return index < size ? ordered[index] : BroadcastEffectStage::none;
+}
+
+PreparedBroadcastEffectsFramePlan
+CompileBroadcastEffectsFramePlan(const BroadcastEffectsPlan &plan) noexcept {
+  PreparedBroadcastEffectsFramePlan prepared;
+
+  for (const std::string &effect_id : plan.ordered_effect_ids) {
+    const BroadcastEffectStage stage =
+        BroadcastEffectStageFromId(effect_id);
+    const std::size_t stage_index = StageIndex(stage);
+    if (stage == BroadcastEffectStage::none ||
+        stage_index >= prepared.positions.size() ||
+        prepared.positions[stage_index] >= 0 ||
+        prepared.size >= prepared.ordered.size()) {
+      prepared.valid = false;
+      continue;
+    }
+    prepared.positions[stage_index] =
+        static_cast<std::int8_t>(prepared.size);
+    prepared.ordered[prepared.size++] = stage;
+  }
+
+  if (!plan.vignette_attach_to_effect_id.empty()) {
+    prepared.vignette_attachment =
+        BroadcastEffectStageFromId(plan.vignette_attach_to_effect_id);
+    if (prepared.vignette_attachment == BroadcastEffectStage::none ||
+        !prepared.Contains(prepared.vignette_attachment)) {
+      prepared.valid = false;
+    }
+  }
+
+  for (std::size_t index = prepared.size; index > 0; --index) {
+    const BroadcastEffectStage stage = prepared.ordered[index - 1];
+    if (CanBeLastDeferredStage(stage)) {
+      prepared.last_deferred_stage = stage;
+      break;
+    }
+  }
+  return prepared;
+}
+
 BroadcastEffectsPlan
 BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
   BroadcastEffectsPlan plan;
@@ -76,14 +188,6 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
             "Disabled: virtual background replace requires `replace_path`."});
     enable_virtual_background = false;
     vb_id.clear();
-  }
-
-  // 2) Mirror is intentionally not implemented in the pipeline.
-  // Keep it in the schema/UI for backward compatibility, but never schedule it.
-  if (enable_mirror) {
-    plan.disabled.push_back(DisabledEffectByRule{
-        .id = std::string(contract::kEffectIdMirror),
-        .reason = "Disabled: mirror is not supported (ignored)."});
   }
 
   // ---- Ordering rules ----
@@ -126,6 +230,13 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
     plan.ordered_effect_ids.push_back(std::string(contract::kEffectIdVignette));
   }
 
+  // Mirror is the final visual transform. Face/subject analysis and every
+  // other effect must consume the unmirrored frame, and the live Vulkan path
+  // applies this stage after any output resize.
+  if (enable_mirror) {
+    plan.ordered_effect_ids.push_back(std::string(contract::kEffectIdMirror));
+  }
+
   // Decide vignette attachment.
   if (enable_vignette) {
     // Attach to the last enabled GPU stage (excluding vignette itself).
@@ -142,6 +253,20 @@ BuildBroadcastEffectsPlan(const BroadcastCameraEffects &fx) {
   }
 
   return plan;
+}
+
+bool BroadcastEffectsPlanRequestsCompute(const BroadcastEffectsPlan &plan) {
+  using namespace contract;
+  for (const std::string &id : plan.ordered_effect_ids) {
+    if (id == kEffectIdMirror || id == kEffectIdVideoNoiseRemoval ||
+        id == kEffectIdEyeContact || id == kEffectIdVirtualBackgroundBlur ||
+        id == kEffectIdVirtualBackgroundRemove ||
+        id == kEffectIdVirtualBackgroundReplace || id == kEffectIdAutoFrame ||
+        id == kEffectIdVirtualKeyLight || id == kEffectIdVignette) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace studiocast::video::effects

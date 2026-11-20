@@ -2,7 +2,7 @@
 
 Status: manual regression plan for the refaced GUI and hardware desktop
 workflows.
-Last updated: 2026-07-03.
+Last updated: 2026-11-12.
 
 This document tracks manual tests that cannot be covered deterministically in
 CI because they require real V4L2 devices, v4l2loopback behavior, desktop
@@ -553,6 +553,238 @@ Expected:
 - Failure leaves the previous working daemon state intact or clearly reports
   what changed.
 
+## HAL Hardware Qualification
+
+Before recording HAL parity or release qualification, capture the source
+commit, build options, exact model identities, GPU and driver, command and exit
+status, writer-commit evidence, and transfer, synchronization, and CPU-tail
+counters. A component oracle, skipped opt-in test, successful session setup, or
+loader enumeration is not a successful production camera run.
+
+- [ ] Run strict Open CUDA production smoke cases for each supported effect and
+  combination on every claimed NVIDIA configuration.
+- [ ] Confirm output publication and a successful writer commit before calling
+  a route active.
+- [ ] Exercise automatic Maxine preference and CUDA fallback, Auto Frame
+  dependencies, missing and invalid models, optional-stage failure, provider or
+  device loss, reconfiguration, stop, cleanup retry, and rollback.
+- [ ] Run the final Vulkan matrix on every NVIDIA, AMD, or Intel family claimed
+  by the release. Do not extrapolate one vendor's result to another.
+
+- [ ] Confirm camera and smoke execution use
+  `BuildProductionVideoBackendSetupRequest` with canonical defaults; do not
+  disable the Maxine greenscreen temporal default to make CUDA smoke pass.
+- [ ] Verify exact CUDA/Vulkan resident mirror separately from the retained
+  automatic/Maxine host mirror finalizer and its committed CPU-tail record.
+- [ ] Record bounded face/matte metadata readbacks and CPU tracking/planning
+  tails for Auto Frame and Eye Contact, in addition to full-frame transfers.
+- [ ] Inject unsuccessful explicit and automatic/discontinuity temporal resets.
+  Confirm execution and publication stop, stale active attribution clears, and
+  only valid re-preparation permits recovery.
+- [ ] Under unconstrained automatic denoise/Eye Contact selection, force a
+  permitted native setup failure and verify host compatibility only after safe
+  cleanup. Strict CUDA or incompatible provider requests, mixed CUDA semantics,
+  pending cleanup, and quarantine must never take that fallback.
+- [ ] Reject insufficient persistent, scratch, upload/readback staging,
+  resource-count, and in-flight-slot budgets before native acquisition.
+- [ ] Fail a submitted frame before final readback and confirm the retirement
+  fence freezes normal enqueue/timing work. Lost or unproven fences must retain
+  resources rather than authorizing release.
+- [ ] Validate installed model metadata against its actual graph. In particular,
+  the current YuNet template is 640x640; a stale installed 320x320 manifest needs
+  an explicitly authorized transaction repair. Validation must preserve the
+  installed pack and test candidates in isolated HOME/XDG roots.
+
+The previous CUDA parity checkpoint `b204b0a` includes CUDA composition, layered
+unsubmitted-frame retirement, disabled final-stage timing, and Vulkan shutdown
+context-lifetime repairs. The
+[HAL evidence table](HARDWARE_EXECUTION_LAYER.md#evidence-and-remaining-gates)
+and [local verification ledger](HAL_PARITY_COMPLETION.md#local-remediation-record-2026-11-11)
+record exact broad/native tests and critique status. Native matrix input is
+generated RGB, uses an in-memory writer, and detects no face. This proves
+bounded execution, not camera transport, gaze correction, visual quality,
+optimized latency, other vendor families, or release readiness. Automatic host
+mirror needs separate camera-level evidence.
+
+The corrected FastDVDnet artifact, metadata, and full license are published
+and byte-verified at immutable Hugging Face commit `8ffe9688`; local catalog
+`2026-11-11` promotes that same sigma15 hash. Publication and catalog promotion
+do not replace an installed pack or constitute a signed application release.
+Verify model identity explicitly. Old unmarked metadata must remain preserved
+with `curated_ownership_unverified`, and sigma25/sigma50 BYO templates remain
+untouched.
+
+A native sanitizer helper no longer reports the Vulkan use-after-free, but
+unresolved LeakSanitizer/symbolizer diagnostics
+prevent a clean full-native-sanitizer claim; see the durable ledger.
+
+Opt-in CI now requires the actual Vulkan final resident integration executable
+on each selected vendor runner. CUDA requires the production smoke executable
+with `--require`, dlib, a preinstalled read-only `cuda_model_root`, exact
+matting/face/eye/denoise model IDs, a readable `cuda_replace_path`, failure
+propagation, and retained evidence logs. It covers fifteen strict topologies
+and an automatic six-stage resident case; automatic host mirror needs separate
+camera-level evidence. A portable
+skip, a configured workflow, or a kernel-only pass is not completed hardware
+qualification.
+
+## Resident Vulkan matting validation
+
+Build the opt-in patched dependency and production configuration described in
+[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#building-resident-vulkan-matting).
+Use the approved curated MODNet pack (catalog `2026-11-12`) or a verified
+converted candidate, and the original ONNX golden tensors
+from [how_to_add_your_own_model.md](how_to_add_your_own_model.md#vulkan-matting-schema-v2).
+Keep candidates and HOME/XDG state isolated; never repair installed packs as a
+side effect of validation.
+
+Required component test (all three model inputs must be supplied together):
+
+```bash
+STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+STUDIOCAST_NCNN_MATTING_PARAM=/candidate/model.ncnn.param \
+STUDIOCAST_NCNN_MATTING_BIN=/candidate/model.ncnn.bin \
+STUDIOCAST_NCNN_MATTING_GOLDEN_ROOT=/candidate/numerical \
+  ./build-vulkan-matting/studiocast-ncnn-vulkan-matting-runtime-tests
+```
+
+Required actual production-manager test, using a preinstalled read-only isolated
+model tree whose path ends in `studiocast/models/open_video` and a readable
+replacement image:
+
+```bash
+./build-vulkan-matting/studiocast-vulkan-matting-production-smoke --require \
+  --model-root /isolated/data/studiocast/models/open_video \
+  --model-id modnet-webnn-256-fp32 --replace-path /fixtures/replacement.ppm \
+  --frames 3
+```
+
+The manager smoke covers eight cases: blur/remove/replace individually, each
+with key light plus fixed-center vignette and mirror, then key light alone and
+with the same final stages. Generated RGB input is 64x48 and output 32x24;
+completion uses the camera's 100 ms deadline, 1 ms poll interval, and 100-poll
+cap. It checks strict cold diagnostics, exact model identity, successful stages,
+zero host allocations during execution, writer-commit attribution, zero
+fallback, one upload/one final readback, zero intermediate transfers, and zero
+CPU tails. Exit 77 is a skip and cannot count as native qualification. The
+opt-in `vulkan-matting-production` CI job requires explicit preprovisioned
+runner/dependency/model/image inputs and fails on a skip; configuration is not
+evidence that remote GPU CI ran.
+
+- [ ] Verify all four consumer readiness predicates after explicit daemon
+  diagnostics refresh; routine status polling must consume cached facts.
+- [ ] Disable the production build, remove/mismatch an artifact, select a foreign
+  device/provider, or introduce a CPU-only layer. Each affected consumer must
+  remain unavailable without disabling independently valid mirror/vignette.
+- [ ] Confirm a failed writer cannot create active effect/backend attribution.
+- [ ] Reconfigure geometry/effects/model and verify one new prepared island,
+  bounded allocations, graph reuse, shared matte, and exact selected queue.
+- [ ] Inject low budgets, initial recording failure, internal submit/reset,
+  timeout, and device loss. Unsafe completion must quarantine and retain all
+  resources until explicit quiescence proof permits shutdown.
+- [ ] Test artifact replacement between verification and model load; only the
+  immutable verified snapshot may be consumed.
+- [ ] Repeat on each claimed vendor and test forced non-push-descriptor behavior,
+  Khronos validation layers, real portrait images, real camera/V4L2 writers,
+  optional failure/recovery, optimized latency, and native sanitizers.
+
+Available component evidence, 2026-11-11: Quadro P1000 / NVIDIA driver
+535.309.01 passed six real MODNet golden cases, with worst maximum error
+`0.000112742`, worst MAE `7.06813e-7`, and all threshold-mask IoU values 1.
+The test also passed changing-output/reuse, CPU-layer and low-budget rejection,
+provider/initial-recording negatives, and timeout quarantine. Retained native
+allocations were 232 and full context peak was 111,266,560 bytes, within the
+256 MiB / 512-resource reservation. Log:
+`/tmp/studiocast-ncnn-native-v2-final-test-20261111.log`.
+
+The actual production-manager matrix passed at source
+`22c8724d82532e483c269e15c44952926c1e6964` (exit 0, 53.61 seconds), including
+immutable verified snapshot loading and camera-bounded fence waits. Strict cold
+diagnostics passed and all eight cases committed three frames each: 24 writer
+commits, 24 uploads, 24 final readbacks, zero intermediate transfers, CPU tails,
+execution-time host allocations, or fallback frames. Every requested stage
+succeeded. Synchronizations were 7–9 per frame within the 16-operation cap and
+100 ms completion policy. Evidence is `matrix.log` and `run.json` under
+`/tmp/studiocast-vulkan-camera-smoke-20261111-seity1rh/`, including exact binary,
+dependency, and model hashes.
+
+This is generated-input/in-memory-writer evidence. No AMD/Intel GPU or Khronos
+validation layers were available. Forced non-push-descriptor execution, real
+portrait quality, real camera/V4L2 transport, optimized latency, and clean
+full-native-sanitizer qualification remain open deployment feedback items.
+The approved model publication is complete at Hugging Face commit
+`f6be359c49ba07163287fe3732dc4a3024b91f60`; signed application release remains
+separate. Consult
+[VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md) for the
+exact current integration and validation record.
+
+## Open Vulkan Adapter Selection
+
+- [ ] On a system with multiple Vulkan devices, inspect
+  `engines.open_vulkan.device_candidates` in daemon status.
+
+Expected:
+
+- Every loader-enumerated device has a stable `enumeration_index` for that run,
+  device/vendor/type details, its compute queue family or a rejection reason,
+  and selected/eligible state.
+- Automatic selection prefers a discrete GPU, then an integrated GPU, then a
+  virtual GPU. A CPU Vulkan implementation such as lavapipe is not treated as
+  hardware acceleration by default.
+- `selected_device_index`, `device_selection_request`, and the top-level device
+  fields agree with the selected candidate.
+
+- [ ] Select a specific candidate and restart the daemon:
+
+```bash
+STUDIOCAST_VULKAN_DEVICE_INDEX=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Open Vulkan selects enumeration index `1`, or reports
+  `vulkan_requested_device_not_found` / `vulkan_requested_device_no_compute_queue`
+  without silently choosing another adapter.
+- Vulkan enumeration indices are not assumed to match NVIDIA `nvidia-smi`
+  indices or the generic `STUDIOCAST_GPU_INDEX` setting.
+
+- [ ] Persist a candidate's `stable_id` through the daemon, then restart it:
+
+```bash
+build/studiocastctl video set vulkan_device=v1:VVVV:DDDD:T:normalized-name
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- `video.vulkan_adapter.configured_device` and
+  `engines.open_vulkan.device_selection_request` report the saved identity.
+- Reordering loader enumeration does not change the selected physical adapter.
+- If the saved identity is absent, status reports
+  `vulkan_requested_device_not_found` without choosing another adapter.
+- If multiple indistinguishable adapters match the fallback identity, status
+  reports `vulkan_requested_device_ambiguous` and fails closed. The v1 identity
+  is a stable-property fallback, not a PCI/UUID identity, so identical GPUs may
+  require a future stronger platform identifier.
+- A changed selection applies to subsequently initialized Vulkan devices;
+  restart the daemon before validating an already-running pipeline.
+
+- [ ] On a CPU-only Vulkan system, test the explicit software-device opt-in:
+
+```bash
+STUDIOCAST_VULKAN_ALLOW_CPU=1 build/studiocastd
+build/studiocastctl status --pretty
+```
+
+Expected:
+
+- Without the opt-in, status reports `vulkan_only_cpu_devices_available` and
+  explains that a working GPU driver/ICD is needed.
+- With the opt-in, the CPU candidate can initialize, but diagnostics set
+  `cpu_device_selected=true` and warn that it is software fallback rather than
+  hardware GPU acceleration.
+
 ## Error And Recovery Cases
 
 - [ ] Start GUI and daemon, then unplug the physical camera during streaming.
@@ -610,3 +842,96 @@ Expected:
   Open CUDA installed, and Maxine installed.
 - Long-running stability and thermal/performance behavior need a separate soak
   plan.
+
+## Complete resident Vulkan model effects
+
+Build the production ncnn runtime above with `STUDIOCAST_ENABLE_DLIB=ON` and
+usable dlib development files. Use a separate verified model tree containing
+MODNet, FastDVDnet sigma15, YuNet FP32, the 68-point dlib predictor and FLX FP32.
+The added ncnn artifacts must be published/verified or supplied as explicit
+isolated converted candidates; an ONNX-only installed pack cannot qualify the
+Vulkan model stage. Model publication and qualification evidence are tracked in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
+
+The complete actual-manager matrix is opt-in and requires a local face fixture:
+
+```bash
+./build-vulkan-matting/studiocast-vulkan-effects-production-smoke --require \
+  --model-root /isolated/data/studiocast/models/open_video \
+  --model-id modnet-webnn-256-fp32 \
+  --face-model-id yunet_opencv_zoo_2023mar_fp32 \
+  --eye-model-id gaze_correction_cam_flx_v0_1_1 \
+  --denoise-model-id fastdvdnet_sigma15 \
+  --replace-path /fixtures/replacement.ppm \
+  --face-path /local/dlib-example-faces/2008_002506.jpg --frames 3
+```
+
+The face fixture is an opt-in local dlib example with SHA-256
+`ede6804edf0ec005144ffe7f0f2b56bd2aa1d21beee79d29f72cb16ead19a447`.
+Its individual redistribution rights have not been established; the repository
+and workflow do not distribute or download it. Provision that exact fixture
+separately. The test checks the selected bytes before decoding it and requires
+Eye100 final output to differ from an otherwise identical Eye0 control. A
+no-face dispatch alone is not face-positive eye correction evidence.
+
+The matrix exercises individual effects, all three backgrounds and combined
+seven-stage chains, odd geometry, no-face and face cases, strength zero,
+sequence gaps/explicit temporal reset, successful/failed writer commits,
+optional/required missing models and all six budget axes. It asserts one upload,
+one final readback, one final synchronization, zero intermediate/model/metadata
+readbacks, zero CPU tails, no C++ Execute allocations and stable native allocation
+counts. Actual inference deltas prove compatible face/matte sharing rather than
+assuming it from stage readiness.
+
+Use `--case denoise`, `--case eye_face`, `--case all_blur`, `--case isolation`
+or `--case budgets` to isolate failures. Use `--prepare-only --case all_blur
+--input 1920x1080 --output 1280x720` to qualify aggregate preparation at a target
+geometry separately from execution. A successful prepare-only run does not
+establish frame latency, output correctness or writer publication. A rejected
+reservation or timed-out native submission is a failure, not a skip or successful
+optional-effect qualification.
+
+Permanent-retention exit handling has a separate isolated negative case:
+use the same verified model/replacement inputs with
+`--case unsafe_timeout_retained --frames 3`, without `--prepare-only`. It submits
+actual work, injects a timeout and denies subsequent fence proof only on that
+owner's private dispatch table. The required result is **exit 1**, together with
+`configuration_retained=1 exact_context_retained=1` after manager destruction and
+the `unsafe native resources retained;` terminal diagnostic. Exit 0, exit 77,
+signals, timeouts or either missing witness are failures. This is synthetic
+failed-proof coverage, not a natural timeout or a successful rendered frame.
+
+Ordinary shutdown still retries only through bounded explicit attempts. If
+native resources are permanently retained, the application finishes ordinary
+local cleanup, reports failure and skips unsafe userspace driver finalizers at
+the already-requested process exit. It does not terminate the daemon merely
+because an optional effect timed out. Native component tests isolate intentional
+permanent quarantine in checked child processes; they do not use a generic
+expected-failure override. Immediate terminal exit is not quiescence proof,
+bounded kernel reclamation or clean sanitizer/LeakSanitizer qualification.
+The current repair, evidence and hardware limits are recorded in
+[VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md).
+
+The cached production diagnostics have their own required smoke. Set isolated
+HOME/config/cache/state roots and point XDG_DATA_HOME at the parent of the
+`studiocast` model-data directory:
+
+```bash
+STUDIOCAST_REQUIRE_VULKAN_MODEL_DIAGNOSTICS=1 \
+XDG_DATA_HOME=/isolated/data \
+  ./build-vulkan-matting/studiocast-vulkan-model-diagnostics-tests
+```
+
+This prepares the actual owner, verifies exact reviewed artifact/profile
+attestations and independent readiness for all nine effects. Ordinary status
+polling must only read cached results. Measure Release setup/refresh timing
+separately from Debug hashing, and preserve the installed CLI's bounded refresh
+contract. Per-frame model hashes, scans or graph preparation remain forbidden.
+
+A separate manually selected `vulkan-model-effects-production` CI job runs the
+required cold diagnostics and complete matrix on a preprovisioned vendor runner;
+it requires the full-model flag, pinned SDK, model root, replacement image and
+local face fixture. It performs no installation/download and treats exit 77 as
+failure. Record exact HEAD, model/dependency hashes, device/driver, live and
+high-water memory/resources, transfer/inference counts and full-frame timing.
+Required command configuration alone does not establish hosted GPU execution.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/video/cpu_primitive_hal.h"
+
 #include <cstddef>
 #include <cstdint>
 

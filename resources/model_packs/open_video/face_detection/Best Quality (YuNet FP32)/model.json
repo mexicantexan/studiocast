@@ -9,6 +9,18 @@
       "kind": "onnx",
       "role": "main",
       "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+    },
+    {
+      "name": "model.ncnn.param",
+      "kind": "ncnn_param",
+      "role": "vulkan_main",
+      "sha256": "a79870770c2e87ce218950ba471b4fd82f2ec3c9c5908405b05e4e93fa3e8293"
+    },
+    {
+      "name": "model.ncnn.bin",
+      "kind": "ncnn_bin",
+      "role": "vulkan_main",
+      "sha256": "8faa696d61ad6bf5c13ed5d6c8ae35e376c660968db53d723a329020856ca5c9"
     }
   ],
   "onnx": {
@@ -18,8 +30,8 @@
         "name": "input",
         "layout": "nchw",
         "dtype": "float32",
-        "width": 320,
-        "height": 320,
+        "width": 640,
+        "height": 640,
         "channels": 3
       }
     ],
@@ -101,5 +113,114 @@
     "upstream_model": "model.onnx",
     "license": "MIT",
     "notes": "Reference fp32 YuNet model (highest compatibility / quality preset)."
-  }
+  },
+  "ncnn_vulkan_networks": [
+    {
+      "role": "main",
+      "profile": "yunet_640_v1",
+      "param_file": "model.ncnn.param",
+      "bin_file": "model.ncnn.bin",
+      "source_onnx_sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+      "converter": {
+        "name": "pnnx",
+        "version": "20261020"
+      },
+      "precision": "fp32",
+      "inputs": [
+        {
+          "blob": "input",
+          "dims": 3,
+          "w": 640,
+          "h": 640,
+          "c": 3
+        }
+      ],
+      "outputs": [
+        {
+          "blob": "cls_8",
+          "dims": 2,
+          "w": 1,
+          "h": 6400,
+          "c": 1
+        },
+        {
+          "blob": "cls_16",
+          "dims": 2,
+          "w": 1,
+          "h": 1600,
+          "c": 1
+        },
+        {
+          "blob": "cls_32",
+          "dims": 2,
+          "w": 1,
+          "h": 400,
+          "c": 1
+        },
+        {
+          "blob": "obj_8",
+          "dims": 2,
+          "w": 1,
+          "h": 6400,
+          "c": 1
+        },
+        {
+          "blob": "obj_16",
+          "dims": 2,
+          "w": 1,
+          "h": 1600,
+          "c": 1
+        },
+        {
+          "blob": "obj_32",
+          "dims": 2,
+          "w": 1,
+          "h": 400,
+          "c": 1
+        },
+        {
+          "blob": "bbox_8",
+          "dims": 2,
+          "w": 4,
+          "h": 6400,
+          "c": 1
+        },
+        {
+          "blob": "bbox_16",
+          "dims": 2,
+          "w": 4,
+          "h": 1600,
+          "c": 1
+        },
+        {
+          "blob": "bbox_32",
+          "dims": 2,
+          "w": 4,
+          "h": 400,
+          "c": 1
+        },
+        {
+          "blob": "kps_8",
+          "dims": 2,
+          "w": 10,
+          "h": 6400,
+          "c": 1
+        },
+        {
+          "blob": "kps_16",
+          "dims": 2,
+          "w": 10,
+          "h": 1600,
+          "c": 1
+        },
+        {
+          "blob": "kps_32",
+          "dims": 2,
+          "w": 10,
+          "h": 400,
+          "c": 1
+        }
+      ]
+    }
+  ]
 }

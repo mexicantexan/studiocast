@@ -4,9 +4,8 @@
 #include <string>
 
 #include "core/audio/effects/broadcast_audio_effects.h"
-#include "core/audio/virtual_audio_service.h"
 #include "core/video/effects/broadcast_effects.h"
-#include "core/video/virtual_camera_service.h"
+#include "core/video/video_config_types.h"
 
 namespace studiocast::config {
 
@@ -35,6 +34,15 @@ struct DaemonConfig {
   // Output scaling backend preference: "cpu" | "gpu" | "auto".
   // "auto" = use GPU scaling when available; otherwise CPU.
   std::string video_scaling_backend = "auto";
+
+  // Video compute backend preference: "auto" | "cpu" | "cuda" | "vulkan".
+  std::string video_compute_backend = "auto";
+
+  // Persistent Open Vulkan adapter identity. "auto" keeps hardware-first
+  // selection and permits the legacy environment selector as a compatibility
+  // override. A stable v1:... identity fails closed when absent or ambiguous.
+  std::string video_vulkan_device = "auto";
+  bool video_vulkan_allow_cpu = false;
 
   // Allow CPU resize/scale fallback when output size mismatches cannot be
   // resolved on GPU. Users can opt out from Advanced settings.
@@ -81,26 +89,5 @@ std::filesystem::path DaemonConfigPath();
 
 DaemonConfig LoadDaemonConfig();
 bool SaveDaemonConfig(const DaemonConfig &s, std::string *error);
-
-// Convert persisted settings into the runtime VirtualCameraServiceConfig used
-// by the daemon.
-studiocast::video::VirtualCameraServiceConfig
-ToVideoServiceConfig(const DaemonConfig &s);
-
-// Update a DaemonConfig from a runtime service config (useful for persistence
-// on IPC changes).
-void ApplyVideoServiceConfigToDaemonConfig(
-    const studiocast::video::VirtualCameraServiceConfig &cfg,
-    DaemonConfig *out);
-
-// Convert persisted settings into the runtime VirtualAudioServiceConfig used by
-// the daemon.
-studiocast::audio::VirtualAudioServiceConfig
-ToAudioServiceConfig(const DaemonConfig &s);
-
-// Update a DaemonConfig from a runtime audio service config (useful for
-// persistence on IPC changes).
-void ApplyAudioServiceConfigToDaemonConfig(
-    const studiocast::audio::VirtualAudioServiceConfig &cfg, DaemonConfig *out);
 
 } // namespace studiocast::config

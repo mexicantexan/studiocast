@@ -1,0 +1,28 @@
+{
+  "typed_video_status": {
+    "active": {
+      "active_backend": "",
+      "effects": []
+    },
+    "telemetry": {
+      "active_backend_frames": 30,
+      "committed_output_frames": 30
+    }
+  },
+  "video": {
+    "compute": {
+      "active_backend": "",
+      "active_engines": [],
+      "transfers": {
+        "open_cuda": {
+          "active_frames": 30,
+          "uploads": 30,
+          "final_downloads": 30
+        }
+      }
+    },
+    "pipeline": {
+      "effects_backends": ""
+    }
+  }
+}

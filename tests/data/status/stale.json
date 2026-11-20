@@ -1,0 +1,33 @@
+{
+  "typed_video_status": {
+    "capabilities": {
+      "refresh": {
+        "status": "stale",
+        "code": {
+          "token": "capability_snapshot_stale"
+        },
+        "current": false
+      }
+    },
+    "active": {
+      "effects": []
+    }
+  },
+  "engines": {
+    "open_vulkan": {
+      "refresh_current": false,
+      "mirror_production_ready": false,
+      "available_effects": [],
+      "blocked_reason": "capability_snapshot_stale"
+    }
+  },
+  "video": {
+    "compute": {
+      "refresh_current": false,
+      "active_backend": ""
+    },
+    "pipeline": {
+      "effects_backends": ""
+    }
+  }
+}

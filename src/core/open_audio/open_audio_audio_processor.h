@@ -153,6 +153,10 @@ public:
   bool UsingCpuFallbackForStatus() const { return using_cpu_fallback_; }
   std::string LastStartupWarningForStatus() const;
 
+  // StudioCast-side prepared binding counters. These deliberately exclude
+  // opaque allocations performed inside ONNX Runtime.
+  OpenAudioOrtSession::PreparedRunStats PreparedRunStatsForTesting() const;
+
   bool Process(const float *in, float *out, std::uint32_t frames,
                std::uint32_t channels, std::string *error) override;
 

@@ -42,6 +42,9 @@ public:
 
   NvCV_Status Process(studiocast::video::GpuFrame &frame,
                       std::string *error) override;
+  bool SetExternalCudaStream(maxine::CUstream stream,
+                             std::string *error) override;
+  void InvalidateBindings() noexcept override;
 
   maxine::NvCVImage *OutputGpu() { return output_ready_ ? &out_gpu_ : nullptr; }
   const maxine::NvCVImage *OutputGpu() const {
@@ -49,10 +52,14 @@ public:
   }
 
   maxine::CUstream cuda_stream() const { return stream_; }
+  const EffectExecutionTelemetry &execution_telemetry() const noexcept {
+    return execution_telemetry_;
+  }
 
 private:
   bool EnsureEffectCreated(std::string *error);
   bool ApplyConfigLocked(std::string *error);
+  bool EnsureStreamBound(std::string *error);
   bool EnsureOutputImage(unsigned width, unsigned height, std::string *error);
   void Destroy();
 
@@ -64,13 +71,22 @@ private:
 
   maxine::vfx::NvVFX_Handle handle_ = nullptr;
   maxine::CUstream stream_ = nullptr;
+  maxine::CUstream external_stream_ = nullptr;
+  bool external_stream_selected_ = false;
   bool own_stream_ = false;
+  bool stream_bound_ = false;
+  bool model_bound_ = false;
 
   bool cfg_dirty_ = true;
 
   maxine::NvCVImage out_gpu_{};
   bool out_allocated_ = false;
   bool output_ready_ = false;
+  const maxine::NvCVImage *bound_input_ = nullptr;
+  maxine::NvCVImage *bound_output_ = nullptr;
+  unsigned bound_width_ = 0;
+  unsigned bound_height_ = 0;
+  EffectExecutionTelemetry execution_telemetry_{};
 };
 
 } // namespace studiocast::maxine::effects

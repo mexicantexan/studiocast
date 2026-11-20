@@ -32,14 +32,160 @@ bool OrtBuildHasTensorRtEpV2();
 // Default TensorRT engine cache path for a CUDA device.
 std::filesystem::path DefaultTensorRtCachePath(int cuda_device_id);
 
+enum class OrtProviderPolicy : std::uint8_t {
+  // Existing behavior: prefer requested accelerator providers but preserve
+  // historical CUDA->CPU and TensorRT->CUDA/CPU compatibility fallbacks.
+  compatibility = 0,
+
+  // Prepared Open Video hardware execution: require exactly the CUDA EP and
+  // disable ORT CPU graph/provider fallback. TensorRT is a distinct provider
+  // and is rejected by this policy.
+  strict_cuda_only = 1,
+};
+
+enum class OrtExecutionProviderId : std::uint8_t {
+  invalid = 0,
+  cpu = 1,
+  cuda = 2,
+  tensorrt = 3,
+};
+
+struct OrtPreparedProviderEvidence {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtExecutionProviderId provider = OrtExecutionProviderId::invalid;
+  std::int32_t cuda_device_id = -1;
+  std::uint64_t cuda_context_generation = 0;
+  std::uintptr_t requested_stream_identity = 0;
+  bool user_stream_bound = false;
+  bool explicit_stream_synchronization = false;
+  bool cpu_ep_fallback_disabled = false;
+
+  bool ValidStrictCuda() const noexcept;
+  bool operator==(const OrtPreparedProviderEvidence &other) const noexcept {
+    return schema_version == other.schema_version &&
+           provider == other.provider &&
+           cuda_device_id == other.cuda_device_id &&
+           cuda_context_generation == other.cuda_context_generation &&
+           requested_stream_identity == other.requested_stream_identity &&
+           user_stream_bound == other.user_stream_bound &&
+           explicit_stream_synchronization ==
+               other.explicit_stream_synchronization &&
+           cpu_ep_fallback_disabled == other.cpu_ep_fallback_disabled;
+  }
+};
+
+bool OrtPreparedProviderEvidenceMatches(
+    const OrtPreparedProviderEvidence &prepared, int cuda_device_id,
+    std::uint64_t cuda_context_generation,
+    std::uintptr_t requested_stream_identity) noexcept;
+
+enum class OrtPreparedRunStatus : std::uint16_t {
+  success = 0,
+  not_prepared = 1,
+  invalid_input_output_contract = 2,
+  foreign_provider_evidence = 3,
+  stale_session_generation = 4,
+  wrong_device = 5,
+  stale_context_generation = 6,
+  stale_stream = 7,
+  stale_binding = 8,
+  provider_unavailable = 9,
+  provider_mismatch = 10,
+  cpu_fallback_forbidden = 11,
+  tensorrt_forbidden = 12,
+  resource_exhausted = 13,
+  inference_failure = 14,
+  provider_failure_quarantine = 15,
+  cancelled_or_shutdown = 16,
+  setup_resource_mutation = 17,
+};
+
+enum class OrtPreparedRunQuarantine : std::uint8_t {
+  none = 0,
+  session = 1,
+  provider = 2,
+};
+
+// Stable mirror of OrtErrorCode values used at the catch boundary. Keeping the
+// values local makes the public header independent of ONNX Runtime headers.
+enum class OrtStableErrorCode : std::int32_t {
+  none = 0,
+  fail = 1,
+  invalid_argument = 2,
+  no_such_file = 3,
+  no_model = 4,
+  engine_error = 5,
+  runtime_exception = 6,
+  invalid_protobuf = 7,
+  model_loaded = 8,
+  not_implemented = 9,
+  invalid_graph = 10,
+  execution_provider_failure = 11,
+  model_load_cancelled = 12,
+  model_requires_compilation = 13,
+  not_found = 14,
+  allocation_failure = 1000,
+  unknown_exception = 1001,
+};
+
+struct OrtPreparedCudaRunEvidence {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtPreparedProviderEvidence provider{};
+  std::uint64_t session_generation = 0;
+
+  bool Valid() const noexcept {
+    return schema_version == kSchemaVersion && session_generation != 0 &&
+           provider.schema_version ==
+               OrtPreparedProviderEvidence::kSchemaVersion &&
+           provider.provider != OrtExecutionProviderId::invalid;
+  }
+};
+
+struct OrtPreparedRunResult {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  OrtPreparedRunStatus status = OrtPreparedRunStatus::not_prepared;
+  OrtPreparedRunQuarantine quarantine = OrtPreparedRunQuarantine::none;
+  OrtStableErrorCode error_code = OrtStableErrorCode::none;
+  std::uint64_t session_generation = 0;
+  std::uint64_t attempt_sequence = 0;
+  std::uint64_t completed_runs = 0;
+
+  bool ok() const noexcept {
+    return schema_version == kSchemaVersion &&
+           status == OrtPreparedRunStatus::success;
+  }
+};
+
 // Options for creating an ONNX Runtime session.
 struct OrtSessionOptions {
+  struct FreeDimensionOverride {
+    std::string name;
+    int64_t extent = 0;
+  };
+
+  OrtProviderPolicy provider_policy = OrtProviderPolicy::compatibility;
+
+  // Setup-time specialization for symbolic model dimensions. Callers must
+  // provide names from a reviewed model contract; ORT ignores unknown names.
+  std::vector<FreeDimensionOverride> free_dimension_overrides;
+
   // If true, attempt to use CUDA EP and fall back to CPU EP if CUDA EP is not
   // available.
   bool prefer_cuda = true;
 
   // CUDA device id to use when CUDA EP is available.
   int cuda_device_id = 0;
+
+  // Caller-owned CUDA context generation. Strict prepared execution requires
+  // a non-zero value and retains it as typed evidence; ORT itself does not own
+  // the CUDA primary-context lifecycle.
+  std::uint64_t cuda_context_generation = 0;
 
   // Optional CUDA EP V2 provider options. Zero/empty means "use ORT default".
   std::uint64_t cuda_gpu_mem_limit = 0;
@@ -100,6 +246,14 @@ struct OrtSessionInfo {
   // caller's stream (e.g., user_compute_stream unavailable). Callers
   // integrating with an explicit stream must synchronize for correctness.
   bool cuda_needs_stream_sync = false;
+  int cuda_device_id = 0;
+  bool cuda_user_compute_stream_requested = false;
+  bool cuda_user_compute_stream_bound = false;
+  std::uintptr_t cuda_user_compute_stream_identity = 0;
+  std::uint64_t cuda_context_generation = 0;
+  bool cpu_ep_fallback_disabled = false;
+  bool strict_provider_validation_passed = false;
+  OrtPreparedProviderEvidence prepared_provider_evidence{};
 
   // Provider/status diagnostics for tools and engine JSON.
   std::string active_provider;
@@ -126,6 +280,23 @@ struct OrtSessionInfo {
 };
 
 namespace internal {
+
+struct OrtPreparedRunContract {
+  bool session_present = false;
+  bool binding_present = false;
+  bool binding_contract_matches = false;
+  bool shutdown_requested = false;
+  OrtPreparedCudaRunEvidence active{};
+  OrtPreparedCudaRunEvidence requested{};
+  bool strict_cuda_only = false;
+};
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunContract(const OrtPreparedRunContract &contract) noexcept;
+
+OrtPreparedRunResult
+ClassifyOrtPreparedRunFailure(OrtStableErrorCode code,
+                              bool exact_cuda_provider) noexcept;
 
 // Internal seam for session-creation-time provider planning. It is intentionally
 // limited to provider append/session-create outcomes so tests can cover fallback
@@ -200,6 +371,23 @@ std::string HumanizeOrtError(const std::string &ort_msg,
 //   - Fall back to CPU if neither Maxine nor CUDA EP is available
 class OrtSession {
 public:
+  static constexpr std::size_t kPreparedBindingSlots = 2;
+
+  struct PreparedRunStats {
+    std::uint64_t session_generation = 0;
+    std::uint64_t execute_attempts = 0;
+    std::uint64_t execute_successes = 0;
+    std::uint64_t execute_failures = 0;
+    std::uint64_t quarantine_events = 0;
+    std::uint64_t runs = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t binding_rebuilds = 0;
+    std::uint64_t tensor_wrapper_constructions = 0;
+    std::uint64_t io_binding_constructions = 0;
+    // Allocation requests made by StudioCast-owned prepared-binding
+    // containers. This intentionally excludes opaque ORT allocator activity.
+    std::uint64_t application_binding_allocation_requests = 0;
+  };
   static OrtRuntimeInfo QueryRuntimeInfo();
 
   // Create an ORT session for the given model.
@@ -240,6 +428,16 @@ public:
               const RunOutput *outputs, std::size_t output_count,
               std::string *error);
 
+  // Run using one of two bounded prepared binding slots. A slot retains the
+  // external-buffer tensor wrappers until the session is destroyed or its
+  // provider/session/name/pointer/size/shape contract changes. Streaming
+  // callers with recurrent state should use one slot for each side of their
+  // state ping-pong. Caller-owned names, shapes, and buffers must remain valid
+  // until InvalidatePreparedBindings() is called or this session is destroyed.
+  bool RunCpuPrepared(std::size_t binding_slot, const RunInput *inputs,
+                      std::size_t input_count, const RunOutput *outputs,
+                      std::size_t output_count, std::string *error);
+
   struct CudaBindingInput {
     const char *name = nullptr;
     const float *device_ptr = nullptr;
@@ -263,12 +461,57 @@ public:
   // synchronize before/after this call so producer/consumer kernels see
   // consistent data.
   //
-  // The wrapper clears bound Ort::Value objects before returning, so caller
-  // owned device buffers only need to remain valid for the duration of this
-  // call and any required caller-side stream synchronization.
+  // This convenience API uses prepared slot 0. Caller-owned names, shapes, and
+  // buffers must remain valid until InvalidatePreparedBindings() is called or
+  // this session is destroyed.
   bool RunCudaIoBinding(const CudaBindingInput *inputs, std::size_t input_count,
                         const CudaBindingOutput *outputs,
                         std::size_t output_count, std::string *error);
+
+  // CUDA equivalent of RunCpuPrepared. The Ort::IoBinding and bound OrtValue
+  // objects remain intact across runs while the external device-buffer
+  // contract is unchanged.
+  bool RunCudaIoBindingPrepared(std::size_t binding_slot,
+                                const CudaBindingInput *inputs,
+                                std::size_t input_count,
+                                const CudaBindingOutput *outputs,
+                                std::size_t output_count, std::string *error);
+
+  // Construct and bind all CUDA external-buffer wrappers during setup without
+  // issuing inference. This operation is transactional: an existing prepared
+  // slot remains usable if replacement construction fails.
+  bool PrepareCudaIoBinding(std::size_t binding_slot,
+                            const CudaBindingInput *inputs,
+                            std::size_t input_count,
+                            const CudaBindingOutput *outputs,
+                            std::size_t output_count, std::string *error);
+
+  // Execute only an exactly matching setup-prepared CUDA binding. This method
+  // never constructs a binding, tensor wrapper, or StudioCast-owned container.
+  bool ExecutePreparedCudaIoBinding(std::size_t binding_slot,
+                                    const CudaBindingInput *inputs,
+                                    std::size_t input_count,
+                                    const CudaBindingOutput *outputs,
+                                    std::size_t output_count,
+                                    std::string *error);
+
+  OrtPreparedRunResult ExecutePreparedCudaIoBindingTyped(
+      std::size_t binding_slot, const CudaBindingInput *inputs,
+      std::size_t input_count, const CudaBindingOutput *outputs,
+      std::size_t output_count,
+      const OrtPreparedCudaRunEvidence &expected,
+      bool cancellation_requested = false,
+      std::string *compatibility_error = nullptr) noexcept;
+
+  OrtPreparedCudaRunEvidence prepared_cuda_run_evidence() const noexcept;
+  void RequestShutdown() noexcept;
+
+  // Release all retained CPU/CUDA tensor wrappers and IoBindings before a
+  // caller replaces or frees their backing storage. Rebuilding a session for a
+  // provider/model change naturally invalidates the old session's bindings.
+  void InvalidatePreparedBindings();
+
+  PreparedRunStats prepared_run_stats() const;
 
   // Returns true if the session has latched a fatal ORT failure (e.g., VRAM
   // OOM).
@@ -282,6 +525,13 @@ private:
   std::unique_ptr<Impl> impl_;
 
   explicit OrtSession(std::unique_ptr<Impl> impl);
+
+  OrtPreparedRunResult ExecutePreparedCudaIoBindingTypedImpl(
+      std::size_t binding_slot, const CudaBindingInput *inputs,
+      std::size_t input_count, const CudaBindingOutput *outputs,
+      std::size_t output_count,
+      const OrtPreparedCudaRunEvidence &expected,
+      bool cancellation_requested, std::string *compatibility_error) noexcept;
 };
 
 } // namespace studiocast::onnx

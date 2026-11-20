@@ -1,13 +1,39 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+namespace studiocast::model_integrity_internal {
+bool ComputeSha256File(const std::filesystem::path &path, std::string *out,
+                       std::string *error);
+}
+
 namespace studiocast::open_video {
+
+struct ModelSnapshotFileCloser {
+  void operator()(std::FILE *file) const noexcept {
+    if (file)
+      std::fclose(file);
+  }
+};
+using VerifiedModelFileSnapshot =
+    std::unique_ptr<std::FILE, ModelSnapshotFileCloser>;
+
+// Setup only. Returns a sealed anonymous FILE* containing exactly the declared
+// digest, bounded before allocation and independent of subsequent path/inode
+// changes. The consumer must load from this stream, never reopen the path.
+VerifiedModelFileSnapshot
+OpenVerifiedModelFileSnapshot(const std::filesystem::path &path,
+                              const std::string &expected_sha256,
+                              std::size_t maximum_bytes, std::string *error);
 
 struct ModelFile {
   // Original relative filename as declared in model.json.
@@ -42,6 +68,13 @@ struct ModelOutputSpec {
   std::string name;
   std::string kind;  // e.g. "alpha"
   std::string dtype; // e.g. "float32"
+  // Exact output geometry is optional for legacy/ONNX-only packs. A
+  // production ncnn Vulkan declaration requires all four fields so the
+  // runtime never infers alpha layout or shape from a filename/graph.
+  std::string layout; // e.g. "nchw"
+  int width = 0;
+  int height = 0;
+  int channels = 0;
 };
 
 struct ModelPreprocessSpec {
@@ -55,6 +88,65 @@ struct MattingSpec {
   ModelTensorSpec input;
   ModelOutputSpec output;
   ModelPreprocessSpec preprocess;
+};
+
+// Offline-converted artifacts and graph metadata required by the production
+// ncnn Vulkan matting runtime. The corresponding manifest section is optional
+// so existing ONNX-only packs remain valid for Open CUDA, but every field is
+// mandatory when the section is present.
+struct NcnnVulkanMattingSpec {
+  std::string param_file;
+  std::string bin_file;
+  std::filesystem::path param_path;
+  std::filesystem::path bin_path;
+  std::string param_sha256;
+  std::string bin_sha256;
+  std::string input_blob;
+  std::string output_blob;
+  std::string converter_name;
+  std::string converter_version;
+  std::string precision; // fp32 or fp16
+};
+
+// Native ncnn tensor geometry, with batch one implicit. dims=1 is a vector
+// (w), dims=2 a row-major matrix (h,w), dims=3 planar (c,h,w). External
+// bindings are always unpacked FP32. Only video_denoise permits dynamic_hw;
+// zero w/h are specialized to padded camera geometry once during setup.
+struct NcnnVulkanTensorSpec {
+  std::string blob;
+  std::uint32_t dims = 0;
+  int w = 0;
+  int h = 1;
+  int c = 1;
+  bool dynamic_hw = false;
+  friend bool operator==(const NcnnVulkanTensorSpec &,
+                         const NcnnVulkanTensorSpec &) = default;
+};
+
+inline constexpr std::size_t kMaxNcnnVulkanInputs = 3;
+inline constexpr std::size_t kMaxNcnnVulkanOutputs = 12;
+
+// Optional schema-v2 ncnn_vulkan_networks[] section. Kept separate from the
+// published matting section so existing ONNX and MODNet metadata is unchanged.
+struct NcnnVulkanNetworkSpec {
+  std::string role;    // main, left, right
+  std::string profile; // fastdvdnet_rgb_v1, yunet_640_v1, flx_prefix_v1
+  std::string param_file;
+  std::string bin_file;
+  std::filesystem::path param_path;
+  std::filesystem::path bin_path;
+  std::string param_sha256;
+  std::string bin_sha256;
+  std::string source_onnx_sha256;
+  std::string converter_name;
+  std::string converter_version;
+  std::string precision;
+  std::array<NcnnVulkanTensorSpec, kMaxNcnnVulkanInputs> inputs{};
+  std::array<NcnnVulkanTensorSpec, kMaxNcnnVulkanOutputs> outputs{};
+  std::size_t input_count = 0;
+  std::size_t output_count = 0;
+  friend bool operator==(const NcnnVulkanNetworkSpec &,
+                         const NcnnVulkanNetworkSpec &) = default;
 };
 
 struct ModelPack {
@@ -76,11 +168,83 @@ struct ModelPack {
   // For task == "matting", this captures the v1-style IO/preprocess metadata.
   std::optional<MattingSpec> matting;
 
+  // Present only when a schema-v2 matting manifest declares a complete
+  // production ncnn Vulkan artifact contract.
+  std::optional<NcnnVulkanMattingSpec> ncnn_vulkan;
+
+  std::vector<NcnnVulkanNetworkSpec> ncnn_vulkan_networks;
+
   // Derived from install layout.
   std::filesystem::path root_dir;
   std::filesystem::path manifest_path;
   std::optional<std::filesystem::path> license_path;
+
+  // Process-local generation of the registry scan that produced this pack.
+  // A zero generation means the pack was not produced by ModelPackRegistry
+  // and cannot be used as trusted prepared-execution evidence.
+  std::uint64_t registry_generation = 0;
+  // Exact manifest bytes parsed by that registry generation. Strict setup
+  // rejects a manifest that changes between registry parsing and validation.
+  std::array<std::uint8_t, 32> registry_manifest_sha256{};
 };
+
+// Setup-time identity for one exact installed model artifact. The fixed-size
+// representation is safe to retain in a prepared program and compare in the
+// frame path without strings, filesystem access, hashing, or allocation.
+struct ValidatedModelArtifactIdentity {
+  static constexpr std::uint32_t kSchemaVersion = 1;
+
+  std::uint32_t schema_version = kSchemaVersion;
+  std::uint64_t registry_generation = 0;
+  std::array<std::uint8_t, 32> model_id_sha256{};
+  std::array<std::uint8_t, 32> manifest_sha256{};
+  std::array<std::uint8_t, 32> artifact_sha256{};
+  std::array<std::uint8_t, 32> artifact_set_sha256{};
+
+  bool Valid() const noexcept;
+  bool operator==(const ValidatedModelArtifactIdentity &other) const noexcept {
+    return schema_version == other.schema_version &&
+           registry_generation == other.registry_generation &&
+           model_id_sha256 == other.model_id_sha256 &&
+           manifest_sha256 == other.manifest_sha256 &&
+           artifact_sha256 == other.artifact_sha256 &&
+           artifact_set_sha256 == other.artifact_set_sha256;
+  }
+};
+
+enum class ModelArtifactValidationStatus : std::uint8_t {
+  ok = 0,
+  foreign_pack,
+  missing,
+  invalid_path,
+  invalid_manifest_checksum,
+  stale_registry,
+  checksum_mismatch,
+  read_error,
+};
+
+struct ModelArtifactValidationResult {
+  ModelArtifactValidationStatus status =
+      ModelArtifactValidationStatus::foreign_pack;
+  ValidatedModelArtifactIdentity identity{};
+  std::string detail;
+
+  bool ok() const noexcept {
+    return status == ModelArtifactValidationStatus::ok && identity.Valid();
+  }
+};
+
+// Hash and validate an already-parsed registry artifact during setup. This is
+// intentionally expensive and must never be called from status polling or the
+// frame loop. Manifest-declared installed-file hashes are enforced when
+// present; the actual installed bytes and manifest bytes are always hashed.
+ModelArtifactValidationResult
+ValidateModelArtifactIdentity(const ModelPack &pack, const ModelFile &artifact);
+
+// Allocation-free execution-time currentness check.
+bool ModelArtifactIdentityMatches(
+    const ValidatedModelArtifactIdentity &prepared,
+    const ValidatedModelArtifactIdentity &current) noexcept;
 
 struct ModelFileVerification {
   std::string name;
@@ -117,6 +281,20 @@ struct ModelPackVerification {
   std::vector<ModelFileVerification> files;
 };
 
+// Strict production gate for ncnn Vulkan matting artifacts. This performs file
+// hashing and is intended for one-time session creation/warmup, never for the
+// frame loop or daemon status polling. It fails closed when the manifest
+// section is missing/incomplete, paths escape the pack, or either checksum does
+// not match.
+bool ValidateProductionNcnnVulkanMattingPack(const ModelPack &pack,
+                                             std::string *error);
+
+// Setup-only strict role/artifact/tensor/provenance validation. The returned
+// network is already parsed; expensive checks never belong in Execute.
+bool ValidateProductionNcnnVulkanNetworkPack(
+    const ModelPack &pack, const NcnnVulkanNetworkSpec &network,
+    std::string *error);
+
 // Registry for model packs under:
 //   <models_root>/open_video/<subject>/<pack_dir>/
 // where <models_root> is normally ~/.local/share/studiocast/models.
@@ -140,6 +318,7 @@ public:
   static std::vector<ModelPackVerification> VerifyDefault();
 
   const std::vector<ModelPack> &ListModels() const { return models_; }
+  std::uint64_t generation() const noexcept { return generation_; }
   std::optional<ModelPack> ResolveModel(const std::string &id) const;
 
   // Convenience view of installed model ids by task.
@@ -168,6 +347,7 @@ public:
 
 private:
   std::filesystem::path root_;
+  std::uint64_t generation_ = 0;
   std::vector<ModelPack> models_;                         // sorted by task,id
   std::map<std::string, std::string> problems_;           // sorted by key
   std::map<std::string, std::vector<std::string>> tasks_; // task -> model ids

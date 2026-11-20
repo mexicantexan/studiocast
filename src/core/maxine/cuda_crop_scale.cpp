@@ -338,7 +338,7 @@ DONE:
 
 } // namespace
 
-bool CudaBgrCropScale::Initialize(CudaDriverApi *cuda, std::string *error_out) {
+bool CudaBgrCropScale::Initialize(studiocast::cuda::CudaDriverApi *cuda, std::string *error_out) {
   cuda_ = cuda;
   if (!cuda_) {
     if (error_out)
@@ -358,15 +358,15 @@ bool CudaBgrCropScale::EnsureKernelLoaded(std::string *error_out) {
   }
 
   const auto &f = cuda_->f();
-  CUresult st = f.cuModuleLoadData(&module_, kCropScalePtx);
-  if (st != CUDA_SUCCESS) {
+  studiocast::cuda::CUresult st = f.cuModuleLoadData(&module_, kCropScalePtx);
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuModuleLoadData failed: " + cuda_->StatusToString(st);
     return false;
   }
 
   st = f.cuModuleGetFunction(&fn_, module_, "crop_scale_bgr_u8");
-  if (st != CUDA_SUCCESS || !fn_) {
+  if (st != studiocast::cuda::CUDA_SUCCESS || !fn_) {
     if (error_out)
       *error_out = "cuModuleGetFunction(crop_scale_bgr_u8) failed: " +
                    cuda_->StatusToString(st);
@@ -424,9 +424,9 @@ bool CudaBgrCropScale::CropScale(const NvCVImage &src_bgr_gpu,
   const unsigned int gridX = (dstW + kBlockX - 1) / kBlockX;
   const unsigned int gridY = (dstH + kBlockY - 1) / kBlockY;
 
-  const CUresult st = cuda_->f().cuLaunchKernel(
+  const studiocast::cuda::CUresult st = cuda_->f().cuLaunchKernel(
       fn_, gridX, gridY, 1, kBlockX, kBlockY, 1, 0, stream, params, nullptr);
-  if (st != CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(crop_scale_bgr_u8) failed: " +
                    cuda_->StatusToString(st);
@@ -436,7 +436,7 @@ bool CudaBgrCropScale::CropScale(const NvCVImage &src_bgr_gpu,
   return true;
 }
 
-bool CudaBgrResizeBilinear::Initialize(CudaDriverApi *cuda,
+bool CudaBgrResizeBilinear::Initialize(studiocast::cuda::CudaDriverApi *cuda,
                                        std::string *error_out) {
   cuda_ = cuda;
   if (!cuda_) {
@@ -457,15 +457,15 @@ bool CudaBgrResizeBilinear::EnsureKernelLoaded(std::string *error_out) {
   }
 
   const auto &f = cuda_->f();
-  CUresult st = f.cuModuleLoadData(&module_, kResizeBilinearPtx);
-  if (st != CUDA_SUCCESS) {
+  studiocast::cuda::CUresult st = f.cuModuleLoadData(&module_, kResizeBilinearPtx);
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuModuleLoadData failed: " + cuda_->StatusToString(st);
     return false;
   }
 
   st = f.cuModuleGetFunction(&fn_, module_, "resize_bilinear_bgr_u8");
-  if (st != CUDA_SUCCESS || !fn_) {
+  if (st != studiocast::cuda::CUDA_SUCCESS || !fn_) {
     if (error_out) {
       *error_out = "cuModuleGetFunction(resize_bilinear_bgr_u8) failed: " +
                    cuda_->StatusToString(st);
@@ -517,9 +517,9 @@ bool CudaBgrResizeBilinear::Resize(const NvCVImage &src_bgr_gpu,
   const unsigned int gridY = (dstH + kBlockY - 1u) / kBlockY;
 
   const auto &f = cuda_->f();
-  const CUresult st = f.cuLaunchKernel(fn_, gridX, gridY, 1, kBlockX, kBlockY,
+  const studiocast::cuda::CUresult st = f.cuLaunchKernel(fn_, gridX, gridY, 1, kBlockX, kBlockY,
                                        1, 0, stream, params, nullptr);
-  if (st != CUDA_SUCCESS) {
+  if (st != studiocast::cuda::CUDA_SUCCESS) {
     if (error_out)
       *error_out = "cuLaunchKernel(resize_bilinear_bgr_u8) failed: " +
                    cuda_->StatusToString(st);

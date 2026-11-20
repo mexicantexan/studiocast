@@ -1,0 +1,1687 @@
+#include "../../support/vulkan_retention_child.h"
+
+#include "core/util/process_exit.h"
+
+#include "core/video/video_execution_coordinator.h"
+#include "core/vulkan/production_video_backend_setup_source.h"
+#include "core/vulkan/video_execution_factory.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <new>
+#include <string>
+
+namespace {
+std::atomic<bool> g_count_allocations{false};
+std::atomic<std::uint64_t> g_allocations{0};
+} // namespace
+
+void *operator new(std::size_t size) {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void *pointer = std::malloc(size))
+    return pointer;
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t size) {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (void *pointer = std::malloc(size))
+    return pointer;
+  throw std::bad_alloc();
+}
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  return std::malloc(size);
+}
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
+  if (g_count_allocations.load(std::memory_order_relaxed))
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  return std::malloc(size);
+}
+void operator delete(void *pointer) noexcept { std::free(pointer); }
+void operator delete[](void *pointer) noexcept { std::free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
+void operator delete[](void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
+void operator delete(void *pointer, const std::nothrow_t &) noexcept {
+  std::free(pointer);
+}
+void operator delete[](void *pointer, const std::nothrow_t &) noexcept {
+  std::free(pointer);
+}
+
+namespace {
+
+using namespace studiocast;
+
+constexpr std::uint64_t kAdapterId = 77;
+constexpr std::uint64_t kFactoryId = 91;
+constexpr std::uint32_t kWidth = 4;
+constexpr std::uint32_t kHeight = 2;
+constexpr std::uint64_t kStride = kWidth * 3u;
+constexpr std::uint64_t kBytes = kStride * kHeight;
+
+bool Require(bool condition, const char *message) {
+  if (!condition)
+    std::cerr << "FAIL: " << message << '\n';
+  return condition;
+}
+
+hal::ExecutionDomainId Domain() {
+  hal::ExecutionDomainId domain;
+  domain.backend = hal::BackendId::vulkan;
+  domain.api_family = hal::ApiFamily::vulkan;
+  domain.physical_device.vendor_id = 0x1002;
+  domain.physical_device.device_id = 0x73bf;
+  domain.physical_device.stable_id[0] = 0xa5;
+  domain.logical_context_generation = 19;
+  domain.allocator_family = hal::AllocatorFamily::vulkan;
+  domain.memory_handle_family = hal::MemoryHandleFamily::vulkan_buffer;
+  domain.queue_or_stream_identity = 0x1234;
+  domain.ownership_model = hal::OwnershipModel::adapter_exclusive;
+  domain.synchronization_protocol =
+      hal::SynchronizationProtocol::vulkan_queue_fence;
+  domain.adapter_instance_id = kAdapterId;
+  return domain;
+}
+
+hal::ImageDescriptor Image(hal::HostCoherence coherence,
+                           hal::Mutability mutability) {
+  hal::ImageDescriptor image;
+  image.width = kWidth;
+  image.height = kHeight;
+  image.plane_count = 1;
+  image.format = hal::PixelFormat::rgb_u8;
+  image.channel_order = hal::ChannelOrder::rgb;
+  image.color_space = hal::ColorSpace::srgb;
+  image.color_range = hal::ColorRange::full;
+  image.alpha_meaning = hal::AlphaMeaning::none;
+  image.orientation = hal::Orientation::top_left;
+  image.host_coherence = coherence;
+  image.mutability = mutability;
+  image.aliasing = hal::AliasingPermission::forbidden;
+  image.base_alignment_bytes = 1;
+  image.planes[0].row_stride_bytes = kStride;
+  image.planes[0].size_bytes = kBytes;
+  image.planes[0].width = kWidth;
+  image.planes[0].height = kHeight;
+  image.planes[0].alignment_bytes = 1;
+  return image;
+}
+
+hal::ResourceHandle Resource(const hal::PreparedProgram &program,
+                             std::uint64_t id,
+                             hal::MemoryDomain memory_domain) {
+  hal::ResourceHandle resource;
+  resource.resource_id = id;
+  resource.allocator_owner_id = kAdapterId;
+  resource.lifetime_generation =
+      program.execution_domain.logical_context_generation;
+  resource.memory_domain = memory_domain;
+  resource.lifetime = hal::ResourceLifetime::frame_borrowed;
+  resource.synchronization_state = hal::SynchronizationState::ready;
+  resource.execution_domain = program.execution_domain;
+  resource.size_bytes = kBytes;
+  resource.alignment_bytes = 1;
+  resource.mutable_resource = true;
+  return resource;
+}
+
+enum class ExecuteMode {
+  success,
+  optional_fail_open,
+  transfer_mismatch,
+  device_loss,
+  synchronization_quarantine,
+};
+
+class FakeVulkanAdapter final : public hal::IResidentAdapter {
+public:
+  std::uint64_t adapter_instance_id() const noexcept override {
+    return kAdapterId;
+  }
+  hal::BackendId backend_id() const noexcept override {
+    return hal::BackendId::vulkan;
+  }
+
+  hal::StatusId Prepare(const hal::PreparedProgram &program,
+                        hal::PreparedProgramHandle *candidate,
+                        hal::ReadinessSnapshot *readiness,
+                        hal::ReasonId *reason) noexcept override {
+    ++prepare_calls;
+    program_ = program;
+    candidate->handle_id = 100 + prepare_calls;
+    candidate->program_id = program.program_id;
+    candidate->adapter_instance_id = kAdapterId;
+    candidate->invalidation_key = program.invalidation_key;
+    candidate->execution_domain = program.execution_domain;
+    candidate->reserved_budget = program.budget;
+    if (fail_prepare) {
+      if (reason)
+        *reason = hal::ReasonId::resource_exhausted;
+      return hal::StatusId::resource_exhausted;
+    }
+    readiness->status = hal::StatusId::ready;
+    readiness->reason = hal::ReasonId::none;
+    readiness->requested_backend = hal::BackendId::vulkan;
+    readiness->selected_backend = hal::BackendId::vulkan;
+    readiness->provider =
+        hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+    readiness->execution_domain = program.execution_domain;
+    readiness->ready_stage_mask =
+        (std::uint32_t{1} << program.stage_count) - 1u;
+    readiness->available = true;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::StatusId BindHostFrame(const hal::PreparedProgramHandle &,
+                              const hal::HostFrameBinding &binding,
+                              hal::HostFrameTokens *tokens,
+                              hal::ReasonId *reason) noexcept override {
+    binding_ = binding;
+    tokens->input = Resource(program_, 1000 + binding.capture_sequence,
+                             hal::MemoryDomain::upload_staging);
+    tokens->output = Resource(program_, 2000 + binding.capture_sequence,
+                              hal::MemoryDomain::readback_staging);
+    tokens_ = *tokens;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::ExecuteResult
+  Execute(const hal::PreparedProgramHandle &,
+          const hal::ExecuteRequest &request) noexcept override {
+    ++execute_calls;
+    hal::ExecuteResult result;
+    if (mode == ExecuteMode::device_loss ||
+        mode == ExecuteMode::synchronization_quarantine) {
+      result.status = hal::StatusId::quarantined;
+      result.reason = mode == ExecuteMode::device_loss
+                          ? hal::ReasonId::device_lost
+                          : hal::ReasonId::synchronization_failed;
+      return result;
+    }
+    std::memcpy(binding_.output_planes[0].write_data,
+                binding_.input_planes[0].read_data, kBytes);
+    result.status = mode == ExecuteMode::optional_fail_open
+                        ? hal::StatusId::degraded
+                        : hal::StatusId::executed;
+    result.reason = mode == ExecuteMode::optional_fail_open
+                        ? hal::ReasonId::optional_stage_failed_open
+                        : hal::ReasonId::none;
+    result.completion = {next_token_++, program_.program_id, kAdapterId,
+                         request.capture_sequence, true};
+    result.output = tokens_.output;
+    result.output_valid = true;
+    result.stage_count = program_.stage_count;
+    for (std::size_t index = 0; index < result.stage_count; ++index) {
+      auto &stage = result.stages[index];
+      stage.stage_id = program_.stages[index].stage_id;
+      stage.semantic = program_.stages[index].semantic;
+      stage.status = hal::StageExecutionStatus::succeeded;
+      stage.valid_output_preserved = true;
+      stage.elapsed_ns = 100 + index;
+    }
+    if (mode == ExecuteMode::optional_fail_open) {
+      result.stages[0].status = hal::StageExecutionStatus::optional_failed_open;
+      result.stages[0].reason = hal::ReasonId::optional_stage_failed_open;
+    }
+    result.transfers.uploads = 1;
+    result.transfers.final_readbacks = 1;
+    result.transfers.synchronizations =
+        mode == ExecuteMode::transfer_mismatch ? 4 : 2;
+    result.frame_elapsed_ns = 500;
+    return result;
+  }
+
+  hal::StatusId
+  ResolveHostFrameOutput(const hal::PreparedProgramHandle &,
+                         const hal::CompletionToken &completion,
+                         const hal::ResourceHandle &output,
+                         hal::HostFrameOutputResolution *resolution,
+                         hal::ReasonId *reason) noexcept override {
+    if (completion.program_id != program_.program_id ||
+        output.resource_id != tokens_.output.resource_id) {
+      if (reason)
+        *reason = hal::ReasonId::stale_program;
+      return hal::StatusId::stale;
+    }
+    resolution->descriptor = binding_.output_descriptor;
+    resolution->planes = binding_.output_planes;
+    resolution->plane_count = binding_.output_plane_count;
+    resolution->capture_sequence = binding_.capture_sequence;
+    resolution->output_ready = true;
+    if (reason)
+      *reason = hal::ReasonId::none;
+    return hal::StatusId::ready;
+  }
+
+  hal::StatusId ResetTemporalState(const hal::PreparedProgramHandle &,
+                                   hal::ReasonId) noexcept override {
+    return hal::StatusId::ready;
+  }
+
+  void DestroyPrepared(hal::PreparedProgramHandle *program) noexcept override {
+    ++destroy_calls;
+    *program = {};
+  }
+
+  void Shutdown() noexcept override {
+    ++shutdown_calls;
+    shutdown = true;
+  }
+
+  ExecuteMode mode = ExecuteMode::success;
+  bool fail_prepare = false;
+  bool shutdown = false;
+  std::uint64_t prepare_calls = 0;
+  std::uint64_t execute_calls = 0;
+  std::uint64_t destroy_calls = 0;
+  std::uint64_t shutdown_calls = 0;
+
+private:
+  hal::PreparedProgram program_{};
+  hal::HostFrameBinding binding_{};
+  hal::HostFrameTokens tokens_{};
+  std::uint64_t next_token_ = 1;
+};
+
+hal::SemanticCapabilityEvidence
+Capability(hal::SemanticEffectId semantic,
+           hal::CapabilityEvidenceCode production_code) {
+  hal::SemanticCapabilityEvidence capability;
+  capability.semantic = semantic;
+  capability.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  capability.status = hal::StatusId::ready;
+  capability.live_stage = true;
+  capability.production_eligible = true;
+  capability.exact_evidence = true;
+  constexpr hal::CapabilityEvidenceCode common[]{
+      hal::CapabilityEvidenceCode::vulkan_physical_device_available,
+      hal::CapabilityEvidenceCode::vulkan_build_enabled,
+      hal::CapabilityEvidenceCode::vulkan_loader_available,
+      hal::CapabilityEvidenceCode::vulkan_non_cpu_device,
+      hal::CapabilityEvidenceCode::vulkan_compute_queue_available,
+      hal::CapabilityEvidenceCode::vulkan_context_healthy,
+      hal::CapabilityEvidenceCode::vulkan_utility_kernels_ready,
+      hal::CapabilityEvidenceCode::vulkan_exact_device_shared,
+      hal::CapabilityEvidenceCode::vulkan_device_local_residency,
+      hal::CapabilityEvidenceCode::vulkan_bounded_allocations,
+      hal::CapabilityEvidenceCode::vulkan_no_cpu_layers,
+      hal::CapabilityEvidenceCode::vulkan_no_intermediate_readbacks,
+      hal::CapabilityEvidenceCode::vulkan_live_stage_present,
+  };
+  for (const auto code : common) {
+    capability.evidence[capability.evidence_count++] = {
+        code,     hal::StatusId::ready,   hal::ReasonId::none,
+        semantic, hal::BackendId::vulkan, true};
+  }
+  capability.evidence[capability.evidence_count++] = {
+      production_code, hal::StatusId::ready,   hal::ReasonId::none,
+      semantic,        hal::BackendId::vulkan, true};
+  return capability;
+}
+
+hal::AdapterRegistration Registration(FakeVulkanAdapter *adapter) {
+  hal::AdapterRegistration registration;
+  registration.adapter_instance_id = kAdapterId;
+  registration.backend = hal::BackendId::vulkan;
+  registration.execution_domain = Domain();
+  registration.selection_priority = 300;
+  registration.resident_adapter = adapter;
+  registration.semantic_capabilities[0] =
+      Capability(hal::SemanticEffectId::vignette,
+                 hal::CapabilityEvidenceCode::
+                     open_vulkan_vignette_fixed_center_production_ready);
+  registration.semantic_capabilities[1] = Capability(
+      hal::SemanticEffectId::mirror,
+      hal::CapabilityEvidenceCode::open_vulkan_mirror_production_ready);
+  registration.semantic_capability_count = 2;
+  return registration;
+}
+
+video::VideoExecutionPlanRequest Request() {
+  video::VideoExecutionPlanRequest request;
+  request.plan_id = 500;
+  request.intent.backend.mode = hal::BackendRequestMode::explicit_backend;
+  request.intent.backend.backend = hal::BackendId::vulkan;
+  request.intent.backend.strict = true;
+  request.intent.preferences.compute_family =
+      hal::ComputeFamilyAllowance::vulkan_only;
+  request.intent.requested_provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  request.intent.strict_provider_selection = true;
+
+  auto &vignette = request.intent.stages[0];
+  vignette.intent.stage_id = 8;
+  vignette.intent.semantic = hal::SemanticEffectId::vignette;
+  vignette.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  vignette.parameters[0].id = video::CanonicalVideoParameterId::intensity;
+  vignette.parameters[0].kind =
+      video::CanonicalVideoParameterKind::signed_integer;
+  vignette.parameters[0].signed_value = 61;
+  vignette.parameters[1].id =
+      video::CanonicalVideoParameterId::center_on_tracked_face;
+  vignette.parameters[1].kind = video::CanonicalVideoParameterKind::boolean;
+  vignette.parameters[1].boolean_value = false;
+  vignette.parameter_count = 2;
+
+  auto &mirror = request.intent.stages[1];
+  mirror.intent.stage_id = 9;
+  mirror.intent.semantic = hal::SemanticEffectId::mirror;
+  mirror.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  request.intent.stage_count = 2;
+
+  request.host_input =
+      Image(hal::HostCoherence::coherent, hal::Mutability::read_only);
+  request.host_output =
+      Image(hal::HostCoherence::coherent, hal::Mutability::write_only);
+  request.invalidation_key.generations = {1, 1, 1, 1, 1, 19};
+  request.invalidation_key.canonical_plan_hash = 1001;
+  request.invalidation_key.execution_domain_hash = 3001;
+  request.budget.persistent_bytes = 4096;
+  request.budget.scratch_bytes = 4096;
+  request.budget.upload_staging_bytes = 4096;
+  request.budget.readback_staging_bytes = 4096;
+  request.budget.resource_count = 16;
+  request.budget.in_flight_slots = 1;
+  return request;
+}
+
+hal::HostFrameBinding Binding(std::uint8_t *input, std::uint8_t *output,
+                              std::uint64_t capture_sequence) {
+  hal::HostFrameBinding binding;
+  binding.input_descriptor =
+      Image(hal::HostCoherence::coherent, hal::Mutability::read_only);
+  binding.output_descriptor =
+      Image(hal::HostCoherence::coherent, hal::Mutability::write_only);
+  binding.input_planes[0].read_data =
+      reinterpret_cast<const std::byte *>(input);
+  binding.input_planes[0].span_bytes = kBytes;
+  binding.input_planes[0].row_stride_bytes = kStride;
+  binding.output_planes[0].write_data = reinterpret_cast<std::byte *>(output);
+  binding.output_planes[0].span_bytes = kBytes;
+  binding.output_planes[0].row_stride_bytes = kStride;
+  binding.input_plane_count = 1;
+  binding.output_plane_count = 1;
+  binding.capture_sequence = capture_sequence;
+  return binding;
+}
+
+struct Fixture {
+  FakeVulkanAdapter adapter;
+  vulkan::VulkanVideoExecutionFactory factory;
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator;
+
+  Fixture()
+      : factory(Registration(&adapter),
+                [] {
+                  vulkan::VulkanVideoExecutionFactoryConfiguration c;
+                  c.factory_id = kFactoryId;
+                  return c;
+                }()),
+        coordinator(registry) {}
+
+  bool Initialize() {
+    hal::ReasonId reason = hal::ReasonId::none;
+    return factory.Initialize(&reason) == hal::StatusId::ready &&
+           registry.Register(factory.adapter_registration(), &reason) ==
+               hal::StatusId::ready &&
+           coordinator.RegisterFactory(factory.factory_registration(),
+                                       &reason) == hal::StatusId::ready;
+  }
+
+  bool Prepare(const video::VideoExecutionPlanRequest &request,
+               video::VideoExecutionPrepareEvidence *evidence = nullptr) {
+    hal::ReasonId reason = hal::ReasonId::none;
+    return coordinator.Prepare(request, evidence, &reason) ==
+           hal::StatusId::ready;
+  }
+};
+
+bool HasEvidence(const hal::ReadinessSnapshot &readiness,
+                 hal::CapabilityEvidenceCode code) {
+  for (std::size_t index = 0; index < readiness.evidence_count; ++index) {
+    if (readiness.evidence[index].code == code &&
+        readiness.evidence[index].satisfied) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TestExactFactoryAndCommit() {
+  Fixture fixture;
+  video::VideoExecutionPrepareEvidence evidence;
+  if (!Require(fixture.Initialize(), "factory fixture must initialize") ||
+      !Require(fixture.Prepare(Request(), &evidence),
+               "qualified Vulkan plan must prepare")) {
+    return false;
+  }
+  const auto snapshot = fixture.coordinator.Snapshot();
+  bool ok =
+      Require(snapshot.plan.prepared_program.stage_count == 2 &&
+                  snapshot.plan.prepared_program.stages[0].semantic ==
+                      hal::SemanticEffectId::vignette &&
+                  snapshot.plan.prepared_program.stages[1].semantic ==
+                      hal::SemanticEffectId::mirror,
+              "factory must preserve canonical vignette-before-mirror order");
+  ok &= Require(
+      HasEvidence(evidence.readiness,
+                  hal::CapabilityEvidenceCode::
+                      open_vulkan_vignette_fixed_center_production_ready) &&
+          HasEvidence(
+              evidence.readiness,
+              hal::CapabilityEvidenceCode::open_vulkan_mirror_production_ready),
+      "readiness must preserve both exact per-effect production attestations");
+
+  std::uint8_t input[kBytes]{};
+  std::uint8_t output[kBytes]{};
+  for (std::size_t index = 0; index < kBytes; ++index)
+    input[index] = static_cast<std::uint8_t>(index + 3);
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_relaxed);
+  const auto frame = fixture.coordinator.Execute(Binding(input, output, 1));
+  g_count_allocations.store(false, std::memory_order_relaxed);
+  ok &= Require(frame.status == hal::StatusId::executed &&
+                    frame.transfers.uploads == 1 &&
+                    frame.transfers.final_readbacks == 1 &&
+                    frame.transfers.intermediate_readbacks == 0 &&
+                    frame.transfers.intermediate_uploads == 0 &&
+                    frame.transfers.synchronizations == 2 &&
+                    std::memcmp(input, output, kBytes) == 0,
+                "prepared frame must keep the exact transfer contract");
+  ok &= Require(g_allocations.load(std::memory_order_relaxed) == 0,
+                "Execute must not allocate");
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok &= Require(fixture.coordinator.CommitOutput(
+                    frame.completion, true, &reason) == hal::StatusId::ready,
+                "successful writer commit must succeed");
+  const auto committed = fixture.coordinator.Snapshot();
+  ok &= Require(committed.latest_committed_frame.valid &&
+                    committed.telemetry.active_backend ==
+                        hal::BackendId::vulkan &&
+                    committed.telemetry.committed_output_frames == 1,
+                "active Vulkan attribution must occur only after commit");
+  return ok;
+}
+
+bool TestFactoryRetainsExactQuarantineReason() {
+  bool ok = true;
+  for (const auto reason :
+       {hal::ReasonId::synchronization_failed, hal::ReasonId::device_lost}) {
+    Fixture fixture;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    video::VideoAdapterPrepareEvidence evidence;
+    auto executor =
+        fixture.factory.Prepare(fixture.coordinator.Snapshot().plan, &evidence);
+    if (!Require(executor != nullptr, "quarantine wrapper must prepare"))
+      return false;
+    fixture.adapter.mode = reason == hal::ReasonId::device_lost
+                               ? ExecuteMode::device_loss
+                               : ExecuteMode::synchronization_quarantine;
+    std::uint8_t input[kBytes]{}, output[kBytes]{};
+    const auto failed = executor->Execute(Binding(input, output, 1));
+    const auto retry = executor->Execute(Binding(input, output, 2));
+    const auto snapshot = executor->Snapshot();
+    ok &= Require(failed.status == hal::StatusId::quarantined &&
+                      failed.reason == reason && !failed.output_ready &&
+                      retry.status == hal::StatusId::quarantined &&
+                      retry.reason == reason &&
+                      snapshot.readiness.status == hal::StatusId::quarantined &&
+                      snapshot.readiness.reason == reason &&
+                      fixture.adapter.execute_calls == 1,
+                  "factory retries and diagnostics must preserve timeout "
+                  "versus real device loss");
+  }
+  return ok;
+}
+
+bool TestMattingFinalGeometryContract() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  const auto semantic = hal::SemanticEffectId::virtual_background_remove;
+  auto capability = Capability(
+      semantic, hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready);
+  capability.evidence[capability.evidence_count++] = {
+      hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid,
+      hal::StatusId::ready,
+      hal::ReasonId::none,
+      semantic,
+      hal::BackendId::vulkan,
+      true};
+  registration.semantic_capabilities[registration.semantic_capability_count++] =
+      capability;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId;
+  configuration.maximum_synchronizations_per_frame =
+      video::kMaxPerFrameSynchronizationsV1;
+  configuration.matting_pack = std::make_shared<open_video::ModelPack>();
+  configuration.matting_identity.artifact_generation = 1;
+  configuration.matting_identity.model_id_hash[0] = 3;
+  configuration.matting_identity.artifact_set_hash[0] = 4;
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(
+          factory.Initialize(&reason) == hal::StatusId::ready &&
+              registry.Register(factory.adapter_registration(), &reason) ==
+                  hal::StatusId::ready &&
+              coordinator.RegisterFactory(factory.factory_registration(),
+                                          &reason) == hal::StatusId::ready,
+          "model-backed factory must initialize from exact injected evidence"))
+    return false;
+  auto request = Request();
+  request.intent.stage_count = 1;
+  auto &stage = request.intent.stages[0];
+  stage = {};
+  stage.intent.stage_id = 8;
+  stage.intent.semantic = semantic;
+  stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  stage.model = configuration.matting_identity;
+  stage.parameter_count = 4;
+  stage.parameters[0].id = video::CanonicalVideoParameterId::strength;
+  stage.parameters[0].kind = video::CanonicalVideoParameterKind::signed_integer;
+  stage.parameters[0].signed_value = 8;
+  stage.parameters[1].id = video::CanonicalVideoParameterId::remove_color_rgb;
+  stage.parameters[1].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  stage.parameters[2].id = video::CanonicalVideoParameterId::greenscreen_mode;
+  stage.parameters[2].kind =
+      video::CanonicalVideoParameterKind::unsigned_integer;
+  stage.parameters[2].unsigned_value =
+      3; // Maxine-only mode is opaque to Vulkan.
+  stage.parameters[3].id =
+      video::CanonicalVideoParameterId::greenscreen_temporal;
+  stage.parameters[3].kind = video::CanonicalVideoParameterKind::boolean;
+  stage.parameters[3].boolean_value = true;
+  request.host_output.width = 2;
+  request.host_output.height = 1;
+  request.host_output.planes[0].width = 2;
+  request.host_output.planes[0].height = 1;
+  request.host_output.planes[0].row_stride_bytes = 6;
+  request.host_output.planes[0].size_bytes = 6;
+  video::VideoExecutionPrepareEvidence evidence;
+  const auto status = coordinator.Prepare(request, &evidence, &reason);
+  const auto snapshot = coordinator.Snapshot();
+  return Require(
+      status == hal::StatusId::ready &&
+          snapshot.plan.prepared_program.stages[0].output.image.width == 2 &&
+          snapshot.plan.prepared_program.stages[0].output.image.height == 1,
+      "standalone matting must bind writer geometry while leaving Maxine-only "
+      "knobs opaque");
+}
+
+bool TestAllModelProgramContract() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  const std::array semantics{hal::SemanticEffectId::video_noise_removal,
+                             hal::SemanticEffectId::eye_contact,
+                             hal::SemanticEffectId::virtual_background_blur,
+                             hal::SemanticEffectId::virtual_key_light,
+                             hal::SemanticEffectId::auto_frame,
+                             hal::SemanticEffectId::vignette,
+                             hal::SemanticEffectId::mirror};
+  const auto proof = [](hal::SemanticCapabilityEvidence &c,
+                        hal::CapabilityEvidenceCode code) {
+    c.evidence[c.evidence_count++] = {
+        code,       hal::StatusId::ready,   hal::ReasonId::none,
+        c.semantic, hal::BackendId::vulkan, true};
+  };
+  proof(registration.semantic_capabilities[0],
+        hal::CapabilityEvidenceCode::vulkan_tracked_vignette_center_supported);
+  registration.semantic_capabilities[0].supports_tracked_vignette_center = true;
+  for (const auto code :
+       {hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid,
+        hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready})
+    proof(registration.semantic_capabilities[0], code);
+  for (std::size_t i = 0; i < 5; ++i) {
+    const auto code =
+        i == 0   ? hal::CapabilityEvidenceCode::vulkan_denoise_runtime_ready
+        : i == 1 ? hal::CapabilityEvidenceCode::vulkan_eye_runtime_ready
+        : i == 4 ? hal::CapabilityEvidenceCode::vulkan_face_runtime_ready
+                 : hal::CapabilityEvidenceCode::vulkan_matting_runtime_ready;
+    auto capability = Capability(semantics[i], code);
+    proof(capability,
+          hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
+    proof(capability, hal::CapabilityEvidenceCode::vulkan_warmup_complete);
+    if (i == 1)
+      for (const auto extra :
+           {hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+            hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready,
+            hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled})
+        proof(capability, extra);
+    if (i == 4)
+      proof(capability, hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready);
+    registration
+        .semantic_capabilities[registration.semantic_capability_count++] =
+        capability;
+  }
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId;
+  configuration.matting_identity.artifact_generation = 1;
+  configuration.matting_identity.model_id_hash[0] = 3;
+  configuration.matting_identity.artifact_set_hash[0] = 4;
+  configuration.denoise_identity = configuration.face_identity =
+      configuration.eye_identity = configuration.matting_identity;
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(factory.Initialize(&reason) == hal::StatusId::ready &&
+                   registry.Register(factory.adapter_registration(), &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(factory.factory_registration(),
+                                               &reason) == hal::StatusId::ready,
+               "all-model exact injected registration must initialize"))
+    return false;
+  auto request = Request();
+  request.intent.stages = {};
+  request.intent.stage_count = semantics.size();
+  request.temporal.temporal = true;
+  request.temporal.history_frames = 5;
+  const auto add = [](video::CanonicalVideoStage &stage,
+                      video::CanonicalVideoParameterId id, std::int64_t value) {
+    auto &p = stage.parameters[stage.parameter_count++];
+    p.id = id;
+    p.kind = video::CanonicalVideoParameterKind::signed_integer;
+    p.signed_value = value;
+  };
+  for (std::size_t i = 0; i < semantics.size(); ++i) {
+    auto &stage = request.intent.stages[i];
+    stage.intent.stage_id = static_cast<std::uint32_t>(i + 1);
+    stage.intent.semantic = semantics[i];
+    stage.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+    if (i < 5)
+      stage.model = configuration.matting_identity;
+    using Id = video::CanonicalVideoParameterId;
+    if (i == 0 || i == 1 || i == 2 || i == 4)
+      add(stage, Id::strength, i == 2 ? 17 : 65);
+    if (i == 1 || i == 5) {
+      if (i == 5)
+        add(stage, Id::intensity, 47);
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = i == 1 ? Id::look_away_enabled : Id::center_on_tracked_face;
+      p.kind = video::CanonicalVideoParameterKind::boolean;
+      p.boolean_value = i == 5;
+      stage.intent.requires_tracked_vignette_center = i == 5;
+    }
+    if (i == 2) {
+      for (const auto id : {Id::remove_color_rgb, Id::greenscreen_mode}) {
+        auto &p = stage.parameters[stage.parameter_count++];
+        p.id = id;
+        p.kind = video::CanonicalVideoParameterKind::unsigned_integer;
+      }
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = Id::greenscreen_temporal;
+      p.kind = video::CanonicalVideoParameterKind::boolean;
+    }
+    if (i == 3) {
+      add(stage, Id::intensity, 65);
+      add(stage, Id::temperature_preset, 1);
+      add(stage, Id::direction_pan_degrees, -35);
+    }
+    if (i == 4) {
+      add(stage, Id::smoothing, 35);
+      auto &p = stage.parameters[stage.parameter_count++];
+      p.id = Id::headroom;
+      p.kind = video::CanonicalVideoParameterKind::real;
+      p.real_value = .15;
+    }
+  }
+  const auto status = coordinator.Prepare(request, nullptr, &reason);
+  if (status != hal::StatusId::ready)
+    std::cerr << "all-model injected status/reason="
+              << static_cast<unsigned>(status) << '/'
+              << static_cast<unsigned>(reason) << '\n';
+  return Require(status == hal::StatusId::ready && adapter.prepare_calls == 1 &&
+                     coordinator.Snapshot().readiness.evidence_count == 25,
+                 "all seven canonical model and utility stages must prepare");
+}
+
+bool TestFactoryRejectsIncompleteAndDuplicateModelProofs() {
+  FakeVulkanAdapter adapter;
+  const auto registration_for = [&](bool eye) {
+    auto registration = Registration(&adapter);
+    const auto semantic = eye ? hal::SemanticEffectId::eye_contact
+                              : hal::SemanticEffectId::auto_frame;
+    auto capability = Capability(
+        semantic, eye ? hal::CapabilityEvidenceCode::vulkan_eye_runtime_ready
+                      : hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready);
+    const auto add = [&](hal::CapabilityEvidenceCode code) {
+      capability.evidence[capability.evidence_count++] = {
+          code,     hal::StatusId::ready,   hal::ReasonId::none,
+          semantic, hal::BackendId::vulkan, true};
+    };
+    add(hal::CapabilityEvidenceCode::vulkan_model_artifacts_valid);
+    add(hal::CapabilityEvidenceCode::vulkan_warmup_complete);
+    add(hal::CapabilityEvidenceCode::vulkan_face_runtime_ready);
+    if (eye) {
+      add(hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready);
+      add(hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled);
+    }
+    registration
+        .semantic_capabilities[registration.semantic_capability_count++] =
+        capability;
+    return registration;
+  };
+  bool ok = true;
+  for (const auto missing :
+       {hal::CapabilityEvidenceCode::vulkan_face_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_tracking_gpu_ready,
+        hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready,
+        hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled}) {
+    const bool eye =
+        missing ==
+            hal::CapabilityEvidenceCode::vulkan_landmarks_runtime_ready ||
+        missing == hal::CapabilityEvidenceCode::vulkan_shader_float64_enabled;
+    auto registration = registration_for(eye);
+    auto &capability = registration.semantic_capabilities[2];
+    auto found = std::find_if(
+        capability.evidence.begin(),
+        capability.evidence.begin() + capability.evidence_count,
+        [&](const auto &record) { return record.code == missing; });
+    std::move(found + 1,
+              capability.evidence.begin() + capability.evidence_count, found);
+    --capability.evidence_count;
+    vulkan::VulkanVideoExecutionFactory factory(registration, {});
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(factory.Initialize(&reason) == hal::StatusId::blocked &&
+                      reason == hal::ReasonId::capability_evidence_incomplete &&
+                      !factory.adapter_registration().resident_adapter &&
+                      adapter.prepare_calls == 0,
+                  "raw factory readiness must reject each missing model proof");
+  }
+  auto registration = registration_for(false);
+  auto &capability = registration.semantic_capabilities[2];
+  capability.evidence[capability.evidence_count] = capability.evidence[0];
+  ++capability.evidence_count;
+  vulkan::VulkanVideoExecutionFactory duplicate(registration, {});
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok &= Require(duplicate.Initialize(&reason) == hal::StatusId::blocked &&
+                    reason == hal::ReasonId::malformed_contract &&
+                    !duplicate.adapter_registration().resident_adapter &&
+                    adapter.prepare_calls == 0,
+                "raw factory readiness must reject duplicate evidence records");
+  return ok;
+}
+
+bool TestInitializeCannotReplaceRefusedRollbackCandidate() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  registration.adapter_instance_id = 0;
+  struct Rollback {
+    bool retired = false;
+    unsigned calls = 0;
+  } rollback;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &rollback;
+  configuration.injected_executor_shutdown = [](void *context) noexcept {
+    auto &state = *static_cast<Rollback *>(context);
+    ++state.calls;
+    return state.retired;
+  };
+  vulkan::VulkanVideoExecutionFactory factory(registration, configuration);
+  hal::ReasonId reason = hal::ReasonId::none;
+  bool ok = Require(factory.Initialize(&reason) == hal::StatusId::quarantined &&
+                        reason == hal::ReasonId::synchronization_failed &&
+                        !factory.initialized() && rollback.calls == 1,
+                    "failed setup with refused rollback must retain quarantine");
+  // Becoming safe does not itself authorize an implicit cleanup/replacement.
+  rollback.retired = true;
+  ok &= Require(factory.Initialize(&reason) == hal::StatusId::quarantined &&
+                    reason == hal::ReasonId::synchronization_failed &&
+                    !factory.initialized() && rollback.calls == 1,
+                "Initialize must not retry or overwrite a refused candidate");
+  const auto shutdown = factory.RequestShutdown();
+  ok &= Require(shutdown.quiescent &&
+                    shutdown.driver_context_release_permitted &&
+                    rollback.calls == 2,
+                "only explicit shutdown may retry retained candidate retirement");
+  ok &= Require(factory.Initialize(&reason) == hal::StatusId::stopped &&
+                    reason == hal::ReasonId::shutdown_requested &&
+                    rollback.calls == 2,
+                "completed explicit shutdown must preserve terminal semantics");
+
+  rollback.calls = 0;
+  vulkan::VulkanVideoExecutionFactory safe_retry(registration, configuration);
+  ok &= Require(safe_retry.Initialize(&reason) == hal::StatusId::blocked &&
+                    safe_retry.Initialize(&reason) == hal::StatusId::blocked &&
+                    rollback.calls == 2,
+                "safely discarded failed candidates must remain retryable");
+  return ok;
+}
+
+bool TestShutdownRequiresExecutorRetirementAfterFenceProof() {
+  FakeVulkanAdapter adapter;
+  struct Gates {
+    bool retired = false;
+    unsigned fence_calls = 0, executor_calls = 0;
+  } gates;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &gates;
+  configuration.injected_shutdown_probe = [](void *context) noexcept {
+    ++static_cast<Gates *>(context)->fence_calls;
+    return hal::StatusId::ready;
+  };
+  configuration.injected_executor_shutdown = [](void *context) noexcept {
+    auto &state = *static_cast<Gates *>(context);
+    ++state.executor_calls;
+    return state.retired;
+  };
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  std::weak_ptr<const video::effects::BroadcastCameraEffects> lifetime =
+      configuration.effects;
+  auto factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  configuration.effects.reset();
+  auto owner =
+      vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto refused = owner->RequestShutdown();
+  bool ok = Require(gates.fence_calls == 1 && gates.executor_calls == 1 &&
+                        refused.status == hal::StatusId::quarantined &&
+                        refused.reason == hal::ReasonId::synchronization_failed &&
+                        refused.pending && !refused.quiescent &&
+                        !refused.driver_context_release_permitted &&
+                        !lifetime.expired(),
+                    "successful fence proof must not waive refused executor "
+                    "retirement or release its owner");
+  gates.retired = true;
+  const auto completed = owner->RequestShutdown();
+  const auto repeated = owner->RequestShutdown();
+  ok &= Require(completed.quiescent &&
+                    completed.driver_context_release_permitted &&
+                    repeated.driver_context_release_permitted &&
+                    gates.fence_calls == 2 && gates.executor_calls == 2,
+                "explicit retry must retire executor once; completed shutdown "
+                "must be idempotent");
+  owner.reset();
+  ok &= Require(lifetime.expired(), "retired executor owner must be released");
+  gates.retired = false;
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  lifetime = configuration.effects;
+  factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  auto *retained = factory.get();
+  configuration.effects.reset();
+  owner = vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto pending = owner->RequestShutdown();
+  const auto calls = gates.executor_calls;
+  owner.reset();
+  ok &= Require(pending.pending && !lifetime.expired() &&
+                    gates.executor_calls == calls,
+                "destruction after refused executor retirement must retain "
+                "the complete owner without another attempt");
+  gates.retired = true;
+  ok &= Require(retained->RequestShutdown().driver_context_release_permitted,
+                "retained fixture cleanup must also prove executor retirement");
+  delete retained;
+  ok &= Require(lifetime.expired(), "proved retained fixture must release");
+  ok &= Require(!util::UnsafeNativeResourcesRetained(),
+                "injected executor refusal must not mark native retention");
+  return ok;
+}
+
+bool TestShutdownRetainsUnprovenNativeOwner() {
+  FakeVulkanAdapter adapter;
+  bool safe = false;
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.injected_shutdown_context = &safe;
+  configuration.injected_shutdown_probe = [](void *context) noexcept {
+    return *static_cast<bool *>(context) ? hal::StatusId::ready
+                                         : hal::StatusId::quarantined;
+  };
+  configuration.effects =
+      std::make_shared<video::effects::BroadcastCameraEffects>();
+  std::weak_ptr<const video::effects::BroadcastCameraEffects> lifetime =
+      configuration.effects;
+  auto factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  configuration.effects.reset();
+  auto owner =
+      vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  const auto first = owner->RequestShutdown();
+  bool ok =
+      Require(first.status == hal::StatusId::quarantined &&
+                  first.reason == hal::ReasonId::synchronization_failed &&
+                  first.shutdown_requested && first.pending &&
+                  !first.quiescent && !first.driver_context_release_permitted,
+              "unproven Vulkan completion must report quarantine and retain "
+              "the native owner");
+  safe = true;
+  const auto retry = owner->RequestShutdown();
+  ok &= Require(
+      retry.status == hal::StatusId::stopped &&
+          retry.reason == hal::ReasonId::shutdown_requested &&
+          retry.shutdown_attempts == 2 && !retry.pending && retry.quiescent &&
+          retry.driver_context_release_permitted,
+      "only a subsequent positive quiescence proof may permit owner release");
+  owner.reset();
+  ok &= Require(lifetime.expired(),
+                "proved shutdown must release factory ownership");
+  // Retention is observed before this fixture explicitly supplies proof and
+  // destroys its fake owner, keeping sanitizer runs free of intentional leaks.
+  auto retained_safe = std::make_shared<bool>(false);
+  configuration.injected_shutdown_context = retained_safe.get();
+  struct RetainedEffects {
+    video::effects::BroadcastCameraEffects effects;
+    std::shared_ptr<bool> safe;
+  };
+  auto retained_effects = std::make_shared<RetainedEffects>();
+  retained_effects->safe = retained_safe;
+  configuration.effects =
+      std::shared_ptr<const video::effects::BroadcastCameraEffects>(
+          retained_effects, &retained_effects->effects);
+  retained_effects.reset();
+  lifetime = configuration.effects;
+  factory = std::make_unique<vulkan::VulkanVideoExecutionFactory>(
+      Registration(&adapter), configuration);
+  auto *retained_factory = factory.get();
+  owner = vulkan::CreateProductionVulkanSetupLeaseOwner(std::move(factory));
+  configuration.effects.reset();
+  const auto pending = owner->RequestShutdown();
+  owner.reset();
+  ok &= Require(pending.pending && !lifetime.expired(),
+                "destruction without proof must retain the complete factory "
+                "rather than release its native island");
+  *retained_safe = true;
+  ok &= Require(
+      retained_factory->RequestShutdown().driver_context_release_permitted,
+      "fixture cleanup also requires positive proof");
+  delete retained_factory;
+  ok &= Require(lifetime.expired(),
+                "proved fixture cleanup must release the retained factory");
+  ok &= Require(!util::UnsafeNativeResourcesRetained(),
+                "injected proof refusal must not mark native retention");
+  return ok;
+}
+
+bool TestFiniteFenceTimeoutContract() {
+  FakeVulkanAdapter adapter;
+  for (const auto timeout : {UINT64_C(0), UINT64_MAX}) {
+    vulkan::VulkanVideoExecutionFactoryConfiguration config;
+    config.execution_fence_timeout_ns = timeout;
+    vulkan::VulkanVideoExecutionFactory factory(Registration(&adapter), config);
+    hal::ReasonId reason = hal::ReasonId::none;
+    if (!Require(factory.Initialize(&reason) == hal::StatusId::blocked &&
+                     reason == hal::ReasonId::malformed_contract &&
+                     adapter.prepare_calls == 0,
+                 "zero or infinite fence deadlines must fail before native "
+                 "acquisition"))
+      return false;
+  }
+  vulkan::VulkanVideoExecutionFactoryConfiguration config;
+  config.execution_fence_timeout_ns = UINT64_C(100000000);
+  vulkan::VulkanVideoExecutionFactory factory(Registration(&adapter), config);
+  hal::ReasonId reason = hal::ReasonId::none;
+  return Require(
+      factory.Initialize(&reason) == hal::StatusId::ready,
+      "the finite camera 100 ms deadline must preserve valid preparation");
+}
+
+bool TestMalformedSourceStageCount() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  request.plan.intent.stage_count = request.plan.intent.stages.size() + 1;
+  const auto result = source->AcquireResidentSetup(request);
+  return Require(result.status == hal::StatusId::blocked &&
+                     !result.lease.live() &&
+                     result.setup_completed_outside_frame_loop,
+                 "an oversized Vulkan setup stage count must fail before "
+                 "scanning or native acquisition");
+}
+
+bool TestUnavailableOptionalStageIsolation() {
+  FakeVulkanAdapter adapter;
+  auto registration = Registration(&adapter);
+  auto &missing =
+      registration
+          .semantic_capabilities[registration.semantic_capability_count++];
+  missing.semantic = hal::SemanticEffectId::video_noise_removal;
+  missing.provider =
+      hal::SemanticEffectProviderId::open_vulkan_production_kernels;
+  missing.status = hal::StatusId::unavailable;
+  missing.reason = hal::ReasonId::semantic_effect_unsupported;
+  vulkan::VulkanVideoExecutionFactory factory(registration, [] {
+    vulkan::VulkanVideoExecutionFactoryConfiguration c;
+    c.factory_id = kFactoryId;
+    return c;
+  }());
+  hal::StaticAdapterRegistry registry;
+  video::VideoExecutionCoordinator coordinator(registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (!Require(factory.Initialize(&reason) == hal::StatusId::ready &&
+                   registry.Register(factory.adapter_registration(), &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(factory.factory_registration(),
+                                               &reason) == hal::StatusId::ready,
+               "unavailable model capability must preserve the ready adapter"))
+    return false;
+  auto request = Request();
+  request.intent.stages[2] = request.intent.stages[1];
+  request.intent.stages[1] = request.intent.stages[0];
+  request.intent.stages[0] = {};
+  request.intent.stages[0].intent.stage_id = 1;
+  request.intent.stages[0].intent.semantic =
+      hal::SemanticEffectId::video_noise_removal;
+  request.intent.stages[0].intent.failure_action =
+      hal::FailureAction::fail_open_preserve_input;
+  request.intent.stage_count = 3;
+  request.temporal.temporal = true;
+  request.temporal.history_frames = 5;
+  video::VideoExecutionPrepareEvidence evidence;
+  const auto status = coordinator.Prepare(request, &evidence, &reason);
+  const auto snapshot = coordinator.Snapshot();
+  bool ok = Require(status == hal::StatusId::degraded &&
+                        snapshot.plan.resolution.stages[0].skipped_optional &&
+                        snapshot.plan.prepared_program.stage_count == 2 &&
+                        evidence.readiness.ready_stage_mask == 6 &&
+                        evidence.readiness.disabled_stage_mask == 1 &&
+                        adapter.prepare_calls == 1,
+                    "missing optional denoise must preserve vignette/mirror "
+                    "and the canonical temporal contract");
+  std::uint8_t input[kBytes]{}, output[kBytes]{};
+  const auto frame = coordinator.Execute(Binding(input, output, 1));
+  ok &= Require(frame.status == hal::StatusId::executed ||
+                    frame.status == hal::StatusId::degraded,
+                "unrelated resident effects must still execute");
+  request.intent.stages[0].intent.required = true;
+  const auto previous_calls = adapter.prepare_calls;
+  const auto required = coordinator.Prepare(request, nullptr, &reason);
+  ok &= Require(required != hal::StatusId::ready &&
+                    required != hal::StatusId::degraded &&
+                    adapter.prepare_calls == previous_calls,
+                "a required missing stage must fail before adapter prepare");
+  return ok;
+}
+
+bool TestMissingSelectedPackNeedsNoNativeContext() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.plan.intent.stages = {};
+  request.plan.intent.stage_count = 1;
+  auto &stage = request.plan.intent.stages[0].intent;
+  stage.stage_id = 1;
+  stage.semantic = hal::SemanticEffectId::video_noise_removal;
+  stage.failure_action = hal::FailureAction::fail_open_preserve_input;
+  request.plan.temporal.temporal = true;
+  request.plan.temporal.history_frames = 5;
+  request.effects.video_noise_removal.enabled = true;
+  request.effects.video_noise_removal.model_id =
+      "hermetic-explicitly-nonexistent-denoise-pack-20261112";
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  auto result = source->AcquireResidentSetup(request);
+  bool ok = Require(
+      result.status == hal::StatusId::degraded && !result.lease.live() &&
+          result.resolution_registration.resident_adapter == nullptr &&
+          result.resolution_registration.semantic_capabilities[0].status ==
+              hal::StatusId::unavailable,
+      "a missing optional selected pack must resolve without "
+      "creating a native context");
+  stage.required = true;
+  result = source->AcquireResidentSetup(request);
+  ok &= Require(
+      result.status == hal::StatusId::unavailable && !result.lease.live() &&
+          result.reason == hal::ReasonId::required_stage_failed,
+      "a missing required selected pack must fail before native setup");
+  return ok;
+}
+
+bool TestCompiledOffInferenceKeepsUtilitySurvivors() {
+  const auto *required =
+      std::getenv("STUDIOCAST_REQUIRE_VULKAN_SDK_OFF_ISOLATION");
+  if (!required || std::string(required) != "1")
+    return true;
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN && \
+    (!defined(STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING) ||                        \
+     !STUDIOCAST_ENABLE_NCNN_VULKAN_MATTING)
+  const auto registry = open_video::ModelPackRegistry::ScanDefault();
+  const auto selected = registry.Find(
+      "video_denoise", registry.DefaultModelIdForTask("video_denoise"));
+  if (!Require(
+          selected && !selected->ncnn_vulkan_networks.empty(),
+          "SDK-off isolation requires an existing converted model fixture"))
+    return false;
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  video::ProductionVideoResidentSetup request;
+  request.plan = Request();
+  request.plan.intent.stages[2] = request.plan.intent.stages[1];
+  request.plan.intent.stages[1] = request.plan.intent.stages[0];
+  auto &model = request.plan.intent.stages[0];
+  model = {};
+  model.intent.stage_id = 1;
+  model.intent.semantic = hal::SemanticEffectId::video_noise_removal;
+  model.intent.failure_action = hal::FailureAction::fail_open_preserve_input;
+  model.parameters[0].id = video::CanonicalVideoParameterId::strength;
+  model.parameters[0].kind = video::CanonicalVideoParameterKind::signed_integer;
+  model.parameters[0].signed_value = 70;
+  model.parameter_count = 1;
+  request.plan.intent.stage_count = 3;
+  request.plan.temporal.temporal = true;
+  request.plan.temporal.history_frames = 5;
+  request.plan.invalidation_key.execution_domain_hash = 0;
+  request.effects.video_noise_removal.enabled = true;
+  request.effects.video_noise_removal.model_id = selected->id;
+  request.effects.vignette.enabled = request.effects.mirror = true;
+  request.effects.vignette.intensity = 61;
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  auto acquired = source->AcquireResidentSetup(request);
+  if (!Require(
+          acquired.status == hal::StatusId::degraded && acquired.lease.live(),
+          "compiled-off inference disabled unrelated fixed vignette/mirror"))
+    return false;
+  hal::StaticAdapterRegistry adapters;
+  video::VideoExecutionCoordinator coordinator(adapters);
+  hal::ReasonId reason = hal::ReasonId::none;
+  const auto snapshot = acquired.lease.snapshot();
+  if (!Require(adapters.Register(snapshot.adapter, &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.RegisterFactory(snapshot.factory, &reason) ==
+                       hal::StatusId::ready &&
+                   coordinator.Prepare(acquired.plan, nullptr, &reason) ==
+                       hal::StatusId::degraded,
+               "SDK-off utility survivors could not prepare"))
+    return false;
+  std::uint8_t input[kBytes]{}, output[kBytes]{};
+  const auto frame = coordinator.Execute(Binding(input, output, 1));
+  bool ok =
+      Require(frame.output_ready && frame.stage_count == 2 &&
+                  frame.transfers.uploads == 1 &&
+                  frame.transfers.final_readbacks == 1 &&
+                  frame.transfers.intermediate_readbacks == 0 &&
+                  coordinator.CommitOutput(frame.completion, true, &reason) ==
+                      hal::StatusId::ready,
+              "SDK-off utility survivors did not execute and commit");
+  coordinator.Shutdown();
+  const auto shutdown = acquired.lease.Shutdown();
+  ok &= Require(shutdown.quiescent && shutdown.driver_context_release_permitted,
+                "SDK-off utility owner did not shut down safely");
+  model.intent.required = true;
+  const auto blocked = source->AcquireResidentSetup(request);
+  ok &= Require(
+      blocked.status == hal::StatusId::unavailable &&
+          blocked.reason == hal::ReasonId::required_stage_failed &&
+          !blocked.lease.live(),
+      "required compiled-off inference must fail before native acquisition");
+  if (ok)
+    std::cout << "PASS SDK-off optional NN isolated; utility survivors "
+                 "executed/committed; required NN blocked\n";
+  return ok;
+#else
+  return Require(false,
+                 "SDK-off isolation requires Vulkan ON and ncnn Vulkan OFF");
+#endif
+}
+
+bool TestUnsupportedAndForeignPreflight() {
+  Fixture fixture;
+  if (!fixture.Initialize() || !fixture.Prepare(Request()))
+    return false;
+  const auto frozen = fixture.coordinator.Snapshot();
+  auto request = Request();
+
+  request.intent.stages[0].parameters[1].boolean_value = true;
+  auto fixed = fixture.factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  if (!Require(fixed.status == hal::StatusId::ready,
+               "tracked-center preference without a retained tracker must "
+               "preserve fixed-center behavior"))
+    return false;
+  request.intent.stages[0].intent.requires_tracked_vignette_center = true;
+  auto preflight = fixture.factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  bool ok = Require(preflight.status == hal::StatusId::blocked &&
+                        preflight.reason ==
+                            hal::ReasonId::semantic_effect_unsupported,
+                    "tracked-center vignette must remain fail-closed");
+
+  request = Request();
+  request.intent.stages[0].intent.semantic =
+      hal::SemanticEffectId::virtual_background_blur;
+  preflight = fixture.factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  ok &= Require(preflight.status == hal::StatusId::blocked &&
+                    preflight.reason == hal::ReasonId::malformed_contract,
+                "Vulkan matting without a bound model must remain fail-closed");
+
+  vulkan::VulkanVideoExecutionFactory invalid_sync_factory(
+      Registration(&fixture.adapter), [] {
+        vulkan::VulkanVideoExecutionFactoryConfiguration c;
+        c.factory_id = kFactoryId + 10;
+        c.minimum_synchronizations_per_frame = 0;
+        c.maximum_synchronizations_per_frame = 0;
+        return c;
+      }());
+  hal::ReasonId invalid_reason = hal::ReasonId::none;
+  ok &= Require(invalid_sync_factory.Initialize(&invalid_reason) ==
+                    hal::StatusId::ready,
+                "injected factory must initialize before sync validation");
+  request = Request();
+  preflight = invalid_sync_factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  ok &= Require(preflight.status == hal::StatusId::blocked &&
+                    preflight.reason == hal::ReasonId::malformed_contract,
+                "Vulkan device plan must reject a zero sync range");
+
+  request = Request();
+  request.invalidation_key.generations.context++;
+  preflight = fixture.factory.Preflight(
+      request, frozen.plan.resolution, frozen.plan.domain_plan,
+      video::VideoExecutionRoute::prepared_resident);
+  ok &= Require(preflight.status == hal::StatusId::stale &&
+                    preflight.reason == hal::ReasonId::wrong_generation,
+                "wrong context generation must be rejected");
+
+  auto foreign_domain = frozen.plan.domain_plan;
+  foreign_domain.islands[0].execution_domain.adapter_instance_id++;
+  preflight = fixture.factory.Preflight(
+      Request(), frozen.plan.resolution, foreign_domain,
+      video::VideoExecutionRoute::prepared_resident);
+  ok &= Require(preflight.status == hal::StatusId::blocked &&
+                    preflight.reason == hal::ReasonId::wrong_execution_domain,
+                "foreign execution domain must be rejected");
+
+  auto malformed_plan = frozen.plan;
+  ++malformed_plan.prepared_program.program_id;
+  video::VideoAdapterPrepareEvidence prepare_evidence;
+  ok &=
+      Require(!fixture.factory.Prepare(malformed_plan, &prepare_evidence) &&
+                  prepare_evidence.status == hal::StatusId::blocked &&
+                  prepare_evidence.reason == hal::ReasonId::malformed_contract,
+              "foreign prepared program identity must be rejected");
+  return ok;
+}
+
+bool TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare() {
+  Fixture fixture;
+  if (!fixture.Initialize() || !fixture.Prepare(Request()))
+    return false;
+  const auto valid = fixture.coordinator.Snapshot().plan;
+  const auto prepare_calls = fixture.adapter.prepare_calls;
+  bool ok = true;
+  for (std::uint32_t mask = 1; mask <= 3; ++mask) {
+    auto forged = valid;
+    forged.prepared_program.maximum_metadata_readbacks_per_frame = mask & 1u;
+    forged.prepared_program.maximum_metadata_cpu_tails_per_frame =
+        (mask >> 1u) & 1u;
+    video::VideoAdapterPrepareEvidence evidence;
+    ok &= Require(!fixture.factory.Prepare(forged, &evidence) &&
+                      evidence.status == hal::StatusId::blocked &&
+                      evidence.reason ==
+                          hal::ReasonId::transfer_contract_violated &&
+                      evidence.candidate_resources_rolled_back &&
+                      fixture.adapter.prepare_calls == prepare_calls,
+                  "Vulkan factory must reject forged metadata allowances "
+                  "before invoking its adapter");
+  }
+  video::VideoAdapterPrepareEvidence evidence;
+  ok &= Require(fixture.factory.Prepare(valid, &evidence) != nullptr &&
+                    fixture.adapter.prepare_calls == prepare_calls + 1,
+                "zero metadata allowances must preserve factory preparation");
+  return ok;
+}
+
+bool TestFailureAndLifecycle() {
+  bool ok = true;
+  {
+    Fixture fixture;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    std::uint8_t input[kBytes]{};
+    std::uint8_t output[kBytes]{};
+    const auto frame = fixture.coordinator.Execute(Binding(input, output, 1));
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(
+        fixture.coordinator.CommitOutput(frame.completion, false, &reason) ==
+                hal::StatusId::failed &&
+            reason == hal::ReasonId::output_write_failed &&
+            !fixture.coordinator.Snapshot().latest_committed_frame.valid &&
+            fixture.coordinator.Snapshot().telemetry.active_backend ==
+                hal::BackendId::invalid,
+        "writer failure must not commit active attribution");
+  }
+  {
+    Fixture fixture;
+    fixture.adapter.mode = ExecuteMode::optional_fail_open;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    std::uint8_t input[kBytes]{};
+    std::uint8_t output[kBytes]{};
+    const auto frame = fixture.coordinator.Execute(Binding(input, output, 1));
+    hal::ReasonId reason = hal::ReasonId::none;
+    ok &= Require(
+        frame.status == hal::StatusId::degraded &&
+            frame.stages[0].status ==
+                hal::StageExecutionStatus::optional_failed_open &&
+            frame.stages[0].valid_output_preserved &&
+            fixture.coordinator.CommitOutput(frame.completion, true, &reason) ==
+                hal::StatusId::ready,
+        "optional failure must preserve valid output and commit");
+  }
+  {
+    Fixture fixture;
+    fixture.adapter.mode = ExecuteMode::transfer_mismatch;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    std::uint8_t input[kBytes]{};
+    std::uint8_t output[kBytes]{};
+    const auto frame = fixture.coordinator.Execute(Binding(input, output, 1));
+    ok &= Require(frame.status == hal::StatusId::failed &&
+                      frame.reason == hal::ReasonId::transfer_contract_violated,
+                  "unexpected transfer/synchronization counts must fail");
+  }
+  {
+    Fixture fixture;
+    fixture.adapter.mode = ExecuteMode::device_loss;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    std::uint8_t input[kBytes]{};
+    std::uint8_t output[kBytes]{};
+    const auto frame = fixture.coordinator.Execute(Binding(input, output, 1));
+    ok &= Require(frame.reason == hal::ReasonId::device_lost &&
+                      fixture.coordinator.Snapshot().quarantined,
+                  "device loss must quarantine the coordinator route");
+  }
+  {
+    Fixture fixture;
+    if (!fixture.Initialize() || !fixture.Prepare(Request()))
+      return false;
+    fixture.adapter.fail_prepare = true;
+    video::VideoExecutionPrepareEvidence evidence;
+    hal::ReasonId reason = hal::ReasonId::none;
+    const auto status =
+        fixture.coordinator.Prepare(Request(), &evidence, &reason);
+    ok &= Require(status == hal::StatusId::resource_exhausted &&
+                      evidence.candidate_resources_rolled_back &&
+                      evidence.old_plan_retained &&
+                      fixture.adapter.destroy_calls >= 1,
+                  "failed candidate setup must roll back and retain the exact "
+                  "old plan");
+  }
+  return ok;
+}
+
+bool TestExecutorShutdownDoesNotOwnSharedAdapter() {
+  Fixture fixture;
+  if (!fixture.Initialize() || !fixture.Prepare(Request()))
+    return false;
+  fixture.coordinator.Shutdown();
+  bool ok =
+      Require(fixture.adapter.shutdown_calls == 0 && !fixture.adapter.shutdown,
+              "coordinator executor shutdown must not stop the "
+              "factory-owned Vulkan island");
+
+  video::VideoExecutionCoordinator replacement(fixture.registry);
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok &= Require(
+      replacement.RegisterFactory(fixture.factory.factory_registration(),
+                                  &reason) == hal::StatusId::ready &&
+          replacement.Prepare(Request(), nullptr, &reason) ==
+              hal::StatusId::ready,
+      "factory-owned adapter must remain reusable after executor shutdown");
+  replacement.Shutdown();
+  return ok;
+}
+
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+int OptionalVulkanSkip(hal::ReasonId reason) {
+  std::cout << "[SKIP] Vulkan video execution factory production runtime: "
+            << static_cast<std::uint32_t>(reason) << '\n';
+  const char *required = std::getenv("STUDIOCAST_REQUIRE_VULKAN_RUNTIME");
+  return required && std::string(required) == "1" ? 1 : 0;
+}
+
+bool RunProductionCombination(vulkan::VulkanVideoExecutionFactory *factory,
+                              const hal::StaticAdapterRegistry &registry,
+                              video::VideoExecutionPlanRequest request,
+                              bool vignette, bool mirror,
+                              std::uint64_t sequence) {
+  request.invalidation_key.generations.context =
+      factory->adapter_registration()
+          .execution_domain.logical_context_generation;
+  if (!vignette) {
+    request.intent.stages[0] = request.intent.stages[1];
+    request.intent.stages[1] = {};
+    request.intent.stage_count = 1;
+  } else if (!mirror) {
+    request.intent.stages[1] = {};
+    request.intent.stage_count = 1;
+  }
+  request.plan_id += sequence;
+  request.invalidation_key.canonical_plan_hash += sequence;
+  const auto resolution = hal::ResolveSemanticStages(
+      registry, video::BuildVideoResolutionRequest(request.intent));
+  const auto domain_plan = hal::PlanExecutionDomains(
+      registry, resolution, hal::CrossAdapterPolicy::reject);
+  const auto preflight =
+      factory->Preflight(request, resolution, domain_plan,
+                         video::VideoExecutionRoute::prepared_resident);
+  if (preflight.status != hal::StatusId::ready) {
+    std::cerr << "production preflight status/reason: "
+              << static_cast<std::uint32_t>(preflight.status) << '/'
+              << static_cast<std::uint32_t>(preflight.reason) << '\n';
+  }
+  if (!Require(preflight.status == hal::StatusId::ready,
+               "production combination preflight must succeed")) {
+    return false;
+  }
+  video::FrozenVideoExecutionPlan plan;
+  plan.plan_id = request.plan_id;
+  plan.route = video::VideoExecutionRoute::prepared_resident;
+  plan.intent = request.intent;
+  plan.host_input = request.host_input;
+  plan.host_output = request.host_output;
+  plan.invalidation_key = request.invalidation_key;
+  plan.temporal = request.temporal;
+  plan.budget = request.budget;
+  plan.setup_failure_policy = request.setup_failure_policy;
+  plan.migration_policy = request.migration_policy;
+  plan.resolution = resolution;
+  plan.domain_plan = domain_plan;
+  plan.factory_id = factory->factory_registration().factory_id;
+  plan.per_frame_transfers = preflight.per_frame_transfers;
+  plan.prepared_program = preflight.prepared_program;
+  video::VideoAdapterPrepareEvidence prepare_evidence;
+  auto executor = factory->Prepare(plan, &prepare_evidence);
+  if (!executor) {
+    std::cerr << "production prepare status/reason: "
+              << static_cast<std::uint32_t>(prepare_evidence.status) << '/'
+              << static_cast<std::uint32_t>(prepare_evidence.reason) << '\n';
+  }
+  if (!Require(executor != nullptr &&
+                   prepare_evidence.status == hal::StatusId::ready,
+               "production combination must prepare")) {
+    return false;
+  }
+  std::array<std::uint8_t, kBytes> input{};
+  std::array<std::uint8_t, kBytes> output{};
+  for (std::size_t index = 0; index < input.size(); ++index)
+    input[index] = static_cast<std::uint8_t>(index * 17u + 5u);
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_relaxed);
+  const auto frame =
+      executor->Execute(Binding(input.data(), output.data(), sequence));
+  g_count_allocations.store(false, std::memory_order_relaxed);
+  bool ok =
+      Require((frame.status == hal::StatusId::executed ||
+               frame.status == hal::StatusId::degraded) &&
+                  frame.transfers.uploads == 1 &&
+                  frame.transfers.final_readbacks == 1 &&
+                  frame.transfers.intermediate_readbacks == 0 &&
+                  frame.transfers.intermediate_uploads == 0 &&
+                  frame.transfers.synchronizations == 3,
+              "each successful qualified Vulkan stage combination must report "
+              "upload + one resident batch + readback synchronization");
+  ok &= Require(g_allocations.load(std::memory_order_relaxed) == 0,
+                "production Execute must not allocate host storage");
+  hal::ReasonId reason = hal::ReasonId::none;
+  ok &= Require(executor->CommitOutput(frame.completion, true, &reason) ==
+                    hal::StatusId::ready,
+                "production combination output must commit");
+  executor->Shutdown();
+  return ok;
+}
+
+int TestProductionRuntimeIfAvailable() {
+  vulkan::VulkanVideoExecutionFactoryConfiguration configuration;
+  configuration.factory_id = kFactoryId + 1;
+  vulkan::VulkanVideoExecutionFactory factory(configuration);
+  hal::ReasonId reason = hal::ReasonId::none;
+  if (factory.Initialize(&reason) != hal::StatusId::ready)
+    return OptionalVulkanSkip(reason);
+  hal::StaticAdapterRegistry registry;
+  if (!Require(registry.Register(factory.adapter_registration(), &reason) ==
+                   hal::StatusId::ready,
+               "production Vulkan registration must be valid")) {
+    return 1;
+  }
+  bool ok = true;
+  ok &=
+      RunProductionCombination(&factory, registry, Request(), false, true, 101);
+  ok &=
+      RunProductionCombination(&factory, registry, Request(), true, false, 102);
+  ok &=
+      RunProductionCombination(&factory, registry, Request(), true, true, 103);
+  return ok ? 0 : 1;
+}
+
+int TestProductionSetupSourceIfAvailable() {
+  auto source = vulkan::CreateProductionVideoBackendSetupSource();
+  if (!Require(source != nullptr,
+               "production Vulkan setup source must be constructible")) {
+    return 1;
+  }
+  video::ProductionVideoResidentSetup request;
+  request.effects.vignette.enabled = true;
+  request.effects.vignette.intensity = 61;
+  request.effects.vignette.center_on_tracked_face = false;
+  request.effects.mirror = true;
+  request.plan = Request();
+  request.wait.timeout_nanoseconds = UINT64_C(100000000);
+  request.plan.invalidation_key.execution_domain_hash = 0;
+  request.plan.cpu_tails[0].id = hal::CpuTailId::backend_resolved_output;
+  request.plan.cpu_tails[0].after_stage_id = 9;
+  request.plan.cpu_tails[0].required = true;
+  request.plan.cpu_tails[0].placement =
+      hal::DeclaredCpuTail::Placement::after_stage;
+  request.plan.cpu_tails[0].boundary_index = 2;
+  request.plan.cpu_tail_count = 1;
+  auto result = source->AcquireResidentSetup(request);
+  if (result.status != hal::StatusId::ready &&
+      result.status != hal::StatusId::degraded) {
+    return OptionalVulkanSkip(result.reason);
+  }
+  bool ok =
+      Require(result.setup_completed_outside_frame_loop &&
+                  result.execution_kind ==
+                      video::ProductionVideoResidentSetupSourceResult::
+                          ExecutionKind::resident_island &&
+                  result.lease.live() &&
+                  result.lease.snapshot().backend == hal::BackendId::vulkan &&
+                  result.plan.cpu_tail_count == 0 &&
+                  result.plan.invalidation_key.execution_domain_hash != 0 &&
+                  result.plan.invalidation_key.generations.context ==
+                      result.lease.snapshot()
+                          .execution_domain.logical_context_generation,
+              "production setup source must bind an exact live Vulkan lease");
+  const auto shutdown = result.lease.Shutdown();
+  ok &=
+      Require(shutdown.status == hal::StatusId::stopped && shutdown.quiescent &&
+                  shutdown.driver_context_release_permitted,
+              "production Vulkan setup lease must shut down synchronously");
+  return ok ? 0 : 1;
+}
+#endif
+
+} // namespace
+
+static bool TestExpectedRetentionChildRejectsOtherFailures() {
+  using studiocast::tests::ExpectedNativeRetentionResult;
+  constexpr std::string_view marker = "RETENTION_CHECKS_PASSED";
+  util::ExecResult result;
+  result.exit_code = 1;
+  result.stdout_str =
+      std::string(marker) +
+      "\nERROR: unsafe native resources retained; finalizing.\n";
+  bool ok = Require(ExpectedNativeRetentionResult(result, marker),
+                    "exact retained-child failure and assertions must pass");
+  for (const int status : {0, 7, 77, -1}) {
+    result.exit_code = status;
+    ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                  "ordinary success, unrelated failure, skip and signal must "
+                  "not satisfy retained-child verification");
+  }
+  result.exit_code = 1;
+  result.timed_out = true;
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "a timeout cannot satisfy retained-child verification");
+  result.timed_out = false;
+  result.cancelled = true;
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "cancellation cannot satisfy retained-child verification");
+  result.cancelled = false;
+  result.stdout_str = "ERROR: unsafe native resources retained; finalizing.\n";
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "missing assertions must fail despite the expected exit code");
+  result.stdout_str = std::string(marker) + '\n';
+  ok &= Require(!ExpectedNativeRetentionResult(result, marker),
+                "missing terminal guard evidence must fail");
+  return ok;
+}
+
+static int RunMain() {
+  if (!TestCompiledOffInferenceKeepsUtilitySurvivors())
+    return 1;
+  bool ok = TestExpectedRetentionChildRejectsOtherFailures();
+  ok &= TestExactFactoryAndCommit();
+  ok &= TestFactoryRetainsExactQuarantineReason();
+  ok &= TestMattingFinalGeometryContract();
+  ok &= TestAllModelProgramContract();
+  ok &= TestFactoryRejectsIncompleteAndDuplicateModelProofs();
+  ok &= TestShutdownRetainsUnprovenNativeOwner();
+  ok &= TestShutdownRequiresExecutorRetirementAfterFenceProof();
+  ok &= TestInitializeCannotReplaceRefusedRollbackCandidate();
+  ok &= TestFiniteFenceTimeoutContract();
+  ok &= TestMalformedSourceStageCount();
+  ok &= TestUnavailableOptionalStageIsolation();
+  ok &= TestMissingSelectedPackNeedsNoNativeContext();
+  ok &= TestUnsupportedAndForeignPreflight();
+  ok &= TestForgedFrozenMetadataAllowancesFailBeforeAdapterPrepare();
+  ok &= TestFailureAndLifecycle();
+  ok &= TestExecutorShutdownDoesNotOwnSharedAdapter();
+#if defined(STUDIOCAST_ENABLE_OPEN_VULKAN) && STUDIOCAST_ENABLE_OPEN_VULKAN
+  ok &= TestProductionRuntimeIfAvailable() == 0;
+  ok &= TestProductionSetupSourceIfAvailable() == 0;
+#endif
+  return ok ? 0 : 1;
+}
+
+int main() { return studiocast::util::FinalizeProcessExit(RunMain()); }

@@ -124,7 +124,7 @@ QString FriendlyBackendLabel(const QString &id) {
   if (v == QStringLiteral("maxine"))
     return QStringLiteral("Maxine");
   if (v == QStringLiteral("open_source") || v == QStringLiteral("open_audio"))
-    return QStringLiteral("Open Source");
+    return QStringLiteral("Open Audio");
   if (v == QStringLiteral("passthrough"))
     return QStringLiteral("Pass-through");
   if (v == QStringLiteral("loopback"))
@@ -273,7 +273,7 @@ AudioPage::AudioPage(AudioPageMode mode, QWidget *parent)
     engineCombo_ = new QComboBox(backendBox_);
     engineCombo_->addItem("Auto", "auto");
     engineCombo_->addItem("Maxine", "maxine");
-    engineCombo_->addItem("Open Source", "open_source");
+    engineCombo_->addItem("Open Audio", "open_source");
     engineCombo_->addItem("Off", "off");
     engineRow->addWidget(engineCombo_);
 
@@ -1660,8 +1660,8 @@ void AudioPage::UpdateEngineUiVisibility() {
                                    : QStringLiteral("auto");
 
   // AUTO behaves like Maxine when Maxine is actually active; only surface
-  // open-source controls when Open Source is explicitly selected, or when AUTO
-  // has fallen back to Open Source.
+  // Open Audio controls when Open Audio is explicitly selected, or when AUTO
+  // has fallen back to Open Audio.
   bool activeIsOpen = false;
   if (engineActiveValue_) {
     QString active = engineActiveValue_->toolTip();
@@ -1818,6 +1818,14 @@ void AudioPage::ApplyCachedDaemonAudioStatus(bool forceControlResync) {
   const QString lastErr = pipeline.value("last_error").toString();
   const QString backendActive = pipeline.value("backend_active").toString();
   const QString effectsNote = pipeline.value("effects_note").toString();
+  const auto micOpenAudioRuntime =
+      pipeline.value("open_audio_runtime").toObject();
+  bool openAudioCpuFallback =
+      micOpenAudioRuntime.value("using_cpu_fallback").toBool(false);
+  bool openAudioDisabled =
+      micOpenAudioRuntime.value("disabled").toBool(false);
+  QString openAudioRuntimeWarning =
+      micOpenAudioRuntime.value("last_runtime_warning").toString().trimmed();
   const bool micConsumerPresent =
       audio.value("mic_consumer_present").toBool(false);
   const int micConsumerCount = audio.value("mic_consumer_count").toInt(0);
@@ -1927,6 +1935,18 @@ void AudioPage::ApplyCachedDaemonAudioStatus(bool forceControlResync) {
       const QString spkRouteMode = spk.value("route_mode").toString();
       const QString spkBackend = spk.value("backend_active").toString();
       const QString spkNote = spk.value("effects_note").toString();
+      const auto spkOpenAudioRuntime =
+          spk.value("open_audio_runtime").toObject();
+      if (!spkOpenAudioRuntime.isEmpty()) {
+        openAudioCpuFallback =
+            spkOpenAudioRuntime.value("using_cpu_fallback").toBool(false);
+        openAudioDisabled =
+            spkOpenAudioRuntime.value("disabled").toBool(false);
+        openAudioRuntimeWarning =
+            spkOpenAudioRuntime.value("last_runtime_warning")
+                .toString()
+                .trimmed();
+      }
 
       QString spkPipeBackend;
       QString spkPipeNote;
@@ -1934,6 +1954,18 @@ void AudioPage::ApplyCachedDaemonAudioStatus(bool forceControlResync) {
         const auto spkPipe = spk.value("pipeline").toObject();
         spkPipeBackend = spkPipe.value("backend_active").toString();
         spkPipeNote = spkPipe.value("effects_note").toString();
+        const auto spkPipeOpenAudioRuntime =
+            spkPipe.value("open_audio_runtime").toObject();
+        if (!spkPipeOpenAudioRuntime.isEmpty()) {
+          openAudioCpuFallback =
+              spkPipeOpenAudioRuntime.value("using_cpu_fallback").toBool(false);
+          openAudioDisabled =
+              spkPipeOpenAudioRuntime.value("disabled").toBool(false);
+          openAudioRuntimeWarning =
+              spkPipeOpenAudioRuntime.value("last_runtime_warning")
+                  .toString()
+                  .trimmed();
+        }
       }
 
       backendForUi = spkBackend.isEmpty() ? spkPipeBackend : spkBackend;
@@ -1954,12 +1986,27 @@ void AudioPage::ApplyCachedDaemonAudioStatus(bool forceControlResync) {
   }
 
   if (engineActiveValue_) {
-    engineActiveValue_->setText(FriendlyBackendLabel(backendForUi));
+    const QString backendLower = backendForUi.trimmed().toLower();
+    QString activeLabel = FriendlyBackendLabel(backendForUi);
+    if (backendLower == QStringLiteral("open_source") ||
+        backendLower == QStringLiteral("open_audio")) {
+      if (openAudioDisabled) {
+        activeLabel = QStringLiteral("Open Audio disabled");
+      } else if (openAudioCpuFallback) {
+        activeLabel = QStringLiteral("Open Audio (CPU fallback)");
+      }
+    }
+    engineActiveValue_->setText(activeLabel);
     engineActiveValue_->setToolTip(backendForUi);
   }
 
   if (aiInfoBanner_) {
-    const QString full = noteForUi.trimmed();
+    QStringList notes;
+    if (!openAudioRuntimeWarning.isEmpty())
+      notes << openAudioRuntimeWarning;
+    if (!noteForUi.trimmed().isEmpty())
+      notes << noteForUi.trimmed();
+    const QString full = notes.join(QStringLiteral("\n")).trimmed();
     const QString first = FirstLine(full);
     aiInfoBanner_->setVisible(!first.isEmpty());
     aiInfoBanner_->setText(first);

@@ -1,0 +1,328 @@
+# Installer curated-model catalog and transactions
+
+- Status: Active installer/model transaction contract
+- Applies To: StudioCast v0.2.9 curated catalog and installer packaging
+- Audience: Installer, model, packaging, and release maintainers
+- Last Verified: 2026-11-14
+
+## Default catalog
+
+`installer/models/curated-model-catalog-v1.json` is the versioned,
+machine-readable model contract used by the installer. Its defaults are exactly:
+
+Open Audio:
+
+- `fastenhancer_s_vd_v1`
+- `fastenhancer_m_vd_v1`
+
+Open Video:
+
+- `modnet-webnn-256-fp32`
+- `yunet_opencv_zoo_2023mar_fp32`
+- `dlib_68_ibug_300w`
+- `gaze_correction_cam_flx_v0_1_1`
+- `fastdvdnet_sigma15`
+
+These are seven packs and eighteen artifacts: gaze correction has separate left-
+and right-eye ONNX files plus four reviewed ncnn Vulkan artifacts. MODNet,
+YuNet, and FastDVDnet each include their preserved ONNX file plus two reviewed
+ncnn Vulkan artifacts. Maxine is not redistributed and its
+presence never removes these open-source fallback defaults.
+
+### FastDVDnet, YuNet, and FLX Vulkan publication (2026-11-14 UTC)
+
+The user approved the unchanged fourteen-file publication inventory, SHA-256
+`8411bb3f45ae31111f515724859128c13d7b59abf4b3058cef139f01fe8a0406`,
+and local catalog activation. One additive
+[Hugging Face commit 47134731](https://huggingface.co/10dallasj/studiocast/commit/4713473184bf7ece0be6c097ff75f6c6c528c8ec)
+with parent `f6be359c49ba07163287fe3732dc4a3024b91f60` added exactly fourteen
+files (22,066,504 bytes) at the approved content-named revision paths. All 62
+existing remote paths, blob identities, and byte sizes were preserved; the
+result contains 76 files. Actual publication time was
+`2026-11-14T01:41:23.325423+00:00`, November 13 locally.
+
+Every new file and all ten original catalog artifacts were independently
+retrieved without authentication at that immutable resulting commit and matched
+their exact sizes and pinned SHA-256 values. Existing artifact objects and all
+their source candidates remain unchanged, including the working legacy MODNet
+fallback `matting/Good Quality/model.onnx`. The catalog's default source is
+pinned to `https://huggingface.co/10dallasj/studiocast/resolve/4713473184bf7ece0be6c097ff75f6c6c528c8ec`.
+All six packaged manifests/licenses are byte-identical to the newly published
+files. The three affected packs retain their original upstream provenance and
+add the actual ncnn publication commit; four unaffected pack objects are unchanged.
+
+Catalog version `2026-11-14`, SHA-256
+`2e5a02a067765fbc54aa1d798d44b25f9d940629e83509b153274ef7d7cdca1b`,
+adds eight model artifacts (22,047,470 bytes), retaining seven defaults and
+bringing the total to eighteen artifacts / 188,659,386 bytes. Receipt:
+`/tmp/studiocast-vulkan-model-publication-20261113/publication-receipt.json`,
+SHA-256 `89b171deb9a5218f0b3da2947f09ed972b4c14fd0bdec532150aa2b646fd3e95`.
+See [VULKAN_MODEL_PUBLICATION.md](VULKAN_MODEL_PUBLICATION.md) for the full
+publication record and [VULKAN_EFFECTS_COMPLETION.md](VULKAN_EFFECTS_COMPLETION.md)
+for hardware qualification limits. Publication does not qualify runtime,
+camera quality, vendor coverage, or latency; the documented failed/unqualified
+combined deadline profiles remain in force. Installed packs are untouched.
+Normal ownership-safe verified update/repair and the signed application
+distribution chain remain required.
+
+### MODNet Vulkan artifacts and publication (2026-11-12)
+
+The user approved adding the verified FP32 ncnn export to the existing
+`modnet-webnn-256-fp32` pack. Publication added exactly four files to
+`10dallasj/studiocast` in one additive
+[Hugging Face commit f6be359c](https://huggingface.co/10dallasj/studiocast/commit/f6be359c49ba07163287fe3732dc4a3024b91f60),
+with parent `8ffe968884e31ded74f857a2d0dca19f571ba044`. All 58 existing files
+retain their paths, blob identities, and byte sizes. Each new file was downloaded
+without authentication at the immutable resulting commit and independently
+verified before local catalog promotion:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `model.ncnn.param` | 12,113 | `4e205032860a9359fa2555c6ef66dece2a8dcd034a1a61466c58d1310af8a1bd` |
+| `model.ncnn.bin` | 25,844,000 | `38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2` |
+| `model.json` | 1,825 | `3b94bc7bac4ae116659bf7b6bac93fe3a4d90448553661de536eb6c428f13bcc` |
+| `LICENSE.txt` | 11,976 | `77b9ad63b2659c31905d1a820403fea0ba0729c7d0530b6e6c6f8b717fd40f81` |
+
+The new files live below
+`open_video/matting/Good Quality/revisions/ncnn-fp32-20261020-38871660dda4dd324304eb572f43a43ddc5c876c8dff50db2cf09d29a17e3fa2/`.
+Only the two model artifacts become downloads; exact published metadata and the
+full Apache license/provenance are packaged in the trusted source surface.
+The existing ONNX artifact object, all three source candidates, model ID,
+default, destination, and other six packs are preserved. The original ONNX file
+was independently verified at its actual legacy source
+`matting/Good Quality/model.onnx` (25,888,640 bytes and its existing pinned hash).
+The catalog's first source candidate was absent; publication checks were corrected
+to verify that existing fallback before any remote mutation.
+
+The four published files total 25,869,914 bytes. The two additional model
+artifacts added 25,856,113 download bytes, making the then-active `2026-11-12` catalog
+seven packs, ten artifacts, and 166,611,916 artifact bytes. The ncnn sources have
+only the verified versioned paths, with no unpublished fallback. Receipt:
+`/tmp/studiocast-modnet-conversion-design-20261111/publication-receipt.json`.
+Conversion, six-case numerical equivalence, and bounded P1000 manager evidence
+are recorded in [VULKAN_MATTING_IMPLEMENTATION.md](VULKAN_MATTING_IMPLEMENTATION.md).
+This promotion does not qualify additional vendors or install/update an existing
+user pack. Marked curated packs use normal verified update/repair; an unmarked
+old manifest/license mismatch remains `curated_ownership_unverified` and is
+preserved. Do not bypass ownership checks. Signed application release and the
+opt-in patched runtime remain separate prerequisites.
+
+### FastDVDnet corrected artifact and publication (2026-11-11)
+
+The approved product decision is to repair/re-export `fastdvdnet_sigma15`,
+preserving its ID and default selection. That checkpoint retained seven packs
+and eight artifacts; the later MODNet promotion above adds two artifacts.
+The previous 416,788-byte artifact matched its pinned hash but is
+invalid: 26 convolution-weight references have no producer/initializer, and 68
+initializer tensors reference an absent `fastdvdnet.onnx.data`. Hash verification
+proves identity, not graph validity. Keep this failure visible; never substitute
+random weights, alias missing tensors, silently switch models, or overwrite an
+installed pack during validation.
+
+`scripts/models/export_fastdvdnet.py` provides an offline, reproducible correction
+using the upstream network and pretrained `model.pth` at commit
+`c8fdf6182a0340e89dd18f5df25b47337cbede6f`. Its embedded hashes verify the Python
+source, checkpoint, and full license before import/deserialization. Source:
+[upstream immutable tree](https://github.com/m-tassano/fastdvdnet/tree/c8fdf6182a0340e89dd18f5df25b47337cbede6f).
+It exports the established FP32 RGB NCHW `noisy`/`noise_map`/`denoised` contract
+as one opset-17 ONNX file with dynamic N/H/W, validates a complete graph without
+external data, and compares ONNX Runtime CPU output with the strictly loaded
+upstream network across nine geometry/noise cases. H/W must be multiples of four.
+CPU equivalence is artifact evidence, not CUDA or full-camera qualification.
+
+Reproduction uses Python 3.10 on Linux x86_64 and an isolated environment:
+
+```bash
+python3 -m venv /tmp/fastdvdnet-export-env
+/tmp/fastdvdnet-export-env/bin/python -m pip install \
+  -r scripts/models/fastdvdnet-export.requirements.txt
+# Manually fetch models.py, model.pth, LICENSE from the immutable raw GitHub URL
+# printed as UPSTREAM_BASE in the script, into /tmp/fastdvdnet-upstream.
+/tmp/fastdvdnet-export-env/bin/python scripts/models/export_fastdvdnet.py \
+  --upstream /tmp/fastdvdnet-upstream --output /tmp/fastdvdnet-candidate
+python3 tests/installer/models/fastdvdnet_export_tests.py -v
+```
+
+The corrected artifact is 9,948,304 bytes with SHA-256
+`0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac`.
+Repeated independent invocations produced identical artifact bytes. The
+`337f3d8` / `b204b0a` exporter fix composes the full upstream license
+idempotently; a fresh full-graph check and nine-case CPU export reproduced all
+three candidate files byte-for-byte. Six exporter regressions passed. Nine CPU
+cases passed with maximum absolute output error `4.76837158203125e-7`.
+The output contains an isolated source tree, candidate `model.json` and full
+license, a complete candidate catalog, and `validation.json` provenance/results.
+It never changes the shipped catalog, installed models, or external hosting.
+The generated candidate catalog points to its own `source/` layout for local
+validation; the active catalog below retains the published versioned path.
+
+The user-authorized publication added exactly `model.onnx`, `model.json`, and
+`LICENSE.txt` to the existing `10dallasj/studiocast` Hugging Face model repository
+in one additive commit:
+[`8ffe968884e31ded74f857a2d0dca19f571ba044`](https://huggingface.co/10dallasj/studiocast/commit/8ffe968884e31ded74f857a2d0dca19f571ba044).
+All three remote files were downloaded at that immutable revision and their
+actual sizes and SHA-256 values matched the approved export:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `model.onnx` | 9,948,304 | `0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac` |
+| `model.json` | 1,881 | `9daf66251194aeaab5c67f18331e18a40596b951a8049b4d359d36fe1e97285e` |
+| `LICENSE.txt` | 1,671 | `e419e198d08f7d62fbc6bbb74409836289246db14ed28a134f79e1a2ea5afedc` |
+
+The active local catalog selects only
+`open_video/video_denoise/Good Quality (FastDVDnet sigma15)/revisions/0895dcad878f44ff4b610e0569bf701c8e23566e675c22a9bb0d59b95dcfc7ac/model.onnx`.
+It has no fallback to the invalid artifact. The packaged manifest and full
+license are byte-identical to the approved published files. Previous repository
+paths were preserved for users of older catalogs; those catalogs retain their
+previous identities and do not silently select the corrected bytes.
+
+The publication receipt is
+`/tmp/studiocast-fastdvdnet-assets-20261110/review-candidate/publication-receipt.json`.
+The earlier staged proposal at
+`/tmp/studiocast-fastdvdnet-promotion-20261111` remains preserved for historical
+review; its authentication-blocked status is superseded by the verified
+publication and current catalog. Sigma25/sigma50 remain untouched noncatalog
+BYO templates with their previous artifact hashes; no additional packs were
+published or promoted.
+
+Publication and local catalog promotion do not install a model, publish a
+StudioCast release, or grant production Recommended trust. The normal signed
+clean-HEAD source/AppImage release chain remains required. Artifact graph and
+CPU equivalence results, and the bounded native CUDA evidence in
+[HAL_PARITY_COMPLETION.md](HAL_PARITY_COMPLETION.md), do not qualify the complete
+camera route, visual quality, optimized latency, or other hardware families.
+
+An old unmarked installed sigma15 pack fails the corrected metadata ownership
+check with `curated_ownership_unverified` and remains preserved. Marked curated
+packs can use normal verified update/repair. For an unmarked pack, review and
+back up that exact directory before a separately authorized ownership-safe
+reinstall; preserve custom siblings and never bypass ownership checks or remove
+the whole model root. This publication/catalog change leaves installed packs
+untouched.
+
+Each artifact records its destination name, pinned SHA-256, source candidates,
+provenance, and license metadata. Runtime `model.json` and `LICENSE.txt` files
+come only from hash-pinned files in the verified StudioCast source/package
+surface; they are not accepted from a model download source.
+
+Catalog version `2026-11-14` records independently verified artifact byte
+counts paired with pinned hashes:
+
+| Pack/artifact | Bytes |
+| --- | ---: |
+| `fastenhancer_s_vd_v1/model.onnx` | 832,775 |
+| `fastenhancer_m_vd_v1/model.onnx` | 2,033,628 |
+| `modnet-webnn-256-fp32/model.onnx` | 25,888,640 |
+| `modnet-webnn-256-fp32/model.ncnn.param` | 12,113 |
+| `modnet-webnn-256-fp32/model.ncnn.bin` | 25,844,000 |
+| `yunet_opencv_zoo_2023mar_fp32/model.onnx` | 232,589 |
+| `yunet_opencv_zoo_2023mar_fp32/model.ncnn.param` | 6,423 |
+| `yunet_opencv_zoo_2023mar_fp32/model.ncnn.bin` | 212,628 |
+| `dlib_68_ibug_300w/shape_predictor_68_face_landmarks.dat` | 99,693,937 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.onnx` | 1,062,936 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.onnx` | 1,062,994 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.ncnn.param` | 2,726 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_left.ncnn.bin` | 1,000,192 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.ncnn.param` | 2,726 |
+| `gaze_correction_cam_flx_v0_1_1/gaze_flx_right.ncnn.bin` | 1,000,192 |
+| `fastdvdnet_sigma15/model.onnx` | 9,948,304 |
+| `fastdvdnet_sigma15/model.ncnn.param` | 7,383 |
+| `fastdvdnet_sigma15/model.ncnn.bin` | 19,815,200 |
+
+The total is 188,659,386 bytes. Every entry is `size_status: known`, and the
+catalog-level evidence reason is
+`artifact_sizes_independently_verified_against_pinned_sha256`. A trusted
+catalog requires every artifact to have a strictly positive integer size; a
+missing, null, zero, negative, boolean, floating-point, string, inconsistent,
+partial, or unknown size contract is rejected before filesystem mutation.
+`trusted: false` continues to produce `artifact_sizes_untrusted` in Recommended
+mode even if numbers are present.
+
+The release manifest v1 does not list model artifacts directly. Instead, its
+signed, hash-pinned source archive and Installer AppImage authenticate the
+catalog transitively: official archives are produced from a clean `git archive
+HEAD`, the signed manifest authenticates the exact archive/AppImage bytes, and
+the packaged catalog is part of those authenticated bytes. The production
+public trust root and signing workflow described in `RELEASE_CHANNEL.md` remain
+a release prerequisite; catalog trust metadata alone cannot substitute for
+that signed distribution chain. Sizes must never be estimated or invented.
+
+The dlib iBUG 300-W landmark predictor has non-commercial training-data
+restrictions. Its catalog license is `LicenseRef-iBUG-300-W-NonCommercial`, and
+the installed `LICENSE.txt` calls out that restriction. Review text must expose
+this before download.
+
+## Transaction behavior
+
+`installer/models/model_transactions.py` and the
+`studiocast-model-transaction` launcher implement unprivileged user-local model
+transactions. The shell entrypoints remain:
+
+```bash
+scripts/install/open_audio_models.sh --list
+scripts/install/open_video_models.sh --list
+scripts/install/open_audio_models.sh --source /verified/local/source
+scripts/install/open_video_models.sh --offline
+```
+
+Sources may be HTTP(S), `file://`, or local paths. Tests and offline workflows
+use local sources; the daemon and live pipeline never download models. The old
+`STUDIOCAST_HF_REPO_ID` and `STUDIOCAST_HF_REV` variables remain compatible,
+while `STUDIOCAST_MODEL_SOURCE` selects a complete alternate source base.
+
+For every artifact, the transaction checks a good installed file, then the
+content-addressed verified cache. Online transfers use a `.part` file and
+resume at its current byte offset when the source supports it. A completed file
+must match its pinned hash and, when authoritative metadata exists, byte size
+before it atomically replaces the cache entry. A mismatch is never activated.
+An offline transaction succeeds only from verified installed/cache content.
+
+All artifacts for one pack are acquired before mutation. The transaction then
+creates a same-filesystem staging directory, copies hash-pinned metadata,
+license, and verified artifacts, re-verifies the stage, writes a curated
+ownership marker, and atomically activates the directory. If acquisition or
+staging fails, an existing pack remains untouched. If activation fails after
+moving an old pack aside, it is restored.
+
+Pack failures are structured and isolated. When some selected optional packs
+succeed and another fails, the overall state is `degraded` with reason
+`optional_model_failure`; callers can offer Retry or Continue without hiding
+the committed packs.
+
+Recommended review plans carry all eighteen exact sizes and bind the selected
+catalog version/hash, canonical pack objects, download rows, and disk totals.
+Apply reloads the packaged catalog and revalidates those bindings before any
+operation can mutate the filesystem. Custom and Advanced routes retain their
+optional degraded/retry behavior, but never bypass size or SHA-256 checks.
+
+## Preservation and removal
+
+Catalog paths are safe relative paths beneath the explicitly selected family
+root. Traversal, absolute paths, unsafe symlinks, duplicate IDs/paths/files, and
+unknown catalog fields are rejected.
+
+The transaction never enumerates arbitrary directories for installation or
+removal. Custom packs at paths outside the catalog are untouched during
+install, update, repair, and curated cleanup. If a catalog destination already
+exists without a StudioCast ownership marker, it is migrated only when its
+hash-pinned `model.json` and `LICENSE.txt` exactly match the legacy curated
+template; otherwise the operation fails with `curated_ownership_unverified` and
+preserves it.
+
+`remove-curated` removes only exact catalog destinations bearing the matching
+StudioCast marker. Missing packs are idempotent success. A custom, symlinked,
+unmarked, or mismatched destination is preserved and reported as a typed
+failure. This contract is intended for clean-install model reset; broad removal
+of the whole model root is forbidden.
+
+## Release and test requirements
+
+- Release tooling may update hashes, trusted sizes, provenance, and licenses
+  only from reviewed signed metadata; it must not add a private signing key.
+- Network-free tests use a temporary local transport, HOME/XDG roots, and tiny
+  fixtures. They must never download real model binaries.
+- Existing verified cache entries survive source failures.
+- Checksum failures must preserve a good active pack.
+- Update/repair must not delete custom packs.
+- Clean install removes only marked curated packs, then reacquires the seven
+  defaults from a verified source/cache.

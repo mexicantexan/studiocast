@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       require_cuda_runtime:
-        description: "Run the opt-in CUDA runtime self-test that fails on CUDA smoke skips."
+        description: "Run required CUDA runtime and model-backed production smoke tests."
         required: false
         type: boolean
         default: false
@@ -14,6 +14,106 @@ on:
         required: false
         type: string
         default: '["self-hosted","linux","x64","gpu"]'
+      cuda_model_root:
+        description: "Preinstalled read-only model root ending in studiocast/models/open_video (required for CUDA opt-in)."
+        required: false
+        type: string
+        default: ''
+      cuda_model_id:
+        description: "Preinstalled CUDA matting model identity for production smoke. No model downloads are performed."
+        required: false
+        type: string
+        default: 'modnet-webnn-256-fp32'
+      cuda_face_model_id:
+        description: "Preinstalled face detector ID for Auto Frame and Eye Contact; metadata must match the graph."
+        required: false
+        type: string
+        default: 'yunet_opencv_zoo_2023mar_fp32'
+      cuda_eye_model_id:
+        description: "Preinstalled Eye Contact ID; its declared dlib landmark dependency must also be installed."
+        required: false
+        type: string
+        default: 'gaze_correction_cam_flx_v0_1_1'
+      cuda_denoise_model_id:
+        description: "Preinstalled graph-validated FastDVDnet ID. The shipped old artifact is not qualification evidence."
+        required: false
+        type: string
+        default: 'fastdvdnet_sigma15'
+      cuda_replace_path:
+        description: "Preinstalled readable replacement image for CUDA background-replace smoke. No image or model downloads."
+        required: false
+        type: string
+        default: ''
+      require_vulkan_nvidia_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an NVIDIA Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_nvidia_runner_labels:
+        description: "JSON runs-on labels for the opt-in NVIDIA Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","nvidia","vulkan"]'
+      require_vulkan_amd_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an AMD Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_amd_runner_labels:
+        description: "JSON runs-on labels for the opt-in AMD Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","amd","vulkan"]'
+      require_vulkan_intel_runtime:
+        description: "Run opt-in Vulkan runtime smoke tests on an Intel Vulkan runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_intel_runner_labels:
+        description: "JSON runs-on labels for the opt-in Intel Vulkan job."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","intel","vulkan"]'
+      require_vulkan_matting_runtime:
+        description: "Run required model-backed production Vulkan matting on a provisioned GPU runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_matting_runner_labels:
+        description: "JSON runner labels; select the GPU vendor being qualified."
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","vulkan"]'
+      vulkan_ncnn_prefix:
+        description: "Preinstalled pinned StudioCast-patched ncnn prefix. No dependency installation is performed."
+        required: false
+        type: string
+        default: ''
+      vulkan_matting_model_root:
+        description: "Preinstalled read-only open_video model root containing validated ncnn MODNet artifacts."
+        required: false
+        type: string
+        default: ''
+      vulkan_matting_model_id:
+        description: "Exact installed matting model identity."
+        required: false
+        type: string
+        default: 'modnet-webnn-256-fp32'
+      vulkan_matting_replace_path:
+        description: "Preinstalled readable replacement image. No image or model downloads are performed."
+        required: false
+        type: string
+        default: ''
+      require_vulkan_model_effects_runtime:
+        description: "Run the full resident Vulkan model-effects matrix and cold diagnostics on a preprovisioned GPU runner."
+        required: false
+        type: boolean
+        default: false
+      vulkan_model_effects_face_path:
+        description: "Preinstalled local face-positive JPEG fixture expected by the production smoke; never downloaded or uploaded."
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -50,10 +150,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            python3 python3-numpy \
             ${{ matrix.cc }} ${{ matrix.cxx }} \
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev
+
+      - name: Validate hardware workflow gates without hardware
+        run: python3 tests/gpu/hardware_ci_workflow_tests.py
 
       - name: Toolchain versions
         run: |
@@ -67,8 +171,12 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE=/usr/bin/python3 \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF
 
       - name: Build
         run: |
@@ -102,6 +210,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config curl \
+            python3 python3-numpy \
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev
@@ -115,8 +224,12 @@ jobs:
       - name: Configure (default Open CUDA / no Maxine SDK required)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE=/usr/bin/python3 \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF
 
       - name: Build
         run: |
@@ -143,12 +256,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl ca-certificates tar \
+            python3 python3-numpy \
             gcc-13 g++-13 \
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
             libxkbcommon-dev libpulse-dev libsqlite3-dev \
             libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
             libblas-dev liblapack-dev \
-            libdlib-dev
+            libdlib-dev \
+            libvulkan1 vulkan-tools
 
       - name: Install ONNX Runtime CPU package
         env:
@@ -156,30 +271,26 @@ jobs:
           ORT_ARCH: x64
           ORT_FLAVOR: cpu
         run: |
-          if [[ "${ORT_FLAVOR}" == "cpu" ]]; then
-            ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}"
-          else
-            ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_FLAVOR}-${ORT_VERSION}"
-          fi
-          ort_tgz="${ort_name}.tgz"
-          ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ort_tgz}"
+          test "${ORT_VERSION}" = 1.17.3
+          test "${ORT_ARCH}" = x64
+          test "${ORT_FLAVOR}" = cpu
+          ort_name="onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}"
+          ort_package="microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
+          ort_url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/${ort_package}"
           ort_prefix="/opt/studiocast/onnxruntime/${ORT_VERSION}"
           ort_root="${ort_prefix}/${ort_name}"
+          ort_stage="$(mktemp -d "${RUNNER_TEMP}/onnxruntime-cpu.XXXXXX")"
 
-          curl --fail --location --retry 3 --output "${RUNNER_TEMP}/${ort_tgz}" "${ort_url}"
+          curl --fail --location --retry 3 --output "${ort_stage}/${ort_package}" "${ort_url}"
+          python3 scripts/dev/prepare_ci_onnxruntime.py \
+            --archive "${ort_stage}/${ort_package}" --output "${ort_stage}/sdk"
           sudo mkdir -p "${ort_prefix}"
-          sudo tar -xzf "${RUNNER_TEMP}/${ort_tgz}" -C "${ort_prefix}"
+          test ! -e "${ort_root}"
+          test ! -L "${ort_root}"
+          sudo cp -a "${ort_stage}/sdk" "${ort_root}"
 
           test -f "${ort_root}/include/onnxruntime_cxx_api.h"
           ort_libdir="${ort_root}/lib"
-          if [[ -d "${ort_root}/lib64" ]]; then
-            ort_libdir="${ort_root}/lib64"
-          fi
-
-          if [[ ! -e "${ort_libdir}/libonnxruntime.so" ]]; then
-            sofile="$(ls -1 "${ort_libdir}"/libonnxruntime.so.* | head -n 1)"
-            sudo ln -sf "$(basename "${sofile}")" "${ort_libdir}/libonnxruntime.so"
-          fi
 
           echo "${ort_libdir}" | sudo tee /etc/ld.so.conf.d/studiocast-onnxruntime.conf >/dev/null
           sudo ldconfig
@@ -214,14 +325,20 @@ jobs:
         run: |
           mkdir -p build
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE=/usr/bin/python3 \
             -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=ON \
-            -DSTUDIOCAST_ENABLE_DLIB=ON 2>&1 | tee build/configure.log
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON 2>&1 | tee build/configure.log
 
           grep -Eq '^STUDIOCAST_ENABLE_OPEN_CUDA:BOOL=ON$' build/CMakeCache.txt
+          grep -Eq '^STUDIOCAST_ENABLE_OPEN_VULKAN:BOOL=ON$' build/CMakeCache.txt
           grep -Eq '^STUDIOCAST_ENABLE_OPEN_AUDIO:BOOL=ON$' build/CMakeCache.txt
           grep -Eq '^STUDIOCAST_ENABLE_DLIB:BOOL=ON$' build/CMakeCache.txt
+          grep -Eq '^STUDIOCAST_BUILD_BENCHMARKS:BOOL=ON$' build/CMakeCache.txt
           grep -F 'Open CUDA backend enabled' build/configure.log
+          grep -F 'Open Vulkan backend enabled' build/configure.log
           grep -F 'Open Audio backend enabled' build/configure.log
           grep -F 'dlib found' build/configure.log
 
@@ -262,14 +379,21 @@ jobs:
 
       - name: Configure (Open CUDA runtime validation)
         run: |
+          set -euo pipefail
+          mkdir -p build/qualification
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSTUDIOCAST_ENABLE_OPEN_CUDA=ON \
             -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
-            -DSTUDIOCAST_ENABLE_DLIB=OFF
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            2>&1 | tee build/qualification/configure.log
+          grep -F 'dlib found; Open Video Eye Contact (dlib landmarks) enabled.' \
+            build/qualification/configure.log
 
-      - name: Build probe
+      - name: Build probe and production smoke
         run: |
-          cmake --build build --target studiocast-probe
+          cmake --build build --target \
+            studiocast-probe \
+            studiocast-open-cuda-production-smoke-tests
 
       - name: Portable self-test
         run: |
@@ -278,6 +402,409 @@ jobs:
       - name: Required CUDA runtime self-test
         run: |
           ./build/studiocast-probe --self-test --require-cuda-runtime
+
+      - name: Required CUDA production smoke
+        env:
+          CUDA_MODEL_ROOT: ${{ inputs.cuda_model_root }}
+          CUDA_MODEL_ID: ${{ inputs.cuda_model_id }}
+          CUDA_FACE_MODEL_ID: ${{ inputs.cuda_face_model_id }}
+          CUDA_EYE_MODEL_ID: ${{ inputs.cuda_eye_model_id }}
+          CUDA_DENOISE_MODEL_ID: ${{ inputs.cuda_denoise_model_id }}
+          CUDA_REPLACE_PATH: ${{ inputs.cuda_replace_path }}
+        run: |
+          set -euo pipefail
+          : "${CUDA_MODEL_ROOT:?Set cuda_model_root to a preinstalled read-only model root}"
+          : "${CUDA_MODEL_ID:?Set cuda_model_id to a preinstalled matting model}"
+          : "${CUDA_FACE_MODEL_ID:?Set cuda_face_model_id to a preinstalled face detector}"
+          : "${CUDA_EYE_MODEL_ID:?Set cuda_eye_model_id to a preinstalled eye model with its landmark dependency}"
+          : "${CUDA_DENOISE_MODEL_ID:?Set cuda_denoise_model_id to a preinstalled graph-validated denoiser}"
+          : "${CUDA_REPLACE_PATH:?Set cuda_replace_path to a preinstalled readable image}"
+          test -d "${CUDA_MODEL_ROOT}"
+          test -f "${CUDA_REPLACE_PATH}"
+          test -r "${CUDA_REPLACE_PATH}"
+          mkdir -p build/qualification
+          git rev-parse HEAD | tee build/qualification/source.txt
+          grep -E '^CMAKE_BUILD_TYPE:STRING=|^STUDIOCAST_ENABLE_(OPEN_CUDA|OPEN_VULKAN|OPEN_AUDIO|DLIB):BOOL=' \
+            build/CMakeCache.txt | tee build/qualification/build-options.txt
+          nvidia-smi --query-gpu=name,driver_version,uuid --format=csv \
+            | tee build/qualification/gpu.csv
+          # Preserve the original topologies, then cover each new effect and
+          # tracked vignette with its required Auto Frame dependency.
+          effects_cases=(blur keylight blur+keylight vignette blur+vignette
+            keylight+vignette blur+keylight+vignette denoise auto_frame
+            eye_contact mirror remove replace auto_frame+tracked_vignette)
+          full_composition=denoise+auto_frame+eye_contact+blur+keylight+tracked_vignette+mirror
+          automatic_resident_composition=denoise+auto_frame+eye_contact+blur+keylight+tracked_vignette
+          for selection in cuda auto; do
+            cases=("${automatic_resident_composition}")
+            if [[ "${selection}" == cuda ]]; then
+              cases=("${effects_cases[@]}" "${full_composition}")
+            fi
+            # Auto verifies CUDA selection/resident stages; camera's retained
+            # automatic host mirror finalizer still needs camera-level evidence.
+            for effects in "${cases[@]}"; do
+              ./build/studiocast-open-cuda-production-smoke-tests \
+                --require "--${selection}" --model-root "${CUDA_MODEL_ROOT}" \
+                --model-id "${CUDA_MODEL_ID}" \
+                --face-model-id "${CUDA_FACE_MODEL_ID}" \
+                --eye-model-id "${CUDA_EYE_MODEL_ID}" \
+                --denoise-model-id "${CUDA_DENOISE_MODEL_ID}" \
+                --replace-path "${CUDA_REPLACE_PATH}" --effects "${effects}" \
+                --input 64x48 --output 32x24 --frames 3 \
+                2>&1 | tee "build/qualification/${selection}-${effects}.log"
+            done
+          done
+
+      - name: Preserve CUDA qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-production-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
+
+  vulkan-matting-production:
+    name: Production Vulkan matting (opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_matting_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_matting_runner_labels || '["ubuntu-24.04"]') }}
+    env:
+      VULKAN_NCNN_PREFIX: ${{ inputs.vulkan_ncnn_prefix }}
+      VULKAN_MODEL_ROOT: ${{ inputs.vulkan_matting_model_root }}
+      VULKAN_MODEL_ID: ${{ inputs.vulkan_matting_model_id }}
+      VULKAN_REPLACE_PATH: ${{ inputs.vulkan_matting_replace_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure production Vulkan matting
+        run: |
+          set -euo pipefail
+          : "${VULKAN_NCNN_PREFIX:?Provide the pinned patched ncnn prefix}"
+          test -d "${VULKAN_NCNN_PREFIX}"
+          mkdir -p build/qualification
+          git rev-parse HEAD > build/qualification/source.txt
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${VULKAN_NCNN_PREFIX}" \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF \
+            2>&1 | tee build/qualification/configure.log
+
+      - name: Build production Vulkan matting smoke
+        run: |
+          cmake --build build --target studiocast-vulkan-matting-production-smoke
+
+      - name: Required production Vulkan matting smoke
+        run: |
+          set -euo pipefail
+          : "${VULKAN_MODEL_ROOT:?Provide a preinstalled validated model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          test -d "${VULKAN_MODEL_ROOT}"
+          test -f "${VULKAN_REPLACE_PATH}" && test -r "${VULKAN_REPLACE_PATH}"
+          mkdir -p build/qualification
+          test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/studiocast-vulkan-matting.XXXXXX")"
+          HOME="${test_root}/home" XDG_CONFIG_HOME="${test_root}/config" \
+            XDG_DATA_HOME="${test_root}/data" XDG_CACHE_HOME="${test_root}/cache" \
+            XDG_STATE_HOME="${test_root}/state" STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-matting-production-smoke --require \
+              --model-root "${VULKAN_MODEL_ROOT}" --model-id "${VULKAN_MODEL_ID}" \
+              --replace-path "${VULKAN_REPLACE_PATH}" --frames 3 \
+              2>&1 | tee build/qualification/matting-production.log
+
+      - name: Preserve Vulkan matting qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-matting-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
+
+  vulkan-model-effects-production:
+    name: Production Vulkan model effects (opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_model_effects_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_matting_runner_labels || '["ubuntu-24.04"]') }}
+    env:
+      VULKAN_NCNN_PREFIX: ${{ inputs.vulkan_ncnn_prefix }}
+      VULKAN_MODEL_ROOT: ${{ inputs.vulkan_matting_model_root }}
+      VULKAN_MODEL_ID: ${{ inputs.vulkan_matting_model_id }}
+      VULKAN_REPLACE_PATH: ${{ inputs.vulkan_matting_replace_path }}
+      VULKAN_FACE_PATH: ${{ inputs.vulkan_model_effects_face_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure production Vulkan model effects
+        run: |
+          set -euo pipefail
+          : "${VULKAN_NCNN_PREFIX:?Provide the preinstalled pinned patched ncnn prefix}"
+          : "${VULKAN_MODEL_ROOT:?Provide the complete preinstalled read-only model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          : "${VULKAN_FACE_PATH:?Provide the preinstalled hash-verified face-positive JPEG fixture}"
+          [[ "${VULKAN_NCNN_PREFIX}" == /* ]]
+          test -d "${VULKAN_NCNN_PREFIX}"
+          for sdk_file in lib/cmake/ncnn/ncnnConfig.cmake lib/libncnn.a \
+            share/licenses/studiocast-ncnn/dependency.json \
+            share/licenses/studiocast-ncnn/ncnn-LICENSE.txt \
+            share/licenses/studiocast-ncnn/glslang-LICENSE.txt; do
+            test -f "${VULKAN_NCNN_PREFIX}/${sdk_file}"
+            test -r "${VULKAN_NCNN_PREFIX}/${sdk_file}"
+          done
+          model_root="$(realpath -e -- "${VULKAN_MODEL_ROOT}")"
+          [[ "${model_root}" == /*/studiocast/models/open_video ]]
+          test -d "${model_root}"
+          test -r "${model_root}"
+          test -f "${VULKAN_REPLACE_PATH}"
+          test -r "${VULKAN_REPLACE_PATH}"
+          test -f "${VULKAN_FACE_PATH}"
+          test -r "${VULKAN_FACE_PATH}"
+          mkdir -p build/qualification
+          git rev-parse HEAD > build/qualification/source.txt
+          sha256sum -- "${VULKAN_FACE_PATH}" "${VULKAN_REPLACE_PATH}" \
+            "${VULKAN_NCNN_PREFIX}/share/licenses/studiocast-ncnn/dependency.json" \
+            > build/qualification/preinstalled-inputs.sha256
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -Dncnn_DIR="${VULKAN_NCNN_PREFIX}/lib/cmake/ncnn" \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_CUDA_KERNELS=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_NCNN_VULKAN_MATTING=ON \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=OFF \
+            2>&1 | tee build/qualification/configure.log
+          grep -Eq '^STUDIOCAST_DLIB_AVAILABLE:INTERNAL=(TRUE|ON|1)$' build/CMakeCache.txt
+          grep -E '^CMAKE_BUILD_TYPE:STRING=|^STUDIOCAST_DLIB_AVAILABLE:INTERNAL=|^STUDIOCAST_ENABLE_(OPEN_CUDA|CUDA_KERNELS|OPEN_VULKAN|OPEN_AUDIO|NCNN_VULKAN_MATTING|DLIB):BOOL=' \
+            build/CMakeCache.txt > build/qualification/build-options.txt
+
+      - name: Build production Vulkan model effects validation
+        run: |
+          set -euo pipefail
+          cmake --build build --target \
+            studiocast-vulkan-effects-production-smoke \
+            studiocast-vulkan-model-diagnostics-tests \
+            2>&1 | tee build/qualification/build.log
+
+      - name: Required production Vulkan model effects validation
+        run: |
+          set -euo pipefail
+          : "${VULKAN_MODEL_ROOT:?Provide the complete preinstalled read-only model root}"
+          : "${VULKAN_MODEL_ID:?Provide the exact matting model ID}"
+          : "${VULKAN_REPLACE_PATH:?Provide a preinstalled replacement image}"
+          : "${VULKAN_FACE_PATH:?Provide the preinstalled face-positive JPEG fixture}"
+          model_root="$(realpath -e -- "${VULKAN_MODEL_ROOT}")"
+          [[ "${model_root}" == /*/studiocast/models/open_video ]]
+          test -d "${model_root}"
+          test -r "${model_root}"
+          test -f "${VULKAN_REPLACE_PATH}"
+          test -r "${VULKAN_REPLACE_PATH}"
+          test -f "${VULKAN_FACE_PATH}"
+          test -r "${VULKAN_FACE_PATH}"
+          test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/studiocast-vulkan-models.XXXXXX")"
+          mkdir -p "${test_root}"/{home,config,cache,state}
+          export HOME="${test_root}/home" XDG_CONFIG_HOME="${test_root}/config" \
+            XDG_CACHE_HOME="${test_root}/cache" XDG_STATE_HOME="${test_root}/state"
+          model_data_home="${model_root%/studiocast/models/open_video}"
+          export XDG_DATA_HOME="${model_data_home:-/}"
+          mkdir -p build/qualification
+          vulkaninfo --summary 2>&1 | tee build/qualification/vulkan-summary.log
+          STUDIOCAST_REQUIRE_VULKAN_MODEL_DIAGNOSTICS=1 \
+            ./build/studiocast-vulkan-model-diagnostics-tests \
+            2>&1 | tee build/qualification/model-diagnostics.log
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-effects-production-smoke --require \
+              --model-root "${model_root}" --model-id "${VULKAN_MODEL_ID}" \
+              --replace-path "${VULKAN_REPLACE_PATH}" --face-path "${VULKAN_FACE_PATH}" \
+              --frames 3 \
+              2>&1 | tee build/qualification/model-effects-production.log
+
+      - name: Preserve Vulkan model effects qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-model-effects-qualification-${{ github.sha }}
+          path: build/qualification/
+          if-no-files-found: ignore
+
+  # Push CI intentionally avoids hard Vulkan runtime requirements. These jobs are
+  # opt-in because the runner must provide a real vendor ICD and GPU.
+  vulkan-runtime-smoke-nvidia:
+    name: Vulkan runtime smoke (NVIDIA, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_nvidia_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_nvidia_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools
+
+      - name: Runtime inventory
+        run: |
+          nvidia-smi || true
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
+
+  vulkan-runtime-smoke-amd:
+    name: Vulkan runtime smoke (AMD, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_amd_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_amd_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools mesa-vulkan-drivers
+
+      - name: Runtime inventory
+        run: |
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
+
+  vulkan-runtime-smoke-intel:
+    name: Vulkan runtime smoke (Intel, opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_vulkan_intel_runtime }}
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.vulkan_intel_runner_labels || '["ubuntu-24.04"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates \
+            gcc-13 g++-13 \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev qt6-tools-dev-tools \
+            libxkbcommon-dev libpulse-dev libsqlite3-dev \
+            libjpeg-turbo8-dev libpng-dev libgl1-mesa-dev \
+            libvulkan1 vulkan-tools mesa-vulkan-drivers
+
+      - name: Runtime inventory
+        run: |
+          vulkaninfo --summary
+
+      - name: Configure (Open Vulkan runtime validation)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTUDIOCAST_ENABLE_OPEN_CUDA=OFF \
+            -DSTUDIOCAST_ENABLE_OPEN_VULKAN=ON \
+            -DSTUDIOCAST_ENABLE_OPEN_AUDIO=OFF \
+            -DSTUDIOCAST_ENABLE_DLIB=OFF \
+            -DSTUDIOCAST_BUILD_BENCHMARKS=ON
+
+      - name: Build Vulkan tests and benchmarks
+        run: |
+          cmake --build build --target \
+            studiocast-vulkan-kernel-tests \
+            studiocast-vulkan-final-stage-integration-tests \
+            studiocast-resize-backend-bench
+
+      - name: Required Vulkan kernel tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ctest --test-dir build -R '^studiocast-vulkan-kernel-tests$' --output-on-failure
+
+      - name: Required Vulkan final resident integration tests
+        run: |
+          STUDIOCAST_REQUIRE_VULKAN_RUNTIME=1 \
+            ./build/studiocast-vulkan-final-stage-integration-tests
+
+      - name: Vulkan resize benchmark smoke
+        run: |
+          ./build/studiocast-resize-backend-bench --warmup 2 --iterations 3 --csv
 
   package-smoke:
     name: package smoke (ubuntu-24.04)

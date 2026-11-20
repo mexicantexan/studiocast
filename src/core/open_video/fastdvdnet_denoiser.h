@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "core/cuda/cuda_driver_api.h"
 #include "core/cuda/cuda_tensor.h"
-#include "core/maxine/cuda_driver_api.h"
 #include "core/onnx/ort_session.h"
 #include "core/open_video/model_pack_registry.h"
 
@@ -110,6 +110,15 @@ public:
                        const std::string &requested_model_id,
                        std::string *error);
 
+  // Prepared-only frame entry point. Setup must have successfully called
+  // EnsureInitialized for this exact geometry and requested model. This path
+  // never scans models, constructs a session, or resizes setup storage.
+  bool ApplyPreparedRgbInPlace(std::uint64_t capture_sequence,
+                               std::uint8_t *rgb, int width, int height,
+                               std::size_t stride, int strength,
+                               const std::string &requested_model_id,
+                               std::string *error);
+
   // Diagnostics.
   bool initialized() const { return initialized_; }
   bool disabled() const { return disabled_; }
@@ -169,6 +178,10 @@ private:
                                std::size_t stride) const;
 
   void DisableAfterFailure(const std::string &why);
+  bool ApplyRgbInPlaceImpl(std::uint64_t capture_sequence, std::uint8_t *rgb,
+                           int width, int height, std::size_t stride,
+                           int strength, const std::string &requested_model_id,
+                           bool allow_setup, std::string *error);
 
   bool initialized_ = false;
   bool disabled_ = false;
@@ -222,8 +235,8 @@ private:
 
   // Optional CUDA ORT IoBinding buffers. These only cover ONNX tensor I/O;
   // frame preprocessing and output postprocess remain CPU-side in this class.
-  studiocast::maxine::CudaDriverApi cuda_;
-  studiocast::maxine::CUstream cuda_stream_ = nullptr;
+  studiocast::cuda::CudaDriverApi cuda_;
+  studiocast::cuda::CUstream cuda_stream_ = nullptr;
   bool cuda_stream_owned_ = false;
   bool cuda_tensor_io_ready_ = false;
   studiocast::cuda::CudaTensor cuda_noisy_tensor_;

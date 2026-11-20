@@ -34,10 +34,53 @@ VfxGreenScreenEffect::VfxGreenScreenEffect(maxine::vfx::VfxApi *vfx,
 VfxGreenScreenEffect::~VfxGreenScreenEffect() { Destroy(); }
 
 void VfxGreenScreenEffect::SetConfig(const Config &cfg) {
-  cfg_ = cfg;
-  if (cfg_.state_count == 0)
-    cfg_.state_count = 1;
+  Config next = cfg;
+  if (next.state_count == 0)
+    next.state_count = 1;
+  if (next.mode == cfg_.mode && next.temporal == cfg_.temporal &&
+      next.state_count == cfg_.state_count)
+    return;
+  cfg_ = next;
   cfg_dirty_ = true;
+}
+
+bool VfxGreenScreenEffect::SetExternalCudaStream(maxine::CUstream stream,
+                                                 std::string *error) {
+  if (!stream) {
+    if (error)
+      *error = "External CUDA stream must be non-null.";
+    return false;
+  }
+  if (stream_ == stream && !own_stream_)
+    return !handle_ || EnsureStreamBound(error);
+
+  if (handle_) {
+    const auto status = vfx_->f().NvVFX_SetCudaStream(
+        handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream);
+    if (status != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetCudaStream failed: " +
+                 StatusToString(vfx_, nvcv_, status);
+      return false;
+    }
+  }
+  if (own_stream_ && stream_ && vfx_ && vfx_->IsInitialized())
+    vfx_->f().NvVFX_CudaStreamDestroy(stream_);
+  stream_ = stream;
+  external_stream_ = stream;
+  external_stream_selected_ = true;
+  own_stream_ = false;
+  stream_bound_ = handle_ != nullptr;
+  return true;
+}
+
+void VfxGreenScreenEffect::InvalidateBindings() noexcept {
+  stream_bound_ = false;
+  bound_input_ = nullptr;
+  bound_output_ = nullptr;
+  bound_width_ = 0;
+  bound_height_ = 0;
+  matte_ready_ = false;
 }
 
 bool VfxGreenScreenEffect::Initialize(std::string *error) {
@@ -90,6 +133,8 @@ NvCV_Status VfxGreenScreenEffect::Process(studiocast::video::GpuFrame &frame,
       *error = init_err;
     return -1;
   }
+  if (!EnsureStreamBound(error))
+    return -1;
 
   if (cfg_dirty_) {
     std::string cfg_err;
@@ -110,30 +155,49 @@ NvCV_Status VfxGreenScreenEffect::Process(studiocast::video::GpuFrame &frame,
 
   // Bind I/O images.
   auto &f = vfx_->f();
-  NvCV_Status s =
-      f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_IMAGE, frame.nvcv_gpu);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error =
-          "NvVFX_SetImage(srcImage) failed: " + StatusToString(vfx_, nvcv_, s);
-    return s;
+  const auto width = static_cast<unsigned>(frame.width);
+  const auto height = static_cast<unsigned>(frame.height);
+  if (bound_width_ != width || bound_height_ != height) {
+    bound_input_ = nullptr;
+    bound_output_ = nullptr;
+    bound_width_ = width;
+    bound_height_ = height;
   }
-
-  s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &matte_gpu_);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error =
-          "NvVFX_SetImage(dstImage) failed: " + StatusToString(vfx_, nvcv_, s);
-    return s;
+  NvCV_Status s = maxine::NVCV_SUCCESS;
+  if (bound_input_ != frame.nvcv_gpu) {
+    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_INPUT_IMAGE,
+                         frame.nvcv_gpu);
+    if (s != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetImage(srcImage) failed: " +
+                 StatusToString(vfx_, nvcv_, s);
+      bound_input_ = nullptr;
+      return s;
+    }
+    bound_input_ = frame.nvcv_gpu;
+  }
+  if (bound_output_ != &matte_gpu_) {
+    s = f.NvVFX_SetImage(handle_, maxine::vfx::NVVFX_OUTPUT_IMAGE, &matte_gpu_);
+    if (s != maxine::NVCV_SUCCESS) {
+      if (error)
+        *error = "NvVFX_SetImage(dstImage) failed: " +
+                 StatusToString(vfx_, nvcv_, s);
+      bound_output_ = nullptr;
+      return s;
+    }
+    bound_output_ = &matte_gpu_;
   }
 
   // Run synchronously for simplicity.
+  ++execution_telemetry_.synchronous_run_attempts;
   s = f.NvVFX_Run(handle_, /*async=*/0);
   if (s != maxine::NVCV_SUCCESS) {
+    InvalidateBindings();
     if (error)
       *error = "NvVFX_Run failed: " + StatusToString(vfx_, nvcv_, s);
     return s;
   }
+  ++execution_telemetry_.synchronous_run_successes;
 
   matte_ready_ = true;
   return s;
@@ -165,21 +229,21 @@ bool VfxGreenScreenEffect::EnsureEffectCreated(std::string *error) {
     return false;
   }
 
-  // CUDA stream.
-  s = f.NvVFX_CudaStreamCreate(&stream_);
-  if (s != maxine::NVCV_SUCCESS || !stream_) {
-    if (error)
-      *error =
-          "NvVFX_CudaStreamCreate failed: " + StatusToString(vfx_, nvcv_, s);
-    Destroy();
-    return false;
+  if (external_stream_selected_) {
+    stream_ = external_stream_;
+    own_stream_ = false;
+  } else if (!stream_) {
+    s = f.NvVFX_CudaStreamCreate(&stream_);
+    if (s != maxine::NVCV_SUCCESS || !stream_) {
+      if (error)
+        *error =
+            "NvVFX_CudaStreamCreate failed: " + StatusToString(vfx_, nvcv_, s);
+      Destroy();
+      return false;
+    }
+    own_stream_ = true;
   }
-  own_stream_ = true;
-
-  s = f.NvVFX_SetCudaStream(handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
-  if (s != maxine::NVCV_SUCCESS) {
-    if (error)
-      *error = "NvVFX_SetCudaStream failed: " + StatusToString(vfx_, nvcv_, s);
+  if (!EnsureStreamBound(error)) {
     Destroy();
     return false;
   }
@@ -217,6 +281,8 @@ bool VfxGreenScreenEffect::EnsureEffectCreated(std::string *error) {
 }
 
 bool VfxGreenScreenEffect::ApplyConfigLocked(std::string *error) {
+  if (!cfg_dirty_)
+    return true;
   if (!handle_) {
     if (error)
       *error = "Green Screen effect not created.";
@@ -251,6 +317,26 @@ bool VfxGreenScreenEffect::ApplyConfigLocked(std::string *error) {
   }
 
   cfg_dirty_ = false;
+  return true;
+}
+
+bool VfxGreenScreenEffect::EnsureStreamBound(std::string *error) {
+  if (stream_bound_)
+    return true;
+  if (!handle_ || !stream_) {
+    if (error)
+      *error = "Green Screen stream is unavailable.";
+    return false;
+  }
+  const auto status = vfx_->f().NvVFX_SetCudaStream(
+      handle_, maxine::vfx::NVVFX_CUDA_STREAM, stream_);
+  if (status != maxine::NVCV_SUCCESS) {
+    if (error)
+      *error =
+          "NvVFX_SetCudaStream failed: " + StatusToString(vfx_, nvcv_, status);
+    return false;
+  }
+  stream_bound_ = true;
   return true;
 }
 
@@ -354,6 +440,10 @@ bool VfxGreenScreenEffect::EnsureMatteImage(unsigned width, unsigned height,
   }
 
   matte_allocated_ = true;
+  bound_input_ = nullptr;
+  bound_output_ = nullptr;
+  bound_width_ = width;
+  bound_height_ = height;
   return true;
 }
 
@@ -393,6 +483,7 @@ void VfxGreenScreenEffect::Destroy() {
   }
   stream_ = nullptr;
   own_stream_ = false;
+  InvalidateBindings();
 
   cfg_dirty_ = true;
 }

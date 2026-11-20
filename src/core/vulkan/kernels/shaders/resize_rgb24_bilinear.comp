@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Src {
+  uint src_pixels[];
+};
+
+layout(std430, binding = 1) writeonly buffer Dst {
+  uint dst_pixels[];
+};
+
+layout(push_constant) uniform Push {
+  uint src_w;
+  uint src_h;
+  uint src_pitch_pixels;
+  uint dst_w;
+  uint dst_h;
+  uint dst_pitch_pixels;
+} pc;
+
+uint byte_channel(uint px, uint channel) {
+  return (px >> (channel * 8u)) & 255u;
+}
+
+float channel_value(uint px, uint channel) {
+  return float(byte_channel(px, channel));
+}
+
+uint round_clamp_byte(float v) {
+  if (v <= 0.0)
+    return 0u;
+  if (v >= 255.0)
+    return 255u;
+  return uint(v + 0.5);
+}
+
+void main() {
+  uint x = gl_GlobalInvocationID.x;
+  uint y = gl_GlobalInvocationID.y;
+  if (x >= pc.dst_w || y >= pc.dst_h)
+    return;
+
+  float scale_x = float(pc.src_w) / float(pc.dst_w);
+  float scale_y = float(pc.src_h) / float(pc.dst_h);
+  float src_x = (float(x) + 0.5) * scale_x - 0.5;
+  float src_y = (float(y) + 0.5) * scale_y - 0.5;
+
+  int x0 = clamp(int(floor(src_x)), 0, int(pc.src_w) - 1);
+  int y0 = clamp(int(floor(src_y)), 0, int(pc.src_h) - 1);
+  int x1 = min(x0 + 1, int(pc.src_w) - 1);
+  int y1 = min(y0 + 1, int(pc.src_h) - 1);
+  float fx = src_x - float(x0);
+  float fy = src_y - float(y0);
+
+  uint p00 = src_pixels[uint(y0) * pc.src_pitch_pixels + uint(x0)];
+  uint p10 = src_pixels[uint(y0) * pc.src_pitch_pixels + uint(x1)];
+  uint p01 = src_pixels[uint(y1) * pc.src_pitch_pixels + uint(x0)];
+  uint p11 = src_pixels[uint(y1) * pc.src_pitch_pixels + uint(x1)];
+
+  uint out_px = 255u << 24u;
+  for (uint c = 0u; c < 3u; ++c) {
+    float v00 = channel_value(p00, c);
+    float v10 = channel_value(p10, c);
+    float v01 = channel_value(p01, c);
+    float v11 = channel_value(p11, c);
+    float top = v00 + fx * (v10 - v00);
+    float bottom = v01 + fx * (v11 - v01);
+    uint byte_value = round_clamp_byte(top + fy * (bottom - top));
+    out_px |= byte_value << (c * 8u);
+  }
+
+  dst_pixels[y * pc.dst_pitch_pixels + x] = out_px;
+}
