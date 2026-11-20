@@ -450,9 +450,17 @@ class PackagingIntegrationTests(unittest.TestCase):
         self.assertIn("forbidden secret PEM marker", verifier)
 
         tools_lock = (ROOT / "packaging/appimage/tools.lock").read_text(encoding="utf-8")
-        self.assertIn('APPIMAGE_RUNTIME_ASSET_ID="456065460"', tools_lock)
         self.assertIn(
-            'APPIMAGE_RUNTIME_SHA256="1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"',
+            'APPIMAGE_RUNTIME_VERSION="dd6cebedcbddde9c82f89b011e8e1d40b6e43868"',
+            tools_lock,
+        )
+        self.assertIn('APPIMAGE_RUNTIME_ASSET_ID="326011592"', tools_lock)
+        self.assertIn(
+            'APPIMAGE_RUNTIME_URL="https://api.github.com/repos/AppImage/type2-runtime/releases/assets/326011592"',
+            tools_lock,
+        )
+        self.assertIn(
+            'APPIMAGE_RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"',
             tools_lock,
         )
 

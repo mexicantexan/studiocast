@@ -366,7 +366,10 @@ def compare_manifests(expected: dict[str, Entry], actual: dict[str, Entry]) -> N
         if wanted.kind != found.kind:
             fail(f"AppImage payload type mismatch: {name or '.'}")
         if wanted.kind in ("file", "dir") and wanted.mode != found.mode:
-            fail(f"AppImage payload mode mismatch: {name or '.'}")
+            fail(
+                f"AppImage payload mode mismatch: {name or '.'}; "
+                f"expected={wanted.mode:04o} actual={found.mode:04o}"
+            )
         if wanted.kind == "file" and (
             wanted.size != found.size or wanted.sha256 != found.sha256
         ):
@@ -392,6 +395,8 @@ def extract_and_verify(args: argparse.Namespace) -> dict[str, object]:
     parent_stat = parent.lstat()
     if not stat.S_ISDIR(parent_stat.st_mode) or parent.is_symlink():
         fail(f"extraction parent must be a real directory: {parent}")
+    if parent_stat.st_uid != os.geteuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
+        fail(f"extraction parent must be private and owned by the current user: {parent}")
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     try:
         result = subprocess.run(
@@ -403,6 +408,8 @@ def extract_and_verify(args: argparse.Namespace) -> dict[str, object]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            # Preserve payload modes for exact comparison inside the private parent.
+            umask=0,
             timeout=120,
             check=False,
         )
