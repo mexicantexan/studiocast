@@ -145,8 +145,19 @@ class Type2AppImageVerifierTests(unittest.TestCase):
 
     def test_payload_mismatch_and_escaping_symlink_are_rejected(self) -> None:
         appdir = self.appdir()
+        source = appdir / "usr/share/studiocast/source/source.tar.gz"
+        source.chmod(0o644)
         archive = self.archive(appdir)
-        (appdir / "usr/share/studiocast/source/source.tar.gz").write_bytes(b"changed")
+        source.chmod(0o600)
+        result = self.verify(
+            self.image(self.payload(appdir, "mode.squashfs"), "mode.AppImage"),
+            archive, "mode-output",
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("AppImage payload mode mismatch", result.stderr)
+        self.assertIn("expected=0644 actual=0600", result.stderr)
+        source.chmod(0o644)
+        source.write_bytes(b"changed")
         result = self.verify(self.image(self.payload(appdir)), archive)
         self.assertEqual(2, result.returncode)
         self.assertIn("payload content mismatch", result.stderr)

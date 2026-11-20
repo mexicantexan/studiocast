@@ -366,7 +366,10 @@ def compare_manifests(expected: dict[str, Entry], actual: dict[str, Entry]) -> N
         if wanted.kind != found.kind:
             fail(f"AppImage payload type mismatch: {name or '.'}")
         if wanted.kind in ("file", "dir") and wanted.mode != found.mode:
-            fail(f"AppImage payload mode mismatch: {name or '.'}")
+            fail(
+                f"AppImage payload mode mismatch: {name or '.'}; "
+                f"expected={wanted.mode:04o} actual={found.mode:04o}"
+            )
         if wanted.kind == "file" and (
             wanted.size != found.size or wanted.sha256 != found.sha256
         ):
